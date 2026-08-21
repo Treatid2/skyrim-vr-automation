@@ -25,6 +25,12 @@ Use the bundled client rather than constructing HTTP or MCP requests ad hoc.
    when a semantic failure must fail the orchestration step.
 7. Prefer client `wait -Condition noBlockingMenu` over the server `noMenu`
    condition when Skyrim's permanent HUD is open.
+8. When a CSX bridge may be gated behind initialization or compilation, use
+   `wait -Condition toolAvailable -Tool <exact-name>` with an explicit bounded
+   timeout and optional explicit `-ProgressLogPath`. Use `serviceReady` plus a
+   read-only `-ArgumentsJson` action when registration alone is insufficient.
+9. Use `-ExpectedErrorCode` for deliberate guard tests such as
+   `producer_mismatch`; do not reinterpret an unrequested API failure as a pass.
 
 The entry point is:
 

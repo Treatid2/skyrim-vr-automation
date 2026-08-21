@@ -3,7 +3,7 @@
 MO2 Control is the shared, machine-readable entry point for Codex tasks that
 inspect or validate the Skyrim VR Mod Organizer 2 installation.
 
-Version `0.4.0` adds exact-profile `open`, MO2-only cooperative `close`, and
+Version `0.5.0` retains exact-profile `open`, MO2-only cooperative `close`, and
 `recover-close` for a stranded pre-session MO2. Cooperative close verifies the
 configured executable path, addresses only the exact MO2 PID, invokes MO2's
 structured exact `File` → `Exit` command, invokes only a button whose normalized
@@ -11,6 +11,19 @@ accessible name is exactly `Unlock`, and otherwise requests normal closure of
 visible MO2-owned modal windows. It never closes Tullius,
 Notepad++, or another editor and never force-terminates. Existing retained-MO2
 game cycling and explicit safe-gated termination remain available.
+
+`open` and `launch` accept `-StartOnly`: they write their exact session receipt,
+start only the intended process, return immediately with the session/evidence
+path, and direct the caller to poll `status`. A missing session ID is a
+structured `missing-session-id` precondition instead of a PowerShell binding
+failure. Launch classifies the exact `Failed to write settings` dialog and
+cooperative close acknowledges only its exact `OK` button.
+
+`status` identifies a closed or headless owner with active RootBuilder
+`BuildData.json` as `rootbuilder-recovery-required`. `recover-rootbuilder`
+performs one recorded exact-profile launch; the caller then uses normal `stop`
+so RootBuilder can restore its deployment through the exact Unlock path. It
+never deletes deployment data.
 
 ## Quick start
 
@@ -22,6 +35,7 @@ From this directory in PowerShell:
 .\Invoke-MO2Control.ps1 validate -RequireClosed
 .\Invoke-MO2Control.ps1 prepare -Label "null-hmd-baseline" -WhatIf
 .\Invoke-MO2Control.ps1 recover-close -Label "stranded-mo2" -WhatIf
+.\Invoke-MO2Control.ps1 recover-rootbuilder -SessionId $sessionId -WhatIf
 ```
 
 Use `-Compact` for one-line JSON. Override the configured defaults only with an

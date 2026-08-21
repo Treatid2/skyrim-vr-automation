@@ -7,10 +7,10 @@ the Skyrim VR installation. The local machine configuration is
 the resolved machine configuration; do not rediscover paths or guess profile and
 executable names when the package can report them.
 
-Version 0.4.0 provides read-only inspection plus single-owner `prepare`, exact
+Version 0.5.0 provides read-only inspection plus single-owner `prepare`, exact
 `open` and `launch`, bounded `status`, graceful `stop-game`, MO2-only
 cooperative `close`, stranded-instance `recover-close`, and graceful full
-`stop`. A successful validation
+`stop`, immediate start receipts, and attributable RootBuilder recovery. A successful validation
 authorizes no mutation by itself. Changes still require the user's task to put
 the relevant MO2 state, mod files, game files, or captured artifacts in scope.
 
@@ -225,6 +225,26 @@ status channel.
 Response: do not retry immediately. Inspect the process tree, MO2 and
 RootBuilder logs, active JSON validity, game start evidence, and timestamps.
 Classify the outcome first. Close residual processes before another attempt.
+
+### `Failed to write settings`
+
+Meaning: MO2 displayed a known blocking settings-write dialog before the game
+was observed. The controller reports `launch-blocked-dialog`, preserves the
+exact window text/buttons, and does not pretend the launch succeeded.
+
+Response: use `close` or `stop` with the retained session ID. Cooperative close
+invokes only the exact `OK` button for this known dialog, then continues normal
+MO2 shutdown. Inspect the settings path/permissions before another launch.
+
+### Stranded RootBuilder deployment
+
+Symptom: `status` reports `rootbuilder-recovery-required` and identifies one
+active `BuildData.json` after MO2/game closure.
+
+Response: retain the session and preview `recover-rootbuilder -SessionId ...
+-WhatIf`. The real command performs one exact-profile launch; finish with normal
+`stop`/Unlock and verify `BuildData.json` is absent. This route does not delete
+or rewrite RootBuilder metadata directly.
 
 ### MO2 command helper exits before the game appears
 

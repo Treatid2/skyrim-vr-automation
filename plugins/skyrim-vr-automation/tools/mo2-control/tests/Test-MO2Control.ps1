@@ -113,6 +113,8 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test ($validation.state -eq 'ready') 'clean fixture is ready'
     Assert-MO2Test ($validation.data.selectedProfile -eq 'Codex') 'ByteArray profile is decoded'
     Assert-MO2Test (@($validation.data.executables | Where-Object title -eq 'Launch MGO - Do Not Unlock').Count -eq 1) 'registered executable is parsed exactly once'
+    $dialogKind = & (Get-Module MO2Control) { Get-MO2KnownDialogKind -Title 'Mod Organizer' -Texts @('Failed to write settings') }
+    Assert-MO2Test ($dialogKind -eq 'failed-to-write-settings') 'known settings-write dialog is classified exactly'
 
     $missingProfile = Invoke-MO2Validate -Config $config -Profile 'Does Not Exist'
     Assert-MO2Test (-not $missingProfile.ok) 'missing exact profile blocks validation'
@@ -142,13 +144,24 @@ selected_profile=@ByteArray(Codex)
     $status = Invoke-MO2Status -Config $config -SessionId $sessionId
     Assert-MO2Test ($status.ok -and $status.state -eq 'prepared') 'owned session status succeeds'
 
-    $launchDryRun = Invoke-MO2Launch -Config $config -SessionId $sessionId -WhatIf
-    Assert-MO2Test ($launchDryRun.ok -and $launchDryRun.state -eq 'dry-run') 'launch dry-run succeeds'
+    $missingSession = (& (Join-Path $packageRoot 'Invoke-MO2Control.ps1') open -ConfigPath $configPath -NoExit | ConvertFrom-Json)
+    Assert-MO2Test (-not $missingSession.ok -and $missingSession.state -eq 'missing-session-id' -and $missingSession.data.requiredParameter -eq 'SessionId') 'entry point returns a structured missing-session precondition'
+
+    $launchDryRun = Invoke-MO2Launch -Config $config -SessionId $sessionId -StartOnly -WhatIf
+    Assert-MO2Test ($launchDryRun.ok -and $launchDryRun.state -eq 'dry-run' -and $launchDryRun.data.startOnly) 'launch start-only dry-run succeeds'
     Assert-MO2Test (($launchDryRun.data.arguments -join '|') -eq '--profile|Codex|run|--executable|Launch MGO - Do Not Unlock') 'launch uses exact official MO2 profile and executable command'
 
-    $openDryRun = Invoke-MO2Open -Config $config -SessionId $sessionId -WhatIf
-    Assert-MO2Test ($openDryRun.ok -and $openDryRun.state -eq 'dry-run' -and -not $openDryRun.data.wouldOpenGame) 'open dry-run opens only exact MO2'
+    $openDryRun = Invoke-MO2Open -Config $config -SessionId $sessionId -StartOnly -WhatIf
+    Assert-MO2Test ($openDryRun.ok -and $openDryRun.state -eq 'dry-run' -and -not $openDryRun.data.wouldOpenGame -and $openDryRun.data.startOnly) 'open start-only dry-run opens only exact MO2'
     Assert-MO2Test (($openDryRun.data.arguments -join '|') -eq '--profile|Codex') 'open uses exact official MO2 profile command'
+
+    $buildData = Join-Path $rootBuilderData 'BuildData.json'
+    '{}' | Set-Content -LiteralPath $buildData -Encoding utf8
+    $rootBuilderStatus = Invoke-MO2Status -Config $config -SessionId $sessionId
+    Assert-MO2Test ($rootBuilderStatus.state -eq 'rootbuilder-recovery-required' -and $rootBuilderStatus.data.controller.activeBuildData.Count -eq 1) 'status classifies a closed stranded RootBuilder transaction'
+    $rootBuilderRecovery = Invoke-MO2RecoverRootBuilder -Config $config -SessionId $sessionId -StartOnly -WhatIf
+    Assert-MO2Test ($rootBuilderRecovery.ok -and $rootBuilderRecovery.state -eq 'dry-run' -and $rootBuilderRecovery.data.recovery.destructiveCleanup -eq $false) 'RootBuilder recovery is an attributable exact-launch dry-run'
+    Remove-Item -LiteralPath $buildData -Force
 
     $closeDryRun = Invoke-MO2Close -Config $config -SessionId $sessionId -WhatIf
     Assert-MO2Test ($closeDryRun.ok -and $closeDryRun.state -eq 'dry-run' -and $closeDryRun.data.alreadyClosed) 'close dry-run is non-mutating when MO2 is already closed'

@@ -39,9 +39,15 @@ are:
    success from process appearance alone.
 5. For repeated measurements, retain the owning MO2 process and cycle Skyrim
    with `stop-game` followed by `launch`.
-6. End with the bounded graceful path. Use `terminate` and `release` only under
+6. Use `-StartOnly` when the outer host cannot safely wait for UI/game
+   readiness; retain the immediate receipt and poll the exact session with
+   `status`.
+7. If `status` reports `rootbuilder-recovery-required`, preview and use
+   `recover-rootbuilder` with the same exact session, then finish through normal
+   `stop`/Unlock. Never delete `BuildData.json` directly.
+8. End with the bounded graceful path. Use `terminate` and `release` only under
    the runbook's ownership and closed-game proofs.
-7. Preserve session identifiers, receipts, hashes, logs, screenshots, dumps,
+9. Preserve session identifiers, receipts, hashes, logs, screenshots, dumps,
    and the pre/post inspection results with the test record.
 
 ## Safety and authority

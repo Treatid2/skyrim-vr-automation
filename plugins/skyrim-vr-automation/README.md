@@ -24,6 +24,8 @@ optional integration rather than the identity or boundary of the toolkit.
   snapshot/restore transactions, and comparison reports.
 - `tools/process-control` — bounded exact-process execution with classified,
   evidence-backed retries for known transient failures.
+- `tools/build-test-control` — CTest-aware branch testing with a direct-test
+  fallback when a configured build contains test binaries but registers none.
 
 The preserved null-HMD profile is `profiles/steamvr-null.profile.json`.
 

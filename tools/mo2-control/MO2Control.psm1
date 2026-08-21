@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 Set-StrictMode -Version Latest
-$script:MO2ControlContractVersion = '0.4.0'
+$script:MO2ControlContractVersion = '0.5.0'
 
 function Resolve-MO2ControlPath {
     param([Parameter(Mandatory)][string]$Path)
@@ -859,17 +859,60 @@ function Get-MO2AutomationWindows {
 function Get-MO2UnlockButtons {
     param([Parameter(Mandatory)]$Window)
 
+    return @(Get-MO2NamedButtons -Window $Window -Name 'Unlock')
+}
+
+function Get-MO2NamedButtons {
+    param(
+        [Parameter(Mandatory)]$Window,
+        [Parameter(Mandatory)][string]$Name
+    )
+
     $buttonCondition = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
         [System.Windows.Automation.ControlType]::Button
     )
     $nameCondition = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::NameProperty,
-        'Unlock',
+        $Name,
         [System.Windows.Automation.PropertyConditionFlags]::IgnoreCase
     )
     $condition = [System.Windows.Automation.AndCondition]::new($buttonCondition, $nameCondition)
     return @($Window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition))
+}
+
+function Get-MO2WindowTextElements {
+    param([Parameter(Mandatory)]$Window)
+
+    $condition = [System.Windows.Automation.OrCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Text
+        ),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Document
+        )
+    )
+    $values = [Collections.Generic.List[string]]::new()
+    foreach ($element in @($Window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition))) {
+        $name = ConvertTo-MO2ControlName ([string]$element.Current.Name)
+        if (-not [string]::IsNullOrWhiteSpace($name) -and -not $values.Contains($name)) {
+            $values.Add($(if ($name.Length -gt 512) { $name.Substring(0, 512) } else { $name }))
+        }
+        if ($values.Count -ge 32) { break }
+    }
+    return @($values)
+}
+
+function Get-MO2KnownDialogKind {
+    param(
+        [AllowNull()][string]$Title,
+        [AllowEmptyCollection()][string[]]$Texts = @()
+    )
+    $combined = ((@($Title) + @($Texts)) -join "`n")
+    if ($combined -match '(?i)failed to write settings') { return 'failed-to-write-settings' }
+    return $null
 }
 
 function Get-MO2NamedMenuItems {
@@ -922,17 +965,24 @@ function Get-MO2WindowSnapshot {
         }
         foreach ($native in @(Get-MO2NativeWindows -ProcessId ([int]$processRecord.id))) {
             $buttons = @()
+            $texts = @()
             $window = $automationByHandle[[string][int64]$native.handle]
             $automationId = $(if ($window) { [string]$window.Current.AutomationId } else { $null })
             if ($window -and $native.visible -and $automationId -ine 'MainWindow') {
-                foreach ($button in @(Get-MO2UnlockButtons -Window $window)) {
+                $buttonCondition = [System.Windows.Automation.PropertyCondition]::new(
+                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                    [System.Windows.Automation.ControlType]::Button
+                )
+                foreach ($button in @($window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition))) {
                     $buttons += [pscustomobject][ordered]@{
                         name = ConvertTo-MO2ControlName ([string]$button.Current.Name)
                         automationId = [string]$button.Current.AutomationId
                         enabled = [bool]$button.Current.IsEnabled
                     }
                 }
+                $texts = @(Get-MO2WindowTextElements -Window $window)
             }
+            $dialogKind = Get-MO2KnownDialogKind -Title ([string]$native.title) -Texts $texts
             $records += [pscustomobject][ordered]@{
                 processId = [int]$processRecord.id
                 handle = [int64]$native.handle
@@ -942,6 +992,8 @@ function Get-MO2WindowSnapshot {
                 automationAvailable = $null -ne $window
                 automationId = $automationId
                 buttons = @($buttons)
+                texts = @($texts)
+                dialogKind = $dialogKind
             }
         }
     }
@@ -1082,6 +1134,20 @@ function Invoke-MO2CooperativeCloseCore {
                         }
                     }
                     continue
+                }
+                $dialogKind = Get-MO2KnownDialogKind -Title ([string]$window.Current.Name) -Texts @(Get-MO2WindowTextElements -Window $window)
+                if ($dialogKind -eq 'failed-to-write-settings') {
+                    foreach ($button in @(Get-MO2NamedButtons -Window $window -Name 'OK')) {
+                        $invoked = Invoke-MO2AutomationButton -Button $button -ExpectedName 'OK'
+                        $actions.Add([pscustomobject][ordered]@{
+                            timestampUtc = [DateTime]::UtcNow.ToString('o')
+                            processId = [int]$record.id
+                            windowHandle = [int64]$window.Current.NativeWindowHandle
+                            windowTitle = [string]$window.Current.Name
+                            action = 'acknowledge-failed-to-write-settings'
+                            accepted = $invoked
+                        })
+                    }
                 }
                 foreach ($button in @(Get-MO2UnlockButtons -Window $window)) {
                     if ((ConvertTo-MO2ControlName ([string]$button.Current.Name)) -ieq 'Unlock') {
@@ -1394,13 +1460,38 @@ function Invoke-MO2Status {
 
     $requestedProfile = $null
     $requestedExecutable = $null
+    $owned = $null
     if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
         $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
         $requestedProfile = [string]$owned.data.profile
         $requestedExecutable = [string]$owned.data.executable
     }
     $data = Get-MO2InspectionData -Config $Config -RequestedProfile $requestedProfile -RequestedExecutable $requestedExecutable
-    $state = if ($data.processes.game.Count -gt 0) { 'game-running' } elseif ($data.processes.mo2.Count -gt 0) { 'mo2-running' } elseif ($data.sessionLock.exists) { [string]$data.sessionLock.status } else { 'closed' }
+    $buildData = @($data.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
+    $windows = if ($data.processes.mo2.Count -gt 0) { @(Get-MO2WindowSnapshot -Processes @($data.processes.mo2)) } else { @() }
+    $headlessMO2 = $data.processes.mo2.Count -gt 0 -and @($windows | Where-Object visible).Count -eq 0
+    $state = if ($data.processes.game.Count -gt 0) {
+        'game-running'
+    }
+    elseif ($buildData.Count -gt 0 -and ($headlessMO2 -or $data.processes.mo2.Count -eq 0)) {
+        'rootbuilder-recovery-required'
+    }
+    elseif ($data.processes.mo2.Count -gt 0) {
+        'mo2-running'
+    }
+    elseif ($data.sessionLock.exists) {
+        [string]$data.sessionLock.status
+    }
+    else { 'closed' }
+    $data | Add-Member -NotePropertyName controller -NotePropertyValue ([pscustomobject][ordered]@{
+        sessionId = if ($owned) { $SessionId } else { $null }
+        sessionPath = if ($owned) { [string]$owned.data.sessionPath } else { $null }
+        lockStatus = if ($owned) { [string]$owned.data.status } else { $null }
+        windows = @($windows)
+        headlessMO2 = $headlessMO2
+        activeBuildData = @($buildData | ForEach-Object path)
+        recoveryCommand = if ($buildData.Count -gt 0 -and $owned) { "recover-rootbuilder -SessionId $SessionId" } else { $null }
+    }) -Force
     return New-MO2ActionResult -Config $Config -Command 'status' -Ok $true -State $state -Data $data
 }
 
@@ -1410,12 +1501,16 @@ function Invoke-MO2Launch {
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)][string]$SessionId,
         [ValidateRange(1, 600)][int]$TimeoutSeconds = 90,
+        [switch]$StartOnly,
+        [switch]$RootBuilderRecovery,
         [switch]$WhatIf
     )
 
     $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
     $lockData = $owned.data
-    if ([string]$lockData.status -notin @('prepared', 'launch-failed', 'game-stopped', 'stop-incomplete', 'mo2-open')) {
+    $acceptedStatuses = @('prepared', 'launch-failed', 'game-stopped', 'stop-incomplete', 'mo2-open')
+    if ($RootBuilderRecovery) { $acceptedStatuses += @('mo2-closed', 'rootbuilder-recovery-required', 'opening', 'open-incomplete') }
+    if ([string]$lockData.status -notin $acceptedStatuses) {
         return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'blocked' -Data @{ lock = $owned } -Errors @("Session status '$($lockData.status)' cannot be launched.")
     }
 
@@ -1437,10 +1532,26 @@ function Invoke-MO2Launch {
     $arguments = @('--profile', [string]$lockData.profile, 'run', '--executable', [string]$lockData.executable)
     $argumentLine = ($arguments | ForEach-Object { ConvertTo-MO2CommandLineArgument ([string]$_) }) -join ' '
     if ($WhatIf) {
-        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'dry-run' -Data @{ path = $mo2Path; arguments = $arguments; argumentLine = $argumentLine; workingDirectory = (Split-Path -Parent $mo2Path); sessionId = $SessionId }
+        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'dry-run' -Data @{ path = $mo2Path; arguments = $arguments; argumentLine = $argumentLine; workingDirectory = (Split-Path -Parent $mo2Path); sessionId = $SessionId; startOnly = [bool]$StartOnly; rootBuilderRecovery = [bool]$RootBuilderRecovery }
     }
 
+    $launchStartedPath = Join-Path ([string]$lockData.sessionPath) 'mo2-launch-started.json'
+    $launchStarted = [pscustomobject][ordered]@{
+        contractVersion = $script:MO2ControlContractVersion
+        sessionId = $SessionId
+        mo2Path = $mo2Path
+        arguments = $arguments
+        argumentLine = $argumentLine
+        timeoutSeconds = $TimeoutSeconds
+        startOnly = [bool]$StartOnly
+        rootBuilderRecovery = [bool]$RootBuilderRecovery
+        requestedPid = $null
+        startedUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted
     $process = Start-Process -FilePath $mo2Path -ArgumentList $argumentLine -WorkingDirectory (Split-Path -Parent $mo2Path) -WindowStyle Hidden -PassThru
+    $launchStarted.requestedPid = $process.Id
+    Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted
     $lockData.status = 'launching'
     if (-not $resumeExistingMO2) {
         if ($lockData.PSObject.Properties['ownerPid']) { $lockData.ownerPid = $process.Id } else { $lockData | Add-Member -NotePropertyName ownerPid -NotePropertyValue $process.Id }
@@ -1449,29 +1560,94 @@ function Invoke-MO2Launch {
     if ($lockData.PSObject.Properties['launchedUtc']) { $lockData.launchedUtc = [DateTime]::UtcNow.ToString('o') } else { $lockData | Add-Member -NotePropertyName launchedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) }
     Write-MO2JsonAtomic -Path $owned.path -Value $lockData
 
+    $manifestPath = Join-Path ([string]$lockData.sessionPath) 'session.json'
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $manifest.status = 'launching'
+    $manifest.launcherPid = $process.Id
+    $manifest.launchedUtc = $lockData.launchedUtc
+    if ($manifest.PSObject.Properties['launchStartedReceiptPath']) { $manifest.launchStartedReceiptPath = $launchStartedPath } else { $manifest | Add-Member -NotePropertyName launchStartedReceiptPath -NotePropertyValue $launchStartedPath }
+    Write-MO2JsonAtomic -Path $manifestPath -Value $manifest
+    if ($StartOnly) {
+        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'launching' -Data @{ sessionId = $SessionId; launcherPid = $process.Id; launchStartedReceiptPath = $launchStartedPath; sessionPath = $lockData.sessionPath; pollWith = "status -SessionId $SessionId"; rootBuilderRecovery = [bool]$RootBuilderRecovery }
+    }
+
     $primaryGameProcessName = [string]@($Config.mo2.gameProcessNames)[0]
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $status = $null
+    $blockingDialog = $null
     do {
         Start-Sleep -Milliseconds 500
         $status = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$lockData.profile) -RequestedExecutable ([string]$lockData.executable)
         if (@($status.processes.game | Where-Object { $_.name -ieq $primaryGameProcessName }).Count -gt 0) { break }
+        $blockingDialog = @(Get-MO2WindowSnapshot -Processes @($status.processes.mo2) | Where-Object { $_.dialogKind -eq 'failed-to-write-settings' } | Select-Object -First 1)
+        if ($blockingDialog.Count -gt 0) { break }
     } while ([DateTime]::UtcNow -lt $deadline)
 
     $gameObserved = @($status.processes.game | Where-Object { $_.name -ieq $primaryGameProcessName }).Count -gt 0
-    $lockData.status = if ($gameObserved) { 'running' } else { 'launch-failed' }
+    $lockData.status = if ($gameObserved) { 'running' } elseif ($blockingDialog.Count -gt 0) { 'launch-blocked-dialog' } else { 'launch-failed' }
     Write-MO2JsonAtomic -Path $owned.path -Value $lockData
-    $manifestPath = Join-Path ([string]$lockData.sessionPath) 'session.json'
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
     $manifest.status = $lockData.status
     $manifest.launcherPid = $process.Id
     $manifest.launchedUtc = $lockData.launchedUtc
     Write-MO2JsonAtomic -Path $manifestPath -Value $manifest
 
-    if (-not $gameObserved) {
-        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'launch-failed' -Data @{ launcherPid = $process.Id; launcherExited = $process.HasExited; launcherExitCode = $(if ($process.HasExited) { $process.ExitCode } else { $null }); primaryGameProcessName = $primaryGameProcessName; processes = $status.processes; sessionPath = $lockData.sessionPath } -Errors @("The primary game process '$primaryGameProcessName' was not observed within $TimeoutSeconds seconds. A launcher helper exit is non-terminal because an existing MO2 instance can accept the request asynchronously.")
+    if ($blockingDialog.Count -gt 0) {
+        $dialogReceiptPath = Join-Path ([string]$lockData.sessionPath) 'mo2-launch-blocked-dialog.json'
+        $dialogReceipt = [pscustomobject][ordered]@{
+            contractVersion = $script:MO2ControlContractVersion
+            sessionId = $SessionId
+            classification = 'failed-to-write-settings'
+            observedUtc = [DateTime]::UtcNow.ToString('o')
+            dialog = $blockingDialog[0]
+            processes = $status.processes
+            safeCloseAction = 'close or stop will acknowledge only the exact OK button, then continue cooperative shutdown'
+        }
+        Write-MO2JsonAtomic -Path $dialogReceiptPath -Value $dialogReceipt
+        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'launch-blocked-dialog' -Data @{ sessionId = $SessionId; launcherPid = $process.Id; launchStartedReceiptPath = $launchStartedPath; dialogReceiptPath = $dialogReceiptPath; dialog = $blockingDialog[0]; processes = $status.processes; sessionPath = $lockData.sessionPath } -Errors @('MO2 reported Failed to write settings. The launch was classified immediately; use close/stop to acknowledge the exact dialog and shut down cooperatively.')
     }
-    return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'game-running' -Data @{ launcherPid = $process.Id; primaryGameProcessName = $primaryGameProcessName; processes = $status.processes; sessionPath = $lockData.sessionPath }
+
+    if (-not $gameObserved) {
+        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'launch-failed' -Data @{ launcherPid = $process.Id; launcherExited = $process.HasExited; launcherExitCode = $(if ($process.HasExited) { $process.ExitCode } else { $null }); primaryGameProcessName = $primaryGameProcessName; processes = $status.processes; sessionPath = $lockData.sessionPath; launchStartedReceiptPath = $launchStartedPath } -Errors @("The primary game process '$primaryGameProcessName' was not observed within $TimeoutSeconds seconds. A launcher helper exit is non-terminal because an existing MO2 instance can accept the request asynchronously.")
+    }
+    return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'game-running' -Data @{ launcherPid = $process.Id; primaryGameProcessName = $primaryGameProcessName; processes = $status.processes; sessionPath = $lockData.sessionPath; launchStartedReceiptPath = $launchStartedPath; rootBuilderRecovery = [bool]$RootBuilderRecovery }
+}
+
+function Invoke-MO2RecoverRootBuilder {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$SessionId,
+        [ValidateRange(1, 600)][int]$TimeoutSeconds = 90,
+        [switch]$StartOnly,
+        [switch]$WhatIf
+    )
+
+    $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
+    $inspection = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$owned.data.profile) -RequestedExecutable ([string]$owned.data.executable)
+    if ($inspection.processes.game.Count -gt 0 -or $inspection.processes.mo2.Count -gt 0) {
+        return New-MO2ActionResult -Config $Config -Command 'recover-rootbuilder' -Ok $false -State 'blocked' -Data @{ sessionId = $SessionId; processes = $inspection.processes; sessionPath = $owned.data.sessionPath } -Errors @('RootBuilder recovery requires MO2 and the game/loader to be closed. Use close or recover-close first.')
+    }
+    $buildData = @($inspection.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
+    if ($buildData.Count -eq 0) {
+        return New-MO2ActionResult -Config $Config -Command 'recover-rootbuilder' -Ok $true -State 'no-recovery-required' -Data @{ sessionId = $SessionId; activeBuildData = @(); sessionPath = $owned.data.sessionPath }
+    }
+    if ($buildData.Count -ne 1) {
+        return New-MO2ActionResult -Config $Config -Command 'recover-rootbuilder' -Ok $false -State 'blocked' -Data @{ sessionId = $SessionId; activeBuildData = @($buildData | ForEach-Object path); sessionPath = $owned.data.sessionPath } -Errors @('RootBuilder recovery requires exactly one active BuildData.json; multiple deployment records require manual classification.')
+    }
+
+    if (-not $WhatIf) {
+        Set-MO2OwnedSessionStatus -Owned $owned -Status 'rootbuilder-recovery-required' -TimestampProperty 'recoveryStartedUtc'
+    }
+    $result = Invoke-MO2Launch -Config $Config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -StartOnly:$StartOnly -RootBuilderRecovery -WhatIf:$WhatIf
+    $result.command = 'recover-rootbuilder'
+    $result.data | Add-Member -NotePropertyName recovery -NotePropertyValue ([pscustomobject][ordered]@{
+        buildDataPath = [string]$buildData[0].path
+        buildDataBytes = [long]$buildData[0].bytes
+        strategy = 'one exact-profile launch followed by normal stop/Unlock so RootBuilder can restore its recorded deployment'
+        destructiveCleanup = $false
+    }) -Force
+    return $result
 }
 
 function Invoke-MO2Open {
@@ -1480,6 +1656,7 @@ function Invoke-MO2Open {
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)][string]$SessionId,
         [ValidateRange(1, 600)][int]$TimeoutSeconds = 90,
+        [switch]$StartOnly,
         [switch]$WhatIf
     )
 
@@ -1499,13 +1676,13 @@ function Invoke-MO2Open {
     $arguments = @('--profile', [string]$owned.data.profile)
     $argumentLine = ($arguments | ForEach-Object { ConvertTo-MO2CommandLineArgument ([string]$_) }) -join ' '
     if ($WhatIf) {
-        return New-MO2ActionResult -Config $Config -Command 'open' -Ok $true -State 'dry-run' -Data @{ sessionId = $SessionId; path = $mo2Path; arguments = $arguments; argumentLine = $argumentLine; workingDirectory = (Split-Path -Parent $mo2Path); wouldOpenGame = $false }
+        return New-MO2ActionResult -Config $Config -Command 'open' -Ok $true -State 'dry-run' -Data @{ sessionId = $SessionId; path = $mo2Path; arguments = $arguments; argumentLine = $argumentLine; workingDirectory = (Split-Path -Parent $mo2Path); wouldOpenGame = $false; startOnly = [bool]$StartOnly }
     }
 
     $process = Start-Process -FilePath $mo2Path -ArgumentList $argumentLine -WorkingDirectory (Split-Path -Parent $mo2Path) -PassThru
     $openStartedPath = Join-Path ([string]$owned.data.sessionPath) 'mo2-open-started.json'
     $openStarted = [pscustomobject][ordered]@{
-        contractVersion = '0.4.0'
+        contractVersion = $script:MO2ControlContractVersion
         sessionId = $SessionId
         requestedPid = $process.Id
         mo2Path = $mo2Path
@@ -1516,6 +1693,9 @@ function Invoke-MO2Open {
     }
     Write-MO2JsonAtomic -Path $openStartedPath -Value $openStarted
     Set-MO2OwnedSessionStatus -Owned $owned -Status 'opening' -TimestampProperty 'openedUtc'
+    if ($StartOnly) {
+        return New-MO2ActionResult -Config $Config -Command 'open' -Ok $true -State 'opening' -Data @{ sessionId = $SessionId; requestedPid = $process.Id; openStartedReceiptPath = $openStartedPath; sessionPath = $owned.data.sessionPath; pollWith = "status -SessionId $SessionId"; gameOpened = $false }
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $observed = $null
     do {
@@ -1874,12 +2054,13 @@ function Get-MO2ControlHelp {
             [pscustomobject]@{ name = 'inspect'; mutation = $false; description = 'Inspect MO2 paths, profiles, registered executables, processes, RootBuilder state, overwrite usage, storage and locks.' },
             [pscustomobject]@{ name = 'validate'; mutation = $false; description = 'Validate an exact profile and registered executable. Add -RequireClosed before future state-changing operations.' },
             [pscustomobject]@{ name = 'prepare'; mutation = $true; description = 'Validate closed state and create a durable single-owner evidence session. Supports -WhatIf.' },
-            [pscustomobject]@{ name = 'open'; mutation = $true; description = 'Open only the exact configured MO2 executable and profile in an owned session. Does not launch the game.' },
-            [pscustomobject]@{ name = 'launch'; mutation = $true; description = 'Launch one exact registered executable under one exact profile. Requires -SessionId and supports -WhatIf.' },
+            [pscustomobject]@{ name = 'open'; mutation = $true; description = 'Open only the exact configured MO2 executable and profile in an owned session. Does not launch the game. -StartOnly returns after the durable receipt is written.' },
+            [pscustomobject]@{ name = 'launch'; mutation = $true; description = 'Launch one exact registered executable under one exact profile. Requires -SessionId; -StartOnly returns after the durable receipt is written.' },
             [pscustomobject]@{ name = 'status'; mutation = $false; description = 'Report bounded MO2, game and runtime process state, optionally verifying -SessionId ownership.' },
             [pscustomobject]@{ name = 'stop-game'; mutation = $true; description = 'Request graceful game shutdown while retaining the exact owned MO2 process for controlled relaunch. Never force-terminates.' },
             [pscustomobject]@{ name = 'close'; mutation = $true; description = 'Cooperatively close only exact session-owned MO2, including its exact Unlock control and MO2-owned modal windows. Never force-terminates.' },
             [pscustomobject]@{ name = 'recover-close'; mutation = $true; description = 'Adopt one stranded exact-path MO2 into a recorded recovery session, then cooperatively close it. Never targets editor or crash-handler processes.' },
+            [pscustomobject]@{ name = 'recover-rootbuilder'; mutation = $true; description = 'Recover one stranded RootBuilder BuildData transaction through one exact-profile launch, followed by the normal stop/Unlock path. Never deletes deployment metadata.' },
             [pscustomobject]@{ name = 'stop'; mutation = $true; description = 'Request graceful game shutdown, then cooperatively close exact owned MO2. Never force-terminates.' },
             [pscustomobject]@{ name = 'terminate'; mutation = $true; description = 'Force-terminate only owned MO2 processes after proving game absence and RootBuilder cleanup. Requires -SessionId and supports -WhatIf.' },
             [pscustomobject]@{ name = 'release'; mutation = $true; description = 'Release an owned lock only after closed-state proof; retain the evidence session. Requires -SessionId and supports -WhatIf.' },
@@ -1890,7 +2071,7 @@ function Get-MO2ControlHelp {
             '.\Invoke-MO2Control.ps1 validate -RequireClosed',
             '.\Invoke-MO2Control.ps1 validate -Profile "Codex" -Executable "Launch MGO - Do Not Unlock" -Compact'
         )
-        note = 'Version 0.4.0 adds exact-path open and cooperative close. Close invokes only MO2''s exact Unlock action, otherwise requests normal closure of MO2-owned windows, never targets Notepad++/Tullius, and never force-terminates.'
+        note = 'Version 0.5.0 adds immediate start receipts, structured session preconditions, exact Failed-to-write-settings classification, and an attributable RootBuilder recovery route.'
     }
 
     return [pscustomobject][ordered]@{
@@ -1906,4 +2087,4 @@ function Get-MO2ControlHelp {
     }
 }
 
-Export-ModuleMember -Function Read-MO2ControlConfig, Invoke-MO2Inspect, Invoke-MO2Validate, Invoke-MO2Prepare, Invoke-MO2Open, Invoke-MO2Launch, Invoke-MO2Status, Invoke-MO2StopGame, Invoke-MO2Close, Invoke-MO2RecoverClose, Invoke-MO2Stop, Invoke-MO2Terminate, Invoke-MO2Release, Get-MO2ControlHelp
+Export-ModuleMember -Function Read-MO2ControlConfig, Invoke-MO2Inspect, Invoke-MO2Validate, Invoke-MO2Prepare, Invoke-MO2Open, Invoke-MO2Launch, Invoke-MO2Status, Invoke-MO2StopGame, Invoke-MO2Close, Invoke-MO2RecoverClose, Invoke-MO2RecoverRootBuilder, Invoke-MO2Stop, Invoke-MO2Terminate, Invoke-MO2Release, Get-MO2ControlHelp

@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('inspect', 'validate', 'prepare', 'open', 'launch', 'status', 'stop-game', 'close', 'recover-close', 'stop', 'terminate', 'release', 'help')]
+    [ValidateSet('inspect', 'validate', 'prepare', 'open', 'launch', 'status', 'stop-game', 'close', 'recover-close', 'recover-rootbuilder', 'stop', 'terminate', 'release', 'help')]
     [string]$Command = 'help',
 
     [string]$ConfigPath,
@@ -23,6 +23,8 @@ param(
 
     [switch]$RequireClosed,
 
+    [switch]$StartOnly,
+
     [switch]$NoExit,
 
     [switch]$Compact
@@ -41,7 +43,21 @@ try {
     }
     $config = Read-MO2ControlConfig -ConfigPath $configuration.path
 
-    $result = switch ($Command) {
+    $sessionCommands = @('open', 'launch', 'stop-game', 'close', 'recover-rootbuilder', 'stop', 'terminate', 'release')
+    if ($Command -in $sessionCommands -and [string]::IsNullOrWhiteSpace($SessionId)) {
+        $result = [pscustomobject][ordered]@{
+            contractVersion = '0.5.0'
+            command = $Command
+            ok = $false
+            state = 'missing-session-id'
+            timestampUtc = [DateTime]::UtcNow.ToString('o')
+            checks = @()
+            warnings = @()
+            errors = @("Command '$Command' requires a non-empty -SessionId returned by prepare or recover-close.")
+            data = [pscustomobject]@{ requiredParameter = 'SessionId'; supplied = $false }
+        }
+    }
+    else { $result = switch ($Command) {
         'inspect' {
             Invoke-MO2Inspect -Config $config -Profile $Profile -Executable $Executable
         }
@@ -52,10 +68,10 @@ try {
             Invoke-MO2Prepare -Config $config -Profile $Profile -Executable $Executable -Label $Label -WhatIf:$WhatIf
         }
         'open' {
-            Invoke-MO2Open -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -WhatIf:$WhatIf
+            Invoke-MO2Open -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -StartOnly:$StartOnly -WhatIf:$WhatIf
         }
         'launch' {
-            Invoke-MO2Launch -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -WhatIf:$WhatIf
+            Invoke-MO2Launch -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -StartOnly:$StartOnly -WhatIf:$WhatIf
         }
         'status' {
             Invoke-MO2Status -Config $config -SessionId $SessionId
@@ -69,6 +85,9 @@ try {
         'recover-close' {
             Invoke-MO2RecoverClose -Config $config -Label $Label -TimeoutSeconds $TimeoutSeconds -WhatIf:$WhatIf
         }
+        'recover-rootbuilder' {
+            Invoke-MO2RecoverRootBuilder -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -StartOnly:$StartOnly -WhatIf:$WhatIf
+        }
         'stop' {
             Invoke-MO2Stop -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -WhatIf:$WhatIf
         }
@@ -81,13 +100,13 @@ try {
         'help' {
             Get-MO2ControlHelp -Config $config
         }
-    }
+    } }
 
     $result.data | Add-Member -NotePropertyName configuration -NotePropertyValue $configuration -Force
 }
 catch {
     $result = [pscustomobject][ordered]@{
-        contractVersion = '0.4.0'
+        contractVersion = '0.5.0'
         command = $Command
         ok = $false
         state = 'tool-error'

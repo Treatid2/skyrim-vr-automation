@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "name": "skyrim-vr-automation",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "license": "GPL-3.0-or-later",
   "publisher": "Treatid2",
   "preservedUtc": "2026-08-21T00:00:00Z",
@@ -15,7 +15,7 @@
     },
     {
       "name": "mo2-control",
-      "version": "0.4.1",
+      "version": "0.5.0",
       "entryPoint": "tools/mo2-control/Invoke-MO2Control.ps1"
     },
     {
@@ -30,7 +30,7 @@
     },
     {
       "name": "devbench-control",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "entryPoint": "tools/devbench-control/Invoke-DevBenchControl.ps1"
     },
     {
@@ -47,6 +47,11 @@
       "name": "process-control",
       "version": "1.0.0",
       "entryPoint": "tools/process-control/Invoke-BoundedProcess.ps1"
+    },
+    {
+      "name": "build-test-control",
+      "version": "1.0.0",
+      "entryPoint": "tools/build-test-control/Invoke-CSXBuildTests.ps1"
     }
   ]
 }
