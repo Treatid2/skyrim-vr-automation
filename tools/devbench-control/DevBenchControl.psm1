@@ -10,6 +10,7 @@ function Get-DevBenchSemanticStatus {
     $reasons = [Collections.Generic.List[string]]::new()
     $codes = [Collections.Generic.List[string]]::new()
     $states = [Collections.Generic.List[string]]::new()
+    $retryableHints = [Collections.Generic.List[bool]]::new()
     $guardCodes = @('producer_mismatch', 'contract_mismatch', 'unsupported_contract_major', 'idempotency_conflict')
     $successNames = @('success', 'ok', 'ready', 'completed', 'accepted', 'idle', 'available')
     $transientNames = @('service_unavailable', 'initializing', 'starting', 'waiting_for_safe_point', 'loading_transition', 'relatch_pending', 'compiling', 'pending', 'queued', 'running')
@@ -39,6 +40,10 @@ function Get-DevBenchSemanticStatus {
             elseif ($name -eq 'aborted' -and [bool]$child) {
                 $script:semanticKnown = $true
                 $reasons.Add("$childPath is true")
+            }
+            elseif ($name -eq 'retryable' -and $null -ne $child) {
+                $script:semanticKnown = $true
+                if ([bool]$child) { $retryableHints.Add($true) }
             }
             elseif ($name -eq 'code' -and $child -is [string] -and -not [string]::IsNullOrWhiteSpace($child)) {
                 $script:semanticKnown = $true
@@ -75,7 +80,7 @@ function Get-DevBenchSemanticStatus {
         Remove-Variable semanticKnown -Scope Script -ErrorAction SilentlyContinue
     }
     $guarded = @($codes | Where-Object { $_ -in $guardCodes }).Count -gt 0
-    $transient = @($codes + $states | Where-Object { $_ -in $transientNames }).Count -gt 0
+    $transient = $retryableHints.Count -gt 0 -or @($codes + $states | Where-Object { $_ -in $transientNames }).Count -gt 0
     $ok = $reasons.Count -eq 0
     $outcome = if ($ok) { if ($transient) { 'accepted-transient' } else { 'success' } } elseif ($guarded) { 'guard-rejected' } else { 'failure' }
     return [pscustomobject][ordered]@{

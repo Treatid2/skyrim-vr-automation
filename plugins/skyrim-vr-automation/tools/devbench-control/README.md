@@ -44,7 +44,8 @@ condition being held open forever by Skyrim's permanent HUD menu.
 
 `toolAvailable` repeatedly refreshes the authoritative tool inventory rather
 than freezing the initial list. `serviceReady` additionally calls the supplied
-read-only action and understands accepted and retryable service states. Both
+read-only action and understands accepted and retryable service states, including
+structured errors that explicitly declare `retryable: true`. Both
 waits back off to `-MaxPollMilliseconds` and collect bounded PID/CPU/memory and
 optional explicit-log samples. A missing target with increasing CPU is reported
 as `api-waiting-behind-initialization`; a quiet missing target is
