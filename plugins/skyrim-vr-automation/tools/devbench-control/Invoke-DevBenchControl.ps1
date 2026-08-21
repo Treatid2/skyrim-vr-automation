@@ -56,7 +56,43 @@ function Invoke-McpRequest {
         catch {
             $statusCode = $null
             try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = $null }
-            $transient = $statusCode -in @(429, 502, 503, 504) -or $_.Exception -is [System.TimeoutException] -or $_.Exception.Message -match 'timed out|temporarily unavailable|connection.*closed'
+            if ($Command -eq 'wait' -and $statusCode -eq 404 -and $Headers.ContainsKey('Mcp-Session-Id') -and $attempt -le $MaxTransientRetries) {
+                try {
+                    $resetHeaders = @{ Accept = 'application/json, text/event-stream'; 'Content-Type' = 'application/json' }
+                    $resetBody = @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'initialize'; params = @{ protocolVersion = '2025-03-26'; capabilities = @{}; clientInfo = @{ name = 'DevBenchControl'; version = '1.2' } } } | ConvertTo-Json -Depth 10 -Compress
+                    $resetResponse = Invoke-WebRequest -UseBasicParsing -Method Post -Uri $Endpoint -Headers $resetHeaders -Body $resetBody -TimeoutSec 15
+                    $resetSessionHeader = $resetResponse.Headers['Mcp-Session-Id']
+                    $resetSessionId = if ($resetSessionHeader -is [array]) { [string]$resetSessionHeader[0] } else { [string]$resetSessionHeader }
+                    if ([string]::IsNullOrWhiteSpace($resetSessionId)) { throw 'DevBench session recovery did not return an MCP session ID.' }
+                    $Headers['Mcp-Session-Id'] = $resetSessionId
+                    Invoke-WebRequest -UseBasicParsing -Method Post -Uri $Endpoint -Headers $Headers -Body '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' -TimeoutSec 15 | Out-Null
+                    $transportRetries.Add([pscustomobject][ordered]@{
+                        attempt = $attempt
+                        statusCode = $statusCode
+                        delayMilliseconds = $delay
+                        recovery = 'mcp-session-reinitialized'
+                        message = $_.Exception.Message
+                        timestampUtc = [DateTime]::UtcNow.ToString('o')
+                    })
+                    Start-Sleep -Milliseconds $delay
+                    $delay = [Math]::Min($MaxPollMilliseconds, $delay * 2)
+                    continue
+                }
+                catch {
+                    $transportRetries.Add([pscustomobject][ordered]@{
+                        attempt = $attempt
+                        statusCode = $statusCode
+                        delayMilliseconds = $delay
+                        recovery = 'mcp-session-reinitialize-failed'
+                        message = $_.Exception.Message
+                        timestampUtc = [DateTime]::UtcNow.ToString('o')
+                    })
+                }
+            }
+            $transient = $statusCode -in @(429, 502, 503, 504) -or
+                ($Command -eq 'wait' -and $statusCode -eq 404) -or
+                $_.Exception -is [System.TimeoutException] -or
+                $_.Exception.Message -match 'timed out|temporarily unavailable|connection.*closed'
             if (-not $transient -or $attempt -gt $MaxTransientRetries) { throw }
             $transportRetries.Add([pscustomobject][ordered]@{
                 attempt = $attempt
@@ -165,7 +201,7 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
     $actualBuildId = if ($buildIds.Count -eq 1) { $buildIds[0] } else { $null }
     $build = [pscustomobject][ordered]@{ buildId = $actualBuildId; producers = @($producers); sources = @($registrySources) }
     if ($expectations.buildId -and -not $actualBuildId -and -not $AllowDeferredBuildIdentity) { $errors.Add('A build ID expectation was supplied but no CSX service registry exposed a producer build ID.') }
-    elseif ($expectations.buildId -and $actualBuildId -ne $expectations.buildId) { $errors.Add("Expected CSX build ID '$($expectations.buildId)' differs from runtime build ID '$actualBuildId'.") }
+    elseif ($expectations.buildId -and $actualBuildId -and $actualBuildId -ne $expectations.buildId) { $errors.Add("Expected CSX build ID '$($expectations.buildId)' differs from runtime build ID '$actualBuildId'.") }
     $artifact = $null
     if ($expectations.artifactPath) {
         $resolvedArtifact = [IO.Path]::GetFullPath($expectations.artifactPath)
@@ -306,14 +342,14 @@ try {
 
                 $now = [DateTime]::UtcNow
                 if (($now - $lastProgressUtc).TotalSeconds -ge 5 -or $progress.Count -eq 0) {
-                    $pid = if ($runtimeIdentity -and $runtimeIdentity.listenerPid) { [int]$runtimeIdentity.listenerPid } else { Get-ListenerPid ([int]$runtime.port) }
+                    $listenerProcessId = if ($runtimeIdentity -and $runtimeIdentity.listenerPid) { [int]$runtimeIdentity.listenerPid } else { Get-ListenerPid ([int]$runtime.port) }
                     $processSample = $null
-                    if ($pid) {
-                        $process = Get-Process -Id $pid -ErrorAction SilentlyContinue
+                    if ($listenerProcessId) {
+                        $process = Get-Process -Id $listenerProcessId -ErrorAction SilentlyContinue
                         if ($process) {
                             $lastCpu = [double]$process.CPU
                             if ($null -eq $firstCpu) { $firstCpu = $lastCpu }
-                            $processSample = [pscustomobject][ordered]@{ pid = $pid; responding = $(try { [bool]$process.Responding } catch { $null }); cpuSeconds = $lastCpu; workingSetBytes = [long]$process.WorkingSet64 }
+                            $processSample = [pscustomobject][ordered]@{ pid = $listenerProcessId; responding = $(try { [bool]$process.Responding } catch { $null }); cpuSeconds = $lastCpu; workingSetBytes = [long]$process.WorkingSet64 }
                         }
                     }
                     $logSample = $null
@@ -351,7 +387,7 @@ try {
         $semantic = [pscustomobject][ordered]@{ known = $true; ok = [bool]$observation.satisfied; reasons = $(if ($observation.satisfied) { @() } else { @("Condition '$Condition' was not satisfied within $TimeoutSeconds seconds.") }) }
     }
 
-    $semanticFailure = $RequireSuccess -and $semantic.known -and -not $semantic.ok
+    $semanticFailure = $semantic.known -and -not $semantic.ok -and ($RequireSuccess -or $Command -eq 'wait')
     $result = [pscustomobject][ordered]@{
         ok = -not $semanticFailure
         transportOk = $true
