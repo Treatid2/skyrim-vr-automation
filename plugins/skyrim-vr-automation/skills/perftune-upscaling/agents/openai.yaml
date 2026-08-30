@@ -1,0 +1,4 @@
+interface:
+  display_name: "Perftune Upscaling"
+  short_description: "Run the automated CSX Upscaling cost sweep"
+  default_prompt: "Use $perftune-upscaling to start perftune upscaling."

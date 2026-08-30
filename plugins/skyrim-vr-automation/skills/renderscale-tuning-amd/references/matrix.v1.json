@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "protocol": "renderscale-tuning-amd",
+  "adapterVendor": "amd",
+  "initialDestination": "fsr_hoshipa",
+  "pacingMilliseconds": 5000,
+  "completionTimeoutMilliseconds": 30000,
+  "traceReadLimit": 16,
+  "lanes": [
+    {
+      "id": "explicit_fsr4",
+      "configuredFsrRuntime": "fsr4",
+      "expectedBackends": ["fsr4_runtime"],
+      "requiresFsr4Available": true,
+      "requiresDocumentedFsr4UnavailableCondition": false
+    },
+    {
+      "id": "explicit_fsr3",
+      "configuredFsrRuntime": "fsr3",
+      "expectedBackends": ["fsr_host", "fsr_runtime"],
+      "requiresFsr4Available": false,
+      "requiresDocumentedFsr4UnavailableCondition": false
+    },
+    {
+      "id": "fsr4_to_fsr3_fallback",
+      "configuredFsrRuntime": "fsr4",
+      "expectedBackends": ["fsr_host", "fsr_runtime"],
+      "requiresFsr4Available": false,
+      "requiresDocumentedFsr4UnavailableCondition": true
+    }
+  ],
+  "destinations": {
+    "none": { "label": "None", "method": "none", "qualityMode": "native_aa", "renderScaleMode": false, "completionClass": "native_logical" },
+    "taa": { "label": "TAA", "method": "taa", "qualityMode": "native_aa", "renderScaleMode": false, "completionClass": "native_logical" },
+    "fsr_native_aa": { "label": "FSR Native AA", "method": "fsr", "qualityMode": "native_aa", "renderScaleMode": false, "completionClass": "vendor_native" },
+    "fsr_hoshipa": { "label": "FSR Hoshipa", "method": "fsr", "qualityMode": "hoshipa", "renderScaleMode": true, "completionClass": "vendor_scaled" },
+    "fsr_ultra_quality": { "label": "FSR Ultra Quality", "method": "fsr", "qualityMode": "ultra_quality", "renderScaleMode": true, "completionClass": "vendor_scaled" },
+    "fsr_quality": { "label": "FSR Quality", "method": "fsr", "qualityMode": "quality", "renderScaleMode": true, "completionClass": "vendor_scaled" },
+    "fsr_balanced": { "label": "FSR Balanced", "method": "fsr", "qualityMode": "balanced", "renderScaleMode": true, "completionClass": "vendor_scaled" },
+    "fsr_performance": { "label": "FSR Performance", "method": "fsr", "qualityMode": "performance", "renderScaleMode": true, "completionClass": "vendor_scaled" },
+    "fsr_ultra_performance": { "label": "FSR Ultra Performance", "method": "fsr", "qualityMode": "ultra_performance", "renderScaleMode": true, "completionClass": "vendor_scaled" }
+  },
+  "transitions": [
+    { "ordinal": 1, "destination": "none" },
+    { "ordinal": 2, "destination": "taa" },
+    { "ordinal": 3, "destination": "fsr_native_aa" },
+    { "ordinal": 4, "destination": "fsr_hoshipa" },
+    { "ordinal": 5, "destination": "fsr_ultra_quality" },
+    { "ordinal": 6, "destination": "fsr_quality" },
+    { "ordinal": 7, "destination": "fsr_balanced" },
+    { "ordinal": 8, "destination": "fsr_performance" },
+    { "ordinal": 9, "destination": "fsr_ultra_performance" },
+    { "ordinal": 10, "destination": "fsr_native_aa" },
+    { "ordinal": 11, "destination": "taa" },
+    { "ordinal": 12, "destination": "none" },
+    { "ordinal": 13, "destination": "fsr_hoshipa" },
+    { "ordinal": 14, "destination": "fsr_native_aa" },
+    { "ordinal": 15, "destination": "none" },
+    { "ordinal": 16, "destination": "fsr_quality" },
+    { "ordinal": 17, "destination": "taa" },
+    { "ordinal": 18, "destination": "fsr_balanced" },
+    { "ordinal": 19, "destination": "none" },
+    { "ordinal": 20, "destination": "fsr_performance" },
+    { "ordinal": 21, "destination": "fsr_native_aa" },
+    { "ordinal": 22, "destination": "taa" },
+    { "ordinal": 23, "destination": "fsr_ultra_performance" },
+    { "ordinal": 24, "destination": "none" },
+    { "ordinal": 25, "destination": "fsr_native_aa" },
+    { "ordinal": 26, "destination": "fsr_hoshipa" },
+    { "ordinal": 27, "destination": "taa" },
+    { "ordinal": 28, "destination": "none" },
+    { "ordinal": 29, "destination": "fsr_native_aa" },
+    { "ordinal": 30, "destination": "fsr_ultra_performance" },
+    { "ordinal": 31, "destination": "fsr_hoshipa" }
+  ],
+  "comparisonGroups": [
+    "amd_explicit_fsr4",
+    "amd_explicit_fsr3",
+    "amd_fsr4_to_fsr3_fallback",
+    "amd_taa_none"
+  ]
+}
