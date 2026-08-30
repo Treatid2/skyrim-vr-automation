@@ -509,12 +509,16 @@ output after destructive mutation. A proven old provider may remain active only
 before mutation begins.
 
 After every complete or interrupted pass, run the shared ownership-guarded
-finalization. Retrieve cumulative operation/event/status/trace/telemetry data
-once, materialize retained terminal receipts, persist stop/final-status
-responses under that pass's `finalization` directory, then build and verify
-`receipt-index.json` once. Do not hash or render per row. An evidence root
-containing only `summary.json` and `transitions.csv` is incomplete and cannot
-support a ledger append.
+finalization. Retrieve cumulative operation/event/status/telemetry data and
+`dlss_trace_status` once, materialize the runner-retained terminal and trace
+receipts, persist stop/final-status responses under that pass's `finalization`
+directory, then build and verify `receipt-index.json` once. Do not issue a
+post-run `dlss_trace_read`: the live runner already captured every required
+window with `matrix.v1.json.traceReadLimit`, and a client-selected limit is not
+part of the finalization contract. Materialize those stored responses before
+any separate or interruptible client work. Do not hash or render per row. An
+evidence root containing only `summary.json` and `transitions.csv` is incomplete
+and cannot support a ledger append.
 Append one uniquely headed result column only after the complete two-pass
 comparison.
 

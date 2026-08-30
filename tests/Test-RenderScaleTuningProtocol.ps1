@@ -254,6 +254,11 @@ foreach ($variant in $variants) {
     Assert-Contains $skill '`content[0].type: "text"`' $variant.Name
     Assert-Contains $skill '`JSON.parse`' $variant.Name
     Assert-Contains $skill '`content[0].text`' $variant.Name
+    Assert-Contains $protocol '`dlss_trace_status` once' $variant.Name
+    Assert-Contains $protocol 'Do not issue a' $variant.Name
+    Assert-Contains $protocol 'post-run `dlss_trace_read`' $variant.Name
+    Assert-Contains $protocol '`matrix.v1.json.traceReadLimit`' $variant.Name
+    Assert-Contains $protocol 'before any separate or interruptible client work' $variant.Name
     foreach ($fixtureToken in @(
         '`ready: true`', '`persisted: false`', '`producer.buildId`',
         '`after.ready`', '`after.vr`', '`after.inGame`',
