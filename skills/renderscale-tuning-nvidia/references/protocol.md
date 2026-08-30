@@ -512,13 +512,27 @@ After every complete or interrupted pass, run the shared ownership-guarded
 finalization. Retrieve cumulative operation/event/status/telemetry data and
 `dlss_trace_status` once, materialize the runner-retained terminal and trace
 receipts, persist stop/final-status responses under that pass's `finalization`
-directory, then build and verify `receipt-index.json` once. Do not issue a
-post-run `dlss_trace_read`: the live runner already captured every required
-window with `matrix.v1.json.traceReadLimit`, and a client-selected limit is not
-part of the finalization contract. Materialize those stored responses before
-any separate or interruptible client work. Do not hash or render per row. An
-evidence root containing only `summary.json` and `transitions.csv` is incomplete
-and cannot support a ledger append.
+directory, then invoke the packaged shared render-scale finalizer at
+`tools/renderscale-tuning-finalizer/finalizer.js`. During live finalization,
+its `collectTracePages` helper obtains the maximum page size from the live
+producer schema, pages with `afterSequence` while `moreAvailable` is true, and
+rejects gaps, duplicates, overwritten requests, or build/session changes.
+Never supply an invented client limit. Materialize each raw page before
+validating it. Offline restart uses the retained per-row trace evidence and
+does not issue a live read. The finalizer must be restartable from the exact
+run/build/session-owned retained files and must never replay an in-game
+transition. It writes `summary.json`, `transitions.csv`, `report.md`, and
+`receipt-index.json` atomically only after validation. Do not hash or render per
+row. An evidence root containing only `summary.json` and `transitions.csv` is
+incomplete and cannot support a ledger append.
+
+Keep `assayExecution`, `render`, `task2Evidence`, and `reporting` as independent
+verdict objects. A finalization failure sets reporting to `INCOMPLETE` without
+rewriting a completed render `PASS`. When a required mutation has no
+`firstPhysicalMutation`, report `missing_required_mutation_boundary` and make
+Task 2 `INCONCLUSIVE`; preserve its phase counters as non-authoritative raw
+observations. With a valid boundary, all existing post-boundary failure rules
+remain strict.
 Append one uniquely headed result column only after the complete two-pass
 comparison.
 

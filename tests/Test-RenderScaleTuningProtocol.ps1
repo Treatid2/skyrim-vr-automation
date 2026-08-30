@@ -56,6 +56,24 @@ Assert-True (Test-Path -LiteralPath $runnerPlugin -PathType Leaf) 'Missing packa
 Assert-True ((Get-FileHash -LiteralPath $runnerSource -Algorithm SHA256).Hash -eq
     (Get-FileHash -LiteralPath $runnerPlugin -Algorithm SHA256).Hash) 'Deterministic tuning runner source/package parity failed.'
 $runner = Get-Content -LiteralPath $runnerSource -Raw
+$finalizerRelative = 'tools\renderscale-tuning-finalizer\finalizer.js'
+$finalizerSource = Join-Path $repositoryRoot $finalizerRelative
+$finalizerPlugin = Join-Path $repositoryRoot "plugins\skyrim-vr-automation\$finalizerRelative"
+Assert-True (Test-Path -LiteralPath $finalizerSource -PathType Leaf) 'Missing shared tuning finalizer.'
+Assert-True (Test-Path -LiteralPath $finalizerPlugin -PathType Leaf) 'Missing packaged shared tuning finalizer.'
+Assert-True ((Get-FileHash -LiteralPath $finalizerSource -Algorithm SHA256).Hash -eq
+    (Get-FileHash -LiteralPath $finalizerPlugin -Algorithm SHA256).Hash) 'Shared tuning finalizer source/package parity failed.'
+$finalizer = Get-Content -LiteralPath $finalizerSource -Raw
+foreach ($token in @(
+    'async function collectTracePages', 'afterSequence', 'moreAvailable',
+    'requestedSequenceOverwritten', 'trace_sequence_gap',
+    'trace_sequence_duplicate', 'trace_session_changed',
+    'trace_build_changed', 'function finalizeEvidence',
+    'missing_required_mutation_boundary', 'phaseCountersAuthoritative',
+    'assayExecution', 'task2Evidence', 'reportingStatus'
+)) {
+    Assert-Contains $finalizer $token 'Shared tuning finalizer'
+}
 foreach ($token in @(
     'async function runRenderScaleTuningLive',
     'mcp__devbench_vr__scenario',
@@ -255,10 +273,16 @@ foreach ($variant in $variants) {
     Assert-Contains $skill '`JSON.parse`' $variant.Name
     Assert-Contains $skill '`content[0].text`' $variant.Name
     Assert-Contains $protocol '`dlss_trace_status` once' $variant.Name
-    Assert-Contains $protocol 'Do not issue a' $variant.Name
-    Assert-Contains $protocol 'post-run `dlss_trace_read`' $variant.Name
-    Assert-Contains $protocol '`matrix.v1.json.traceReadLimit`' $variant.Name
-    Assert-Contains $protocol 'before any separate or interruptible client work' $variant.Name
+    Assert-Contains $protocol 'packaged shared render-scale finalizer' $variant.Name
+    Assert-Contains $protocol '`tools/renderscale-tuning-finalizer/finalizer.js`' $variant.Name
+    Assert-Contains $protocol '`collectTracePages` helper' $variant.Name
+    Assert-Contains $protocol '`afterSequence` while `moreAvailable`' $variant.Name
+    Assert-Contains $protocol 'rejects gaps, duplicates, overwritten requests' $variant.Name
+    Assert-Contains $protocol 'Never supply an invented client limit' $variant.Name
+    Assert-Contains $protocol 'restartable from the exact' $variant.Name
+    Assert-Contains $protocol '`missing_required_mutation_boundary`' $variant.Name
+    Assert-Contains $protocol 'phase counters as non-authoritative' $variant.Name
+    Assert-Contains $protocol '`assayExecution`, `render`, `task2Evidence`, and `reporting`' $variant.Name
     foreach ($fixtureToken in @(
         '`ready: true`', '`persisted: false`', '`producer.buildId`',
         '`after.ready`', '`after.vr`', '`after.inGame`',
@@ -590,6 +614,16 @@ Assert-True (-not $simpleCsmProtocol.Contains('reset CPU/GPU telemetry', [String
 Assert-True ((Get-FileHash -LiteralPath (Join-Path $repositoryRoot 'skills\simple-csm\references\protocol.md') -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $simpleCsmPluginProtocolPath -Algorithm SHA256).Hash) 'Simple CSM source/package parity failed for telemetry arming.'
 Assert-True (-not $simpleCsmProtocol.Contains('renderscale-tuning-nvidia', [StringComparison]::Ordinal)) 'Simple CSM references NVIDIA tuning.'
 Assert-True (-not $simpleCsmProtocol.Contains('renderscale-tuning-amd', [StringComparison]::Ordinal)) 'Simple CSM references AMD tuning.'
+
+foreach ($script in @(
+    'tests\Test-RenderScaleTuningLiveRunner.js',
+    'tests\Test-RenderScaleTuningFinalizer.js'
+)) {
+    $output = & node (Join-Path $repositoryRoot $script) 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "$script failed: $($output -join [Environment]::NewLine)"
+    }
+}
 
 [pscustomobject][ordered]@{
     ok = $true

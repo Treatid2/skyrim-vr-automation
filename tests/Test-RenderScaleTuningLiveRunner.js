@@ -513,9 +513,26 @@ async function testEvidenceVerdicts() {
         return receipt;
     });
     assert(missingMutation.every((row) => row.evidenceVerdict === "INCONCLUSIVE" &&
-        row.missingEvidence.includes("first_physical_mutation") &&
+        row.missingEvidence.includes("missing_required_mutation_boundary") &&
         row.first_physical_mutation_ === "not_exposed"),
     "Missing required mutation evidence was not INCONCLUSIVE.");
+
+    const missingBoundaryWithCounters = await runNvidiaProjectionTransform(
+        (receipt, context) => {
+            if (!context.baseline) {
+                delete receipt.replacementTimeline.firstPhysicalMutation;
+                receipt.presentationCycleAudit.violations
+                    .preMutationStretchWithoutMutation = 1;
+                receipt.presentationCycleAudit.violations
+                    .postMutationOldGenerationPresented = 1;
+            }
+            return receipt;
+        });
+    assert(missingBoundaryWithCounters.every((row) =>
+        row.evidenceVerdict === "INCONCLUSIVE" &&
+        row.phaseCountersAuthoritative === false &&
+        row.genuineInvariantViolations.length === 0),
+    "Phase counters without a required boundary produced a false failure.");
 
     const notRequired = await runNvidiaProjectionTransform((receipt, context) => {
         if (!context.baseline) {
@@ -651,6 +668,7 @@ async function testEvidenceVerdicts() {
         return receipt;
     });
     assert(violated.every((row) => row.evidenceVerdict === "FAIL" &&
+        row.phaseCountersAuthoritative === true &&
         row.invariantViolations.postMutationOldGenerationPresented === 1 &&
         row.genuineInvariantViolations.includes("postMutationOldGenerationPresented")),
     "Exact Task 2 violation was not classified FAIL.");

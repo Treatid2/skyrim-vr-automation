@@ -387,7 +387,7 @@ async function runRenderScaleTuningLive(context) {
             missing.push("truthful_current_contract");
         }
         if (required && !timeline.firstPhysicalMutation) {
-            missing.push("first_physical_mutation");
+            missing.push("missing_required_mutation_boundary");
         }
         if (required && !timeline.firstPostMutation) {
             missing.push("first_post_mutation");
@@ -450,6 +450,8 @@ async function runRenderScaleTuningLive(context) {
         const genuineViolations = [];
         for (const [name, count] of Object.entries(violations)) {
             if (!(count > 0)) continue;
+            // Phase counters cannot prove a violation without their owning boundary.
+            if (required && !boundary) continue;
             const offenderName = postMutationOffenders[name];
             if (!offenderName) {
                 genuineViolations.push(name);
@@ -516,6 +518,7 @@ async function runRenderScaleTuningLive(context) {
             mutationNotRequiredProven: notRequired &&
                 explicitNotRequiredReason && exactTerminalProof,
             missingEvidence: missing,
+            phaseCountersAuthoritative: !(required && !boundary),
             invariantViolations: violations,
             genuineInvariantViolations: genuineViolations,
             temporallyImpossibleViolations: temporallyImpossible,
