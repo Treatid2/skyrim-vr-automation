@@ -175,6 +175,31 @@ function createMock(semanticFailureOrdinal, receiptTransform = null) {
             revision += 1;
             const target = applyStep.args.target;
             const profile = flatProfile(target);
+            const renderWidth = target.renderScaleMode ? 100 : 200;
+            const renderHeight = target.renderScaleMode ? 100 : 200;
+            const proofKind = target.method === "dlss" || target.method === "fsr" ?
+                "exact_vendor_evaluation" : "exact_native_presentation";
+            const exactProof = () => ({
+                proven: true,
+                kind: proofKind,
+                frame: 14,
+                qpcTick: 14,
+                method: target.method,
+                qualityMode: profile.qualityMode,
+                renderScaleMode: target.renderScaleMode,
+                requestId: 9,
+                transitionEpoch: 9,
+                contractGeneration: 9,
+                providerRuntimeGeneration: 11,
+                resourcePublicationGeneration: 101,
+                resourceRevision: 41,
+                deviceIdentity: 100,
+                renderWidth,
+                renderHeight,
+                displayWidth: 200,
+                displayHeight: 200,
+                compositorCycleToken: 22,
+            });
             const semanticFailure = semanticFailureOrdinal > 0 &&
                 ((transitionOrdinal - 1) % 33) + 1 === semanticFailureOrdinal;
             if (traceActive && target.method === "dlss") {
@@ -230,7 +255,15 @@ function createMock(semanticFailureOrdinal, receiptTransform = null) {
                         firstPhysicalMutation: {
                             tick: 12,
                             frame: 12,
+                            stressSessionId: stressSession,
+                            qualificationTransitionId: waitStep.args.transitionId,
+                            ownershipToken: 1,
+                            replacementRequestId: 9,
+                            replacementTransitionEpoch: 9,
+                            replacementContractGeneration: 9,
+                            replacementDeviceIdentity: 100,
                             physicalMutationStarted: true,
+                            physicalMutationSource: "provider_invalidation",
                             selectedPresentationDisposition: "PresentationStretch",
                         },
                         firstPostMutation: {
@@ -241,27 +274,17 @@ function createMock(semanticFailureOrdinal, receiptTransform = null) {
                         firstNewGenerationProven: {
                             tick: 14,
                             frame: 14,
-                            presentationProof: {
-                                proven: true,
-                                kind: target.method === "fsr" ?
-                                    "exact_vendor_evaluation" :
-                                    target.method === "dlss" ?
-                                        "exact_vendor_evaluation" :
-                                        "exact_native_presentation",
-                                contractGeneration: 9,
-                            },
+                            stressSessionId: stressSession,
+                            qualificationTransitionId: waitStep.args.transitionId,
+                            ownershipToken: 1,
+                            presentationProof: exactProof(),
                         },
                         terminal: {
                             tick: 15,
                             frame: 15,
-                            presentationProof: {
-                                proven: true,
-                                kind: target.renderScaleMode ?
-                                    "exact_vendor_evaluation" :
-                                    "exact_native_presentation",
-                                contractGeneration: 9,
-                            },
+                            presentationProof: exactProof(),
                         },
+                        mutationNotRequiredTerminalProof: null,
                     },
                     presentationCycleAudit: {
                         evidenceComplete: true,
@@ -270,6 +293,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null) {
                         ownerToken: 1,
                         partialEyeObservations: 0,
                         incompleteStereoCycles: 0,
+                        firstExactNewGenerationCycles: 1,
                         violations: {
                             preMutationExactPresentationSuppressed: 0,
                             preMutationStretchWithoutMutation: 0,
@@ -500,6 +524,20 @@ async function testEvidenceVerdicts() {
             delete receipt.replacementTimeline.firstPhysicalMutation;
             delete receipt.replacementTimeline.firstPostMutation;
             delete receipt.replacementTimeline.firstNewGenerationProven;
+            receipt.presentationCycleAudit.firstExactNewGenerationCycles = 0;
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof = {
+                ...receipt.replacementTimeline.terminal,
+            };
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof.stressSessionId =
+                receipt.baseline.stressSessionId;
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof.qualificationTransitionId =
+                receipt.transitionId;
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof.ownershipToken =
+                receipt.presentationCycleAudit.ownerToken;
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof.replacementRequestId = 9;
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof.replacementTransitionEpoch = 9;
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof.replacementContractGeneration = 9;
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof.replacementDeviceIdentity = 100;
         }
         return receipt;
     });
@@ -514,6 +552,21 @@ async function testEvidenceVerdicts() {
             receipt.replacementTimeline.mutationExpectation = "not_required";
             receipt.replacementTimeline.mutationExpectationReason = "replacement_not_observed";
             delete receipt.replacementTimeline.firstPhysicalMutation;
+            delete receipt.replacementTimeline.firstNewGenerationProven;
+            receipt.presentationCycleAudit.firstExactNewGenerationCycles = 0;
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof = {
+                ...receipt.replacementTimeline.terminal,
+            };
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof.stressSessionId =
+                receipt.baseline.stressSessionId;
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof.qualificationTransitionId =
+                receipt.transitionId;
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof.ownershipToken =
+                receipt.presentationCycleAudit.ownerToken;
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof.replacementRequestId = 9;
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof.replacementTransitionEpoch = 9;
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof.replacementContractGeneration = 9;
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof.replacementDeviceIdentity = 100;
         }
         return receipt;
     });
@@ -529,7 +582,9 @@ async function testEvidenceVerdicts() {
             receipt.replacementTimeline.mutationExpectationReason =
                 "native_contract_reuse";
             delete receipt.replacementTimeline.firstPhysicalMutation;
-            delete receipt.replacementTimeline.terminal.presentationProof.kind;
+            delete receipt.replacementTimeline.firstNewGenerationProven;
+            receipt.presentationCycleAudit.firstExactNewGenerationCycles = 0;
+            delete receipt.replacementTimeline.mutationNotRequiredTerminalProof;
         }
         return receipt;
     });
@@ -537,7 +592,35 @@ async function testEvidenceVerdicts() {
         row.evidenceVerdict === "INCONCLUSIVE" &&
         row.missingEvidence.includes("mutation_not_required_terminal_proof") &&
         row.first_physical_mutation_ === "not_exposed"),
-    "Mutation not_required without exact terminal proof was accepted.");
+    `Mutation not_required without exact terminal proof was accepted: ${JSON.stringify(notRequiredWithoutProof[0])}`);
+
+    const notRequiredFromAnotherOwner = await runNvidiaProjectionTransform((receipt, context) => {
+        if (!context.baseline) {
+            receipt.replacementTimeline.mutationExpectation = "not_required";
+            receipt.replacementTimeline.mutationExpectationReason =
+                "native_contract_reuse";
+            delete receipt.replacementTimeline.firstPhysicalMutation;
+            delete receipt.replacementTimeline.firstPostMutation;
+            delete receipt.replacementTimeline.firstNewGenerationProven;
+            receipt.presentationCycleAudit.firstExactNewGenerationCycles = 0;
+            receipt.replacementTimeline.mutationNotRequiredTerminalProof = {
+                ...receipt.replacementTimeline.terminal,
+                stressSessionId: receipt.baseline.stressSessionId,
+                qualificationTransitionId: receipt.transitionId + 1,
+                ownershipToken: receipt.presentationCycleAudit.ownerToken,
+                replacementRequestId: 9,
+                replacementTransitionEpoch: 9,
+                replacementContractGeneration: 9,
+                replacementDeviceIdentity: 100,
+            };
+        }
+        return receipt;
+    });
+    assert(notRequiredFromAnotherOwner.every((row) =>
+        row.evidenceVerdict === "INCONCLUSIVE" &&
+        row.missingEvidence.includes("mutation_not_required_terminal_proof") &&
+        row.mutationNotRequiredProven === false),
+    "A not_required proof from another transition was accepted.");
 
     const unknown = await runNvidiaProjectionTransform((receipt, context) => {
         if (!context.baseline) {
@@ -545,6 +628,8 @@ async function testEvidenceVerdicts() {
             receipt.replacementTimeline.mutationExpectationReason =
                 "replacement_not_observed";
             delete receipt.replacementTimeline.firstPhysicalMutation;
+            delete receipt.replacementTimeline.firstNewGenerationProven;
+            receipt.presentationCycleAudit.firstExactNewGenerationCycles = 0;
         }
         return receipt;
     });
@@ -555,12 +640,85 @@ async function testEvidenceVerdicts() {
     const violated = await runNvidiaProjectionTransform((receipt, context) => {
         if (!context.baseline) {
             receipt.presentationCycleAudit.violations.postMutationOldGenerationPresented = 1;
+            receipt.presentationCycleAudit.violations.firstPostMutationOldGenerationPresented = {
+                frame: 13,
+                qpcTick: 13,
+                disposition: "exact_vendor_evaluation",
+                submitted: true,
+                exactCurrent: true,
+            };
         }
         return receipt;
     });
     assert(violated.every((row) => row.evidenceVerdict === "FAIL" &&
-        row.invariantViolations.postMutationOldGenerationPresented === 1),
+        row.invariantViolations.postMutationOldGenerationPresented === 1 &&
+        row.genuineInvariantViolations.includes("postMutationOldGenerationPresented")),
     "Exact Task 2 violation was not classified FAIL.");
+
+    const qpcBeforeBoundary = await runNvidiaProjectionTransform((receipt, context) => {
+        if (!context.baseline) {
+            receipt.presentationCycleAudit.violations.postMutationUnprovenStereoSubmitted = 1;
+            receipt.presentationCycleAudit.violations.firstPostMutationUnprovenStereoSubmitted = {
+                frame: 13,
+                qpcTick: 11,
+                disposition: "presentation_stretch",
+                submitted: true,
+            };
+        }
+        return receipt;
+    });
+    assert(qpcBeforeBoundary.every((row) => row.evidenceVerdict === "INCONCLUSIVE" &&
+        row.temporallyImpossibleViolations.includes(
+            "postMutationUnprovenStereoSubmitted") &&
+        row.producerInvalidEvidence.includes(
+            "postMutationUnprovenStereoSubmitted_precedes_boundary")),
+    "An offender QPC before the boundary was treated as a runtime failure.");
+
+    const frameBeforeBoundary = await runNvidiaProjectionTransform((receipt, context) => {
+        if (!context.baseline) {
+            receipt.presentationCycleAudit.violations.postMutationOldGenerationPresented = 1;
+            receipt.presentationCycleAudit.violations.firstPostMutationOldGenerationPresented = {
+                frame: 11,
+                qpcTick: 13,
+                disposition: "exact_vendor_evaluation",
+                submitted: true,
+            };
+        }
+        return receipt;
+    });
+    assert(frameBeforeBoundary.every((row) => row.evidenceVerdict === "INCONCLUSIVE" &&
+        row.temporallyImpossibleViolations.includes(
+            "postMutationOldGenerationPresented")),
+    "An offender frame before the boundary was treated as a runtime failure.");
+
+    const proofDisagreement = await runNvidiaProjectionTransform((receipt, context) => {
+        if (!context.baseline) {
+            delete receipt.replacementTimeline.firstNewGenerationProven;
+        }
+        return receipt;
+    });
+    assert(proofDisagreement.every((row) => row.evidenceVerdict === "INCONCLUSIVE" &&
+        row.producerInvalidEvidence.includes(
+            "first_exact_new_generation_proof_missing")),
+    "Audit/timeline replacement proof disagreement was not producer-invalid.");
+
+    const postBoundaryStretch = await runNvidiaProjectionTransform((receipt, context) => {
+        if (!context.baseline) {
+            receipt.presentationCycleAudit.violations.postMutationUnprovenStereoSubmitted = 1;
+            receipt.presentationCycleAudit.violations.firstPostMutationUnprovenStereoSubmitted = {
+                frame: 13,
+                qpcTick: 13,
+                disposition: "presentation_stretch",
+                submitted: true,
+                exactReplacement: false,
+            };
+        }
+        return receipt;
+    });
+    assert(postBoundaryStretch.every((row) => row.evidenceVerdict === "FAIL" &&
+        row.genuineInvariantViolations.includes(
+            "postMutationUnprovenStereoSubmitted")),
+    "A real post-boundary PresentationStretch was downgraded.");
 
     const wrongOrigin = await runNvidiaProjectionTransform((receipt, context) => {
         if (!context.baseline) {

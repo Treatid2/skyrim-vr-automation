@@ -292,7 +292,57 @@ async function runRenderScaleTuningLive(context) {
         return Number.isSafeInteger(value) && value >= 0 ? value : null;
     }
 
-    function task2Projection(waiter) {
+    function positiveInteger(value) {
+        return Number.isSafeInteger(value) && value > 0;
+    }
+
+    function exactTargetProof(proof, target) {
+        if (!proof || proof.proven !== true || !target) return false;
+        const vendorTarget = target.method === "dlss" || target.method === "fsr";
+        const expectedKind = vendorTarget ?
+            "exact_vendor_evaluation" : "exact_native_presentation";
+        if (proof.kind !== expectedKind || proof.method !== target.method ||
+            proof.qualityMode !== quality[target.qualityMode] ||
+            proof.renderScaleMode !== target.renderScaleMode) {
+            return false;
+        }
+        const identifiers = [
+            proof.requestId,
+            proof.transitionEpoch,
+            proof.contractGeneration,
+            proof.resourcePublicationGeneration,
+            proof.resourceRevision,
+            proof.deviceIdentity,
+            proof.renderWidth,
+            proof.renderHeight,
+            proof.displayWidth,
+            proof.displayHeight,
+        ];
+        if (!identifiers.every(positiveInteger)) return false;
+        if (vendorTarget && !positiveInteger(proof.providerRuntimeGeneration)) {
+            return false;
+        }
+        return target.renderScaleMode ?
+            proof.renderWidth < proof.displayWidth &&
+                proof.renderHeight < proof.displayHeight :
+            proof.renderWidth === proof.displayWidth &&
+                proof.renderHeight === proof.displayHeight;
+    }
+
+    function isBeforeBoundary(offender, boundary) {
+        if (!offender || !boundary) return null;
+        const offenderTick = offender.qpcTick ?? offender.tick;
+        const boundaryTick = boundary.qpcTick ?? boundary.tick;
+        const frameComparable = positiveInteger(offender.frame) &&
+            positiveInteger(boundary.frame);
+        const tickComparable = positiveInteger(offenderTick) &&
+            positiveInteger(boundaryTick);
+        if (!frameComparable || !tickComparable) return null;
+        return (frameComparable && offender.frame < boundary.frame) ||
+            (tickComparable && offenderTick < boundaryTick);
+    }
+
+    function task2Projection(waiter, target) {
         const timeline = waiter && waiter.replacementTimeline;
         const audit = waiter && waiter.presentationCycleAudit;
         const expectation = timeline && timeline.mutationExpectation || "unknown";
@@ -301,12 +351,36 @@ async function runRenderScaleTuningLive(context) {
         const notRequired = expectation === "not_required";
         const explicitNotRequiredReason = typeof expectationReason === "string" &&
             expectationReason.length > 0 && expectationReason !== "replacement_not_observed";
-        const terminalProof = timeline && timeline.terminal &&
-            timeline.terminal.presentationProof;
-        const exactTerminalProof = terminalProof && terminalProof.proven === true &&
-            (terminalProof.kind === "exact_native_presentation" ||
-                terminalProof.kind === "exact_vendor_evaluation");
+        const notRequiredEvidence = timeline &&
+            timeline.mutationNotRequiredTerminalProof;
+        const notRequiredProof = notRequiredEvidence &&
+            notRequiredEvidence.presentationProof;
+        const notRequiredOwnerProof = notRequiredEvidence && audit &&
+            notRequiredEvidence.stressSessionId ===
+                (waiter.baseline && waiter.baseline.stressSessionId) &&
+            notRequiredEvidence.qualificationTransitionId ===
+                waiter.transitionId &&
+            positiveInteger(notRequiredEvidence.ownershipToken) &&
+            notRequiredEvidence.ownershipToken === audit.ownerToken;
+        const notRequiredIdentityProof = notRequiredEvidence &&
+            notRequiredProof &&
+            positiveInteger(notRequiredEvidence.replacementRequestId) &&
+            notRequiredProof.requestId ===
+                notRequiredEvidence.replacementRequestId &&
+            positiveInteger(notRequiredEvidence.replacementTransitionEpoch) &&
+            notRequiredProof.transitionEpoch ===
+                notRequiredEvidence.replacementTransitionEpoch &&
+            positiveInteger(notRequiredEvidence.replacementContractGeneration) &&
+            notRequiredProof.contractGeneration ===
+                notRequiredEvidence.replacementContractGeneration &&
+            positiveInteger(notRequiredEvidence.replacementDeviceIdentity) &&
+            notRequiredProof.deviceIdentity ===
+                notRequiredEvidence.replacementDeviceIdentity;
+        const exactTerminalProof = notRequiredOwnerProof &&
+            notRequiredIdentityProof &&
+            exactTargetProof(notRequiredProof, target);
         const missing = [];
+        const producerInvalid = [];
         if (!timeline || !timeline.dispatch) missing.push("dispatch");
         else if (!timeline.dispatch.presentationProof ||
             timeline.dispatch.presentationProof.proven !== true) {
@@ -348,9 +422,91 @@ async function runRenderScaleTuningLive(context) {
         if (Object.values(violations).some((value) => value === null)) {
             missing.push("authoritative_cycle_counters");
         }
-        const exactViolation = Object.values(violations).some((value) => value > 0);
+        const boundary = timeline && timeline.firstPhysicalMutation;
+        if (boundary &&
+            (!positiveInteger(boundary.stressSessionId) ||
+                boundary.stressSessionId !==
+                    (waiter.baseline && waiter.baseline.stressSessionId) ||
+                boundary.qualificationTransitionId !== waiter.transitionId ||
+                !positiveInteger(boundary.ownershipToken) || !audit ||
+                boundary.ownershipToken !== audit.ownerToken ||
+                !positiveInteger(boundary.replacementRequestId) ||
+                !positiveInteger(boundary.replacementTransitionEpoch) ||
+                !positiveInteger(boundary.replacementContractGeneration) ||
+                !positiveInteger(boundary.replacementDeviceIdentity) ||
+                !positiveInteger(boundary.frame) ||
+                !positiveInteger(boundary.tick) ||
+                typeof boundary.physicalMutationSource !== "string" ||
+                boundary.physicalMutationSource.length === 0)) {
+            producerInvalid.push("physical_mutation_boundary_owner_mismatch");
+        }
+        const postMutationOffenders = {
+            postMutationOldGenerationPresented:
+                "firstPostMutationOldGenerationPresented",
+            postMutationUnprovenStereoSubmitted:
+                "firstPostMutationUnprovenStereoSubmitted",
+        };
+        const temporallyImpossible = [];
+        const genuineViolations = [];
+        for (const [name, count] of Object.entries(violations)) {
+            if (!(count > 0)) continue;
+            const offenderName = postMutationOffenders[name];
+            if (!offenderName) {
+                genuineViolations.push(name);
+                continue;
+            }
+            const offender = audit && audit.violations &&
+                audit.violations[offenderName];
+            const beforeBoundary = isBeforeBoundary(offender, boundary);
+            if (beforeBoundary === true) {
+                temporallyImpossible.push(name);
+                producerInvalid.push(`${name}_precedes_boundary`);
+            } else if (beforeBoundary === null) {
+                producerInvalid.push(`${name}_temporal_order_unproven`);
+            } else {
+                genuineViolations.push(name);
+            }
+        }
+
+        const firstExactCycles = audit && audit.firstExactNewGenerationCycles;
+        const firstNew = timeline && timeline.firstNewGenerationProven;
+        const firstNewProof = firstNew && firstNew.presentationProof;
+        if (!Number.isSafeInteger(firstExactCycles) || firstExactCycles < 0) {
+            producerInvalid.push("first_exact_new_generation_counter_invalid");
+        } else if (firstExactCycles > 0 && !firstNew) {
+            producerInvalid.push("first_exact_new_generation_proof_missing");
+        } else if (firstExactCycles === 0 && firstNew) {
+            producerInvalid.push("first_exact_new_generation_counter_missing");
+        }
+        if (firstNew) {
+            if (!exactTargetProof(firstNewProof, target)) {
+                producerInvalid.push("first_new_generation_target_mismatch");
+            }
+            if (!boundary || isBeforeBoundary(firstNew, boundary) !== false) {
+                producerInvalid.push("first_new_generation_not_after_boundary");
+            }
+            if (firstNew.qualificationTransitionId !== waiter.transitionId ||
+                !positiveInteger(firstNew.ownershipToken) ||
+                !audit || firstNew.ownershipToken !== audit.ownerToken ||
+                !boundary || firstNew.stressSessionId !== boundary.stressSessionId ||
+                firstNew.qualificationTransitionId !==
+                    boundary.qualificationTransitionId ||
+                firstNew.ownershipToken !== boundary.ownershipToken ||
+                !firstNewProof || firstNewProof.requestId !==
+                    boundary.replacementRequestId ||
+                firstNewProof.transitionEpoch !==
+                    boundary.replacementTransitionEpoch ||
+                firstNewProof.contractGeneration !==
+                    boundary.replacementContractGeneration ||
+                firstNewProof.deviceIdentity !==
+                    boundary.replacementDeviceIdentity) {
+                producerInvalid.push("first_new_generation_owner_mismatch");
+            }
+        }
+        const exactViolation = genuineViolations.length > 0;
         const evidenceVerdict = exactViolation ? "FAIL" :
-            missing.length > 0 || expectation === "unknown" ? "INCONCLUSIVE" : "PASS";
+            missing.length > 0 || producerInvalid.length > 0 ||
+                expectation === "unknown" ? "INCONCLUSIVE" : "PASS";
         return {
             renderVerdict: waiter && waiter.satisfied === true ? "PASS" : "FAIL",
             evidenceVerdict,
@@ -361,10 +517,13 @@ async function runRenderScaleTuningLive(context) {
                 explicitNotRequiredReason && exactTerminalProof,
             missingEvidence: missing,
             invariantViolations: violations,
+            genuineInvariantViolations: genuineViolations,
+            temporallyImpossibleViolations: temporallyImpossible,
+            producerInvalidEvidence: producerInvalid,
         };
     }
 
-    function transitionProjection(waiter) {
+    function transitionProjection(waiter, target) {
         const timeline = waiter && waiter.replacementTimeline || {};
         const auditDispositions = waiter && waiter.presentationCycleAudit &&
             waiter.presentationCycleAudit.dispositionCounts;
@@ -381,7 +540,7 @@ async function runRenderScaleTuningLive(context) {
                     auditDispositions.beforeMutation.presentation_stretch > 0) ||
                     (auditDispositions.afterMutation &&
                         auditDispositions.afterMutation.presentation_stretch > 0)));
-        const task2 = task2Projection(waiter);
+        const task2 = task2Projection(waiter, target);
         return {
             satisfied: waiter.satisfied === true,
             presentationStable: waiter.presentationStable === true,
@@ -535,7 +694,7 @@ async function runRenderScaleTuningLive(context) {
             response = await scenario(steps);
         } catch {
             const waiter = await recoverTerminal(identifiers);
-            const projection = transitionProjection(waiter);
+            const projection = transitionProjection(waiter, target);
             store(`${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`, {
                 waiter,
                 projection,
@@ -547,7 +706,7 @@ async function runRenderScaleTuningLive(context) {
         }
         const entries = resultMap(response.root);
         const waiter = entries.get("qualification-wait");
-        const projection = waiter ? transitionProjection(waiter) : null;
+        const projection = waiter ? transitionProjection(waiter, target) : null;
         store(`${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`, {
             apply: entries.get("profile-apply"),
             waiter,
