@@ -158,6 +158,15 @@ function aggregateVerdict(values) {
         "PASS" : "INCONCLUSIVE";
 }
 
+function verdictCounts(values) {
+    const counts = { PASS: 0, FAIL: 0, INCONCLUSIVE: 0 };
+    for (const value of values) {
+        if (Object.hasOwn(counts, value)) counts[value] += 1;
+        else throw new Error("invalid_task2_verdict");
+    }
+    return counts;
+}
+
 function rowIdentity(root, file) {
     const parts = relative(root, file).split("/");
     const passPart = parts.find((part) => /^pass-\d+$/.test(part));
@@ -175,6 +184,124 @@ function rowIdentity(root, file) {
 function unique(values) {
     return [...new Set(values.filter((value) => value !== null &&
         value !== undefined && value !== ""))];
+}
+
+function exposed(value) {
+    return value === null || value === undefined ? "not_exposed" : value;
+}
+
+function facetValue(facet, name) {
+    return facet && typeof facet === "object" ? exposed(facet[name]) :
+        "not_exposed";
+}
+
+function proofEyeValue(facet, side, name) {
+    if (!facet || typeof facet !== "object") return "not_exposed";
+    const proof = facet.presentationProof &&
+        typeof facet.presentationProof === "object" ? facet.presentationProof : null;
+    const eye = proof && proof[`${side}Eye`] || facet[`${side}Eye`];
+    return eye && typeof eye === "object" ? exposed(eye[name]) : "not_exposed";
+}
+
+function transitionDiagnostics(timeline) {
+    const dispatch = timeline.dispatch || null;
+    const terminal = timeline.terminal || null;
+    const boundary = timeline.firstPhysicalMutation || null;
+    const eyeValues = (facet, side) => ({
+        generation: proofEyeValue(facet, side, "generation"),
+        transitionEpoch: proofEyeValue(facet, side, "transitionEpoch"),
+        resourceRevision: proofEyeValue(facet, side, "resourceRevision"),
+    });
+    return {
+        diagnosticOnly: true,
+        boundaryExposed: boundary !== null,
+        dispatchFrame: facetValue(dispatch, "frame"),
+        dispatchQpcTick: exposed(dispatch && (dispatch.tick ?? dispatch.qpcTick)),
+        dispatchLeft: eyeValues(dispatch, "left"),
+        dispatchRight: eyeValues(dispatch, "right"),
+        terminalFrame: facetValue(terminal, "frame"),
+        terminalQpcTick: exposed(terminal && (terminal.tick ?? terminal.qpcTick)),
+        terminalLeft: eyeValues(terminal, "left"),
+        terminalRight: eyeValues(terminal, "right"),
+        firstPhysicalMutationFrame: facetValue(boundary, "frame"),
+        firstPhysicalMutationQpcTick:
+            exposed(boundary && (boundary.tick ?? boundary.qpcTick)),
+        firstPhysicalMutationSource:
+            facetValue(boundary, "physicalMutationSource"),
+    };
+}
+
+function pointerSegment(value) {
+    return String(value).replaceAll("~", "~0").replaceAll("/", "~1");
+}
+
+function flattenJson(value, pointer, emit) {
+    if (Array.isArray(value)) {
+        if (value.length === 0) {
+            emit(pointer, "empty_array", "[]");
+            return;
+        }
+        value.forEach((entry, index) =>
+            flattenJson(entry, `${pointer}/${index}`, emit));
+        return;
+    }
+    if (value !== null && typeof value === "object") {
+        const keys = Object.keys(value).sort((left, right) =>
+            left.localeCompare(right));
+        if (keys.length === 0) {
+            emit(pointer, "empty_object", "{}");
+            return;
+        }
+        for (const key of keys) {
+            flattenJson(value[key], `${pointer}/${pointerSegment(key)}`, emit);
+        }
+        return;
+    }
+    const type = value === null ? "null" : typeof value;
+    if (type === "number" && (!Number.isFinite(value) ||
+        (Number.isInteger(value) && !Number.isSafeInteger(value)))) {
+        throw new Error("evidence_numeric_value_not_lossless");
+    }
+    emit(pointer, type, JSON.stringify(value));
+}
+
+function rawIdentity(root, file) {
+    const parts = relative(root, file).split("/");
+    const passPart = parts.find((part) => /^pass-\d+$/.test(part));
+    const transitionIndex = parts.indexOf("transitions");
+    const ordinalPart = transitionIndex >= 0 ? parts[transitionIndex + 1] : null;
+    const lanePart = parts.find((part) => /^lane-/.test(part));
+    return {
+        lane: lanePart ? lanePart.slice(5) : "",
+        pass: passPart ? Number(passPart.slice(5)) : "",
+        ordinal: ordinalPart && /^\d+$/.test(ordinalPart) ?
+            Number(ordinalPart) : "",
+    };
+}
+
+function evidenceValues(root) {
+    const rawRoot = path.join(root, "raw");
+    const files = fs.existsSync(rawRoot) ? walk(rawRoot).filter((file) =>
+        path.extname(file).toLowerCase() === ".json").sort() : [];
+    const columns = ["source_path", "lane", "pass", "ordinal",
+        "json_pointer", "value_type", "value_json"];
+    const lines = [columns.join(",")];
+    const stats = { rawJsonFiles: files.length, values: 0, nullValues: 0,
+        emptyContainers: 0 };
+    for (const file of files) {
+        const source = relative(root, file);
+        const identity = rawIdentity(root, file);
+        flattenJson(readJson(file), "", (pointer, type, valueJson) => {
+            stats.values += 1;
+            if (type === "null") stats.nullValues += 1;
+            if (type === "empty_array" || type === "empty_object") {
+                stats.emptyContainers += 1;
+            }
+            lines.push([source, identity.lane, identity.pass, identity.ordinal,
+                pointer, type, valueJson].map(csvCell).join(","));
+        });
+    }
+    return { text: `${lines.join("\n")}\n`, stats };
 }
 
 function normalizeTask2(retained) {
@@ -228,6 +355,7 @@ function transitionRow(root, file, retained) {
     const task2 = normalizeTask2(retained);
     const profile = finalProfile(waiter);
     const timeline = waiter.replacementTimeline || retained.replacementTimeline || {};
+    const diagnostics = transitionDiagnostics(timeline);
     const boundary = timeline.firstPhysicalMutation;
     const target = waiter.target || {};
     const traceRequired = target.method === "dlss";
@@ -244,6 +372,7 @@ function transitionRow(root, file, retained) {
         observedPhaseCounters: task2.observedPhaseCounters,
         authoritativeTask2Violations: task2.authoritativeViolations,
         mutationExpectation: task2.expectation,
+        diagnostics,
         physicalMutationStarted: boundary ?
             boundary.physicalMutationStarted === true : "not_exposed",
         finalMethod: profile.method,
@@ -273,16 +402,44 @@ function csv(rows) {
         "missing_evidence", "phase_counters_authoritative",
         "physical_mutation_started", "final_method", "final_quality",
         "final_render_scale_mode", "final_state_revision", "trace_required",
-        "trace_complete", "raw_retained",
+        "trace_complete", "boundary_exposed", "dispatch_frame",
+        "dispatch_qpc_tick", "dispatch_left_generation",
+        "dispatch_left_transition_epoch", "dispatch_left_resource_revision",
+        "dispatch_right_generation", "dispatch_right_transition_epoch",
+        "dispatch_right_resource_revision",
+        "terminal_frame", "terminal_qpc_tick", "terminal_left_generation",
+        "terminal_left_transition_epoch", "terminal_left_resource_revision",
+        "terminal_right_generation", "terminal_right_transition_epoch",
+        "terminal_right_resource_revision",
+        "first_physical_mutation_frame", "first_physical_mutation_qpc_tick",
+        "first_physical_mutation_source", "raw_retained",
     ];
     const lines = [columns.join(",")];
     for (const row of rows) {
+        const diagnostics = row.diagnostics;
         const values = [row.lane, row.pass, row.ordinal, row.target.method,
             row.target.qualityMode, row.target.renderScaleMode, row.renderVerdict,
             row.task2Verdict, row.mutationExpectation, row.task2MissingEvidence,
             row.phaseCountersAuthoritative, row.physicalMutationStarted,
             row.finalMethod, row.finalQuality, row.finalRenderScaleMode,
             row.finalStateRevision, row.traceRequired, row.traceComplete,
+            diagnostics.boundaryExposed, diagnostics.dispatchFrame,
+            diagnostics.dispatchQpcTick, diagnostics.dispatchLeft.generation,
+            diagnostics.dispatchLeft.transitionEpoch,
+            diagnostics.dispatchLeft.resourceRevision,
+            diagnostics.dispatchRight.generation,
+            diagnostics.dispatchRight.transitionEpoch,
+            diagnostics.dispatchRight.resourceRevision,
+            diagnostics.terminalFrame, diagnostics.terminalQpcTick,
+            diagnostics.terminalLeft.generation,
+            diagnostics.terminalLeft.transitionEpoch,
+            diagnostics.terminalLeft.resourceRevision,
+            diagnostics.terminalRight.generation,
+            diagnostics.terminalRight.transitionEpoch,
+            diagnostics.terminalRight.resourceRevision,
+            diagnostics.firstPhysicalMutationFrame,
+            diagnostics.firstPhysicalMutationQpcTick,
+            diagnostics.firstPhysicalMutationSource,
             row.rawRetained];
         lines.push(values.map(csvCell).join(","));
     }
@@ -297,10 +454,15 @@ function report(summary) {
     return `# ${summary.protocol} final report\n\n` +
         `- Assay execution: **${summary.assayExecution.status}**\n` +
         `- Render verdict: **${summary.render.verdict}**\n` +
-        `- Task 2/evidence verdict: **${summary.task2Evidence.verdict}**\n` +
+        `- Task 2/evidence: **per transition** ` +
+        `(${summary.task2Evidence.counts.PASS} PASS, ` +
+        `${summary.task2Evidence.counts.FAIL} FAIL, ` +
+        `${summary.task2Evidence.counts.INCONCLUSIVE} INCONCLUSIVE)\n` +
         `- Reporting completeness: **${summary.reporting.status}**\n\n` +
-        `The four statuses are independent. Reporting failure does not rewrite ` +
-        `the render result, and a render pass does not hide missing Task 2 evidence.\n\n` +
+        `Task 2 is deliberately not aggregated. Reporting failure does not ` +
+        `rewrite the render result, and a render pass does not hide missing ` +
+        `per-transition evidence. Every raw JSON value is available in ` +
+        `\`${summary.evidenceExtraction.path}\`.\n\n` +
         `## Transitions\n\n` +
         `| Lane | Pass | Row | Render | Task 2 | Missing evidence |\n` +
         `| --- | ---: | ---: | --- | --- | --- |\n${rows}\n`;
@@ -357,38 +519,42 @@ function finalizeEvidence(options) {
         (existing.counts && existing.counts.transitionsDispatched) ?? rows.length;
     const assayStatus = rows.length === expectedRows ? "COMPLETE" : "INCOMPLETE";
     const renderVerdict = aggregateVerdict(rows.map((row) => row.renderVerdict));
-    const task2Verdict = aggregateVerdict(rows.map((row) => row.task2Verdict));
+    const task2Counts = verdictCounts(rows.map((row) => row.task2Verdict));
     const reportingReasons = [];
     if (assayStatus !== "COMPLETE") reportingReasons.push("terminal_receipts_incomplete");
     if (rows.some((row) => !row.traceComplete)) {
         reportingReasons.push("required_trace_evidence_incomplete");
     }
     const reportingStatus = reportingReasons.length === 0 ? "COMPLETE" : "INCOMPLETE";
-    const overallVerdict = aggregateVerdict([renderVerdict, task2Verdict]);
+    const extraction = evidenceValues(root);
     const generatedUtc = options.generatedUtc || existing.generatedUtc ||
         "not_exposed";
     const summary = {
         ...existing,
-        schemaVersion: `renderscale-tuning-${variant}-summary-v2`,
+        schemaVersion: `renderscale-tuning-${variant}-summary-v3`,
         protocol: `renderscale-tuning-${variant}`,
         runId: runIds[0],
         generatedUtc,
         executionStatus: assayStatus,
         renderVerdict,
-        evidenceVerdict: task2Verdict,
-        task2Verdict,
         reportingStatus,
-        overallVerdict,
         assayExecution: { status: assayStatus, terminalReceipts: rows.length,
             expectedTerminalReceipts: expectedRows },
         render: { verdict: renderVerdict },
-        task2Evidence: { verdict: task2Verdict,
-            inconclusiveRows: rows.filter((row) => row.task2Verdict === "INCONCLUSIVE").length },
+        task2Evidence: { mode: "per_transition", counts: task2Counts,
+            aggregateVerdict: "NOT_COMPUTED" },
         reporting: { status: reportingStatus, reasons: reportingReasons },
         reportingContract: { complete: reportingStatus === "COMPLETE",
             status: reportingStatus, reasons: reportingReasons },
+        evidenceExtraction: { complete: true,
+            path: "evidence-values.csv",
+            format: "rfc6901-json-pointer-long-form-csv",
+            ...extraction.stats },
         transitions: rows,
     };
+    delete summary.evidenceVerdict;
+    delete summary.task2Verdict;
+    delete summary.overallVerdict;
     const reportText = report(summary);
     const csvText = csv(rows);
     const summaryText = `${JSON.stringify(summary, null, 2)}\n`;
@@ -397,18 +563,20 @@ function finalizeEvidence(options) {
     writeAtomic(path.join(root, "summary.json"), summaryText);
     writeAtomic(path.join(root, "transitions.csv"), csvText);
     writeAtomic(path.join(root, "report.md"), reportText);
+    writeAtomic(path.join(root, "evidence-values.csv"), extraction.text);
 
     const files = walk(root).filter((file) =>
         path.basename(file) !== "receipt-index.json" &&
         !file.endsWith(".tmp-finalizer")).sort();
     const index = {
-        schemaVersion: `renderscale-tuning-${variant}-receipt-index-v2`,
+        schemaVersion: `renderscale-tuning-${variant}-receipt-index-v3`,
         generatedUtc,
         runId: runIds[0],
         buildId: buildIds[0],
         assayStatus,
         renderVerdict,
-        task2Verdict,
+        task2Evidence: { mode: "per_transition", counts: task2Counts,
+            aggregateVerdict: "NOT_COMPUTED" },
         reportingStatus,
         files: files.map((file) => ({ path: relative(root, file),
             bytes: fs.statSync(file).size, sha256: sha256(file) })),
@@ -444,7 +612,8 @@ if (require.main === module) {
         process.stdout.write(`${JSON.stringify({ ok: true,
             assayStatus: result.summary.assayExecution.status,
             renderVerdict: result.summary.render.verdict,
-            task2Verdict: result.summary.task2Evidence.verdict,
+            task2EvidenceMode: result.summary.task2Evidence.mode,
+            task2RowCounts: result.summary.task2Evidence.counts,
             reportingStatus: result.summary.reporting.status })}\n`);
     } catch (error) {
         process.stderr.write(`${error.stack || error}\n`);

@@ -70,7 +70,11 @@ foreach ($token in @(
     'trace_sequence_duplicate', 'trace_session_changed',
     'trace_build_changed', 'function finalizeEvidence',
     'missing_required_mutation_boundary', 'phaseCountersAuthoritative',
-    'assayExecution', 'task2Evidence', 'reportingStatus'
+    'assayExecution', 'task2Evidence', 'reportingStatus',
+    'function evidenceValues', 'evidence-values.csv',
+    'rfc6901-json-pointer-long-form-csv',
+    'evidence_numeric_value_not_lossless', 'delete summary.overallVerdict',
+    'per_transition', 'dispatch_left_generation'
 )) {
     Assert-Contains $finalizer $token 'Shared tuning finalizer'
 }
@@ -128,6 +132,16 @@ foreach ($token in @(
     'read `qualification_status` once'
 )) {
     Assert-Contains $fastStart $token 'Shared tuning fast-start contract'
+}
+foreach ($token in @(
+    'post-measurement finalizer', '`evidence-values.csv`',
+    'RFC 6901 JSON Pointer', 'Do not use a field allowlist',
+    'explicit empty arrays/objects', 'Keep Task 2 classifications per transition',
+    'never calculate an aggregate Task 2 or overall verdict',
+    'Omit legacy aggregate verdict fields',
+    'does not add or reorder startup'
+)) {
+    Assert-Contains $fastStart $token 'Shared post-measurement extraction contract'
 }
 foreach ($token in @('six labeled tool steps in this exact order', '`baseline-stress-reset`', '`baseline-stress-start`', '`qualification-begin`', '`qualification-dispatch`', '`profile-apply`', '`qualification-wait`', 'only pre-baseline reset', 'inside the same server-owned scenario', 'Do not inspect, validate, persist, or comment', '`stepsRun: 6`', '`results[]` entry `label: profile-apply`', '`result.apply.disposition.name`', '`label: qualification-wait`', '`result.action: qualification_wait`', 'Never search another wrapper location', 'containing scenario response is lost', 'do not replay the scenario, apply, or waiter', 'allow the already-running server scenario', 'at most five additional seconds', 'matching terminal `lastEvidence`', 'Never reapply the profile', 'applies to every baseline and measured waiter', 'must never invoke this handoff scenario', 'handoff scenario is never a cleanup path', 'reset then start texture-lifetime', 'reset then start load-presentation', '"action":"clear_history"', 'do not use', '`start_capture`', 'sole CPU/GPU reset/start', 'Stop only the baseline stress session', 'do not run another local command', 'never search for it', '`communityshaders.profiler_api`', '`result.status.session.id`', 'Immediately begin transition 1')) {
     Assert-Contains $fastStart $token 'Shared server-owned waiter contract'
@@ -249,6 +263,7 @@ foreach ($variant in $variants) {
     Assert-Contains $skill 'Do not enumerate tools or inspect fallbacks' $variant.Name
     Assert-Contains $skill 'if a named tool is not callable' $variant.Name
     Assert-Contains $skill 'never use the bundled controller' $variant.Name
+    Assert-True (-not $skill.Contains('evidence-values.csv', [StringComparison]::Ordinal)) "$($variant.Name) moved finalization into startup instructions."
     Assert-Contains $live '../../../docs/protocols/renderscale-tuning-fast-start.md' $variant.Name
     Assert-Contains $skill 'first `mcp__devbench_vr__communityshaders_menu`' $variant.Name
     Assert-Contains $skill '`{"action":"prepare_coc"}`' $variant.Name
@@ -282,7 +297,12 @@ foreach ($variant in $variants) {
     Assert-Contains $protocol 'restartable from the exact' $variant.Name
     Assert-Contains $protocol '`missing_required_mutation_boundary`' $variant.Name
     Assert-Contains $protocol 'phase counters as non-authoritative' $variant.Name
-    Assert-Contains $protocol '`assayExecution`, `render`, `task2Evidence`, and `reporting`' $variant.Name
+    Assert-Contains $protocol 'per-transition `task2Evidence`' $variant.Name
+    Assert-Contains $protocol '`evidence-values.csv`' $variant.Name
+    Assert-Contains $protocol 'RFC 6901 JSON Pointer' $variant.Name
+    Assert-Contains $protocol 'Do not use a curated field allowlist' $variant.Name
+    Assert-Contains $protocol 'Task 2 is never aggregated into one' $variant.Name
+    Assert-Contains $protocol 'Do not calculate an overall verdict' $variant.Name
     foreach ($fixtureToken in @(
         '`ready: true`', '`persisted: false`', '`producer.buildId`',
         '`after.ready`', '`after.vr`', '`after.inGame`',
@@ -384,6 +404,9 @@ foreach ($variant in $variants) {
         'replacement admission state and all reasons', 'consecutive stretch frames',
         '`raw/transitions/', '`receipt-index.json`', 'client response store',
         'compact transition projection',
+        '`evidence-values.csv`', 'every scalar, null, and empty container',
+        'dispatch, terminal, and first-mutation frame/QPC',
+        'diagnostic deltas never',
         '`milestoneTimings`', '`cleanupTailMs`', '`sameObservation`',
         '`replacementTimeline`', '`presentationCycleAudit`',
         '`preparationAdmission: not_applicable`',
@@ -591,6 +614,8 @@ foreach ($protocol in @(
         'CSV `actual_backend` comes from',
         'must not be JSON null on a `PASS`',
         '`reporting_contract_incomplete`',
+        'per-transition `task2Evidence`',
+        'Task 2 is never aggregated into one',
         'Always emit the memory table and `memoryConfirmation` object',
         '`verdict: repeat_not_completed`',
         'no leak/retention conclusion is possible'

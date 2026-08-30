@@ -400,6 +400,15 @@ Every transition record must retain direct raw paths for:
 - per-lane CPU/GPU telemetry and profiler capture, plus all stress, fidelity,
   stereo, lifetime, load-presentation, and trace session identities.
 
+During finalization, extract every scalar, null, and empty container from every
+JSON receipt below `raw/` into `evidence-values.csv`. Use one row per value with
+its relative source path, lane/pass/ordinal when present, RFC 6901 JSON Pointer,
+JSON type, and JSON-encoded value. Do not use a curated field allowlist or drop
+false, zero, null, or empty values. The compact transition table must also
+expose dispatch, terminal, and first-mutation frame/QPC plus per-eye generation,
+transition epoch, and resource revision. These diagnostic deltas never
+synthesize a missing mutation-boundary receipt or change a row verdict.
+
 Project every `replacementTimeline` facet independently into `summary.json`,
 `transitions.csv`, and the rendered report. Use these prefixes exactly:
 `dispatch_`, `blocked_pre_mutation_`, `last_pre_mutation_`,
@@ -523,15 +532,19 @@ Never supply an invented client limit. Materialize each raw page before
 validating it. Offline restart uses the retained per-row trace evidence and
 does not issue a live read. The finalizer must be restartable from the exact
 run/build/session-owned retained files and must never replay an in-game
-transition. It writes `summary.json`, `transitions.csv`, `report.md`, and
-`receipt-index.json` atomically only after validation. Do not hash or render per
+transition. It writes `summary.json`, `transitions.csv`,
+`evidence-values.csv`, `report.md`, and `receipt-index.json` atomically only
+after validation. Do not hash or render per
 row. An evidence root containing only `summary.json` and `transitions.csv` is
 incomplete and cannot support a ledger append. Append one uniquely headed
 result column per completed two-pass lane.
 
-Keep `assayExecution`, `render`, `task2Evidence`, and `reporting` as independent
-verdict objects. A finalization failure sets reporting to `INCOMPLETE` without
-rewriting a completed render `PASS`. When a required mutation has no
+Keep `assayExecution`, `render`, per-transition `task2Evidence`, and `reporting`
+independent. A finalization failure sets reporting to `INCOMPLETE` without
+rewriting a completed render `PASS`. Task 2 is never aggregated into one
+verdict: preserve every row classification and report only the `PASS`, `FAIL`,
+and `INCONCLUSIVE` counts. Do not calculate an overall verdict from those
+counts. When a required mutation has no
 `firstPhysicalMutation`, report `missing_required_mutation_boundary` and make
 Task 2 `INCONCLUSIVE`; preserve its phase counters as non-authoritative raw
 observations. With a valid boundary, all existing post-boundary failure rules

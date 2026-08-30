@@ -269,6 +269,25 @@ SHA-256 hashes in one local batch. Missing optional cumulative detail marks
 only that evidence facet `INCONCLUSIVE`; a preserved terminal receipt remains
 valid transition evidence.
 
+The post-measurement finalizer must also walk every JSON file below `raw/` and
+write `evidence-values.csv` as a lossless long-form analysis table. Give every
+row its relative source path, lane/pass/ordinal when present, RFC 6901 JSON
+Pointer, JSON value type, and JSON-encoded value. Do not use a field allowlist:
+retain false, zero, null, strings, numbers, and explicit empty arrays/objects.
+This export makes every retained producer value queryable without flattening
+different timeline facets together or treating a terminal delta as a missing
+mutation-boundary event.
+
+Keep Task 2 classifications per transition. Report counts for `PASS`, `FAIL`,
+and `INCONCLUSIVE`, but never calculate an aggregate Task 2 or overall verdict.
+Omit legacy aggregate verdict fields instead of populating them with sentinel
+values that a consumer could misclassify as a failure.
+An absent boundary remains `not_exposed` for that row while its dispatch and
+terminal generations, epochs, resource revisions, paths, backends, frames, and
+QPC values remain available for diagnosis. This finalization-only rule does not
+add or reorder startup, positioning, baseline, handoff, pacing, or mutation
+steps.
+
 Finalization runs after a complete pass and after every interrupted pass while
 the direct control plane remains callable. Stop only task-owned sessions with
 their exact returned guards, disable the task-owned profiler state, and verify

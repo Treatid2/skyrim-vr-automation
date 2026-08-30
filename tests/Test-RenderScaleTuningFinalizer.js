@@ -153,6 +153,14 @@ function retained(boundary, violation, identity = {}) {
     const runId = identity.runId || "nvidia-test-run";
     const buildId = identity.buildId || "e".repeat(64);
     return {
+        analysisSentinel: {
+            falseValue: false,
+            zeroValue: 0,
+            nullValue: null,
+            emptyArray: [],
+            emptyObject: {},
+            "slash/key~": "retained",
+        },
         waiter: {
             satisfied: true,
             ownerId: `${runId}-owner`,
@@ -161,9 +169,68 @@ function retained(boundary, violation, identity = {}) {
             target: { method: "none", qualityMode: 0, renderScaleMode: false },
             replacementTimeline: {
                 mutationExpectation: "required",
+                dispatch: {
+                    tick: 100,
+                    frame: 10,
+                    presentationProof: {
+                        proven: true,
+                        kind: "exact_native_presentation",
+                        leftEye: {
+                            frame: 10,
+                            qpcTick: 100,
+                            transitionEpoch: 8,
+                            generation: 8,
+                            resourceRevision: 40,
+                            method: "none",
+                            backend: "none",
+                            path: "NativeOriginal",
+                        },
+                        rightEye: {
+                            frame: 10,
+                            qpcTick: 100,
+                            transitionEpoch: 8,
+                            generation: 8,
+                            resourceRevision: 40,
+                            method: "none",
+                            backend: "none",
+                            path: "NativeOriginal",
+                        },
+                    },
+                },
                 ...(boundary ? { firstPhysicalMutation: {
+                    tick: 110,
+                    frame: 11,
                     physicalMutationStarted: true,
-                } } : {}),
+                    physicalMutationSource: "engine_target_creator",
+                } } : { firstPhysicalMutation: null }),
+                terminal: {
+                    tick: 120,
+                    frame: 12,
+                    presentationProof: {
+                        proven: true,
+                        kind: "exact_native_presentation",
+                        leftEye: {
+                            frame: 12,
+                            qpcTick: 120,
+                            transitionEpoch: 9,
+                            generation: 9,
+                            resourceRevision: 41,
+                            method: "none",
+                            backend: "none",
+                            path: "NativeOriginal",
+                        },
+                        rightEye: {
+                            frame: 12,
+                            qpcTick: 120,
+                            transitionEpoch: 9,
+                            generation: 9,
+                            resourceRevision: 41,
+                            method: "none",
+                            backend: "none",
+                            path: "NativeOriginal",
+                        },
+                    },
+                },
             },
             upscalingSnapshot: {
                 stateRevision: 8,
@@ -218,8 +285,15 @@ function testOfflineFinalization() {
             "Completed assay execution was rewritten.");
         assert(result.summary.render.verdict === "PASS",
             "Render PASS was rewritten by evidence handling.");
-        assert(result.summary.task2Evidence.verdict === "FAIL",
-            "A genuine post-boundary violation did not remain FAIL.");
+        assert(result.summary.task2Evidence.mode === "per_transition" &&
+            result.summary.task2Evidence.aggregateVerdict === "NOT_COMPUTED" &&
+            result.summary.task2Evidence.counts.FAIL === 1 &&
+            result.summary.task2Evidence.counts.INCONCLUSIVE === 1,
+        "Task 2 evidence was aggregated instead of retained per transition.");
+        assert(!Object.hasOwn(result.summary, "evidenceVerdict") &&
+            !Object.hasOwn(result.summary, "task2Verdict") &&
+            !Object.hasOwn(result.summary, "overallVerdict"),
+        "Legacy aggregate verdict fields were retained.");
         assert(result.summary.reporting.status === "COMPLETE",
             "Complete preserved receipts did not finalize.");
         const first = result.summary.transitions[0];
@@ -230,9 +304,53 @@ function testOfflineFinalization() {
         "Missing required mutation boundary was not INCONCLUSIVE.");
         assert(result.summary.transitions[1].task2Verdict === "FAIL",
             "Post-boundary violation was downgraded.");
+        assert(first.diagnostics.boundaryExposed === false &&
+            first.diagnostics.dispatchLeft.generation === 8 &&
+            first.diagnostics.terminalLeft.generation === 9 &&
+            first.diagnostics.terminalLeft.generation -
+                first.diagnostics.dispatchLeft.generation === 1,
+        "Dispatch/terminal diagnostic values were not retained independently.");
+        assert(result.summary.evidenceExtraction.complete === true &&
+            result.summary.evidenceExtraction.rawJsonFiles === 2 &&
+            result.summary.evidenceExtraction.values > 0 &&
+            result.summary.evidenceExtraction.nullValues > 0 &&
+            result.summary.evidenceExtraction.emptyContainers > 0,
+        "Raw JSON value extraction was not recorded.");
+
+        const extracted = fs.readFileSync(path.join(root,
+            "evidence-values.csv"), "utf8");
+        assert(extracted.includes(
+            "/waiter/replacementTimeline/dispatch/presentationProof/leftEye/generation,number,8") &&
+            extracted.includes(
+                "/waiter/replacementTimeline/terminal/presentationProof/leftEye/resourceRevision,number,41") &&
+            extracted.includes(
+                "/waiter/replacementTimeline/firstPhysicalMutation,null,null"),
+        "Lossless extraction omitted a required diagnostic path or null value.");
+        assert(extracted.includes("/analysisSentinel/falseValue,boolean,false") &&
+            extracted.includes("/analysisSentinel/zeroValue,number,0") &&
+            extracted.includes("/analysisSentinel/emptyArray,empty_array,[]") &&
+            extracted.includes("/analysisSentinel/emptyObject,empty_object,{}") &&
+            extracted.includes("/analysisSentinel/slash~1key~0,string"),
+        "Lossless extraction dropped a false, zero, empty, or escaped path value.");
+        assert(result.index.files.some((entry) =>
+            entry.path === "evidence-values.csv"),
+        "The lossless value export was not hashed in the receipt index.");
+        const report = fs.readFileSync(path.join(root, "report.md"), "utf8");
+        assert(report.includes("Task 2/evidence: **per transition**") &&
+            report.includes("Task 2 is deliberately not aggregated"),
+        "The report still presents an aggregate Task 2 verdict.");
+        const transitionCsv = fs.readFileSync(path.join(root,
+            "transitions.csv"), "utf8");
+        assert(transitionCsv.startsWith("lane,pass,ordinal") &&
+            transitionCsv.includes("boundary_exposed") &&
+            transitionCsv.includes("dispatch_left_generation") &&
+            transitionCsv.includes("dispatch_right_generation") &&
+            transitionCsv.includes("terminal_left_resource_revision") &&
+            transitionCsv.includes("terminal_right_resource_revision"),
+        "The compact transition table omitted diagnostic columns.");
 
         const outputs = ["report.md", "summary.json", "transitions.csv",
-            "receipt-index.json"];
+            "evidence-values.csv", "receipt-index.json"];
         const firstHashes = outputs.map((name) => sha(path.join(root, name)));
         result = finalizeEvidence(options);
         const secondHashes = outputs.map((name) => sha(path.join(root, name)));
@@ -270,7 +388,11 @@ function testAmdParity() {
             generatedUtc: "2026-08-30T20:00:00.000Z" });
         assert(result.summary.protocol === "renderscale-tuning-amd" &&
             result.summary.transitions[0].task2Verdict === "INCONCLUSIVE" &&
-            result.summary.transitions[1].task2Verdict === "FAIL",
+            result.summary.transitions[1].task2Verdict === "FAIL" &&
+            result.summary.task2Evidence.mode === "per_transition" &&
+            result.summary.task2Evidence.counts.INCONCLUSIVE === 1 &&
+            result.summary.task2Evidence.counts.FAIL === 1 &&
+            result.summary.evidenceExtraction.complete === true,
         "AMD did not use the shared Task 2 finalization contract.");
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
@@ -296,10 +418,33 @@ function testValidationLeavesEvidenceUntouched() {
     }
 }
 
+function testUnsafeEvidenceNumberFailsClosed() {
+    const root = createEvidenceRoot();
+    try {
+        const before = sha(path.join(root, "summary.json"));
+        fs.writeFileSync(path.join(root, "raw", "unsafe-number.json"),
+            "{\"value\":9007199254740993}\n");
+        try {
+            finalizeEvidence({ root, variant: "nvidia",
+                runId: "nvidia-test-run", buildId: "e".repeat(64),
+                expectedRows: 2 });
+            throw new Error("Expected unsafe evidence number to fail.");
+        } catch (error) {
+            assert(error.message === "evidence_numeric_value_not_lossless",
+                "Unsafe JSON integer was not rejected losslessly.");
+        }
+        assert(sha(path.join(root, "summary.json")) === before,
+            "Unsafe evidence modified finalized output.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
 Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testPagingResume).then(testOfflineFinalization)
     .then(testReportingSeparation).then(testAmdParity)
-    .then(testValidationLeavesEvidenceUntouched).then(() => {
+    .then(testValidationLeavesEvidenceUntouched)
+    .then(testUnsafeEvidenceNumberFailsClosed).then(() => {
         process.stdout.write("Render-scale tuning finalizer tests passed.\n");
     }).catch((error) => {
         process.stderr.write(`${error.stack || error}\n`);
