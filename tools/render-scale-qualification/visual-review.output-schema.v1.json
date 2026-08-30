@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "provider",
+    "model",
+    "promptRevision",
+    "runId",
+    "requestSha256",
+    "replicate",
+    "presentationPass",
+    "mode",
+    "samples",
+    "overallVerdict"
+  ],
+  "properties": {
+    "schema": {
+      "const": "csx-render-scale-image-model-response-v1"
+    },
+    "provider": {
+      "const": "codex_cli"
+    },
+    "model": {
+      "const": "gpt-5.6-sol"
+    },
+    "promptRevision": {
+      "const": 1
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^rsq-[A-Za-z0-9_-]{8,80}$"
+    },
+    "requestSha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "replicate": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 3
+    },
+    "presentationPass": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2
+    },
+    "mode": {
+      "enum": [
+        "standalone",
+        "pr_baseline"
+      ]
+    },
+    "samples": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ordinal",
+          "categories"
+        ],
+        "properties": {
+          "ordinal": {
+            "enum": [
+              1,
+              8,
+              16
+            ]
+          },
+          "categories": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "sharpness",
+              "blur",
+              "shimmer",
+              "stereoAlignment",
+              "equalEyeScale",
+              "geometryCorrespondence"
+            ],
+            "properties": {
+              "sharpness": {
+                "$ref": "#/$defs/rating"
+              },
+              "blur": {
+                "$ref": "#/$defs/rating"
+              },
+              "shimmer": {
+                "$ref": "#/$defs/rating"
+              },
+              "stereoAlignment": {
+                "$ref": "#/$defs/rating"
+              },
+              "equalEyeScale": {
+                "$ref": "#/$defs/rating"
+              },
+              "geometryCorrespondence": {
+                "$ref": "#/$defs/rating"
+              }
+            }
+          }
+        }
+      }
+    },
+    "overallVerdict": {
+      "enum": [
+        "pass",
+        "fail",
+        "indeterminate"
+      ]
+    }
+  },
+  "$defs": {
+    "rating": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verdict",
+        "confidence",
+        "observation",
+        "evidenceViews"
+      ],
+      "properties": {
+        "verdict": {
+          "enum": [
+            "pass",
+            "fail",
+            "first_better",
+            "tie",
+            "second_better",
+            "indeterminate"
+          ]
+        },
+        "confidence": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "observation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "evidenceViews": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "left_eye",
+              "right_eye",
+              "side_by_side"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

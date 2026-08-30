@@ -1,0 +1,6 @@
+interface:
+  display_name: "Render-scale qualification"
+  short_description: "Run unattended CSX VR qualification"
+  default_prompt: "Use $render-scale-qualification to attach to my already-running CSX VR DLL and complete the unattended qualification in one invocation."
+policy:
+  allow_implicit_invocation: true
