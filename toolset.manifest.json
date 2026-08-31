@@ -9,6 +9,11 @@
   "devBenchProtocolVersion": "2026-08-26",
   "tools": [
     {
+      "name": "modlist-control",
+      "version": "1.0.0",
+      "entryPoint": "tools/modlist-control/Invoke-SkyrimVRModlist.ps1"
+    },
+    {
       "name": "doctor",
       "version": "1.1.0",
       "entryPoint": "tools/doctor/Invoke-SkyrimVRAutomationDoctor.ps1"
@@ -30,7 +35,7 @@
     },
     {
       "name": "mo2-workspace-control",
-      "version": "1.2.0",
+      "version": "1.3.0",
       "entryPoint": "tools/mo2-workspace-control/Invoke-MO2WorkspaceControl.ps1"
     },
     {
@@ -49,6 +54,11 @@
       "entryPoint": "tools/devbench-control/Invoke-DevBenchControl.ps1"
     },
     {
+      "name": "render-scale-qualification",
+      "version": "2.0.0",
+      "entryPoint": "tools/render-scale-qualification/Start-CSXRenderScaleQualification.ps1"
+    },
+    {
       "name": "profiler-control",
       "version": "1.2.0",
       "entryPoint": "tools/profiler-control/Measure-CSXProfiler.ps1"
@@ -65,8 +75,18 @@
     },
     {
       "name": "process-control",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "entryPoint": "tools/process-control/Invoke-BoundedProcess.ps1"
+    },
+    {
+      "name": "coc-evidence-control",
+      "version": "1.1.0",
+      "entryPoint": "tools/coc-evidence-control/Invoke-CocEvidenceControl.ps1"
+    },
+    {
+      "name": "coc-stability-control",
+      "version": "1.0.0",
+      "entryPoint": "tools/coc-stability-control/Invoke-CocStabilityControl.ps1"
     },
     {
       "name": "build-test-control",

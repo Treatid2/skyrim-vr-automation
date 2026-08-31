@@ -20,6 +20,11 @@
   selected and read-only unless the user has placed a state change in scope.
 - Machine-specific paths belong only in ignored `machine.local.json` files,
   explicit parameters, or documented environment variables.
+- Never rotate an installed Codex plugin cache while any automation protocol
+  is active in any chat. Build and commit the marketplace package, then defer
+  installation until every run is terminal. Use the guarded repository
+  installer instead of direct `codex plugin add`, and fully reload the Codex
+  host after installation; a new chat alone is not a safe pickup boundary.
 - When an automation command behaves unexpectedly, its contract is ambiguous,
   or a concrete safety issue or enhancement is discovered, submit it through
   `tools/feedback-control/Invoke-AutomationFeedback.ps1`. Claim that feedback

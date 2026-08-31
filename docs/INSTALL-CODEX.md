@@ -15,6 +15,16 @@ Restart Codex after a new installation. Run the doctor before a live workflow:
 .\tools\doctor\Invoke-SkyrimVRAutomationDoctor.ps1 inspect
 ```
 
+The plugin registers the loopback `devbench_vr` MCP server from its own
+`.mcp.json`. Render-scale tuning requires those plugin-provided direct tools
+and never uses the bundled HTTP controller. A separate global
+`mcp_servers.devbench_vr` entry is not required. Remove a legacy global entry
+after installing the plugin, then restart Codex:
+
+```text
+codex mcp remove devbench_vr
+```
+
 Initialize the stable MO2 configuration at
 `%LOCALAPPDATA%\SkyrimVRAutomation\machine.local.json` and then edit the copied
 example, or migrate an existing file with `-SourceConfigPath`:
@@ -56,13 +66,38 @@ and is not reverified after the task changes its own mod or save state.
 
 ## Upgrade
 
-```text
-codex plugin marketplace upgrade skyrim-vr-tools
-codex plugin add skyrim-vr-automation@skyrim-vr-tools
+From a repository checkout, use the bounded installer:
+
+```powershell
+.\scripts\Install-CodexMarketplacePlugin.ps1 -ConfirmSafeCacheRotation
 ```
 
-Review `CHANGELOG.md`, rerun the doctor, and restart Codex. Pin a marketplace
-checkout to a release tag with `--ref vX.Y.Z` when reproducibility matters.
+It verifies the marketplace manifest version, the structured installed
+registration, and every installed file hash. If `plugin add` succeeds while
+`plugin list` still reports an older snapshot, it performs one scoped
+`skyrim-vr-tools` remove/add cycle and verifies the result again.
+
+Installation replaces the versioned plugin cache directory. Finish every
+automation run in every chat before invoking it, then fully reload the Codex
+host or VS Code before starting another protocol. A new chat in the existing
+host can retain the old catalog path and is not a sufficient reload boundary.
+Source/package generation and commits may continue while a run is active;
+defer only the installed-cache rotation.
+
+For a Git marketplace installation without a checkout, refresh the marketplace
+registration before reinstalling the plugin:
+
+```text
+codex plugin remove skyrim-vr-automation@skyrim-vr-tools
+codex plugin marketplace remove skyrim-vr-tools
+codex plugin marketplace add Treatid2/skyrim-vr-automation --ref main
+codex plugin add skyrim-vr-automation@skyrim-vr-tools
+codex plugin list --marketplace skyrim-vr-tools --json
+```
+
+The listed version must match `.codex-plugin/plugin.json`. Review
+`CHANGELOG.md`, rerun the doctor, and restart Codex. Pin a marketplace checkout
+to a release tag with `--ref vX.Y.Z` when reproducibility matters.
 
 ## Remove
 

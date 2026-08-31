@@ -23,12 +23,12 @@ edit `modlist.txt` ad hoc.
   parameter block before acting. For a DLL deployment, prefer the workspace
   controller's `-WinningPaths` transaction; do not guess MO2 priority order.
 - For every independent test task, read
-  `../../tools/mo2-workspace-control/README.md`, run `prepare-source` to move
-  every `ShaderCache*` directory out of overwrite, and use the stable task ID
-  to discover, resume, or create its task profile before preparing a session.
-  Never
-  use an experimental alternate profile as an implicit template, and never
-  hand off a task profile while a ShaderCache directory remains in overwrite.
+  `../../tools/mo2-workspace-control/README.md` and use the stable task ID to
+  discover, resume, or create its task profile before preparing a session.
+  Creation binds snapshotted `ShaderCache` and `backup` output to MO2 Overwrite,
+  removes both game and `Synthesis` custom-overwrite mappings from the clone,
+  and physically shadows every enabled provider path. Never use an
+  experimental alternate profile as an implicit template.
 - Treat the repository-root `AGENTS.md` as binding operational policy.
 
 Resolve all paths from this skill's installed location. The main entry points
@@ -46,7 +46,7 @@ are:
    `request-access`, retain its exact `accessId`, and respect `access-busy`.
    An estimated duration is advisory only and never permits lease stealing.
    Use workspace `list-task -TaskId` to discover retained state. On the first
-   request, run `prepare-source`, require `fixture-status` to report
+   request, require `fixture-status` to report
    `fixture-valid`, and then run `create -TaskId`; the primary profile, its
    complete save tree, and the mandatory default world-entry save are cloned,
    verified, and selected. On later requests, require an explicit
@@ -84,8 +84,16 @@ are:
    do not guess a save or manifest path.
    If the task may compile CSX shaders, apply `$shader-cache-control` while MO2
    and Skyrim are still closed: catalog `prepare` the exact task cache before
-   launch, then catalog `complete` after shutdown and before yielding access or
-   retiring the workspace.
+   launch with the exact task profile, mods root, Overwrite cache path,
+   `-BindToOverwrite`, and `-RequireMaterializedOutput`. Require its provider
+   shadow receipt and prepared tree hash; an empty directory cannot prevent
+   later-area shader paths from resolving back into a lower mod. MO2
+   preparation and the first launch recompute the exact tree and current provider
+   coverage. They also verify the complete generated `backup` tree against its
+   creation receipt. Retained game cycles may grow the bound Overwrite cache
+   and backup trees, but every relaunch still requires complete provider path
+   coverage. Then catalog `complete` and workspace `complete-output` after
+   shutdown and before yielding access or retiring the workspace.
 5. For repeated measurements, retain the owning MO2 process and cycle Skyrim
    with `stop-game` followed by `launch`.
    If `stop-game` returns `mo2-exited-after-game-stop` or `releaseRequired`, do
@@ -103,8 +111,9 @@ are:
    game recovery: it targets launch-recorded identities, retains MO2, invokes
    exact Unlock, and requires RootBuilder cleanup. `release-access` is the
    normal yield path and preserves the task workspace. Use workspace `retire`
-   only when that exact profile is no longer wanted; workspace `release` is a
-   deprecated destructive alias.
+   only when that exact profile is no longer wanted. Retirement requires the
+   exact cache and backup completion receipts and never deletes MO2 Overwrite;
+   workspace `release` is a deprecated destructive alias.
 9. Preserve session identifiers, receipts, hashes, logs, screenshots, dumps,
    and the pre/post inspection results with the test record.
 

@@ -10,9 +10,11 @@ hashes. This does not assert a successful live load. Missing or stale fixture me
 profiles may not be cloned without a known route into the loaded game world.
 
 MO2 configuration is resolved in strict precedence order: explicit
-`-ConfigPath`, `SKYRIM_VR_AUTOMATION_CONFIG`, the stable per-user file
-`%LOCALAPPDATA%\SkyrimVRAutomation\machine.local.json`, then the legacy ignored
-checkout-local file. The selected source is always reported.
+`-ConfigPath`, `SKYRIM_VR_AUTOMATION_CONFIG`, an exact
+`SKYRIM_VR_AUTOMATION_MODLIST` name, the persisted selection managed by
+`../modlist-control`, the stable per-user file, then the legacy ignored
+checkout-local file. The historical files are considered only when no named
+configs exist. The selected source and modlist are always reported.
 
 Initialize the stable path without overwriting an existing file:
 

@@ -1,0 +1,131 @@
+{
+  "schema": "csx-coc-stability-protocol-v1",
+  "startCellEditorId": "WindhelmExterior01",
+  "interiorCellEditorId": "WhiterunDragonsreach",
+  "transitionCount": 20,
+  "qualification": {
+    "milestone": "strict",
+    "timeoutMs": 30000,
+    "receiptFields": [
+      "presentationStable",
+      "presentationFailureMask",
+      "presentationFailureReasons",
+      "presentationElapsedMs",
+      "presentationElapsedFrames",
+      "cleanupDrained",
+      "cleanupFailureMask",
+      "cleanupFailureReasons",
+      "cleanupElapsedMs",
+      "cleanupElapsedFrames",
+      "strictSatisfied",
+      "strictFailureMask",
+      "strictFailureReasons",
+      "strictElapsedMs",
+      "strictElapsedFrames",
+      "outstandingCleanupDebt",
+      "timing",
+      "frames",
+      "observation",
+      "producer"
+    ],
+    "strictFrameTargets": {
+      "WhiterunDragonsreach": 24,
+      "WindhelmExterior01": 20,
+      "overall": 22,
+      "worst": 24
+    },
+    "retryLimit": 9,
+    "stretchLimits": {
+      "sessionObservations": 428,
+      "consecutiveFrames": 18,
+      "vendorFailures": 0,
+      "boundsMismatchFallbacks": 0
+    }
+  },
+  "telemetry": {
+    "resourcePublicationFields": [
+      "current",
+      "currentGeneration",
+      "completedGeneration",
+      "publishedGeneration",
+      "expectedWidth",
+      "expectedHeight",
+      "publishedWidth",
+      "publishedHeight",
+      "complete",
+      "deferredSetupAcknowledged",
+      "deviceMatches",
+      "contextMatches"
+    ],
+    "preparation": {
+      "source": "status.preparation",
+      "capturePoint": "post_wait_status",
+      "fields": [
+        "schemaVersion",
+        "devBenchOnly",
+        "active",
+        "sessionId",
+        "qpcFrequency",
+        "retainedEvents",
+        "capacity",
+        "overwrittenEvents",
+        "coalescedEvents",
+        "events"
+      ],
+      "eventFields": [
+        "sequence",
+        "sessionId",
+        "requestId",
+        "transitionEpoch",
+        "optionsGeneration",
+        "shaderDefinesGeneration",
+        "deviceIdentity",
+        "frame",
+        "lastFrame",
+        "occurrences",
+        "method",
+        "qualityMode",
+        "dlssPreset",
+        "fsr4RuntimeEnabled",
+        "renderEyeWidth",
+        "renderEyeHeight",
+        "displayEyeWidth",
+        "displayEyeHeight",
+        "event",
+        "outcome",
+        "reasonMask",
+        "reasons",
+        "beginQpc",
+        "endQpc",
+        "durationQpcTicks",
+        "durationMs",
+        "bytecodeCompilationQpcTicks",
+        "bytecodeCompilationMs",
+        "d3dObjectCreationQpcTicks",
+        "d3dObjectCreationMs"
+      ],
+      "eventNames": [
+        "request_queued",
+        "admission_check",
+        "early_exit",
+        "shader_cache_busy_wait",
+        "sss_raymarch_prewarm",
+        "ssgi_prewarm",
+        "dlss_preparation",
+        "fsr_preparation",
+        "fsr4_preparation",
+        "d3d_object_creation",
+        "total_preparation",
+        "request_to_prepared",
+        "prepared_to_creator"
+      ]
+    }
+  },
+  "foveation": {
+    "foveatedVendorDispatch": true,
+    "foveatedCenterArea": 0.3,
+    "peripheryTAAEnable": true,
+    "peripheryTAACenterArea": 0.3,
+    "peripheryTAAOuterScale": 0.7
+  }
+}

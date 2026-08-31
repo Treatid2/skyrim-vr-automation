@@ -1,0 +1,87 @@
+{
+    "schema": "csx.fork-reciprocal-search.v1",
+    "campaignId": "replace-with-unique-id",
+    "firstMover": "csx",
+    "fixedContract": {
+        "matrix": {
+            "name": "matrix_int-ext-weather-coc",
+            "sourceCommit": "29cf460613e0f56956c0e739cc504b2e9c4e75d1",
+            "sha256": null
+        },
+        "automationCommit": null,
+        "runtimeLane": null,
+        "mo2Modlist": null,
+        "testProfileSource": null,
+        "saveFixtureId": null,
+        "gpu": {
+            "vendor": null,
+            "device": null,
+            "driver": null,
+            "powerPolicy": null
+        },
+        "hmd": {
+            "mode": null,
+            "profile": null,
+            "refreshRateHz": null,
+            "renderWidth": null,
+            "renderHeight": null,
+            "motionSmoothing": null
+        },
+        "upscaling": {
+            "method": "DLSS",
+            "quality": "Quality",
+            "linearInputScale": 0.666667,
+            "preset": "K",
+            "renderScaleEnabled": true,
+            "foveationEnabled": true
+        },
+        "features": {
+            "bloomEnabled": true,
+            "forkNativeWetnessEnabled": true
+        },
+        "qualityAssessment": {
+            "humanViewing": false,
+            "protocol": "image-quality-protocol.md",
+            "model": null,
+            "modelRuntime": null,
+            "promptRevision": null,
+            "motionRecordingSha256": null
+        }
+    },
+    "measurement": {
+        "screeningBlocks": 1,
+        "qualificationBlocks": [3, 5, 7],
+        "matrixRepetitionsPerBlock": 3,
+        "warmupRuns": 1,
+        "settleSeconds": 10,
+        "scenarioSeconds": 30,
+        "sceneTimeoutSeconds": 180,
+        "conditionTimeoutSeconds": 60,
+        "pollMilliseconds": 500,
+        "stableSamples": 3,
+        "minimumStableFrameAdvance": 10,
+        "balancedOrders": ["A-B-A", "B-A-B"]
+    },
+    "forks": [
+        {
+            "id": "csx",
+            "head": "d748e1089e4f696cb8d34ffc3a6154c279586a17",
+            "baselineSettings": "csx-d748e108/SettingsUser.json",
+            "searchSpaceManifest": null
+        },
+        {
+            "id": "open-shaders",
+            "head": "6f532ca3ecf5bc63324e7ad5b9aa526fce8dabff",
+            "baselineSettings": "open-shaders-6f532ca3/SettingsUser.json",
+            "searchSpaceManifest": null
+        }
+    ],
+    "stopping": {
+        "requireJointVisualAndPerformanceDominance": true,
+        "requireReciprocalSearchExhaustion": true,
+        "requireStableAnchorRounds": 2,
+        "requireFinalBalancedConfirmation": true,
+        "allowWinnerOnInvalidEvidence": false,
+        "exhaustedWithoutDominance": "no-winner"
+    }
+}

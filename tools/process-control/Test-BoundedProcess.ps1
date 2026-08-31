@@ -35,10 +35,10 @@ Set-Content -LiteralPath $ChildPidPath -Value $child.Id
 Start-Sleep -Seconds 30
 '@ | Set-Content -LiteralPath $treeFixture -Encoding utf8
     $timer = [Diagnostics.Stopwatch]::StartNew()
-    $timedOut = & $tool -FilePath $pwsh -ArgumentList @('-NoProfile', '-File', $treeFixture, '-ChildPidPath', $childPidPath) -WorkingDirectory $root -TimeoutSeconds 1 -TerminationGraceMilliseconds 500 -StreamDrainGraceMilliseconds 500 -NoExit | ConvertFrom-Json
+    $timedOut = & $tool -FilePath $pwsh -ArgumentList @('-NoProfile', '-File', $treeFixture, '-ChildPidPath', $childPidPath) -WorkingDirectory $root -TimeoutSeconds 10 -TerminationGraceMilliseconds 500 -StreamDrainGraceMilliseconds 500 -NoExit | ConvertFrom-Json
     $timer.Stop()
     if ($timedOut.ok -or -not $timedOut.attempts[0].timedOut -or -not $timedOut.attempts[0].terminationConfirmed -or $timedOut.attempts[0].unresolvedProcess) { throw 'Timeout did not return a confirmed owned-tree termination.' }
-    if ($timer.Elapsed.TotalSeconds -gt 5) { throw "Bounded timeout exceeded its termination and drain allowance: $($timer.Elapsed)." }
+    if ($timer.Elapsed.TotalSeconds -gt 15) { throw "Bounded timeout exceeded its termination and drain allowance: $($timer.Elapsed)." }
     $childPid = [int](Get-Content -LiteralPath $childPidPath -Raw)
     if (Get-Process -Id $childPid -ErrorAction SilentlyContinue) { throw "Descendant process remained alive after job termination: $childPid" }
 

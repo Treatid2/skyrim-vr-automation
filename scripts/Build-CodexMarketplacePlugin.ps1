@@ -17,7 +17,7 @@ if ($destination -eq $repositoryRoot -or $repositoryRoot.StartsWith($destination
 if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination -Recurse -Force }
 New-Item -ItemType Directory -Path $destination -Force | Out-Null
 
-$rootFiles = @('AGENTS.md', 'LICENSE', 'README.md', 'toolset.manifest.json', 'CHANGELOG.md', 'PRIVACY.md', 'SUPPORT.md', 'TERMS.md')
+$rootFiles = @('.mcp.json', 'AGENTS.md', 'LICENSE', 'README.md', 'toolset.manifest.json', 'CHANGELOG.md', 'PRIVACY.md', 'SUPPORT.md', 'TERMS.md')
 foreach ($relative in $rootFiles) {
     $source = Join-Path $repositoryRoot $relative
     if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Item -LiteralPath $source -Destination (Join-Path $destination $relative) }

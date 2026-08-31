@@ -116,7 +116,10 @@ Prepare a closed task cache immediately before launching MO2:
 
 ```powershell
 .\Invoke-CSXShaderCacheCatalog.ps1 prepare `
-  -CachePath 'D:\MO2\mods\Task Cache\ShaderCache' `
+  -CachePath 'D:\MO2\overwrite\ShaderCache' `
+  -ProfilePath 'D:\MO2\profiles\Codex Task - Example\modlist.txt' `
+  -ModsPath 'D:\MO2\mods' `
+  -BindToOverwrite `
   -EvidenceDirectory 'D:\Evidence\task-id\shader-cache' `
   -ShaderCacheAbi '<exact ABI>' `
   -ShaderSourceSha256 '<exact source-tree SHA-256>' `
@@ -124,6 +127,7 @@ Prepare a closed task cache immediately before launching MO2:
   -BuildId '<build identity>' `
   -PresetSha256 '<preset SHA-256>' `
   -RequiredTags quality,full-render `
+  -RequireMaterializedOutput `
   -Confirm:$false
 ```
 
@@ -133,6 +137,25 @@ different. With no match it safely leaves the current tree in use; add
 `-RequireMatch` when a task must not proceed without a catalog baseline.
 Repeating `prepare` with the same immutable cache, evidence, and catalog
 identities reconciles and returns the existing prepared plan.
+
+With `-BindToOverwrite`, `prepare` binds the exact profile hash, mods root, and
+physical `overwrite\ShaderCache` path. After optional seeding it inventories
+all enabled providers in exact modlist priority order and copies every missing
+provider path into Overwrite. Existing Overwrite or seed files remain
+authoritative. Every copied source is checked for stability and the target is
+SHA-256 verified; complete path coverage is then written to
+`shader-cache-provider-shadow.receipt.json` together with the final prepared
+inventory and `preparedTreeSha256`. This full shadow is required because MO2
+writes modifications to the original provider of an existing virtual path;
+new paths naturally use Overwrite, but existing mod paths must first be made
+Overwrite winners. `-CacheModName` remains available for older explicitly
+bound loose-mod workflows and cannot be combined with `-BindToOverwrite`.
+
+MO2 session authorization reads this receipt and independently inventories the
+current providers. Before the first launch, the live Overwrite cache must match
+`preparedTreeSha256` exactly. A retained game cycle may add or update files in
+Overwrite, but every relaunch still requires all current provider paths to
+remain shadowed.
 
 After the game and MO2 are closed, complete the cache transaction:
 
