@@ -378,8 +378,8 @@ function assertQualificationTimeouts(scenarioCalls, matrix, variant) {
         if (!waiter) continue;
         if (call.steps.some((step) => step.label === "baseline-stress-start")) {
             baselineWaiters += 1;
-            assert(waiter.args.timeoutMs === 60000,
-                `${variant} baseline waiter does not use 60 seconds.`);
+            assert(waiter.args.timeoutMs === matrix.completionTimeoutMilliseconds,
+                `${variant} baseline waiter no longer uses the matrix deadline.`);
         } else if (call.steps.some((step) => step.label === "profile-apply")) {
             measuredWaiters += 1;
             assert(waiter.args.timeoutMs === matrix.completionTimeoutMilliseconds,

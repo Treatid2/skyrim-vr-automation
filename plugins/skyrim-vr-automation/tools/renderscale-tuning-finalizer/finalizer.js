@@ -151,6 +151,63 @@ function walk(root) {
     return files;
 }
 
+function qualificationWait(value) {
+    if (value && Array.isArray(value.content) && value.content[0] &&
+        typeof value.content[0].text === "string") {
+        return qualificationWait(JSON.parse(value.content[0].text));
+    }
+    if (value && Array.isArray(value.results)) {
+        const step = value.results.find((entry) => entry && entry.result &&
+            (entry.label === "qualification-wait" ||
+                entry.result.action === "qualification_wait"));
+        return step && step.result;
+    }
+    return value && value.action === "qualification_wait" ? value : null;
+}
+
+function validateBaselineOnlyInterruption(root, variant, runId, buildId) {
+    const liveResultPath = path.join(root, "raw", "live-result.json");
+    if (!fs.existsSync(liveResultPath)) {
+        throw new Error("baseline_interruption_result_missing");
+    }
+    const liveResult = readJson(liveResultPath);
+    if (liveResult.status !== "INTERRUPTED" || liveResult.variant !== variant ||
+        liveResult.runId !== runId) {
+        throw new Error("baseline_interruption_identity_mismatch");
+    }
+    const baselineFiles = walk(path.join(root, "raw")).filter((file) =>
+        path.basename(file) === "baseline.json" &&
+        relative(root, file).split("/").includes("baseline"));
+    if (baselineFiles.length === 0) {
+        throw new Error("baseline_interruption_receipt_missing");
+    }
+    for (const file of baselineFiles) {
+        const waiter = qualificationWait(readJson(file));
+        if (!waiter || !waiter.producer || waiter.producer.buildId !== buildId ||
+            typeof waiter.ownerId !== "string" ||
+            !waiter.ownerId.startsWith(`${runId}-`) || !waiter.baseline ||
+            !Number.isSafeInteger(waiter.baseline.stressSessionId) ||
+            waiter.baseline.stressSessionId < 1) {
+            throw new Error("baseline_interruption_receipt_mismatch");
+        }
+    }
+}
+
+function baselineOnlyMemoryConfirmation() {
+    return {
+        passesCompleted: 0,
+        cooldownMilliseconds: null,
+        boundaries: { pass1: null, cooldown: null, pass2: null },
+        deltas: null,
+        ratios: null,
+        predicateInputs: { available: false, reason: "repeat_not_completed" },
+        unavailableBoundaries: ["pass1_start", "pass1_end", "cooldown_start",
+            "cooldown_end", "pass2_start", "pass2_end"],
+        verdict: "repeat_not_completed",
+        conclusion: "no_leak_or_retention_conclusion_possible",
+    };
+}
+
 function aggregateVerdict(values) {
     if (values.includes("FAIL")) return "FAIL";
     if (values.includes("INCONCLUSIVE")) return "INCONCLUSIVE";
@@ -453,12 +510,17 @@ function report(summary) {
         `${row.task2MissingEvidence.join("; ") || "none"} |`).join("\n");
     return `# ${summary.protocol} final report\n\n` +
         `- Assay execution: **${summary.assayExecution.status}**\n` +
+        `- Transitions dispatched: **${summary.assayExecution.transitionsDispatched}/` +
+        `${summary.assayExecution.expectedTransitions}**\n` +
         `- Render verdict: **${summary.render.verdict}**\n` +
         `- Task 2/evidence: **per transition** ` +
         `(${summary.task2Evidence.counts.PASS} PASS, ` +
         `${summary.task2Evidence.counts.FAIL} FAIL, ` +
         `${summary.task2Evidence.counts.INCONCLUSIVE} INCONCLUSIVE)\n` +
-        `- Reporting completeness: **${summary.reporting.status}**\n\n` +
+        `- Reporting completeness: **${summary.reporting.status}**\n` +
+        (summary.memoryConfirmation ?
+            `- Memory confirmation: **${summary.memoryConfirmation.verdict}**\n` : "") +
+        `\n` +
         `Task 2 is deliberately not aggregated. Reporting failure does not ` +
         `rewrite the render result, and a render pass does not hide missing ` +
         `per-transition evidence. Every raw JSON value is available in ` +
@@ -490,7 +552,6 @@ function finalizeEvidence(options) {
     const rows = retained.map(({ file, value }) => transitionRow(root, file, value))
         .sort((left, right) => (left.lane || "").localeCompare(right.lane || "") ||
             left.pass - right.pass || left.ordinal - right.ordinal);
-    if (rows.length === 0) throw new Error("no_terminal_receipts");
 
     const existingSummaryPath = path.join(root, "summary.json");
     const existing = fs.existsSync(existingSummaryPath) ? readJson(existingSummaryPath) : {};
@@ -498,6 +559,18 @@ function finalizeEvidence(options) {
     const buildIds = unique([options.buildId, existing.build && existing.build.buildId]);
     if (runIds.length !== 1 || buildIds.length !== 1) {
         throw new Error("finalization_identity_ambiguous");
+    }
+    const expectedRows = options.expectedRows ??
+        (existing.assayExecution &&
+            existing.assayExecution.expectedTerminalReceipts) ??
+        (existing.counts && existing.counts.transitionsExpected) ?? rows.length;
+    if (!Number.isSafeInteger(expectedRows) || expectedRows < rows.length ||
+        expectedRows < 1) {
+        throw new Error("invalid_expected_terminal_receipts");
+    }
+    const baselineOnlyInterrupted = rows.length === 0;
+    if (baselineOnlyInterrupted) {
+        validateBaselineOnlyInterruption(root, variant, runIds[0], buildIds[0]);
     }
     for (const entry of retained) {
         const waiter = entry.value.waiter || {};
@@ -515,13 +588,13 @@ function finalizeEvidence(options) {
             throw new Error("terminal_receipt_session_missing");
         }
     }
-    const expectedRows = options.expectedRows ??
-        (existing.counts && existing.counts.transitionsDispatched) ?? rows.length;
-    const assayStatus = rows.length === expectedRows ? "COMPLETE" : "INCOMPLETE";
+    const assayStatus = baselineOnlyInterrupted ? "INTERRUPTED" :
+        rows.length === expectedRows ? "COMPLETE" : "INCOMPLETE";
     const renderVerdict = aggregateVerdict(rows.map((row) => row.renderVerdict));
     const task2Counts = verdictCounts(rows.map((row) => row.task2Verdict));
     const reportingReasons = [];
     if (assayStatus !== "COMPLETE") reportingReasons.push("terminal_receipts_incomplete");
+    if (baselineOnlyInterrupted) reportingReasons.push("baseline_only_interrupted");
     if (rows.some((row) => !row.traceComplete)) {
         reportingReasons.push("required_trace_evidence_incomplete");
     }
@@ -538,14 +611,23 @@ function finalizeEvidence(options) {
         executionStatus: assayStatus,
         renderVerdict,
         reportingStatus,
+        counts: baselineOnlyInterrupted ? {
+            ...(existing.counts || {}),
+            transitionsDispatched: 0,
+            transitionsExpected: expectedRows,
+        } : existing.counts,
         assayExecution: { status: assayStatus, terminalReceipts: rows.length,
-            expectedTerminalReceipts: expectedRows },
+            expectedTerminalReceipts: expectedRows,
+            transitionsDispatched: rows.length,
+            expectedTransitions: expectedRows },
         render: { verdict: renderVerdict },
         task2Evidence: { mode: "per_transition", counts: task2Counts,
             aggregateVerdict: "NOT_COMPUTED" },
         reporting: { status: reportingStatus, reasons: reportingReasons },
         reportingContract: { complete: reportingStatus === "COMPLETE",
             status: reportingStatus, reasons: reportingReasons },
+        memoryConfirmation: baselineOnlyInterrupted ?
+            baselineOnlyMemoryConfirmation() : existing.memoryConfirmation,
         evidenceExtraction: { complete: true,
             path: "evidence-values.csv",
             format: "rfc6901-json-pointer-long-form-csv",

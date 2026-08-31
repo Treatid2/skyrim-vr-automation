@@ -31,7 +31,6 @@ async function runRenderScaleTuningLive(context) {
         peripheryTAACenterArea: 0.3,
         peripheryTAAOuterScale: 0.7,
     });
-    const baselineCompletionTimeoutMilliseconds = 60000;
 
     function decodeEnvelope(envelope) {
         const block = envelope && envelope.content && envelope.content[0];
@@ -182,8 +181,7 @@ async function runRenderScaleTuningLive(context) {
             transitionId: identifiers.transitionId,
             ownerId: identifiers.ownerId,
             expectedCellEditorId: "WhiterunDragonsreach",
-            timeoutMs: baseline ? baselineCompletionTimeoutMilliseconds :
-                matrix.completionTimeoutMilliseconds,
+            timeoutMs: matrix.completionTimeoutMilliseconds,
             milestone: "strict",
             target: waiterTarget(target),
             foveation,

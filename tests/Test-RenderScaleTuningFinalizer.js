@@ -274,6 +274,77 @@ function createEvidenceRoot(variant = "nvidia") {
     return root;
 }
 
+function createBaselineOnlyEvidenceRoot(variant) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "rst-finalizer-baseline-"));
+    const runId = `${variant}-baseline-run`;
+    const buildId = "b".repeat(64);
+    writeJson(path.join(root, "raw", "live-result.json"), {
+        ok: false,
+        status: "INTERRUPTED",
+        variant,
+        runId,
+        lanes: [{ id: variant, status: "INTERRUPTED",
+            passes: [{ pass: 1, status: "INTERRUPTED",
+                error: "baseline_failed" }] }],
+    });
+    writeJson(path.join(root, "raw", "pass-1", "baseline", "baseline.json"), {
+        ok: true,
+        results: [{
+            label: "qualification-wait",
+            result: {
+                action: "qualification_wait",
+                ownerId: `${runId}-${variant}-1-1-b-owner`,
+                producer: { buildId },
+                baseline: { stressSessionId: 1 },
+                outcome: "timeout",
+                satisfied: false,
+            },
+        }],
+    });
+    return { root, runId, buildId };
+}
+
+function testBaselineOnlyInterruptedFinalization() {
+    for (const [variant, expectedRows] of [["nvidia", 66], ["amd", 186]]) {
+        const evidence = createBaselineOnlyEvidenceRoot(variant);
+        try {
+            const options = { ...evidence, variant, expectedRows,
+                generatedUtc: "2026-08-31T01:00:00.000Z" };
+            let result = finalizeEvidence(options);
+            assert(result.summary.assayExecution.status === "INTERRUPTED" &&
+                result.summary.assayExecution.transitionsDispatched === 0 &&
+                result.summary.assayExecution.expectedTransitions === expectedRows,
+            `${variant} baseline-only execution count was not retained.`);
+            assert(result.summary.render.verdict === "INCONCLUSIVE" &&
+                result.summary.reporting.status === "INCOMPLETE" &&
+                result.summary.reporting.reasons.includes(
+                    "baseline_only_interrupted"),
+            `${variant} baseline-only verdict separation is wrong.`);
+            assert(result.summary.memoryConfirmation.passesCompleted === 0 &&
+                result.summary.memoryConfirmation.verdict ===
+                    "repeat_not_completed" &&
+                result.summary.memoryConfirmation.unavailableBoundaries.length === 6,
+            `${variant} baseline-only memory status is incomplete.`);
+            const reportText = fs.readFileSync(path.join(evidence.root,
+                "report.md"), "utf8");
+            assert(reportText.includes(`Transitions dispatched: **0/${expectedRows}**`) &&
+                reportText.includes("Memory confirmation: **repeat_not_completed**"),
+            `${variant} baseline-only report is incomplete.`);
+            const outputs = ["report.md", "summary.json", "transitions.csv",
+                "evidence-values.csv", "receipt-index.json"];
+            const firstHashes = outputs.map((name) =>
+                sha(path.join(evidence.root, name)));
+            result = finalizeEvidence(options);
+            const secondHashes = outputs.map((name) =>
+                sha(path.join(evidence.root, name)));
+            assert(JSON.stringify(firstHashes) === JSON.stringify(secondHashes),
+                `${variant} baseline-only finalization is not deterministic.`);
+        } finally {
+            fs.rmSync(evidence.root, { recursive: true, force: true });
+        }
+    }
+}
+
 function testOfflineFinalization() {
     const root = createEvidenceRoot();
     try {
@@ -443,6 +514,7 @@ function testUnsafeEvidenceNumberFailsClosed() {
 Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testPagingResume).then(testOfflineFinalization)
     .then(testReportingSeparation).then(testAmdParity)
+    .then(testBaselineOnlyInterruptedFinalization)
     .then(testValidationLeavesEvidenceUntouched)
     .then(testUnsafeEvidenceNumberFailsClosed).then(() => {
         process.stdout.write("Render-scale tuning finalizer tests passed.\n");

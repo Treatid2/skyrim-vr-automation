@@ -113,7 +113,7 @@ no field and perform no lookup:
 | `qualification-begin` | `communityshaders.renderscale` | `{"action":"qualification_begin","transitionId":<transition-id>,"ownerId":"<owner-id>","expectedBuildId":"<build-id>"}` |
 | `qualification-dispatch` | `communityshaders.renderscale` | `{"action":"qualification_dispatch","transitionId":<transition-id>,"ownerId":"<owner-id>","startPerformanceTelemetry":false,"expectedBuildId":"<build-id>"}` |
 | `profile-apply` | `communityshaders.upscaling_api` | `{"action":"apply","expectedBuildId":"<build-id>","expectedStateRevision":<state-revision>,"target":<api-target>,"purpose":"direct","persistence":"runtime_only","clientId":"<client-id>","commandId":"<command-id>","reason":"render-scale tuning baseline"}` |
-| `qualification-wait` | `communityshaders.renderscale` | `{"action":"qualification_wait","transitionId":<transition-id>,"ownerId":"<owner-id>","expectedCellEditorId":"WhiterunDragonsreach","timeoutMs":60000,"milestone":"strict","target":<qualification-target>,"foveation":<foveation>,"expectedBuildId":"<build-id>"}` |
+| `qualification-wait` | `communityshaders.renderscale` | `{"action":"qualification_wait","transitionId":<transition-id>,"ownerId":"<owner-id>","expectedCellEditorId":"WhiterunDragonsreach","timeoutMs":30000,"milestone":"strict","target":<qualification-target>,"foveation":<foveation>,"expectedBuildId":"<build-id>"}` |
 
 Start the baseline with one synchronous fail-closed scenario containing six
 labeled tool steps in this exact order: `baseline-stress-reset`,
@@ -121,7 +121,7 @@ labeled tool steps in this exact order: `baseline-stress-reset`,
 `profile-apply`, and `qualification-wait`. This is the only pre-baseline reset.
 The apply immediately follows dispatch, and the strict target-correlated waiter
 immediately follows apply inside the same server-owned scenario. Pass the full
-dispatch-relative `timeoutMs: 60000`; DevBench measures it from
+dispatch-relative `timeoutMs: 30000`; DevBench measures it from
 `qualification_dispatch`. Never calculate or pass a client-side remaining
 timeout. Do not inspect, validate, persist, or comment on the scenario response
 until the server has executed the waiter and returned the complete six-step
@@ -277,6 +277,12 @@ retain false, zero, null, strings, numbers, and explicit empty arrays/objects.
 This export makes every retained producer value queryable without flattening
 different timeline facets together or treating a terminal delta as a missing
 mutation-boundary event.
+
+When the live runner is interrupted at baseline, retain `raw/live-result.json`
+and the exact baseline waiter receipt. The offline finalizer validates their
+run/build ownership and emits an `INTERRUPTED` zero-of-expected report with
+reporting `INCOMPLETE` and memory `repeat_not_completed`; it performs no live
+DevBench call and does not require a measured transition receipt.
 
 Keep Task 2 classifications per transition. Report counts for `PASS`, `FAIL`,
 and `INCONCLUSIVE`, but never calculate an aggregate Task 2 or overall verdict.

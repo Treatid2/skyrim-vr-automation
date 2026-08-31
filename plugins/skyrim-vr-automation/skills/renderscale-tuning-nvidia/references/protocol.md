@@ -64,7 +64,7 @@ snapshot's exact `stateRevision`, exact Build ID, unique baseline client and
 command IDs, `purpose: direct`, and `persistence: runtime_only`.
 
 The final waiter step uses the same owner and transition, the full
-dispatch-relative `timeoutMs: 60000`, exact target and foveation fixture, and
+dispatch-relative `timeoutMs: 30000`, exact target and foveation fixture, and
 `milestone: strict`; never calculate or pass a client-side remaining budget.
 Do not add an independent operation wait. After the complete scenario returns,
 require
@@ -535,6 +535,12 @@ transition. It writes `summary.json`, `transitions.csv`,
 after validation. Do not hash or render per
 row. An evidence root containing only `summary.json` and `transitions.csv` is
 incomplete and cannot support a ledger append.
+
+If the live runner stops at baseline before any measured row, retain
+`raw/live-result.json` and the exact baseline waiter receipt. Run the same
+offline finalizer with the exact run ID, Build ID, and expected row count. It
+must emit `INTERRUPTED`, zero dispatched rows, reporting `INCOMPLETE`, and
+memory `repeat_not_completed` without issuing another DevBench call.
 
 Keep `assayExecution`, `render`, per-transition `task2Evidence`, and `reporting`
 independent. A finalization failure sets reporting to `INCOMPLETE` without
