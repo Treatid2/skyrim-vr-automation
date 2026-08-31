@@ -414,7 +414,11 @@ public-API mutation was blocked. Use the producer's authoritative
 `replacementMutationAdmission` status, reason mask, and reasons.
 
 Retain `presentationCycleAudit`, all disposition counters, and the four
-decisive violation counters with their first-offender identity. A partial eye
+decisive violation counters with their first-offender identity. A coherent
+post-mutation `PresentationStretch` during transition cooldown remains visible
+in the raw disposition and mixed-or-unproven counters, but is not a decisive
+`postMutationUnprovenStereoSubmitted` violation. Pre-mutation, mixed,
+boundary-spanning, or unprotected stretch remains decisive. A partial eye
 observation is not a submitted mixed stereo pair. Render and evidence verdicts
 remain separate. Task 2 evidence is `PASS` only when every required facet is
 present, the authoritative audit is complete, and all four counters are zero;

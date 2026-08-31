@@ -296,6 +296,16 @@ async function runRenderScaleTuningLive(context) {
         return Number.isSafeInteger(value) && value > 0;
     }
 
+    function nonNegativeInteger(value) {
+        return Number.isSafeInteger(value) && value >= 0;
+    }
+
+    function matchesMutationBoundaryGeneration(boundaryGeneration, proofGeneration) {
+        return nonNegativeInteger(boundaryGeneration) &&
+            nonNegativeInteger(proofGeneration) &&
+            (boundaryGeneration === 0 || boundaryGeneration === proofGeneration);
+    }
+
     function exactTargetProof(proof, target) {
         if (!proof || proof.proven !== true || !target) return false;
         const vendorTarget = target.method === "dlss" || target.method === "fsr";
@@ -309,7 +319,6 @@ async function runRenderScaleTuningLive(context) {
         const identifiers = [
             proof.requestId,
             proof.transitionEpoch,
-            proof.contractGeneration,
             proof.resourcePublicationGeneration,
             proof.resourceRevision,
             proof.deviceIdentity,
@@ -319,7 +328,10 @@ async function runRenderScaleTuningLive(context) {
             proof.displayHeight,
         ];
         if (!identifiers.every(positiveInteger)) return false;
-        if (vendorTarget && !positiveInteger(proof.providerRuntimeGeneration)) {
+        const generationValidator = target.renderScaleMode ?
+            positiveInteger : nonNegativeInteger;
+        if (!generationValidator(proof.contractGeneration)) return false;
+        if (vendorTarget && !generationValidator(proof.providerRuntimeGeneration)) {
             return false;
         }
         return target.renderScaleMode ?
@@ -370,9 +382,9 @@ async function runRenderScaleTuningLive(context) {
             positiveInteger(notRequiredEvidence.replacementTransitionEpoch) &&
             notRequiredProof.transitionEpoch ===
                 notRequiredEvidence.replacementTransitionEpoch &&
-            positiveInteger(notRequiredEvidence.replacementContractGeneration) &&
-            notRequiredProof.contractGeneration ===
-                notRequiredEvidence.replacementContractGeneration &&
+            matchesMutationBoundaryGeneration(
+                notRequiredEvidence.replacementContractGeneration,
+                notRequiredProof.contractGeneration) &&
             positiveInteger(notRequiredEvidence.replacementDeviceIdentity) &&
             notRequiredProof.deviceIdentity ===
                 notRequiredEvidence.replacementDeviceIdentity;
@@ -432,7 +444,7 @@ async function runRenderScaleTuningLive(context) {
                 boundary.ownershipToken !== audit.ownerToken ||
                 !positiveInteger(boundary.replacementRequestId) ||
                 !positiveInteger(boundary.replacementTransitionEpoch) ||
-                !positiveInteger(boundary.replacementContractGeneration) ||
+                !nonNegativeInteger(boundary.replacementContractGeneration) ||
                 !positiveInteger(boundary.replacementDeviceIdentity) ||
                 !positiveInteger(boundary.frame) ||
                 !positiveInteger(boundary.tick) ||
@@ -498,8 +510,9 @@ async function runRenderScaleTuningLive(context) {
                     boundary.replacementRequestId ||
                 firstNewProof.transitionEpoch !==
                     boundary.replacementTransitionEpoch ||
-                firstNewProof.contractGeneration !==
-                    boundary.replacementContractGeneration ||
+                !matchesMutationBoundaryGeneration(
+                    boundary.replacementContractGeneration,
+                    firstNewProof.contractGeneration) ||
                 firstNewProof.deviceIdentity !==
                     boundary.replacementDeviceIdentity) {
                 producerInvalid.push("first_new_generation_owner_mismatch");

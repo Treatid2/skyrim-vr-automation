@@ -530,6 +530,75 @@ async function runNvidiaProjectionTransform(receiptTransform) {
 }
 
 async function testEvidenceVerdicts() {
+    const unpublishedBoundaryGeneration = await runNvidiaProjectionTransform(
+        (receipt, context) => {
+            if (!context.baseline) {
+                receipt.replacementTimeline.firstPhysicalMutation
+                    .replacementContractGeneration = 0;
+            }
+            return receipt;
+        });
+    assert(unpublishedBoundaryGeneration.every((row) =>
+        row.evidenceVerdict === "PASS" &&
+        !row.producerInvalidEvidence.includes(
+            "physical_mutation_boundary_owner_mismatch") &&
+        !row.producerInvalidEvidence.includes(
+            "first_new_generation_owner_mismatch")),
+    "An unpublished boundary generation did not correlate with its later proof.");
+
+    const fixedNativeGenerationZero = await runNvidiaProjectionTransform(
+        (receipt, context) => {
+            if (!context.baseline &&
+                receipt.upscalingSnapshot.stable.renderScaleMode === false) {
+                receipt.replacementTimeline.firstPhysicalMutation
+                    .replacementContractGeneration = 0;
+                receipt.replacementTimeline.firstNewGenerationProven
+                    .presentationProof.contractGeneration = 0;
+                receipt.replacementTimeline.firstNewGenerationProven
+                    .presentationProof.providerRuntimeGeneration = 0;
+            }
+            return receipt;
+        });
+    const fixedNativeRows = fixedNativeGenerationZero.filter((row) =>
+        row.target.renderScaleMode === false);
+    assert(fixedNativeRows.length > 0 && fixedNativeRows.every((row) =>
+        row.evidenceVerdict === "PASS" &&
+        row.producerInvalidEvidence.length === 0),
+    "A fixed native target rejected its valid zero generation proof.");
+
+    const scaledGenerationZero = await runNvidiaProjectionTransform(
+        (receipt, context) => {
+            if (!context.baseline &&
+                receipt.upscalingSnapshot.stable.renderScaleMode === true) {
+                receipt.replacementTimeline.firstPhysicalMutation
+                    .replacementContractGeneration = 0;
+                receipt.replacementTimeline.firstNewGenerationProven
+                    .presentationProof.contractGeneration = 0;
+            }
+            return receipt;
+        });
+    const scaledRows = scaledGenerationZero.filter((row) =>
+        row.target.renderScaleMode === true);
+    assert(scaledRows.length > 0 && scaledRows.every((row) =>
+        row.evidenceVerdict === "INCONCLUSIVE" &&
+        row.producerInvalidEvidence.includes(
+            "first_new_generation_target_mismatch")),
+    "A scaled target accepted a zero contract generation.");
+
+    const publishedBoundaryGenerationMismatch = await runNvidiaProjectionTransform(
+        (receipt, context) => {
+            if (!context.baseline) {
+                receipt.replacementTimeline.firstPhysicalMutation
+                    .replacementContractGeneration = 8;
+            }
+            return receipt;
+        });
+    assert(publishedBoundaryGenerationMismatch.every((row) =>
+        row.evidenceVerdict === "INCONCLUSIVE" &&
+        row.producerInvalidEvidence.includes(
+            "first_new_generation_owner_mismatch")),
+    "A published boundary generation mismatch was accepted.");
+
     const missingMutation = await runNvidiaProjectionTransform((receipt, context) => {
         if (!context.baseline) delete receipt.replacementTimeline.firstPhysicalMutation;
         return receipt;
@@ -585,6 +654,40 @@ async function testEvidenceVerdicts() {
         row.mutationNotRequiredProven === true &&
         row.first_physical_mutation_ === "not_required"),
     "Explicit mutation not_required was not accepted.");
+
+    const nativeNotRequiredGenerationZero = await runNvidiaProjectionTransform(
+        (receipt, context) => {
+            if (!context.baseline &&
+                receipt.upscalingSnapshot.stable.renderScaleMode === false) {
+                receipt.replacementTimeline.mutationExpectation = "not_required";
+                receipt.replacementTimeline.mutationExpectationReason =
+                    "native_contract_reuse";
+                delete receipt.replacementTimeline.firstPhysicalMutation;
+                delete receipt.replacementTimeline.firstPostMutation;
+                delete receipt.replacementTimeline.firstNewGenerationProven;
+                receipt.presentationCycleAudit.firstExactNewGenerationCycles = 0;
+                receipt.replacementTimeline.terminal.presentationProof.contractGeneration = 0;
+                receipt.replacementTimeline.terminal.presentationProof
+                    .providerRuntimeGeneration = 0;
+                receipt.replacementTimeline.mutationNotRequiredTerminalProof = {
+                    ...receipt.replacementTimeline.terminal,
+                    stressSessionId: receipt.baseline.stressSessionId,
+                    qualificationTransitionId: receipt.transitionId,
+                    ownershipToken: receipt.presentationCycleAudit.ownerToken,
+                    replacementRequestId: 9,
+                    replacementTransitionEpoch: 9,
+                    replacementContractGeneration: 0,
+                    replacementDeviceIdentity: 100,
+                };
+            }
+            return receipt;
+        });
+    const nativeNotRequiredRows = nativeNotRequiredGenerationZero.filter((row) =>
+        row.target.renderScaleMode === false);
+    assert(nativeNotRequiredRows.length > 0 && nativeNotRequiredRows.every((row) =>
+        row.evidenceVerdict === "PASS" && row.mutationNotRequiredProven === true &&
+        row.first_physical_mutation_ === "not_required"),
+    "A native not_required receipt rejected its valid zero generation proof.");
 
     const notRequiredWithoutReason = await runNvidiaProjectionTransform((receipt, context) => {
         if (!context.baseline) {
@@ -742,7 +845,7 @@ async function testEvidenceVerdicts() {
             "first_exact_new_generation_proof_missing")),
     "Audit/timeline replacement proof disagreement was not producer-invalid.");
 
-    const postBoundaryStretch = await runNvidiaProjectionTransform((receipt, context) => {
+    const unprotectedPostBoundaryStretch = await runNvidiaProjectionTransform((receipt, context) => {
         if (!context.baseline) {
             receipt.presentationCycleAudit.violations.postMutationUnprovenStereoSubmitted = 1;
             receipt.presentationCycleAudit.violations.firstPostMutationUnprovenStereoSubmitted = {
@@ -755,10 +858,10 @@ async function testEvidenceVerdicts() {
         }
         return receipt;
     });
-    assert(postBoundaryStretch.every((row) => row.evidenceVerdict === "FAIL" &&
+    assert(unprotectedPostBoundaryStretch.every((row) => row.evidenceVerdict === "FAIL" &&
         row.genuineInvariantViolations.includes(
             "postMutationUnprovenStereoSubmitted")),
-    "A real post-boundary PresentationStretch was downgraded.");
+    "An unprotected post-boundary PresentationStretch was downgraded.");
 
     const wrongOrigin = await runNvidiaProjectionTransform((receipt, context) => {
         if (!context.baseline) {
