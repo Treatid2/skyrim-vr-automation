@@ -98,13 +98,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
         if (step.label === "baseline-stress-start" || step.label === "measured-stress-start") {
             stressSession += 1;
             stressActive = true;
-            revision += 2;
-            return {
-                status: {
-                    session: { id: stressSession, active: true },
-                    controller: { revision },
-                },
-            };
+            return { status: { session: { id: stressSession, active: true } } };
         }
         if (args.action === "stop") {
             stressActive = false;
@@ -171,20 +165,8 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
             cpuActive = true;
             gpuActive = true;
         }
-        if (applyStep && applyStep.args.reason !== "render-scale tuning baseline") {
+        if (applyStep && !args.steps.some((step) => step.label === "baseline-stress-start")) {
             transitionOrdinal += 1;
-        }
-        if (applyStep && applyStep.args.expectedStateRevision !== revision) {
-            return envelope({
-                ok: false,
-                aborted: true,
-                stepsRun: args.steps.findIndex((step) => step === applyStep) + 1,
-                results: [{
-                    label: "profile-apply",
-                    ok: false,
-                    error: "state_revision_mismatch",
-                }],
-            });
         }
         const results = args.steps.map((step) => {
             if (step.wait !== undefined) return { kind: "wait", ms: step.wait };
@@ -361,8 +343,8 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
                 if (entry.label === "qualification-wait") {
                     entry.result = receiptTransform(entry.result, {
                         transitionOrdinal,
-                        baseline: applyStep &&
-                            applyStep.args.reason === "render-scale tuning baseline",
+                        baseline: args.steps.some((step) =>
+                            step.label === "baseline-stress-start"),
                     });
                 }
             }
@@ -399,8 +381,7 @@ function assertQualificationTimeouts(scenarioCalls, matrix, variant) {
     for (const call of scenarioCalls) {
         const waiter = call.steps.find((step) => step.label === "qualification-wait");
         if (!waiter) continue;
-        const apply = call.steps.find((step) => step.label === "profile-apply");
-        if (apply && apply.args.reason === "render-scale tuning baseline") {
+        if (call.steps.some((step) => step.label === "baseline-stress-start")) {
             baselineWaiters += 1;
             assert(waiter.args.timeoutMs === matrix.completionTimeoutMilliseconds,
                 `${variant} baseline waiter no longer uses the matrix deadline.`);
@@ -439,24 +420,31 @@ function assertRevisionFencing(scenarioCalls, variant) {
     const mutationCalls = scenarioCalls.filter((call) =>
         call.steps.some((step) => step.label === "profile-apply"));
     const baselineCalls = mutationCalls.filter((call) =>
-        call.steps.find((step) => step.label === "profile-apply").args.reason ===
-            "render-scale tuning baseline");
+        call.steps.some((step) => step.label === "baseline-stress-start"));
     const measuredCalls = mutationCalls.filter((call) =>
-        call.steps.find((step) => step.label === "profile-apply").args.reason !==
-            "render-scale tuning baseline");
+        !call.steps.some((step) => step.label === "baseline-stress-start"));
     assert(baselineCalls.length > 0, `${variant} has no baseline apply.`);
+    const expectedBaselineLabels = [
+        "baseline-stress-reset",
+        "baseline-stress-start",
+        "qualification-begin",
+        "qualification-dispatch",
+        "profile-apply",
+        "qualification-wait",
+    ];
+    assert(baselineCalls.every((call) =>
+        JSON.stringify(call.steps.map((step) => step.label)) ===
+            JSON.stringify(expectedBaselineLabels)),
+    `${variant} baseline no longer uses the single six-step scenario.`);
     assert(mutationCalls.every((call) => {
         const args = call.steps.find((step) => step.label === "profile-apply").args;
         return typeof args.clientId === "string" && args.clientId.length > 0 &&
             typeof args.commandId === "string" && args.commandId.length > 0;
     }), `${variant} apply lost its required client or command identifier.`);
-    assert(baselineCalls.every((call) => Number.isInteger(
-        call.steps.find((step) => step.label === "profile-apply").args
-            .expectedStateRevision)),
-    `${variant} baseline apply lost its post-stress revision fence.`);
-    assert(baselineCalls.every((call) => !call.steps.some((step) =>
-        step.label === "baseline-stress-start")),
-    `${variant} baseline apply cannot consume a revision produced later in its scenario.`);
+    assert(baselineCalls.every((call) => !Object.hasOwn(
+        call.steps.find((step) => step.label === "profile-apply").args,
+        "expectedStateRevision")),
+    `${variant} baseline reused a revision captured before stress setup.`);
     assert(measuredCalls.length > 0, `${variant} has no measured apply.`);
     assert(measuredCalls.every((call) => Number.isInteger(
         call.steps.find((step) => step.label === "profile-apply").args

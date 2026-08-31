@@ -228,7 +228,14 @@ async function runRenderScaleTuningLive(context) {
 
     function qualificationSteps(boundary, target, identifiers, baseline, firstRow) {
         const steps = [];
-        if (!baseline) {
+        if (baseline) {
+            steps.push(toolStep("baseline-stress-reset", "communityshaders.renderscale", {
+                action: "reset", expectedBuildId: buildId,
+            }));
+            steps.push(toolStep("baseline-stress-start", "communityshaders.renderscale", {
+                action: "start", expectedBuildId: buildId,
+            }));
+        } else {
             steps.push({ label: "transition-pace", wait: matrix.pacingMilliseconds });
             if (variant === "nvidia" && target.method === "dlss") {
                 steps.push(toolStep("dlss-trace-reset", "communityshaders.renderscale", {
@@ -264,7 +271,7 @@ async function runRenderScaleTuningLive(context) {
         steps.push(toolStep("profile-apply", "communityshaders.upscaling_api", {
             action: "apply",
             expectedBuildId: buildId,
-            expectedStateRevision: boundary.revision,
+            ...(baseline ? {} : { expectedStateRevision: boundary.revision }),
             target,
             purpose: "direct",
             persistence: "runtime_only",
@@ -860,29 +867,7 @@ async function runRenderScaleTuningLive(context) {
         const target = targetFor(
             boundary, matrix.destinations[matrix.initialDestination], lane.configuredFsrRuntime);
         const identifiers = ids(laneIndex, pass, 0, true);
-        const stressSteps = [
-            toolStep("baseline-stress-reset", "communityshaders.renderscale", {
-                action: "reset", expectedBuildId: buildId,
-            }),
-            toolStep("baseline-stress-start", "communityshaders.renderscale", {
-                action: "start", expectedBuildId: buildId,
-            }),
-        ];
-        const stressReceiptKey = `${runId}:${lane.id}:pass-${pass}:baseline-stress`;
-        const stressResponse = await scenario(stressSteps, stressReceiptKey);
-        const stressEntries = requireScenario(
-            stressResponse.root, stressSteps, stressReceiptKey);
-        const start = stressEntries.get("baseline-stress-start");
-        const stressSessionId = start && start.status && start.status.session &&
-            start.status.session.id;
-        const stressRevision = start && start.status && start.status.controller &&
-            start.status.controller.revision;
-        if (!positiveInteger(stressSessionId) || !nonNegativeInteger(stressRevision)) {
-            throw diagnosticError("baseline_stress_receipt_invalid",
-                scenarioDiagnostic(stressResponse.root, stressSteps, stressReceiptKey));
-        }
-        const steps = qualificationSteps(
-            { ...boundary, revision: stressRevision }, target, identifiers, true, false);
+        const steps = qualificationSteps(boundary, target, identifiers, true, false);
         const receiptKey = `${runId}:${lane.id}:pass-${pass}:baseline`;
         let response;
         try {
@@ -895,6 +880,7 @@ async function runRenderScaleTuningLive(context) {
                 throw diagnosticError("baseline_receipt_unavailable",
                     scenarioFailure && scenarioFailure.diagnostic || null);
             }
+            const stressSessionId = waiter.baseline && waiter.baseline.stressSessionId;
             if (!safeTerminal(waiter, identifiers) || waiter.satisfied !== true ||
                 !waiter.milestoneTimings || !waiter.replacementTimeline) {
                 throw diagnosticError("baseline_failed",
@@ -903,6 +889,8 @@ async function runRenderScaleTuningLive(context) {
             return { boundary: terminalBoundary(waiter), stressSessionId, waiter };
         }
         const entries = resultMap(response.root);
+        const start = entries.get("baseline-stress-start");
+        const stressSessionId = start && start.status && start.status.session.id;
         const waiter = entries.get("qualification-wait");
         if (!response.root.ok || !waiter || !safeTerminal(waiter, identifiers) ||
             waiter.satisfied !== true || !waiter.milestoneTimings ||
@@ -963,15 +951,8 @@ async function runRenderScaleTuningLive(context) {
         const response = await scenario(steps, receiptKey);
         const entries = requireScenario(response.root, steps, receiptKey);
         const start = entries.get("measured-stress-start");
-        const sessionId = start && start.status && start.status.session &&
-            start.status.session.id;
-        const revision = start && start.status && start.status.controller &&
-            start.status.controller.revision;
-        if (!positiveInteger(sessionId) || !nonNegativeInteger(revision)) {
-            throw diagnosticError("measured_stress_receipt_invalid",
-                scenarioDiagnostic(response.root, steps, receiptKey));
-        }
-        return { sessionId, revision };
+        const sessionId = start.status.session.id;
+        return sessionId;
     }
 
     async function transition(boundary, lane, laneIndex, pass, row) {
@@ -1209,10 +1190,8 @@ async function runRenderScaleTuningLive(context) {
             try {
                 const base = await baseline(boundary, lane, laneIndex + 1, pass);
                 boundary = base.boundary;
-                const measuredOwner = await armOwners(
+                stressSessionId = await armOwners(
                     base, lane, laneIndex + 1, pass, passSequence > 1);
-                stressSessionId = measuredOwner.sessionId;
-                boundary = { ...boundary, revision: measuredOwner.revision };
                 for (const row of matrix.transitions) {
                     const completed = await transition(
                         boundary, lane, laneIndex + 1, pass, row);
