@@ -302,6 +302,12 @@ async function runRenderScaleTuningLive(context) {
         return steps;
     }
 
+    function optionalSafetyFactClear(facts, name) {
+        // Older producers may omit diagnostics; an explicit non-true value still fails closed.
+        return !Object.prototype.hasOwnProperty.call(facts, name) ||
+            facts[name] === true;
+    }
+
     function safeTerminal(waiter, identifiers) {
         const facts = waiter && waiter.observation && waiter.observation.facts;
         return waiter && waiter.action === "qualification_wait" &&
@@ -309,8 +315,9 @@ async function runRenderScaleTuningLive(context) {
             waiter.ownerId === identifiers.ownerId &&
             waiter.upscalingSnapshot && waiter.upscalingSnapshot.activeOperationId === 0 &&
             facts && facts.stressSession === true && facts.exactCell === true &&
-            facts.loadedInWorld === true && facts.apiOperationClear === true &&
-            facts.physicalMutationClear === true && facts.terminalClear === true;
+            facts.loadedInWorld === true && facts.terminalClear === true &&
+            optionalSafetyFactClear(facts, "apiOperationClear") &&
+            optionalSafetyFactClear(facts, "physicalMutationClear");
     }
 
     function facetProjection(facet) {

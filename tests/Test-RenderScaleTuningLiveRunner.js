@@ -674,6 +674,45 @@ async function testInformationalReasonIsNotFailure() {
     "An informational reason fabricated a failed step.");
 }
 
+async function testOptionalTerminalFacts() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const omitted = createMock(0, (receipt) => {
+        delete receipt.observation.facts.apiOperationClear;
+        delete receipt.observation.facts.physicalMutationClear;
+        return receipt;
+    });
+    const omittedResult = await runRenderScaleTuningLive({
+        ...omitted.context,
+        variant: "nvidia",
+        runId: "optional-terminal-facts",
+        buildId,
+        initialBoundary: initialBoundary(),
+        capabilities: {},
+        matrix,
+    });
+    assert(omittedResult.ok === true && omittedResult.status === "COMPLETE",
+        "Omitted optional terminal facts interrupted a strict successful assay.");
+
+    const explicitFailure = createMock(0, (receipt, context) => {
+        if (context.baseline) receipt.observation.facts.apiOperationClear = false;
+        return receipt;
+    });
+    const failedResult = await runRenderScaleTuningLive({
+        ...explicitFailure.context,
+        variant: "nvidia",
+        runId: "explicit-terminal-failure",
+        buildId,
+        initialBoundary: initialBoundary(),
+        capabilities: {},
+        matrix,
+    });
+    assert(failedResult.ok === false && failedResult.status === "INTERRUPTED" &&
+        failedResult.lanes[0].passes[0].error === "baseline_failed",
+    "An explicitly false optional terminal fact did not fail closed.");
+}
+
 async function runNvidiaProjectionTransform(receiptTransform) {
     const matrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-nvidia", "references", "matrix.v1.json")));
@@ -1246,7 +1285,8 @@ async function testEvidenceVerdicts() {
 }
 
 Promise.all([testNvidia(), testAmd(), testEvidenceVerdicts(),
-    testScenarioFailureRetention(), testInformationalReasonIsNotFailure()]).then(() => {
+    testScenarioFailureRetention(), testInformationalReasonIsNotFailure(),
+    testOptionalTerminalFacts()]).then(() => {
     process.stdout.write("Render-scale tuning live runner tests passed.\n");
 }).catch((error) => {
     process.stderr.write(`${error.stack || error}\n`);

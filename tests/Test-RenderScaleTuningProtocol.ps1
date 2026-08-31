@@ -98,7 +98,8 @@ foreach ($token in @(
     'reportedInvariantViolations', 'violationAuthority', 'boundaryOrder',
     'transitionEvidenceComplete', 'authoritative_violation_schema',
     'retainLiveResult', 'receiptKeys',
-    'facts.physicalMutationClear === true', 'facts.terminalClear === true',
+    'optionalSafetyFactClear', '"apiOperationClear"',
+    '"physicalMutationClear"', 'facts.terminalClear === true',
     'for (const row of matrix.transitions)', 'notify({'
 )) {
     Assert-Contains $runner $token 'Deterministic tuning runner'
