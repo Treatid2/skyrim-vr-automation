@@ -61,10 +61,9 @@ baseline-only stress session, `qualification_begin`, then
 `qualification_dispatch` with `startPerformanceTelemetry: false`, then the
 public API `apply` as the immediately following step, then the strict DLSS
 Hoshipa `qualification_wait` as the final step. Use the shared contract's exact
-six labels and wrapper paths. The baseline apply omits `expectedStateRevision`
-because stress and qualification advance controller state inside that same
-scenario. Bind it to the exact Build ID, unique baseline client and command
-IDs, `purpose: direct`, and `persistence: runtime_only`.
+six labels and wrapper paths. Bind the apply to the
+snapshot's exact `stateRevision`, exact Build ID, unique baseline client and
+command IDs, `purpose: direct`, and `persistence: runtime_only`.
 
 The final waiter step uses the same owner and transition, the full
 dispatch-relative `timeoutMs: 30000`, exact target and foveation fixture, and

@@ -365,7 +365,7 @@ foreach ($variant in $variants) {
         'reset then start the short', 'six baseline scenario steps',
         'one synchronous fail-closed handoff scenario',
         'coc WhiterunDragonsreach', 'communityshaders.upscaling_api',
-        '`expectedStateRevision`', '`clientId`', '`commandId`',
+        '"expectedStateRevision"', '`clientId`', '`commandId`',
         '`persistence: runtime_only`', 'server-owned 5,000 ms wait',
         '`timeoutMs: 30000`',
         'one shared 30,000 ms monotonic deadline',

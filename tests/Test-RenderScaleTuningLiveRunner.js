@@ -441,10 +441,10 @@ function assertRevisionFencing(scenarioCalls, variant) {
         return typeof args.clientId === "string" && args.clientId.length > 0 &&
             typeof args.commandId === "string" && args.commandId.length > 0;
     }), `${variant} apply lost its required client or command identifier.`);
-    assert(baselineCalls.every((call) => !Object.hasOwn(
-        call.steps.find((step) => step.label === "profile-apply").args,
-        "expectedStateRevision")),
-    `${variant} baseline reused a revision captured before stress setup.`);
+    assert(baselineCalls.every((call) => Number.isInteger(
+        call.steps.find((step) => step.label === "profile-apply").args
+            .expectedStateRevision)),
+    `${variant} baseline apply lost its state revision.`);
     assert(measuredCalls.length > 0, `${variant} has no measured apply.`);
     assert(measuredCalls.every((call) => Number.isInteger(
         call.steps.find((step) => step.label === "profile-apply").args
