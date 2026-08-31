@@ -192,8 +192,8 @@ function Get-ToolkitIdentity {
     }
     return [ordered]@{
         name = 'skyrim-vr-automation'
-        version = if ($null -ne $manifest) { [string]$manifest.version } else { $null }
-        pluginVersion = if ($null -ne $plugin) { [string]$plugin.version } else { $null }
+        version = if ($null -ne $manifest -and $manifest.PSObject.Properties['version']) { [string]$manifest.version } else { $null }
+        pluginVersion = if ($null -ne $plugin -and $plugin.PSObject.Properties['version']) { [string]$plugin.version } else { $null }
         sourceCommit = $commit
         powerShellVersion = [string]$PSVersionTable.PSVersion
     }
