@@ -35,8 +35,6 @@ async function runRenderScaleTuningLive(context) {
         performance: 5,
         ultra_performance: 6,
     });
-    const qualityName = Object.freeze(Object.fromEntries(
-        Object.entries(quality).map(([name, value]) => [value, name])));
     const foveation = Object.freeze({
         foveatedVendorDispatch: true,
         foveatedCenterArea: 0.3,
@@ -123,18 +121,18 @@ async function runRenderScaleTuningLive(context) {
         return resultMap(root);
     }
 
-    // A terminal qualification receipt uses the flat qualification snapshot.
+    // Qualification snapshots retain the public API's named enum wrappers.
     function terminalBoundary(waiter) {
         const snapshot = waiter.upscalingSnapshot;
-        const profile = snapshot.effective;
+        const profile = snapshot.profiles.effective;
         return {
             revision: snapshot.stateRevision,
             profile: {
-                method: profile.method,
-                qualityMode: qualityName[profile.qualityMode],
+                method: profile.method.name,
+                qualityMode: profile.qualityMode.name,
                 renderScaleMode: profile.renderScaleMode,
-                dlssProfile: profile.dlssProfile,
-                fsrRuntime: profile.fsrRuntime,
+                dlssProfile: profile.dlssProfile.name,
+                fsrRuntime: profile.fsrRuntime.name,
             },
         };
     }

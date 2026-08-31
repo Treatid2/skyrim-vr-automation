@@ -66,6 +66,16 @@ function flatProfile(target) {
     };
 }
 
+function wrappedProfile(target) {
+    return {
+        method: named(target.method),
+        qualityMode: named(target.qualityMode),
+        renderScaleMode: target.renderScaleMode,
+        dlssProfile: named(target.dlssProfile),
+        fsrRuntime: named(target.fsrRuntime),
+    };
+}
+
 function createMock(semanticFailureOrdinal, receiptTransform = null,
     scenarioTransform = null) {
     let revision = 1;
@@ -321,9 +331,11 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
                     upscalingSnapshot: {
                         stateRevision: revision,
                         activeOperationId: 0,
-                        requested: profile,
-                        effective: profile,
-                        stable: profile,
+                        profiles: {
+                            requested: wrappedProfile(target),
+                            effective: wrappedProfile(target),
+                            stable: wrappedProfile(target),
+                        },
                     },
                     observation: {
                         facts: {
@@ -780,7 +792,7 @@ async function testEvidenceVerdicts() {
     const fixedNativeGenerationZero = await runNvidiaProjectionTransform(
         (receipt, context) => {
             if (!context.baseline &&
-                receipt.upscalingSnapshot.stable.renderScaleMode === false) {
+                receipt.upscalingSnapshot.profiles.stable.renderScaleMode === false) {
                 receipt.replacementTimeline.firstPhysicalMutation
                     .replacementContractGeneration = 0;
                 receipt.replacementTimeline.firstNewGenerationProven
@@ -800,7 +812,7 @@ async function testEvidenceVerdicts() {
     const scaledGenerationZero = await runNvidiaProjectionTransform(
         (receipt, context) => {
             if (!context.baseline &&
-                receipt.upscalingSnapshot.stable.renderScaleMode === true) {
+                receipt.upscalingSnapshot.profiles.stable.renderScaleMode === true) {
                 receipt.replacementTimeline.firstPhysicalMutation
                     .replacementContractGeneration = 0;
                 receipt.replacementTimeline.firstNewGenerationProven
@@ -889,7 +901,7 @@ async function testEvidenceVerdicts() {
     const nativeNotRequiredGenerationZero = await runNvidiaProjectionTransform(
         (receipt, context) => {
             if (!context.baseline &&
-                receipt.upscalingSnapshot.stable.renderScaleMode === false) {
+                receipt.upscalingSnapshot.profiles.stable.renderScaleMode === false) {
                 receipt.replacementTimeline.mutationExpectation = "not_required";
                 receipt.replacementTimeline.mutationExpectationReason =
                     "native_contract_reuse";
