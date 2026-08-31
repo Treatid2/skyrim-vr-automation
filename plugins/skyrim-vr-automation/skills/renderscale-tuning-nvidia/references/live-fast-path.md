@@ -6,7 +6,10 @@ during live measurement.
 
 Use the decoded positioning snapshot as the baseline boundary. Build the
 runtime-only DLSS Hoshipa target from its effective profile names, preserving
-`dlssProfile`, and set dormant `fsrRuntime: fsr3`. Run one fail-closed scenario
+`dlssProfile`, and set dormant `fsrRuntime: fsr3` in the public apply target.
+The strict DLSS waiter target includes `dlssProfile` but omits dormant
+`fsrRuntime`; waiter targets prove only the active provider. Run one
+fail-closed scenario
 in this order: render-scale `reset`, render-scale `start`,
 `qualification_begin`, `qualification_dispatch` with
 `startPerformanceTelemetry: false`, public-API `apply`, and strict

@@ -75,7 +75,9 @@ complete configured and effective profiles, physical stable evidence, and no
 active operation. Clone the effective profile through its
 `name` fields; set only `method: fsr`,
 `qualityMode: hoshipa`, `renderScaleMode: true`, and the lane's configured
-`fsrRuntime`; preserve `dlssProfile`. Run one synchronous (`async: false`),
+`fsrRuntime`; preserve dormant `dlssProfile` in the public apply target. The
+strict FSR waiter target includes `fsrRuntime` and omits dormant
+`dlssProfile`. Run one synchronous (`async: false`),
 fail-closed mutation scenario: reset then start the short baseline-only stress
 session, then `qualification_begin`, then
 `qualification_dispatch` with
@@ -162,8 +164,10 @@ begin, dispatch, wait, and any cancellation; never reuse either pair.
    Construct its complete API target from the effective profile's `name`
    fields; mutate only `method`, `qualityMode`, and
    `renderScaleMode` from the destination. For FSR entries also set the lane's
-   configured `fsrRuntime`. Preserve `dlssProfile` and preserve the lane
-   runtime as dormant state on None and TAA entries. Record the separate
+   configured `fsrRuntime`. The public apply target preserves `dlssProfile`
+   and the lane runtime as dormant state on None and TAA entries. The strict
+   waiter target carries only active `fsrRuntime` for FSR and neither provider
+   setting for None/TAA. Record the separate
    render-scale controller applied/stable resource keys as physical telemetry;
    for a native target they must be inactive with backend `none` and retain
    that target's exact method.

@@ -520,7 +520,8 @@ foreach ($token in @(
     'reset, start, stop, and raw', 'bounded-read',
     'eErrorDuplicatedConstants` is a transition `FAIL`',
     'continue later matrix rows to preserve the error history',
-    '`fsr4_runtime` is a failure', 'Include the preserved `dlssProfile.name`'
+    '`fsr4_runtime` is a failure', 'Include the preserved `dlssProfile.name`',
+    'The strict waiter target carries only the active provider setting'
 )) {
     Assert-Contains $nvidiaProtocol $token 'NVIDIA adversarial guard'
 }
@@ -529,6 +530,8 @@ $amd = Get-Content -LiteralPath (Join-Path $repositoryRoot 'skills\renderscale-t
 Assert-True ($amd.adapterVendor -eq 'amd') 'AMD matrix vendor is wrong.'
 Assert-True ($amd.initialDestination -eq 'fsr_hoshipa') 'AMD baseline is wrong.'
 Assert-Profile $amd.destinations.fsr_native_aa 'fsr' 'native_aa' $false 'AMD FSR Native AA'
+$amdProtocol = Get-Content -LiteralPath (Join-Path $repositoryRoot 'skills\renderscale-tuning-amd\references\protocol.md') -Raw
+Assert-Contains $amdProtocol 'The strict waiter target carries only active `fsrRuntime` for FSR' 'AMD provider target separation'
 $lanes = @($amd.lanes)
 Assert-True (($lanes.id -join ',') -eq 'explicit_fsr4,explicit_fsr3,fsr4_to_fsr3_fallback') 'AMD lanes are wrong.'
 Assert-True ($lanes[0].configuredFsrRuntime -eq 'fsr4' -and (@($lanes[0].expectedBackends) -join ',') -eq 'fsr4_runtime') 'Explicit FSR4 lane is wrong.'

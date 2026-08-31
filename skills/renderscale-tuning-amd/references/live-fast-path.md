@@ -7,7 +7,9 @@ during live measurement.
 Select runnable lanes from the decoded positioning capabilities and use the
 decoded positioning snapshot as the first baseline boundary. For each runnable
 lane, build the runtime-only FSR Hoshipa target from the effective profile
-names, preserving `dlssProfile`, with the lane's configured FSR runtime. Run
+names, preserving `dlssProfile`, with the lane's configured FSR runtime. Use
+the complete public apply target, but omit dormant `dlssProfile` from the
+strict FSR waiter target; waiter targets prove only the active provider. Run
 one fail-closed scenario in this order: render-scale `reset`, render-scale
 `start`, `qualification_begin`, `qualification_dispatch` with
 `startPerformanceTelemetry: false`, public-API `apply`, and strict

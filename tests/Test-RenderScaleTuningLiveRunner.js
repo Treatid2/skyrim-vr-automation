@@ -395,6 +395,27 @@ function assertQualificationTimeouts(scenarioCalls, matrix, variant) {
     assert(measuredWaiters > 0, `${variant} did not execute a measured waiter.`);
 }
 
+function assertProviderTargetSeparation(scenarioCalls, variant) {
+    const mutationCalls = scenarioCalls.filter((call) =>
+        call.steps.some((step) => step.label === "profile-apply"));
+    assert(mutationCalls.length > 0, `${variant} has no profile applies.`);
+    for (const call of mutationCalls) {
+        const applyTarget = call.steps.find((step) =>
+            step.label === "profile-apply").args.target;
+        const waiterTarget = call.steps.find((step) =>
+            step.label === "qualification-wait").args.target;
+        assert(typeof applyTarget.dlssProfile === "string" &&
+            typeof applyTarget.fsrRuntime === "string",
+        `${variant} public apply target lost dormant provider state.`);
+        assert((waiterTarget.dlssProfile !== undefined) ===
+            (applyTarget.method === "dlss"),
+        `${variant} waiter did not scope dlssProfile to active DLSS.`);
+        assert((waiterTarget.fsrRuntime !== undefined) ===
+            (applyTarget.method === "fsr"),
+        `${variant} waiter did not scope fsrRuntime to active FSR.`);
+    }
+}
+
 async function testNvidia() {
     const matrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-nvidia", "references", "matrix.v1.json")));
@@ -410,6 +431,7 @@ async function testNvidia() {
     });
     assert(result.ok === true && result.status === "COMPLETE", "NVIDIA mock run did not complete.");
     assertQualificationTimeouts(mock.scenarioCalls, matrix, "NVIDIA");
+    assertProviderTargetSeparation(mock.scenarioCalls, "NVIDIA");
     assert(result.lanes[0].passes.length === 2, "NVIDIA mock did not run two passes.");
     assert(result.lanes[0].passes.every((pass) => pass.rows.length === 33), "NVIDIA mock row count is wrong.");
     assert(mock.notifications.length === 66, "NVIDIA progress count is wrong.");
@@ -486,6 +508,7 @@ async function testAmd() {
     });
     assert(result.ok === true && result.status === "COMPLETE", "AMD mock run did not complete.");
     assertQualificationTimeouts(mock.scenarioCalls, matrix, "AMD");
+    assertProviderTargetSeparation(mock.scenarioCalls, "AMD");
     const fsr3 = result.lanes.find((lane) => lane.id === "explicit_fsr3");
     const fallback = result.lanes.find((lane) => lane.id === "fsr4_to_fsr3_fallback");
     assert(fsr3 && fsr3.passes.length === 2, "AMD FSR3 lane did not run two passes.");

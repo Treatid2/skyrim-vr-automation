@@ -53,7 +53,9 @@ and effective profiles, physical stable evidence, and no active operation.
 Clone the effective profile through its
 `name` fields, set only `method: dlss`,
 `qualityMode: hoshipa`, `renderScaleMode: true`, and dormant
-`fsrRuntime: fsr3`, and preserve `dlssProfile`. Run one synchronous
+`fsrRuntime: fsr3`, and preserve `dlssProfile` in the public apply target.
+The strict waiter target includes only the active DLSS provider setting and
+must omit dormant `fsrRuntime`. Run one synchronous
 (`async: false`), fail-closed mutation scenario: reset then start the short
 baseline-only stress session, `qualification_begin`, then
 `qualification_dispatch` with `startPerformanceTelemetry: false`, then the
@@ -134,8 +136,10 @@ begin, dispatch, wait, and any cancellation; never reuse either pair.
    Construct the complete API target from the effective profile's `name`
    fields; mutate only `method`, `qualityMode`, and
    `renderScaleMode` from the destination. For FSR entries also set
-   `fsrRuntime: fsr3`. Preserve `dlssProfile` and preserve dormant
-   `fsrRuntime` on None, TAA, DLAA, and DLSS entries. Record the separate
+   `fsrRuntime: fsr3`. The public apply target preserves `dlssProfile` and
+   dormant `fsrRuntime` on None, TAA, DLAA, and DLSS entries. The strict
+   waiter target carries only the active provider setting: `dlssProfile` for
+   DLSS/DLAA, `fsrRuntime` for FSR, and neither for None/TAA. Record the separate
    render-scale controller applied/stable resource keys as physical telemetry;
    for a native target they must be inactive with backend `none` and retain
    that target's exact method.
