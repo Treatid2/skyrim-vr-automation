@@ -74,7 +74,9 @@ foreach ($token in @(
     'function evidenceValues', 'evidence-values.csv',
     'rfc6901-json-pointer-long-form-csv',
     'evidence_numeric_value_not_lossless', 'delete summary.overallVerdict',
-    'per_transition', 'dispatch_left_generation'
+    'per_transition', 'dispatch_left_generation',
+    'phaseCounterAuthorityStatus', 'reportedTask2Violations',
+    'producer_invalid_evidence'
 )) {
     Assert-Contains $finalizer $token 'Shared tuning finalizer'
 }
@@ -90,6 +92,9 @@ foreach ($token in @(
     'action: "dlss_trace_read"', 'traceReset:', 'traceStart:', 'traceRead:',
     'retainAmdTraceCapability', 'amd:dlss-trace-capability',
     'transitionProjection', 'waiter.cleanupDrained === true',
+    'scenarioDiagnostic', 'scenarioReceiptKey', 'failedStep',
+    'firstUnreportedStep', 'phaseCounterAuthorityStatus',
+    'reportedInvariantViolations', 'violationAuthority', 'boundaryOrder',
     'facts.physicalMutationClear === true', 'facts.terminalClear === true',
     'for (const row of matrix.transitions)', 'notify({'
 )) {
@@ -122,6 +127,8 @@ foreach ($token in @(
     'terminal `qualification-wait` receipt is the transition boundary',
     'Do not invent another previous-transition safety gate',
     '`store()` that exact terminal receipt', 'return only a compact', '`text()`',
+    'Store the complete scenario envelope', '`failedStep`',
+    '`firstUnreportedStep`', 'never invent that it failed',
     'complete measured pass in that one live orchestration cell',
     '`notify()`', '`yield_control()`',
     'sole server-owned `wait` of exactly 5,000 ms',
@@ -412,6 +419,8 @@ foreach ($variant in $variants) {
         '`replacementTimeline`', '`presentationCycleAudit`',
         '`preparationAdmission: not_applicable`',
         '`replacementMutationAdmission`', '`mutationExpectation`',
+        '`MATCHED`, `MISMATCHED`, or', 'reported pipeline observation',
+        'Never rewrite a mismatched counter to zero',
         '`dispatch_`', '`blocked_pre_mutation_`', '`last_pre_mutation_`',
         '`first_physical_mutation_`', '`first_post_mutation_`',
         '`first_new_generation_proven_`', '`terminal_`',

@@ -66,7 +66,8 @@ function flatProfile(target) {
     };
 }
 
-function createMock(semanticFailureOrdinal, receiptTransform = null) {
+function createMock(semanticFailureOrdinal, receiptTransform = null,
+    scenarioTransform = null) {
     let revision = 1;
     let stressSession = 0;
     let stressActive = false;
@@ -211,6 +212,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null) {
             return {
                 label: step.label,
                 result: {
+                    schemaRevision: 14,
                     action: "qualification_wait",
                     transitionId: waitStep.args.transitionId,
                     ownerId: waitStep.args.ownerId,
@@ -291,6 +293,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null) {
                         retentionOverflow: false,
                         ownerTransitionId: waitStep.args.transitionId,
                         ownerToken: 1,
+                        eyeObservations: 2,
                         partialEyeObservations: 0,
                         incompleteStereoCycles: 0,
                         firstExactNewGenerationCycles: 1,
@@ -346,12 +349,14 @@ function createMock(semanticFailureOrdinal, receiptTransform = null) {
                 }
             }
         }
-        return envelope({
+        const root = {
             ok: true,
             aborted: false,
             stepsRun: args.steps.length,
             results,
-        });
+        };
+        return envelope(scenarioTransform ?
+            scenarioTransform(root, args, { transitionOrdinal }) : root);
     }
 
     return {
@@ -510,6 +515,59 @@ async function testAmd() {
     const amdTransitionTrace = mock.scenarioCalls.some((call) =>
         call.steps.some((step) => step.label === "dlss-trace-start"));
     assert(amdTransitionTrace === false, "AMD matrix started a per-row DLSS trace.");
+}
+
+async function testScenarioFailureRetention() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    let injected = false;
+    const mock = createMock(0, null, (root, args) => {
+        if (injected || !args.steps.some((step) =>
+            step.label === "profiler-clear-history") ||
+            args.steps.some((step) => step.label === "baseline-stress-start")) {
+            return root;
+        }
+        injected = true;
+        const results = root.results.slice(0, 3);
+        results[2] = {
+            label: "profiler-clear-history",
+            ok: false,
+            error: "synthetic_profiler_failure",
+            result: { ok: false, error: "synthetic_profiler_failure" },
+        };
+        return { ...root, ok: false, aborted: true, stepsRun: 3, results };
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "nvidia",
+        runId: "scenario-failure",
+        buildId,
+        initialBoundary: initialBoundary(),
+        capabilities: {},
+        matrix,
+    });
+    assert(result.ok === false && result.status === "INTERRUPTED",
+        "A failed scenario did not interrupt the live assay.");
+    const pass = result.lanes[0].passes[0];
+    assert(pass.error === "transition_scenario_failed" && pass.failure &&
+        pass.failure.failedStep === "profiler-clear-history" &&
+        pass.failure.reportedError === "synthetic_profiler_failure" &&
+        pass.failure.firstUnreportedStep === "qualification-dispatch",
+    "The compact live failure omitted the producer-reported step or boundary.");
+    const receiptKey =
+        "scenario-failure:nvidia:pass-1:transition-1:scenario";
+    const rawEnvelope = mock.stores.get(receiptKey);
+    assert(rawEnvelope, "The exact failed scenario envelope was not retained.");
+    const raw = JSON.parse(rawEnvelope.content[0].text);
+    assert(raw.ok === false && raw.results[2].error ===
+        "synthetic_profiler_failure",
+    "The retained failed scenario envelope was rewritten.");
+    const retained = mock.stores.get(
+        "scenario-failure:nvidia:pass-1:transition-1");
+    assert(retained.scenarioReceiptKey === receiptKey &&
+        retained.scenario.failedStep === "profiler-clear-history",
+    "The compact transition receipt is not linked to its exact scenario evidence.");
 }
 
 async function runNvidiaProjectionTransform(receiptTransform) {
@@ -798,6 +856,107 @@ async function testEvidenceVerdicts() {
         row.genuineInvariantViolations.includes("postMutationOldGenerationPresented")),
     "Exact Task 2 violation was not classified FAIL.");
 
+    const unownedViolation = await runNvidiaProjectionTransform((receipt, context) => {
+        if (!context.baseline) {
+            receipt.replacementTimeline.firstPhysicalMutation.ownershipToken = 2;
+            receipt.presentationCycleAudit.violations
+                .postMutationOldGenerationPresented = 1;
+            receipt.presentationCycleAudit.violations
+                .firstPostMutationOldGenerationPresented = {
+                    frame: 13,
+                    qpcTick: 13,
+                    disposition: "exact_vendor_evaluation",
+                    submitted: true,
+                };
+        }
+        return receipt;
+    });
+    assert(unownedViolation.every((row) =>
+        row.evidenceVerdict === "INCONCLUSIVE" &&
+        row.phaseCountersAuthoritative === false &&
+        row.phaseCounterAuthorityStatus === "MISMATCHED" &&
+        row.phaseCounterAuthorityReasons.includes(
+            "boundary_audit_token_mismatch") &&
+        row.reportedInvariantViolations.includes(
+            "postMutationOldGenerationPresented") &&
+        row.genuineInvariantViolations.length === 0 &&
+        row.producerInvalidEvidence.includes(
+            "physical_mutation_boundary_owner_mismatch")),
+    "An unowned phase counter was promoted into a false pipeline failure.");
+
+    const missingFirstOffender = await runNvidiaProjectionTransform(
+        (receipt, context) => {
+            if (!context.baseline) {
+                receipt.presentationCycleAudit.violations
+                    .preMutationStretchWithoutMutation = 1;
+            }
+            return receipt;
+        });
+    assert(missingFirstOffender.every((row) =>
+        row.evidenceVerdict === "INCONCLUSIVE" &&
+        row.phaseCounterAuthorityStatus === "INCOMPLETE" &&
+        row.phaseCountersAuthoritative === false &&
+        row.reportedInvariantViolations.includes(
+            "preMutationStretchWithoutMutation") &&
+        row.violationAuthority.preMutationStretchWithoutMutation.status ===
+            "INCOMPLETE" &&
+        row.genuineInvariantViolations.length === 0 &&
+        row.producerInvalidEvidence.includes(
+            "preMutationStretchWithoutMutation_first_offender_missing")),
+    "A counter without its first-offender receipt became false evidence.");
+
+    const preBoundaryConflict = await runNvidiaProjectionTransform(
+        (receipt, context) => {
+            if (!context.baseline) {
+                receipt.presentationCycleAudit.violations
+                    .preMutationStretchWithoutMutation = 1;
+                receipt.presentationCycleAudit.violations
+                    .firstPreMutationStretchWithoutMutation = {
+                        frame: 11,
+                        qpcTick: 13,
+                        disposition: "presentation_stretch",
+                        submitted: true,
+                    };
+            }
+            return receipt;
+        });
+    assert(preBoundaryConflict.every((row) =>
+        row.evidenceVerdict === "INCONCLUSIVE" &&
+        row.phaseCounterAuthorityStatus === "MISMATCHED" &&
+        row.violationAuthority.preMutationStretchWithoutMutation.status ===
+            "MISMATCHED" &&
+        row.producerInvalidEvidence.includes(
+            "preMutationStretchWithoutMutation_temporal_order_conflict")),
+    "Conflicting pre-mutation clocks produced a false pipeline failure.");
+
+    const matchedAndIncomplete = await runNvidiaProjectionTransform(
+        (receipt, context) => {
+            if (!context.baseline) {
+                receipt.presentationCycleAudit.violations
+                    .postMutationOldGenerationPresented = 1;
+                receipt.presentationCycleAudit.violations
+                    .firstPostMutationOldGenerationPresented = {
+                        frame: 13,
+                        qpcTick: 13,
+                        disposition: "exact_vendor_evaluation",
+                        submitted: true,
+                    };
+                receipt.presentationCycleAudit.violations
+                    .preMutationStretchWithoutMutation = 1;
+            }
+            return receipt;
+        });
+    assert(matchedAndIncomplete.every((row) =>
+        row.evidenceVerdict === "FAIL" &&
+        row.phaseCounterAuthorityStatus === "INCOMPLETE" &&
+        row.violationAuthority.postMutationOldGenerationPresented.status ===
+            "MATCHED" &&
+        row.violationAuthority.preMutationStretchWithoutMutation.status ===
+            "INCOMPLETE" &&
+        row.genuineInvariantViolations.includes(
+            "postMutationOldGenerationPresented")),
+    "One incomplete counter erased a different exact pipeline violation.");
+
     const qpcBeforeBoundary = await runNvidiaProjectionTransform((receipt, context) => {
         if (!context.baseline) {
             receipt.presentationCycleAudit.violations.postMutationUnprovenStereoSubmitted = 1;
@@ -814,7 +973,9 @@ async function testEvidenceVerdicts() {
         row.temporallyImpossibleViolations.includes(
             "postMutationUnprovenStereoSubmitted") &&
         row.producerInvalidEvidence.includes(
-            "postMutationUnprovenStereoSubmitted_precedes_boundary")),
+            "postMutationUnprovenStereoSubmitted_temporal_order_conflict") &&
+        row.violationAuthority.postMutationUnprovenStereoSubmitted.status ===
+            "MISMATCHED"),
     "An offender QPC before the boundary was treated as a runtime failure.");
 
     const frameBeforeBoundary = await runNvidiaProjectionTransform((receipt, context) => {
@@ -831,7 +992,9 @@ async function testEvidenceVerdicts() {
     });
     assert(frameBeforeBoundary.every((row) => row.evidenceVerdict === "INCONCLUSIVE" &&
         row.temporallyImpossibleViolations.includes(
-            "postMutationOldGenerationPresented")),
+            "postMutationOldGenerationPresented") &&
+        row.producerInvalidEvidence.includes(
+            "postMutationOldGenerationPresented_temporal_order_conflict")),
     "An offender frame before the boundary was treated as a runtime failure.");
 
     const proofDisagreement = await runNvidiaProjectionTransform((receipt, context) => {
@@ -902,7 +1065,8 @@ async function testEvidenceVerdicts() {
     "A partial eye observation was treated as submitted mixed stereo.");
 }
 
-Promise.all([testNvidia(), testAmd(), testEvidenceVerdicts()]).then(() => {
+Promise.all([testNvidia(), testAmd(), testEvidenceVerdicts(),
+    testScenarioFailureRetention()]).then(() => {
     process.stdout.write("Render-scale tuning live runner tests passed.\n");
 }).catch((error) => {
     process.stderr.write(`${error.stack || error}\n`);

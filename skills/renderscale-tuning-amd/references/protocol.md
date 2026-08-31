@@ -228,6 +228,11 @@ begin, dispatch, wait, and any cancellation; never reuse either pair.
    successful waiter still returns immediately and never waits out that
    envelope.
 
+   Store the exact scenario envelope before decoding or extracting any step.
+   On failure, link the compact row interruption to that raw receipt and expose
+   only explicitly reported failed-step/error fields. Keep the first
+   unreported step separate; never claim that an unreported step failed.
+
    If the mutation-and-wait scenario response is lost, apply the shared
    contract's owner-correlated recovery rule immediately. Never replay the
    scenario, apply, or waiter. Recover matching terminal `lastEvidence` from
@@ -439,6 +444,17 @@ or overflowed evidence. Missing `firstPhysicalMutation` is valid only when
 `mutationExpectation` is explicitly `not_required`; otherwise it is
 `INCONCLUSIVE`. Do not synthesize a missing facet from terminal status.
 
+
+Report phase-counter authority separately as `MATCHED`, `MISMATCHED`, or
+`INCOMPLETE`. Keep every nonzero counter visible as a reported pipeline
+observation. A counter is an authoritative violation only when the audit owner,
+qualification transition, stress session, mutation-boundary ownership token,
+and first-offender phase ordering agree. An explicit disagreement is
+`MISMATCHED`; a missing authority or ordering fact is `INCOMPLETE`. Both make
+Task 2 `INCONCLUSIVE`, not `FAIL`, while retaining the exact mismatch reason and
+raw counter. Never rewrite a mismatched counter to zero.
+Emit status and reasons per reported counter; one `MATCHED` exact violation
+remains a `FAIL` even if a different counter is `MISMATCHED` or `INCOMPLETE`.
 Preserve server-QPC phase durations for dispatch to blocked/preparation,
 blocked/preparation to first physical mutation, first physical mutation to
 the first exact new generation, new generation to cleanup drained, and

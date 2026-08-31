@@ -414,6 +414,9 @@ function testOfflineFinalization() {
             "transitions.csv"), "utf8");
         assert(transitionCsv.startsWith("lane,pass,ordinal") &&
             transitionCsv.includes("boundary_exposed") &&
+            transitionCsv.includes("reported_violations") &&
+            transitionCsv.includes("producer_invalid_evidence") &&
+            transitionCsv.includes("violation_authority") &&
             transitionCsv.includes("dispatch_left_generation") &&
             transitionCsv.includes("dispatch_right_generation") &&
             transitionCsv.includes("terminal_left_resource_revision") &&
@@ -427,6 +430,53 @@ function testOfflineFinalization() {
         const secondHashes = outputs.map((name) => sha(path.join(root, name)));
         assert(JSON.stringify(firstHashes) === JSON.stringify(secondHashes),
             "Offline finalization output hashes are not deterministic.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testUnownedViolationRemainsReported() {
+    const root = createEvidenceRoot();
+    try {
+        const retainedPath = path.join(root, "raw", "pass-1", "transitions",
+            "02", "retained.json");
+        const receipt = JSON.parse(fs.readFileSync(retainedPath, "utf8"));
+        receipt.projection.phaseCountersAuthoritative = true;
+        receipt.projection.producerInvalidEvidence =
+            ["physical_mutation_boundary_owner_mismatch"];
+        receipt.projection.reportedInvariantViolations =
+            ["postMutationOldGenerationPresented"];
+        receipt.waiter.transitionId = 101;
+        receipt.waiter.presentationCycleAudit = {
+            evidenceComplete: true,
+            retentionOverflow: false,
+            ownerTransitionId: 101,
+            ownerToken: 1,
+        };
+        receipt.waiter.replacementTimeline.firstPhysicalMutation.stressSessionId = 7;
+        receipt.waiter.replacementTimeline.firstPhysicalMutation
+            .qualificationTransitionId = 101;
+        receipt.waiter.replacementTimeline.firstPhysicalMutation.ownershipToken = 2;
+        writeJson(retainedPath, receipt);
+        const result = finalizeEvidence({ root, variant: "nvidia",
+            runId: "nvidia-test-run", buildId: "e".repeat(64), expectedRows: 2,
+            generatedUtc: "2026-08-30T20:00:00.000Z" });
+        const row = result.summary.transitions[1];
+        assert(row.task2Verdict === "INCONCLUSIVE" &&
+            row.phaseCountersAuthoritative === false &&
+            row.phaseCounterAuthorityStatus === "MISMATCHED" &&
+            row.phaseCounterAuthorityReasons.includes(
+                "boundary_audit_token_mismatch") &&
+            row.reportedTask2Violations.includes(
+                "postMutationOldGenerationPresented") &&
+            row.authoritativeTask2Violations.length === 0 &&
+            row.task2ProducerInvalidEvidence.includes(
+                "physical_mutation_boundary_owner_mismatch"),
+        "Finalization promoted an unowned reported counter into false evidence.");
+        const report = fs.readFileSync(path.join(root, "report.md"), "utf8");
+        assert(report.includes("Reported violations") &&
+            report.includes("physical_mutation_boundary_owner_mismatch"),
+        "The report hid the observed counter or its invalid authority.");
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -446,6 +496,48 @@ function testReportingSeparation() {
         assert(result.summary.render.verdict === "PASS" &&
             result.summary.reporting.status === "INCOMPLETE",
         "Reporting incompleteness rewrote a completed render PASS.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testMatchedViolationSurvivesIncompletePeer() {
+    const root = createEvidenceRoot();
+    try {
+        const retainedPath = path.join(root, "raw", "pass-1", "transitions",
+            "02", "retained.json");
+        const receipt = JSON.parse(fs.readFileSync(retainedPath, "utf8"));
+        receipt.projection.phaseCountersAuthoritative = false;
+        receipt.projection.phaseCounterAuthorityStatus = "INCOMPLETE";
+        receipt.projection.phaseCounterAuthorityReasons =
+            ["preMutationStretchWithoutMutation_first_offender_missing"];
+        receipt.projection.producerInvalidEvidence =
+            ["preMutationStretchWithoutMutation_first_offender_missing"];
+        receipt.projection.reportedInvariantViolations = [
+            "preMutationStretchWithoutMutation",
+            "postMutationOldGenerationPresented",
+        ];
+        receipt.projection.violationAuthority = {
+            preMutationStretchWithoutMutation: {
+                status: "INCOMPLETE",
+                reasons: [
+                    "preMutationStretchWithoutMutation_first_offender_missing",
+                ],
+            },
+            postMutationOldGenerationPresented: {
+                status: "MATCHED", reasons: [],
+            },
+        };
+        writeJson(retainedPath, receipt);
+        const result = finalizeEvidence({ root, variant: "nvidia",
+            runId: "nvidia-test-run", buildId: "e".repeat(64), expectedRows: 2,
+            generatedUtc: "2026-08-30T20:00:00.000Z" });
+        const row = result.summary.transitions[1];
+        assert(row.task2Verdict === "FAIL" &&
+            row.phaseCounterAuthorityStatus === "INCOMPLETE" &&
+            row.authoritativeTask2Violations.includes(
+                "postMutationOldGenerationPresented"),
+        "Finalization erased a matched violation because another counter was incomplete.");
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -513,7 +605,9 @@ function testUnsafeEvidenceNumberFailsClosed() {
 
 Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testPagingResume).then(testOfflineFinalization)
-    .then(testReportingSeparation).then(testAmdParity)
+    .then(testReportingSeparation).then(testUnownedViolationRemainsReported)
+    .then(testMatchedViolationSurvivesIncompletePeer)
+    .then(testAmdParity)
     .then(testBaselineOnlyInterruptedFinalization)
     .then(testValidationLeavesEvidenceUntouched)
     .then(testUnsafeEvidenceNumberFailsClosed).then(() => {

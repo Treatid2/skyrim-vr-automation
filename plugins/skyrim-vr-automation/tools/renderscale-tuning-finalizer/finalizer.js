@@ -370,11 +370,34 @@ function normalizeTask2(retained) {
     const boundary = timeline.firstPhysicalMutation;
     const missing = unique([...(projection.missingEvidence || [])]
         .filter((value) => value !== "first_physical_mutation"));
+    const producerInvalid = unique(projection.producerInvalidEvidence || []);
     const counters = projection.invariantViolations || {};
-    let authoritativeViolations = projection.genuineInvariantViolations || [];
+    const reportedViolations = unique(projection.reportedInvariantViolations ||
+        Object.entries(counters).filter(([, value]) => value > 0)
+            .map(([name]) => name));
+    const violationAuthority = projection.violationAuthority || {};
+    const hasViolationAuthority = Object.keys(violationAuthority).length > 0;
+    let authoritativeViolations = (projection.genuineInvariantViolations || [])
+        .filter((name) => !hasViolationAuthority ||
+            violationAuthority[name] &&
+            violationAuthority[name].status === "MATCHED");
     let verdict = projection.task2Verdict || projection.evidenceVerdict ||
         "INCONCLUSIVE";
-    let phaseCountersAuthoritative = true;
+    const authorityMissing = missing.some((value) => [
+        "authoritative_cycle_audit",
+        "authoritative_cycle_owner",
+        "authoritative_cycle_counters",
+    ].includes(value));
+    const authorityInvalid = producerInvalid.some((value) =>
+        value === "physical_mutation_boundary_owner_mismatch" ||
+        /_(first_offender_missing|temporal_order_unproven|temporal_order_conflict|not_before_boundary|precedes_boundary)$/.test(
+            value));
+    if (!hasViolationAuthority && authorityInvalid) {
+        authoritativeViolations = [];
+    }
+    let phaseCountersAuthoritative =
+        projection.phaseCountersAuthoritative !== false &&
+        !authorityMissing && !authorityInvalid;
 
     if (expectation === "required" && !boundary) {
         missing.push("missing_required_mutation_boundary");
@@ -383,14 +406,69 @@ function normalizeTask2(retained) {
         verdict = "INCONCLUSIVE";
     } else if (authoritativeViolations.length > 0) {
         verdict = "FAIL";
+    } else if (!phaseCountersAuthoritative) {
+        authoritativeViolations = [];
+        verdict = "INCONCLUSIVE";
     }
+    const audit = waiter.presentationCycleAudit || retained.presentationCycleAudit || {};
+    const baselineSession = waiter.baseline && waiter.baseline.stressSessionId;
+    const derivedMismatchReasons = [];
+    if (Number.isSafeInteger(audit.ownerTransitionId) &&
+        audit.ownerTransitionId > 0 &&
+        Number.isSafeInteger(waiter.transitionId) && waiter.transitionId > 0 &&
+        audit.ownerTransitionId !== waiter.transitionId) {
+        derivedMismatchReasons.push("audit_transition_owner_mismatch");
+    }
+    if (boundary && Number.isSafeInteger(boundary.stressSessionId) &&
+        boundary.stressSessionId > 0 && Number.isSafeInteger(baselineSession) &&
+        baselineSession > 0 && boundary.stressSessionId !== baselineSession) {
+        derivedMismatchReasons.push("boundary_stress_session_mismatch");
+    }
+    if (boundary && Number.isSafeInteger(boundary.qualificationTransitionId) &&
+        boundary.qualificationTransitionId > 0 &&
+        Number.isSafeInteger(waiter.transitionId) && waiter.transitionId > 0 &&
+        boundary.qualificationTransitionId !== waiter.transitionId) {
+        derivedMismatchReasons.push("boundary_transition_owner_mismatch");
+    }
+    if (boundary && Number.isSafeInteger(boundary.ownershipToken) &&
+        boundary.ownershipToken > 0 && Number.isSafeInteger(audit.ownerToken) &&
+        audit.ownerToken > 0 && boundary.ownershipToken !== audit.ownerToken) {
+        derivedMismatchReasons.push("boundary_audit_token_mismatch");
+    }
+    const temporalMismatchReasons = producerInvalid.filter((value) =>
+        /_(temporal_order_conflict|not_before_boundary|precedes_boundary)$/.test(
+            value));
+    const projectedMismatchReasons =
+        projection.phaseCounterAuthorityStatus === "MISMATCHED" ?
+            projection.phaseCounterAuthorityReasons || [] : [];
+    const mismatchReasons = unique([...derivedMismatchReasons,
+        ...temporalMismatchReasons, ...projectedMismatchReasons]);
+    const explicitMismatch = mismatchReasons.length > 0;
+    const authorityStatus = explicitMismatch ? "MISMATCHED" :
+        !phaseCountersAuthoritative ? "INCOMPLETE" :
+            projection.phaseCounterAuthorityStatus || "MATCHED";
+    const projectedAuthorityReasons =
+        Array.isArray(projection.phaseCounterAuthorityReasons) &&
+        projection.phaseCounterAuthorityReasons.length > 0 ?
+            projection.phaseCounterAuthorityReasons : null;
+    const authorityReasons = unique(authorityStatus === "MISMATCHED" ?
+        mismatchReasons : projectedAuthorityReasons ||
+        [...missing.filter((value) => value.startsWith("authoritative_") ||
+            value === "missing_required_mutation_boundary"),
+        ...producerInvalid.filter((value) =>
+            /_(first_offender_missing|temporal_order_unproven)$/.test(value))]);
     return {
         verdict,
         expectation,
         missingEvidence: unique(missing),
         phaseCountersAuthoritative,
+        authorityStatus,
+        authorityReasons,
         observedPhaseCounters: counters,
+        reportedViolations,
+        violationAuthority,
         authoritativeViolations,
+        producerInvalidEvidence: producerInvalid,
     };
 }
 
@@ -425,8 +503,13 @@ function transitionRow(root, file, retained) {
             (waiter.satisfied === true ? "PASS" : "FAIL"),
         task2Verdict: task2.verdict,
         task2MissingEvidence: task2.missingEvidence,
+        task2ProducerInvalidEvidence: task2.producerInvalidEvidence,
         phaseCountersAuthoritative: task2.phaseCountersAuthoritative,
+        phaseCounterAuthorityStatus: task2.authorityStatus,
+        phaseCounterAuthorityReasons: task2.authorityReasons,
         observedPhaseCounters: task2.observedPhaseCounters,
+        reportedTask2Violations: task2.reportedViolations,
+        task2ViolationAuthority: task2.violationAuthority,
         authoritativeTask2Violations: task2.authoritativeViolations,
         mutationExpectation: task2.expectation,
         diagnostics,
@@ -456,7 +539,10 @@ function csv(rows) {
     const columns = [
         "lane", "pass", "ordinal", "method", "quality_mode", "render_scale_mode",
         "render_verdict", "task2_verdict", "mutation_expectation",
-        "missing_evidence", "phase_counters_authoritative",
+        "missing_evidence", "producer_invalid_evidence", "reported_violations",
+        "authoritative_violations", "violation_authority",
+        "phase_counter_authority_status",
+        "phase_counter_authority_reasons", "phase_counters_authoritative",
         "physical_mutation_started", "final_method", "final_quality",
         "final_render_scale_mode", "final_state_revision", "trace_required",
         "trace_complete", "boundary_exposed", "dispatch_frame",
@@ -477,6 +563,10 @@ function csv(rows) {
         const values = [row.lane, row.pass, row.ordinal, row.target.method,
             row.target.qualityMode, row.target.renderScaleMode, row.renderVerdict,
             row.task2Verdict, row.mutationExpectation, row.task2MissingEvidence,
+            row.task2ProducerInvalidEvidence, row.reportedTask2Violations,
+            row.authoritativeTask2Violations,
+            row.task2ViolationAuthority,
+            row.phaseCounterAuthorityStatus, row.phaseCounterAuthorityReasons,
             row.phaseCountersAuthoritative, row.physicalMutationStarted,
             row.finalMethod, row.finalQuality, row.finalRenderScaleMode,
             row.finalStateRevision, row.traceRequired, row.traceComplete,
@@ -507,7 +597,10 @@ function report(summary) {
     const rows = summary.transitions.map((row) =>
         `| ${row.lane || "default"} | ${row.pass} | ${row.ordinal} | ` +
         `${row.renderVerdict} | ${row.task2Verdict} | ` +
-        `${row.task2MissingEvidence.join("; ") || "none"} |`).join("\n");
+        `${row.phaseCounterAuthorityStatus} | ` +
+        `${row.reportedTask2Violations.join("; ") || "none"} | ` +
+        `${row.task2MissingEvidence.join("; ") || "none"} | ` +
+        `${row.task2ProducerInvalidEvidence.join("; ") || "none"} |`).join("\n");
     return `# ${summary.protocol} final report\n\n` +
         `- Assay execution: **${summary.assayExecution.status}**\n` +
         `- Transitions dispatched: **${summary.assayExecution.transitionsDispatched}/` +
@@ -526,8 +619,9 @@ function report(summary) {
         `per-transition evidence. Every raw JSON value is available in ` +
         `\`${summary.evidenceExtraction.path}\`.\n\n` +
         `## Transitions\n\n` +
-        `| Lane | Pass | Row | Render | Task 2 | Missing evidence |\n` +
-        `| --- | ---: | ---: | --- | --- | --- |\n${rows}\n`;
+        `| Lane | Pass | Row | Render | Task 2 | Authority | Reported violations | ` +
+        `Missing evidence | Invalid producer evidence |\n` +
+        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- |\n${rows}\n`;
 }
 
 function writeAtomic(file, content) {
@@ -604,7 +698,7 @@ function finalizeEvidence(options) {
         "not_exposed";
     const summary = {
         ...existing,
-        schemaVersion: `renderscale-tuning-${variant}-summary-v3`,
+        schemaVersion: `renderscale-tuning-${variant}-summary-v4`,
         protocol: `renderscale-tuning-${variant}`,
         runId: runIds[0],
         generatedUtc,

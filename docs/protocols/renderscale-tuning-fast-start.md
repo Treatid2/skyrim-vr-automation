@@ -220,6 +220,15 @@ and same-scenario trace subreceipts are the only immediate per-row evidence
 action. A stable response-store handle is raw evidence until pass finalization;
 it is not a substitute in the completed evidence bundle.
 
+Store the complete scenario envelope under its own stable receipt key
+immediately after the direct call returns and before decoding, validating, or
+extracting any step. A failed scenario's compact projection must link to that
+key and retain the producer-reported `ok`, `aborted`, `stepsRun`, error, failed
+step, and ordered step results. Set `failedStep` only when the response
+explicitly marks a step failed. Report `firstUnreportedStep` separately as an
+observation boundary; never invent that it failed. Transport and decode
+failures likewise retain their phase without fabricating a producer result.
+
 The orchestration cell and packaged runner are only a response-handling
 boundary. Every nested live call must still use the installed plugin's selected
 direct DevBench MCP tools; this does not authorize an external controller,
@@ -286,6 +295,16 @@ DevBench call and does not require a measured transition receipt.
 
 Keep Task 2 classifications per transition. Report counts for `PASS`, `FAIL`,
 and `INCONCLUSIVE`, but never calculate an aggregate Task 2 or overall verdict.
+Retain every nonzero producer violation counter as a reported pipeline
+observation. Promote it to authoritative `FAIL` only when the cycle audit is
+complete, its owner matches the qualification, the required mutation boundary
+has matching session/transition/token ownership, and the first-offender timing
+places that violation in the claimed phase. If any authority or ordering fact
+is missing, mismatched, or impossible, keep the counter visible, record the
+producer-invalid reason, and classify Task 2 `INCONCLUSIVE`. Never turn an
+unowned counter into either a pipeline failure or a synthetic zero.
+Emit each reported counter's own authority status and reasons so one exact
+violation is not erased merely because a different counter is mismatched.
 Omit legacy aggregate verdict fields instead of populating them with sentinel
 values that a consumer could misclassify as a failure.
 An absent boundary remains `not_exposed` for that row while its dispatch and
