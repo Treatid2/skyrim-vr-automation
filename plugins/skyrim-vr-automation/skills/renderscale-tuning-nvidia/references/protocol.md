@@ -64,7 +64,7 @@ snapshot's exact `stateRevision`, exact Build ID, unique baseline client and
 command IDs, `purpose: direct`, and `persistence: runtime_only`.
 
 The final waiter step uses the same owner and transition, the full
-dispatch-relative `timeoutMs: 30000`, exact target and foveation fixture, and
+dispatch-relative `timeoutMs: 60000`, exact target and foveation fixture, and
 `milestone: strict`; never calculate or pass a client-side remaining budget.
 Do not add an independent operation wait. After the complete scenario returns,
 require

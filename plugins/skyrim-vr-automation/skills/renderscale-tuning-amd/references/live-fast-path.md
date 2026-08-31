@@ -14,7 +14,7 @@ one fail-closed scenario in this order: render-scale `reset`, render-scale
 `qualification_wait`. Use unique nonempty string owner/client/command IDs, a
 numeric transition ID, the exact state revision and Build ID, Dragonsreach,
 the `0.3/0.3/0.7` fixture, `persistence: runtime_only`, and the full
-dispatch-relative `timeoutMs: 30000`.
+dispatch-relative `timeoutMs: 60000`.
 
 Before the first runnable AMD lane, run and retain one bounded DLSS trace
 status/reset/start/stop/read lifecycle and require its raw read to contain no

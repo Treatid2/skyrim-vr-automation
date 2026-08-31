@@ -85,6 +85,8 @@ foreach ($token in @(
     'initialBoundary', 'capabilities',
     'waiter.upscalingSnapshot', 'snapshot.effective',
     'matrix.pacingMilliseconds', 'matrix.completionTimeoutMilliseconds',
+    'baselineCompletionTimeoutMilliseconds = 60000',
+    'timeoutMs: baseline ? baselineCompletionTimeoutMilliseconds',
     'startPerformanceTelemetry: firstRow',
     'store(`${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`',
     'action: "dlss_trace_read"', 'traceReset:', 'traceStart:', 'traceRead:',
@@ -143,7 +145,7 @@ foreach ($token in @(
 )) {
     Assert-Contains $fastStart $token 'Shared post-measurement extraction contract'
 }
-foreach ($token in @('six labeled tool steps in this exact order', '`baseline-stress-reset`', '`baseline-stress-start`', '`qualification-begin`', '`qualification-dispatch`', '`profile-apply`', '`qualification-wait`', 'only pre-baseline reset', 'inside the same server-owned scenario', 'Do not inspect, validate, persist, or comment', '`stepsRun: 6`', '`results[]` entry `label: profile-apply`', '`result.apply.disposition.name`', '`label: qualification-wait`', '`result.action: qualification_wait`', 'Never search another wrapper location', 'containing scenario response is lost', 'do not replay the scenario, apply, or waiter', 'allow the already-running server scenario', 'at most five additional seconds', 'matching terminal `lastEvidence`', 'Never reapply the profile', 'applies to every baseline and measured waiter', 'must never invoke this handoff scenario', 'handoff scenario is never a cleanup path', 'reset then start texture-lifetime', 'reset then start load-presentation', '"action":"clear_history"', 'do not use', '`start_capture`', 'sole CPU/GPU reset/start', 'Stop only the baseline stress session', 'do not run another local command', 'never search for it', '`communityshaders.profiler_api`', '`result.status.session.id`', 'Immediately begin transition 1')) {
+foreach ($token in @('six labeled tool steps in this exact order', '`baseline-stress-reset`', '`baseline-stress-start`', '`qualification-begin`', '`qualification-dispatch`', '`profile-apply`', '`qualification-wait`', 'only pre-baseline reset', 'inside the same server-owned scenario', '"timeoutMs":60000', '`timeoutMs: 60000`', 'Do not inspect, validate, persist, or comment', '`stepsRun: 6`', '`results[]` entry `label: profile-apply`', '`result.apply.disposition.name`', '`label: qualification-wait`', '`result.action: qualification_wait`', 'Never search another wrapper location', 'containing scenario response is lost', 'do not replay the scenario, apply, or waiter', 'allow the already-running server scenario', 'at most five additional seconds', 'matching terminal `lastEvidence`', 'Never reapply the profile', 'applies to every baseline and measured waiter', 'must never invoke this handoff scenario', 'handoff scenario is never a cleanup path', 'reset then start texture-lifetime', 'reset then start load-presentation', '"action":"clear_history"', 'do not use', '`start_capture`', 'sole CPU/GPU reset/start', 'Stop only the baseline stress session', 'do not run another local command', 'never search for it', '`communityshaders.profiler_api`', '`result.status.session.id`', 'Immediately begin transition 1')) {
     Assert-Contains $fastStart $token 'Shared server-owned waiter contract'
 }
 foreach ($token in @(
@@ -357,7 +359,8 @@ foreach ($variant in $variants) {
         'coc WhiterunDragonsreach', 'communityshaders.upscaling_api',
         '"expectedStateRevision"', '`clientId`', '`commandId`',
         '`persistence: runtime_only`', 'server-owned 5,000 ms wait',
-        '`timeoutMs: 30000`', 'one shared 30,000 ms monotonic deadline',
+        '`timeoutMs: 60000`', '`timeoutMs: 30000`',
+        'one shared 30,000 ms monotonic deadline',
         'full dispatch-relative', 'client-side remaining budget',
         'return upon its first successful receipt',
         '`async: false`', 'poll `operation`',

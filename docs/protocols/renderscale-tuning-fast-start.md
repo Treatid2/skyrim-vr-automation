@@ -113,7 +113,7 @@ no field and perform no lookup:
 | `qualification-begin` | `communityshaders.renderscale` | `{"action":"qualification_begin","transitionId":<transition-id>,"ownerId":"<owner-id>","expectedBuildId":"<build-id>"}` |
 | `qualification-dispatch` | `communityshaders.renderscale` | `{"action":"qualification_dispatch","transitionId":<transition-id>,"ownerId":"<owner-id>","startPerformanceTelemetry":false,"expectedBuildId":"<build-id>"}` |
 | `profile-apply` | `communityshaders.upscaling_api` | `{"action":"apply","expectedBuildId":"<build-id>","expectedStateRevision":<state-revision>,"target":<api-target>,"purpose":"direct","persistence":"runtime_only","clientId":"<client-id>","commandId":"<command-id>","reason":"render-scale tuning baseline"}` |
-| `qualification-wait` | `communityshaders.renderscale` | `{"action":"qualification_wait","transitionId":<transition-id>,"ownerId":"<owner-id>","expectedCellEditorId":"WhiterunDragonsreach","timeoutMs":30000,"milestone":"strict","target":<qualification-target>,"foveation":<foveation>,"expectedBuildId":"<build-id>"}` |
+| `qualification-wait` | `communityshaders.renderscale` | `{"action":"qualification_wait","transitionId":<transition-id>,"ownerId":"<owner-id>","expectedCellEditorId":"WhiterunDragonsreach","timeoutMs":60000,"milestone":"strict","target":<qualification-target>,"foveation":<foveation>,"expectedBuildId":"<build-id>"}` |
 
 Start the baseline with one synchronous fail-closed scenario containing six
 labeled tool steps in this exact order: `baseline-stress-reset`,
@@ -121,7 +121,7 @@ labeled tool steps in this exact order: `baseline-stress-reset`,
 `profile-apply`, and `qualification-wait`. This is the only pre-baseline reset.
 The apply immediately follows dispatch, and the strict target-correlated waiter
 immediately follows apply inside the same server-owned scenario. Pass the full
-dispatch-relative `timeoutMs: 30000`; DevBench measures it from
+dispatch-relative `timeoutMs: 60000`; DevBench measures it from
 `qualification_dispatch`. Never calculate or pass a client-side remaining
 timeout. Do not inspect, validate, persist, or comment on the scenario response
 until the server has executed the waiter and returned the complete six-step

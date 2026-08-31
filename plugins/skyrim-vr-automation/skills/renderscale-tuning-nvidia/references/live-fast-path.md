@@ -13,7 +13,7 @@ in this order: render-scale `reset`, render-scale `start`,
 `qualification_wait`. Use unique nonempty string owner/client/command IDs, a
 numeric transition ID, the exact state revision and Build ID, Dragonsreach,
 the `0.3/0.3/0.7` fixture, `persistence: runtime_only`, and the full
-dispatch-relative `timeoutMs: 30000`.
+dispatch-relative `timeoutMs: 60000`.
 
 On strict baseline success, immediately run one handoff scenario: stop the
 exact baseline stress session, start measured stress, reset/start texture

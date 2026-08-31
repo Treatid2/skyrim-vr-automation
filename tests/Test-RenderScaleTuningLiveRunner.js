@@ -370,6 +370,26 @@ function createMock(semanticFailureOrdinal, receiptTransform = null) {
     };
 }
 
+function assertQualificationTimeouts(scenarioCalls, matrix, variant) {
+    let baselineWaiters = 0;
+    let measuredWaiters = 0;
+    for (const call of scenarioCalls) {
+        const waiter = call.steps.find((step) => step.label === "qualification-wait");
+        if (!waiter) continue;
+        if (call.steps.some((step) => step.label === "baseline-stress-start")) {
+            baselineWaiters += 1;
+            assert(waiter.args.timeoutMs === 60000,
+                `${variant} baseline waiter does not use 60 seconds.`);
+        } else if (call.steps.some((step) => step.label === "profile-apply")) {
+            measuredWaiters += 1;
+            assert(waiter.args.timeoutMs === matrix.completionTimeoutMilliseconds,
+                `${variant} measured waiter no longer uses the matrix deadline.`);
+        }
+    }
+    assert(baselineWaiters > 0, `${variant} did not execute a baseline waiter.`);
+    assert(measuredWaiters > 0, `${variant} did not execute a measured waiter.`);
+}
+
 async function testNvidia() {
     const matrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-nvidia", "references", "matrix.v1.json")));
@@ -384,6 +404,7 @@ async function testNvidia() {
         matrix,
     });
     assert(result.ok === true && result.status === "COMPLETE", "NVIDIA mock run did not complete.");
+    assertQualificationTimeouts(mock.scenarioCalls, matrix, "NVIDIA");
     assert(result.lanes[0].passes.length === 2, "NVIDIA mock did not run two passes.");
     assert(result.lanes[0].passes.every((pass) => pass.rows.length === 33), "NVIDIA mock row count is wrong.");
     assert(mock.notifications.length === 66, "NVIDIA progress count is wrong.");
@@ -459,6 +480,7 @@ async function testAmd() {
         matrix,
     });
     assert(result.ok === true && result.status === "COMPLETE", "AMD mock run did not complete.");
+    assertQualificationTimeouts(mock.scenarioCalls, matrix, "AMD");
     const fsr3 = result.lanes.find((lane) => lane.id === "explicit_fsr3");
     const fallback = result.lanes.find((lane) => lane.id === "fsr4_to_fsr3_fallback");
     assert(fsr3 && fsr3.passes.length === 2, "AMD FSR3 lane did not run two passes.");
