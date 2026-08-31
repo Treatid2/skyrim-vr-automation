@@ -416,6 +416,25 @@ function assertProviderTargetSeparation(scenarioCalls, variant) {
     }
 }
 
+function assertRevisionFencing(scenarioCalls, variant) {
+    const mutationCalls = scenarioCalls.filter((call) =>
+        call.steps.some((step) => step.label === "profile-apply"));
+    const baselineCalls = mutationCalls.filter((call) =>
+        call.steps.some((step) => step.label === "baseline-stress-start"));
+    const measuredCalls = mutationCalls.filter((call) =>
+        !call.steps.some((step) => step.label === "baseline-stress-start"));
+    assert(baselineCalls.length > 0, `${variant} has no baseline apply.`);
+    assert(baselineCalls.every((call) => !Object.hasOwn(
+        call.steps.find((step) => step.label === "profile-apply").args,
+        "expectedStateRevision")),
+    `${variant} baseline reused a revision captured before stress setup.`);
+    assert(measuredCalls.length > 0, `${variant} has no measured apply.`);
+    assert(measuredCalls.every((call) => Number.isInteger(
+        call.steps.find((step) => step.label === "profile-apply").args
+            .expectedStateRevision)),
+    `${variant} measured apply lost its terminal revision fence.`);
+}
+
 async function testNvidia() {
     const matrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-nvidia", "references", "matrix.v1.json")));
@@ -432,6 +451,7 @@ async function testNvidia() {
     assert(result.ok === true && result.status === "COMPLETE", "NVIDIA mock run did not complete.");
     assertQualificationTimeouts(mock.scenarioCalls, matrix, "NVIDIA");
     assertProviderTargetSeparation(mock.scenarioCalls, "NVIDIA");
+    assertRevisionFencing(mock.scenarioCalls, "NVIDIA");
     assert(result.lanes[0].passes.length === 2, "NVIDIA mock did not run two passes.");
     assert(result.lanes[0].passes.every((pass) => pass.rows.length === 33), "NVIDIA mock row count is wrong.");
     assert(mock.notifications.length === 66, "NVIDIA progress count is wrong.");
@@ -509,6 +529,7 @@ async function testAmd() {
     assert(result.ok === true && result.status === "COMPLETE", "AMD mock run did not complete.");
     assertQualificationTimeouts(mock.scenarioCalls, matrix, "AMD");
     assertProviderTargetSeparation(mock.scenarioCalls, "AMD");
+    assertRevisionFencing(mock.scenarioCalls, "AMD");
     const fsr3 = result.lanes.find((lane) => lane.id === "explicit_fsr3");
     const fallback = result.lanes.find((lane) => lane.id === "fsr4_to_fsr3_fallback");
     assert(fsr3 && fsr3.passes.length === 2, "AMD FSR3 lane did not run two passes.");

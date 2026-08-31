@@ -271,7 +271,7 @@ async function runRenderScaleTuningLive(context) {
         steps.push(toolStep("profile-apply", "communityshaders.upscaling_api", {
             action: "apply",
             expectedBuildId: buildId,
-            expectedStateRevision: boundary.revision,
+            ...(baseline ? {} : { expectedStateRevision: boundary.revision }),
             target,
             purpose: "direct",
             persistence: "runtime_only",

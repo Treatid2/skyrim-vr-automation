@@ -112,8 +112,13 @@ no field and perform no lookup:
 | `baseline-stress-start` | `communityshaders.renderscale` | `{"action":"start","expectedBuildId":"<build-id>"}` |
 | `qualification-begin` | `communityshaders.renderscale` | `{"action":"qualification_begin","transitionId":<transition-id>,"ownerId":"<owner-id>","expectedBuildId":"<build-id>"}` |
 | `qualification-dispatch` | `communityshaders.renderscale` | `{"action":"qualification_dispatch","transitionId":<transition-id>,"ownerId":"<owner-id>","startPerformanceTelemetry":false,"expectedBuildId":"<build-id>"}` |
-| `profile-apply` | `communityshaders.upscaling_api` | `{"action":"apply","expectedBuildId":"<build-id>","expectedStateRevision":<state-revision>,"target":<api-target>,"purpose":"direct","persistence":"runtime_only","clientId":"<client-id>","commandId":"<command-id>","reason":"render-scale tuning baseline"}` |
+| `profile-apply` | `communityshaders.upscaling_api` | `{"action":"apply","expectedBuildId":"<build-id>","target":<api-target>,"purpose":"direct","persistence":"runtime_only","clientId":"<client-id>","commandId":"<command-id>","reason":"render-scale tuning baseline"}` |
 | `qualification-wait` | `communityshaders.renderscale` | `{"action":"qualification_wait","transitionId":<transition-id>,"ownerId":"<owner-id>","expectedCellEditorId":"WhiterunDragonsreach","timeoutMs":30000,"milestone":"strict","target":<qualification-target>,"foveation":<foveation>,"expectedBuildId":"<build-id>"}` |
+
+The baseline apply intentionally omits `expectedStateRevision`: the preceding
+stress reset and start advance the controller revision inside this same
+server-owned scenario. Measured transition applies retain the revision from the
+previous terminal waiter.
 
 Start the baseline with one synchronous fail-closed scenario containing six
 labeled tool steps in this exact order: `baseline-stress-reset`,
