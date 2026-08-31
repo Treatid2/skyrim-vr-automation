@@ -103,8 +103,8 @@ number. Use descriptive values such as
   "foveatedCenterArea": 0.3, "peripheryTAAEnable": true,
   "peripheryTAACenterArea": 0.3, "peripheryTAAOuterScale": 0.7 }`.
 
-The six baseline scenario steps have these complete tool/argument shapes; add
-no field and perform no lookup:
+The baseline uses the following complete tool/argument shapes; add no field and
+perform no separate status or snapshot lookup:
 
 | Label | Tool | Arguments |
 | --- | --- | --- |
@@ -112,28 +112,31 @@ no field and perform no lookup:
 | `baseline-stress-start` | `communityshaders.renderscale` | `{"action":"start","expectedBuildId":"<build-id>"}` |
 | `qualification-begin` | `communityshaders.renderscale` | `{"action":"qualification_begin","transitionId":<transition-id>,"ownerId":"<owner-id>","expectedBuildId":"<build-id>"}` |
 | `qualification-dispatch` | `communityshaders.renderscale` | `{"action":"qualification_dispatch","transitionId":<transition-id>,"ownerId":"<owner-id>","startPerformanceTelemetry":false,"expectedBuildId":"<build-id>"}` |
-| `profile-apply` | `communityshaders.upscaling_api` | `{"action":"apply","expectedBuildId":"<build-id>","target":<api-target>,"purpose":"direct","persistence":"runtime_only","clientId":"<client-id>","commandId":"<command-id>","reason":"render-scale tuning baseline"}` |
+| `profile-apply` | `communityshaders.upscaling_api` | `{"action":"apply","expectedBuildId":"<build-id>","expectedStateRevision":<post-stress-revision>,"target":<api-target>,"purpose":"direct","persistence":"runtime_only","clientId":"<client-id>","commandId":"<command-id>","reason":"render-scale tuning baseline"}` |
 | `qualification-wait` | `communityshaders.renderscale` | `{"action":"qualification_wait","transitionId":<transition-id>,"ownerId":"<owner-id>","expectedCellEditorId":"WhiterunDragonsreach","timeoutMs":30000,"milestone":"strict","target":<qualification-target>,"foveation":<foveation>,"expectedBuildId":"<build-id>"}` |
 
-The baseline apply intentionally omits `expectedStateRevision`: the preceding
-stress reset and start advance the controller revision inside this same
-server-owned scenario. Measured transition applies retain the revision from the
-previous terminal waiter.
+Run stress reset and start together first. Read the positive session ID and
+nonnegative controller revision directly from the returned
+`baseline-stress-start.result.status`; do not issue a confirmation call. Use
+that revision as the baseline apply's `expectedStateRevision`. Measured
+transition applies retain the revision from the previous terminal waiter.
 
-Start the baseline with one synchronous fail-closed scenario containing six
-labeled tool steps in this exact order: `baseline-stress-reset`,
-`baseline-stress-start`, `qualification-begin`, `qualification-dispatch`,
-`profile-apply`, and `qualification-wait`. This is the only pre-baseline reset.
-The apply immediately follows dispatch, and the strict target-correlated waiter
-immediately follows apply inside the same server-owned scenario. Pass the full
+Start the baseline with one synchronous fail-closed two-step stress setup,
+followed immediately by one synchronous fail-closed four-step qualification
+scenario. Across them, the six operations remain in this exact order:
+`baseline-stress-reset`, `baseline-stress-start`, `qualification-begin`,
+`qualification-dispatch`, `profile-apply`, and `qualification-wait`. This is
+the only pre-baseline reset. The apply immediately follows dispatch, and the
+strict target-correlated waiter immediately follows apply inside the same
+server-owned scenario. Pass the full
 dispatch-relative `timeoutMs: 30000`; DevBench measures it from
 `qualification_dispatch`. Never calculate or pass a client-side remaining
 timeout. Do not inspect, validate, persist, or comment on the scenario response
-until the server has executed the waiter and returned the complete six-step
-transcript.
+until the server has executed the waiter and returned the complete
+qualification transcript.
 
-After the scenario returns, read only its fixed wrapper shape. Require
-top-level `ok: true`, `aborted: false`, and `stepsRun: 6`. The apply receipt is
+After the qualification scenario returns, read only its fixed wrapper shape.
+Require top-level `ok: true`, `aborted: false`, and `stepsRun: 4`. The apply receipt is
 `results[]` entry `label: profile-apply`, under `result.apply`; its disposition
 is `result.apply.disposition.name`. The waiter receipt is the unique entry
 `label: qualification-wait`, under `result`, with
@@ -182,6 +185,11 @@ command IDs:
 | `load-presentation-reset` | `communityshaders.renderscale` | `{"action":"probe_reset","expectedBuildId":"<build-id>"}` |
 | `load-presentation-start` | `communityshaders.renderscale` | `{"action":"probe_start","expectedBuildId":"<build-id>"}` |
 | `profiler-enable` | `communityshaders.profiler_api` | `{"contractMajor":1,"clientId":"<client-id>","commandId":"<command-id>","action":"set_enabled","enabled":true,"expectedBuildId":"<build-id>"}` |
+
+Use the controller revision already returned by
+`measured-stress-start.result.status.controller.revision` as transition 1's
+revision fence. Do not issue a separate confirmation call. Later transitions
+continue to use the preceding terminal waiter's revision.
 
 Do not clear profiler history here. Transition 1 inserts exactly
 `{"contractMajor":1,"clientId":"<client-id>","commandId":"<command-id>","action":"clear_history","expectedBuildId":"<build-id>"}`

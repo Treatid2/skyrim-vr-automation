@@ -55,15 +55,17 @@ Clone the effective profile through its
 `qualityMode: hoshipa`, `renderScaleMode: true`, and dormant
 `fsrRuntime: fsr3`, and preserve `dlssProfile` in the public apply target.
 The strict waiter target includes only the active DLSS provider setting and
-must omit dormant `fsrRuntime`. Run one synchronous
-(`async: false`), fail-closed mutation scenario: reset then start the short
-baseline-only stress session, `qualification_begin`, then
-`qualification_dispatch` with `startPerformanceTelemetry: false`, then the
-public API `apply` as the immediately following step, then the strict DLSS
-Hoshipa `qualification_wait` as the final step. Use the shared contract's exact
-six labels and wrapper paths. Bind the apply to the
-snapshot's exact `stateRevision`, exact Build ID, unique baseline client and
-command IDs, `purpose: direct`, and `persistence: runtime_only`.
+must omit dormant `fsrRuntime`. Run one synchronous (`async: false`),
+fail-closed two-step scenario to reset then start the short baseline-only
+stress session. Use the revision returned by that start receipt in the
+immediately following synchronous, fail-closed mutation scenario:
+`qualification_begin`, `qualification_dispatch` with
+`startPerformanceTelemetry: false`, the public API `apply`, then the strict
+DLSS Hoshipa `qualification_wait`. Use the shared contract's exact six labels
+and wrapper paths across the two scenarios. Bind the apply to the returned
+post-stress `stateRevision`, exact Build ID, unique baseline client and command
+IDs, `purpose: direct`, and `persistence: runtime_only`. Do not issue a status
+or snapshot call between them.
 
 The final waiter step uses the same owner and transition, the full
 dispatch-relative `timeoutMs: 30000`, exact target and foveation fixture, and
@@ -126,7 +128,8 @@ begin, dispatch, wait, and any cancellation; never reuse either pair.
    snapshot as this row's precondition. Require the exact Build ID, complete
    configured/requested/effective/stable profiles, no active operation, and no
    unresolved physical mutation. Transition 1 uses the terminal baseline
-   receipt. Do not issue a separate settle scenario, snapshot, operation read,
+   profile with the controller revision returned by the measured stress-start
+   handoff. Do not issue a separate settle scenario, snapshot, operation read,
    or status call. Start this row's mutation scenario immediately after the
    preceding terminal receipt; its first step is the sole server-owned 5,000 ms
    wait.
