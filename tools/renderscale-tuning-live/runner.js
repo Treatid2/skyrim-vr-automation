@@ -277,7 +277,7 @@ async function runRenderScaleTuningLive(context) {
             commandId: identifiers.commandId,
             reason: baseline ? "render-scale tuning baseline" : "render-scale tuning transition",
         }));
-        steps.push(toolStep("qualification-wait", "communityshaders.renderscale", {
+        const waitArgs = {
             action: "qualification_wait",
             transitionId: identifiers.transitionId,
             ownerId: identifiers.ownerId,
@@ -285,9 +285,13 @@ async function runRenderScaleTuningLive(context) {
             timeoutMs: matrix.completionTimeoutMilliseconds,
             milestone: "strict",
             target: waiterTarget(target),
-            foveation,
             expectedBuildId: buildId,
-        }));
+        };
+        // None and TAA have no live vendor path; their configured fixture remains telemetry.
+        if (target.method === "dlss" || target.method === "fsr") {
+            waitArgs.foveation = foveation;
+        }
+        steps.push(toolStep("qualification-wait", "communityshaders.renderscale", waitArgs));
         if (!baseline && variant === "nvidia" && target.method === "dlss") {
             steps.push(toolStep("dlss-trace-stop", "communityshaders.renderscale", {
                 action: "dlss_trace_stop", expectedBuildId: buildId,

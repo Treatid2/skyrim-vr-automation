@@ -102,6 +102,7 @@ foreach ($token in @(
     'retainLiveResult', 'receiptKeys',
     'optionalSafetyFactClear', '"apiOperationClear"',
     '"physicalMutationClear"', 'facts.terminalClear === true',
+    'waitArgs.foveation = foveation',
     'for (const row of matrix.transitions)', 'notify({'
 )) {
     Assert-Contains $runner $token 'Deterministic tuning runner'
@@ -140,6 +141,8 @@ foreach ($token in @(
     'sole server-owned `wait` of exactly 5,000 ms',
     "preceding terminal waiter's", 'At pass finalization', '`load()`',
     'one cumulative evidence-read batch', 'generate the receipt index',
+    '`continueOnError: true`', 'validate each labeled result independently',
+    'unsupported optional operation', 'must not suppress',
     'after every interrupted pass', '`tooling_false_positive`',
     'row was never dispatched',
     'read `qualification_status` once'
@@ -389,6 +392,7 @@ foreach ($variant in $variants) {
         'owner-correlated recovery rule immediately',
         'Never replay the', 'terminal `lastEvidence`',
         '`method: none`', '`method: taa`', '`qualityMode: 0`',
+        'waiter `foveation` field',
         'target-correlated server barrier', 'advancing coherent native presentation',
         '`active/active` native controller state',
         'do not call `qualification_cancel` after any terminal waiter receipt',

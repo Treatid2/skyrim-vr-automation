@@ -428,6 +428,25 @@ function assertProviderTargetSeparation(scenarioCalls, variant) {
     }
 }
 
+function assertFoveationTargetScope(scenarioCalls, variant) {
+    let nativeTargets = 0;
+    let vendorTargets = 0;
+    for (const call of scenarioCalls) {
+        const apply = call.steps.find((step) => step.label === "profile-apply");
+        const waiter = call.steps.find((step) => step.label === "qualification-wait");
+        if (!apply || !waiter) continue;
+        const vendorTarget = apply.args.target.method === "dlss" ||
+            apply.args.target.method === "fsr";
+        if (vendorTarget) vendorTargets += 1;
+        else nativeTargets += 1;
+        assert(Object.prototype.hasOwnProperty.call(waiter.args, "foveation") ===
+            vendorTarget,
+        `${variant} waiter applied vendor foveation proof to the wrong target.`);
+    }
+    assert(nativeTargets > 0, `${variant} did not exercise a None/TAA waiter.`);
+    assert(vendorTargets > 0, `${variant} did not exercise a vendor waiter.`);
+}
+
 function assertRevisionFencing(scenarioCalls, variant) {
     const mutationCalls = scenarioCalls.filter((call) =>
         call.steps.some((step) => step.label === "profile-apply"));
@@ -480,6 +499,7 @@ async function testNvidia() {
     assert(result.ok === true && result.status === "COMPLETE", "NVIDIA mock run did not complete.");
     assertQualificationTimeouts(mock.scenarioCalls, matrix, "NVIDIA");
     assertProviderTargetSeparation(mock.scenarioCalls, "NVIDIA");
+    assertFoveationTargetScope(mock.scenarioCalls, "NVIDIA");
     assertRevisionFencing(mock.scenarioCalls, "NVIDIA");
     assert(result.lanes[0].passes.length === 2, "NVIDIA mock did not run two passes.");
     assert(result.lanes[0].passes.every((pass) => pass.rows.length === 33), "NVIDIA mock row count is wrong.");
@@ -558,6 +578,7 @@ async function testAmd() {
     assert(result.ok === true && result.status === "COMPLETE", "AMD mock run did not complete.");
     assertQualificationTimeouts(mock.scenarioCalls, matrix, "AMD");
     assertProviderTargetSeparation(mock.scenarioCalls, "AMD");
+    assertFoveationTargetScope(mock.scenarioCalls, "AMD");
     assertRevisionFencing(mock.scenarioCalls, "AMD");
     const fsr3 = result.lanes.find((lane) => lane.id === "explicit_fsr3");
     const fallback = result.lanes.find((lane) => lane.id === "fsr4_to_fsr3_fallback");

@@ -102,6 +102,9 @@ number. Use descriptive values such as
 - `<foveation>`: exactly `{ "foveatedVendorDispatch": true,
   "foveatedCenterArea": 0.3, "peripheryTAAEnable": true,
   "peripheryTAACenterArea": 0.3, "peripheryTAAOuterScale": 0.7 }`.
+  Supply this waiter field only for DLSS and FSR targets. None and TAA have no
+  live vendor path, so their waiters omit the field while retaining the
+  configured fixture in telemetry.
 
 The six baseline scenario steps have these complete tool/argument shapes; add
 no field and perform no lookup:
@@ -281,6 +284,12 @@ the raw files, generate the receipt index, and calculate byte lengths and
 SHA-256 hashes in one local batch. Missing optional cumulative detail marks
 only that evidence facet `INCONCLUSIVE`; a preserved terminal receipt remains
 valid transition evidence.
+
+Run that cumulative read-only scenario with `continueOnError: true` and
+validate each labeled result independently. An unsupported optional operation
+or event-history action is retained as `not_exposed` and must not suppress
+later status, telemetry, or cleanup reads. A required read failure still makes
+reporting incomplete, but never rewrites completed render rows.
 
 During that same offline finalization, hash the exact deployed DLL and verify
 its adjacent build manifest against the bound Build ID, artifact hash, and byte

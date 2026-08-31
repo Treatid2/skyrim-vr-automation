@@ -253,9 +253,12 @@ begin, dispatch, wait, and any cancellation; never reuse either pair.
    `milestone: strict` and the exact native target:
    `method: none` or
    `method: taa`, `qualityMode: 0`, and `renderScaleMode: false`; omit
-   `dlssProfile` and `fsrRuntime`. This is a native target, not a manufactured
-   FSR target. The target-correlated server barrier requires the authoritative
-   requested/effective/stable profiles to equal that target, render scale to
+   `dlssProfile`, `fsrRuntime`, and the waiter `foveation` field. This is a
+   native target, not a manufactured FSR target. The configured fixture
+   remains telemetry, but inactive vendor execution is correct and cannot be
+   a foveation mismatch. The target-correlated server barrier requires the
+   authoritative requested/effective/stable profiles to equal that target,
+   render scale to
    remain disabled, no active operation, advancing coherent native
    presentation, and either `idle/idle` or `active/active` native controller
    state. Native TAA legitimately reports `active/active`. Its physical
@@ -558,7 +561,11 @@ finalization. Retrieve cumulative operation/event/status/telemetry data and
 `dlss_trace_status` once, materialize the runner-retained terminal and trace
 receipts, persist stop/final-status responses under that pass's `finalization`
 directory, then invoke the packaged shared render-scale finalizer at
-`tools/renderscale-tuning-finalizer/finalizer.js`. During live finalization,
+`tools/renderscale-tuning-finalizer/finalizer.js`. Use one read-only scenario
+with `continueOnError: true` and validate each
+labeled result independently. Treat an unsupported optional operation or event
+history action as `not_exposed`; it must not abort the later status, telemetry,
+or cleanup reads. During live finalization,
 its `collectTracePages` helper obtains the maximum page size from the live
 producer schema, pages with `afterSequence` while `moreAvailable` is true, and
 rejects gaps, duplicates, overwritten requests, or build/session changes.
