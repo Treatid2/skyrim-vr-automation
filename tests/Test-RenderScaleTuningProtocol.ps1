@@ -76,7 +76,8 @@ foreach ($token in @(
     'evidence_numeric_value_not_lossless', 'delete summary.overallVerdict',
     'per_transition', 'dispatch_left_generation',
     'phaseCounterAuthorityStatus', 'reportedTask2Violations',
-    'producer_invalid_evidence'
+    'producer_invalid_evidence', 'deploymentVerification',
+    'deployment-verification.json', 'artifact-path', 'manifest-path'
 )) {
     Assert-Contains $finalizer $token 'Shared tuning finalizer'
 }
@@ -88,13 +89,15 @@ foreach ($token in @(
     'waiter.upscalingSnapshot', 'snapshot.effective',
     'matrix.pacingMilliseconds', 'matrix.completionTimeoutMilliseconds',
     'startPerformanceTelemetry: firstRow',
-    'store(`${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`',
+    'retain(`${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`',
     'action: "dlss_trace_read"', 'traceReset:', 'traceStart:', 'traceRead:',
     'retainAmdTraceCapability', 'amd:dlss-trace-capability',
     'transitionProjection', 'waiter.cleanupDrained === true',
     'scenarioDiagnostic', 'scenarioReceiptKey', 'failedStep',
     'firstUnreportedStep', 'phaseCounterAuthorityStatus',
     'reportedInvariantViolations', 'violationAuthority', 'boundaryOrder',
+    'transitionEvidenceComplete', 'authoritative_violation_schema',
+    'retainLiveResult', 'receiptKeys',
     'facts.physicalMutationClear === true', 'facts.terminalClear === true',
     'for (const row of matrix.transitions)', 'notify({'
 )) {

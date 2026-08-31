@@ -12,6 +12,19 @@ async function runRenderScaleTuningLive(context) {
     if (typeof scenarioTool !== "function" || typeof renderScaleTool !== "function") {
         throw new Error("plugin_direct_unavailable");
     }
+    const retainedReceiptKeys = [];
+
+    function retain(key, value) {
+        store(key, value);
+        if (!retainedReceiptKeys.includes(key)) retainedReceiptKeys.push(key);
+    }
+
+    function retainLiveResult(summary) {
+        const key = `${runId}:live-result`;
+        if (!retainedReceiptKeys.includes(key)) retainedReceiptKeys.push(key);
+        summary.receiptKeys = [...retainedReceiptKeys];
+        store(key, summary);
+    }
 
     const quality = Object.freeze({
         native_aa: 0,
@@ -61,10 +74,11 @@ async function runRenderScaleTuningLive(context) {
         const reportedSteps = results.map((entry, index) => {
             const planned = steps[index] || {};
             const result = entry && entry.result;
-            const error = reportedError(entry) || reportedError(result);
             const failed = Boolean(entry && (entry.ok === false ||
-                entry.isError === true || error !== null ||
+                entry.isError === true ||
                 (result && (result.ok === false || result.isError === true))));
+            const error = failed ?
+                reportedError(entry) || reportedError(result) : null;
             return {
                 index,
                 label: entry && typeof entry.label === "string" ?
@@ -85,7 +99,9 @@ async function runRenderScaleTuningLive(context) {
             stepsRun: root && Number.isSafeInteger(root.stepsRun) ?
                 root.stepsRun : null,
             expectedSteps: steps.length,
-            reportedError: reportedError(root) || (failed && failed.error) || null,
+            reportedError: root && (root.ok === false || root.isError === true) ?
+                reportedError(root) || (failed && failed.error) || null :
+                failed && failed.error || null,
             failedStep: failed && failed.label || null,
             firstUnreportedStep: firstUnreported && firstUnreported.label || null,
             reportedSteps,
@@ -172,7 +188,7 @@ async function runRenderScaleTuningLive(context) {
                 reportedSteps: [],
             });
         }
-        store(receiptKey, envelope);
+        retain(receiptKey, envelope);
         try {
             return { envelope, root: decodeEnvelope(envelope) };
         } catch (error) {
@@ -437,6 +453,9 @@ async function runRenderScaleTuningLive(context) {
         const tickComparable = positiveInteger(offenderTick) &&
             positiveInteger(boundaryTick);
         if (!frameComparable || !tickComparable) return "unknown";
+        if (offender.frame === boundary.frame) {
+            return offenderTick < boundaryTick ? "before" : "at_or_after";
+        }
         const frameBefore = offender.frame < boundary.frame;
         const tickBefore = offenderTick < boundaryTick;
         if (frameBefore && tickBefore) return "before";
@@ -505,13 +524,26 @@ async function runRenderScaleTuningLive(context) {
         if (notRequired && !exactTerminalProof) {
             missing.push("mutation_not_required_terminal_proof");
         }
-        if (!audit || audit.evidenceComplete !== true ||
-            audit.retentionOverflow === true) {
+        const auditStorageComplete = Boolean(audit &&
+            audit.evidenceComplete === true && audit.retentionOverflow !== true);
+        if (!auditStorageComplete) {
             missing.push("authoritative_cycle_audit");
         }
-        if (audit && (audit.ownerTransitionId !== waiter.transitionId ||
-            !Number.isSafeInteger(audit.ownerToken) || audit.ownerToken <= 0)) {
+        const auditOwnerAuthoritative = Boolean(audit &&
+            audit.ownerTransitionId === waiter.transitionId &&
+            positiveInteger(audit.ownerToken));
+        if (!auditOwnerAuthoritative) {
             missing.push("authoritative_cycle_owner");
+        }
+        const auditHasObservations = Boolean(audit &&
+            positiveInteger(audit.eyeObservations));
+        if (!auditHasObservations) {
+            missing.push("authoritative_cycle_observations");
+        }
+        const violationSchemaAuthoritative = Number.isSafeInteger(
+            waiter.schemaRevision) && waiter.schemaRevision >= 14;
+        if (!violationSchemaAuthoritative) {
+            missing.push("authoritative_violation_schema");
         }
         const violationNames = [
             "preMutationExactPresentationSuppressed",
@@ -545,13 +577,11 @@ async function runRenderScaleTuningLive(context) {
         if (boundaryOwnerMismatch) {
             producerInvalid.push("physical_mutation_boundary_owner_mismatch");
         }
-        const auditComplete = Boolean(audit && audit.evidenceComplete === true &&
-            audit.retentionOverflow !== true);
-        const auditOwnerAuthoritative = Boolean(audit &&
-            audit.ownerTransitionId === waiter.transitionId &&
-            positiveInteger(audit.ownerToken));
-        const basePhaseCountersAuthoritative = auditComplete &&
-            auditOwnerAuthoritative && countersComplete &&
+        const transitionEvidenceComplete = Boolean(timeline && timeline.dispatch &&
+            auditStorageComplete && auditOwnerAuthoritative &&
+            auditHasObservations && countersComplete &&
+            violationSchemaAuthoritative);
+        const basePhaseCountersAuthoritative = transitionEvidenceComplete &&
             (!required || Boolean(boundary) && !boundaryOwnerMismatch);
         const authorityMismatchReasons = [];
         if (audit && positiveInteger(audit.ownerTransitionId) &&
@@ -736,6 +766,10 @@ async function runRenderScaleTuningLive(context) {
             mutationExpectationReason: expectationReason || null,
             mutationNotRequiredProven: notRequired &&
                 explicitNotRequiredReason && exactTerminalProof,
+            auditStorageComplete,
+            ownerCorrelatedAuditObserved: auditOwnerAuthoritative &&
+                auditHasObservations,
+            transitionEvidenceComplete,
             missingEvidence: missing,
             phaseCountersAuthoritative,
             phaseCounterAuthorityStatus,
@@ -796,7 +830,7 @@ async function runRenderScaleTuningLive(context) {
             action: "qualification_status",
             expectedBuildId: buildId,
         });
-        store(`${runId}:recovery:${identifiers.transitionId}`, status.envelope);
+        retain(`${runId}:recovery:${identifiers.transitionId}`, status.envelope);
         const qualification = status.root.qualification;
         const waiter = qualification && qualification.lastEvidence;
         if (qualification && qualification.active === false && waiter &&
@@ -812,7 +846,7 @@ async function runRenderScaleTuningLive(context) {
             action: "qualification_status",
             expectedBuildId: buildId,
         });
-        store(`${runId}:recovery:${identifiers.transitionId}:close-status`,
+        retain(`${runId}:recovery:${identifiers.transitionId}:close-status`,
             status.envelope);
         const qualification = status.root.qualification;
         if (qualification && qualification.active === true &&
@@ -824,7 +858,7 @@ async function runRenderScaleTuningLive(context) {
                 ownerId: identifiers.ownerId,
                 expectedBuildId: buildId,
             });
-            store(`${runId}:recovery:${identifiers.transitionId}:cancel`,
+            retain(`${runId}:recovery:${identifiers.transitionId}:cancel`,
                 cancel.envelope);
         }
     }
@@ -937,7 +971,7 @@ async function runRenderScaleTuningLive(context) {
             try {
                 waiter = await recoverTerminal(identifiers);
             } catch {
-                store(`${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`, {
+                retain(`${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`, {
                     scenarioReceiptKey: receiptKey,
                     scenario: scenarioFailure && scenarioFailure.diagnostic || null,
                     waiter: null,
@@ -947,7 +981,7 @@ async function runRenderScaleTuningLive(context) {
                     scenarioFailure && scenarioFailure.diagnostic || null);
             }
             const projection = transitionProjection(waiter, target);
-            store(`${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`, {
+            retain(`${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`, {
                 scenarioReceiptKey: receiptKey,
                 scenario: scenarioFailure && scenarioFailure.diagnostic || null,
                 recoveredTerminal: true,
@@ -963,7 +997,7 @@ async function runRenderScaleTuningLive(context) {
         const waiter = entries.get("qualification-wait");
         const projection = waiter ? transitionProjection(waiter, target) : null;
         const diagnostic = scenarioDiagnostic(response.root, steps, receiptKey);
-        store(`${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`, {
+        retain(`${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`, {
             scenarioReceiptKey: receiptKey,
             scenario: diagnostic,
             apply: entries.get("profile-apply"),
@@ -1139,7 +1173,7 @@ async function runRenderScaleTuningLive(context) {
             summary.error = error instanceof Error ? error.message : String(error);
             summary.failure = error && typeof error === "object" &&
                 error.diagnostic ? error.diagnostic : null;
-            store(`${runId}:live-result`, summary);
+            retainLiveResult(summary);
             return summary;
         }
     }
@@ -1151,21 +1185,26 @@ async function runRenderScaleTuningLive(context) {
         for (let pass = 1; pass <= 2; pass += 1) {
             passSequence += 1;
             let stressSessionId = 0;
+            const passSummary = { pass, status: "RUNNING", rows: [] };
+            laneSummary.passes.push(passSummary);
             try {
                 const base = await baseline(boundary, lane, laneIndex + 1, pass);
                 boundary = base.boundary;
                 stressSessionId = await armOwners(
                     base, lane, laneIndex + 1, pass, passSequence > 1);
-                const rows = [];
                 for (const row of matrix.transitions) {
                     const completed = await transition(
                         boundary, lane, laneIndex + 1, pass, row);
                     boundary = completed.boundary;
-                    rows.push({ ordinal: row.ordinal, ...completed.projection });
+                    passSummary.rows.push({
+                        ordinal: row.ordinal,
+                        receiptKey: `${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`,
+                        ...completed.projection,
+                    });
                 }
                 await cleanup(lane, pass, stressSessionId);
                 stressSessionId = 0;
-                laneSummary.passes.push({ pass, status: "COMPLETE", rows });
+                passSummary.status = "COMPLETE";
                 if (pass === 1) await cooldown(lane, pass);
             } catch (error) {
                 if (stressSessionId) {
@@ -1174,18 +1213,16 @@ async function runRenderScaleTuningLive(context) {
                 summary.ok = false;
                 summary.status = "INTERRUPTED";
                 laneSummary.status = "INTERRUPTED";
-                laneSummary.passes.push({
-                    pass,
-                    status: "INTERRUPTED",
-                    error: error instanceof Error ? error.message : String(error),
-                    failure: error && typeof error === "object" &&
-                        error.diagnostic ? error.diagnostic : null,
-                });
-                store(`${runId}:live-result`, summary);
+                passSummary.status = "INTERRUPTED";
+                passSummary.error = error instanceof Error ?
+                    error.message : String(error);
+                passSummary.failure = error && typeof error === "object" &&
+                    error.diagnostic ? error.diagnostic : null;
+                retainLiveResult(summary);
                 return summary;
             }
         }
     }
-    store(`${runId}:live-result`, summary);
+    retainLiveResult(summary);
     return summary;
 }

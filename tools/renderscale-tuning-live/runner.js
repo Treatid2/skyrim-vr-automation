@@ -74,10 +74,11 @@ async function runRenderScaleTuningLive(context) {
         const reportedSteps = results.map((entry, index) => {
             const planned = steps[index] || {};
             const result = entry && entry.result;
-            const error = reportedError(entry) || reportedError(result);
             const failed = Boolean(entry && (entry.ok === false ||
-                entry.isError === true || error !== null ||
+                entry.isError === true ||
                 (result && (result.ok === false || result.isError === true))));
+            const error = failed ?
+                reportedError(entry) || reportedError(result) : null;
             return {
                 index,
                 label: entry && typeof entry.label === "string" ?
@@ -98,7 +99,9 @@ async function runRenderScaleTuningLive(context) {
             stepsRun: root && Number.isSafeInteger(root.stepsRun) ?
                 root.stepsRun : null,
             expectedSteps: steps.length,
-            reportedError: reportedError(root) || (failed && failed.error) || null,
+            reportedError: root && (root.ok === false || root.isError === true) ?
+                reportedError(root) || (failed && failed.error) || null :
+                failed && failed.error || null,
             failedStep: failed && failed.label || null,
             firstUnreportedStep: firstUnreported && firstUnreported.label || null,
             reportedSteps,
@@ -450,6 +453,9 @@ async function runRenderScaleTuningLive(context) {
         const tickComparable = positiveInteger(offenderTick) &&
             positiveInteger(boundaryTick);
         if (!frameComparable || !tickComparable) return "unknown";
+        if (offender.frame === boundary.frame) {
+            return offenderTick < boundaryTick ? "before" : "at_or_after";
+        }
         const frameBefore = offender.frame < boundary.frame;
         const tickBefore = offenderTick < boundaryTick;
         if (frameBefore && tickBefore) return "before";

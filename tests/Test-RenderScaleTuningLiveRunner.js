@@ -522,10 +522,11 @@ async function testScenarioFailureRetention() {
         repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
         "matrix.v1.json")));
     let injected = false;
-    const mock = createMock(0, null, (root, args) => {
+    const mock = createMock(0, null, (root, args, state) => {
         if (injected || !args.steps.some((step) =>
             step.label === "profiler-clear-history") ||
-            args.steps.some((step) => step.label === "baseline-stress-start")) {
+            args.steps.some((step) => step.label === "baseline-stress-start") ||
+            state.transitionOrdinal !== matrix.transitions.length + 1) {
             return root;
         }
         injected = true;
@@ -549,14 +550,17 @@ async function testScenarioFailureRetention() {
     });
     assert(result.ok === false && result.status === "INTERRUPTED",
         "A failed scenario did not interrupt the live assay.");
-    const pass = result.lanes[0].passes[0];
+    assert(result.lanes[0].passes[0].status === "COMPLETE" &&
+        result.lanes[0].passes[0].rows.length === 33,
+    "A completed pass was discarded by a later interruption.");
+    const pass = result.lanes[0].passes[1];
     assert(pass.error === "transition_scenario_failed" && pass.failure &&
         pass.failure.failedStep === "profiler-clear-history" &&
         pass.failure.reportedError === "synthetic_profiler_failure" &&
         pass.failure.firstUnreportedStep === "qualification-dispatch",
     "The compact live failure omitted the producer-reported step or boundary.");
     const receiptKey =
-        "scenario-failure:nvidia:pass-1:transition-1:scenario";
+        "scenario-failure:nvidia:pass-2:transition-1:scenario";
     const rawEnvelope = mock.stores.get(receiptKey);
     assert(rawEnvelope, "The exact failed scenario envelope was not retained.");
     const raw = JSON.parse(rawEnvelope.content[0].text);
@@ -564,10 +568,49 @@ async function testScenarioFailureRetention() {
         "synthetic_profiler_failure",
     "The retained failed scenario envelope was rewritten.");
     const retained = mock.stores.get(
-        "scenario-failure:nvidia:pass-1:transition-1");
+        "scenario-failure:nvidia:pass-2:transition-1");
     assert(retained.scenarioReceiptKey === receiptKey &&
         retained.scenario.failedStep === "profiler-clear-history",
     "The compact transition receipt is not linked to its exact scenario evidence.");
+    assert(result.receiptKeys.includes(receiptKey) &&
+        result.receiptKeys.includes(
+            "scenario-failure:nvidia:pass-2:transition-1") &&
+        result.receiptKeys.includes("scenario-failure:live-result"),
+    "The interruption result omitted receipt keys needed for materialization.");
+}
+
+async function testInformationalReasonIsNotFailure() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    let injected = false;
+    const mock = createMock(0, null, (root, args, state) => {
+        if (injected || state.transitionOrdinal !== 1) return root;
+        const index = args.steps.findIndex((step) =>
+            step.label === "profiler-clear-history");
+        if (index < 0) return root;
+        injected = true;
+        root.results[index].result.reason = "history_already_empty";
+        return root;
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "nvidia",
+        runId: "informational-reason",
+        buildId,
+        initialBoundary: initialBoundary(),
+        capabilities: {},
+        matrix,
+    });
+    assert(result.ok === true && result.status === "COMPLETE",
+        "A successful informational reason interrupted the assay.");
+    const retained = mock.stores.get(
+        "informational-reason:nvidia:pass-1:transition-1");
+    const step = retained.scenario.reportedSteps.find((entry) =>
+        entry.label === "profiler-clear-history");
+    assert(step && step.failed === false && step.error === null &&
+        retained.scenario.failedStep === null,
+    "An informational reason fabricated a failed step.");
 }
 
 async function runNvidiaProjectionTransform(receiptTransform) {
@@ -588,6 +631,36 @@ async function runNvidiaProjectionTransform(receiptTransform) {
 }
 
 async function testEvidenceVerdicts() {
+    const cancelledBeforeDispatch = await runNvidiaProjectionTransform(
+        (receipt, context) => {
+            if (!context.baseline) {
+                receipt.replacementTimeline.dispatch = null;
+                receipt.presentationCycleAudit.ownerTransitionId = 0;
+                receipt.presentationCycleAudit.ownerToken = 0;
+                receipt.presentationCycleAudit.eyeObservations = 0;
+                receipt.presentationCycleAudit.evidenceComplete = true;
+            }
+            return receipt;
+        });
+    assert(cancelledBeforeDispatch.every((row) =>
+        row.evidenceVerdict === "INCONCLUSIVE" &&
+        row.auditStorageComplete === true &&
+        row.ownerCorrelatedAuditObserved === false &&
+        row.transitionEvidenceComplete === false &&
+        row.missingEvidence.includes("dispatch") &&
+        row.missingEvidence.includes("authoritative_cycle_owner") &&
+        row.missingEvidence.includes("authoritative_cycle_observations")),
+    "Storage completeness was misreported as complete transition evidence.");
+
+    const schema13 = await runNvidiaProjectionTransform((receipt, context) => {
+        if (!context.baseline) receipt.schemaRevision = 13;
+        return receipt;
+    });
+    assert(schema13.every((row) => row.evidenceVerdict === "INCONCLUSIVE" &&
+        row.transitionEvidenceComplete === false &&
+        row.missingEvidence.includes("authoritative_violation_schema")),
+    "Pre-schema-14 counters were treated as current authoritative evidence.");
+
     const unpublishedBoundaryGeneration = await runNvidiaProjectionTransform(
         (receipt, context) => {
             if (!context.baseline) {
@@ -978,6 +1051,52 @@ async function testEvidenceVerdicts() {
             "MISMATCHED"),
     "An offender QPC before the boundary was treated as a runtime failure.");
 
+    const sameFrameEarlierQpc = await runNvidiaProjectionTransform(
+        (receipt, context) => {
+            if (!context.baseline) {
+                receipt.presentationCycleAudit.violations
+                    .postMutationUnprovenStereoSubmitted = 1;
+                receipt.presentationCycleAudit.violations
+                    .firstPostMutationUnprovenStereoSubmitted = {
+                        frame: 12,
+                        qpcTick: 11,
+                        disposition: "presentation_stretch",
+                        submitted: true,
+                    };
+            }
+            return receipt;
+        });
+    assert(sameFrameEarlierQpc.every((row) =>
+        row.evidenceVerdict === "INCONCLUSIVE" &&
+        row.temporallyImpossibleViolations.includes(
+            "postMutationUnprovenStereoSubmitted") &&
+        row.producerInvalidEvidence.includes(
+            "postMutationUnprovenStereoSubmitted_precedes_boundary") &&
+        !row.producerInvalidEvidence.includes(
+            "postMutationUnprovenStereoSubmitted_temporal_order_conflict")),
+    "Same-frame earlier QPC evidence was misclassified as a clock conflict.");
+
+    const sameFrameEqualQpc = await runNvidiaProjectionTransform(
+        (receipt, context) => {
+            if (!context.baseline) {
+                receipt.presentationCycleAudit.violations
+                    .postMutationUnprovenStereoSubmitted = 1;
+                receipt.presentationCycleAudit.violations
+                    .firstPostMutationUnprovenStereoSubmitted = {
+                        frame: 12,
+                        qpcTick: 12,
+                        disposition: "presentation_stretch",
+                        submitted: true,
+                    };
+            }
+            return receipt;
+        });
+    assert(sameFrameEqualQpc.every((row) =>
+        row.evidenceVerdict === "FAIL" &&
+        row.genuineInvariantViolations.includes(
+            "postMutationUnprovenStereoSubmitted")),
+    "Same-frame equal QPC evidence was not classified at-or-after mutation.");
+
     const frameBeforeBoundary = await runNvidiaProjectionTransform((receipt, context) => {
         if (!context.baseline) {
             receipt.presentationCycleAudit.violations.postMutationOldGenerationPresented = 1;
@@ -1066,7 +1185,7 @@ async function testEvidenceVerdicts() {
 }
 
 Promise.all([testNvidia(), testAmd(), testEvidenceVerdicts(),
-    testScenarioFailureRetention()]).then(() => {
+    testScenarioFailureRetention(), testInformationalReasonIsNotFailure()]).then(() => {
     process.stdout.write("Render-scale tuning live runner tests passed.\n");
 }).catch((error) => {
     process.stderr.write(`${error.stack || error}\n`);

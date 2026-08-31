@@ -165,6 +165,17 @@ function qualificationWait(value) {
     return value && value.action === "qualification_wait" ? value : null;
 }
 
+function interruptedLiveResult(root, variant, runId) {
+    const file = path.join(root, "raw", "live-result.json");
+    if (!fs.existsSync(file)) return null;
+    const value = readJson(file);
+    if (value.status !== "INTERRUPTED") return null;
+    if (value.variant !== variant || value.runId !== runId) {
+        throw new Error("interrupted_result_identity_mismatch");
+    }
+    return value;
+}
+
 function validateBaselineOnlyInterruption(root, variant, runId, buildId) {
     const liveResultPath = path.join(root, "raw", "live-result.json");
     if (!fs.existsSync(liveResultPath)) {
@@ -206,6 +217,61 @@ function baselineOnlyMemoryConfirmation() {
         verdict: "repeat_not_completed",
         conclusion: "no_leak_or_retention_conclusion_possible",
     };
+}
+
+function deploymentVerification(root, buildId, options) {
+    const file = path.join(root, "raw", "startup", "deployment-verification.json");
+    const retainedManifest = path.join(
+        root, "raw", "startup", "deployment-manifest.json");
+    if (options.artifactPath || options.manifestPath) {
+        if (!options.artifactPath || !options.manifestPath) {
+            throw new Error("deployment_verification_paths_incomplete");
+        }
+        const artifactPath = path.resolve(options.artifactPath);
+        const manifestPath = path.resolve(options.manifestPath);
+        const manifest = readJson(manifestPath);
+        const expected = manifest && manifest.artifact;
+        const artifactBytes = fs.statSync(artifactPath).size;
+        const artifactSha256 = sha256(artifactPath);
+        if (manifest.buildId !== buildId || !expected ||
+            String(expected.sha256).toLowerCase() !== artifactSha256 ||
+            Number(expected.sizeBytes) !== artifactBytes) {
+            throw new Error("deployment_manifest_mismatch");
+        }
+        const receipt = {
+            schemaVersion: "renderscale-tuning-deployment-verification-v1",
+            buildId,
+            artifact: { fileName: path.basename(artifactPath),
+                bytes: artifactBytes, sha256: artifactSha256 },
+            manifest: { fileName: path.basename(manifestPath),
+                path: relative(root, retainedManifest),
+                sha256: sha256(manifestPath) },
+            manifestVerified: true,
+        };
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        writeAtomic(retainedManifest, fs.readFileSync(manifestPath));
+        writeAtomic(file, `${JSON.stringify(receipt, null, 2)}\n`);
+    }
+    if (!fs.existsSync(file)) {
+        return { complete: false, reason: "deployment_verification_missing" };
+    }
+    const receipt = readJson(file);
+    if (receipt.buildId !== buildId || receipt.manifestVerified !== true ||
+        !receipt.artifact ||
+        !/^[a-f0-9]{64}$/i.test(String(receipt.artifact.sha256 || "")) ||
+        !Number.isSafeInteger(receipt.artifact.bytes) ||
+        receipt.artifact.bytes < 1 || !receipt.manifest ||
+        typeof receipt.manifest.path !== "string") {
+        throw new Error("deployment_verification_invalid");
+    }
+    const manifestEvidence = path.resolve(root, receipt.manifest.path);
+    if (!manifestEvidence.startsWith(`${root}${path.sep}`) ||
+        !fs.existsSync(manifestEvidence) ||
+        sha256(manifestEvidence) !== receipt.manifest.sha256) {
+        throw new Error("deployment_manifest_evidence_invalid");
+    }
+    return { complete: true, receipt: relative(root, file),
+        artifactSha256: receipt.artifact.sha256 };
 }
 
 function aggregateVerdict(values) {
@@ -383,10 +449,21 @@ function normalizeTask2(retained) {
             violationAuthority[name].status === "MATCHED");
     let verdict = projection.task2Verdict || projection.evidenceVerdict ||
         "INCONCLUSIVE";
+    const audit = waiter.presentationCycleAudit || retained.presentationCycleAudit || {};
+    if (!Number.isSafeInteger(waiter.schemaRevision) ||
+        waiter.schemaRevision < 14) {
+        missing.push("authoritative_violation_schema");
+    }
+    if (!Number.isSafeInteger(audit.eyeObservations) ||
+        audit.eyeObservations < 1) {
+        missing.push("authoritative_cycle_observations");
+    }
     const authorityMissing = missing.some((value) => [
         "authoritative_cycle_audit",
         "authoritative_cycle_owner",
         "authoritative_cycle_counters",
+        "authoritative_cycle_observations",
+        "authoritative_violation_schema",
     ].includes(value));
     const authorityInvalid = producerInvalid.some((value) =>
         value === "physical_mutation_boundary_owner_mismatch" ||
@@ -410,7 +487,6 @@ function normalizeTask2(retained) {
         authoritativeViolations = [];
         verdict = "INCONCLUSIVE";
     }
-    const audit = waiter.presentationCycleAudit || retained.presentationCycleAudit || {};
     const baselineSession = waiter.baseline && waiter.baseline.stressSessionId;
     const derivedMismatchReasons = [];
     if (Number.isSafeInteger(audit.ownerTransitionId) &&
@@ -469,6 +545,25 @@ function normalizeTask2(retained) {
         violationAuthority,
         authoritativeViolations,
         producerInvalidEvidence: producerInvalid,
+        auditStorageComplete: projection.auditStorageComplete ??
+            (audit.evidenceComplete === true && audit.retentionOverflow !== true),
+        ownerCorrelatedAuditObserved:
+            projection.ownerCorrelatedAuditObserved ??
+            (audit.ownerTransitionId === waiter.transitionId &&
+                Number.isSafeInteger(audit.ownerToken) && audit.ownerToken > 0 &&
+                Number.isSafeInteger(audit.eyeObservations) &&
+                audit.eyeObservations > 0),
+        transitionEvidenceComplete:
+            projection.transitionEvidenceComplete ??
+            (Boolean(timeline.dispatch) &&
+                audit.evidenceComplete === true &&
+                audit.retentionOverflow !== true &&
+                audit.ownerTransitionId === waiter.transitionId &&
+                Number.isSafeInteger(audit.ownerToken) && audit.ownerToken > 0 &&
+                Number.isSafeInteger(audit.eyeObservations) &&
+                audit.eyeObservations > 0 &&
+                Number.isSafeInteger(waiter.schemaRevision) &&
+                waiter.schemaRevision >= 14),
     };
 }
 
@@ -511,6 +606,9 @@ function transitionRow(root, file, retained) {
         reportedTask2Violations: task2.reportedViolations,
         task2ViolationAuthority: task2.violationAuthority,
         authoritativeTask2Violations: task2.authoritativeViolations,
+        auditStorageComplete: task2.auditStorageComplete,
+        ownerCorrelatedAuditObserved: task2.ownerCorrelatedAuditObserved,
+        transitionEvidenceComplete: task2.transitionEvidenceComplete,
         mutationExpectation: task2.expectation,
         diagnostics,
         physicalMutationStarted: boundary ?
@@ -529,6 +627,14 @@ function transitionRow(root, file, retained) {
     };
 }
 
+function transitionWasDispatched(retained) {
+    const waiter = retained && retained.waiter;
+    return Boolean(waiter &&
+        ((waiter.replacementTimeline && waiter.replacementTimeline.dispatch) ||
+            (waiter.frames && Number.isSafeInteger(waiter.frames.dispatch)) ||
+            (waiter.timing && Number.isSafeInteger(waiter.timing.dispatchTick))));
+}
+
 function csvCell(value) {
     const text = Array.isArray(value) ? value.join(";") :
         value && typeof value === "object" ? JSON.stringify(value) : String(value ?? "");
@@ -543,6 +649,8 @@ function csv(rows) {
         "authoritative_violations", "violation_authority",
         "phase_counter_authority_status",
         "phase_counter_authority_reasons", "phase_counters_authoritative",
+        "audit_storage_complete", "owner_correlated_audit_observed",
+        "transition_evidence_complete",
         "physical_mutation_started", "final_method", "final_quality",
         "final_render_scale_mode", "final_state_revision", "trace_required",
         "trace_complete", "boundary_exposed", "dispatch_frame",
@@ -567,7 +675,9 @@ function csv(rows) {
             row.authoritativeTask2Violations,
             row.task2ViolationAuthority,
             row.phaseCounterAuthorityStatus, row.phaseCounterAuthorityReasons,
-            row.phaseCountersAuthoritative, row.physicalMutationStarted,
+            row.phaseCountersAuthoritative, row.auditStorageComplete,
+            row.ownerCorrelatedAuditObserved, row.transitionEvidenceComplete,
+            row.physicalMutationStarted,
             row.finalMethod, row.finalQuality, row.finalRenderScaleMode,
             row.finalStateRevision, row.traceRequired, row.traceComplete,
             diagnostics.boundaryExposed, diagnostics.dispatchFrame,
@@ -601,6 +711,8 @@ function report(summary) {
         `${row.reportedTask2Violations.join("; ") || "none"} | ` +
         `${row.task2MissingEvidence.join("; ") || "none"} | ` +
         `${row.task2ProducerInvalidEvidence.join("; ") || "none"} |`).join("\n");
+    const interruption = summary.assayExecution.interruption;
+    const failure = interruption && interruption.failure;
     return `# ${summary.protocol} final report\n\n` +
         `- Assay execution: **${summary.assayExecution.status}**\n` +
         `- Transitions dispatched: **${summary.assayExecution.transitionsDispatched}/` +
@@ -611,6 +723,14 @@ function report(summary) {
         `${summary.task2Evidence.counts.FAIL} FAIL, ` +
         `${summary.task2Evidence.counts.INCONCLUSIVE} INCONCLUSIVE)\n` +
         `- Reporting completeness: **${summary.reporting.status}**\n` +
+        `- Deployment verification: **${summary.deploymentVerification.complete ?
+            "COMPLETE" : "INCOMPLETE"}**\n` +
+        (interruption ?
+            `- Interruption: **${interruption.error || "not_exposed"}**\n` : "") +
+        (failure ?
+            `- Failed scenario step: **${failure.failedStep || "not_exposed"}** ` +
+            `(first unreported: ${failure.firstUnreportedStep || "none"}; ` +
+            `receipt: ${failure.receiptKey || "not_exposed"})\n` : "") +
         (summary.memoryConfirmation ?
             `- Memory confirmation: **${summary.memoryConfirmation.verdict}**\n` : "") +
         `\n` +
@@ -642,7 +762,11 @@ function finalizeEvidence(options) {
     }
     const retainedFiles = walk(root).filter((file) =>
         path.basename(file) === "retained.json" && rowIdentity(root, file));
-    const retained = retainedFiles.map((file) => ({ file, value: readJson(file) }));
+    const allRetained = retainedFiles.map((file) => ({ file, value: readJson(file) }));
+    const retained = allRetained.filter((entry) =>
+        transitionWasDispatched(entry.value));
+    const undispatchedFailures = allRetained.filter((entry) =>
+        !transitionWasDispatched(entry.value));
     const rows = retained.map(({ file, value }) => transitionRow(root, file, value))
         .sort((left, right) => (left.lane || "").localeCompare(right.lane || "") ||
             left.pass - right.pass || left.ordinal - right.ordinal);
@@ -654,6 +778,8 @@ function finalizeEvidence(options) {
     if (runIds.length !== 1 || buildIds.length !== 1) {
         throw new Error("finalization_identity_ambiguous");
     }
+    const interrupted = interruptedLiveResult(
+        root, variant, runIds[0]);
     const expectedRows = options.expectedRows ??
         (existing.assayExecution &&
             existing.assayExecution.expectedTerminalReceipts) ??
@@ -682,16 +808,21 @@ function finalizeEvidence(options) {
             throw new Error("terminal_receipt_session_missing");
         }
     }
-    const assayStatus = baselineOnlyInterrupted ? "INTERRUPTED" :
+    const assayStatus = interrupted ? "INTERRUPTED" :
         rows.length === expectedRows ? "COMPLETE" : "INCOMPLETE";
     const renderVerdict = aggregateVerdict(rows.map((row) => row.renderVerdict));
     const task2Counts = verdictCounts(rows.map((row) => row.task2Verdict));
     const reportingReasons = [];
     if (assayStatus !== "COMPLETE") reportingReasons.push("terminal_receipts_incomplete");
     if (baselineOnlyInterrupted) reportingReasons.push("baseline_only_interrupted");
+    if (interrupted && !baselineOnlyInterrupted) {
+        reportingReasons.push("assay_interrupted");
+    }
     if (rows.some((row) => !row.traceComplete)) {
         reportingReasons.push("required_trace_evidence_incomplete");
     }
+    const deployment = deploymentVerification(root, buildIds[0], options);
+    if (!deployment.complete) reportingReasons.push(deployment.reason);
     const reportingStatus = reportingReasons.length === 0 ? "COMPLETE" : "INCOMPLETE";
     const extraction = evidenceValues(root);
     const generatedUtc = options.generatedUtc || existing.generatedUtc ||
@@ -713,13 +844,23 @@ function finalizeEvidence(options) {
         assayExecution: { status: assayStatus, terminalReceipts: rows.length,
             expectedTerminalReceipts: expectedRows,
             transitionsDispatched: rows.length,
-            expectedTransitions: expectedRows },
+            expectedTransitions: expectedRows,
+            interruption: interrupted ? {
+                error: interrupted.error || null,
+                failure: interrupted.failure ||
+                    interrupted.lanes && interrupted.lanes
+                        .flatMap((lane) => lane.passes || [])
+                        .find((pass) => pass.status === "INTERRUPTED")?.failure || null,
+                undispatchedTransitionReceipts: undispatchedFailures.map((entry) =>
+                    relative(root, entry.file)),
+            } : null },
         render: { verdict: renderVerdict },
         task2Evidence: { mode: "per_transition", counts: task2Counts,
             aggregateVerdict: "NOT_COMPUTED" },
         reporting: { status: reportingStatus, reasons: reportingReasons },
         reportingContract: { complete: reportingStatus === "COMPLETE",
             status: reportingStatus, reasons: reportingReasons },
+        deploymentVerification: deployment,
         memoryConfirmation: baselineOnlyInterrupted ?
             baselineOnlyMemoryConfirmation() : existing.memoryConfirmation,
         evidenceExtraction: { complete: true,
@@ -784,6 +925,8 @@ if (require.main === module) {
             buildId: args["build-id"],
             expectedRows: args["expected-rows"] ? Number(args["expected-rows"]) : undefined,
             generatedUtc: args["generated-utc"],
+            artifactPath: args["artifact-path"],
+            manifestPath: args["manifest-path"],
         });
         process.stdout.write(`${JSON.stringify({ ok: true,
             assayStatus: result.summary.assayExecution.status,
@@ -799,6 +942,7 @@ if (require.main === module) {
 
 module.exports = {
     collectTracePages,
+    deploymentVerification,
     finalizeEvidence,
     normalizeTask2,
     traceCapacity,

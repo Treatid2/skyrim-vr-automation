@@ -228,6 +228,10 @@ step, and ordered step results. Set `failedStep` only when the response
 explicitly marks a step failed. Report `firstUnreportedStep` separately as an
 observation boundary; never invent that it failed. Transport and decode
 failures likewise retain their phase without fabricating a producer result.
+The live result lists every retained receipt key and keeps completed rows in
+the pass summary as each row closes. After interruption, materialize those
+keys plus the failed scenario before reporting; a later failure never discards
+an earlier completed pass or row.
 
 The orchestration cell and packaged runner are only a response-handling
 boundary. Every nested live call must still use the installed plugin's selected
@@ -278,6 +282,15 @@ SHA-256 hashes in one local batch. Missing optional cumulative detail marks
 only that evidence facet `INCONCLUSIVE`; a preserved terminal receipt remains
 valid transition evidence.
 
+During that same offline finalization, hash the exact deployed DLL and verify
+its adjacent build manifest against the bound Build ID, artifact hash, and byte
+length. Preserve the resulting receipt under
+`raw/startup/deployment-verification.json`. Missing or mismatched deployment
+proof makes reporting incomplete but does not rewrite completed render rows.
+Pass those already-resolved paths to the offline finalizer as
+`--artifact-path` and `--manifest-path`; never discover or hash them in the
+live startup/measurement cell.
+
 The post-measurement finalizer must also walk every JSON file below `raw/` and
 write `evidence-values.csv` as a lossless long-form analysis table. Give every
 row its relative source path, lane/pass/ordinal when present, RFC 6901 JSON
@@ -303,6 +316,13 @@ places that violation in the claimed phase. If any authority or ordering fact
 is missing, mismatched, or impossible, keep the counter visible, record the
 producer-invalid reason, and classify Task 2 `INCONCLUSIVE`. Never turn an
 unowned counter into either a pipeline failure or a synthetic zero.
+Producer `presentationCycleAudit.evidenceComplete` describes bounded-storage
+retention only. Transition evidence is complete only after dispatch, a matching
+audit owner/token, at least one eye observation, all four decisive violation
+counters, and schema revision 14 or newer are present. Older schemas and
+cancelled pre-dispatch owners remain `INCONCLUSIVE` even when their storage flag
+is true. Keep raw mixed/unproven stereo totals diagnostic; only the four
+`violations` counters can decide Task 2.
 Emit each reported counter's own authority status and reasons so one exact
 violation is not erased merely because a different counter is mismatched.
 Omit legacy aggregate verdict fields instead of populating them with sentinel

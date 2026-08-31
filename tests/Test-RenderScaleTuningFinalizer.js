@@ -8,6 +8,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const {
     collectTracePages,
+    deploymentVerification,
     finalizeEvidence,
 } = require("../tools/renderscale-tuning-finalizer/finalizer.js");
 
@@ -162,6 +163,8 @@ function retained(boundary, violation, identity = {}) {
             "slash/key~": "retained",
         },
         waiter: {
+            schemaRevision: 14,
+            transitionId: 101,
             satisfied: true,
             ownerId: `${runId}-owner`,
             baseline: { stressSessionId: 7 },
@@ -236,6 +239,19 @@ function retained(boundary, violation, identity = {}) {
                 stateRevision: 8,
                 stable: { method: "none", qualityMode: 0, renderScaleMode: false },
             },
+            presentationCycleAudit: {
+                evidenceComplete: true,
+                retentionOverflow: false,
+                ownerTransitionId: 101,
+                ownerToken: 1,
+                eyeObservations: 2,
+                violations: {
+                    preMutationExactPresentationSuppressed: 0,
+                    preMutationStretchWithoutMutation: violation ? 1 : 0,
+                    postMutationOldGenerationPresented: violation ? 1 : 0,
+                    postMutationUnprovenStereoSubmitted: 0,
+                },
+            },
         },
         projection: {
             renderVerdict: "PASS",
@@ -257,6 +273,51 @@ function writeJson(file, value) {
     fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function writeDeploymentVerification(root, buildId) {
+    const retainedManifest = path.join(root, "raw", "startup",
+        "deployment-manifest.json");
+    writeJson(retainedManifest, { buildId,
+        artifact: { sha256: "a".repeat(64), sizeBytes: 1 } });
+    writeJson(path.join(root, "raw", "startup", "deployment-verification.json"), {
+        schemaVersion: "renderscale-tuning-deployment-verification-v1",
+        buildId,
+        artifact: { fileName: "CommunityShaders.dll", bytes: 1,
+            sha256: "a".repeat(64) },
+        manifest: { fileName: "CSX.BuildManifest.json",
+            path: "raw/startup/deployment-manifest.json",
+            sha256: sha(retainedManifest) },
+        manifestVerified: true,
+    });
+}
+
+function testDeploymentVerification() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "rst-deployment-"));
+    const buildId = "f".repeat(64);
+    try {
+        const artifactPath = path.join(root, "CommunityShaders.dll");
+        const manifestPath = path.join(root, "CSX.BuildManifest.json");
+        fs.writeFileSync(artifactPath, "verified-artifact");
+        writeJson(manifestPath, {
+            buildId,
+            artifact: {
+                fileName: path.basename(artifactPath),
+                sizeBytes: fs.statSync(artifactPath).size,
+                sha256: sha(artifactPath),
+            },
+        });
+        const result = deploymentVerification(root, buildId, {
+            artifactPath, manifestPath,
+        });
+        assert(result.complete === true && result.artifactSha256 ===
+            sha(artifactPath) && fs.existsSync(path.join(root, result.receipt)) &&
+            fs.existsSync(path.join(root, "raw", "startup",
+                "deployment-manifest.json")),
+        "Deployment verification did not retain portable artifact proof.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
 function createEvidenceRoot(variant = "nvidia") {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "rst-finalizer-"));
     const runId = `${variant}-test-run`;
@@ -267,6 +328,7 @@ function createEvidenceRoot(variant = "nvidia") {
         build: { buildId },
         counts: { transitionsDispatched: 2 },
     });
+    writeDeploymentVerification(root, buildId);
     writeJson(path.join(root, "raw", "pass-1", "transitions", "01",
         "retained.json"), retained(false, true, { runId, buildId }));
     writeJson(path.join(root, "raw", "pass-1", "transitions", "02",
@@ -287,6 +349,7 @@ function createBaselineOnlyEvidenceRoot(variant) {
             passes: [{ pass: 1, status: "INTERRUPTED",
                 error: "baseline_failed" }] }],
     });
+    writeDeploymentVerification(root, buildId);
     writeJson(path.join(root, "raw", "pass-1", "baseline", "baseline.json"), {
         ok: true,
         results: [{
@@ -345,6 +408,70 @@ function testBaselineOnlyInterruptedFinalization() {
     }
 }
 
+function testPartialInterruptedFinalization() {
+    const root = createEvidenceRoot("nvidia");
+    const runId = "nvidia-test-run";
+    const buildId = "e".repeat(64);
+    try {
+        const failure = {
+            phase: "response",
+            receiptKey: `${runId}:nvidia:pass-2:transition-1:scenario`,
+            ok: false,
+            aborted: true,
+            stepsRun: 3,
+            expectedSteps: 7,
+            reportedError: "profiler_timeout",
+            failedStep: "profiler-clear-history",
+            firstUnreportedStep: "qualification-dispatch",
+        };
+        writeJson(path.join(root, "raw", "live-result.json"), {
+            ok: false, status: "INTERRUPTED", variant: "nvidia", runId,
+            lanes: [{ id: "nvidia", status: "INTERRUPTED", passes: [
+                { pass: 1, status: "COMPLETE", rows: [{ ordinal: 1 },
+                    { ordinal: 2 }] },
+                { pass: 2, status: "INTERRUPTED", rows: [],
+                    error: "transition_scenario_failed", failure },
+            ] }],
+        });
+        writeJson(path.join(root, "raw", "pass-2", "transitions", "01",
+            "retained.json"), {
+            scenarioReceiptKey: failure.receiptKey,
+            scenario: failure,
+            waiter: null,
+            projection: null,
+        });
+        writeJson(path.join(root, "raw", "pass-2", "transitions", "01",
+            "scenario.json"), {
+            ok: false, aborted: true, stepsRun: 3,
+            results: [{ label: "transition-wait", result: { ok: true } },
+                { label: "qualification-begin", result: { ok: true } },
+                { label: "profiler-clear-history", ok: false,
+                    error: "profiler_timeout" }],
+        });
+        const result = finalizeEvidence({ root, variant: "nvidia", runId,
+            buildId, expectedRows: 4,
+            generatedUtc: "2026-08-31T05:00:00.000Z" });
+        assert(result.summary.assayExecution.status === "INTERRUPTED" &&
+            result.summary.assayExecution.transitionsDispatched === 2 &&
+            result.summary.transitions.length === 2,
+        "A partial interruption discarded completed rows or counted an undispatched row.");
+        assert(result.summary.assayExecution.interruption.failure.failedStep ===
+            "profiler-clear-history" &&
+            result.summary.assayExecution.interruption
+                .undispatchedTransitionReceipts.length === 1,
+        "The failed scenario diagnostic was not retained in the offline summary.");
+        assert(result.index.files.some((entry) =>
+            entry.path.endsWith("pass-2/transitions/01/scenario.json")),
+        "The raw failed scenario was omitted from the receipt index.");
+        const reportText = fs.readFileSync(path.join(root, "report.md"), "utf8");
+        assert(reportText.includes("profiler-clear-history") &&
+            reportText.includes(failure.receiptKey),
+        "The interrupted report omitted the exact failed step or receipt key.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
 function testOfflineFinalization() {
     const root = createEvidenceRoot();
     try {
@@ -382,7 +509,7 @@ function testOfflineFinalization() {
                 first.diagnostics.dispatchLeft.generation === 1,
         "Dispatch/terminal diagnostic values were not retained independently.");
         assert(result.summary.evidenceExtraction.complete === true &&
-            result.summary.evidenceExtraction.rawJsonFiles === 2 &&
+            result.summary.evidenceExtraction.rawJsonFiles === 4 &&
             result.summary.evidenceExtraction.values > 0 &&
             result.summary.evidenceExtraction.nullValues > 0 &&
             result.summary.evidenceExtraction.emptyContainers > 0,
@@ -452,6 +579,7 @@ function testUnownedViolationRemainsReported() {
             retentionOverflow: false,
             ownerTransitionId: 101,
             ownerToken: 1,
+            eyeObservations: 2,
         };
         receipt.waiter.replacementTimeline.firstPhysicalMutation.stressSessionId = 7;
         receipt.waiter.replacementTimeline.firstPhysicalMutation
@@ -604,11 +732,13 @@ function testUnsafeEvidenceNumberFailsClosed() {
 }
 
 Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
-    .then(testPagingResume).then(testOfflineFinalization)
+    .then(testPagingResume).then(testDeploymentVerification)
+    .then(testOfflineFinalization)
     .then(testReportingSeparation).then(testUnownedViolationRemainsReported)
     .then(testMatchedViolationSurvivesIncompletePeer)
     .then(testAmdParity)
     .then(testBaselineOnlyInterruptedFinalization)
+    .then(testPartialInterruptedFinalization)
     .then(testValidationLeavesEvidenceUntouched)
     .then(testUnsafeEvidenceNumberFailsClosed).then(() => {
         process.stdout.write("Render-scale tuning finalizer tests passed.\n");

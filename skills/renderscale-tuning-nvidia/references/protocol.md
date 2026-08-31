@@ -211,6 +211,8 @@ begin, dispatch, wait, and any cancellation; never reuse either pair.
    On failure, link the compact row interruption to that raw receipt and expose
    only explicitly reported failed-step/error fields. Keep the first
    unreported step separate; never claim that an unreported step failed.
+   The interrupted live result must enumerate the retained receipt keys and
+   preserve every earlier completed row/pass for offline materialization.
 
    If the mutation-and-wait scenario response is lost, apply the shared
    contract's owner-correlated recovery rule immediately. Never replay the
@@ -443,6 +445,14 @@ Task 2 `INCONCLUSIVE`, not `FAIL`, while retaining the exact mismatch reason and
 raw counter. Never rewrite a mismatched counter to zero.
 Emit status and reasons per reported counter; one `MATCHED` exact violation
 remains a `FAIL` even if a different counter is `MISMATCHED` or `INCOMPLETE`.
+Treat `presentationCycleAudit.evidenceComplete` only as storage-retention
+status. Require dispatch, matching audit ownership, actual eye observations,
+all four decisive `violations` counters, and schema revision 14 or newer before
+calling transition evidence complete. Raw mixed/unproven totals stay
+diagnostic. Preserve an offline DLL/build-manifest verification receipt in the
+run bundle; missing proof affects reporting completeness, not render truth.
+Supply the exact resolved DLL and manifest to the offline finalizer through
+`--artifact-path` and `--manifest-path`, never through a new live startup gate.
 Preserve server-QPC phase durations for dispatch to blocked/preparation,
 blocked/preparation to first physical mutation, first physical mutation to
 the first exact new generation, new generation to cleanup drained, and
