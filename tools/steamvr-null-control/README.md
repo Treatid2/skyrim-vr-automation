@@ -77,6 +77,12 @@ next command reconciles a nonterminal authoritative journal before proceeding
 a committed exact baseline as `already-restored`. An active committed apply
 retains ownership of its original evidence directory; another apply returns
 `already-applied`, while start/restore reject a conflicting explicit directory.
+If a reboot or external owner restores only one exact pre-apply file, restore
+classifies that target as already restored and changes only the remaining
+applied target. An apply retry can transactionally re-isolate an exact restored
+OpenVR registration from the receipt-bound target inventory. A file matching
+neither its applied state nor its exact preimage remains unclassified drift and
+fails closed.
 
 The control root is fixed beneath the Windows LocalApplicationData folder at
 `CSX-VR-Automation\SteamVR\transactions`; callers cannot select different lock

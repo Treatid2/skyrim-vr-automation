@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Reconcile mixed post-reboot null-HMD target states: exact pre-apply files are
+  treated as already restored, restore changes only targets that remain
+  applied, and apply can transactionally re-isolate an exact restored OpenVR
+  registration while retaining the original authoritative baseline.
 - Qualify null-HMD application routing from exact enabled root OpenVR providers,
   accept current Valve null-runtime log vocabulary, return unmatched evidence,
   and make target-lock contention attributable to its live owner.

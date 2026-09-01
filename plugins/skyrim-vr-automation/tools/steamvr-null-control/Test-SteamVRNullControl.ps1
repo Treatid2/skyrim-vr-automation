@@ -264,6 +264,26 @@ try {
     $isolatedRestoreAgain = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -Compact | ConvertFrom-Json
     Assert-Test ($isolatedRestoreAgain.ok -and $isolatedRestoreAgain.state -eq 'already-restored') 'restore retry recognizes the committed exact baseline without rewriting it'
 
+    $mixedSettingsPath = Join-Path $fixture 'mixed-steamvr.vrsettings'
+    $mixedOpenVRPathsPath = Join-Path $fixture 'mixed-openvrpaths.vrpath'
+    $mixedEvidence = Join-Path $fixture 'evidence-mixed-targets'
+    New-Item -ItemType Directory -Path $mixedEvidence | Out-Null
+    [IO.File]::WriteAllText($mixedSettingsPath, $originalText, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($mixedOpenVRPathsPath, $openVrTextBeforeIsolation, [Text.UTF8Encoding]::new($false))
+    $mixedApply = & $entry apply -SettingsPath $mixedSettingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $mixedOpenVRPathsPath -EvidenceDirectory $mixedEvidence -IsolateExternalDisplayRedirectors -Compact | ConvertFrom-Json
+    Assert-Test ($mixedApply.ok -and $mixedApply.state -eq 'null-applied') 'mixed-target fixture begins from a committed isolated apply transaction'
+
+    Copy-Item -LiteralPath (Join-Path $mixedEvidence 'openvrpaths.vrpath.before') -Destination $mixedOpenVRPathsPath -Force
+    $partialRestoreDry = & $entry restore -SettingsPath $mixedSettingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $mixedOpenVRPathsPath -EvidenceDirectory $mixedEvidence -WhatIf -Compact | ConvertFrom-Json
+    Assert-Test ($partialRestoreDry.ok -and $partialRestoreDry.data.externalDriverIsolationValidation.state -eq 'baseline' -and $partialRestoreDry.data.wouldRestoreSettings -and -not $partialRestoreDry.data.wouldRestoreOpenVRPaths) 'restore accepts an exact OpenVR preimage while SteamVR settings remain applied'
+    $mixedReapply = & $entry apply -SettingsPath $mixedSettingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $mixedOpenVRPathsPath -EvidenceDirectory $mixedEvidence -Compact | ConvertFrom-Json
+    Assert-Test ($mixedReapply.ok -and $mixedReapply.state -eq 'null-reconciled' -and $mixedReapply.data.externalDriverIsolationValidation.state -eq 'isolated') 'apply transactionally re-isolates an exact externally restored OpenVR target'
+
+    Copy-Item -LiteralPath (Join-Path $mixedEvidence 'steamvr.vrsettings.before') -Destination $mixedSettingsPath -Force
+    $mixedRestore = & $entry restore -SettingsPath $mixedSettingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $mixedOpenVRPathsPath -EvidenceDirectory $mixedEvidence -Compact | ConvertFrom-Json
+    Assert-Test ($mixedRestore.ok -and $mixedRestore.state -eq 'restored' -and $mixedRestore.data.settingsRestoreValidation.authorizationRoute -eq 'exact-baseline-bytes') 'restore completes only the still-isolated OpenVR target when SteamVR settings are already exact baseline bytes'
+    Assert-Test ([IO.File]::ReadAllText($mixedSettingsPath) -ceq $originalText -and [IO.File]::ReadAllText($mixedOpenVRPathsPath) -ceq $openVrTextBeforeIsolation) 'mixed-target reconciliation converges both files to their exact pre-apply bytes'
+
     $failedApply = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $failureEvidence -IsolateExternalDisplayRedirectors -InternalTestFailurePoint apply-after-openvr -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $failedApply.ok -and $failedApply.errors[0] -match 'every exact backup was restored') 'two-file apply failure reports verified rollback to the original state'
     Assert-Test ([IO.File]::ReadAllText($settingsPath) -ceq $originalText -and [IO.File]::ReadAllText($openVrPathsPath) -ceq $openVrTextBeforeIsolation) 'two-file apply failure leaves neither target partially mutated'

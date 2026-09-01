@@ -508,6 +508,21 @@ function Get-IsolationValidation {
     }
 }
 
+function Get-IsolationReconciliationState {
+    param(
+        [Parameter(Mandatory)]$Isolation,
+        [Parameter(Mandatory)][string]$BackupPath,
+        [Parameter(Mandatory)][string]$CurrentPath
+    )
+    $validation = Get-IsolationValidation -Isolation $Isolation -BackupPath $BackupPath -CurrentPath $CurrentPath
+    $baselineExact = [string]$validation.currentSha256 -eq [string]$Isolation['sha256Before']
+    $state = if ($baselineExact) { 'baseline' } elseif ([bool]$validation.semanticMatch) { 'isolated' } else { 'drift' }
+    $validation | Add-Member -NotePropertyName baselineExactMatch -NotePropertyValue $baselineExact -Force
+    $validation | Add-Member -NotePropertyName state -NotePropertyValue $state -Force
+    $validation | Add-Member -NotePropertyName authorized -NotePropertyValue ($state -ne 'drift') -Force
+    return $validation
+}
+
 function Get-ExternalDriverInventory {
     param([string]$Path)
     $drivers = [Collections.Generic.List[object]]::new()
@@ -745,7 +760,10 @@ function Assert-SteamVRJournalTargets {
         if ($path.ToLowerInvariant() -notin $allowed) { throw "The authoritative SteamVR journal contains an out-of-contract rollback target: $path" }
         if (-not $seen.Add($path)) { throw "The authoritative SteamVR journal repeats a rollback target: $path" }
     }
-    if (-not $seen.Contains($settingsFull)) { throw 'The authoritative SteamVR journal does not contain the SteamVR settings rollback target.' }
+    $operation = [string]$Journal['operation']
+    if ($operation -eq 'apply' -and -not $seen.Contains($settingsFull)) { throw 'The authoritative SteamVR apply journal does not contain the SteamVR settings rollback target.' }
+    if ($operation -eq 'apply-reconcile' -and -not $seen.Contains($openVRFull)) { throw 'The authoritative SteamVR apply-reconcile journal does not contain the OpenVR registration rollback target.' }
+    if ($operation -eq 'restore' -and $seen.Count -eq 0) { throw 'The authoritative SteamVR restore journal contains no target requiring restoration.' }
 }
 
 function Stop-ExactStartedSteamVRProcesses([DateTime]$StartedUtc) {
@@ -1053,7 +1071,8 @@ try {
     $authoritativeEvidenceDirectory = if ($null -ne $recoveredTransaction -and (Test-JsonDictionaryContains $recoveredTransaction 'evidenceDirectory')) { [string]$recoveredTransaction['evidenceDirectory'] } else { $null }
     $authoritativeOwnsAppliedState = $effective.active -and $null -ne $recoveredTransaction -and (
         ([string]$recoveredTransaction['operation'] -eq 'apply' -and [string]$recoveredTransaction['phase'] -eq 'committed') -or
-        ([string]$recoveredTransaction['operation'] -eq 'restore' -and [string]$recoveredTransaction['phase'] -in @('rolled-back', 'recovered'))
+        ([string]$recoveredTransaction['operation'] -eq 'restore' -and [string]$recoveredTransaction['phase'] -in @('rolled-back', 'recovered')) -or
+        ([string]$recoveredTransaction['operation'] -eq 'apply-reconcile' -and [string]$recoveredTransaction['phase'] -in @('committed', 'rolled-back', 'recovered'))
     )
 
     if ($Command -eq 'stop') {
@@ -1267,12 +1286,77 @@ try {
 
         if ($Command -eq 'apply') {
             if ($authoritativeOwnsAppliedState) {
-                $result = New-Result -Ok $true -State 'already-applied' -Data @{
-                    settingsPath = $SettingsPath
-                    receiptPath = if ([string]$recoveredTransaction['operation'] -eq 'apply') { [string]$recoveredTransaction['receiptPath'] } else { Join-Path $authoritativeEvidenceDirectory 'steamvr-null-receipt.json' }
-                    evidenceDirectory = $authoritativeEvidenceDirectory
-                    targetControl = $targetControl
-                    effective = $effective
+                $ownedReceiptPath = if ([string]$recoveredTransaction['operation'] -eq 'apply') { [string]$recoveredTransaction['receiptPath'] } else { Join-Path $authoritativeEvidenceDirectory 'steamvr-null-receipt.json' }
+                if (-not (Test-Path -LiteralPath $ownedReceiptPath -PathType Leaf)) { throw "Authoritative apply receipt is missing: $ownedReceiptPath" }
+                $ownedReceipt = Read-JsonHashtable -Path $ownedReceiptPath
+                $ownedIsolation = if ($ownedReceipt.ContainsKey('externalDriverIsolation')) { $ownedReceipt['externalDriverIsolation'] } else { $null }
+                $ownedIsolationValidation = $null
+                if ($null -ne $ownedIsolation -and [bool]$ownedIsolation['enabled']) {
+                    if ([IO.Path]::GetFullPath([string]$ownedIsolation['openVRPathsPath']) -ne [IO.Path]::GetFullPath($OpenVRPathsPath)) {
+                        throw 'The requested OpenVR registration path does not match the authoritative apply receipt.'
+                    }
+                    $ownedIsolationBackupPath = [string]$ownedIsolation['backupPath']
+                    if (-not (Test-Path -LiteralPath $ownedIsolationBackupPath -PathType Leaf)) { throw "Exact OpenVR registration backup is missing: $ownedIsolationBackupPath" }
+                    if ((Get-HashOrNull $ownedIsolationBackupPath) -ne [string]$ownedIsolation['sha256Before']) { throw 'The exact OpenVR registration backup hash does not match the authoritative apply receipt.' }
+                    foreach ($target in @($ownedIsolation['targets'])) {
+                        if ((Get-HashOrNull ([string]$target['manifestPath'])) -ne [string]$target['manifestSha256']) {
+                            throw "Suppressed driver manifest changed after apply: $($target['manifestPath'])"
+                        }
+                    }
+                    $ownedIsolationValidation = Get-IsolationReconciliationState -Isolation $ownedIsolation -BackupPath $ownedIsolationBackupPath -CurrentPath $OpenVRPathsPath
+                    if (-not [bool]$ownedIsolationValidation.authorized) {
+                        throw 'The OpenVR registration file matches neither the receipt-bound isolated state nor its exact pre-apply baseline.'
+                    }
+                }
+                if ($null -ne $ownedIsolationValidation -and [string]$ownedIsolationValidation.state -eq 'baseline') {
+                    if ($WhatIf) {
+                        $result = New-Result -Ok $true -State 'dry-run' -Data @{
+                            settingsPath = $SettingsPath; receiptPath = $ownedReceiptPath; evidenceDirectory = $authoritativeEvidenceDirectory
+                            targetControl = $targetControl; effective = $effective; externalDriverIsolation = $ownedIsolation
+                            externalDriverIsolationValidation = $ownedIsolationValidation; wouldReapplyExternalDriverIsolation = $true
+                        }
+                    }
+                    else {
+                        $transactionId = [guid]::NewGuid().ToString('N')
+                        $rollbackPath = Join-Path $authoritativeEvidenceDirectory ("openvrpaths.vrpath.reconcile.$transactionId")
+                        Copy-Item -LiteralPath $OpenVRPathsPath -Destination $rollbackPath
+                        $rollbackHash = Get-HashOrNull $rollbackPath
+                        $reconcileJournalPath = Join-Path $authoritativeEvidenceDirectory 'steamvr-null-apply-reconcile.journal.json'
+                        $journal = [ordered]@{
+                            contractVersion = '1.0.0'; operation = 'apply-reconcile'; transactionId = $transactionId; phase = 'prepared'
+                            applyTransactionId = [string]$ownedReceipt['transactionId']; settingsPath = [IO.Path]::GetFullPath($SettingsPath)
+                            openVRPathsPath = [IO.Path]::GetFullPath($OpenVRPathsPath); evidenceDirectory = [IO.Path]::GetFullPath($authoritativeEvidenceDirectory)
+                            evidenceJournalPath = [IO.Path]::GetFullPath($reconcileJournalPath); receiptPath = [IO.Path]::GetFullPath($ownedReceiptPath)
+                            rollbackTargets = @([ordered]@{ name = 'openvr-registrations'; path = [IO.Path]::GetFullPath($OpenVRPathsPath); backupPath = [IO.Path]::GetFullPath($rollbackPath); expectedHash = $rollbackHash })
+                            preparedUtc = [DateTime]::UtcNow.ToString('o'); rollback = $null
+                        }
+                        Write-SteamVRTransactionJournal -AuthoritativePath $authoritativeJournalPath -Journal $journal
+                        try {
+                            $null = Disable-ExternalDriverRegistrations -Path $OpenVRPathsPath -Targets @($ownedIsolation['targets'])
+                            $journal['phase'] = 'openvr-isolated-uncommitted'; Write-SteamVRTransactionJournal -AuthoritativePath $authoritativeJournalPath -Journal $journal
+                            $ownedIsolationValidation = Get-IsolationReconciliationState -Isolation $ownedIsolation -BackupPath $ownedIsolationBackupPath -CurrentPath $OpenVRPathsPath
+                            if ([string]$ownedIsolationValidation.state -ne 'isolated') { throw 'OpenVR registration reconciliation did not reproduce the receipt-bound isolated state.' }
+                            $journal['phase'] = 'committed'; $journal['committedUtc'] = [DateTime]::UtcNow.ToString('o')
+                            Write-SteamVRTransactionJournal -AuthoritativePath $authoritativeJournalPath -Journal $journal
+                        }
+                        catch {
+                            $failure = $_.Exception.Message
+                            Restore-SteamVRTransactionTargets -Targets @($journal['rollbackTargets']) -Journal $journal -JournalPath $authoritativeJournalPath -FailureContext "Null-HMD apply reconciliation failed: $failure"
+                            throw "Null-HMD apply reconciliation failed; the exact pre-reconciliation registration state was restored. $failure"
+                        }
+                        $result = New-Result -Ok $true -State 'null-reconciled' -Data @{
+                            settingsPath = $SettingsPath; receiptPath = $ownedReceiptPath; evidenceDirectory = $authoritativeEvidenceDirectory
+                            targetControl = $targetControl; effective = $effective; externalDriverIsolation = $ownedIsolation
+                            externalDriverIsolationValidation = $ownedIsolationValidation; reconcileJournalPath = $authoritativeJournalPath
+                        }
+                    }
+                }
+                else {
+                    $result = New-Result -Ok $true -State 'already-applied' -Data @{
+                        settingsPath = $SettingsPath; receiptPath = $ownedReceiptPath; evidenceDirectory = $authoritativeEvidenceDirectory
+                        targetControl = $targetControl; effective = $effective; externalDriverIsolation = $ownedIsolation
+                        externalDriverIsolationValidation = $ownedIsolationValidation
+                    }
                 }
             }
             elseif ($effective.active) {
@@ -1414,9 +1498,17 @@ try {
             }
             if (-not $receipt.ContainsKey('settingsSha256Null') -or [string]::IsNullOrWhiteSpace([string]$receipt['settingsSha256Null'])) { throw 'The apply receipt does not identify the applied SteamVR settings hash.' }
             $settingsLiveHash = Get-HashOrNull $SettingsPath
-            $restoreAlreadyCommitted = $null -ne $pendingRestore -and [string]$pendingRestore['phase'] -eq 'committed' -and $settingsLiveHash -eq $backupHash
+            $settingsAlreadyRestored = $settingsLiveHash -eq $backupHash
+            $restoreAlreadyCommitted = $null -ne $pendingRestore -and [string]$pendingRestore['operation'] -eq 'restore' -and [string]$pendingRestore['phase'] -eq 'committed' -and $settingsLiveHash -eq $backupHash
             $settingsValidation = $null
-            if (-not $restoreAlreadyCommitted) {
+            if ($settingsAlreadyRestored) {
+                $settingsValidation = [pscustomobject][ordered]@{
+                    exactMatch = $true; controlledContractMatch = $false; formattingOnlyDriftAccepted = $false; runtimeManagedOnlyDriftAccepted = $false
+                    authorized = $true; authorizationRoute = 'exact-baseline-bytes'; currentSha256 = $settingsLiveHash; expectedSha256 = $backupHash
+                    currentSemanticSha256 = Get-JsonSemanticSha256 -Path $SettingsPath; controlledDifferences = @(); runtimeManagedDifferencePaths = @(); unclassifiedDifferencePaths = @()
+                }
+            }
+            elseif (-not $restoreAlreadyCommitted) {
                 $settingsValidation = Get-SettingsRestoreValidation -Receipt $receipt -BackupPath $backupPath -CurrentPath $SettingsPath
                 if (-not [bool]$settingsValidation.authorized) {
                     $details = @($settingsValidation.controlledDifferences + $settingsValidation.unclassifiedDifferencePaths | Select-Object -Unique)
@@ -1426,6 +1518,7 @@ try {
             $isolation = if ($receipt.ContainsKey('externalDriverIsolation')) { $receipt['externalDriverIsolation'] } else { $null }
             $restoreExternalDrivers = $null -ne $isolation -and [bool]$isolation['enabled']
             $isolationValidation = $null
+            $openVRAlreadyRestored = -not $restoreExternalDrivers
             if ($restoreExternalDrivers) {
                 if ([IO.Path]::GetFullPath([string]$isolation['openVRPathsPath']) -ne [IO.Path]::GetFullPath($OpenVRPathsPath)) {
                     throw 'The requested OpenVR registration path does not match the apply receipt.'
@@ -1433,12 +1526,13 @@ try {
                 if (-not (Test-Path -LiteralPath $openVRPathsBackupPath -PathType Leaf)) { throw "Exact OpenVR registration backup is missing: $openVRPathsBackupPath" }
                 if ((Get-HashOrNull $openVRPathsBackupPath) -ne [string]$isolation['sha256Before']) { throw 'The exact OpenVR registration backup hash does not match the apply receipt.' }
                 $openVRLiveHash = Get-HashOrNull $OpenVRPathsPath
+                $openVRAlreadyRestored = $openVRLiveHash -eq [string]$isolation['sha256Before']
                 if ($restoreAlreadyCommitted) {
-                    if ($openVRLiveHash -ne [string]$isolation['sha256Before']) { throw 'Committed restore journal exists but OpenVR registrations do not match the exact baseline.' }
+                    if (-not $openVRAlreadyRestored) { throw 'Committed restore journal exists but OpenVR registrations do not match the exact baseline.' }
                 }
                 else {
-                    $isolationValidation = Get-IsolationValidation -Isolation $isolation -BackupPath $openVRPathsBackupPath -CurrentPath $OpenVRPathsPath
-                    if (-not [bool]$isolationValidation.semanticMatch) { throw 'The OpenVR registration file changed semantically after isolation. Refusing to overwrite unclassified registration drift.' }
+                    $isolationValidation = Get-IsolationReconciliationState -Isolation $isolation -BackupPath $openVRPathsBackupPath -CurrentPath $OpenVRPathsPath
+                    if (-not [bool]$isolationValidation.authorized) { throw 'The OpenVR registration file changed and matches neither the isolated state nor its exact baseline. Refusing to overwrite unclassified registration drift.' }
                 }
                 foreach ($target in @($isolation['targets'])) {
                     if ((Get-HashOrNull ([string]$target['manifestPath'])) -ne [string]$target['manifestSha256']) {
@@ -1446,7 +1540,8 @@ try {
                     }
                 }
             }
-            if ($restoreAlreadyCommitted) {
+            $allTargetsAlreadyRestored = $settingsAlreadyRestored -and $openVRAlreadyRestored
+            if ($restoreAlreadyCommitted -or $allTargetsAlreadyRestored) {
                 $result = New-Result -Ok $true -State 'already-restored' -Data @{
                     settingsPath = $SettingsPath; restoredSha256 = $settingsLiveHash; backupPath = $backupPath; backupRetained = $true
                     externalDriverIsolation = $isolation; openVRPathsRestoredSha256 = if ($restoreExternalDrivers) { Get-HashOrNull $OpenVRPathsPath } else { $null }
@@ -1462,15 +1557,19 @@ try {
                     settingsRestoreValidation = $settingsValidation
                     externalDriverIsolation = $isolation
                     externalDriverIsolationValidation = $isolationValidation
-                    wouldRestoreOpenVRPaths = if ($restoreExternalDrivers) { $openVRPathsBackupPath } else { $null }
+                    wouldRestoreSettings = -not $settingsAlreadyRestored
+                    wouldRestoreOpenVRPaths = if ($restoreExternalDrivers -and -not $openVRAlreadyRestored) { $openVRPathsBackupPath } else { $null }
                 }
             }
-            elseif (-not $restoreAlreadyCommitted) {
+            elseif (-not $restoreAlreadyCommitted -and -not $allTargetsAlreadyRestored) {
                 $transactionId = [guid]::NewGuid().ToString('N')
-                $settingsRollbackPath = Join-Path $EvidenceDirectory ("steamvr.vrsettings.applied.$transactionId")
-                Copy-Item -LiteralPath $SettingsPath -Destination $settingsRollbackPath
-                $rollbackTargets = @([ordered]@{ name = 'steamvr-settings'; path = [IO.Path]::GetFullPath($SettingsPath); backupPath = $settingsRollbackPath; expectedHash = $settingsLiveHash })
-                if ($restoreExternalDrivers) {
+                $rollbackTargets = @()
+                if (-not $settingsAlreadyRestored) {
+                    $settingsRollbackPath = Join-Path $EvidenceDirectory ("steamvr.vrsettings.applied.$transactionId")
+                    Copy-Item -LiteralPath $SettingsPath -Destination $settingsRollbackPath
+                    $rollbackTargets += [ordered]@{ name = 'steamvr-settings'; path = [IO.Path]::GetFullPath($SettingsPath); backupPath = $settingsRollbackPath; expectedHash = $settingsLiveHash }
+                }
+                if ($restoreExternalDrivers -and -not $openVRAlreadyRestored) {
                     $openVRRollbackPath = Join-Path $EvidenceDirectory ("openvrpaths.vrpath.isolated.$transactionId")
                     Copy-Item -LiteralPath $OpenVRPathsPath -Destination $openVRRollbackPath
                     $rollbackTargets += [ordered]@{ name = 'openvr-registrations'; path = [IO.Path]::GetFullPath($OpenVRPathsPath); backupPath = $openVRRollbackPath; expectedHash = $openVRLiveHash }
@@ -1484,10 +1583,10 @@ try {
                 }
                 Write-SteamVRTransactionJournal -AuthoritativePath $authoritativeJournalPath -Journal $journal
                 try {
-                    Copy-FileAtomic -Source $backupPath -Destination $SettingsPath
+                    if (-not $settingsAlreadyRestored) { Copy-FileAtomic -Source $backupPath -Destination $SettingsPath }
                     $journal['phase'] = 'settings-restored-uncommitted'; Write-SteamVRTransactionJournal -AuthoritativePath $authoritativeJournalPath -Journal $journal
                     if ($InternalTestFailurePoint -eq 'restore-after-settings') { throw 'Injected restore failure after settings restoration.' }
-                    if ($restoreExternalDrivers) { Copy-FileAtomic -Source $openVRPathsBackupPath -Destination $OpenVRPathsPath }
+                    if ($restoreExternalDrivers -and -not $openVRAlreadyRestored) { Copy-FileAtomic -Source $openVRPathsBackupPath -Destination $OpenVRPathsPath }
                     $journal['phase'] = 'all-targets-restored-uncommitted'; Write-SteamVRTransactionJournal -AuthoritativePath $authoritativeJournalPath -Journal $journal
                     $restoredHash = Get-HashOrNull $SettingsPath
                     if ($restoredHash -ne $backupHash) { throw 'Restored SteamVR settings hash does not match the exact backup.' }
