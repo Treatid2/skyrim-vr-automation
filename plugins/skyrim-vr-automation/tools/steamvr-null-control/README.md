@@ -28,6 +28,9 @@ marks the HMD pose provider ready only after both driver acknowledgement and an
 application-observed OpenVR qualification. Controller input remains
 unavailable, replay readiness remains false, and the broader measurement policy
 remains fail-closed until its other runtime conflicts are separately qualified.
+The v2 provider publishes a 128-byte shared-memory record. The profile declares
+that size explicitly; legacy v1 profiles without the field retain their
+88-byte compatibility default.
 
 Before `start`, the controller reads the OpenVR registration file (normally
 `%LOCALAPPDATA%\openvr\openvrpaths.vrpath`) and inventories every external

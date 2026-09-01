@@ -845,10 +845,22 @@ function Get-HeadPoseSharedState {
     $mapping = $null
     $view = $null
     try {
+        $expectedSize = if ($Contract.ContainsKey('sharedMemorySize')) {
+            [int]$Contract['sharedMemorySize']
+        }
+        elseif ([int]$Contract['sharedMemoryVersion'] -ge 2) {
+            128
+        }
+        else {
+            88
+        }
+        if ($expectedSize -lt 88 -or $expectedSize -gt 4096) {
+            throw "The head-pose shared-memory size '$expectedSize' is outside the supported range."
+        }
         $mapping = [IO.MemoryMappedFiles.MemoryMappedFile]::OpenExisting(
             [string]$Contract['sharedMemoryName'],
             [IO.MemoryMappedFiles.MemoryMappedFileRights]::Read)
-        $view = $mapping.CreateViewAccessor(0, 88, [IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
+        $view = $mapping.CreateViewAccessor(0, $expectedSize, [IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
         $firstSequence = $view.ReadUInt64(8)
         $state = [ordered]@{
             magic = $view.ReadUInt32(0)
@@ -864,7 +876,8 @@ function Get-HeadPoseSharedState {
         $secondSequence = $view.ReadUInt64(8)
         $state['stable'] = $firstSequence -eq $secondSequence -and ($secondSequence % 2) -eq 0
         $state['available'] = $true
-        $state['protocolValid'] = $state.magic -eq 0x48505343 -and $state.version -eq [int]$Contract['sharedMemoryVersion'] -and $state.size -eq 88
+        $state['expectedSize'] = $expectedSize
+        $state['protocolValid'] = $state.magic -eq 0x48505343 -and $state.version -eq [int]$Contract['sharedMemoryVersion'] -and $state.size -eq $expectedSize
         $state['acknowledged'] = $state.stable -and $state.requestedSequence -gt 0 -and $state.appliedSequence -eq $state.requestedSequence -and $state.status -eq 1
         $state['eyeHeightQualified'] = $state.position[1] -ge [double]$Contract['minimumQualifiedEyeHeightMeters'] -and $state.position[1] -le [double]$Contract['maximumQualifiedEyeHeightMeters']
         $state['qualified'] = $state.protocolValid -and $state.acknowledged -and $state.eyeHeightQualified -and (($state.flags -band 1) -eq 1)

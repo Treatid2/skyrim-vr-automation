@@ -90,9 +90,36 @@ try {
     $parseErrors = $null
     $ast = [Management.Automation.Language.Parser]::ParseFile($entry, [ref]$tokens, [ref]$parseErrors)
     Assert-Test ($parseErrors.Count -eq 0) 'SteamVR null controller parses before fixture helper extraction'
-    foreach ($functionName in @('Get-SharedTextTail', 'Get-LogTimestampUtc', 'Get-NullRuntimeLogMarkers')) {
+    foreach ($functionName in @('Get-SharedTextTail', 'Get-LogTimestampUtc', 'Get-NullRuntimeLogMarkers', 'Get-HeadPoseSharedState')) {
         $definition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName }, $true)
         if ($definition) { . ([scriptblock]::Create($definition.Extent.Text)) }
+    }
+    $poseMapName = "Local\CSXVRHeadPose-null-test-$([guid]::NewGuid().ToString('N'))"
+    $poseMap = [IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew($poseMapName, 128)
+    $poseView = $poseMap.CreateViewAccessor(0, 128, [IO.MemoryMappedFiles.MemoryMappedFileAccess]::ReadWrite)
+    try {
+        $poseView.Write(0, [uint32]0x48505343)
+        $poseView.Write(4, [uint16]2)
+        $poseView.Write(6, [uint16]128)
+        $poseView.Write(8, [uint64]2)
+        $poseView.Write(16, [uint64]2)
+        $poseView.Write(24, [uint32]1)
+        $poseView.Write(28, [uint32]1)
+        $poseView.Write(40, [double]1.68)
+        $poseView.Write(80, [double]1.0)
+        $poseView.Flush()
+        $poseState = Get-HeadPoseSharedState -Contract (@{
+            sharedMemoryName = $poseMapName
+            sharedMemoryVersion = 2
+            sharedMemorySize = 128
+            minimumQualifiedEyeHeightMeters = 1.0
+            maximumQualifiedEyeHeightMeters = 2.5
+        })
+        Assert-Test ($poseState.available -and $poseState.protocolValid -and $poseState.qualified -and $poseState.expectedSize -eq 128) 'null runtime accepts the current 128-byte head-pose v2 contract'
+    }
+    finally {
+        $poseView.Dispose()
+        $poseMap.Dispose()
     }
     $minimumUtc = [DateTime]::Parse('2026-09-01T05:09:55Z').ToUniversalTime()
     $classicMarkers = Get-NullRuntimeLogMarkers -MinimumUtc $minimumUtc -SerialNumber 'CSX Null HMD' -Lines @(

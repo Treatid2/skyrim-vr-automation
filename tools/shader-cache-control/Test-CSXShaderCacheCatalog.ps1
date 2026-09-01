@@ -104,7 +104,7 @@ try {
     $physicalRouteCapture.RenderPath = 'vr-steamvr-physical'
     $physicalRouteCapture.Label = 'physical SteamVR fixture'
     $physicalCapture = Invoke-Catalog $physicalRouteCapture
-    Assert-Test ($physicalCapture.ok -and $physicalCapture.data.snapshot.manifest.compatibility.renderFamily -eq 'vr-steamvr') 'capture records the canonical SteamVR render family while retaining the physical route'
+    Assert-Test ($physicalCapture.ok -and $physicalCapture.state -eq 'already-present' -and $physicalCapture.data.snapshot.manifest.compatibility.renderFamily -eq 'vr-steamvr') 'capture deduplicates legacy and canonical physical SteamVR provenance within one render family'
     $nullRouteArgs = @{} + $selectArgs
     $nullRouteArgs.RenderPath = 'vr-steamvr-null'
     $nullRouteSelect = Invoke-Catalog $nullRouteArgs
@@ -188,7 +188,7 @@ try {
     Assert-Test ($completeAgain.ok -and $completeAgain.state -eq 'already-complete') 'task completion retry returns the immutable existing completion'
 
     $finalList = Invoke-Catalog @{ Command = 'list'; CatalogRoot = $catalogRoot; Compact = $true; NoExit = $true }
-    Assert-Test (@($finalList.data.snapshots).Count -eq 3 -and @($finalList.data.issues).Count -eq 0) 'catalog retains all known-working compatibility records and validates every manifest'
+    Assert-Test (@($finalList.data.snapshots).Count -eq 2 -and @($finalList.data.issues).Count -eq 0) 'catalog retains each distinct known-working compatibility record and validates every manifest'
 }
 finally {
     $env:CSX_SHADER_CACHE_CONTROL_ROOT = $priorControlRoot

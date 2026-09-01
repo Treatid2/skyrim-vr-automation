@@ -1,7 +1,9 @@
 # DevBench Control
 
-`Invoke-DevBenchControl.ps1` lists and calls the MCP tools exposed by a running
-CSX DevBench server. Supply runtime metadata with `-RuntimePath` or set
+`Invoke-DevBenchControl.ps1` lists and calls the tools exposed by a running
+CSX DevBench server. It prefers streamable-HTTP MCP and negotiates the REST
+`/api/tools` and `/api/tool/<name>` facade when an older host returns 404 for
+`/mcp`. Supply runtime metadata with `-RuntimePath` or set
 `CSX_DEVBENCH_RUNTIME_PATH`; no machine-specific path is compiled into the
 client.
 
@@ -25,7 +27,9 @@ off-thread `inspect health` identity before returning. Runtime metadata may add
 expectations. Pass `-EvidenceDirectory` to preserve this binding with the run.
 Each invocation writes a uniquely named binding receipt, so parallel calls do
 not overwrite one another. Use `-EvidenceLabel` to give that receipt a stable
-human-readable label within the unique filename.
+human-readable label within the unique filename. The receipt records whether
+the exact call used `mcp` or `rest`; a fallback mutation keeps the same
+indeterminate/no-replay safety rule as MCP.
 The controller also persists an invocation journal before dispatch. It records
 the requested tool and arguments, dispatch boundary, last verified runtime
 identity, transport retries, and terminal result. If the target exits during a

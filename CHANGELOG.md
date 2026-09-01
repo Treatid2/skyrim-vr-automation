@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Negotiate the DevBench REST tool facade when a live host does not expose
+  `/mcp`, while retaining exact runtime identity and no-replay mutation safety.
+- Validate null-HMD startup against the current 128-byte head-pose v2 shared-
+  memory contract instead of rejecting it as the obsolete 88-byte layout.
+- Normalize legacy SteamVR physical/null cache provenance into the canonical
+  SteamVR render family during compatible shader-cache selection.
 - Reopen the same retained MO2 session and exact profile when its owner exits
   after `stop-game`, while continuing to reject unrelated or ambiguous MO2
   processes.

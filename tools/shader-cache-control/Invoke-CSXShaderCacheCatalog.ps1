@@ -293,7 +293,7 @@ function Get-NormalizedStrings([string[]]$Values) {
 
 function Get-RenderFamily([string]$Value) {
     $normalized = $Value.Trim().ToLowerInvariant()
-    if ($normalized -in @('vr-steamvr-physical', 'vr-steamvr-null')) { return 'vr-steamvr' }
+    if ($normalized -in @('steamvr-physical', 'steamvr-null', 'vr-steamvr-physical', 'vr-steamvr-null')) { return 'vr-steamvr' }
     return $normalized
 }
 

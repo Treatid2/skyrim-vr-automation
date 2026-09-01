@@ -46,6 +46,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $argumentsJsonSupplied = $PSBoundParameters.ContainsKey('ArgumentsJson')
 $endpoint = $null
+$baseEndpoint = $null
+$transport = 'unknown'
 $runtimeIdentity = $null
 $transportRetries = [Collections.Generic.List[object]]::new()
 $invocationEvidencePath = $null
@@ -102,6 +104,7 @@ function Initialize-InvocationEvidence {
         tool = $Tool
         condition = if ($Command -eq 'wait') { $Condition } else { $null }
         endpoint = $endpoint
+        transport = $transport
         runtimePath = if ([string]::IsNullOrWhiteSpace($RuntimePath)) { $null } else { [IO.Path]::GetFullPath($RuntimePath) }
         runtimeSha256 = if (-not [string]::IsNullOrWhiteSpace($RuntimePath) -and (Test-Path -LiteralPath $RuntimePath -PathType Leaf)) { (Get-FileHash -LiteralPath $RuntimePath -Algorithm SHA256).Hash } else { $null }
         requestedArguments = if ($Command -eq 'call') { $ArgumentsJson } else { $null }
@@ -126,6 +129,7 @@ function Update-InvocationEvidence {
     if ($null -eq $script:invocationRecord -or [string]::IsNullOrWhiteSpace($script:invocationEvidencePath)) { return }
     $script:invocationRecord.state = $State
     $script:invocationRecord.endpoint = $endpoint
+    $script:invocationRecord.transport = $transport
     $script:invocationRecord.runtimeIdentity = $runtimeIdentity
     $script:invocationRecord.transportRetries = @($transportRetries)
     $script:invocationRecord.semantic = $Semantic
@@ -251,7 +255,7 @@ function Test-GameMutationPolicy {
 }
 
 function Invoke-McpRequest {
-    param([string]$Endpoint, [hashtable]$Headers, $Payload, [switch]$Mutation)
+    param([string]$Endpoint, [hashtable]$Headers, $Payload, [switch]$Mutation, [switch]$Probe)
     $body = $Payload | ConvertTo-Json -Depth 30 -Compress
     $attempt = 0
     $delay = [Math]::Max(50, $PollMilliseconds)
@@ -265,7 +269,7 @@ function Invoke-McpRequest {
             $statusCode = $null
             try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = $null }
             $transient = $statusCode -in @(408, 429, 500, 502, 503, 504) -or
-                ($Command -eq 'wait' -and $statusCode -eq 404) -or
+                ($Command -eq 'wait' -and $statusCode -eq 404 -and -not $Probe) -or
                 $_.Exception -is [System.TimeoutException] -or
                 $_.Exception.Message -match 'timed out|temporarily unavailable|connection.*closed'
             if ($Mutation -and $transient) {
@@ -298,8 +302,65 @@ function Invoke-McpRequest {
     }
 }
 
+function Invoke-RestRequest {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [ValidateSet('Get', 'Post')][string]$Method = 'Get',
+        $Payload = $null,
+        [switch]$Mutation
+    )
+    $attempt = 0
+    $delay = [Math]::Max(50, $PollMilliseconds)
+    while ($true) {
+        $attempt++
+        try {
+            $request = @{
+                UseBasicParsing = $true
+                Method = $Method
+                Uri = $Uri
+                Headers = @{ Accept = 'application/json' }
+                TimeoutSec = Get-RequestTimeoutSeconds
+            }
+            if ($Method -eq 'Post') {
+                $request['ContentType'] = 'application/json'
+                $request['Body'] = $Payload | ConvertTo-Json -Depth 30 -Compress
+            }
+            $response = Invoke-WebRequest @request
+            return [pscustomobject]@{ response = $response; json = ($response.Content | ConvertFrom-Json -Depth 50); attempts = $attempt }
+        }
+        catch {
+            $statusCode = $null
+            try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = $null }
+            $transient = $statusCode -in @(408, 429, 500, 502, 503, 504) -or
+                $_.Exception -is [System.TimeoutException] -or
+                $_.Exception.Message -match 'timed out|temporarily unavailable|connection.*closed'
+            if ($Mutation -and $transient) {
+                $transportRetries.Add([pscustomobject][ordered]@{
+                    attempt = $attempt; statusCode = $statusCode; delayMilliseconds = 0
+                    recovery = 'not-retried-indeterminate'; transport = 'rest'; message = $_.Exception.Message; timestampUtc = [DateTime]::UtcNow.ToString('o')
+                })
+                $indeterminate = [InvalidOperationException]::new('DevBench REST mutation transport failed after dispatch; the command may already have committed and was not replayed. Reconcile by commandId and runtime state before any retry.', $_.Exception)
+                $indeterminate.Data['DevBenchIndeterminateMutation'] = $true
+                throw $indeterminate
+            }
+            if (-not $transient -or $attempt -gt $MaxTransientRetries) { throw }
+            $transportRetries.Add([pscustomobject][ordered]@{
+                attempt = $attempt; statusCode = $statusCode; delayMilliseconds = $delay
+                transport = 'rest'; message = $_.Exception.Message; timestampUtc = [DateTime]::UtcNow.ToString('o')
+            })
+            Start-OperationDelay -RequestedMilliseconds $delay
+            $delay = [Math]::Min($MaxPollMilliseconds, $delay * 2)
+        }
+    }
+}
+
 function Invoke-ToolRpc {
     param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation)
+    if ($script:transport -eq 'rest') {
+        $escapedName = [Uri]::EscapeDataString($Name)
+        $rest = Invoke-RestRequest -Uri "$script:baseEndpoint/api/tool/$escapedName" -Method Post -Payload $Arguments -Mutation:$Mutation
+        return [pscustomobject][ordered]@{ tool = $Name; content = @($rest.json); rawResult = $rest.json }
+    }
     $rpc = Invoke-McpRequest -Endpoint $endpoint -Headers $Headers -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/call'; params = @{ name = $Name; arguments = $Arguments } } -Mutation:$Mutation
     if ($rpc.json.PSObject.Properties['error']) { throw "DevBench tools/call failed: $($rpc.json.error | ConvertTo-Json -Compress)" }
     if ($rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
@@ -314,6 +375,15 @@ function Invoke-ToolRpc {
         else { $parsed += ,$item }
     }
     return [pscustomobject][ordered]@{ tool = $Name; content = $parsed; rawResult = $rpc.json.result }
+}
+
+function Get-ToolDescriptors([hashtable]$Headers) {
+    if ($script:transport -eq 'rest') {
+        return @((Invoke-RestRequest -Uri "$script:baseEndpoint/api/tools").json)
+    }
+    $currentList = Invoke-McpRequest -Endpoint $endpoint -Headers $Headers -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/list'; params = @{} }
+    if ($currentList.json.PSObject.Properties['error']) { throw "DevBench tools/list failed: $($currentList.json.error | ConvertTo-Json -Compress)" }
+    return @($currentList.json.result.tools)
 }
 
 function Test-WaitRetryableException {
@@ -331,7 +401,7 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
         jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'initialize'; params = @{
             protocolVersion = '2025-03-26'; capabilities = @{}; clientInfo = @{ name = 'DevBenchControl'; version = '1.4' }
         }
-    }
+    } -Probe
     $sessionHeader = $initialize.response.Headers['Mcp-Session-Id']
     $sessionId = if ($sessionHeader -is [array]) { [string]$sessionHeader[0] } else { [string]$sessionHeader }
     if ([string]::IsNullOrWhiteSpace($sessionId)) { throw 'DevBench did not return an MCP session ID.' }
@@ -346,6 +416,35 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
         if ($identity.errors.Count -gt 0) { throw "DevBench runtime identity verification failed: $($identity.errors -join ' ')" }
     }
     return [pscustomobject][ordered]@{ headers = $sessionHeaders; tools = $sessionTools; runtimeIdentity = $identity; sessionId = $sessionId }
+}
+
+function Open-DevBenchSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
+    try {
+        $script:transport = 'mcp'
+        $script:endpoint = "$script:baseEndpoint/mcp"
+        $session = Open-McpSession -Runtime $Runtime -AllowDeferredBuildIdentity:$AllowDeferredBuildIdentity
+        $session | Add-Member -NotePropertyName transport -NotePropertyValue 'mcp'
+        return $session
+    }
+    catch {
+        $statusCode = $null
+        try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = $null }
+        if ($statusCode -ne 404) { throw }
+        $transportRetries.Add([pscustomobject][ordered]@{
+            attempt = 1; statusCode = 404; delayMilliseconds = 0; recovery = 'rest-capability-negotiation'
+            transport = 'mcp'; message = $_.Exception.Message; timestampUtc = [DateTime]::UtcNow.ToString('o')
+        })
+    }
+    $script:transport = 'rest'
+    $script:endpoint = $script:baseEndpoint
+    $headers = @{ Accept = 'application/json'; 'Content-Type' = 'application/json' }
+    $tools = @(Get-ToolDescriptors -Headers $headers)
+    $identity = $null
+    if (-not $SkipRuntimeIdentityVerification) {
+        $identity = Get-RuntimeIdentity -Runtime $Runtime -Headers $headers -Tools $tools -AllowDeferredBuildIdentity:$AllowDeferredBuildIdentity
+        if ($identity.errors.Count -gt 0) { throw "DevBench runtime identity verification failed: $($identity.errors -join ' ')" }
+    }
+    return [pscustomobject][ordered]@{ headers = $headers; tools = $tools; runtimeIdentity = $identity; sessionId = $null; transport = 'rest' }
 }
 
 function Get-ListenerPid([int]$Port) {
@@ -486,6 +585,7 @@ function Write-RuntimeEvidence($Binding) {
         runtimePath = [IO.Path]::GetFullPath($RuntimePath)
         runtimeSha256 = (Get-FileHash -LiteralPath $RuntimePath -Algorithm SHA256).Hash
         endpoint = $endpoint
+        transport = $transport
         identity = $Binding
     } | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $path -Encoding utf8
     return $path
@@ -503,7 +603,8 @@ try {
     if (-not (Test-Path -LiteralPath $RuntimePath -PathType Leaf)) { throw "DevBench runtime metadata does not exist: $RuntimePath" }
     $runtime = Get-Content -LiteralPath $RuntimePath -Raw | ConvertFrom-Json
     if (-not $runtime.PSObject.Properties['port']) { throw 'DevBench runtime metadata has no port.' }
-    $endpoint = "http://127.0.0.1:$([int]$runtime.port)/mcp"
+    $baseEndpoint = "http://127.0.0.1:$([int]$runtime.port)"
+    $endpoint = "$baseEndpoint/mcp"
     $arguments = $null
     if ($Command -eq 'call') {
         if ([string]::IsNullOrWhiteSpace($Tool)) { throw 'Tool is required for call.' }
@@ -527,7 +628,7 @@ try {
     $tools = @()
     $evidencePath = $null
     if ($Command -ne 'wait') {
-        $session = Open-McpSession -Runtime $runtime
+        $session = Open-DevBenchSession -Runtime $runtime
         $headers = $session.headers
         $tools = @($session.tools)
         $runtimeIdentity = $session.runtimeIdentity
@@ -600,7 +701,7 @@ try {
             $attempts++
             if ($null -eq $headers) {
                 try {
-                    $session = Open-McpSession -Runtime $runtime -AllowDeferredBuildIdentity:($Condition -in @('toolAvailable', 'serviceReady'))
+                    $session = Open-DevBenchSession -Runtime $runtime -AllowDeferredBuildIdentity:($Condition -in @('toolAvailable', 'serviceReady'))
                     $headers = $session.headers
                     $tools = @($session.tools)
                     $runtimeIdentity = $session.runtimeIdentity
@@ -623,9 +724,7 @@ try {
             }
             if ($requiredTool -and @($tools | Where-Object name -eq $requiredTool).Count -ne 1) {
                 try {
-                    $currentList = Invoke-McpRequest -Endpoint $endpoint -Headers $headers -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/list'; params = @{} }
-                    if ($currentList.json.PSObject.Properties['error']) { throw "DevBench tools/list failed: $($currentList.json.error | ConvertTo-Json -Compress)" }
-                    $tools = @($currentList.json.result.tools)
+                    $tools = @(Get-ToolDescriptors -Headers $headers)
                 }
                 catch {
                     if (-not (Test-WaitRetryableException -Exception $_.Exception)) { throw }
