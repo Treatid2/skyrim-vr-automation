@@ -18,6 +18,10 @@ param(
 
     [string]$HeadPoseDriverRoot = $(if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { Join-Path $env:LOCALAPPDATA 'CSX-VR-Automation\SteamVR\drivers\codex_head_pose' } else { $null }),
 
+    [string]$MO2ProfilePath,
+
+    [string]$MO2ModsPath,
+
     [string]$EvidenceDirectory,
 
     [ValidateRange(100, 60000)]
@@ -115,7 +119,6 @@ function Get-SharedTextTail {
         [Parameter(Mandatory)][ValidateRange(4096, 4194304)][int]$MaxBytes,
         [DateTime]$DeadlineUtc = [DateTime]::MaxValue
     )
-    if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw 'SteamVR log-tail deadline expired before opening the log.' }
     $stream = $null
     try {
         $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
@@ -134,7 +137,6 @@ function Get-SharedTextTail {
         $stream.Position = $start
         $read = 0
         while ($read -lt $readLength) {
-            if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw 'SteamVR log-tail deadline expired while reading the log.' }
             $current = $stream.Read($bytes, $read, $readLength - $read)
             if ($current -le 0) { break }
             $read += $current
@@ -146,7 +148,7 @@ function Get-SharedTextTail {
         }
         $prefix = if ($incremental) { [string]$prior.residual } else { '' }
         $combined = $prefix + $text
-        $parts = @($combined -split "`r?`n", -1)
+        $parts = @([regex]::Split($combined, "`r?`n"))
         $residual = if ($combined.EndsWith("`n", [StringComparison]::Ordinal)) { '' } else { [string]$parts[-1] }
         $completed = if ($residual.Length -gt 0 -and $parts.Count -gt 1) { @($parts[0..($parts.Count - 2)]) } elseif ($residual.Length -gt 0) { @() } else { @($parts | Select-Object -SkipLast 1) }
         $lines = @($(if ($incremental) { @($prior.lines) }) + $completed)
@@ -159,6 +161,98 @@ function Get-SharedTextTail {
     }
     finally {
         if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Get-MO2SteamVRRouteEvidence {
+    param([string]$ProfilePath, [string]$ModsPath)
+    $profileSupplied = -not [string]::IsNullOrWhiteSpace($ProfilePath)
+    $modsSupplied = -not [string]::IsNullOrWhiteSpace($ModsPath)
+    if (-not $profileSupplied -and -not $modsSupplied) {
+        return [pscustomobject][ordered]@{ evaluated = $false; qualified = $false; reason = 'MO2 route evidence was not supplied.'; providers = @() }
+    }
+    if (-not $profileSupplied -or -not $modsSupplied) { throw 'MO2 route qualification requires both -MO2ProfilePath and -MO2ModsPath.' }
+    $resolvedProfile = [IO.Path]::GetFullPath($ProfilePath)
+    $modlistPath = if (Test-Path -LiteralPath $resolvedProfile -PathType Container) { Join-Path $resolvedProfile 'modlist.txt' } else { $resolvedProfile }
+    if (-not (Test-Path -LiteralPath $modlistPath -PathType Leaf)) { throw "MO2 modlist does not exist: $modlistPath" }
+    $resolvedMods = [IO.Path]::GetFullPath($ModsPath).TrimEnd('\')
+    if (-not (Test-Path -LiteralPath $resolvedMods -PathType Container)) { throw "MO2 mods directory does not exist: $resolvedMods" }
+    $providers = [Collections.Generic.List[object]]::new()
+    $lineNumber = 0
+    foreach ($line in [IO.File]::ReadAllLines($modlistPath)) {
+        $lineNumber++
+        if (-not $line.StartsWith('+', [StringComparison]::Ordinal) -or $line.Length -lt 2) { continue }
+        $modName = $line.Substring(1).Trim()
+        if ([string]::IsNullOrWhiteSpace($modName)) { continue }
+        $modRoot = [IO.Path]::GetFullPath((Join-Path $resolvedMods $modName))
+        if (-not $modRoot.StartsWith($resolvedMods + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Enabled MO2 mod escapes the configured mods directory: $modName"
+        }
+        foreach ($relativePath in @('Root\openvr_api.dll', 'openvr_api.dll')) {
+            $providerPath = Join-Path $modRoot $relativePath
+            if (Test-Path -LiteralPath $providerPath -PathType Leaf) {
+                $providers.Add([pscustomobject][ordered]@{
+                    modName = $modName
+                    lineNumber = $lineNumber
+                    relativePath = $relativePath
+                    providerPath = [IO.Path]::GetFullPath($providerPath)
+                    sha256 = (Get-FileHash -LiteralPath $providerPath -Algorithm SHA256).Hash
+                })
+            }
+        }
+    }
+    return [pscustomobject][ordered]@{
+        evaluated = $true
+        qualified = $providers.Count -eq 0
+        profilePath = $resolvedProfile
+        modlistPath = [IO.Path]::GetFullPath($modlistPath)
+        modsPath = $resolvedMods
+        providers = @($providers)
+        reason = $(if ($providers.Count -eq 0) { 'No enabled MO2 mod deploys a root OpenVR runtime DLL.' } else { 'One or more enabled MO2 mods deploy a root OpenVR runtime DLL and can bypass SteamVR.' })
+    }
+}
+
+function Get-NullRuntimeLogMarkers {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Lines,
+        [Parameter(Mandatory)][DateTime]$MinimumUtc,
+        [Parameter(Mandatory)][string]$SerialNumber
+    )
+    $loaded = $null
+    $active = $null
+    $headPoseLoaded = $null
+    $headPoseRegistered = $null
+    $recentEvidence = [Collections.Generic.List[object]]::new()
+    $escapedSerial = [regex]::Escape($SerialNumber)
+    foreach ($line in $Lines) {
+        $timestampUtc = Get-LogTimestampUtc -Line $line
+        if (-not $timestampUtc -or $timestampUtc -lt $MinimumUtc) { continue }
+        if ($line -match 'Loaded server driver null .*driver_null\.dll') {
+            $loaded = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line; vocabulary = 'driver-loaded' }
+        }
+        if ($line -match "(?:Active HMD(?: set to)?|Using existing HMD) null\.$escapedSerial(?:\s|$)") {
+            $active = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line; vocabulary = $(if ($line -match 'Using existing HMD') { 'existing-hmd' } else { 'active-hmd' }) }
+            if ($null -eq $loaded) {
+                $loaded = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line; vocabulary = 'active-hmd-implies-null-driver' }
+            }
+        }
+        if ($line -match 'Loaded server driver codex_head_pose .*driver_codex_head_pose\.dll') {
+            $headPoseLoaded = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line }
+        }
+        if ($line -match 'codex_head_pose: registered synthetic head-pose device at configured standing pose') {
+            $headPoseRegistered = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line }
+        }
+        if ($line -match '(?i)null\.|codex_head_pose') {
+            $recentEvidence.Add([pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line })
+            while ($recentEvidence.Count -gt 20) { $recentEvidence.RemoveAt(0) }
+        }
+    }
+    return [pscustomobject][ordered]@{
+        driverLoaded = $loaded
+        activeHmd = $active
+        headPoseDriverLoaded = $headPoseLoaded
+        headPoseDeviceRegistered = $headPoseRegistered
+        recentEvidence = @($recentEvidence)
     }
 }
 
@@ -193,14 +287,26 @@ function Enter-SteamVRTargetLock {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
     do {
         try {
-            $stream = [IO.File]::Open([string]$Control.lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-            $owner = [ordered]@{ pid = $PID; acquiredUtc = [DateTime]::UtcNow.ToString('o'); command = $Command; targetKey = [string]$Control.key } | ConvertTo-Json -Compress
+            $stream = [IO.File]::Open([string]$Control.lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read)
+            $processStartUtc = $(try { (Get-Process -Id $PID -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o') } catch { $null })
+            $owner = [ordered]@{ pid = $PID; processStartUtc = $processStartUtc; acquiredUtc = [DateTime]::UtcNow.ToString('o'); command = $Command; targetKey = [string]$Control.key } | ConvertTo-Json -Compress
             $bytes = [Text.UTF8Encoding]::new($false).GetBytes($owner)
             $stream.SetLength(0); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true)
             return $stream
         }
         catch [IO.IOException] {
-            if ([DateTime]::UtcNow -ge $deadline) { throw "Timed out acquiring the SteamVR target transaction lock after $TimeoutMilliseconds ms: $($Control.lockPath)" }
+            if ([DateTime]::UtcNow -ge $deadline) {
+                $ownerEvidence = $(try {
+                    $ownerStream = [IO.File]::Open([string]$Control.lockPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+                    try {
+                        $ownerBytes = [byte[]]::new([Math]::Min(4096, [int]$ownerStream.Length))
+                        $ownerRead = $ownerStream.Read($ownerBytes, 0, $ownerBytes.Length)
+                        [Text.Encoding]::UTF8.GetString($ownerBytes, 0, $ownerRead)
+                    }
+                    finally { $ownerStream.Dispose() }
+                } catch { '<owner metadata unavailable while lock is held>' })
+                throw "Timed out acquiring the SteamVR target transaction lock after $TimeoutMilliseconds ms: $($Control.lockPath). Current owner evidence: $ownerEvidence"
+            }
             Start-Sleep -Milliseconds 50
         }
     } while ($true)
@@ -820,47 +926,29 @@ function Get-NullRuntimeEvidence {
     })
     $server = @($owned | Where-Object name -eq 'vrserver' | Sort-Object startTimeUtc | Select-Object -First 1)
     $serverStartUtc = if ($server.Count -eq 1 -and $server[0].startTimeUtc) { [DateTime]::Parse([string]$server[0].startTimeUtc).ToUniversalTime() } else { $null }
-    $loaded = $null
-    $active = $null
-    $headPoseLoaded = $null
-    $headPoseRegistered = $null
+    $markers = [pscustomobject][ordered]@{ driverLoaded = $null; activeHmd = $null; headPoseDriverLoaded = $null; headPoseDeviceRegistered = $null; recentEvidence = @() }
     $tail = @()
     if ($serverStartUtc -and (Test-Path -LiteralPath $ServerLogPath -PathType Leaf)) {
         $tail = @(Get-SharedTextTail -Path $ServerLogPath -Count 2000 -MaxBytes $LogTailMaxBytes -DeadlineUtc $DeadlineUtc)
-        $minimumUtc = $serverStartUtc.AddSeconds(-3)
-        foreach ($line in $tail) {
-            $timestampUtc = Get-LogTimestampUtc -Line $line
-            if (-not $timestampUtc -or $timestampUtc -lt $minimumUtc) { continue }
-            if ($line -match 'Loaded server driver null .*driver_null\.dll') {
-                $loaded = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line }
-            }
-            if ($line -match "Active HMD set to null\.$([regex]::Escape([string]$Profile['driver_null']['serialNumber']))") {
-                $active = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line }
-            }
-            if ($line -match 'Loaded server driver codex_head_pose .*driver_codex_head_pose\.dll') {
-                $headPoseLoaded = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line }
-            }
-            if ($line -match 'codex_head_pose: registered synthetic head-pose device at configured standing pose') {
-                $headPoseRegistered = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line }
-            }
-        }
+        $markers = Get-NullRuntimeLogMarkers -Lines $tail -MinimumUtc $serverStartUtc.AddSeconds(-3) -SerialNumber ([string]$Profile['driver_null']['serialNumber'])
     }
     $headPoseState = Get-HeadPoseSharedState -Contract $Profile['headPoseProviderContract']
     $applicationHeadPose = if ($server.Count -eq 1 -and [bool]$headPoseState.qualified) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider is not ready for an application-facing pose probe.' } }
     return [pscustomobject][ordered]@{
-        active = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active
+        active = $server.Count -eq 1 -and $null -ne $markers.driverLoaded -and $null -ne $markers.activeHmd
         serverProcess = if ($server.Count -eq 1) { $server[0] } else { $null }
         steamVrProcesses = $owned
         unprovenProcesses = @($Processes | Where-Object { $_ -notin $owned })
         serverLogPath = $ServerLogPath
         serverLogSha256 = Get-HashOrNull $ServerLogPath
-        driverLoaded = $loaded
-        activeHmd = $active
-        headPoseDriverLoaded = $headPoseLoaded
-        headPoseDeviceRegistered = $headPoseRegistered
+        driverLoaded = $markers.driverLoaded
+        activeHmd = $markers.activeHmd
+        headPoseDriverLoaded = $markers.headPoseDriverLoaded
+        headPoseDeviceRegistered = $markers.headPoseDeviceRegistered
+        recentLogEvidence = @($markers.recentEvidence)
         headPoseState = $headPoseState
         applicationHeadPose = $applicationHeadPose
-        headPoseReady = $server.Count -eq 1 -and $null -ne $headPoseLoaded -and $null -ne $headPoseRegistered -and [bool]$headPoseState.qualified -and [bool]$applicationHeadPose.qualified
+        headPoseReady = $server.Count -eq 1 -and $null -ne $markers.headPoseDriverLoaded -and $null -ne $markers.headPoseDeviceRegistered -and [bool]$headPoseState.qualified -and [bool]$applicationHeadPose.qualified
         dashboardProcesses = @($owned | Where-Object name -eq 'vrdashboard')
         dashboardSuppressed = $Profile['dashboard'].ContainsKey('enableDashboard') -and -not [bool]$Profile['dashboard']['enableDashboard']
     }
@@ -961,6 +1049,7 @@ try {
     $effective = Get-EffectiveState -Settings $settings -Profile $profile
     $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile
     $externalDrivers = Get-ExternalDriverInventory -Path $OpenVRPathsPath
+    $applicationRoute = Get-MO2SteamVRRouteEvidence -ProfilePath $MO2ProfilePath -ModsPath $MO2ModsPath
     $authoritativeEvidenceDirectory = if ($null -ne $recoveredTransaction -and (Test-JsonDictionaryContains $recoveredTransaction 'evidenceDirectory')) { [string]$recoveredTransaction['evidenceDirectory'] } else { $null }
     $authoritativeOwnsAppliedState = $effective.active -and $null -ne $recoveredTransaction -and (
         ([string]$recoveredTransaction['operation'] -eq 'apply' -and [string]$recoveredTransaction['phase'] -eq 'committed') -or
@@ -1041,13 +1130,18 @@ try {
             runtime = $runtime
             externalDrivers = $externalDrivers
             inputContract = $inputContract
+            applicationRoute = $applicationRoute
             targetControl = $targetControl
             recoveredTransaction = $recoveredTransaction
         }
     }
     elseif ($Command -eq 'start') {
         $providerDriver = @($externalDrivers.drivers | Where-Object name -eq ([string]$profile['headPoseProviderContract']['driverName']))
-        if ($externalDrivers.errors.Count -gt 0) {
+        if ($applicationRoute.evaluated -and -not $applicationRoute.qualified) {
+            $providerNames = @($applicationRoute.providers | ForEach-Object modName | Select-Object -Unique)
+            $result = New-Result -Ok $false -State 'application-route-conflict' -Data @{ effective = $effective; runtime = $runtime; applicationRoute = $applicationRoute } -Errors @("Refusing null-HMD startup because the selected MO2 profile enables root OpenVR runtime provider(s): $($providerNames -join ', '). Disable the exact provider in the task profile before retrying.")
+        }
+        elseif ($externalDrivers.errors.Count -gt 0) {
             $result = New-Result -Ok $false -State 'external-driver-inventory-failed' -Data @{ effective = $effective; runtime = $runtime; externalDrivers = $externalDrivers } -Errors @('The external OpenVR driver inventory could not be read reliably; refusing null-HMD startup.')
         }
         elseif ($providerDriver.Count -ne 1) {
@@ -1102,7 +1196,7 @@ try {
             }
             elseif ($WhatIf) {
                 $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers -DiagnosticDisplayOverride ([bool]$AllowExternalDisplayRedirector)
-                $result = New-Result -Ok $true -State 'dry-run' -Data @{ startupPath = $startupPath; effective = $effective; runtime = $runtime; externalDrivers = $externalDrivers; externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector; externalDriverIsolation = $isolation; externalDriverIsolationValidation = $isolationValidation; inputContract = $inputContract }
+                $result = New-Result -Ok $true -State 'dry-run' -Data @{ startupPath = $startupPath; effective = $effective; runtime = $runtime; externalDrivers = $externalDrivers; externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector; externalDriverIsolation = $isolation; externalDriverIsolationValidation = $isolationValidation; inputContract = $inputContract; applicationRoute = $applicationRoute }
             }
             else {
                 $startedUtc = [DateTime]::UtcNow

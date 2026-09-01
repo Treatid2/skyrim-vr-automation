@@ -116,6 +116,10 @@ Assert-Test ($entryPointText -match 'probeError = \$_.Exception.Message') 'wait 
 Assert-Test ($entryPointText -match "phase = 'initialize'; recovery = 'outer-wait-retry'") 'wait initialization failures remain inside the outer timeout state machine'
 Assert-Test ($entryPointText -match '\$null -eq \$headers') 'bounded waits establish or re-establish the MCP session inside the polling loop'
 Assert-Test ($entryPointText -match '\[switch\]\$AcceptAlreadyLoaded') 'playerLoaded exposes an explicit compatibility opt-out for freshness'
+Assert-Test ($entryPointText -match '\[switch\]\$LoadAlreadyQueued') 'playerLoaded accepts explicit ownership of an already queued load'
+Assert-Test ($entryPointText -match '\$playerTransitionObserved = \[bool\]\$LoadAlreadyQueued') 'queued-load ownership survives listener rebinding without replaying the mutation'
+Assert-Test ($entryPointText -match '-LoadAlreadyQueued is valid only with wait -Condition playerLoaded') 'queued-load ownership is rejected outside the playerLoaded wait contract'
+Assert-Test ($entryPointText -match '-LoadAlreadyQueued and -AcceptAlreadyLoaded') 'queued-load ownership cannot be weakened into a current-state check'
 Assert-Test ($entryPointText -match '\$playerTransitionObserved') 'playerLoaded requires an observed unloaded-to-loaded transition by default'
 
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('devbench-control-' + [guid]::NewGuid().ToString('N'))

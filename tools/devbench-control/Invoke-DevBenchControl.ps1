@@ -35,6 +35,7 @@ param(
     [string[]]$IgnoredMenus = @('HUD Menu'),
     [string[]]$AllowedMainMenuMenus = @('HUD Menu', 'Main Menu'),
     [switch]$AcceptAlreadyLoaded,
+    [switch]$LoadAlreadyQueued,
     [switch]$AllowUnsafeTfc1,
     [switch]$AllowUnprovenGameMutation,
     [switch]$NoExit,
@@ -492,6 +493,12 @@ function Write-RuntimeEvidence($Binding) {
 
 try {
     Initialize-InvocationEvidence
+    if ($LoadAlreadyQueued -and ($Command -ne 'wait' -or $Condition -ne 'playerLoaded')) {
+        throw '-LoadAlreadyQueued is valid only with wait -Condition playerLoaded.'
+    }
+    if ($LoadAlreadyQueued -and $AcceptAlreadyLoaded) {
+        throw '-LoadAlreadyQueued and -AcceptAlreadyLoaded describe different freshness contracts and cannot be combined.'
+    }
     if ([string]::IsNullOrWhiteSpace($RuntimePath)) { throw 'RuntimePath is required. Pass -RuntimePath or set CSX_DEVBENCH_RUNTIME_PATH.' }
     if (-not (Test-Path -LiteralPath $RuntimePath -PathType Leaf)) { throw "DevBench runtime metadata does not exist: $RuntimePath" }
     $runtime = Get-Content -LiteralPath $RuntimePath -Raw | ConvertFrom-Json
@@ -587,7 +594,7 @@ try {
         $lastProgressUtc = [DateTime]::MinValue
         $firstCpu = $null
         $lastCpu = $null
-        $playerTransitionObserved = $false
+        $playerTransitionObserved = [bool]$LoadAlreadyQueued
         $playerInitialState = $null
         do {
             $attempts++
@@ -661,6 +668,7 @@ try {
                         satisfied = $loaded -and $fresh; state = $state; retryable = $false; probeError = $null
                         initialPlayerLoaded = $playerInitialState; freshTransitionObserved = $playerTransitionObserved
                         acceptAlreadyLoaded = [bool]$AcceptAlreadyLoaded
+                        loadAlreadyQueued = [bool]$LoadAlreadyQueued
                     }
                 }
                 catch {

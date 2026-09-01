@@ -38,6 +38,14 @@ inventory. Use `-OpenVRPathsPath` for a nonstandard registration file. This
 preflight also refuses startup when a registered driver cannot be classified;
 it does not silently mutate or unregister third-party drivers.
 
+For an MO2-launched application, pass both `-MO2ProfilePath` and
+`-MO2ModsPath`. The controller reads the exact profile's `modlist.txt` and
+refuses `start` when any enabled mod provides `Root\openvr_api.dll` or
+`openvr_api.dll`; this catches renamed OpenComposite/OCU selectors by effective
+root-file provenance rather than a legacy display name. The check is read-only
+and never disables a mod. Omitting both parameters remains valid for
+non-MO2 applications, but does not establish the application's SteamVR route.
+
 For a measurement-qualified transaction with one classified redirector, pass
 `-IsolateExternalDisplayRedirectors` to `apply`. The controller backs up and
 hashes the exact OpenVR registration file, binds the selected driver root and
@@ -74,7 +82,11 @@ The control root is fixed beneath the Windows LocalApplicationData folder at
 `CSX-VR-Automation\SteamVR\transactions`; callers cannot select different lock
 domains. The fixture-only `CSX_STEAMVR_TRANSACTION_ROOT` override is rejected
 unless both settings and control paths are inside the OS temporary directory.
-Lock acquisition is bounded by `-TransactionLockTimeoutMilliseconds`.
+Lock acquisition is bounded by `-TransactionLockTimeoutMilliseconds`. The
+retained lock file is owner evidence, not the lock itself: the operating-system
+file handle provides exclusion and is released when its process exits. Timeout
+errors include the readable PID and process-start identity of the current owner
+when available, which distinguishes a live holder from a stale filename.
 
 SteamVR may rewrite `steamvr.vrsettings` while the null runtime is active. A
 restore therefore reconstructs the applied settings contract from the exact
@@ -115,14 +127,19 @@ processes whose creation time belongs to that attempt and reports the verified
 survivor inventory.
 
 Readiness polling keeps an incremental identity/offset cache and reads at most
-`LogTailMaxBytes` from the shared `vrserver` log. Decoding and I/O are charged
-to the startup deadline, so a large historical log cannot turn one poll into an
-unbounded whole-file read.
+`LogTailMaxBytes` from the shared `vrserver` log. The byte cap, rather than the
+startup deadline, bounds one file read, so a large historical log cannot turn
+one poll into an unbounded whole-file read. A final bounded read is still
+attempted when process
+startup consumes the polling budget. Current Valve evidence using either
+`Active HMD` or `Using existing HMD` is accepted for the exact configured null
+serial, and recent matching log lines are returned when qualification fails.
 
 ```powershell
 .\Invoke-SteamVRNullControl.ps1 apply -EvidenceDirectory <session-evidence> -Compact
 .\Invoke-SteamVRNullControl.ps1 apply -EvidenceDirectory <session-evidence> -IsolateExternalDisplayRedirectors -Compact
-.\Invoke-SteamVRNullControl.ps1 start -EvidenceDirectory <session-evidence> -Compact
+.\Invoke-SteamVRNullControl.ps1 start -EvidenceDirectory <session-evidence> `
+  -MO2ProfilePath <exact-task-profile> -MO2ModsPath <mods-directory> -Compact
 .\Invoke-SteamVRNullControl.ps1 inspect -Compact
 .\Invoke-SteamVRNullControl.ps1 stop -Compact
 .\Invoke-SteamVRNullControl.ps1 stop -Force -Compact

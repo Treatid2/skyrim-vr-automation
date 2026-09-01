@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Qualify null-HMD application routing from exact enabled root OpenVR providers,
+  accept current Valve null-runtime log vocabulary, return unmatched evidence,
+  and make target-lock contention attributable to its live owner.
+- Let a transition-fresh `playerLoaded` wait explicitly inherit ownership of an
+  already queued load across bounded DevBench listener rebinding without
+  replaying the mutation.
 - Add a correlated capture/interaction framework with latest committed frame
   selection, continuous or on-demand stereo capture, full-state recording,
   pose-preserving named actions, direct DevBench passthrough, orderly

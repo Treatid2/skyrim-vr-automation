@@ -74,5 +74,9 @@ particular drive letter for the plugin itself.
   result before another attempt.
 
 When a test also uses MO2, complete the runtime transition before invoking the
-`$mo2-control` lifecycle. Do not infer which runtime Skyrim actually used from
-the presence of SteamVR processes alone; record the route separately.
+`$mo2-control` lifecycle. Pass the exact task profile and mods directory as
+`-MO2ProfilePath` and `-MO2ModsPath` to `start`, and require
+`applicationRoute.qualified=true`. This read-only proof rejects renamed
+OpenComposite/OCU selectors by the enabled root `openvr_api.dll` provider.
+Do not infer which runtime Skyrim actually used from the presence of SteamVR
+processes alone.

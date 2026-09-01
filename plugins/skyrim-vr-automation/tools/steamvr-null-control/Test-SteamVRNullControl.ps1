@@ -39,10 +39,17 @@ try {
     $startupPath = Join-Path $steamVrRoot 'bin\win64\vrstartup.exe'
     $serverLogPath = Join-Path $fixture 'vrserver.txt'
     $openVrPathsPath = Join-Path $fixture 'openvrpaths.vrpath'
+    $mo2ProfilePath = Join-Path $fixture 'MO2Profile'
+    $mo2ModsPath = Join-Path $fixture 'mods'
+    $ocuModPath = Join-Path $mo2ModsPath 'Renamed OCU Root Provider'
     $externalDriverRoot = Join-Path $fixture 'VirtualDesktopDriver'
     $headPoseDriverRoot = Join-Path $fixture 'HeadPoseDriver'
     New-Item -ItemType Directory -Path $externalDriverRoot | Out-Null
     New-Item -ItemType Directory -Path $headPoseDriverRoot | Out-Null
+    New-Item -ItemType Directory -Path $mo2ProfilePath | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $ocuModPath 'Root') -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $mo2ProfilePath 'modlist.txt'), "+Renamed OCU Root Provider`r`n", [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllBytes((Join-Path $ocuModPath 'Root\openvr_api.dll'), [byte[]]@(1, 2, 3))
     [ordered]@{ name = 'codex_head_pose'; alwaysActivate = $true; redirectsDisplay = $false } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $headPoseDriverRoot 'driver.vrdrivermanifest') -Encoding utf8
     [ordered]@{ version = 1; external_drivers = @($headPoseDriverRoot) } | ConvertTo-Json | Set-Content -LiteralPath $openVrPathsPath -Encoding utf8
     New-Item -ItemType Directory -Path $evidence | Out-Null
@@ -66,15 +73,47 @@ try {
     Assert-Test ($inspectBefore.ok -and $inspectBefore.state -eq 'null-inactive') 'inspect identifies inactive null profile'
     Assert-Test ((Test-Path -LiteralPath $inspectBefore.data.targetControl.directory -PathType Container) -and $inspectBefore.data.targetControl.key -match '^[0-9a-f]{64}$') 'canonical live targets map to a deterministic target-owned control directory'
 
-    $heldLock = [IO.File]::Open([string]$inspectBefore.data.targetControl.lockPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $knownOwner = '{"pid":4242,"processStartUtc":"2026-09-01T00:00:00Z"}'
+    [IO.File]::WriteAllText([string]$inspectBefore.data.targetControl.lockPath, $knownOwner, [Text.UTF8Encoding]::new($false))
+    $heldLock = [IO.File]::Open([string]$inspectBefore.data.targetControl.lockPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read)
     try {
         $contended = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -TransactionLockTimeoutMilliseconds 100 -Compact -NoExit | ConvertFrom-Json
-        Assert-Test (-not $contended.ok -and $contended.errors[0] -match 'target transaction lock') 'a second caller cannot inspect or mutate the same live targets while their bounded lock is held'
+        Assert-Test (-not $contended.ok -and $contended.errors[0] -match 'target transaction lock' -and $contended.errors[0] -match '4242') 'a second caller reports attributable owner evidence while the bounded target lock is held'
     }
     finally { $heldLock.Dispose() }
 
     $sourceText = [IO.File]::ReadAllText($entry)
     Assert-Test ($sourceText -notmatch '\.ReadToEnd\(' -and $sourceText -match 'LogTailMaxBytes') 'SteamVR readiness polling uses a bounded byte tail instead of whole-log reads'
+    Assert-Test ($sourceText -notmatch 'deadline expired before opening the log') 'an expired poll budget still permits one final bounded log read'
+
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($entry, [ref]$tokens, [ref]$parseErrors)
+    Assert-Test ($parseErrors.Count -eq 0) 'SteamVR null controller parses before fixture helper extraction'
+    foreach ($functionName in @('Get-SharedTextTail', 'Get-LogTimestampUtc', 'Get-NullRuntimeLogMarkers')) {
+        $definition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName }, $true)
+        if ($definition) { . ([scriptblock]::Create($definition.Extent.Text)) }
+    }
+    $minimumUtc = [DateTime]::Parse('2026-09-01T05:09:55Z').ToUniversalTime()
+    $classicMarkers = Get-NullRuntimeLogMarkers -MinimumUtc $minimumUtc -SerialNumber 'CSX Null HMD' -Lines @(
+        'Tue Sep 01 2026 06:09:59.502 [Info] - Loaded server driver null (IServerTrackedDeviceProvider_004) from C:\SteamVR\drivers\null\bin\win64\driver_null.dll',
+        'Tue Sep 01 2026 06:09:59.502 [Info] - Active HMD set to null.CSX Null HMD',
+        'Tue Sep 01 2026 06:09:59.515 [Info] - codex_head_pose: codex_head_pose: registered synthetic head-pose device at configured standing pose',
+        'Tue Sep 01 2026 06:09:59.515 [Info] - Loaded server driver codex_head_pose (IServerTrackedDeviceProvider_004) from C:\Drivers\driver_codex_head_pose.dll'
+    )
+    Assert-Test ($classicMarkers.driverLoaded -and $classicMarkers.activeHmd -and $classicMarkers.headPoseDriverLoaded -and $classicMarkers.headPoseDeviceRegistered) 'classic current-session null and head-pose vocabulary remains qualified'
+    $existingMarkers = Get-NullRuntimeLogMarkers -MinimumUtc $minimumUtc -SerialNumber 'CSX Null HMD' -Lines @(
+        'Tue Sep 01 2026 06:09:54.000 [Info] - Using existing HMD null.CSX Null HMD',
+        'Tue Sep 01 2026 06:09:59.643 [Info] - Using existing HMD null.CSX Null HMD'
+    )
+    Assert-Test ($existingMarkers.driverLoaded.vocabulary -eq 'active-hmd-implies-null-driver' -and $existingMarkers.activeHmd.vocabulary -eq 'existing-hmd' -and $existingMarkers.recentEvidence.Count -eq 1) 'Valve existing-HMD vocabulary proves the exact current-session null route and excludes stale lines'
+    $largeLogPath = Join-Path $fixture 'bounded-large-vrserver.txt'
+    $largeLines = 1..5000 | ForEach-Object { "Tue Sep 01 2026 06:10:00.000 [Info] - filler $_" }
+    $largeLines[-1] = 'Tue Sep 01 2026 06:10:01.000 [Info] - Using existing HMD null.CSX Null HMD'
+    [IO.File]::WriteAllLines($largeLogPath, $largeLines, [Text.UTF8Encoding]::new($false))
+    $script:SharedTextTailState = @{}
+    $expiredTail = @(Get-SharedTextTail -Path $largeLogPath -Count 2000 -MaxBytes 262144 -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(-1)))
+    Assert-Test ($expiredTail[-1] -match 'Using existing HMD') 'a pre-existing large log yields a bounded final tail after the readiness deadline'
 
     $stop = & $entry stop -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json
     Assert-Test ($stop.ok -and $stop.state -eq 'already-stopped') 'stop recognizes an already closed SteamVR state'
@@ -136,6 +175,11 @@ try {
 
     $startDry = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact | ConvertFrom-Json
     Assert-Test ($startDry.ok -and $startDry.state -eq 'dry-run' -and $startDry.data.startupPath -eq $startupPath) 'start dry-run validates the configured transaction and exact startup path'
+    $routeConflict = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -MO2ProfilePath $mo2ProfilePath -MO2ModsPath $mo2ModsPath -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $routeConflict.ok -and $routeConflict.state -eq 'application-route-conflict' -and $routeConflict.data.applicationRoute.providers[0].modName -eq 'Renamed OCU Root Provider') 'null-HMD start rejects a renamed enabled root OpenVR provider by exact profile provenance'
+    [IO.File]::WriteAllText((Join-Path $mo2ProfilePath 'modlist.txt'), "-Renamed OCU Root Provider`r`n", [Text.UTF8Encoding]::new($false))
+    $routeQualified = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -MO2ProfilePath $mo2ProfilePath -MO2ModsPath $mo2ModsPath -WhatIf -Compact | ConvertFrom-Json
+    Assert-Test ($routeQualified.ok -and $routeQualified.data.applicationRoute.evaluated -and $routeQualified.data.applicationRoute.qualified) 'null-HMD start qualifies an exact profile with no enabled root OpenVR provider'
 
     [ordered]@{ name = 'VirtualDesktop'; alwaysActivate = $true; redirectsDisplay = $true } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $externalDriverRoot 'driver.vrdrivermanifest') -Encoding utf8
     [ordered]@{ version = 1; external_drivers = @($headPoseDriverRoot, $externalDriverRoot) } | ConvertTo-Json | Set-Content -LiteralPath $openVrPathsPath -Encoding utf8

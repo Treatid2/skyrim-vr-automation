@@ -120,7 +120,10 @@ the short transport budget before the requested timeout begins.
 unloaded state before accepting loaded. This prevents the prior world's cached
 `true` from satisfying an asynchronous load. Use `-AcceptAlreadyLoaded` only
 when the caller intentionally wants a current-state check rather than proof of
-a new load transition.
+a new load transition. When a separate, successful mutation has already queued
+the load, pass `-LoadAlreadyQueued`. That explicit ownership assertion preserves
+freshness across a transient listener rebind without replaying the mutation;
+the first qualified loaded observation may then complete the wait.
 
 Runtime identity is refreshed after a waited-for service registers. The binding
 reports listener process identity, every available CSX producer registry,
