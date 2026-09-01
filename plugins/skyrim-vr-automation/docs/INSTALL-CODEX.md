@@ -48,6 +48,10 @@ The first command must return `fixture-valid`; the doctor check
 `prime-profile-world-entry-integrity` must pass. A missing, stale, or mismatched fixture
 blocks fresh workspace creation. Only one save is required because guarded
 `coc`/`cow` transitions can reach other locations after world entry.
+The doctor check `prime-profile-launch-readiness` must also pass. It validates
+the exact profile named by `defaults.testProfileSource` and its registered
+executable provider, and reports discovered profile candidates when that
+configuration is stale.
 
 Every fresh task profile receives the complete prime-profile save tree and a
 verified copy of that baseline. This is exact static integrity, not proof of a

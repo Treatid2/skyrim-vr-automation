@@ -14,7 +14,7 @@ function Get-TestProfileFingerprint([string]$Path) {
         if ($relative -match '^(?i:saves)[\\/]') { continue }
         $records += [pscustomobject][ordered]@{ path = $relative; bytes = [long]$file.Length; sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash }
     }
-    $canonical = $records | ConvertTo-Json -Compress -Depth 4
+    $canonical = ConvertTo-Json -InputObject @($records) -Compress -Depth 4
     return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($canonical)))
 }
 try {
@@ -50,7 +50,7 @@ try {
     }
     [ordered]@{ contractVersion='1.0.0'; sourceProfile='Mad God Stable'; profileFingerprintSha256=(Get-TestProfileFingerprint $source); defaultFixtureId='interior'; fixtures=@([ordered]@{id='interior';label='Known-good interior';location='TestCell';loadName='Save2_KnownGood';files=$saveFiles}) } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $fixtureManifestPath -Encoding utf8
     [ordered]@{
-        contractVersion='0.4.0'; machine='fixture'; mo2=[ordered]@{root=$mo2;executable=$mo2Exe;ini=$ini;profilesDirectory=$profiles;modsDirectory=$mods;overwriteDirectory=(Join-Path $mo2 'overwrite');logsDirectory=(Join-Path $mo2 'logs');rootBuilderDefinitions=@();rootBuilderDataDirectory=(Join-Path $mo2 'rb');processNames=@('WorkspaceImpossibleMO2');gameProcessNames=@('WorkspaceImpossibleGame');runtimeProcessNames=@()};
+        contractVersion='0.4.0'; machine='fixture'; mo2=[ordered]@{root=$mo2;executable=$mo2Exe;ini=$ini;profilesDirectory=$profiles;modsDirectory=$mods;overwriteDirectory=(Join-Path $mo2 'overwrite');logsDirectory=(Join-Path $mo2 'logs');rootBuilderDefinitions=@();rootBuilderDataDirectory=(Join-Path $mo2 'rb');processNames=@('WorkspaceImpossibleMO2');gameProcessNames=@('WorkspaceImpossibleGame');runtimeProcessNames=@((Get-Process -Id $PID).ProcessName)};
         defaults=[ordered]@{profile='Mad God Stable';testProfileSource='Mad God Stable';newGameFixtureManifest=$fixtureManifestPath;executable='Test'};storage=[ordered]@{sessionStaging=$sessions;archive=(Join-Path $fixture 'archive')};limits=[ordered]@{maxEnumeratedFiles=100;overwriteWarningFiles=10;overwriteBlockFiles=50;overwriteWarningBytes=1024;overwriteBlockBytes=4096;launchPendingGraceSeconds=30};session=[ordered]@{lockFile=$lock}
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding utf8
     Import-Module (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'mo2-control\MO2Control.psm1') -Force
@@ -81,6 +81,22 @@ try {
     $unconfigured | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $missingPath -Encoding utf8
     $missingStatus = & $entry fixture-status -ConfigPath $missingPath -Compact | ConvertFrom-Json
     if (-not $missingStatus.ok -or $missingStatus.state -ne 'fixture-manifest-missing' -or -not $missingStatus.data.configured -or $missingStatus.data.manifestExists) { throw 'Fixture discovery did not distinguish a configured missing manifest.' }
+    $emptySource = Join-Path $profiles 'Empty Prime'
+    New-Item -ItemType Directory -Path (Join-Path $emptySource 'saves') -Force | Out-Null
+    'save-only' | Set-Content -LiteralPath (Join-Path $emptySource 'saves\only.ess') -Encoding utf8
+    $nullFixturePath = Join-Path $fixture 'config-null-fixture.json'
+    $nullFixture = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    $nullFixture.defaults.testProfileSource = 'Empty Prime'
+    $nullFixture.defaults.newGameFixtureManifest = $null
+    $nullFixture | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $nullFixturePath -Encoding utf8
+    $nullFixtureStatus = & $entry fixture-status -ConfigPath $nullFixturePath -Compact | ConvertFrom-Json
+    if (-not $nullFixtureStatus.ok -or $nullFixtureStatus.state -ne 'fixture-not-configured' -or [string]::IsNullOrWhiteSpace([string]$nullFixtureStatus.data.actualProfileFingerprintSha256)) { throw 'Null fixture configuration or an empty non-save profile inventory was not normalized.' }
+    $staleConfigPath = Join-Path $fixture 'config-stale-source.json'
+    $staleConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    $staleConfig.defaults.testProfileSource = 'Renamed Stable'
+    $staleConfig | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $staleConfigPath -Encoding utf8
+    $staleSource = & $entry prepare-source -ConfigPath $staleConfigPath -AccessId $accessId -Confirm:$false -Compact -NoExit | ConvertFrom-Json
+    if ($staleSource.ok -or $staleSource.errors[0] -notmatch 'defaults\.testProfileSource' -or $staleSource.errors[0] -notmatch 'Mad God Stable') { throw 'A stale configured source did not report its exact field and available profile candidates.' }
     if ($DiscoveryOnly) {
         $releasedAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
         if (-not $releasedAccess.ok) { throw 'Discovery-only access release failed.' }
@@ -182,6 +198,9 @@ try {
     $resumed = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -Confirm:$false | ConvertFrom-Json
     if (-not $resumed.ok -or $resumed.state -ne 'workspace-resumed' -or $resumed.data.accessId -ne $nextAccessId -or -not (Test-Path -LiteralPath (Join-Path $created.data.profilePath 'task-state.txt'))) { throw "Retained workspace was not rebound without losing task state: $($resumed | ConvertTo-Json -Depth 12 -Compress)" }
     if ((Get-Content -LiteralPath $ini -Raw) -notmatch ('selected_profile=@ByteArray\(' + [regex]::Escape([string]$created.data.profileName) + '\)')) { throw 'Resume did not select the retained task profile.' }
+    $selectedBytes = [IO.File]::ReadAllBytes($ini)
+    $resumedNoOp = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -Confirm:$false | ConvertFrom-Json
+    if (-not $resumedNoOp.ok -or $resumedNoOp.data.selectedProfileTransaction.changed -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($ini)) -cne [Convert]::ToBase64String($selectedBytes)) { throw 'An already-selected retained workspace was not resumed as an exact-byte no-op.' }
     $resumeJournal = Get-ChildItem -LiteralPath $workspaceControlRoot -Filter ($created.data.workspaceId + '.resume.*.journal.json') -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     $resumeJournalData = Get-Content -LiteralPath $resumeJournal.FullName -Raw | ConvertFrom-Json
     if ($resumeJournalData.phase -ne 'committed' -or -not (Test-Path -LiteralPath $resumeJournalData.manifestPreimagePath -PathType Leaf) -or [string]::IsNullOrWhiteSpace([string]$resumeJournalData.selectedProfileJournalPath)) { throw 'Committed resume did not retain a durable manifest preimage and selected-profile journal link.' }
@@ -229,6 +248,6 @@ try {
     if (-not (Test-Path -LiteralPath $source) -or -not (Test-Path -LiteralPath $loaderMod)) { throw 'Workspace cleanup damaged stable state.' }
     $releasedAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $nextAccessId
     if (-not $releasedAccess.ok) { throw 'Resumed access release failed.' }
-    [pscustomobject]@{ok=$true; assertions=61; workspaceId=$created.data.workspaceId} | ConvertTo-Json
+    [pscustomobject]@{ok=$true; assertions=65; workspaceId=$created.data.workspaceId} | ConvertTo-Json
 }
 finally { if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force } }

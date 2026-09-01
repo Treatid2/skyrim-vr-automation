@@ -45,6 +45,13 @@ profile. `list-task` reports retained profiles. `resume` rebinds one exact
 retained workspace to a newly owned lease and selects it without refreshing it
 from the primary profile. See `../../docs/MO2-TASK-WORKSPACES.md`.
 
+The stable source resolves from an explicit `-SourceProfile` or from
+`defaults.testProfileSource`, in that order. A missing profile or one whose
+registered executable provider is unavailable fails with the exact source field
+and discovered profile candidates. The automation doctor exposes the same
+prerequisite as `prime-profile-launch-readiness`, so stale configuration can be
+repaired before requesting an MO2 lease.
+
 For elevated use, follow `../mo2-control/APPROVALS.md`. Every result reports a
 literal command-specific `data.approval.reusablePrefix`. `create`,
 `register-mod`, and `ensure-mod-wins` are eligible for narrow reusable approval;
