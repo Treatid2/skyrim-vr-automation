@@ -149,11 +149,20 @@ try {
     $mods = Join-Path $resolvedTestRoot 'mods'
     $profile = Join-Path $resolvedTestRoot 'modlist.txt'
     New-Item -ItemType Directory -Path (Join-Path $mods 'Enabled Cache\ShaderCache'), (Join-Path $mods 'Disabled Cache\ShaderCache') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $mods 'Enabled Cache\ShaderCache\enabled.bin') -Value 'enabled' -NoNewline
+    Set-Content -LiteralPath (Join-Path $mods 'Disabled Cache\ShaderCache\disabled.bin') -Value 'disabled' -NoNewline
     Set-Content -LiteralPath $profile -Value @('+Enabled Cache', '-Disabled Cache') -Encoding utf8
     Set-Content -LiteralPath (Join-Path $mods 'Enabled Cache\Info.ini') -Value @('[Feature]', 'Version=1.2.3') -Encoding utf8
-    $providers = & $transaction providers -ProfilePath $profile -ModsPath $mods -DeepInventory -NoExit | ConvertFrom-Json
+    $providerEvidence = Join-Path $resolvedTestRoot 'provider-evidence'
+    $providers = & $transaction providers -ProfilePath $profile -ModsPath $mods -DeepInventory -EvidenceDirectory $providerEvidence -NoExit | ConvertFrom-Json
     Assert-Test ($providers.ok -and $providers.data.providers.Count -eq 2) 'provider inventory finds enabled and disabled physical cache providers'
     Assert-Test ($providers.data.enabledProviders -eq 1 -and $providers.data.disabledProviders -eq 1) 'provider inventory preserves exact MO2 marker state'
+    Assert-Test (-not $providers.data.inventoryEntriesIncluded -and -not $providers.data.providers[0].inventory.PSObject.Properties['entries']) 'provider inventory defaults to compact tree summaries'
+    $providerInventoryEvidence = Get-Content -LiteralPath $providers.data.inventoryEvidencePath -Raw | ConvertFrom-Json
+    Assert-Test ($providerInventoryEvidence.providers[0].inventory.entries.Count -eq 1 -and $providerInventoryEvidence.providers[0].inventory.files -eq 1) 'provider inventory preserves full entries in separate evidence'
+
+    $providersWithEntries = & $transaction providers -ProfilePath $profile -ModsPath $mods -DeepInventory -IncludeInventoryEntries -NoExit | ConvertFrom-Json
+    Assert-Test ($providersWithEntries.data.inventoryEntriesIncluded -and $providersWithEntries.data.providers[0].inventory.PSObject.Properties['entries']) 'provider inventory includes entries only when explicitly requested'
 
     $dllRelativePath = 'SKSE\Plugins\CommunityShaders.dll'
     New-Item -ItemType Directory -Path (Join-Path $mods 'Enabled Cache\SKSE\Plugins'), (Join-Path $mods 'Disabled Cache\SKSE\Plugins') -Force | Out-Null
