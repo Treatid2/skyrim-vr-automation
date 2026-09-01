@@ -78,7 +78,11 @@ Lock acquisition is bounded by `-TransactionLockTimeoutMilliseconds`.
 
 SteamVR may rewrite `steamvr.vrsettings` while the null runtime is active. A
 restore therefore reconstructs the applied settings contract from the exact
-pre-apply backup plus the receipt-bound null profile. It accepts byte-only
+pre-apply backup plus the receipt-bound null profile. Apply copies the exact
+profile bytes into its evidence directory and binds that stable path and hash
+in the receipt, so plugin-cache replacement cannot strand a later restore. A
+legacy receipt may use a caller-supplied profile only when its SHA-256 matches
+the receipt. Restore accepts byte-only
 formatting changes and runtime-managed changes confined to the top-level
 `GpuSpeed` and `LastKnown` sections only when every controller-owned null-HMD
 setting still matches. Changes to a controller-owned key or any other section
@@ -117,7 +121,10 @@ survivor inventory.
 Readiness polling keeps an incremental identity/offset cache and reads at most
 `LogTailMaxBytes` from the shared `vrserver` log. Decoding and I/O are charged
 to the startup deadline, so a large historical log cannot turn one poll into an
-unbounded whole-file read.
+unbounded whole-file read. The polling loop reserves a final bounded log-read
+window and records its deadlines, attempt count, and any final probe timeout in
+the runtime receipt instead of entering a new log read after qualification time
+has expired.
 
 ```powershell
 .\Invoke-SteamVRNullControl.ps1 apply -EvidenceDirectory <session-evidence> -Compact

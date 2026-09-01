@@ -91,6 +91,8 @@ try {
     Assert-Test ($appliedJson['dashboard']['enableDashboard'] -eq $false) 'apply disables the dashboard generic-HMD input route'
     Assert-Test ($appliedJson['driver_codex_head_pose']['eyeHeightMeters'] -eq 1.68 -and $appliedJson['TrackingOverrides']['/devices/codex_head_pose/CSX-NULL-HMD-POSE-1'] -eq '/user/head') 'apply configures the synthetic head pose and semantic override'
     Assert-Test (Test-Path -LiteralPath (Join-Path $evidence 'steamvr-null-receipt.json')) 'apply writes hash receipt'
+    $appliedReceipt = Get-Content -LiteralPath (Join-Path $evidence 'steamvr-null-receipt.json') -Raw | ConvertFrom-Json
+    Assert-Test ((Test-Path -LiteralPath $appliedReceipt.profileEvidencePath -PathType Leaf) -and (Get-FileHash -LiteralPath $appliedReceipt.profileEvidencePath -Algorithm SHA256).Hash -eq $appliedReceipt.profileSha256) 'apply retains an exact receipt-bound null profile in stable evidence'
     $appliedText = [IO.File]::ReadAllText($settingsPath)
 
     $secondCallerApply = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -Compact -NoExit | ConvertFrom-Json
@@ -104,6 +106,14 @@ try {
     [IO.File]::WriteAllText($otherSettingsPath, $originalText, [Text.UTF8Encoding]::new($false))
     $wrongPathRestore = & $entry restore -SettingsPath $otherSettingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $wrongPathRestore.ok -and $wrongPathRestore.state -eq 'blocked' -and $wrongPathRestore.errors[0] -match 'settings path') 'restore refuses a settings path different from its apply receipt'
+
+    $movedProfilePath = "$profilePath.moved"
+    Move-Item -LiteralPath $profilePath -Destination $movedProfilePath
+    try {
+        $cacheIndependentRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+        Assert-Test ($cacheIndependentRestore.ok -and $cacheIndependentRestore.data.settingsRestoreValidation.authorized) 'restore survives removal of the original versioned profile path'
+    }
+    finally { Move-Item -LiteralPath $movedProfilePath -Destination $profilePath }
 
     [IO.File]::AppendAllText($settingsPath, "`n")
     $formattingRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json

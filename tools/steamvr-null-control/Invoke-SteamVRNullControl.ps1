@@ -115,7 +115,7 @@ function Get-SharedTextTail {
         [Parameter(Mandatory)][ValidateRange(4096, 4194304)][int]$MaxBytes,
         [DateTime]$DeadlineUtc = [DateTime]::MaxValue
     )
-    if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw 'SteamVR log-tail deadline expired before opening the log.' }
+    if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before opening the log.') }
     $stream = $null
     try {
         $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
@@ -134,7 +134,7 @@ function Get-SharedTextTail {
         $stream.Position = $start
         $read = 0
         while ($read -lt $readLength) {
-            if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw 'SteamVR log-tail deadline expired while reading the log.' }
+            if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired while reading the log.') }
             $current = $stream.Read($bytes, $read, $readLength - $read)
             if ($current -le 0) { break }
             $read += $current
@@ -292,10 +292,19 @@ function Get-JsonDifferencePaths([AllowNull()]$Expected, [AllowNull()]$Actual, [
 }
 
 function Get-NullSettingsExpectation([Collections.IDictionary]$Receipt, [string]$BackupPath) {
-    if (-not $Receipt.Contains('profilePath') -or [string]::IsNullOrWhiteSpace([string]$Receipt['profilePath'])) { throw 'The apply receipt does not identify its null-HMD profile.' }
-    $profilePath = [IO.Path]::GetFullPath([string]$Receipt['profilePath'])
-    if (-not (Test-Path -LiteralPath $profilePath -PathType Leaf)) { throw "The receipt-bound null-HMD profile is missing: $profilePath" }
-    if ((Get-HashOrNull $profilePath) -ne [string]$Receipt['profileSha256']) { throw 'The null-HMD profile hash differs from the apply receipt.' }
+    if (-not $Receipt.Contains('profileSha256') -or [string]::IsNullOrWhiteSpace([string]$Receipt['profileSha256'])) { throw 'The apply receipt does not identify its null-HMD profile hash.' }
+    $profileCandidates = [Collections.Generic.List[string]]::new()
+    foreach ($field in @('profileEvidencePath', 'profilePath')) {
+        if ($Receipt.Contains($field) -and -not [string]::IsNullOrWhiteSpace([string]$Receipt[$field])) {
+            $profileCandidates.Add([IO.Path]::GetFullPath([string]$Receipt[$field]))
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($NullProfilePath)) { $profileCandidates.Add([IO.Path]::GetFullPath($NullProfilePath)) }
+    $profilePath = @($profileCandidates | Select-Object -Unique | Where-Object {
+        (Test-Path -LiteralPath $_ -PathType Leaf) -and (Get-HashOrNull $_) -eq [string]$Receipt['profileSha256']
+    } | Select-Object -First 1)
+    if ($profilePath.Count -ne 1) { throw 'No receipt-bound or caller-supplied null-HMD profile matches the apply receipt hash.' }
+    $profilePath = [string]$profilePath[0]
     $expected = Read-JsonHashtable -Path $BackupPath
     $profile = Read-JsonHashtable -Path $profilePath
     $controlled = [Collections.Generic.List[string]]::new()
@@ -561,6 +570,24 @@ function Write-JsonAtomic {
         if (Test-Path -LiteralPath $temporary -PathType Leaf) {
             Remove-Item -LiteralPath $temporary -Force
         }
+    }
+}
+
+function Copy-FileAtomicVerified {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$ExpectedSha256
+    )
+    $temporary = "$Destination.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllBytes($temporary, [IO.File]::ReadAllBytes($Source))
+        if ((Get-HashOrNull $temporary) -ne $ExpectedSha256) { throw 'The staged null-HMD profile copy failed hash verification.' }
+        Move-Item -LiteralPath $temporary -Destination $Destination -Force
+        if ((Get-HashOrNull $Destination) -ne $ExpectedSha256) { throw 'The committed null-HMD profile evidence failed hash verification.' }
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force }
     }
 }
 
@@ -943,8 +970,26 @@ try {
     if (-not (Test-Path -LiteralPath $SettingsPath -PathType Leaf)) {
         throw "SteamVR settings file does not exist: $SettingsPath"
     }
+    if (-not (Test-Path -LiteralPath $NullProfilePath -PathType Leaf) -and $Command -eq 'restore') {
+        $restoreEvidenceDirectory = if (-not [string]::IsNullOrWhiteSpace($EvidenceDirectory)) { [IO.Path]::GetFullPath($EvidenceDirectory) } elseif ($null -ne $recoveredTransaction -and (Test-JsonDictionaryContains $recoveredTransaction 'evidenceDirectory')) { [IO.Path]::GetFullPath([string]$recoveredTransaction['evidenceDirectory']) } else { $null }
+        if ($restoreEvidenceDirectory) {
+            $restoreReceiptPath = Join-Path $restoreEvidenceDirectory 'steamvr-null-receipt.json'
+            if (Test-Path -LiteralPath $restoreReceiptPath -PathType Leaf) {
+                $restoreReceiptProfile = Read-JsonHashtable -Path $restoreReceiptPath
+                foreach ($field in @('profileEvidencePath', 'profilePath')) {
+                    if ($restoreReceiptProfile.Contains($field) -and -not [string]::IsNullOrWhiteSpace([string]$restoreReceiptProfile[$field])) {
+                        $candidateProfilePath = [IO.Path]::GetFullPath([string]$restoreReceiptProfile[$field])
+                        if ((Test-Path -LiteralPath $candidateProfilePath -PathType Leaf) -and (Get-HashOrNull $candidateProfilePath) -eq [string]$restoreReceiptProfile['profileSha256']) {
+                            $NullProfilePath = $candidateProfilePath
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (-not (Test-Path -LiteralPath $NullProfilePath -PathType Leaf)) {
-        throw "Null-HMD profile does not exist: $NullProfilePath"
+        throw "Null-HMD profile does not exist and no receipt-bound evidence copy is available: $NullProfilePath"
     }
     $settings = Read-JsonHashtable -Path $SettingsPath
     $profile = Read-JsonHashtable -Path $NullProfilePath
@@ -1108,15 +1153,33 @@ try {
                 $startedUtc = [DateTime]::UtcNow
                 $launcher = Start-Process -FilePath $startupPath -WindowStyle Hidden -PassThru
                 $deadline = $startedUtc.AddSeconds($StartupTimeoutSeconds)
+                $logReadReserveMilliseconds = [int][Math]::Min(2000, [Math]::Max(500, $StartupTimeoutSeconds * 50))
+                $qualificationDeadline = $deadline.AddMilliseconds(-$logReadReserveMilliseconds)
+                $runtimeProbeAttempts = 0
+                $lastRuntimeProbeError = $null
                 do {
-                    Start-Sleep -Milliseconds 250
+                    $remainingBeforeProbeMilliseconds = [long]($qualificationDeadline - [DateTime]::UtcNow).TotalMilliseconds
+                    if ($remainingBeforeProbeMilliseconds -le 0) { break }
+                    Start-Sleep -Milliseconds ([int][Math]::Min(250, $remainingBeforeProbeMilliseconds))
+                    if ([DateTime]::UtcNow -ge $qualificationDeadline) { break }
                     $processes = @(Get-SteamVRProcesses)
-                    $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline
-                } while ((-not $runtime.active -or -not $runtime.headPoseReady) -and [DateTime]::UtcNow -lt $deadline)
-                if ($runtime.active -and $runtime.headPoseReady -and [DateTime]::UtcNow.AddMilliseconds(2250) -lt $deadline) {
+                    try {
+                        $runtimeProbeAttempts++
+                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline
+                    }
+                    catch [TimeoutException] {
+                        $lastRuntimeProbeError = $_.Exception.Message
+                        break
+                    }
+                } while (-not $runtime.active -or -not $runtime.headPoseReady)
+                if ($runtime.active -and $runtime.headPoseReady -and [DateTime]::UtcNow.AddMilliseconds(2250) -lt $qualificationDeadline) {
                     Start-Sleep -Seconds 2
                     $processes = @(Get-SteamVRProcesses)
-                    $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline
+                    try {
+                        $runtimeProbeAttempts++
+                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline
+                    }
+                    catch [TimeoutException] { $lastRuntimeProbeError = $_.Exception.Message }
                 }
                 $runtimeReceiptPath = Join-Path $EvidenceDirectory 'steamvr-null-runtime.receipt.json'
                 $runtimeReceipt = [ordered]@{
@@ -1126,6 +1189,11 @@ try {
                     startupPath = $startupPath
                     runtimeActive = [bool]$runtime.active
                     runtime = $runtime
+                    startupDeadlineUtc = $deadline.ToString('o')
+                    qualificationDeadlineUtc = $qualificationDeadline.ToString('o')
+                    logReadReserveMilliseconds = $logReadReserveMilliseconds
+                    runtimeProbeAttempts = $runtimeProbeAttempts
+                    lastRuntimeProbeError = $lastRuntimeProbeError
                     externalDrivers = $externalDrivers
                     externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector
                     externalDriverIsolationValidation = $isolationValidation
@@ -1256,6 +1324,9 @@ try {
                     $afterSettings = Read-JsonHashtable -Path $SettingsPath
                     $afterEffective = Get-EffectiveState -Settings $afterSettings -Profile $profile
                     if (-not $afterEffective.active) { throw 'The written settings do not match the null-HMD profile.' }
+                    $profileSha256 = Get-HashOrNull $NullProfilePath
+                    $profileEvidencePath = Join-Path $EvidenceDirectory 'steamvr-null.profile.applied.json'
+                    Copy-FileAtomicVerified -Source $NullProfilePath -Destination $profileEvidencePath -ExpectedSha256 $profileSha256
                     $receipt = [ordered]@{
                         schemaVersion = 2
                         operation = 'apply'
@@ -1269,8 +1340,10 @@ try {
                         settingsSha256Null = Get-HashOrNull $SettingsPath
                         settingsSemanticSha256Before = Get-JsonSemanticSha256 -Path $backupPath
                         settingsSemanticSha256Null = Get-JsonSemanticSha256 -Path $SettingsPath
-                        profilePath = $NullProfilePath
-                        profileSha256 = Get-HashOrNull $NullProfilePath
+                        profilePath = $profileEvidencePath
+                        profileEvidencePath = $profileEvidencePath
+                        sourceProfilePath = $NullProfilePath
+                        profileSha256 = $profileSha256
                         externalDriverIsolation = [ordered]@{
                             enabled = [bool]$IsolateExternalDisplayRedirectors
                             openVRPathsPath = if ($IsolateExternalDisplayRedirectors) { [IO.Path]::GetFullPath($OpenVRPathsPath) } else { $null }
