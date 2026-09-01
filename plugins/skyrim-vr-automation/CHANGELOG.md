@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Reopen the same retained MO2 session and exact profile when its owner exits
+  after `stop-game`, while continuing to reject unrelated or ambiguous MO2
+  processes.
 - Reconcile mixed post-reboot null-HMD target states: exact pre-apply files are
   treated as already restored, restore changes only targets that remain
   applied, and apply can transactionally re-isolate an exact restored OpenVR

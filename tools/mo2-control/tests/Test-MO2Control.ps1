@@ -40,6 +40,23 @@ $retentionFixture = & $mo2Module {
 }
 Assert-MO2Test (-not $retentionFixture.stable -and $retentionFixture.samples.Count -eq 2 -and -not $retentionFixture.samples[-1].ownerPresent) 'MO2 retention stability detects an owner that exits immediately after game shutdown'
 
+$lateExitDisposition = & $mo2Module {
+    Get-MO2LaunchResumeDisposition -SessionStatus 'game-stopped' -GameProcesses @() -MO2Processes @() -OwnerPid 4123
+}
+Assert-MO2Test ($lateExitDisposition.ok -and $lateExitDisposition.mode -eq 'reopen-exact-session' -and $lateExitDisposition.reason -eq 'retained-owner-exited') 'launch reopens the exact retained session when its MO2 owner exits after stop-game'
+$detectedExitDisposition = & $mo2Module {
+    Get-MO2LaunchResumeDisposition -SessionStatus 'mo2-exited-after-game-stop' -GameProcesses @() -MO2Processes @() -OwnerPid 4123
+}
+Assert-MO2Test ($detectedExitDisposition.ok -and $detectedExitDisposition.mode -eq 'reopen-exact-session') 'launch reopens an exact session when stop-game observed its MO2 owner exit'
+$retainedDisposition = & $mo2Module {
+    Get-MO2LaunchResumeDisposition -SessionStatus 'game-stopped' -GameProcesses @() -MO2Processes @([pscustomobject]@{ id = 4123 }) -OwnerPid 4123
+}
+Assert-MO2Test ($retainedDisposition.ok -and $retainedDisposition.mode -eq 'retained-owner') 'launch reuses the exact retained MO2 owner when it remains present'
+$ambiguousDisposition = & $mo2Module {
+    Get-MO2LaunchResumeDisposition -SessionStatus 'game-stopped' -GameProcesses @() -MO2Processes @([pscustomobject]@{ id = 9001 }) -OwnerPid 4123
+}
+Assert-MO2Test (-not $ambiguousDisposition.ok -and $ambiguousDisposition.reason -eq 'ambiguous-mo2-owner') 'launch refuses to adopt an unrelated MO2 process during exact-session resume'
+
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('mo2-control-test-' + [guid]::NewGuid().ToString('N'))
 try {
     $mo2Root = Join-Path $fixture 'MO2'
