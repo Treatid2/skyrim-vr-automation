@@ -105,6 +105,7 @@ try {
 
     $sourceText = [IO.File]::ReadAllText($entry)
     Assert-Test ($sourceText -notmatch '\.ReadToEnd\(' -and $sourceText -match 'LogTailMaxBytes') 'SteamVR readiness polling uses a bounded byte tail instead of whole-log reads'
+    Assert-Test ($sourceText -match '\$providerLogReady -and \[bool\]\$headPoseState\.qualified' -and $sourceText -match '\$applicationHeadPose = if \(\$providerLogReady') 'application-facing pose probing waits for retained null-driver and provider log proof'
 
     $stop = & $entry stop -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json
     Assert-Test ($stop.ok -and $stop.state -eq 'already-stopped') 'stop recognizes an already closed SteamVR state'

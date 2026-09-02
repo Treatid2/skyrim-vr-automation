@@ -965,7 +965,8 @@ function Get-NullRuntimeEvidence {
         }
     }
     $headPoseState = Get-HeadPoseSharedState -Contract $Profile['headPoseProviderContract']
-    $applicationHeadPose = if ($server.Count -eq 1 -and [bool]$headPoseState.qualified) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider is not ready for an application-facing pose probe.' } }
+    $providerLogReady = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active -and $null -ne $headPoseLoaded -and $null -ne $headPoseRegistered
+    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider is not ready for an application-facing pose probe.' } }
     return [pscustomobject][ordered]@{
         active = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active
         serverProcess = if ($server.Count -eq 1) { $server[0] } else { $null }
@@ -979,7 +980,7 @@ function Get-NullRuntimeEvidence {
         headPoseDeviceRegistered = $headPoseRegistered
         headPoseState = $headPoseState
         applicationHeadPose = $applicationHeadPose
-        headPoseReady = $server.Count -eq 1 -and $null -ne $headPoseLoaded -and $null -ne $headPoseRegistered -and [bool]$headPoseState.qualified -and [bool]$applicationHeadPose.qualified
+        headPoseReady = $providerLogReady -and [bool]$headPoseState.qualified -and [bool]$applicationHeadPose.qualified
         dashboardProcesses = @($owned | Where-Object name -eq 'vrdashboard')
         dashboardSuppressed = $Profile['dashboard'].ContainsKey('enableDashboard') -and -not [bool]$Profile['dashboard']['enableDashboard']
     }
