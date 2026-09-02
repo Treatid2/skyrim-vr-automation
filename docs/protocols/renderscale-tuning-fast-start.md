@@ -278,6 +278,13 @@ after the reset's strict waiter is satisfied and safe. Device loss, OOM, lost
 scene/ownership/build or transport, missing terminal evidence, or a
 rejected/unstable reset stops future mutations.
 
+That stop is terminal for the current attempt. A variant protocol may permit a
+separate replacement attempt only after the runner returns, retained cleanup is
+complete, and the user explicitly authorizes replay after a named obstruction
+is cleared. Such a replacement must repeat normal admission with a fresh run
+ID and must not splice evidence from the interrupted attempt. Without that
+variant-specific authorization, do not replay.
+
 Start the next row's one synchronous scenario immediately. Its first step is
 the sole server-owned `wait` of exactly 5,000 ms, followed by that row's
 preconstructed begin/dispatch/apply/wait sequence. Use the preceding terminal

@@ -554,6 +554,20 @@ foreach ($token in @(
 )) {
     Assert-Contains $nvidiaProtocol $token 'NVIDIA adversarial guard'
 }
+$nvidiaSkill = Get-Content -LiteralPath (Join-Path $repositoryRoot `
+    'skills\renderscale-tuning-nvidia\SKILL.md') -Raw
+foreach ($token in @(
+    'Explicit failed-recovery replay',
+    '`transition_recovery_failed`',
+    'close only the identified stale non-HUD menu',
+    'complete NVIDIA assay with a fresh run ID',
+    'at most one replacement attempt'
+)) {
+    Assert-Contains "$nvidiaSkill`n$nvidiaProtocol" $token 'NVIDIA operator replay guard'
+}
+Assert-Contains $fastStart `
+    'A variant protocol may permit a separate replacement attempt' `
+    'Shared operator replay boundary'
 
 $amd = Get-Content -LiteralPath (Join-Path $repositoryRoot 'skills\renderscale-tuning-amd\references\matrix.v1.json') -Raw | ConvertFrom-Json -Depth 30
 Assert-True ($amd.adapterVendor -eq 'amd') 'AMD matrix vendor is wrong.'

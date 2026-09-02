@@ -45,7 +45,10 @@ profile. Use the render-scale iteration action only for that recovery, qualify
 the reset strictly under a fresh owner, do not retry the failed destination,
 and continue with the next row only after the reset is safe and stable. Device
 loss, OOM, lost scene/ownership/transport, or failed recovery stops future
-mutations and triggers ownership-guarded cleanup. After pass 1,
+mutations in the current attempt and triggers ownership-guarded cleanup. After
+the cell returns, only the NVIDIA protocol's explicit failed-recovery replay
+may authorize a fresh, fully re-admitted replacement attempt; never resume the
+interrupted cell or reuse its run ID. After pass 1,
 finalize its owned sessions, take the memory boundary, run the one server-owned
 10,000 ms cooldown, establish the fresh pass-2 baseline and owners, and repeat
 the unchanged matrix.

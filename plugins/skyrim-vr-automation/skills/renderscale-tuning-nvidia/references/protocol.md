@@ -293,7 +293,27 @@ can supersede the stuck public request. The reset is not a measured row and
 does not retry or revise the failed destination. Continue only after its strict
 waiter is satisfied and safe. Device loss, OOM, lost scene/ownership/build or
 transport, missing terminal evidence, or a rejected/unstable reset stops the
-run.
+current attempt.
+
+### Operator-authorized replay after failed recovery
+
+`transition_recovery_failed` is terminal for its current attempt, but it is
+not a permanent replay prohibition. After the current attempt has retained its
+failure and completed ownership-guarded cleanup, an explicit user directive to
+close an identified stale in-game window or menu and continue authorizes one
+replacement attempt. Inspect the menu list, close only the named stale non-HUD
+menu, and inspect again. Do not broadly dismiss menus or kill Skyrim.
+
+Before the replacement's first apply, require the stale menu to be absent, no
+active operation or qualification owner, no unresolved physical mutation, and
+the exact PID, Build ID, and Dragonsreach scene to be re-established with
+direct read-only DevBench inspection. Then repeat the normal admission path.
+Preserve the interrupted run ID and all of its evidence. Start the full
+two-pass NVIDIA assay from Immediate positioning with a fresh run ID; never
+splice completed or failed rows from the interrupted attempt into the
+replacement evidence. This is one deliberate operator-authorized replay, not
+automatic recovery. A generic retry request, failed cleanup, device loss, OOM,
+lost identity, or unavailable terminal evidence does not authorize it.
 
 A completed transition-level physical-contract, presentation, lifecycle, or
 both-eye fidelity mismatch makes that row `FAIL`; it does not by itself make
@@ -309,8 +329,10 @@ Preserve the terminal receipt first on every stop path. While direct control
 remains callable, finalize immediately: stop only task-owned trace, profiler,
 and telemetry sessions with their exact returned guards and verify them
 inactive. A cleanup failure is a separately recorded anomaly and never
-authorizes another apply, retry, recovery, or substitution. When transport is
-genuinely unavailable, retain the guards and ask the user before later cleanup.
+authorizes another apply, retry, recovery, or substitution. The explicit replay
+above requires successful cleanup and therefore does not override this rule.
+When transport is genuinely unavailable, retain the guards and ask the user
+before later cleanup.
 
 Every entry has exactly one begin, one dispatch, one apply, and one terminal
 qualification receipt from the same strict waiter for every destination. The
