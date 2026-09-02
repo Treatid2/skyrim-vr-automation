@@ -651,6 +651,8 @@ function Assert-SteamVRJournalTargets {
     )
     $settingsFull = [IO.Path]::GetFullPath($ExpectedSettingsPath)
     $openVRFull = [IO.Path]::GetFullPath($ExpectedOpenVRPathsPath)
+    $operation = if (Test-JsonDictionaryContains $Journal 'operation') { [string]$Journal['operation'] } else { '' }
+    $isLegacyApplyReconcile = [string]::Equals($operation, 'apply-reconcile', [StringComparison]::Ordinal)
     if (-not (Test-JsonDictionaryContains $Journal 'settingsPath') -or -not [string]::Equals([IO.Path]::GetFullPath([string]$Journal['settingsPath']), $settingsFull, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'The authoritative SteamVR journal settings target does not match its target-owned control directory.'
     }
@@ -666,7 +668,12 @@ function Assert-SteamVRJournalTargets {
         if ($path.ToLowerInvariant() -notin $allowed) { throw "The authoritative SteamVR journal contains an out-of-contract rollback target: $path" }
         if (-not $seen.Add($path)) { throw "The authoritative SteamVR journal repeats a rollback target: $path" }
     }
-    if (-not $seen.Contains($settingsFull)) { throw 'The authoritative SteamVR journal does not contain the SteamVR settings rollback target.' }
+    if ($isLegacyApplyReconcile) {
+        if (-not $seen.Contains($openVRFull)) { throw 'The authoritative legacy apply-reconcile journal does not contain the OpenVR registrations rollback target.' }
+    }
+    elseif (-not $seen.Contains($settingsFull)) {
+        throw 'The authoritative SteamVR journal does not contain the SteamVR settings rollback target.'
+    }
 }
 
 function Stop-ExactStartedSteamVRProcesses([DateTime]$StartedUtc) {

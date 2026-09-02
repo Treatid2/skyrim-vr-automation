@@ -234,6 +234,24 @@ try {
     Assert-Test (-not $failedApply.ok -and $failedApply.errors[0] -match 'every exact backup was restored') 'two-file apply failure reports verified rollback to the original state'
     Assert-Test ([IO.File]::ReadAllText($settingsPath) -ceq $originalText -and [IO.File]::ReadAllText($openVrPathsPath) -ceq $openVrTextBeforeIsolation) 'two-file apply failure leaves neither target partially mutated'
 
+    $legacyReconcileBackup = Join-Path $failureEvidence 'openvrpaths.vrpath.reconcile.before'
+    Copy-Item -LiteralPath $openVrPathsPath -Destination $legacyReconcileBackup
+    $legacyReconcile = [ordered]@{
+        contractVersion = '1.0.0'; operation = 'apply-reconcile'; transactionId = [guid]::NewGuid().ToString('N'); phase = 'committed'
+        settingsPath = [IO.Path]::GetFullPath($settingsPath); openVRPathsPath = [IO.Path]::GetFullPath($openVrPathsPath)
+        evidenceDirectory = [IO.Path]::GetFullPath($failureEvidence); evidenceJournalPath = [IO.Path]::GetFullPath((Join-Path $failureEvidence 'steamvr-null-apply-reconcile.journal.json'))
+        rollbackTargets = @([ordered]@{ name = 'openvr-registrations'; path = [IO.Path]::GetFullPath($openVrPathsPath); backupPath = [IO.Path]::GetFullPath($legacyReconcileBackup); expectedHash = (Get-FileHash -LiteralPath $legacyReconcileBackup -Algorithm SHA256).Hash })
+        preparedUtc = [DateTime]::UtcNow.ToString('o'); rollback = $null; committedUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    $legacyReconcile | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath ([string]$inspectBefore.data.targetControl.journalPath) -Encoding utf8
+    $legacyReconcileInspect = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($legacyReconcileInspect.ok -and $legacyReconcileInspect.data.recoveredTransaction.operation -eq 'apply-reconcile') 'inspect accepts a committed legacy apply-reconcile journal whose sole rollback target is OpenVR registrations'
+
+    $legacyReconcile['rollbackTargets'] = @()
+    $legacyReconcile | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath ([string]$inspectBefore.data.targetControl.journalPath) -Encoding utf8
+    $invalidLegacyReconcile = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $invalidLegacyReconcile.ok -and $invalidLegacyReconcile.errors[0] -match 'OpenVR registrations rollback target') 'legacy apply-reconcile compatibility still requires its exact OpenVR rollback target'
+
     $recoveryEvidenceA = Join-Path $fixture 'recovery-evidence-a'
     $recoveryEvidenceB = Join-Path $fixture 'recovery-evidence-b'
     New-Item -ItemType Directory -Path $recoveryEvidenceA, $recoveryEvidenceB | Out-Null
