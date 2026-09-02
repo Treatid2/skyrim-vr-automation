@@ -104,7 +104,7 @@ try {
     finally { $heldLock.Dispose() }
 
     $sourceText = [IO.File]::ReadAllText($entry)
-    Assert-Test ($sourceText -notmatch '\.ReadToEnd\(' -and $sourceText -match 'LogTailMaxBytes') 'SteamVR readiness polling uses a bounded byte tail instead of whole-log reads'
+    Assert-Test ($sourceText -notmatch '\.ReadToEnd\(' -and $sourceText -notmatch '-split\s+"`r\?`n",\s*-1' -and $sourceText -match 'LogTailMaxBytes' -and $sourceText -match '-FreshSnapshot') 'SteamVR readiness polling uses a fresh bounded and correctly split text tail'
     Assert-Test ($sourceText -match '\$providerLogReady -and \[bool\]\$headPoseState\.qualified' -and $sourceText -match '\$applicationHeadPose = if \(\$providerLogReady') 'application-facing pose probing waits for retained null-driver and provider log proof'
 
     $stop = & $entry stop -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json

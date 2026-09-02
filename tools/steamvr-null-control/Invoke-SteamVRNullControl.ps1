@@ -145,7 +145,8 @@ function Get-SharedTextTail {
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][ValidateRange(1, 10000)][int]$Count,
         [Parameter(Mandatory)][ValidateRange(4096, 4194304)][int]$MaxBytes,
-        [DateTime]$DeadlineUtc = [DateTime]::MaxValue
+        [DateTime]$DeadlineUtc = [DateTime]::MaxValue,
+        [switch]$FreshSnapshot
     )
     if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before opening the log.') }
     $stream = $null
@@ -154,7 +155,7 @@ function Get-SharedTextTail {
         $capturedLength = $stream.Length
         $info = [IO.FileInfo]::new([IO.Path]::GetFullPath($Path))
         $identity = "$($info.FullName.ToLowerInvariant())|$($info.CreationTimeUtc.Ticks)"
-        $prior = if ($script:SharedTextTailState.ContainsKey($identity)) { $script:SharedTextTailState[$identity] } else { $null }
+        $prior = if (-not $FreshSnapshot -and $script:SharedTextTailState.ContainsKey($identity)) { $script:SharedTextTailState[$identity] } else { $null }
         $incremental = $null -ne $prior -and [int64]$prior.offset -le $capturedLength
         $start = if ($incremental) { [int64]$prior.offset } else { [Math]::Max([int64]0, $capturedLength - $MaxBytes) }
         if (($capturedLength - $start) -gt $MaxBytes) {
@@ -178,7 +179,7 @@ function Get-SharedTextTail {
         }
         $prefix = if ($incremental) { [string]$prior.residual } else { '' }
         $combined = $prefix + $text
-        $parts = @($combined -split "`r?`n", -1)
+        $parts = @($combined -split "`r?`n")
         $residual = if ($combined.EndsWith("`n", [StringComparison]::Ordinal)) { '' } else { [string]$parts[-1] }
         $completed = if ($residual.Length -gt 0 -and $parts.Count -gt 1) { @($parts[0..($parts.Count - 2)]) } elseif ($residual.Length -gt 0) { @() } else { @($parts | Select-Object -SkipLast 1) }
         $lines = @($(if ($incremental) { @($prior.lines) }) + $completed)
@@ -945,7 +946,7 @@ function Get-NullRuntimeEvidence {
     $headPoseRegistered = $null
     $tail = @()
     if ($serverStartUtc -and (Test-Path -LiteralPath $ServerLogPath -PathType Leaf)) {
-        $tail = @(Get-SharedTextTail -Path $ServerLogPath -Count 2000 -MaxBytes $LogTailMaxBytes -DeadlineUtc $DeadlineUtc)
+        $tail = @(Get-SharedTextTail -Path $ServerLogPath -Count 2000 -MaxBytes $LogTailMaxBytes -DeadlineUtc $DeadlineUtc -FreshSnapshot)
         $minimumUtc = $serverStartUtc.AddSeconds(-3)
         foreach ($line in $tail) {
             $timestampUtc = Get-LogTimestampUtc -Line $line
