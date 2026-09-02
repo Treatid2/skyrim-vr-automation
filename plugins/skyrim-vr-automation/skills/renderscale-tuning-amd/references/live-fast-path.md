@@ -4,8 +4,9 @@
 cell. This file is its post-run audit contract; it is not read or translated
 during live measurement.
 
-Select runnable lanes from the decoded positioning capabilities and use the
-decoded positioning snapshot as the first baseline boundary. For each runnable
+Decode the admitted positioning receipt inside the runner, select runnable
+lanes from its capabilities, and use its snapshot as the first baseline
+boundary. For each runnable
 lane, build the runtime-only FSR Hoshipa target from the effective profile
 names, preserving `dlssProfile`, with the lane's configured FSR runtime. Use
 the complete public apply target, but omit dormant `dlssProfile` from the

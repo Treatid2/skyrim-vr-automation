@@ -34,17 +34,21 @@ function publicProfile(method = "dlss", qualityMode = "native_aa", renderScaleMo
     };
 }
 
-function initialBoundary() {
-    const profile = publicProfile();
+function positioningRoot(capabilities = {}, flatSnapshot = false) {
+    const snapshot = { stateRevision: 1 };
+    if (flatSnapshot) snapshot.effective = publicProfile();
+    else snapshot.profiles = { effective: publicProfile() };
     return {
-        revision: 1,
-        profile: {
-            method: profile.method.name,
-            qualityMode: profile.qualityMode.name,
-            renderScaleMode: profile.renderScaleMode,
-            dlssProfile: profile.dlssProfile.name,
-            fsrRuntime: profile.fsrRuntime.name,
-        },
+        results: [
+            {
+                label: "position-capabilities",
+                result: { capabilities },
+            },
+            {
+                label: "position-snapshot",
+                result: { snapshot },
+            },
+        ],
     };
 }
 
@@ -492,8 +496,7 @@ async function testNvidia() {
         variant: "nvidia",
         runId: "nvidia-test",
         buildId,
-        initialBoundary: initialBoundary(),
-        capabilities: {},
+        positioningRoot: positioningRoot(),
         matrix,
     });
     assert(result.ok === true && result.status === "COMPLETE", "NVIDIA mock run did not complete.");
@@ -573,11 +576,10 @@ async function testAmd() {
         variant: "amd",
         runId: "amd-test",
         buildId,
-        initialBoundary: initialBoundary(),
-        capabilities: {
+        positioningRoot: positioningRoot({
             supportedFSRRuntimeMask: 1,
             fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }],
-        },
+        }),
         matrix,
     });
     assert(result.ok === true && result.status === "COMPLETE", "AMD mock run did not complete.");
@@ -643,8 +645,7 @@ async function testScenarioFailureRetention() {
         variant: "nvidia",
         runId: "scenario-failure",
         buildId,
-        initialBoundary: initialBoundary(),
-        capabilities: {},
+        positioningRoot: positioningRoot(),
         matrix,
     });
     assert(result.ok === false && result.status === "INTERRUPTED",
@@ -697,8 +698,7 @@ async function testInformationalReasonIsNotFailure() {
         variant: "nvidia",
         runId: "informational-reason",
         buildId,
-        initialBoundary: initialBoundary(),
-        capabilities: {},
+        positioningRoot: positioningRoot(),
         matrix,
     });
     assert(result.ok === true && result.status === "COMPLETE",
@@ -746,8 +746,7 @@ async function testFlatTerminalBoundary() {
             variant: spec.variant,
             runId: `${spec.variant}-flat-terminal-boundary`,
             buildId,
-            initialBoundary: initialBoundary(),
-            capabilities: spec.capabilities,
+            positioningRoot: positioningRoot(spec.capabilities, true),
             matrix,
         });
         assert(result.ok === true && result.status === "COMPLETE",
@@ -769,8 +768,7 @@ async function testOptionalTerminalFacts() {
         variant: "nvidia",
         runId: "optional-terminal-facts",
         buildId,
-        initialBoundary: initialBoundary(),
-        capabilities: {},
+        positioningRoot: positioningRoot(),
         matrix,
     });
     assert(omittedResult.ok === true && omittedResult.status === "COMPLETE",
@@ -785,8 +783,7 @@ async function testOptionalTerminalFacts() {
         variant: "nvidia",
         runId: "explicit-terminal-failure",
         buildId,
-        initialBoundary: initialBoundary(),
-        capabilities: {},
+        positioningRoot: positioningRoot(),
         matrix,
     });
     assert(failedResult.ok === false && failedResult.status === "INTERRUPTED" &&
@@ -813,8 +810,7 @@ async function testSafeUnstableBaselineContinues() {
         variant: "nvidia",
         runId: "safe-unstable-baseline",
         buildId,
-        initialBoundary: initialBoundary(),
-        capabilities: {},
+        positioningRoot: positioningRoot(),
         matrix,
     });
     assert(result.ok === true && result.status === "COMPLETE" &&
@@ -841,8 +837,7 @@ async function runNvidiaProjectionTransform(receiptTransform) {
         variant: "nvidia",
         runId: `projection-${Date.now()}`,
         buildId,
-        initialBoundary: initialBoundary(),
-        capabilities: {},
+        positioningRoot: positioningRoot(),
         matrix,
     });
     assert(result.ok === true, "Projection test run did not complete.");

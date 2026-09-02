@@ -86,7 +86,7 @@ foreach ($token in @(
     'async function runRenderScaleTuningLive',
     'mcp__devbench_vr__scenario',
     'mcp__devbench_vr__communityshaders_renderscale',
-    'initialBoundary', 'capabilities',
+    'positioningRoot', 'positioningInputs', 'capabilities',
     'waiter.upscalingSnapshot', 'snapshot.effective',
     'snapshot.profiles && snapshot.profiles.effective',
     'enumName(profile.method)', 'enumName(profile.qualityMode, qualityName)',
@@ -113,8 +113,7 @@ foreach ($token in @(
 foreach ($forbidden in @(
     'Get-ChildItem', 'Invoke-RestMethod', '127.0.0.1',
     'mcp__devbench_vr__communityshaders_upscaling_api',
-    'sourceDescribe', 'artifactSha256', 'positionBoundary',
-    'position-snapshot'
+    'sourceDescribe', 'artifactSha256', 'positionBoundary'
 )) {
     Assert-True (-not $runner.Contains($forbidden, [StringComparison]::Ordinal)) "Deterministic tuning runner adds an unnecessary live gate: $forbidden"
 }
@@ -349,8 +348,10 @@ foreach ($variant in $variants) {
     Assert-Contains $skill 'tools/renderscale-tuning-live/runner.js' $variant.Name
     Assert-Contains $skill 'The runner is the executable live contract' $variant.Name
     Assert-Contains $skill 'Do not translate the matrix' $variant.Name
-    Assert-Contains $skill 'initialBoundary' $variant.Name
-    Assert-Contains $skill 'capabilities' $variant.Name
+    Assert-Contains $skill 'positioningRoot' $variant.Name
+    Assert-True (-not $skill.Contains('const initialSnapshot', [StringComparison]::Ordinal)) "$($variant.Name) still decodes the positioning snapshot in the client."
+    Assert-True (-not $skill.Contains('const initialBoundary', [StringComparison]::Ordinal)) "$($variant.Name) still constructs a client-side boundary."
+    Assert-True (-not $skill.Contains('const capabilities = positioningResults', [StringComparison]::Ordinal)) "$($variant.Name) still inspects capability shape in the client."
     Assert-Contains $skill 'qualification-wait.upscalingSnapshot' $variant.Name
     Assert-Contains $live '`tools/renderscale-tuning-live/runner.js` executes this path' $variant.Name
     Assert-Contains $live 'not read or translated during live measurement' $variant.Name

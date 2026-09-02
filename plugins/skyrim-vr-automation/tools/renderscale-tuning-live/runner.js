@@ -5,7 +5,7 @@ async function runRenderScaleTuningLive(context) {
 
     const {
         tools, store, notify, variant, runId, buildId,
-        initialBoundary, capabilities, matrix,
+        positioningRoot, matrix,
     } = context;
     const scenarioTool = tools.mcp__devbench_vr__scenario;
     const renderScaleTool = tools.mcp__devbench_vr__communityshaders_renderscale;
@@ -143,6 +143,31 @@ async function runRenderScaleTuningLive(context) {
             },
         };
     }
+
+    // Keep positioning receipt decoding inside the runner so callers cannot
+    // introduce additional admission rules or depend on one snapshot shape.
+    function positioningInputs(root) {
+        const results = resultMap(root);
+        const snapshotResult = results.get("position-snapshot");
+        const capabilitiesResult = results.get("position-capabilities");
+        if (!snapshotResult || !snapshotResult.snapshot) {
+            throw new Error("positioning_snapshot_missing");
+        }
+        if (variant === "amd" &&
+            (!capabilitiesResult || !capabilitiesResult.capabilities)) {
+            throw new Error("positioning_capabilities_missing");
+        }
+        return {
+            boundary: terminalBoundary({
+                upscalingSnapshot: snapshotResult.snapshot,
+            }),
+            capabilities: capabilitiesResult &&
+                capabilitiesResult.capabilities || {},
+        };
+    }
+
+    const positioning = positioningInputs(positioningRoot);
+    const capabilities = positioning.capabilities;
 
     function targetFor(boundary, destination, fsrRuntime) {
         return {
@@ -1218,7 +1243,7 @@ async function runRenderScaleTuningLive(context) {
         }));
     }
 
-    let boundary = initialBoundary;
+    let boundary = positioning.boundary;
     const summary = { ok: true, status: "COMPLETE", variant, runId, lanes: [] };
     let passSequence = 0;
     const selectedLanes = lanes();

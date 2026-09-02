@@ -24,5 +24,8 @@
   or a concrete safety issue or enhancement is discovered, submit it through
   `tools/feedback-control/Invoke-AutomationFeedback.ps1`. Claim that feedback
   was recorded only when the controller returns a durable `AUTO-...` receipt.
+  When an in-scope safe fix is available, implement and validate it before
+  resolving or amending feedback; record feedback first only when evidence
+  would otherwise be lost or the implementation is blocked.
   Tasks report desires; they do not publish issues or edit automation source
   unless that work is explicitly in scope.

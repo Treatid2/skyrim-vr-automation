@@ -67,10 +67,11 @@ Do not end the positioning `functions.exec` after its compact `notify()`. In
 that same cell, load `tools/renderscale-tuning-live/runner.js` and
 `skills/renderscale-tuning-nvidia/references/matrix.v1.json` from the current
 plugin root with one parallel local read. Evaluate the runner source as
-`runRenderScaleTuningLive` and await it with the initial boundary and
-capabilities already extracted while admitting positioning, `variant:
-"nvidia"`, the bound Build ID, the parsed matrix, a short run-unique ID, and
-the cell's `tools`, `store`, and `notify` functions. Do not validate them again.
+`runRenderScaleTuningLive` and await it with the already-admitted
+`positioningRoot` unchanged, `variant: "nvidia"`, the bound Build ID, the
+parsed matrix, a short run-unique ID, and the cell's `tools`, `store`, and
+`notify` functions. Do not extract, normalize, or validate positioning fields
+in the client.
 Use this loader shape, substituting only the current plugin root and the local
 positioning/build variables:
 
@@ -80,12 +81,7 @@ const support = await Promise.all([
   tools.exec_command({cmd:"Get-Content -Raw -LiteralPath 'skills\\renderscale-tuning-nvidia\\references\\matrix.v1.json'",workdir:"<plugin-root>",shell:"powershell",login:false})
 ]);
 const runLive = new Function(`${support[0].output}\nreturn runRenderScaleTuningLive;`)();
-const positioningResults = new Map(positioningRoot.results.filter(entry => entry.label).map(entry => [entry.label, entry.result]));
-const initialSnapshot = positioningResults.get("position-snapshot").snapshot;
-const initialProfile = initialSnapshot.profiles.effective;
-const initialBoundary = {revision:initialSnapshot.stateRevision,profile:{method:initialProfile.method.name,qualityMode:initialProfile.qualityMode.name,renderScaleMode:initialProfile.renderScaleMode,dlssProfile:initialProfile.dlssProfile.name,fsrRuntime:initialProfile.fsrRuntime.name}};
-const capabilities = positioningResults.get("position-capabilities").capabilities;
-const liveResult = await runLive({tools,store,notify,variant:"nvidia",runId:`nvidia-${Date.now().toString(36)}`,buildId,initialBoundary,capabilities,matrix:JSON.parse(support[1].output)});
+const liveResult = await runLive({tools,store,notify,variant:"nvidia",runId:`nvidia-${Date.now().toString(36)}`,buildId,positioningRoot,matrix:JSON.parse(support[1].output)});
 text(JSON.stringify(liveResult));
 ```
 
@@ -95,7 +91,7 @@ note, including its presentation disposition and eye paths, and advances only
 when the current operation, qualification owner, and physical mutation are
 closed. Do not translate the matrix or
 live-path prose into another cell, normalize receipt shapes, or add client
-checks. It accepts the already-decoded positioning boundary and reads each
+checks. It decodes the already-admitted positioning receipt and reads each
 later boundary only at `qualification-wait.upscalingSnapshot`. DevBench owns
 admission, timing, strict qualification, and fail-closed scenario execution. Read the
 [live-path audit](references/live-fast-path.md), detailed contract, and NVIDIA

@@ -4,7 +4,8 @@
 cell. This file is its post-run audit contract; it is not read or translated
 during live measurement.
 
-Use the decoded positioning snapshot as the baseline boundary. Build the
+Decode the admitted positioning receipt inside the runner and use its snapshot
+as the baseline boundary. Build the
 runtime-only DLSS Hoshipa target from its effective profile names, preserving
 `dlssProfile`, and set dormant `fsrRuntime: fsr3` in the public apply target.
 The strict DLSS waiter target includes `dlssProfile` but omits dormant
