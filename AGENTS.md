@@ -3,7 +3,8 @@
 - Treat `dev` as the sole integration line for ongoing automation work. A
   temporary worktree branch is not complete until its commits are integrated
   into `dev`; update `main` only through a `dev`-to-`main` pull request, and
-  keep local `main` aligned with the latest merged `origin/main`.
+  keep local `main` aligned with the latest merged `origin/main`. Open or merge
+  that pull request only when the user explicitly instructs it.
 - Treat every game, MO2, SteamVR, profile, and cache mutation as an attributable
   transaction. Inspect first and preserve its result with the test record.
 - Never silently fall back to a different MO2 profile, executable, runtime,
