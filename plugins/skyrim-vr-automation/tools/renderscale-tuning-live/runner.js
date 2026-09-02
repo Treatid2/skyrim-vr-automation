@@ -35,6 +35,8 @@ async function runRenderScaleTuningLive(context) {
         performance: 5,
         ultra_performance: 6,
     });
+    const qualityName = Object.freeze(Object.fromEntries(
+        Object.entries(quality).map(([name, value]) => [value, name])));
     const foveation = Object.freeze({
         foveatedVendorDispatch: true,
         foveatedCenterArea: 0.3,
@@ -121,18 +123,23 @@ async function runRenderScaleTuningLive(context) {
         return resultMap(root);
     }
 
-    // Qualification snapshots retain the public API's named enum wrappers.
+    // Qualification producers have used flat profiles and wrapped public
+    // snapshots. Decode either shape without changing the measured sequence.
     function terminalBoundary(waiter) {
         const snapshot = waiter.upscalingSnapshot;
-        const profile = snapshot.profiles.effective;
+        const profile = snapshot.effective ||
+            (snapshot.profiles && snapshot.profiles.effective);
+        const enumName = (value, names = null) =>
+            value && typeof value === "object" ? value.name :
+                names && Number.isSafeInteger(value) ? names[value] : value;
         return {
             revision: snapshot.stateRevision,
             profile: {
-                method: profile.method.name,
-                qualityMode: profile.qualityMode.name,
+                method: enumName(profile.method),
+                qualityMode: enumName(profile.qualityMode, qualityName),
                 renderScaleMode: profile.renderScaleMode,
-                dlssProfile: profile.dlssProfile.name,
-                fsrRuntime: profile.fsrRuntime.name,
+                dlssProfile: enumName(profile.dlssProfile),
+                fsrRuntime: enumName(profile.fsrRuntime),
             },
         };
     }

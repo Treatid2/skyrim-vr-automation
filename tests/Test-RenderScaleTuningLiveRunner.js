@@ -712,6 +712,49 @@ async function testInformationalReasonIsNotFailure() {
     "An informational reason fabricated a failed step.");
 }
 
+async function testFlatTerminalBoundary() {
+    for (const spec of [
+        { variant: "nvidia", capabilities: {} },
+        {
+            variant: "amd",
+            capabilities: {
+                supportedFSRRuntimeMask: 1,
+                fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }],
+            },
+        },
+    ]) {
+        const matrix = JSON.parse(fs.readFileSync(path.join(
+            repositoryRoot, "skills", `renderscale-tuning-${spec.variant}`,
+            "references", "matrix.v1.json")));
+        const mock = createMock(0, (receipt) => {
+            const snapshot = receipt.upscalingSnapshot;
+            const flatten = (profile) => flatProfile({
+                method: profile.method.name,
+                qualityMode: profile.qualityMode.name,
+                renderScaleMode: profile.renderScaleMode,
+                dlssProfile: profile.dlssProfile.name,
+                fsrRuntime: profile.fsrRuntime.name,
+            });
+            snapshot.requested = flatten(snapshot.profiles.requested);
+            snapshot.effective = flatten(snapshot.profiles.effective);
+            snapshot.stable = flatten(snapshot.profiles.stable);
+            delete snapshot.profiles;
+            return receipt;
+        });
+        const result = await runRenderScaleTuningLive({
+            ...mock.context,
+            variant: spec.variant,
+            runId: `${spec.variant}-flat-terminal-boundary`,
+            buildId,
+            initialBoundary: initialBoundary(),
+            capabilities: spec.capabilities,
+            matrix,
+        });
+        assert(result.ok === true && result.status === "COMPLETE",
+            `${spec.variant} rejected a flat terminal profile.`);
+    }
+}
+
 async function testOptionalTerminalFacts() {
     const matrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
@@ -1362,7 +1405,8 @@ async function testEvidenceVerdicts() {
 
 Promise.all([testNvidia(), testAmd(), testEvidenceVerdicts(),
     testScenarioFailureRetention(), testInformationalReasonIsNotFailure(),
-    testOptionalTerminalFacts(), testSafeUnstableBaselineContinues()]).then(() => {
+    testOptionalTerminalFacts(), testSafeUnstableBaselineContinues(),
+    testFlatTerminalBoundary()]).then(() => {
     process.stdout.write("Render-scale tuning live runner tests passed.\n");
 }).catch((error) => {
     process.stderr.write(`${error.stack || error}\n`);
