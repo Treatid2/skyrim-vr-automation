@@ -150,7 +150,7 @@ function sha(file) {
     return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
-function retained(boundary, violation, identity = {}) {
+function retained(boundary, violation, identity = {}, nonStable = false) {
     const runId = identity.runId || "nvidia-test-run";
     const buildId = identity.buildId || "e".repeat(64);
     return {
@@ -165,7 +165,7 @@ function retained(boundary, violation, identity = {}) {
         waiter: {
             schemaRevision: 14,
             transitionId: 101,
-            satisfied: true,
+            satisfied: !nonStable,
             ownerId: `${runId}-owner`,
             baseline: { stressSessionId: 7 },
             producer: { buildId },
@@ -254,7 +254,19 @@ function retained(boundary, violation, identity = {}) {
             },
         },
         projection: {
-            renderVerdict: "PASS",
+            renderVerdict: nonStable ? "FAIL" : "PASS",
+            nonStableNote: nonStable ? {
+                status: "not_stable",
+                deadlineMilliseconds: 20000,
+                outcome: "timeout",
+                timedOutMilestone: "strict",
+                presentationDisposition: "PresentationStretch",
+                leftEyePath: "PresentationStretch",
+                rightEyePath: "PresentationStretch",
+                controllerState: "Stabilizing",
+                presentationPhase: "awaiting_stereo",
+                failureCodes: ["active:vendor_presentation_not_stable"],
+            } : null,
             evidenceVerdict: violation ? "FAIL" : "PASS",
             task2Verdict: violation ? "FAIL" : "PASS",
             missingEvidence: [],
@@ -318,7 +330,7 @@ function testDeploymentVerification() {
     }
 }
 
-function createEvidenceRoot(variant = "nvidia") {
+function createEvidenceRoot(variant = "nvidia", nonStable = false) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "rst-finalizer-"));
     const runId = `${variant}-test-run`;
     const buildId = "e".repeat(64);
@@ -332,7 +344,7 @@ function createEvidenceRoot(variant = "nvidia") {
     writeJson(path.join(root, "raw", "pass-1", "transitions", "01",
         "retained.json"), retained(false, true, { runId, buildId }));
     writeJson(path.join(root, "raw", "pass-1", "transitions", "02",
-        "retained.json"), retained(true, true, { runId, buildId }));
+        "retained.json"), retained(true, true, { runId, buildId }, nonStable));
     return root;
 }
 
@@ -473,7 +485,7 @@ function testPartialInterruptedFinalization() {
 }
 
 function testOfflineFinalization() {
-    const root = createEvidenceRoot();
+    const root = createEvidenceRoot("nvidia", true);
     try {
         const options = { root, variant: "nvidia", runId: "nvidia-test-run",
             buildId: "e".repeat(64), expectedRows: 2,
@@ -481,8 +493,8 @@ function testOfflineFinalization() {
         let result = finalizeEvidence(options);
         assert(result.summary.assayExecution.status === "COMPLETE",
             "Completed assay execution was rewritten.");
-        assert(result.summary.render.verdict === "PASS",
-            "Render PASS was rewritten by evidence handling.");
+        assert(result.summary.render.verdict === "FAIL",
+            "The non-stable transition was not retained as a render failure.");
         assert(result.summary.task2Evidence.mode === "per_transition" &&
             result.summary.task2Evidence.aggregateVerdict === "NOT_COMPUTED" &&
             result.summary.task2Evidence.counts.FAIL === 1 &&
@@ -494,6 +506,10 @@ function testOfflineFinalization() {
         "Legacy aggregate verdict fields were retained.");
         assert(result.summary.reporting.status === "COMPLETE",
             "Complete preserved receipts did not finalize.");
+        assert(result.summary.stabilityNotes.count === 1 &&
+            result.summary.stabilityNotes.transitions[0]
+                .presentationDisposition === "PresentationStretch",
+        "The non-stable transition note was not summarized.");
         const first = result.summary.transitions[0];
         assert(first.task2Verdict === "INCONCLUSIVE" &&
             first.task2MissingEvidence.includes(
@@ -535,7 +551,9 @@ function testOfflineFinalization() {
         "The lossless value export was not hashed in the receipt index.");
         const report = fs.readFileSync(path.join(root, "report.md"), "utf8");
         assert(report.includes("Task 2/evidence: **per transition**") &&
-            report.includes("Task 2 is deliberately not aggregated"),
+            report.includes("Task 2 is deliberately not aggregated") &&
+            report.includes("not stable: PresentationStretch") &&
+            report.includes("Non-stable terminal notes: **1**"),
         "The report still presents an aggregate Task 2 verdict.");
         const transitionCsv = fs.readFileSync(path.join(root,
             "transitions.csv"), "utf8");
@@ -547,7 +565,9 @@ function testOfflineFinalization() {
             transitionCsv.includes("dispatch_left_generation") &&
             transitionCsv.includes("dispatch_right_generation") &&
             transitionCsv.includes("terminal_left_resource_revision") &&
-            transitionCsv.includes("terminal_right_resource_revision"),
+            transitionCsv.includes("terminal_right_resource_revision") &&
+            transitionCsv.includes("stability_presentation_disposition") &&
+            transitionCsv.includes("PresentationStretch"),
         "The compact transition table omitted diagnostic columns.");
 
         const outputs = ["report.md", "summary.json", "transitions.csv",

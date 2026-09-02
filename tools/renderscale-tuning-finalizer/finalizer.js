@@ -617,6 +617,7 @@ function transitionRow(root, file, retained) {
         finalQuality: profile.quality,
         finalRenderScaleMode: profile.renderScaleMode,
         finalStateRevision: profile.stateRevision,
+        nonStableNote: projection.nonStableNote || null,
         presentationStretchSelected:
             projection.presentationStretchSelected === true,
         presentationStretchRecovered:
@@ -644,7 +645,10 @@ function csvCell(value) {
 function csv(rows) {
     const columns = [
         "lane", "pass", "ordinal", "method", "quality_mode", "render_scale_mode",
-        "render_verdict", "task2_verdict", "mutation_expectation",
+        "render_verdict", "stability_status", "stability_presentation_disposition",
+        "stability_left_eye_path", "stability_right_eye_path",
+        "stability_controller_state", "stability_presentation_phase",
+        "stability_failure_codes", "task2_verdict", "mutation_expectation",
         "missing_evidence", "producer_invalid_evidence", "reported_violations",
         "authoritative_violations", "violation_authority",
         "phase_counter_authority_status",
@@ -668,8 +672,16 @@ function csv(rows) {
     const lines = [columns.join(",")];
     for (const row of rows) {
         const diagnostics = row.diagnostics;
+        const note = row.nonStableNote;
         const values = [row.lane, row.pass, row.ordinal, row.target.method,
             row.target.qualityMode, row.target.renderScaleMode, row.renderVerdict,
+            note ? note.status : "stable",
+            note ? note.presentationDisposition : "n/a",
+            note ? note.leftEyePath : "n/a",
+            note ? note.rightEyePath : "n/a",
+            note ? note.controllerState : "n/a",
+            note ? note.presentationPhase : "n/a",
+            note ? note.failureCodes : [],
             row.task2Verdict, row.mutationExpectation, row.task2MissingEvidence,
             row.task2ProducerInvalidEvidence, row.reportedTask2Violations,
             row.authoritativeTask2Violations,
@@ -704,13 +716,20 @@ function csv(rows) {
 }
 
 function report(summary) {
-    const rows = summary.transitions.map((row) =>
+    const rows = summary.transitions.map((row) => {
+        const note = row.nonStableNote;
+        const stability = note ?
+            `not stable: ${note.presentationDisposition}; ` +
+                `${note.leftEyePath}/${note.rightEyePath}; ` +
+                `${note.controllerState}/${note.presentationPhase}` : "stable";
+        return (
         `| ${row.lane || "default"} | ${row.pass} | ${row.ordinal} | ` +
-        `${row.renderVerdict} | ${row.task2Verdict} | ` +
+        `${row.renderVerdict} | ${stability} | ${row.task2Verdict} | ` +
         `${row.phaseCounterAuthorityStatus} | ` +
         `${row.reportedTask2Violations.join("; ") || "none"} | ` +
         `${row.task2MissingEvidence.join("; ") || "none"} | ` +
-        `${row.task2ProducerInvalidEvidence.join("; ") || "none"} |`).join("\n");
+        `${row.task2ProducerInvalidEvidence.join("; ") || "none"} |`);
+    }).join("\n");
     const interruption = summary.assayExecution.interruption;
     const failure = interruption && interruption.failure;
     return `# ${summary.protocol} final report\n\n` +
@@ -718,6 +737,7 @@ function report(summary) {
         `- Transitions dispatched: **${summary.assayExecution.transitionsDispatched}/` +
         `${summary.assayExecution.expectedTransitions}**\n` +
         `- Render verdict: **${summary.render.verdict}**\n` +
+        `- Non-stable terminal notes: **${summary.stabilityNotes.count}**\n` +
         `- Task 2/evidence: **per transition** ` +
         `(${summary.task2Evidence.counts.PASS} PASS, ` +
         `${summary.task2Evidence.counts.FAIL} FAIL, ` +
@@ -739,9 +759,9 @@ function report(summary) {
         `per-transition evidence. Every raw JSON value is available in ` +
         `\`${summary.evidenceExtraction.path}\`.\n\n` +
         `## Transitions\n\n` +
-        `| Lane | Pass | Row | Render | Task 2 | Authority | Reported violations | ` +
+        `| Lane | Pass | Row | Render | Stability | Task 2 | Authority | Reported violations | ` +
         `Missing evidence | Invalid producer evidence |\n` +
-        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- |\n${rows}\n`;
+        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n`;
 }
 
 function writeAtomic(file, content) {
@@ -812,6 +832,12 @@ function finalizeEvidence(options) {
         rows.length === expectedRows ? "COMPLETE" : "INCOMPLETE";
     const renderVerdict = aggregateVerdict(rows.map((row) => row.renderVerdict));
     const task2Counts = verdictCounts(rows.map((row) => row.task2Verdict));
+    const nonStableTransitions = rows.filter((row) => row.nonStableNote).map((row) => ({
+        lane: row.lane,
+        pass: row.pass,
+        ordinal: row.ordinal,
+        ...row.nonStableNote,
+    }));
     const reportingReasons = [];
     if (assayStatus !== "COMPLETE") reportingReasons.push("terminal_receipts_incomplete");
     if (baselineOnlyInterrupted) reportingReasons.push("baseline_only_interrupted");
@@ -855,6 +881,8 @@ function finalizeEvidence(options) {
                     relative(root, entry.file)),
             } : null },
         render: { verdict: renderVerdict },
+        stabilityNotes: { count: nonStableTransitions.length,
+            transitions: nonStableTransitions },
         task2Evidence: { mode: "per_transition", counts: task2Counts,
             aggregateVerdict: "NOT_COMPUTED" },
         reporting: { status: reportingStatus, reasons: reportingReasons },

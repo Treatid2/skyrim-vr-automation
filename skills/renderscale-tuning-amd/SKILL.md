@@ -43,7 +43,7 @@ another call, or local work between the fixture and this request.
 ```json
 {"action":"run","async":false,"continueOnError":false,"steps":[
   {"label":"position-coc","tool":"console","args":{"action":"exec","command":"coc WhiterunDragonsreach"}},
-  {"label":"position-settle","wait":10000},
+  {"label":"position-settle","wait":60000},
   {"label":"position-health","tool":"inspect","args":{"kind":"health"}},
   {"label":"position-state","tool":"inspect","args":{"kind":"state"}},
   {"label":"position-scene","tool":"inspect","args":{"kind":"scene"}},
@@ -54,7 +54,7 @@ another call, or local work between the fixture and this request.
 ```
 
 Require `ok:true`,`aborted:false`,`stepsRun:8`; 7 tool entries have
-label/`.result`; wait `results[1]` has `kind:"wait"`/`ms:10000` and no
+label/`.result`; wait `results[1]` has `kind:"wait"`/`ms:60000` and no
 label/result; cell and snapshot are at
 `position-scene.result.cell.editorId` and
 `position-snapshot.result.snapshot`. Preserve the complete
@@ -89,7 +89,11 @@ const liveResult = await runLive({tools,store,notify,variant:"amd",runId:`amd-${
 text(JSON.stringify(liveResult));
 ```
 
-The runner is the executable live contract. Do not translate the matrix or
+The runner is the executable live contract. Each strict waiter owns a 20-second
+terminal budget. An unsatisfied terminal receipt records a compact non-stable
+note, including its presentation disposition and eye paths, and advances only
+when the current operation, qualification owner, and physical mutation are
+closed. Do not translate the matrix or
 live-path prose into another cell, normalize receipt shapes, or add client
 checks. It accepts the already-decoded positioning boundary and reads each
 later boundary only at `qualification-wait.upscalingSnapshot`. DevBench owns

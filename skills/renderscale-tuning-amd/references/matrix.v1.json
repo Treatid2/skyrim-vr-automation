@@ -4,7 +4,7 @@
   "adapterVendor": "amd",
   "initialDestination": "fsr_hoshipa",
   "pacingMilliseconds": 5000,
-  "completionTimeoutMilliseconds": 30000,
+  "completionTimeoutMilliseconds": 20000,
   "traceReadLimit": 16,
   "lanes": [
     {

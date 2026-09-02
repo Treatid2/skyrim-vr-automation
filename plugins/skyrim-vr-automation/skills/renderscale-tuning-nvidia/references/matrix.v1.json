@@ -5,7 +5,7 @@
   "initialDestination": "dlss_hoshipa",
   "initialDormantFsrRuntime": "fsr3",
   "pacingMilliseconds": 5000,
-  "completionTimeoutMilliseconds": 30000,
+  "completionTimeoutMilliseconds": 20000,
   "traceReadLimit": 16,
   "destinations": {
     "none": { "label": "None", "method": "none", "qualityMode": "native_aa", "renderScaleMode": false, "completionClass": "native_logical" },

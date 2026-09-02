@@ -31,6 +31,10 @@ reads. Require:
   physical failure, an available adapter, and vendor ID `0x10DE`/4318 for
   NVIDIA or `0x1002`/4098 for AMD.
 
+The positioning scenario owns one 60,000 ms `position-settle` wait immediately
+after the COC and before these observations. This startup stabilization is
+separate from each mutation's 20,000 ms strict waiter.
+
 The synchronous response is the positioning observation. The live skill
 decodes the MCP envelope exactly once from `content[0].text`, validates the
 fixed labeled paths, and reports positioning as soon as it returns. It must not
@@ -116,7 +120,7 @@ no field and perform no lookup:
 | `qualification-begin` | `communityshaders.renderscale` | `{"action":"qualification_begin","transitionId":<transition-id>,"ownerId":"<owner-id>","expectedBuildId":"<build-id>"}` |
 | `qualification-dispatch` | `communityshaders.renderscale` | `{"action":"qualification_dispatch","transitionId":<transition-id>,"ownerId":"<owner-id>","startPerformanceTelemetry":false,"expectedBuildId":"<build-id>"}` |
 | `profile-apply` | `communityshaders.upscaling_api` | `{"action":"apply","expectedBuildId":"<build-id>","expectedStateRevision":<state-revision>,"target":<api-target>,"purpose":"direct","persistence":"runtime_only","clientId":"<client-id>","commandId":"<command-id>","reason":"render-scale tuning baseline"}` |
-| `qualification-wait` | `communityshaders.renderscale` | `{"action":"qualification_wait","transitionId":<transition-id>,"ownerId":"<owner-id>","expectedCellEditorId":"WhiterunDragonsreach","timeoutMs":30000,"milestone":"strict","target":<qualification-target>,"foveation":<foveation>,"expectedBuildId":"<build-id>"}` |
+| `qualification-wait` | `communityshaders.renderscale` | `{"action":"qualification_wait","transitionId":<transition-id>,"ownerId":"<owner-id>","expectedCellEditorId":"WhiterunDragonsreach","timeoutMs":20000,"milestone":"strict","target":<qualification-target>,"foveation":<foveation>,"expectedBuildId":"<build-id>"}` |
 
 Start the baseline with one synchronous fail-closed scenario containing six
 labeled tool steps in this exact order: `baseline-stress-reset`,
@@ -124,7 +128,7 @@ labeled tool steps in this exact order: `baseline-stress-reset`,
 `profile-apply`, and `qualification-wait`. This is the only pre-baseline reset.
 The apply immediately follows dispatch, and the strict target-correlated waiter
 immediately follows apply inside the same server-owned scenario. Pass the full
-dispatch-relative `timeoutMs: 30000`; DevBench measures it from
+dispatch-relative `timeoutMs: 20000`; DevBench measures it from
 `qualification_dispatch`. Never calculate or pass a client-side remaining
 timeout. Do not inspect, validate, persist, or comment on the scenario response
 until the server has executed the waiter and returned the complete six-step
@@ -161,8 +165,13 @@ the receipt, stop the baseline stress session with its ownership guard, and
 stop before measured-owner handoff or transition 1. Never infer either object
 from a tool description or later status snapshot.
 
-Only after strict waiter success and that receipt check, continue without a
-model pause into one synchronous fail-closed handoff scenario to stop the
+After that receipt check, a strictly satisfied baseline continues normally. An
+unsatisfied baseline records a compact `not_stable` note with the terminal
+presentation disposition, eye paths, controller state, presentation phase,
+and reported failure codes. It may continue without a model pause only when
+the waiter proves the qualification owner closed, zero active operation,
+matching PID/Build ID, and no unresolved physical mutation. Then run one
+synchronous fail-closed handoff scenario to stop the
 baseline stress session with its exact ownership guard, start measured stress,
 reset then start texture-lifetime, reset then start load-presentation, and
 pre-arm the profiler with `set_enabled`. The baseline session guard is the
@@ -188,11 +197,11 @@ as a `communityshaders.profiler_api` step immediately before
 `start_capture` or invent `frameCount`. Transition 1's
 `qualification_dispatch` is the sole CPU/GPU reset/start and timing origin.
 Immediately begin transition 1's measured scenario after the handoff returns;
-its first step owns the 5,000 ms wait. Retain every owner receipt. A failed or
-unsatisfied baseline waiter, a missing waiter subreceipt, or an incomplete
-scenario must never invoke this handoff scenario because it contains measured
-owner start actions. The handoff scenario is never a cleanup path. Stop only
-the baseline stress session with one
+its first step owns the 5,000 ms wait. Retain every owner receipt. A missing
+waiter subreceipt, incomplete scenario, active operation or owner, identity
+mismatch, or unresolved physical mutation must never invoke this handoff
+scenario because it contains measured owner start actions. The handoff
+scenario is never a cleanup path. Stop only the baseline stress session with one
 ownership-guarded `stop` call, start no measured owner, and follow the lane's
 terminal failure rules.
 
@@ -204,6 +213,13 @@ state are the complete safety decision for starting the next row. Do not add a
 post-wait operation read, status read, final snapshot, local evidence write,
 hash, report update, source search, or model pause before starting the next
 row. Do not invent another previous-transition safety gate.
+
+When the 20,000 ms waiter returns unsatisfied but this safety decision passes,
+record `nonStableNote` with `status: not_stable`, the terminal presentation
+disposition, both eye paths, controller state, presentation phase, and reported
+failure codes. Then start the next row immediately. An active owner or API
+operation, identity loss, or unresolved physical mutation still stops the
+matrix; the note is evidence, not permission to overlap mutations.
 
 Invoke the direct scenario inside one orchestration cell. Extract its uniquely
 labeled `qualification-wait` result, `store()` that exact terminal receipt
@@ -308,6 +324,11 @@ retain false, zero, null, strings, numbers, and explicit empty arrays/objects.
 This export makes every retained producer value queryable without flattening
 different timeline facets together or treating a terminal delta as a missing
 mutation-boundary event.
+
+Project each retained `nonStableNote` into `summary.json`, `transitions.csv`,
+and the rendered report. Keep the state fields attached to their exact lane,
+pass, and transition; do not replace the row's render or Task 2 verdict with
+the note.
 
 When the live runner is interrupted at baseline, retain `raw/live-result.json`
 and the exact baseline waiter receipt. The offline finalizer validates their

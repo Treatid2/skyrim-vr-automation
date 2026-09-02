@@ -322,6 +322,45 @@ async function runRenderScaleTuningLive(context) {
             optionalSafetyFactClear(facts, "physicalMutationClear");
     }
 
+    function nonStableNote(waiter) {
+        if (!waiter || waiter.satisfied === true) return null;
+        const timeline = waiter.replacementTimeline || {};
+        const observation = waiter.observation || {};
+        const physical = observation.physical || {};
+        const presentation = observation.replacementPresentation || {};
+        const facets = [timeline.terminal, timeline.firstNewGenerationProven,
+            timeline.firstPostMutation, timeline.firstPhysicalMutation,
+            timeline.lastPreMutation].filter((facet) => facet);
+        const dispositionFacet = facets.find((facet) =>
+            typeof facet.selectedPresentationDisposition === "string");
+        const terminal = timeline.terminal || {};
+        const proof = terminal.presentationProof || {};
+        const failureCodes = Array.isArray(waiter.failureReasons) ?
+            waiter.failureReasons.map((reason) => {
+                if (typeof reason === "string") return reason;
+                if (!reason || typeof reason !== "object") return null;
+                const category = typeof reason.category === "string" ?
+                    `${reason.category}:` : "";
+                return typeof reason.code === "string" ?
+                    `${category}${reason.code}` : null;
+            }).filter((reason) => reason) : [];
+        return {
+            status: "not_stable",
+            deadlineMilliseconds: matrix.completionTimeoutMilliseconds,
+            outcome: waiter.outcome || null,
+            timedOutMilestone: waiter.timedOutMilestone || null,
+            presentationDisposition: dispositionFacet ?
+                dispositionFacet.selectedPresentationDisposition : "not_exposed",
+            leftEyePath: presentation.leftEye && presentation.leftEye.path ||
+                proof.leftEye && proof.leftEye.path || "not_exposed",
+            rightEyePath: presentation.rightEye && presentation.rightEye.path ||
+                proof.rightEye && proof.rightEye.path || "not_exposed",
+            controllerState: physical.state || "not_exposed",
+            presentationPhase: physical.presentationPhase || "not_exposed",
+            failureCodes,
+        };
+    }
+
     function facetProjection(facet) {
         if (!facet || typeof facet !== "object") return null;
         const proof = facet.presentationProof && typeof facet.presentationProof === "object" ?
@@ -812,6 +851,7 @@ async function runRenderScaleTuningLive(context) {
         const task2 = task2Projection(waiter, target);
         return {
             satisfied: waiter.satisfied === true,
+            nonStableNote: nonStableNote(waiter),
             presentationStable: waiter.presentationStable === true,
             cleanupDrained: waiter.cleanupDrained === true,
             presentationStretchSelected: presentationStretchSelected === true,
@@ -890,19 +930,20 @@ async function runRenderScaleTuningLive(context) {
                     scenarioFailure && scenarioFailure.diagnostic || null);
             }
             const stressSessionId = waiter.baseline && waiter.baseline.stressSessionId;
-            if (!safeTerminal(waiter, identifiers) || waiter.satisfied !== true ||
-                !waiter.milestoneTimings || !waiter.replacementTimeline) {
+            if (!safeTerminal(waiter, identifiers) || !waiter.milestoneTimings ||
+                !waiter.replacementTimeline) {
                 throw diagnosticError("baseline_failed",
                     scenarioFailure && scenarioFailure.diagnostic || null);
             }
-            return { boundary: terminalBoundary(waiter), stressSessionId, waiter };
+            return { boundary: terminalBoundary(waiter), stressSessionId, waiter,
+                nonStableNote: nonStableNote(waiter) };
         }
         const entries = resultMap(response.root);
         const start = entries.get("baseline-stress-start");
         const stressSessionId = start && start.status && start.status.session.id;
         const waiter = entries.get("qualification-wait");
         if (!response.root.ok || !waiter || !safeTerminal(waiter, identifiers) ||
-            waiter.satisfied !== true || !waiter.milestoneTimings ||
+            !waiter.milestoneTimings ||
             !waiter.replacementTimeline) {
             await closeOpenQualification(identifiers);
             if (stressSessionId) {
@@ -914,7 +955,8 @@ async function runRenderScaleTuningLive(context) {
             throw diagnosticError("baseline_failed",
                 scenarioDiagnostic(response.root, steps, receiptKey));
         }
-        return { boundary: terminalBoundary(waiter), stressSessionId, waiter };
+        return { boundary: terminalBoundary(waiter), stressSessionId, waiter,
+            nonStableNote: nonStableNote(waiter) };
     }
 
     async function armOwners(baselineResult, lane, laneIndex, pass, resetPerformance) {
@@ -1199,6 +1241,15 @@ async function runRenderScaleTuningLive(context) {
             try {
                 const base = await baseline(boundary, lane, laneIndex + 1, pass);
                 boundary = base.boundary;
+                passSummary.baseline = {
+                    satisfied: base.waiter.satisfied === true,
+                    outcome: base.waiter.outcome || null,
+                    nonStableNote: base.nonStableNote,
+                };
+                if (base.nonStableNote) {
+                    notify({ lane: lane.id, pass, phase: "baseline",
+                        ...base.nonStableNote });
+                }
                 stressSessionId = await armOwners(
                     base, lane, laneIndex + 1, pass, passSequence > 1);
                 for (const row of matrix.transitions) {

@@ -506,6 +506,11 @@ async function testNvidia() {
     assert(mock.notifications.length === 66, "NVIDIA progress count is wrong.");
     assert(mock.notifications.filter((row) => row.satisfied === false).length === 2,
         "NVIDIA semantic failures did not continue through both passes.");
+    assert(mock.notifications.filter((row) => row.satisfied === false).every((row) =>
+        row.nonStableNote && row.nonStableNote.status === "not_stable" &&
+        row.nonStableNote.deadlineMilliseconds === 20000 &&
+        row.nonStableNote.presentationDisposition === "PresentationStretch"),
+    "NVIDIA semantic failures did not retain their non-stable state note.");
     assert(mock.notifications.every((row) => row.evidenceVerdict === "PASS"),
         `Complete NVIDIA Task 2 evidence was not classified PASS: ${JSON.stringify(mock.notifications[0])}`);
     assert(mock.notifications.every((row) => row.renderVerdict ===
@@ -744,6 +749,44 @@ async function testOptionalTerminalFacts() {
     assert(failedResult.ok === false && failedResult.status === "INTERRUPTED" &&
         failedResult.lanes[0].passes[0].error === "baseline_failed",
     "An explicitly false optional terminal fact did not fail closed.");
+}
+
+async function testSafeUnstableBaselineContinues() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const mock = createMock(0, (receipt, context) => {
+        if (context.baseline) {
+            receipt.satisfied = false;
+            receipt.outcome = "timeout";
+            receipt.timedOutMilestone = "strict";
+            receipt.failureReasons = [{ category: "active",
+                code: "vendor_presentation_not_stable" }];
+        }
+        return receipt;
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "nvidia",
+        runId: "safe-unstable-baseline",
+        buildId,
+        initialBoundary: initialBoundary(),
+        capabilities: {},
+        matrix,
+    });
+    assert(result.ok === true && result.status === "COMPLETE" &&
+        result.lanes[0].passes.every((pass) =>
+            pass.baseline && pass.baseline.satisfied === false &&
+            pass.baseline.nonStableNote &&
+            pass.baseline.nonStableNote.presentationDisposition ===
+                "PresentationStretch"),
+    "A safely closed non-stable baseline did not continue with a state note.");
+    const baselineNotes = mock.notifications.filter((entry) =>
+        entry.phase === "baseline");
+    assert(baselineNotes.length === 2 && baselineNotes.every((entry) =>
+        entry.status === "not_stable" &&
+        entry.failureCodes.includes("active:vendor_presentation_not_stable")),
+    "Safe non-stable baseline progress notes were not emitted.");
 }
 
 async function runNvidiaProjectionTransform(receiptTransform) {
@@ -1319,7 +1362,7 @@ async function testEvidenceVerdicts() {
 
 Promise.all([testNvidia(), testAmd(), testEvidenceVerdicts(),
     testScenarioFailureRetention(), testInformationalReasonIsNotFailure(),
-    testOptionalTerminalFacts()]).then(() => {
+    testOptionalTerminalFacts(), testSafeUnstableBaselineContinues()]).then(() => {
     process.stdout.write("Render-scale tuning live runner tests passed.\n");
 }).catch((error) => {
     process.stderr.write(`${error.stack || error}\n`);
