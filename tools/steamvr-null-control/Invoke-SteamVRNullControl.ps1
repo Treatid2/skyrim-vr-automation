@@ -1424,7 +1424,8 @@ try {
                 }
                 else {
                     $isolationValidation = Get-IsolationValidation -Isolation $isolation -BackupPath $openVRPathsBackupPath -CurrentPath $OpenVRPathsPath
-                    if (-not [bool]$isolationValidation.semanticMatch) { throw 'The OpenVR registration file changed semantically after isolation. Refusing to overwrite unclassified registration drift.' }
+                    $isolationValidation | Add-Member -NotePropertyName baselineAlreadyRestored -NotePropertyValue ($openVRLiveHash -eq [string]$isolation['sha256Before'])
+                    if (-not [bool]$isolationValidation.semanticMatch -and -not [bool]$isolationValidation.baselineAlreadyRestored) { throw 'The OpenVR registration file changed semantically after isolation. Refusing to overwrite unclassified registration drift.' }
                 }
                 foreach ($target in @($isolation['targets'])) {
                     if ((Get-HashOrNull ([string]$target['manifestPath'])) -ne [string]$target['manifestSha256']) {
