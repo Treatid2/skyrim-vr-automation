@@ -44,9 +44,10 @@ stops without replaying the COC.
 
 After positioning, the same orchestration cell loads the packaged deterministic
 runner and matrix in parallel and starts the baseline without another model
-handoff. Pass the initial boundary already decoded during positioning; the
-runner reads only each strict waiter's documented qualification snapshot after
-that. It does not search, normalize, or revalidate positioning. Do not load
+handoff. Pass the already-admitted positioning receipt unchanged; the runner
+decodes its snapshot once, then reads only each strict waiter's documented
+qualification snapshot. The client does not search, normalize, or revalidate
+positioning. Do not load
 Simple COC/CSM, enumerate tools, inspect schemas, or run another
 admission/reset scenario. Vendor live-path, protocol, and this detailed
 contract are finalization-only reads.

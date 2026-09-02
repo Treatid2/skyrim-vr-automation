@@ -16,6 +16,10 @@
   classified. Never delete unclassified MO2 overwrite or shader-cache content.
 - Keep automated waits bounded and report the observed postcondition. A CTD is
   useful evidence, not permission for unbounded retries.
+- Treat the render-scale tuning fixture, immediate positioning, and startup
+  admission sequence as frozen. Change that prefix only on explicit user
+  instruction or preserved evidence proving the prefix itself is defective;
+  post-position runner, telemetry, and reporting fixes must not alter it.
 - Tests must use temporary fixtures by default. Live checks must be explicitly
   selected and read-only unless the user has placed a state change in scope.
 - Machine-specific paths belong only in ignored `machine.local.json` files,

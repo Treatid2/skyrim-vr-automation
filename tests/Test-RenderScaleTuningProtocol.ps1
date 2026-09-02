@@ -48,6 +48,9 @@ Assert-True (Test-Path -LiteralPath $fastStartPlugin -PathType Leaf) 'Missing pa
 Assert-True ((Get-FileHash -LiteralPath $fastStartSource -Algorithm SHA256).Hash -eq
     (Get-FileHash -LiteralPath $fastStartPlugin -Algorithm SHA256).Hash) 'Shared tuning fast-start source/package parity failed.'
 $fastStart = Get-Content -LiteralPath $fastStartSource -Raw
+Assert-Contains $fastStart 'Pass the already-admitted positioning receipt unchanged' 'Shared tuning fast-start contract'
+Assert-Contains $fastStart 'The client does not search, normalize, or revalidate positioning' 'Shared tuning fast-start contract'
+Assert-True (-not $fastStart.Contains('Pass the initial boundary already decoded during positioning', [StringComparison]::Ordinal)) 'Shared tuning fast-start still delegates boundary decoding to the client.'
 $runnerRelative = 'tools\renderscale-tuning-live\runner.js'
 $runnerSource = Join-Path $repositoryRoot $runnerRelative
 $runnerPlugin = Join-Path $repositoryRoot "plugins\skyrim-vr-automation\$runnerRelative"
