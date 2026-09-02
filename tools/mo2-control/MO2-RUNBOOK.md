@@ -32,6 +32,12 @@ location, archive, process names, and safety limits live in the ignored
 the doctor-reported configuration. Start from `config/machine.example.json`; do not
 commit the resulting machine file.
 
+Machines with multiple portable MO2 installations keep one exact config per
+modlist through `../modlist-control`. Inspect and select the intended name
+before preflight. A persisted exact selection is allowed; choosing the first
+config, assuming that `main` means safe, or falling back to the UI-selected
+profile is not.
+
 Before any elevated invocation, read `APPROVALS.md`. Use a direct literal
 `pwsh.exe -NoProfile -NonInteractive -File <entrypoint> <subcommand>` shape and
 the result's `data.approval.reusablePrefix`. Variables in this runbook describe
@@ -132,9 +138,11 @@ or resume one while holding access. On the first request, prepare the configured
 stable source and create a task workspace. On later requests, select an exact
 retained WorkspaceId or explicitly request a fresh clone. Pass the returned
 task profile explicitly to `prepare`.
-Source preparation moves every legacy `ShaderCache*` directory out of overwrite
-into a newly enabled stable-source mod; creation refuses to continue if any
-remain. Fresh creation also refuses to continue unless `fixture-status` is
+`prepare-source` now reports existing cache trees without moving them. Creation
+binds the workspace to snapshotted MO2 Overwrite output, removes the cloned
+profile's game and `Synthesis` custom-overwrite mappings, and materializes the
+enabled `backup` provider union there. Cache catalog preparation does the same
+for `ShaderCache`. Fresh creation also requires `fixture-status` to be
 `fixture-valid` for the maintained source's default world-entry save:
 
 ```text
@@ -143,6 +151,7 @@ remain. Fresh creation also refuses to continue unless `fixture-status` is
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> list-task -TaskId <stable-task-id> -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> create -AccessId <literal-access-id> -TaskId <stable-task-id> -Label short-test-name -SavePolicy MainMenuOnly -Confirm:$false -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> resume -AccessId <literal-access-id> -TaskId <stable-task-id> -WorkspaceId <exact-retained-workspace-id> -Confirm:$false -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> complete-output -AccessId <literal-access-id> -TaskId <stable-task-id> -WorkspaceId <exact-workspace-id> -Confirm:$false -Compact
 ```
 
 After each live use, release the evidence session and access lease but retain
@@ -273,6 +282,17 @@ Response: stop. Do not acknowledge the fallback and continue automation. Close
 MO2, verify the exact profile directory and `selected_profile`, then run
 `validate -RequireClosed`. A fallback is a failed precondition even if MO2 can
 launch.
+
+### Persisted legacy task profile
+
+Symptom: `inspect` reports that MO2 selects a `Codex Task -` profile whose
+workspace has no runtime-output isolation contract.
+
+Response: do not launch that profile. Close Skyrim and MO2, acquire the exact
+access lease, validate closed state, preview workspace
+`recover-legacy-selection`, and run it with the reported workspace ID. The
+operation selects the configured stable source and retains the legacy profile,
+mods, cache, manifest, exact INI backup, and recovery receipt.
 
 ### `Cannot start -r`
 

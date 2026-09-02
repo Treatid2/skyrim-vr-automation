@@ -3,6 +3,12 @@
 MO2 Control is the shared, machine-readable entry point for Codex tasks that
 inspect or validate the Skyrim VR Mod Organizer 2 installation.
 
+Version `1.0.0` makes task launch authorization independently verify the cache
+materialization receipt, the complete generated `backup` shadow, prepared tree
+hashes, and every current lower-provider path. The first launch rejects
+unexplained output drift. Retained game cycles may add task output, but every
+relaunch still rejects a missing shadow or changed lower-provider inventory.
+
 `validate-closed` is the explicit closed-state spelling of `validate
 -RequireClosed`; both commands are read-only and return the same proof.
 
@@ -57,9 +63,20 @@ session cannot silently fall back to the plain game executable.
 Overwrite is scanned recursively for `ShaderCache` and `ShaderCache.*`
 directories. Inspection classifies active, rollback (`.Previous`), temporary
 swap (`.Swap`), and other legacy trees and marks swap state older than one hour
-as stale. Validation blocks launch whenever any such tree remains, regardless
-of ordinary file-count thresholds; use workspace `prepare-source` to move the
-complete trees into an enabled stable-profile mod first.
+as stale. An ordinary profile cannot launch with unbound cache trees. A task
+profile may use the exact `mo2-overwrite-output` workspace contract, which is
+verified separately before session preparation and launch.
+
+A `Codex Task - ...` profile has an additional launch gate. The controller
+requires an exact owner marker for MO2 Overwrite and rejects both game and
+`Synthesis` entries in the cloned profile's `custom_overwrites` section. A
+launchable cache plan must use `-BindToOverwrite` and
+`RequireMaterializedOutput`. Preparation copies the complete enabled-provider
+union into `overwrite\ShaderCache`; workspace creation does the same for
+`overwrite\backup`. This makes Overwrite win paths that already existed in a
+mod while new-area paths use MO2's ordinary Overwrite route. First launch
+requires exact prepared hashes. Retained cycles may add files while every
+relaunch still checks complete provider coverage.
 
 ## Quick start
 

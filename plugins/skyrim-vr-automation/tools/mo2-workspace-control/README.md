@@ -16,13 +16,10 @@ rejects reparse points. Exceeding any budget returns a bounded failure before a
 new clone is committed; the limits are configurable through the corresponding
 `-MaxProfile*` and `-TreeOperationTimeoutSeconds` parameters.
 
-Before `create`, run `prepare-source` under the same MO2 access lease. It scans
-overwrite recursively for every directory named `ShaderCache` or beginning
-`ShaderCache.`, including the legacy `ShaderCache.Previous` and
-`ShaderCache.Swap` trees. If any exist, it moves their complete relative trees
-into one newly named MO2 mod and enables that mod in the stable source profile
-under an exact modlist backup and receipt. `create` refuses to clone while any
-such directory remains in overwrite.
+`prepare-source` is now a non-mutating compatibility command. It reports
+existing Overwrite cache trees but never moves them or changes the stable
+profile. `create` snapshots the exact Overwrite `backup` tree and later cache
+`prepare` snapshots the exact Overwrite `ShaderCache` tree.
 
 The task must own an MO2 access lease. MO2, Skyrim, loaders, and active
 RootBuilder deployment must be closed before `create`, `resume`, `register-mod`,
@@ -45,12 +42,23 @@ profile. `list-task` reports retained profiles. `resume` rebinds one exact
 retained workspace to a newly owned lease and selects it without refreshing it
 from the primary profile. See `../../docs/MO2-TASK-WORKSPACES.md`.
 
+Creation binds the task to MO2 Overwrite with an exact owner marker. It removes
+both the selected game executable and `Synthesis` entries from the cloned
+profile's `custom_overwrites` section. It snapshots the pre-task `backup` tree
+and materializes every enabled loose-provider path into `overwrite\backup`
+without replacing an existing Overwrite file. Shader-cache catalog `prepare`
+must use `-BindToOverwrite`; it snapshots `overwrite\ShaderCache` and
+materializes every enabled provider path there. New-area files then use MO2's
+ordinary Overwrite route, while paths that already existed in a mod also have
+an Overwrite winner. First launch requires exact prepared hashes; retained game
+cycles may grow both trees while preserving complete provider coverage.
+
 For elevated use, follow `../mo2-control/APPROVALS.md`. Every result reports a
 literal command-specific `data.approval.reusablePrefix`. `create`,
 `register-mod`, and `ensure-mod-wins` are eligible for narrow reusable approval;
-`refresh-fixture`, `prepare-source`, and `retire` remain one-shot because they
-replace shared metadata, move overwrite trees into a shared stable mod, or
-recursively remove exact owned paths.
+`refresh-fixture`, `complete-output`, and `retire` remain one-shot because they
+replace shared metadata, restore snapshotted Overwrite state, or recursively
+remove exact owned paths. `prepare-source` is reusable because it is read-only.
 
 `adopt` is also one-shot: it transfers one ready workspace from the exact
 released `-PreviousAccessId` to a distinct active lease only after closed-state,
@@ -62,6 +70,7 @@ when an otherwise valid workspace outlives its transient access lease.
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> list-task -TaskId <stable-task-id> -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> create -AccessId <literal-access-id> -TaskId <stable-task-id> -Label weather-api -SavePolicy MainMenuOnly -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> resume -AccessId <new-literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> complete-output -AccessId <literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -Confirm:$false -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> register-mod -AccessId <literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -ModName "Codex Weather API Test 20260822" -ModDirectory "<exact-mod-directory>" -WinningPaths "SKSE\Plugins\CommunityShaders.dll" -Confirm:$false -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> release-access -AccessId <literal-access-id> -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> retire -AccessId <literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -CleanupOwnedMods -Confirm:$false -Compact
@@ -123,6 +132,11 @@ the exact prior INI bytes and receipt, and only then removes the task profile.
 Workspace manifests and results expose `profileName`, `profileDirectory`, and
 `modListPath` while retaining the legacy `profile` and `profilePath` fields.
 Calling MO2 `release-access` alone preserves the workspace for later `resume`.
+After the game and MO2 close, catalog `complete` preserves generated
+`ShaderCache` evidence and restores its pre-task tree. Then workspace
+`complete-output` preserves the generated `backup` tree, restores its pre-task
+tree, and releases the Overwrite owner marker. `retire` requires both exact
+completion receipts and never deletes the Overwrite directory.
 The deprecated workspace `release` command is retained only to return safe
 recovery guidance; it fails before mutation and never deletes a profile.
 

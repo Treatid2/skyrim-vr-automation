@@ -97,7 +97,13 @@ try {
     Import-Module (Join-Path $PSScriptRoot 'MO2Control.psm1') -Force -ErrorAction Stop
     $configuration = Resolve-MO2ControlConfigPath -ConfigPath $ConfigPath -PackageRoot $PSScriptRoot
     if (-not $configuration.exists) {
-        throw "MO2 configuration was not found at '$($configuration.path)' (source: $($configuration.source)). Run tools/doctor/Invoke-SkyrimVRAutomationDoctor.ps1 init, pass -ConfigPath, or set SKYRIM_VR_AUTOMATION_CONFIG."
+        if ($configuration.source -eq 'named-selection-required') {
+            throw "Named MO2 configurations exist, but none is selected. Run tools/modlist-control/Invoke-SkyrimVRModlist.ps1 list, then select -Name <exact-name>; or pass -ConfigPath/set SKYRIM_VR_AUTOMATION_MODLIST explicitly."
+        }
+        elseif ($configuration.source -eq 'active-modlist-invalid') {
+            throw "The active MO2 modlist selection is invalid: '$($configuration.path)'. Run tools/modlist-control/Invoke-SkyrimVRModlist.ps1 list and select one exact valid name."
+        }
+        throw "MO2 configuration was not found at '$($configuration.path)' (source: $($configuration.source)). Run tools/doctor/Invoke-SkyrimVRAutomationDoctor.ps1 init, pass -ConfigPath, set SKYRIM_VR_AUTOMATION_CONFIG, or register/select a named modlist."
     }
     $config = Read-MO2ControlConfig -ConfigPath $configuration.path
 

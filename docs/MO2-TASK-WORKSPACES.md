@@ -9,8 +9,8 @@ copy of the maintained primary profile and survives any number of lease yields.
 Identify the task with the stable Codex task/thread ID. `list-task -TaskId`
 reports every retained workspace owned by that task.
 
-- On the task's first MO2 request, acquire MO2 access, run `prepare-source`, and
-  run `fixture-status`. Proceed to `create -TaskId` only from
+- On the task's first MO2 request, acquire MO2 access and run `fixture-status`.
+  Proceed to `create -TaskId` only from
   `fixture-valid`. Creation otherwise fails closed. It clones the configured
   primary profile, including its complete saves tree and mandatory default
   world-entry save, verifies the copy, and selects the new profile in MO2.
@@ -35,7 +35,10 @@ task can compile, edit, or analyse offline. This yields MO2 but preserves the
 task profile, its saves, its option state, and its task-owned mods. A later
 lease can resume it directly.
 
-Use workspace `retire` only when the task has finished with that profile.
+After the game and MO2 close, run shader-cache catalog `complete` and workspace
+`complete-output`. These preserve generated `ShaderCache` and `backup` trees,
+restore the exact pre-task MO2 Overwrite state, and release the output owner
+marker. Use workspace `retire` only when the task has finished with that profile.
 Retirement selects the maintained primary profile and recursively removes only
 the exact task-owned profile. `-CleanupOwnedMods` additionally removes only
 mods that the workspace created and registered. The old workspace `release`
@@ -55,7 +58,8 @@ name, then disable the old mod and enable the new mod in the maintained primary
 profile. Existing task profiles retain their prior mod selections and shared
 mod references until the owning task explicitly requests a fresh clone.
 
-Some applications write runtime data into an existing mod, notably CSX writing
-compiled shaders into the managed shader-cache mod. That known exception is
-accepted. Automatic cache reset on lease yield is intentionally not part of
-this contract; it can be added later as a separately evidenced policy.
+CSX runtime output is bound to MO2 Overwrite, not an existing mod. Workspace
+creation removes the cloned profile's game and `Synthesis` custom-overwrite
+mappings, snapshots `backup`, and materializes its enabled-provider union.
+Shader-cache preparation does the same for `ShaderCache`. New paths and updates
+therefore resolve to Overwrite; shared mod directories remain immutable.

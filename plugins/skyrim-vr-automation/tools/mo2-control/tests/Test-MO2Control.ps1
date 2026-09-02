@@ -283,6 +283,8 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test (Test-Path -LiteralPath (Join-Path $prepared.data.sessionPath 'session.json') -PathType Leaf) 'prepare creates a durable session manifest'
     Assert-MO2Test ([bool]$prepared.data.session.requirements.skseLoader) 'prepare persists the SKSE requirement for launch revalidation'
     Assert-MO2Test (Test-Path -LiteralPath $prepared.data.controllerPath -PathType Leaf) 'prepare snapshots a durable session controller outside the plugin cache'
+    Assert-MO2Test (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $prepared.data.controllerPath) 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1') -PathType Leaf) 'durable session controller retains its shader-cache provider verifier'
+    Assert-MO2Test (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $prepared.data.controllerPath) 'shader-cache-control\ShaderCacheInventory.ps1') -PathType Leaf) 'durable session controller retains the shader-cache inventory dependency'
     $durableStatus = & $prepared.data.controllerPath status -SessionId ([string]$prepared.data.session.sessionId) -Compact -NoExit | ConvertFrom-Json
     Assert-MO2Test ($durableStatus.ok -and $durableStatus.state -eq 'prepared') 'durable session controller can resume the owned lifecycle independently'
     Assert-MO2Test ($durableStatus.data.approval.entryPoint -eq [IO.Path]::GetFullPath([string]$prepared.data.controllerPath) -and $durableStatus.data.approval.reusablePrefix[5] -eq 'status') 'durable controller advertises its own stable literal approval prefix'

@@ -187,6 +187,191 @@ try {
     }
     Assert-Test ($completeAgain.ok -and $completeAgain.state -eq 'already-complete') 'task completion retry returns the immutable existing completion'
 
+    $boundCatalogRoot = Join-Path $resolvedTestRoot 'bound-catalog'
+    $boundEvidence = Join-Path $resolvedTestRoot 'bound-task-evidence'
+    $modsRoot = Join-Path $resolvedTestRoot 'mo2\mods'
+    $profilePath = Join-Path $resolvedTestRoot 'mo2\profiles\Task\modlist.txt'
+    $taskCache = Join-Path $modsRoot 'Task Cache\ShaderCache'
+    $otherCache = Join-Path $modsRoot 'Other Cache\ShaderCache'
+    $expectedPluginRoot = Join-Path $modsRoot 'Expected Plugin\SKSE\Plugins'
+    $wrongPluginRoot = Join-Path $modsRoot 'Wrong Plugin\SKSE\Plugins'
+    $overwriteCache = Join-Path $resolvedTestRoot 'mo2\overwrite\ShaderCache'
+    New-Item -ItemType Directory -Path $taskCache, $otherCache, $expectedPluginRoot, $wrongPluginRoot, $overwriteCache, (Split-Path -Parent $profilePath) -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $taskCache '.codex-vfs-sentinel.txt') -Value 'task-owned cache provider' -Encoding utf8
+    [IO.File]::WriteAllBytes((Join-Path $otherCache 'other-provider.bin'), [byte[]](4, 2))
+    $expectedPluginBytes = [byte[]](1, 4, 1, 5, 9)
+    $wrongPluginBytes = [byte[]](2, 7, 1, 8, 2)
+    $expectedPluginPath = Join-Path $expectedPluginRoot 'CommunityShaders.dll'
+    $wrongPluginPath = Join-Path $wrongPluginRoot 'CommunityShaders.dll'
+    [IO.File]::WriteAllBytes($expectedPluginPath, $expectedPluginBytes)
+    [IO.File]::WriteAllBytes($wrongPluginPath, $wrongPluginBytes)
+    $expectedPluginHash = (Get-FileHash -LiteralPath $expectedPluginPath -Algorithm SHA256).Hash
+    $wrongPluginHash = (Get-FileHash -LiteralPath $wrongPluginPath -Algorithm SHA256).Hash
+    [pscustomobject]@{
+        buildId = 'build-bound-fixture'
+        artifact = [pscustomobject]@{ fileName = 'CommunityShaders.dll'; sha256 = $expectedPluginHash; sizeBytes = $expectedPluginBytes.Length }
+        identity = [pscustomobject]@{ shaderCache = [pscustomobject]@{ abiId = 'abi-bound' } }
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $expectedPluginRoot 'CSX.BuildManifest.json') -Encoding utf8
+    [pscustomobject]@{
+        buildId = 'wrong-build-fixture'
+        artifact = [pscustomobject]@{ fileName = 'CommunityShaders.dll'; sha256 = $wrongPluginHash; sizeBytes = $wrongPluginBytes.Length }
+        identity = [pscustomobject]@{ shaderCache = [pscustomobject]@{ abiId = 'abi-bound' } }
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $wrongPluginRoot 'CSX.BuildManifest.json') -Encoding utf8
+    Set-Content -LiteralPath $profilePath -Value @('+Task Cache', '+Other Cache', '+Wrong Plugin', '+Expected Plugin') -Encoding utf8
+
+    $boundCommon = @{
+        CatalogRoot = $boundCatalogRoot
+        ProfilePath = $profilePath
+        ModsPath = $modsRoot
+        CacheModName = 'Task Cache'
+        ShaderCacheAbi = 'abi-bound'
+        ShaderSourceSha256 = $shaderSource
+        GameRuntime = 'SkyrimVR-1.4.15'
+        RenderPath = 'vr'
+        BuildId = 'build-bound-fixture'
+        Tags = @('task-cache')
+        BlockingProcessNames = $blockers
+        Compact = $true
+        NoExit = $true
+    }
+    $wrongPathArgs = @{} + $boundCommon
+    $wrongPathArgs.Command = 'prepare'
+    $wrongPathArgs.CachePath = $overwriteCache
+    $wrongPathArgs.EvidenceDirectory = Join-Path $resolvedTestRoot 'wrong-path-evidence'
+    $wrongPathArgs.Confirm = $false
+    $wrongPath = Invoke-Catalog $wrongPathArgs
+    Assert-Test (-not $wrongPath.ok -and $wrongPath.errors[0] -match 'does not match the exact winning MO2 provider') 'task preparation rejects a physical overwrite path when another loose-mod provider wins'
+
+    $wrongBuildArgs = @{} + $boundCommon
+    $wrongBuildArgs.Command = 'prepare'
+    $wrongBuildArgs.EvidenceDirectory = Join-Path $resolvedTestRoot 'wrong-build-evidence'
+    $wrongBuildArgs.Confirm = $false
+    $wrongBuild = Invoke-Catalog $wrongBuildArgs
+    Assert-Test (-not $wrongBuild.ok -and $wrongBuild.errors[0] -match "has build 'wrong-build-fixture'; expected 'build-bound-fixture'") 'provider-bound preparation rejects a different winning Community Shaders build'
+    Assert-Test (-not (Test-Path -LiteralPath (Join-Path $wrongBuildArgs.EvidenceDirectory 'shader-cache-task.plan.json'))) 'a wrong DLL winner is rejected before a task cache plan is created'
+
+    Set-Content -LiteralPath $profilePath -Value @('+Task Cache', '+Other Cache', '+Expected Plugin', '+Wrong Plugin') -Encoding utf8
+
+    $boundPrepareArgs = @{} + $boundCommon
+    $boundPrepareArgs.Command = 'prepare'
+    $boundPrepareArgs.EvidenceDirectory = $boundEvidence
+    $boundPrepareArgs.RequireMaterializedOutput = $true
+    $boundPrepareArgs.Confirm = $false
+    $boundPrepare = Invoke-Catalog $boundPrepareArgs
+    Assert-Test ($boundPrepare.ok -and [string]$boundPrepare.data.task.cacheBinding.modName -eq 'Task Cache') 'task preparation resolves and records the exact winning loose-mod cache provider'
+    Assert-Test ([string]$boundPrepare.data.task.cacheBinding.communityShadersPlugin.modName -eq 'Expected Plugin' -and [string]$boundPrepare.data.task.cacheBinding.communityShadersPlugin.buildId -eq 'build-bound-fixture') 'task preparation binds the expected winning Community Shaders build and provider'
+    Assert-Test ([string]$boundPrepare.data.task.before.root -eq [IO.Path]::GetFullPath($taskCache)) 'task preparation snapshots the provider-backed cache instead of global overwrite'
+    $shadowedLowerCache = Join-Path $taskCache 'other-provider.bin'
+    Assert-Test ((Test-Path -LiteralPath $shadowedLowerCache -PathType Leaf) -and (Get-FileHash -LiteralPath $shadowedLowerCache -Algorithm SHA256).Hash -ceq (Get-FileHash -LiteralPath (Join-Path $otherCache 'other-provider.bin') -Algorithm SHA256).Hash) 'task preparation materializes a byte-identical shadow for a lower-provider-only cache file'
+    Assert-Test ([int]$boundPrepare.data.task.providerShadow.receipt.requiredLowerProviderFiles -eq 1 -and [int]$boundPrepare.data.task.providerShadow.receipt.copiedFiles -eq 1 -and (Test-Path -LiteralPath $boundPrepare.data.task.providerShadow.receiptPath -PathType Leaf)) 'task preparation records exact lower-provider shadow coverage'
+    $boundPrepareAgain = Invoke-Catalog $boundPrepareArgs
+    Assert-Test ($boundPrepareAgain.ok -and $boundPrepareAgain.state -eq 'already-prepared' -and [string]$boundPrepareAgain.data.task.providerShadow.receipt.preparedInventory.treeSha256 -ceq [string]$boundPrepare.data.task.providerShadow.receipt.preparedInventory.treeSha256) 'provider-bound preparation retry validates the materialized task tree instead of the pre-shadow seed hash'
+
+    [IO.File]::WriteAllBytes($expectedPluginPath, [byte[]](9, 9, 9))
+    $changedPluginComplete = Invoke-Catalog @{
+        Command = 'complete'
+        CatalogRoot = $boundCatalogRoot
+        EvidenceDirectory = $boundEvidence
+        WorkingSetStatus = 'unverified'
+        BlockingProcessNames = $blockers
+        Confirm = $false
+        Compact = $true
+        NoExit = $true
+    }
+    Assert-Test (-not $changedPluginComplete.ok -and $changedPluginComplete.errors[0] -match 'DLL hash does not match its build manifest') 'task completion rejects physical Community Shaders DLL drift'
+    Assert-Test (-not (Test-Path -LiteralPath (Join-Path $boundEvidence 'shader-cache-task.completion.json'))) 'DLL drift leaves the cache transaction open'
+    [IO.File]::WriteAllBytes($expectedPluginPath, $expectedPluginBytes)
+
+    $emptyComplete = Invoke-Catalog @{
+        Command = 'complete'
+        CatalogRoot = $boundCatalogRoot
+        EvidenceDirectory = $boundEvidence
+        WorkingSetStatus = 'unverified'
+        BlockingProcessNames = $blockers
+        Confirm = $false
+        Compact = $true
+        NoExit = $true
+    }
+    $materializationFailurePath = Join-Path $boundEvidence 'shader-cache-task.materialization-failure.json'
+    Assert-Test (-not $emptyComplete.ok -and $emptyComplete.errors[0] -match 'no file added or changed after preparation') 'task completion rejects a prepared provider shadow without task-generated output'
+    Assert-Test ((Test-Path -LiteralPath $materializationFailurePath -PathType Leaf) -and -not (Test-Path -LiteralPath (Join-Path $boundEvidence 'shader-cache-task.completion.json'))) 'missing materialization preserves evidence and leaves the task transaction open'
+    Assert-Test (Test-Path -LiteralPath (Join-Path $taskCache '.codex-vfs-sentinel.txt') -PathType Leaf) 'failed materialization does not restore or remove the live provider tree'
+
+    [IO.File]::WriteAllBytes((Join-Path $taskCache 'compiled-during-bound-task.bin'), [byte[]](6, 2, 6, 4))
+    $boundComplete = Invoke-Catalog @{
+        Command = 'complete'
+        CatalogRoot = $boundCatalogRoot
+        EvidenceDirectory = $boundEvidence
+        WorkingSetStatus = 'unverified'
+        BlockingProcessNames = $blockers
+        Confirm = $false
+        Compact = $true
+        NoExit = $true
+    }
+    Assert-Test ($boundComplete.ok -and [int]$boundComplete.data.task.workingTree.materializedFiles -eq 1) 'task completion preserves materialized output from the exact bound provider'
+    Assert-Test (Test-Path -LiteralPath (Join-Path $boundComplete.data.task.workingTree.preservedPath 'compiled-during-bound-task.bin') -PathType Leaf) 'provider-backed compiled output survives restoration in the evidence tree'
+    Assert-Test (-not (Test-Path -LiteralPath (Join-Path $taskCache 'compiled-during-bound-task.bin'))) 'task completion restores the exact pre-task provider tree'
+
+    $unboundOverwrite = Invoke-Catalog @{
+        Command = 'prepare'
+        CatalogRoot = (Join-Path $resolvedTestRoot 'unbound-catalog')
+        CachePath = $overwriteCache
+        EvidenceDirectory = (Join-Path $resolvedTestRoot 'unbound-evidence')
+        ShaderCacheAbi = 'abi-unbound'
+        ShaderSourceSha256 = $shaderSource
+        BlockingProcessNames = $blockers
+        Confirm = $false
+        Compact = $true
+        NoExit = $true
+    }
+    Assert-Test (-not $unboundOverwrite.ok -and $unboundOverwrite.errors[0] -match 'Refusing an unbound MO2 overwrite') 'catalog refuses to infer global overwrite as the effective MO2 cache target'
+
+    $wrongOverwriteChild = Join-Path (Split-Path -Parent $overwriteCache) 'WrongCache'
+    New-Item -ItemType Directory -Path $wrongOverwriteChild -Force | Out-Null
+    $overwriteRoot = Split-Path -Parent $overwriteCache
+    $overwriteWorkspaceId = 'catalog-overwrite-workspace'
+    $overwriteOwnershipId = 'catalog-overwrite-owner'
+    $overwriteOwnerMarkerPath = Join-Path $overwriteRoot '.codex-workspace-output-owner.json'
+    [pscustomobject]@{
+        workspaceId = $overwriteWorkspaceId; ownershipId = $overwriteOwnershipId
+        mode = 'mo2-overwrite-output'; overwritePath = $overwriteRoot
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $overwriteOwnerMarkerPath -Encoding utf8
+    $overwriteOwnerMarkerSha256 = (Get-FileHash -LiteralPath $overwriteOwnerMarkerPath -Algorithm SHA256).Hash
+    $wrongOverwriteBinding = Invoke-Catalog @{
+        Command = 'prepare'; CatalogRoot = (Join-Path $resolvedTestRoot 'wrong-overwrite-catalog')
+        CachePath = $wrongOverwriteChild; ProfilePath = $profilePath; ModsPath = $modsRoot
+        BindToOverwrite = $true; EvidenceDirectory = (Join-Path $resolvedTestRoot 'wrong-overwrite-evidence')
+        BuildId = 'build-bound-fixture'; ShaderCacheAbi = 'abi-bound'; ShaderSourceSha256 = $shaderSource
+        WorkspaceId = $overwriteWorkspaceId; OwnershipId = $overwriteOwnershipId
+        OwnerMarkerPath = $overwriteOwnerMarkerPath; OwnerMarkerSha256 = $overwriteOwnerMarkerSha256
+        BlockingProcessNames = $blockers; Confirm = $false; Compact = $true; NoExit = $true
+    }
+    Assert-Test (-not $wrongOverwriteBinding.ok -and $wrongOverwriteBinding.errors[0] -match 'exact MO2 overwrite directory') 'Overwrite binding rejects a cache path outside the declared relative tree'
+
+    [IO.File]::WriteAllBytes((Join-Path $overwriteCache 'pre-task.bin'), [byte[]](8, 6, 7, 5))
+    $overwriteEvidence = Join-Path $resolvedTestRoot 'overwrite-task-evidence'
+    $overwritePrepare = Invoke-Catalog @{
+        Command = 'prepare'; CatalogRoot = (Join-Path $resolvedTestRoot 'overwrite-catalog')
+        CachePath = $overwriteCache; ProfilePath = $profilePath; ModsPath = $modsRoot
+        BindToOverwrite = $true; EvidenceDirectory = $overwriteEvidence
+        ShaderCacheAbi = 'abi-bound'; ShaderSourceSha256 = $shaderSource
+        BuildId = 'build-bound-fixture'; RequireMaterializedOutput = $true
+        WorkspaceId = $overwriteWorkspaceId; OwnershipId = $overwriteOwnershipId
+        OwnerMarkerPath = $overwriteOwnerMarkerPath; OwnerMarkerSha256 = $overwriteOwnerMarkerSha256
+        BlockingProcessNames = $blockers; Confirm = $false; Compact = $true; NoExit = $true
+    }
+    Assert-Test ($overwritePrepare.ok -and [string]$overwritePrepare.data.task.cacheBinding.mode -eq 'mo2-overwrite-output') 'catalog explicitly binds the exact MO2 Overwrite tree'
+    Assert-Test ((Test-Path -LiteralPath (Join-Path $overwriteCache 'other-provider.bin') -PathType Leaf) -and [int]$overwritePrepare.data.task.providerShadow.receipt.requiredLowerProviderFiles -eq 2) 'Overwrite preparation materializes the complete enabled-provider union'
+    [IO.File]::WriteAllBytes((Join-Path $overwriteCache 'later-area.bin'), [byte[]](3, 1, 4, 1, 5))
+    $overwriteComplete = Invoke-Catalog @{
+        Command = 'complete'; CatalogRoot = (Join-Path $resolvedTestRoot 'overwrite-catalog')
+        CachePath = $overwriteCache; EvidenceDirectory = $overwriteEvidence
+        WorkingSetStatus = 'unverified'; BlockingProcessNames = $blockers
+        Confirm = $false; Compact = $true; NoExit = $true
+    }
+    Assert-Test ($overwriteComplete.ok -and (Test-Path -LiteralPath (Join-Path $overwriteComplete.data.task.workingTree.preservedPath 'later-area.bin') -PathType Leaf)) 'Overwrite completion preserves later-area generated cache output'
+    Assert-Test ((Test-Path -LiteralPath (Join-Path $overwriteCache 'pre-task.bin') -PathType Leaf) -and -not (Test-Path -LiteralPath (Join-Path $overwriteCache 'later-area.bin'))) 'Overwrite completion restores the exact pre-task cache tree'
+
     $finalList = Invoke-Catalog @{ Command = 'list'; CatalogRoot = $catalogRoot; Compact = $true; NoExit = $true }
     Assert-Test (@($finalList.data.snapshots).Count -eq 3 -and @($finalList.data.issues).Count -eq 0) 'catalog retains all known-working compatibility records and validates every manifest'
 }
