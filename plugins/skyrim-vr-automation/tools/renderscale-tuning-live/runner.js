@@ -144,12 +144,41 @@ async function runRenderScaleTuningLive(context) {
         };
     }
 
-    // Keep positioning receipt decoding inside the runner so callers cannot
-    // introduce additional admission rules or depend on one snapshot shape.
+    // Keep positioning admission inside the runner so callers cannot add
+    // shape checks between the fixed COC prefix and measured execution.
     function positioningInputs(root) {
+        if (!root || root.ok !== true || root.aborted !== false ||
+            !Number.isSafeInteger(root.stepsRun) ||
+            !Array.isArray(root.results) ||
+            root.stepsRun !== root.results.length) {
+            throw new Error("positioning_scenario_failed");
+        }
+        const requiredLabels = [
+            "position-coc",
+            "position-health",
+            "position-state",
+            "position-scene",
+            "position-capabilities",
+            "position-snapshot",
+            "position-renderscale",
+        ];
+        for (const label of requiredLabels) {
+            const entry = root.results.find((candidate) =>
+                candidate && candidate.label === label);
+            // Tool payloads are opaque; only the outer scenario result is
+            // part of positioning admission.
+            if (!entry || !Object.prototype.hasOwnProperty.call(entry, "result")) {
+                throw new Error(`positioning_tool_result_missing:${label}`);
+            }
+        }
         const results = resultMap(root);
+        const sceneResult = results.get("position-scene");
         const snapshotResult = results.get("position-snapshot");
         const capabilitiesResult = results.get("position-capabilities");
+        if (!sceneResult || !sceneResult.cell ||
+            sceneResult.cell.editorId !== "WhiterunDragonsreach") {
+            throw new Error("positioning_scene_mismatch");
+        }
         if (!snapshotResult || !snapshotResult.snapshot) {
             throw new Error("positioning_snapshot_missing");
         }
@@ -158,6 +187,7 @@ async function runRenderScaleTuningLive(context) {
             throw new Error("positioning_capabilities_missing");
         }
         return {
+            cellEditorId: sceneResult.cell.editorId,
             boundary: terminalBoundary({
                 upscalingSnapshot: snapshotResult.snapshot,
             }),
@@ -168,6 +198,12 @@ async function runRenderScaleTuningLive(context) {
 
     const positioning = positioningInputs(positioningRoot);
     const capabilities = positioning.capabilities;
+    notify({
+        phase: "positioning",
+        status: "admitted",
+        cellEditorId: positioning.cellEditorId,
+        buildId,
+    });
 
     function targetFor(boundary, destination, fsrRuntime) {
         return {

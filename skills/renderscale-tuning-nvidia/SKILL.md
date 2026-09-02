@@ -53,17 +53,17 @@ another call, or local work between the fixture and this request.
 ]}
 ```
 
-Require `ok:true`,`aborted:false`,`stepsRun:8`; 7 tool entries have
-label/`.result`; wait `results[1]` has `kind:"wait"`/`ms:60000` and no
-label/result; cell and snapshot are at
-`position-scene.result.cell.editorId` and
-`position-snapshot.result.snapshot`. Preserve the complete
-`position-renderscale.result` as evidence, but do not decode or gate on its
-adapter subshape during startup. Emit compact `notify()`.
+Pass the decoded scenario root unchanged to the packaged runner. Do not
+calculate a positioning-admission result, inspect individual payload shapes,
+or emit a positioning verdict in the client. The runner validates the
+successful outer scenario, required labeled tool entries, exact scene, and
+snapshot, then emits the compact positioning `notify()`. In particular,
+`position-renderscale.result` is an opaque payload: its outer presence is
+required, but no nested `result` or adapter field is required.
 
 ## Uninterrupted measurement
 
-Do not end the positioning `functions.exec` after its compact `notify()`. In
+Do not end the positioning `functions.exec` after the scenario response. In
 that same cell, load `tools/renderscale-tuning-live/runner.js` and
 `skills/renderscale-tuning-nvidia/references/matrix.v1.json` from the current
 plugin root with one parallel local read. Evaluate the runner source as
@@ -71,7 +71,7 @@ plugin root with one parallel local read. Evaluate the runner source as
 `positioningRoot` unchanged, `variant: "nvidia"`, the bound Build ID, the
 parsed matrix, a short run-unique ID, and the cell's `tools`, `store`, and
 `notify` functions. Do not extract, normalize, or validate positioning fields
-in the client.
+in the client; the runner exclusively owns positioning admission.
 Use this loader shape, substituting only the current plugin root and the local
 positioning/build variables:
 

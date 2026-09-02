@@ -48,8 +48,8 @@ Assert-True (Test-Path -LiteralPath $fastStartPlugin -PathType Leaf) 'Missing pa
 Assert-True ((Get-FileHash -LiteralPath $fastStartSource -Algorithm SHA256).Hash -eq
     (Get-FileHash -LiteralPath $fastStartPlugin -Algorithm SHA256).Hash) 'Shared tuning fast-start source/package parity failed.'
 $fastStart = Get-Content -LiteralPath $fastStartSource -Raw
-Assert-Contains $fastStart 'Pass the already-admitted positioning receipt unchanged' 'Shared tuning fast-start contract'
-Assert-Contains $fastStart 'The client does not search, normalize, or revalidate positioning' 'Shared tuning fast-start contract'
+Assert-Contains $fastStart 'Pass the positioning receipt unchanged' 'Shared tuning fast-start contract'
+Assert-Contains $fastStart 'The client does not search, normalize, or validate positioning' 'Shared tuning fast-start contract'
 Assert-True (-not $fastStart.Contains('Pass the initial boundary already decoded during positioning', [StringComparison]::Ordinal)) 'Shared tuning fast-start still delegates boundary decoding to the client.'
 $runnerRelative = 'tools\renderscale-tuning-live\runner.js'
 $runnerSource = Join-Path $repositoryRoot $runnerRelative
@@ -90,6 +90,8 @@ foreach ($token in @(
     'mcp__devbench_vr__scenario',
     'mcp__devbench_vr__communityshaders_renderscale',
     'positioningRoot', 'positioningInputs', 'capabilities',
+    'positioning_tool_result_missing', 'positioning_scene_mismatch',
+    'Object.prototype.hasOwnProperty.call(entry, "result")',
     'waiter.upscalingSnapshot', 'snapshot.effective',
     'snapshot.profiles && snapshot.profiles.effective',
     'enumName(profile.method)', 'enumName(profile.qualityMode, qualityName)',
@@ -123,10 +125,10 @@ foreach ($forbidden in @(
 foreach ($token in @(
     'detailed contract', 'packaged deterministic runner and matrix',
     'only after a pass has', 'finalization-only', 'synchronous',
-    '`stepsRun: 8`', '`position-health`', '`position-state`',
+    '`position-health`', '`position-state`',
     '`position-scene`', '`position-capabilities`', '`position-snapshot`',
-    '`position-renderscale`', '`cell.editorId: WhiterunDragonsreach`', '`0x10DE`/4318',
-    '`0x1002`/4098', 'reports positioning as soon as it returns',
+    '`position-renderscale`', '`cell.editorId: WhiterunDragonsreach`',
+    'reports positioning as soon as it admits the response',
     'create an evidence directory', 'decode Base64',
     '`content[0].text`', 'recursively search',
     'without another model handoff',
@@ -343,8 +345,9 @@ foreach ($variant in $variants) {
     }
     Assert-Contains $skill 'No other `before` or `after`' $variant.Name
     Assert-Contains $skill 'do not infer aliases' $variant.Name
-    Assert-Contains $skill 'compact `notify()`' $variant.Name
-    Assert-Contains $skill 'do not decode or gate on its adapter subshape' $variant.Name
+    Assert-Contains $skill 'compact positioning `notify()`' $variant.Name
+    Assert-Contains $skill '`position-renderscale.result` is an opaque payload' $variant.Name
+    Assert-Contains $skill 'no nested `result` or adapter field is required' $variant.Name
     Assert-Contains $skill 'not by another client-side adapter-shape admission gate' $variant.Name
     Assert-True (-not $skill.Contains("Require the structured positioning receipt's bound adapter", [StringComparison]::Ordinal)) "$($variant.Name) still blocks startup on an adapter receipt shape."
     Assert-Contains $skill 'Do not end the positioning `functions.exec`' $variant.Name
@@ -352,6 +355,9 @@ foreach ($variant in $variants) {
     Assert-Contains $skill 'The runner is the executable live contract' $variant.Name
     Assert-Contains $skill 'Do not translate the matrix' $variant.Name
     Assert-Contains $skill 'positioningRoot' $variant.Name
+    Assert-Contains $skill 'the runner exclusively owns positioning admission' $variant.Name
+    Assert-True (-not $skill.Contains('positioningAdmitted', [StringComparison]::Ordinal)) "$($variant.Name) still calculates client-side positioning admission."
+    Assert-True (-not $skill.Contains('hasOwnProperty.call(', [StringComparison]::Ordinal)) "$($variant.Name) still checks positioning payload shape in the client."
     Assert-True (-not $skill.Contains('const initialSnapshot', [StringComparison]::Ordinal)) "$($variant.Name) still decodes the positioning snapshot in the client."
     Assert-True (-not $skill.Contains('const initialBoundary', [StringComparison]::Ordinal)) "$($variant.Name) still constructs a client-side boundary."
     Assert-True (-not $skill.Contains('const capabilities = positioningResults', [StringComparison]::Ordinal)) "$($variant.Name) still inspects capability shape in the client."

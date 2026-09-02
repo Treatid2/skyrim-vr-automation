@@ -39,7 +39,18 @@ function positioningRoot(capabilities = {}, flatSnapshot = false) {
     if (flatSnapshot) snapshot.effective = publicProfile();
     else snapshot.profiles = { effective: publicProfile() };
     return {
+        ok: true,
+        aborted: false,
+        stepsRun: 8,
         results: [
+            { label: "position-coc", result: {} },
+            { kind: "wait", ms: 60000 },
+            { label: "position-health", result: {} },
+            { label: "position-state", result: {} },
+            {
+                label: "position-scene",
+                result: { cell: { editorId: "WhiterunDragonsreach" } },
+            },
             {
                 label: "position-capabilities",
                 result: { capabilities },
@@ -48,6 +59,7 @@ function positioningRoot(capabilities = {}, flatSnapshot = false) {
                 label: "position-snapshot",
                 result: { snapshot },
             },
+            { label: "position-renderscale", result: {} },
         ],
     };
 }
@@ -506,33 +518,38 @@ async function testNvidia() {
     assertRevisionFencing(mock.scenarioCalls, "NVIDIA");
     assert(result.lanes[0].passes.length === 2, "NVIDIA mock did not run two passes.");
     assert(result.lanes[0].passes.every((pass) => pass.rows.length === 33), "NVIDIA mock row count is wrong.");
-    assert(mock.notifications.length === 66, "NVIDIA progress count is wrong.");
-    assert(mock.notifications.filter((row) => row.satisfied === false).length === 2,
+    const transitionNotifications = mock.notifications.filter((row) =>
+        Number.isInteger(row.ordinal));
+    assert(mock.notifications.filter((row) => row.phase === "positioning" &&
+        row.status === "admitted").length === 1,
+    "NVIDIA positioning admission was not reported by the runner.");
+    assert(transitionNotifications.length === 66, "NVIDIA progress count is wrong.");
+    assert(transitionNotifications.filter((row) => row.satisfied === false).length === 2,
         "NVIDIA semantic failures did not continue through both passes.");
-    assert(mock.notifications.filter((row) => row.satisfied === false).every((row) =>
+    assert(transitionNotifications.filter((row) => row.satisfied === false).every((row) =>
         row.nonStableNote && row.nonStableNote.status === "not_stable" &&
         row.nonStableNote.deadlineMilliseconds === 20000 &&
         row.nonStableNote.presentationDisposition === "PresentationStretch"),
     "NVIDIA semantic failures did not retain their non-stable state note.");
-    assert(mock.notifications.every((row) => row.evidenceVerdict === "PASS"),
-        `Complete NVIDIA Task 2 evidence was not classified PASS: ${JSON.stringify(mock.notifications[0])}`);
-    assert(mock.notifications.every((row) => row.renderVerdict ===
+    assert(transitionNotifications.every((row) => row.evidenceVerdict === "PASS"),
+        `Complete NVIDIA Task 2 evidence was not classified PASS: ${JSON.stringify(transitionNotifications[0])}`);
+    assert(transitionNotifications.every((row) => row.renderVerdict ===
         (row.satisfied ? "PASS" : "FAIL")),
     "Render and evidence verdicts were not kept separate.");
-    assert(mock.notifications.every((row) => row.dispatch_ &&
+    assert(transitionNotifications.every((row) => row.dispatch_ &&
         row.last_pre_mutation_ && row.first_physical_mutation_ &&
         row.first_post_mutation_ && row.first_new_generation_proven_ && row.terminal_),
     "NVIDIA timeline facets were not projected independently.");
-    assert(mock.notifications.every((row) =>
+    assert(transitionNotifications.every((row) =>
         row.last_pre_mutation_.proof_contract_generation === 8 &&
         row.first_new_generation_proven_.proof_contract_generation === 9),
     "NVIDIA old/new generations were flattened across facets.");
-    assert(mock.notifications.every((row) => row.cleanupDrained === true),
+    assert(transitionNotifications.every((row) => row.cleanupDrained === true),
         "Structured cleanup debt was not projected from cleanupDrained.");
-    assert(mock.notifications.filter((row) => row.satisfied === true).every((row) =>
+    assert(transitionNotifications.filter((row) => row.satisfied === true).every((row) =>
         row.presentationStretchTerminalRecovery === true),
         "Recovered stretch was misclassified from structured cleanup debt.");
-    assert(mock.notifications.filter((row) => row.satisfied === false).every((row) =>
+    assert(transitionNotifications.filter((row) => row.satisfied === false).every((row) =>
         row.presentationStretchTerminalRecovery === false),
         "Failed stretch was incorrectly projected as recovered.");
     assert(mock.stores.has("nvidia-test:nvidia:pass-2:transition-33"),
@@ -593,8 +610,13 @@ async function testAmd() {
     assert(fallback && fallback.passes.length === 2, "AMD fallback lane did not run two passes.");
     assert(fsr3.passes.every((pass) => pass.rows.length === 31), "AMD mock row count is wrong.");
     assert(fallback.passes.every((pass) => pass.rows.length === 31), "AMD fallback row count is wrong.");
-    assert(mock.notifications.length === 124, "AMD progress count is wrong.");
-    assert(mock.notifications.every((row) => row.evidenceVerdict === "PASS" &&
+    const transitionNotifications = mock.notifications.filter((row) =>
+        Number.isInteger(row.ordinal));
+    assert(mock.notifications.filter((row) => row.phase === "positioning" &&
+        row.status === "admitted").length === 1,
+    "AMD positioning admission was not reported by the runner.");
+    assert(transitionNotifications.length === 124, "AMD progress count is wrong.");
+    assert(transitionNotifications.every((row) => row.evidenceVerdict === "PASS" &&
         row.dispatch_ && row.first_new_generation_proven_),
     "AMD did not receive the shared Task 2 evidence projection.");
     const capabilityEnvelope = mock.stores.get("amd-test:amd:dlss-trace-capability");
@@ -710,6 +732,53 @@ async function testInformationalReasonIsNotFailure() {
     assert(step && step.failed === false && step.error === null &&
         retained.scenario.failedStep === null,
     "An informational reason fabricated a failed step.");
+}
+
+async function testPositionRenderScalePayloadIsOpaque() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const admittedRoot = positioningRoot();
+    const renderScaleEntry = admittedRoot.results.find((entry) =>
+        entry.label === "position-renderscale");
+    assert(renderScaleEntry &&
+        !Object.prototype.hasOwnProperty.call(renderScaleEntry.result, "result"),
+    "Positioning fixture unexpectedly contains a nested result.");
+    const admitted = createMock(0);
+    const admittedResult = await runRenderScaleTuningLive({
+        ...admitted.context,
+        variant: "nvidia",
+        runId: "opaque-position-renderscale",
+        buildId,
+        positioningRoot: admittedRoot,
+        matrix,
+    });
+    assert(admittedResult.ok === true,
+        "An opaque position-renderscale payload was rejected.");
+
+    const missingRoot = positioningRoot();
+    const missingEntry = missingRoot.results.find((entry) =>
+        entry.label === "position-renderscale");
+    delete missingEntry.result;
+    const rejected = createMock(0);
+    let error = null;
+    try {
+        await runRenderScaleTuningLive({
+            ...rejected.context,
+            variant: "nvidia",
+            runId: "missing-position-renderscale",
+            buildId,
+            positioningRoot: missingRoot,
+            matrix,
+        });
+    } catch (caught) {
+        error = caught;
+    }
+    assert(error && error.message ===
+        "positioning_tool_result_missing:position-renderscale",
+    "A missing outer position-renderscale result was not rejected.");
+    assert(rejected.scenarioCalls.length === 0,
+        "The runner mutated the game after invalid positioning evidence.");
 }
 
 async function testFlatTerminalBoundary() {
@@ -841,7 +910,7 @@ async function runNvidiaProjectionTransform(receiptTransform) {
         matrix,
     });
     assert(result.ok === true, "Projection test run did not complete.");
-    return mock.notifications;
+    return mock.notifications.filter((row) => Number.isInteger(row.ordinal));
 }
 
 async function testEvidenceVerdicts() {
@@ -1401,7 +1470,7 @@ async function testEvidenceVerdicts() {
 Promise.all([testNvidia(), testAmd(), testEvidenceVerdicts(),
     testScenarioFailureRetention(), testInformationalReasonIsNotFailure(),
     testOptionalTerminalFacts(), testSafeUnstableBaselineContinues(),
-    testFlatTerminalBoundary()]).then(() => {
+    testFlatTerminalBoundary(), testPositionRenderScalePayloadIsOpaque()]).then(() => {
     process.stdout.write("Render-scale tuning live runner tests passed.\n");
 }).catch((error) => {
     process.stderr.write(`${error.stack || error}\n`);
