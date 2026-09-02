@@ -30,12 +30,14 @@
   installation until every run is terminal. Use the guarded repository
   installer instead of direct `codex plugin add`, and fully reload the Codex
   host after installation; a new chat alone is not a safe pickup boundary.
-- After every committed protocol update, rotate both plugin manifest cache
-  identities, rebuild the managed marketplace source from that exact commit,
-  reinstall it with the guarded installer, and verify the registered version
-  plus source, marketplace, and installed-cache hashes. If a protocol is
-  active, complete every step except installed-cache rotation and perform that
-  rotation as soon as all runs are terminal.
+- After every committed change that affects installed plugin behavior, skills,
+  tools, MCP configuration, manifests, or packaged AI guidance, automatically
+  rotate both plugin manifest cache identities, rebuild the managed marketplace
+  source from that exact commit, reinstall it with the guarded installer, and
+  verify the registered version plus source, marketplace, and installed-cache
+  hashes without waiting for a separate user request. If a protocol is active,
+  complete every step except installed-cache rotation and perform that rotation
+  as soon as all runs are terminal.
 - When an automation command behaves unexpectedly, its contract is ambiguous,
   or a concrete safety issue or enhancement is discovered, submit it through
   `tools/feedback-control/Invoke-AutomationFeedback.ps1`. Claim that feedback
