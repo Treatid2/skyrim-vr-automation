@@ -48,6 +48,7 @@
     "semanticTarget": "/user/head",
     "sharedMemoryName": "Local\\CSXVRHeadPose-v2",
     "sharedMemoryVersion": 2,
+    "sharedMemorySize": 128,
     "poseProbeRelativePath": "tools\\csx_openvr_pose_probe.exe",
     "minimumQualifiedEyeHeightMeters": 1.0,
     "maximumQualifiedEyeHeightMeters": 2.5

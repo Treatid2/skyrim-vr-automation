@@ -67,6 +67,38 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+if (-not ('SkyrimVRAutomation.Native.SharedPoseAtomics' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Threading;
+using Microsoft.Win32.SafeHandles;
+
+namespace SkyrimVRAutomation.Native {
+    public static unsafe class SharedPoseAtomics {
+        public static long ReadInt64(SafeMemoryMappedViewHandle handle, long pointerOffset, long fieldOffset) {
+            bool referenced = false;
+            handle.DangerousAddRef(ref referenced);
+            try {
+                byte* pointer = (byte*)handle.DangerousGetHandle() + pointerOffset + fieldOffset;
+                return Interlocked.Read(ref *(long*)pointer);
+            }
+            finally { if (referenced) handle.DangerousRelease(); }
+        }
+
+        public static long ExchangeInt64(SafeMemoryMappedViewHandle handle, long pointerOffset, long fieldOffset, long value) {
+            bool referenced = false;
+            handle.DangerousAddRef(ref referenced);
+            try {
+                byte* pointer = (byte*)handle.DangerousGetHandle() + pointerOffset + fieldOffset;
+                return Interlocked.Exchange(ref *(long*)pointer, value);
+            }
+            finally { if (referenced) handle.DangerousRelease(); }
+        }
+    }
+}
+'@ -CompilerOptions '/unsafe'
+}
+
 if ([string]::IsNullOrWhiteSpace($NullProfilePath)) {
     $NullProfilePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\profiles\steamvr-null.profile.json'))
 }
@@ -750,35 +782,88 @@ function Get-EffectiveState {
     }
 }
 
+function Read-HeadPoseAtomicUInt64([IO.MemoryMappedFiles.MemoryMappedViewAccessor]$View, [long]$Offset) {
+    return [uint64][SkyrimVRAutomation.Native.SharedPoseAtomics]::ReadInt64(
+        $View.SafeMemoryMappedViewHandle,
+        $View.PointerOffset,
+        $Offset)
+}
+
+function Test-HeadPoseDriverIdentity([uint32]$CreatorPid, [uint64]$DriverStartedFileTimeUtc) {
+    if ($CreatorPid -eq 0 -or $DriverStartedFileTimeUtc -eq 0) { return $false }
+    try {
+        $process = Get-Process -Id $CreatorPid -ErrorAction Stop
+        $processStart = [uint64]$process.StartTime.ToUniversalTime().ToFileTimeUtc()
+        $now = [uint64][DateTime]::UtcNow.AddSeconds(5).ToFileTimeUtc()
+        return $processStart -le $DriverStartedFileTimeUtc -and $DriverStartedFileTimeUtc -le $now
+    }
+    catch { return $false }
+}
+
 function Get-HeadPoseSharedState {
     param([Parameter(Mandatory)]$Contract)
     $mapping = $null
     $view = $null
     try {
+        $expectedVersion = [int]$Contract['sharedMemoryVersion']
+        $expectedSize = if ($Contract.ContainsKey('sharedMemorySize')) {
+            [int]$Contract['sharedMemorySize']
+        }
+        elseif ($expectedVersion -eq 1) { 88 }
+        elseif ($expectedVersion -eq 2) { 128 }
+        else { throw "Unsupported head-pose shared-memory version: $expectedVersion" }
+        $requiredSize = if ($expectedVersion -eq 1) { 88 } elseif ($expectedVersion -eq 2) { 128 } else { 0 }
+        if ($expectedSize -ne $requiredSize) {
+            throw "Head-pose shared-memory version $expectedVersion requires a $requiredSize-byte contract, not $expectedSize bytes."
+        }
         $mapping = [IO.MemoryMappedFiles.MemoryMappedFile]::OpenExisting(
             [string]$Contract['sharedMemoryName'],
-            [IO.MemoryMappedFiles.MemoryMappedFileRights]::Read)
-        $view = $mapping.CreateViewAccessor(0, 88, [IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
-        $firstSequence = $view.ReadUInt64(8)
-        $state = [ordered]@{
-            magic = $view.ReadUInt32(0)
-            version = $view.ReadUInt16(4)
-            size = $view.ReadUInt16(6)
-            requestedSequence = $firstSequence
-            appliedSequence = $view.ReadUInt64(16)
-            status = $view.ReadUInt32(24)
-            flags = $view.ReadUInt32(28)
-            position = @($view.ReadDouble(32), $view.ReadDouble(40), $view.ReadDouble(48))
-            quaternion = @($view.ReadDouble(56), $view.ReadDouble(64), $view.ReadDouble(72), $view.ReadDouble(80))
+            [IO.MemoryMappedFiles.MemoryMappedFileRights]::ReadWrite)
+        # Interlocked.Read requires a writable view but does not mutate the contract.
+        $view = $mapping.CreateViewAccessor(0, $expectedSize, [IO.MemoryMappedFiles.MemoryMappedFileAccess]::ReadWrite)
+        for ($attempt = 0; $attempt -lt 10; $attempt++) {
+            $firstSequence = Read-HeadPoseAtomicUInt64 -View $view -Offset 8
+            if (($firstSequence % 2) -ne 0) {
+                [Threading.Thread]::Sleep(1)
+                continue
+            }
+            $state = [ordered]@{
+                magic = $view.ReadUInt32(0)
+                version = $view.ReadUInt16(4)
+                size = $view.ReadUInt16(6)
+                requestedSequence = $firstSequence
+                appliedSequence = Read-HeadPoseAtomicUInt64 -View $view -Offset 16
+                status = $view.ReadUInt32(24)
+                flags = $view.ReadUInt32(28)
+                position = @($view.ReadDouble(32), $view.ReadDouble(40), $view.ReadDouble(48))
+                quaternion = @($view.ReadDouble(56), $view.ReadDouble(64), $view.ReadDouble(72), $view.ReadDouble(80))
+            }
+            if ($expectedVersion -eq 2) {
+                $state['writerNonce'] = $view.ReadUInt64(88)
+                $state['acknowledgedWriterNonce'] = $view.ReadUInt64(96)
+                $state['driverInstanceNonce'] = $view.ReadUInt64(104)
+                $state['driverCreatorPid'] = $view.ReadUInt32(112)
+                $state['driverStartedFileTimeUtc'] = $view.ReadUInt64(120)
+            }
+            $secondSequence = Read-HeadPoseAtomicUInt64 -View $view -Offset 8
+            if ($firstSequence -ne $secondSequence -or ($secondSequence % 2) -ne 0) { continue }
+
+            $state['stable'] = $true
+            $state['available'] = $true
+            $state['protocolValid'] = $state.magic -eq 0x48505343 -and $state.version -eq $expectedVersion -and $state.size -eq $expectedSize
+            $state['eyeHeightQualified'] = $state.position[1] -ge [double]$Contract['minimumQualifiedEyeHeightMeters'] -and $state.position[1] -le [double]$Contract['maximumQualifiedEyeHeightMeters']
+            if ($expectedVersion -eq 2) {
+                $state['driverIdentityVerified'] = Test-HeadPoseDriverIdentity -CreatorPid $state.driverCreatorPid -DriverStartedFileTimeUtc $state.driverStartedFileTimeUtc
+                $state['acknowledged'] = $state.requestedSequence -gt 0 -and $state.appliedSequence -eq $state.requestedSequence -and $state.writerNonce -ne 0 -and $state.acknowledgedWriterNonce -eq $state.writerNonce -and $state.status -eq 1
+                $state['qualified'] = $state.protocolValid -and $state.driverIdentityVerified -and $state.driverInstanceNonce -ne 0 -and $state.acknowledged -and $state.eyeHeightQualified -and (($state.flags -band 1) -eq 1)
+            }
+            else {
+                $state['acknowledged'] = $state.requestedSequence -gt 0 -and $state.appliedSequence -eq $state.requestedSequence -and $state.status -eq 1
+                $state['qualified'] = $state.protocolValid -and $state.acknowledged -and $state.eyeHeightQualified -and (($state.flags -band 1) -eq 1)
+            }
+            return [pscustomobject]$state
         }
-        $secondSequence = $view.ReadUInt64(8)
-        $state['stable'] = $firstSequence -eq $secondSequence -and ($secondSequence % 2) -eq 0
-        $state['available'] = $true
-        $state['protocolValid'] = $state.magic -eq 0x48505343 -and $state.version -eq [int]$Contract['sharedMemoryVersion'] -and $state.size -eq 88
-        $state['acknowledged'] = $state.stable -and $state.requestedSequence -gt 0 -and $state.appliedSequence -eq $state.requestedSequence -and $state.status -eq 1
-        $state['eyeHeightQualified'] = $state.position[1] -ge [double]$Contract['minimumQualifiedEyeHeightMeters'] -and $state.position[1] -le [double]$Contract['maximumQualifiedEyeHeightMeters']
-        $state['qualified'] = $state.protocolValid -and $state.acknowledged -and $state.eyeHeightQualified -and (($state.flags -band 1) -eq 1)
-        return [pscustomobject]$state
+        throw 'The shared pose changed continuously and could not be read atomically.'
     }
     catch [IO.FileNotFoundException] {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The head-pose shared-memory provider is not running.' }

@@ -15,6 +15,8 @@ if (-not $resolvedFixture.StartsWith($resolvedTemp, [StringComparison]::OrdinalI
 $failures = [Collections.Generic.List[string]]::new()
 $passes = [Collections.Generic.List[string]]::new()
 $priorTransactionRoot = $env:CSX_STEAMVR_TRANSACTION_ROOT
+$poseMapping = $null
+$poseView = $null
 
 function Assert-Test([bool]$Condition, [string]$Name) {
     if ($Condition) { $passes.Add($Name) } else { $failures.Add($Name) }
@@ -52,18 +54,46 @@ try {
     [IO.File]::WriteAllBytes($startupPath, [byte[]]@(0))
     $originalText = "{`r`n  `"steamvr`": { `"enableHomeApp`": true },`r`n  `"unrelated`": { `"value`": 7 }`r`n}`r`n"
     [IO.File]::WriteAllText($settingsPath, $originalText, [Text.UTF8Encoding]::new($false))
+    $headPoseMapName = "Local\CSXVRHeadPose-fixture-$([guid]::NewGuid().ToString('N'))"
     [ordered]@{
         steamvr = [ordered]@{ forcedDriver = 'null'; requireHmd = $false; activateMultipleDrivers = $true; enableHomeApp = $false }
         dashboard = [ordered]@{ enableDashboard = $false }
         driver_null = [ordered]@{ enable = $true; serialNumber = 'Fixture'; modelNumber = 'Fixture'; windowWidth = 2160; windowHeight = 1200; renderWidth = 1512; renderHeight = 1680; displayFrequency = 90.0 }
         driver_codex_head_pose = [ordered]@{ enable = $true; serialNumber = 'CSX-NULL-HMD-POSE-1'; modelNumber = 'Fixture Pose'; positionX = 0.0; eyeHeightMeters = 1.68; positionZ = 0.0; yawDegrees = 0.0; pitchDegrees = 0.0; rollDegrees = 0.0 }
         TrackingOverrides = [ordered]@{ '/devices/codex_head_pose/CSX-NULL-HMD-POSE-1' = '/user/head' }
-        headPoseProviderContract = [ordered]@{ driverName = 'codex_head_pose'; registeredDevicePath = '/devices/codex_head_pose/CSX-NULL-HMD-POSE-1'; semanticTarget = '/user/head'; sharedMemoryName = "Local\CSXVRHeadPose-fixture-$([guid]::NewGuid().ToString('N'))"; sharedMemoryVersion = 1; minimumQualifiedEyeHeightMeters = 1.0; maximumQualifiedEyeHeightMeters = 2.5 }
+        headPoseProviderContract = [ordered]@{ driverName = 'codex_head_pose'; registeredDevicePath = '/devices/codex_head_pose/CSX-NULL-HMD-POSE-1'; semanticTarget = '/user/head'; sharedMemoryName = $headPoseMapName; sharedMemoryVersion = 2; sharedMemorySize = 128; minimumQualifiedEyeHeightMeters = 1.0; maximumQualifiedEyeHeightMeters = 2.5 }
         automationInputContract = [ordered]@{ hmdPoseProvider = 'codex-head-pose-v2'; hmdPoseControl = 'shared-memory-v2'; controllerInput = 'unavailable'; dashboardInput = 'disabled'; replayReady = $false; measurementReady = $false; qualificationRequired = 'fixture qualification' }
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $profilePath -Encoding utf8
 
+    $poseMapping = [IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew($headPoseMapName, 128)
+    $poseView = $poseMapping.CreateViewAccessor(0, 128, [IO.MemoryMappedFiles.MemoryMappedFileAccess]::ReadWrite)
+    $poseView.Write(0, [uint32]0x48505343)
+    $poseView.Write(4, [uint16]2)
+    $poseView.Write(6, [uint16]128)
+    $poseView.Write(8, [uint64]2)
+    $poseView.Write(16, [uint64]2)
+    $poseView.Write(24, [uint32]1)
+    $poseView.Write(28, [uint32]1)
+    $poseView.Write(32, [double]0.0)
+    $poseView.Write(40, [double]1.68)
+    $poseView.Write(48, [double]0.0)
+    $poseView.Write(56, [double]1.0)
+    $poseView.Write(64, [double]0.0)
+    $poseView.Write(72, [double]0.0)
+    $poseView.Write(80, [double]0.0)
+    $poseView.Write(88, [uint64]41)
+    $poseView.Write(96, [uint64]41)
+    $poseView.Write(104, [uint64]73)
+    $poseView.Write(112, [uint32]$PID)
+    $poseView.Write(120, [uint64][DateTime]::UtcNow.ToFileTimeUtc())
+
     $inspectBefore = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json
     Assert-Test ($inspectBefore.ok -and $inspectBefore.state -eq 'null-inactive') 'inspect identifies inactive null profile'
+    Assert-Test ($inspectBefore.data.runtime.headPoseState.qualified -and $inspectBefore.data.runtime.headPoseState.protocolValid -and $inspectBefore.data.runtime.headPoseState.driverIdentityVerified) 'inspect accepts a fully acknowledged v2 head-pose provider with verified live-process identity'
+    $poseView.Write(96, [uint64]42)
+    $nonceMismatch = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json
+    Assert-Test (-not $nonceMismatch.data.runtime.headPoseState.qualified -and -not $nonceMismatch.data.runtime.headPoseState.acknowledged) 'inspect rejects a v2 provider whose acknowledged writer nonce does not match'
+    $poseView.Write(96, [uint64]41)
     Assert-Test ((Test-Path -LiteralPath $inspectBefore.data.targetControl.directory -PathType Container) -and $inspectBefore.data.targetControl.key -match '^[0-9a-f]{64}$') 'canonical live targets map to a deterministic target-owned control directory'
 
     $heldLock = [IO.File]::Open([string]$inspectBefore.data.targetControl.lockPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
@@ -297,6 +327,8 @@ try {
 }
 finally {
     $env:CSX_STEAMVR_TRANSACTION_ROOT = $priorTransactionRoot
+    if ($poseView) { $poseView.Dispose() }
+    if ($poseMapping) { $poseMapping.Dispose() }
     if (Test-Path -LiteralPath $resolvedFixture) { Remove-Item -LiteralPath $resolvedFixture -Recurse -Force }
 }
 
