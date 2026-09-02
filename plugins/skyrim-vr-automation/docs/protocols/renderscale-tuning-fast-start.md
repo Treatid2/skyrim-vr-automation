@@ -268,6 +268,16 @@ wait. Use `yield_control()` when a user update is due while the cell continues;
 never return to model reasoning, local commands, or evidence processing between
 safe rows. Stop the loop in the cell on an unsafe terminal receipt.
 
+When a terminal row proves the game remains loaded in the exact scene but its
+operation or physical mutation is stuck, preserve that failed row and make one
+runner-owned reset to the lane's existing starting profile. Use a fresh
+qualification owner and the render-scale iteration `apply` action so the reset
+can supersede the stuck public request. This reset is not a matrix row and must
+not retry or revise the failed destination. Continue with the next row only
+after the reset's strict waiter is satisfied and safe. Device loss, OOM, lost
+scene/ownership/build or transport, missing terminal evidence, or a
+rejected/unstable reset stops future mutations.
+
 Start the next row's one synchronous scenario immediately. Its first step is
 the sole server-owned `wait` of exactly 5,000 ms, followed by that row's
 preconstructed begin/dispatch/apply/wait sequence. Use the preceding terminal

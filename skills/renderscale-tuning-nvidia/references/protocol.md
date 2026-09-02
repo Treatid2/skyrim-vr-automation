@@ -285,16 +285,25 @@ matrix row when the terminal waiter
 proves the game responsive, the qualification owner closed, no active
 operation or unresolved physical mutation, and exact PID/build ownership.
 Do not demand a second snapshot or status receipt for those same facts.
-Otherwise stop future mutations without attempting repair.
+If the terminal waiter instead proves the exact scene remains loaded but the
+operation or physical mutation is stuck, preserve the failed row and attempt
+one reset to the lane's existing DLSS Hoshipa starting profile. Use a fresh
+qualification owner and the render-scale iteration `apply` action so the reset
+can supersede the stuck public request. The reset is not a measured row and
+does not retry or revise the failed destination. Continue only after its strict
+waiter is satisfied and safe. Device loss, OOM, lost scene/ownership/build or
+transport, missing terminal evidence, or a rejected/unstable reset stops the
+run.
 
 A completed transition-level physical-contract, presentation, lifecycle, or
 both-eye fidelity mismatch makes that row `FAIL`; it does not by itself make
 control unsafe. Once its terminal receipt is preserved, its trace owner is
 closed, and the conditions above are clean, continue to the next matrix row so
-the assay retains the build's error history. Stop only for unresolved ownership
-or mutation, a still-active owner/operation, stale or mixed resources still in
-use, producer terminal failure, device loss, OOM, identity loss, or transport
-loss whose terminal receipt cannot be recovered.
+the assay retains the build's error history. A stuck operation, unresolved
+mutation, or producer terminal failure uses the one reset above when its exact
+terminal/scene ownership remains provable. Stop directly for device loss, OOM,
+identity or transport loss, missing terminal evidence, or lost ownership; stop
+after any reset that is rejected or does not stabilize.
 
 Preserve the terminal receipt first on every stop path. While direct control
 remains callable, finalize immediately: stop only task-owned trace, profiler,
@@ -306,8 +315,9 @@ genuinely unavailable, retain the guards and ask the user before later cleanup.
 Every entry has exactly one begin, one dispatch, one apply, and one terminal
 qualification receipt from the same strict waiter for every destination. The
 public API must be the sole mutation path. Do not open the CS menu and do
-not call `communityshaders.renderscale` action `apply`. No external
-frame-timing source is used.
+not call `communityshaders.renderscale` action `apply` for a baseline or matrix
+destination. The single reset described above is the only exception. No
+external frame-timing source is used.
 
 For every entry, distinguish the pre-mutation interval from destructive
 mutation using the producer's `physicalMutationStarted` evidence, whose first
@@ -734,11 +744,12 @@ stale-provider evidence. Never average None, TAA, DLAA, and FSR Native AA.
 Classify every transition `PASS`, `FAIL`, `BLOCKED`, or `INCONCLUSIVE`.
 Preserve semantic anomalies and continue only when control, PID, build,
 required tools, and mutation ownership remain valid. A qualification-terminal
-row failure is not a producer terminal failure. Stop future mutations on a
-scenario abort, unrecoverable transport/control failure, identity mismatch,
-device loss, OOM, leaked owner/session, active operation, unresolved physical
-mutation, or stale/mixed resources that remain in use. Do not stop solely
-because a completed row recorded a physical or fidelity mismatch.
+row failure is not a producer terminal failure. Apply the one bounded reset
+above for an exact terminal row with a stuck operation or mutation. Stop future
+mutations on a scenario abort without terminal evidence, failed reset,
+unrecoverable transport/control failure, identity mismatch, device loss, OOM,
+or leaked owner/session. Do not stop solely because a completed row recorded a
+physical or fidelity mismatch.
 
 If the matrix ends early, label every entry that was never dispatched
 `NOT RUN`, never `BLOCKED`. Reserve `BLOCKED` for a row whose required admission

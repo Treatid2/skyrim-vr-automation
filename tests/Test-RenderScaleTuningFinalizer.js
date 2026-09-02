@@ -710,6 +710,46 @@ function testAmdParity() {
     }
 }
 
+function testRecoveryIsReportedWithoutRewritingFailure() {
+    const root = createEvidenceRoot("nvidia", true);
+    try {
+        const retainedPath = path.join(root, "raw", "pass-1", "transitions",
+            "02", "retained.json");
+        const receipt = JSON.parse(fs.readFileSync(retainedPath, "utf8"));
+        receipt.recovery = {
+            status: "RECOVERED",
+            target: {
+                method: "dlss", qualityMode: "hoshipa",
+                renderScaleMode: true, dlssProfile: "K",
+            },
+            receiptKey: "nvidia-test-run:nvidia:pass-1:transition-2:recovery",
+        };
+        receipt.recoveryReceiptKey = receipt.recovery.receiptKey;
+        writeJson(retainedPath, receipt);
+        const result = finalizeEvidence({ root, variant: "nvidia",
+            runId: "nvidia-test-run", buildId: "e".repeat(64), expectedRows: 2,
+            generatedUtc: "2026-08-30T20:00:00.000Z" });
+        const row = result.summary.transitions[1];
+        assert(result.summary.schemaVersion ===
+            "renderscale-tuning-nvidia-summary-v5" &&
+            row.renderVerdict === "FAIL" &&
+            row.recoveryStatus === "RECOVERED" &&
+            row.recoveryTarget.method === "dlss" &&
+            row.recoveryReceiptKey === receipt.recovery.receiptKey,
+        "Recovery rewrote the failed row or was omitted from the summary.");
+        const csvText = fs.readFileSync(path.join(root, "transitions.csv"),
+            "utf8");
+        const reportText = fs.readFileSync(path.join(root, "report.md"), "utf8");
+        assert(csvText.includes("recovery_status") &&
+            csvText.includes("RECOVERED") &&
+            reportText.includes("| FAIL |") &&
+            reportText.includes("| reset after row |"),
+        "Recovery was omitted from the durable CSV or report.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
 function testValidationLeavesEvidenceUntouched() {
     const root = createEvidenceRoot();
     try {
@@ -757,6 +797,7 @@ Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testReportingSeparation).then(testUnownedViolationRemainsReported)
     .then(testMatchedViolationSurvivesIncompletePeer)
     .then(testAmdParity)
+    .then(testRecoveryIsReportedWithoutRewritingFailure)
     .then(testBaselineOnlyInterruptedFinalization)
     .then(testPartialInterruptedFinalization)
     .then(testValidationLeavesEvidenceUntouched)

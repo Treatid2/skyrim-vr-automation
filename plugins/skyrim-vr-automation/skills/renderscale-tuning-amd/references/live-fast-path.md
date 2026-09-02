@@ -39,10 +39,16 @@ immediately and emit only a compact projection. Do not pause for model
 reasoning, read files, write evidence, hash, or issue a confirmation read
 between rows.
 
-Continue after a semantic baseline or row failure only when the terminal receipt proves
-the owner closed, zero active operation, matching PID/Build ID, and no device
-loss, OOM, producer terminal failure, or unresolved mutation. Otherwise stop
-future mutations and perform only ownership-guarded cleanup. After pass 1,
+Continue directly after a semantic baseline or row failure when the terminal
+receipt proves the owner closed, zero active operation, matching PID/Build ID,
+and no unresolved mutation. When a row instead closes with the game still in
+world but its operation or physical mutation stuck, preserve the failed row
+and make exactly one runner-owned recovery apply to this lane's proven starting
+profile. Use the render-scale iteration action only for that recovery, qualify
+the reset strictly under a fresh owner, do not retry the failed destination,
+and continue with the next row only after the reset is safe and stable. Device
+loss, OOM, lost scene/ownership/transport, or failed recovery stops future
+mutations and triggers ownership-guarded cleanup. After pass 1,
 finalize its owned sessions, take the memory boundary, run the one server-owned
 10,000 ms cooldown, establish the fresh pass-2 baseline and owners, and repeat
 the unchanged lane matrix. Finalize a lane before selecting the next one.

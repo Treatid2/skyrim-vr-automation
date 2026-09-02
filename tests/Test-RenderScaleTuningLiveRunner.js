@@ -178,12 +178,18 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
         if (args.action === "gpu_performance_status") return { capture: { active: gpuActive } };
         if (args.action === "texture_lifetime_status") return { capture: { active: textureActive } };
         if (step.label === "profile-apply") return { apply: { disposition: { name: "queued" } } };
+        if (step.label === "recovery-profile-apply") {
+            return { action: "apply", accepted: true, disposition: "queued" };
+        }
         return {};
     }
 
     async function scenario(args) {
         scenarioCalls.push(args);
         const applyStep = args.steps.find((step) => step.label === "profile-apply");
+        const recoveryApplyStep = args.steps.find((step) =>
+            step.label === "recovery-profile-apply");
+        const recovery = Boolean(recoveryApplyStep);
         const waitStep = args.steps.find((step) => step.label === "qualification-wait");
         const firstMeasured = args.steps.some((step) =>
             step.label === "qualification-dispatch" && step.args.startPerformanceTelemetry === true);
@@ -200,7 +206,16 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
                 return { label: step.label, result: toolResult(step) };
             }
             revision += 1;
-            const target = applyStep.args.target;
+            const waiterProfile = waitStep.args.target;
+            const target = applyStep ? applyStep.args.target : {
+                method: waiterProfile.method,
+                qualityMode: ["native_aa", "hoshipa", "ultra_quality",
+                    "quality", "balanced", "performance",
+                    "ultra_performance"][waiterProfile.qualityMode],
+                renderScaleMode: waiterProfile.renderScaleMode,
+                dlssProfile: waiterProfile.dlssProfile || "K",
+                fsrRuntime: waiterProfile.fsrRuntime || "fsr3",
+            };
             const profile = flatProfile(target);
             const renderWidth = target.renderScaleMode ? 100 : 200;
             const renderHeight = target.renderScaleMode ? 100 : 200;
@@ -227,7 +242,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
                 displayHeight: 200,
                 compositorCycleToken: 22,
             });
-            const semanticFailure = semanticFailureOrdinal > 0 &&
+            const semanticFailure = !recovery && semanticFailureOrdinal > 0 &&
                 ((transitionOrdinal - 1) % 33) + 1 === semanticFailureOrdinal;
             if (traceActive && target.method === "dlss") {
                 traceRecords = [
@@ -371,6 +386,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
                 if (entry.label === "qualification-wait") {
                     entry.result = receiptTransform(entry.result, {
                         transitionOrdinal,
+                        recovery,
                         baseline: args.steps.some((step) =>
                             step.label === "baseline-stress-start"),
                     });
@@ -384,7 +400,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
             results,
         };
         return envelope(scenarioTransform ?
-            scenarioTransform(root, args, { transitionOrdinal }) : root);
+            scenarioTransform(root, args, { transitionOrdinal, recovery }) : root);
     }
 
     return {
@@ -779,6 +795,232 @@ async function testPositionRenderScalePayloadIsOpaque() {
     "A missing outer position-renderscale result was not rejected.");
     assert(rejected.scenarioCalls.length === 0,
         "The runner mutated the game after invalid positioning evidence.");
+}
+
+async function testUnsafeTransitionRestoresBaselineAndContinues() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const failOrdinal = 13;
+    const mock = createMock(0, (receipt, context) => {
+        if (!context.baseline && !context.recovery &&
+            ((context.transitionOrdinal - 1) % 33) + 1 === failOrdinal) {
+            receipt.ok = false;
+            receipt.error = "qualification reached a terminal state";
+            receipt.satisfied = false;
+            receipt.outcome = "terminal_failure";
+            receipt.failureReasons = [
+                { category: "provider", code: "provider_terminal_failure" },
+                { category: "api", code: "api_operation_active" },
+            ];
+            receipt.cleanupDrained = false;
+            receipt.upscalingSnapshot.activeOperationId = 14;
+            receipt.observation.facts.apiOperationClear = false;
+            receipt.observation.facts.physicalMutationClear = false;
+            receipt.observation.facts.terminalClear = false;
+        }
+        return receipt;
+    }, (root, args, state) => {
+        if (!state.recovery) {
+            const waiter = root.results.find((entry) =>
+                entry.label === "qualification-wait");
+            if (waiter && waiter.result && waiter.result.ok === false) {
+                root.ok = false;
+                root.aborted = true;
+            }
+        }
+        return root;
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "nvidia",
+        runId: "recover-unsafe-transition",
+        buildId,
+        positioningRoot: positioningRoot(),
+        matrix,
+    });
+    assert(result.ok === true && result.status === "COMPLETE",
+        "A recoverable terminal transition stopped the assay.");
+    assert(result.lanes[0].passes.every((pass) => pass.rows.length === 33),
+        "Recovery omitted later matrix rows.");
+    const recoveries = mock.scenarioCalls.filter((call) =>
+        call.steps.some((step) => step.label === "recovery-profile-apply"));
+    assert(recoveries.length === 2,
+        "The runner did not make exactly one recovery attempt per failed pass.");
+    assert(recoveries.every((call) => {
+        const apply = call.steps.find((step) =>
+            step.label === "recovery-profile-apply");
+        return apply.tool === "communityshaders.renderscale" &&
+            apply.args.method === "dlss" && apply.args.enabled === true &&
+            apply.args.qualityMode === 1 && apply.args.dlssPreset === 1;
+    }), "Recovery did not restore the lane's proven baseline.");
+    const failedRows = mock.notifications.filter((row) =>
+        row.ordinal === failOrdinal);
+    assert(failedRows.length === 2 && failedRows.every((row) =>
+        row.satisfied === false && row.recovery &&
+        row.recovery.status === "RECOVERED"),
+    "Failed transitions did not retain their verdict and recovery result.");
+    const afterRecoveryRows = mock.notifications.filter((row) =>
+        row.ordinal === failOrdinal + 1);
+    assert(afterRecoveryRows.length === 2 && afterRecoveryRows.every((row) =>
+        typeof row.sourceRecoveryReceiptKey === "string"),
+    "The next rows did not disclose their reset baseline source.");
+    const retained = mock.stores.get(
+        "recover-unsafe-transition:nvidia:pass-1:transition-13");
+    assert(retained && retained.waiter.satisfied === false &&
+        retained.recovery.status === "RECOVERED" &&
+        retained.recoveryReceiptKey,
+    "The failed row was not linked to its baseline recovery evidence.");
+}
+
+async function testAmdUnsafeTransitionUsesLaneBaseline() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-amd", "references",
+        "matrix.v1.json")));
+    let injected = false;
+    const mock = createMock(0, (receipt, context) => {
+        if (!injected && !context.baseline && !context.recovery) {
+            injected = true;
+            receipt.ok = false;
+            receipt.error = "qualification reached a terminal state";
+            receipt.satisfied = false;
+            receipt.outcome = "terminal_failure";
+            receipt.failureReasons = [
+                { category: "provider", code: "provider_terminal_failure" },
+            ];
+            receipt.cleanupDrained = false;
+            receipt.upscalingSnapshot.activeOperationId = 9;
+            receipt.observation.facts.apiOperationClear = false;
+            receipt.observation.facts.physicalMutationClear = false;
+            receipt.observation.facts.terminalClear = false;
+        }
+        return receipt;
+    }, (root, args, state) => {
+        if (!state.recovery) {
+            const waiter = root.results.find((entry) =>
+                entry.label === "qualification-wait");
+            if (waiter && waiter.result && waiter.result.ok === false) {
+                root.ok = false;
+                root.aborted = true;
+            }
+        }
+        return root;
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "amd",
+        runId: "recover-amd-transition",
+        buildId,
+        positioningRoot: positioningRoot({
+            supportedFSRRuntimeMask: 1,
+            fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }],
+        }),
+        matrix,
+    });
+    assert(result.ok === true && result.status === "COMPLETE",
+        "AMD recovery stopped the assay.");
+    const recoveries = mock.scenarioCalls.filter((call) =>
+        call.steps.some((step) => step.label === "recovery-profile-apply"));
+    assert(recoveries.length === 1,
+        "AMD did not make exactly one recovery attempt for the failed row.");
+    const apply = recoveries[0].steps.find((step) =>
+        step.label === "recovery-profile-apply");
+    assert(apply.tool === "communityshaders.renderscale" &&
+        apply.args.method === "fsr" && apply.args.enabled === true &&
+        apply.args.qualityMode === 1 && !("dlssPreset" in apply.args),
+    "AMD recovery did not restore the active lane's FSR Hoshipa baseline.");
+}
+
+async function testFailedRecoveryStopsLaterTransitions() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    let injected = false;
+    const mock = createMock(0, (receipt, context) => {
+        if (!injected && !context.baseline && !context.recovery) {
+            injected = true;
+            receipt.ok = false;
+            receipt.error = "qualification reached a terminal state";
+            receipt.satisfied = false;
+            receipt.outcome = "terminal_failure";
+            receipt.cleanupDrained = false;
+            receipt.upscalingSnapshot.activeOperationId = 10;
+            receipt.observation.facts.apiOperationClear = false;
+            receipt.observation.facts.physicalMutationClear = false;
+            receipt.observation.facts.terminalClear = false;
+        }
+        return receipt;
+    }, (root, args, state) => {
+        const waiter = root.results.find((entry) =>
+            entry.label === "qualification-wait");
+        if (state.recovery) {
+            const apply = root.results.find((entry) =>
+                entry.label === "recovery-profile-apply");
+            apply.result.accepted = false;
+            root.ok = false;
+            root.aborted = true;
+        } else if (waiter && waiter.result && waiter.result.ok === false) {
+            root.ok = false;
+            root.aborted = true;
+        }
+        return root;
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "nvidia",
+        runId: "failed-recovery",
+        buildId,
+        positioningRoot: positioningRoot(),
+        matrix,
+    });
+    assert(result.ok === false && result.status === "INTERRUPTED" &&
+        result.lanes[0].passes[0].error === "transition_recovery_failed",
+    "A failed reset did not stop the assay explicitly.");
+    const measuredApplies = mock.scenarioCalls.flatMap((call) => call.steps)
+        .filter((step) => step.label === "profile-apply");
+    assert(measuredApplies.length === 2,
+        "The runner continued measured mutations after recovery failed.");
+    const retained = mock.stores.get(
+        "failed-recovery:nvidia:pass-1:transition-1");
+    assert(retained.recovery.status === "FAILED" &&
+        typeof retained.recoveryReceiptKey === "string",
+    "The failed recovery was not linked from the interrupted row.");
+}
+
+async function testDeviceLossNeverAttemptsRecovery() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    let injected = false;
+    const mock = createMock(0, (receipt, context) => {
+        if (!injected && !context.baseline && !context.recovery) {
+            injected = true;
+            receipt.satisfied = false;
+            receipt.outcome = "terminal_failure";
+            receipt.failureReasons = [
+                { category: "diagnostics", code: "device_lost_failure" },
+            ];
+            receipt.upscalingSnapshot.activeOperationId = 11;
+            receipt.observation.facts.apiOperationClear = false;
+            receipt.observation.facts.physicalMutationClear = false;
+            receipt.observation.facts.terminalClear = false;
+        }
+        return receipt;
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "nvidia",
+        runId: "device-loss-no-recovery",
+        buildId,
+        positioningRoot: positioningRoot(),
+        matrix,
+    });
+    assert(result.ok === false && result.status === "INTERRUPTED" &&
+        result.lanes[0].passes[0].error === "transition_unsafe",
+    "Device loss did not stop the assay.");
+    assert(!mock.scenarioCalls.some((call) => call.steps.some((step) =>
+        step.label === "recovery-profile-apply")),
+    "The runner attempted a reset after device loss.");
 }
 
 async function testFlatTerminalBoundary() {
@@ -1470,7 +1712,11 @@ async function testEvidenceVerdicts() {
 Promise.all([testNvidia(), testAmd(), testEvidenceVerdicts(),
     testScenarioFailureRetention(), testInformationalReasonIsNotFailure(),
     testOptionalTerminalFacts(), testSafeUnstableBaselineContinues(),
-    testFlatTerminalBoundary(), testPositionRenderScalePayloadIsOpaque()]).then(() => {
+    testFlatTerminalBoundary(), testPositionRenderScalePayloadIsOpaque(),
+    testUnsafeTransitionRestoresBaselineAndContinues(),
+    testAmdUnsafeTransitionUsesLaneBaseline(),
+    testFailedRecoveryStopsLaterTransitions(),
+    testDeviceLossNeverAttemptsRecovery()]).then(() => {
     process.stdout.write("Render-scale tuning live runner tests passed.\n");
 }).catch((error) => {
     process.stderr.write(`${error.stack || error}\n`);

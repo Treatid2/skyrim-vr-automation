@@ -591,6 +591,7 @@ function transitionRow(root, file, retained) {
     const traceRequired = target.method === "dlss";
     const traceComplete = !traceRequired || ["traceReset", "traceStart", "traceStop",
         "traceRead"].every((name) => retained[name]);
+    const recovery = retained.recovery || null;
     return {
         ...identity,
         target,
@@ -624,6 +625,11 @@ function transitionRow(root, file, retained) {
             projection.presentationStretchTerminalRecovery === true,
         traceRequired,
         traceComplete,
+        recoveryStatus: recovery ? recovery.status || "not_exposed" : "not_needed",
+        recoveryTarget: recovery ? recovery.target || null : null,
+        recoveryReceiptKey: retained.recoveryReceiptKey ||
+            recovery && recovery.receiptKey || null,
+        sourceRecoveryReceiptKey: retained.sourceRecoveryReceiptKey || null,
         rawRetained: relative(root, file),
     };
 }
@@ -657,7 +663,9 @@ function csv(rows) {
         "transition_evidence_complete",
         "physical_mutation_started", "final_method", "final_quality",
         "final_render_scale_mode", "final_state_revision", "trace_required",
-        "trace_complete", "boundary_exposed", "dispatch_frame",
+        "trace_complete", "recovery_status", "recovery_target",
+        "recovery_receipt_key", "source_recovery_receipt_key",
+        "boundary_exposed", "dispatch_frame",
         "dispatch_qpc_tick", "dispatch_left_generation",
         "dispatch_left_transition_epoch", "dispatch_left_resource_revision",
         "dispatch_right_generation", "dispatch_right_transition_epoch",
@@ -692,6 +700,8 @@ function csv(rows) {
             row.physicalMutationStarted,
             row.finalMethod, row.finalQuality, row.finalRenderScaleMode,
             row.finalStateRevision, row.traceRequired, row.traceComplete,
+            row.recoveryStatus, row.recoveryTarget, row.recoveryReceiptKey,
+            row.sourceRecoveryReceiptKey,
             diagnostics.boundaryExposed, diagnostics.dispatchFrame,
             diagnostics.dispatchQpcTick, diagnostics.dispatchLeft.generation,
             diagnostics.dispatchLeft.transitionEpoch,
@@ -722,9 +732,13 @@ function report(summary) {
             `not stable: ${note.presentationDisposition}; ` +
                 `${note.leftEyePath}/${note.rightEyePath}; ` +
                 `${note.controllerState}/${note.presentationPhase}` : "stable";
+        const recovery = row.recoveryStatus === "RECOVERED" ?
+            "reset after row" : row.sourceRecoveryReceiptKey ?
+                "started after reset" : row.recoveryStatus;
         return (
         `| ${row.lane || "default"} | ${row.pass} | ${row.ordinal} | ` +
         `${row.renderVerdict} | ${stability} | ${row.task2Verdict} | ` +
+        `${recovery} | ` +
         `${row.phaseCounterAuthorityStatus} | ` +
         `${row.reportedTask2Violations.join("; ") || "none"} | ` +
         `${row.task2MissingEvidence.join("; ") || "none"} | ` +
@@ -759,9 +773,9 @@ function report(summary) {
         `per-transition evidence. Every raw JSON value is available in ` +
         `\`${summary.evidenceExtraction.path}\`.\n\n` +
         `## Transitions\n\n` +
-        `| Lane | Pass | Row | Render | Stability | Task 2 | Authority | Reported violations | ` +
+        `| Lane | Pass | Row | Render | Stability | Task 2 | Recovery | Authority | Reported violations | ` +
         `Missing evidence | Invalid producer evidence |\n` +
-        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n`;
+        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n`;
 }
 
 function writeAtomic(file, content) {
@@ -855,7 +869,7 @@ function finalizeEvidence(options) {
         "not_exposed";
     const summary = {
         ...existing,
-        schemaVersion: `renderscale-tuning-${variant}-summary-v4`,
+        schemaVersion: `renderscale-tuning-${variant}-summary-v5`,
         protocol: `renderscale-tuning-${variant}`,
         runId: runIds[0],
         generatedUtc,

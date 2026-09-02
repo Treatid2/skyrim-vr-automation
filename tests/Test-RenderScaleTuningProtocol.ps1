@@ -81,7 +81,8 @@ foreach ($token in @(
     'phaseCounterAuthorityStatus', 'reportedTask2Violations',
     'producer_invalid_evidence', 'deploymentVerification',
     'deployment-verification.json', 'artifact-path', 'manifest-path',
-    'nonStableNote', 'stabilityNotes', 'stability_presentation_disposition'
+    'nonStableNote', 'stabilityNotes', 'stability_presentation_disposition',
+    'recoveryStatus', 'recovery_receipt_key', 'source_recovery_receipt_key'
 )) {
     Assert-Contains $finalizer $token 'Shared tuning finalizer'
 }
@@ -98,7 +99,7 @@ foreach ($token in @(
     'enumName(profile.dlssProfile)', 'enumName(profile.fsrRuntime)',
     'matrix.pacingMilliseconds', 'matrix.completionTimeoutMilliseconds',
     'startPerformanceTelemetry: firstRow',
-    'retain(`${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`',
+    'const retainedKey =', 'retain(retainedKey, retained)',
     'action: "dlss_trace_read"', 'traceReset:', 'traceStart:', 'traceRead:',
     'retainAmdTraceCapability', 'amd:dlss-trace-capability',
     'transitionProjection', 'waiter.cleanupDrained === true',
@@ -111,7 +112,9 @@ foreach ($token in @(
     '"physicalMutationClear"', 'facts.terminalClear === true',
     'waitArgs.foveation = foveation',
     'for (const row of matrix.transitions)', 'notify({',
-    'function nonStableNote', 'status: "not_stable"'
+    'function nonStableNote', 'status: "not_stable"',
+    'restoreBaseline', 'recovery-profile-apply',
+    'transition_recovery_failed', 'recoveryReceiptKey'
 )) {
     Assert-Contains $runner $token 'Deterministic tuning runner'
 }
@@ -414,7 +417,10 @@ foreach ($variant in $variants) {
         'do not call `qualification_cancel` after any terminal waiter receipt',
         'in the terminal snapshot',
         'recorded transition `FAIL` or `INCONCLUSIVE`',
-        'qualification owner closed', 'Otherwise stop future mutations',
+        'qualification owner closed',
+        "lane's existing", 'starting profile',
+        'does not retry or revise the failed destination',
+        'single reset described above is the only exception',
         'vendor_native', 'same-frame', 'nativeVendorExecution',
         'observation.nativeVendorExecution', 'older producer',
         '`sameFrameBothEyesValid: true`', '`actualBackend`',
@@ -587,7 +593,7 @@ foreach ($protocol in @(
         'without changing the shared 20-second measurement deadline',
         '`qualification_status`',
         'Never replay the',
-        'terminal receipt cannot be recovered',
+        'missing terminal evidence',
         'does not by itself make control unsafe',
         'must remain `PASS`',
         '`nativeGenerationEvidence: INCONCLUSIVE`',

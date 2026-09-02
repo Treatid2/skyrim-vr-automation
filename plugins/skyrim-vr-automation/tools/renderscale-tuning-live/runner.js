@@ -37,6 +37,7 @@ async function runRenderScaleTuningLive(context) {
     });
     const qualityName = Object.freeze(Object.fromEntries(
         Object.entries(quality).map(([name, value]) => [value, name])));
+    const dlssProfile = Object.freeze({ J: 0, K: 1, L: 2, M: 3, F: 4, E: 5 });
     const foveation = Object.freeze({
         foveatedVendorDispatch: true,
         foveatedCenterArea: 0.3,
@@ -292,6 +293,15 @@ async function runRenderScaleTuningLive(context) {
         };
     }
 
+    function recoveryIds(laneIndex, pass, ordinal) {
+        const serial = laneIndex * 100 + pass * 40 + ordinal;
+        const stem = `${runId}-${variant}-${laneIndex}-${pass}-${ordinal}-recovery`;
+        return {
+            transitionId: 500000 + serial,
+            ownerId: `${stem}-owner`,
+        };
+    }
+
     function qualificationSteps(boundary, target, identifiers, baseline, firstRow) {
         const steps = [];
         if (baseline) {
@@ -388,6 +398,28 @@ async function runRenderScaleTuningLive(context) {
             facts.loadedInWorld === true && facts.terminalClear === true &&
             optionalSafetyFactClear(facts, "apiOperationClear") &&
             optionalSafetyFactClear(facts, "physicalMutationClear");
+    }
+
+    function recoverableTerminal(waiter, identifiers) {
+        if (!waiter || waiter.action !== "qualification_wait" ||
+            waiter.transitionId !== identifiers.transitionId ||
+            waiter.ownerId !== identifiers.ownerId ||
+            !waiter.upscalingSnapshot ||
+            !Number.isSafeInteger(waiter.upscalingSnapshot.activeOperationId)) {
+            return false;
+        }
+        const facts = waiter.observation && waiter.observation.facts;
+        if (!facts || facts.stressSession !== true || facts.exactCell !== true ||
+            facts.loadedInWorld !== true) {
+            return false;
+        }
+        const failureCodes = Array.isArray(waiter.failureReasons) ?
+            waiter.failureReasons.map((reason) =>
+                typeof reason === "string" ? reason :
+                    reason && `${reason.category || ""}:${reason.code || ""}`)
+                .filter(Boolean).map((reason) => reason.toLowerCase()) : [];
+        return !failureCodes.some((reason) =>
+            /device[_ -]?los(?:s|t)|out[_ -]?of[_ -]?memory|(^|[:_ -])oom($|[:_ -])/.test(reason));
     }
 
     function nonStableNote(waiter) {
@@ -980,6 +1012,112 @@ async function runRenderScaleTuningLive(context) {
         }
     }
 
+    async function restoreBaseline(boundary, lane, laneIndex, pass, row,
+        closeDlssTrace) {
+        const target = targetFor(boundary,
+            matrix.destinations[matrix.initialDestination],
+            lane.configuredFsrRuntime);
+        if ((target.method !== "dlss" && target.method !== "fsr") ||
+            target.renderScaleMode !== true ||
+            !Number.isSafeInteger(quality[target.qualityMode])) {
+            throw new Error("recovery_baseline_target_invalid");
+        }
+        const identifiers = recoveryIds(laneIndex, pass, row.ordinal);
+        const steps = [];
+        if (closeDlssTrace) {
+            steps.push(toolStep("failed-dlss-trace-stop",
+                "communityshaders.renderscale", {
+                    action: "dlss_trace_stop", expectedBuildId: buildId,
+                }));
+            steps.push(toolStep("failed-dlss-trace-read",
+                "communityshaders.renderscale", {
+                    action: "dlss_trace_read", afterSequence: 0,
+                    limit: matrix.traceReadLimit, expectedBuildId: buildId,
+                }));
+        }
+        steps.push(toolStep("recovery-qualification-begin",
+            "communityshaders.renderscale", {
+                action: "qualification_begin",
+                transitionId: identifiers.transitionId,
+                ownerId: identifiers.ownerId,
+                expectedBuildId: buildId,
+            }));
+        steps.push(toolStep("recovery-qualification-dispatch",
+            "communityshaders.renderscale", {
+                action: "qualification_dispatch",
+                transitionId: identifiers.transitionId,
+                ownerId: identifiers.ownerId,
+                startPerformanceTelemetry: false,
+                expectedBuildId: buildId,
+            }));
+        const applyArgs = {
+            action: "apply",
+            method: target.method,
+            enabled: true,
+            qualityMode: quality[target.qualityMode],
+            expectedBuildId: buildId,
+        };
+        if (target.method === "dlss") {
+            applyArgs.dlssPreset = dlssProfile[target.dlssProfile];
+        }
+        steps.push(toolStep("recovery-profile-apply",
+            "communityshaders.renderscale", applyArgs));
+        const waitArgs = {
+            action: "qualification_wait",
+            transitionId: identifiers.transitionId,
+            ownerId: identifiers.ownerId,
+            expectedCellEditorId: "WhiterunDragonsreach",
+            timeoutMs: matrix.completionTimeoutMilliseconds,
+            milestone: "strict",
+            target: waiterTarget(target),
+            foveation,
+            expectedBuildId: buildId,
+        };
+        steps.push(toolStep("qualification-wait",
+            "communityshaders.renderscale", waitArgs));
+        const receiptKey =
+            `${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}:recovery`;
+        const response = await scenario(steps, `${receiptKey}:scenario`);
+        const entries = resultMap(response.root);
+        const apply = entries.get("recovery-profile-apply");
+        const waiter = entries.get("qualification-wait");
+        const diagnostic = scenarioDiagnostic(
+            response.root, steps, `${receiptKey}:scenario`);
+        const recovered = response.root.ok === true && apply &&
+            apply.accepted === true && waiter && waiter.satisfied === true &&
+            safeTerminal(waiter, identifiers) && waiter.milestoneTimings &&
+            waiter.replacementTimeline;
+        const evidence = {
+            status: recovered ? "RECOVERED" : "FAILED",
+            scenarioReceiptKey: `${receiptKey}:scenario`,
+            scenario: diagnostic,
+            target,
+            apply,
+            waiter,
+            traceStop: entries.get("failed-dlss-trace-stop") || null,
+            traceRead: entries.get("failed-dlss-trace-read") || null,
+        };
+        retain(receiptKey, evidence);
+        if (!recovered) {
+            if (!waiter) await closeOpenQualification(identifiers);
+            throw diagnosticError("transition_recovery_failed", diagnostic);
+        }
+        return {
+            boundary: {
+                ...terminalBoundary(waiter),
+                recoveryReceiptKey: receiptKey,
+            },
+            receiptKey,
+            evidence,
+            summary: {
+                status: "RECOVERED",
+                target,
+                receiptKey,
+                elapsedMs: waiter.timing ? waiter.timing.elapsedMs : null,
+            },
+        };
+    }
+
     async function baseline(boundary, lane, laneIndex, pass) {
         const target = targetFor(
             boundary, matrix.destinations[matrix.initialDestination], lane.configuredFsrRuntime);
@@ -1083,14 +1221,20 @@ async function runRenderScaleTuningLive(context) {
         const receiptKey =
             `${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}:scenario`;
         let response;
+        let waiter;
+        let projection;
+        let diagnostic;
+        let entries = new Map();
+        const retainedKey =
+            `${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`;
+        let retained;
         try {
             response = await scenario(steps, receiptKey);
         } catch (scenarioFailure) {
-            let waiter;
             try {
                 waiter = await recoverTerminal(identifiers);
             } catch {
-                retain(`${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`, {
+                retain(retainedKey, {
                     scenarioReceiptKey: receiptKey,
                     scenario: scenarioFailure && scenarioFailure.diagnostic || null,
                     waiter: null,
@@ -1099,47 +1243,89 @@ async function runRenderScaleTuningLive(context) {
                 throw diagnosticError("transition_receipt_unavailable",
                     scenarioFailure && scenarioFailure.diagnostic || null);
             }
-            const projection = transitionProjection(waiter, target);
-            retain(`${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`, {
+            projection = transitionProjection(waiter, target);
+            diagnostic = scenarioFailure && scenarioFailure.diagnostic || null;
+            retained = {
                 scenarioReceiptKey: receiptKey,
-                scenario: scenarioFailure && scenarioFailure.diagnostic || null,
+                scenario: diagnostic,
+                sourceRecoveryReceiptKey: boundary.recoveryReceiptKey || null,
                 recoveredTerminal: true,
                 waiter,
                 projection,
                 replacementTimeline: waiter.replacementTimeline || null,
                 presentationCycleAudit: waiter.presentationCycleAudit || null,
-            });
-            if (!safeTerminal(waiter, identifiers)) throw new Error("transition_unsafe");
-            return { boundary: terminalBoundary(waiter), waiter, projection };
+            };
         }
-        const entries = resultMap(response.root);
-        const waiter = entries.get("qualification-wait");
-        const projection = waiter ? transitionProjection(waiter, target) : null;
-        const diagnostic = scenarioDiagnostic(response.root, steps, receiptKey);
-        retain(`${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`, {
-            scenarioReceiptKey: receiptKey,
-            scenario: diagnostic,
-            apply: entries.get("profile-apply"),
-            waiter,
-            projection,
-            operation: waiter && waiter.upscalingSnapshot ? {
-                activeOperationId: waiter.upscalingSnapshot.activeOperationId,
-                stateRevision: waiter.upscalingSnapshot.stateRevision,
-            } : null,
-            preparation: waiter && waiter.observation ?
-                waiter.observation.preparationTelemetry || null : null,
-            replacementTimeline: waiter ? waiter.replacementTimeline || null : null,
-            presentationCycleAudit: waiter ? waiter.presentationCycleAudit || null : null,
-            traceReset: entries.get("dlss-trace-reset") || null,
-            traceStart: entries.get("dlss-trace-start") || null,
-            traceStop: entries.get("dlss-trace-stop") || null,
-            traceRead: entries.get("dlss-trace-read") || null,
-        });
-        if (!response.root.ok || !waiter) {
-            await closeOpenQualification(identifiers);
-            throw diagnosticError("transition_scenario_failed", diagnostic);
+        if (response) {
+            entries = resultMap(response.root);
+            waiter = entries.get("qualification-wait");
+            projection = waiter ? transitionProjection(waiter, target) : null;
+            diagnostic = scenarioDiagnostic(response.root, steps, receiptKey);
+            retained = {
+                scenarioReceiptKey: receiptKey,
+                scenario: diagnostic,
+                sourceRecoveryReceiptKey: boundary.recoveryReceiptKey || null,
+                apply: entries.get("profile-apply"),
+                waiter,
+                projection,
+                operation: waiter && waiter.upscalingSnapshot ? {
+                    activeOperationId: waiter.upscalingSnapshot.activeOperationId,
+                    stateRevision: waiter.upscalingSnapshot.stateRevision,
+                } : null,
+                preparation: waiter && waiter.observation ?
+                    waiter.observation.preparationTelemetry || null : null,
+                replacementTimeline: waiter ? waiter.replacementTimeline || null : null,
+                presentationCycleAudit: waiter ? waiter.presentationCycleAudit || null : null,
+                traceReset: entries.get("dlss-trace-reset") || null,
+                traceStart: entries.get("dlss-trace-start") || null,
+                traceStop: entries.get("dlss-trace-stop") || null,
+                traceRead: entries.get("dlss-trace-read") || null,
+            };
+            retain(retainedKey, retained);
+            if (!waiter || (response.root.ok !== true &&
+                diagnostic.failedStep !== "qualification-wait")) {
+                await closeOpenQualification(identifiers);
+                throw diagnosticError("transition_scenario_failed", diagnostic);
+            }
         }
-        if (!safeTerminal(waiter, identifiers)) throw new Error("transition_unsafe");
+        retain(retainedKey, retained);
+        let recovery = null;
+        let nextBoundary;
+        if (safeTerminal(waiter, identifiers)) {
+            nextBoundary = terminalBoundary(waiter);
+        } else {
+            if (!recoverableTerminal(waiter, identifiers)) {
+                throw new Error("transition_unsafe");
+            }
+            try {
+                const restored = await restoreBaseline(
+                    boundary, lane, laneIndex, pass, row,
+                    variant === "nvidia" && target.method === "dlss" &&
+                        !retained.traceStop);
+                recovery = restored.summary;
+                retained.recovery = recovery;
+                retained.recoveryReceiptKey = restored.receiptKey;
+                if (restored.evidence.traceStop) {
+                    retained.traceStop = restored.evidence.traceStop;
+                    retained.traceRead = restored.evidence.traceRead;
+                }
+                retain(retainedKey, retained);
+                nextBoundary = restored.boundary;
+            } catch (error) {
+                const recoveryReceiptKey =
+                    `${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}:recovery`;
+                retained.recovery = {
+                    status: "FAILED",
+                    error: error instanceof Error ? error.message : String(error),
+                    receiptKey: recoveryReceiptKey,
+                    scenario: error && typeof error === "object" ?
+                        error.diagnostic || null : null,
+                };
+                retained.recoveryReceiptKey = recoveryReceiptKey;
+                retain(retainedKey, retained);
+                throw error;
+            }
+        }
         notify({
             lane: lane.id,
             pass,
@@ -1148,8 +1334,11 @@ async function runRenderScaleTuningLive(context) {
             ...projection,
             outcome: waiter.outcome,
             elapsedMs: waiter.timing ? waiter.timing.elapsedMs : null,
+            recovery,
+            sourceRecoveryReceiptKey: retained.sourceRecoveryReceiptKey,
         });
-        return { boundary: terminalBoundary(waiter), waiter, projection };
+        return { boundary: nextBoundary, waiter, projection, recovery,
+            sourceRecoveryReceiptKey: retained.sourceRecoveryReceiptKey };
     }
 
     async function retainAmdTraceCapability() {
@@ -1328,6 +1517,9 @@ async function runRenderScaleTuningLive(context) {
                         ordinal: row.ordinal,
                         receiptKey: `${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`,
                         ...completed.projection,
+                        recovery: completed.recovery,
+                        sourceRecoveryReceiptKey:
+                            completed.sourceRecoveryReceiptKey,
                     });
                 }
                 await cleanup(lane, pass, stressSessionId);
