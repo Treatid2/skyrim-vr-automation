@@ -7,7 +7,7 @@ the Skyrim VR installation. The local machine configuration is
 the resolved machine configuration; do not rediscover paths or guess profile and
 executable names when the package can report them.
 
-Version 0.8.0 provides cooperative cross-task access leases, read-only
+Version 0.9.0 provides cooperative cross-task access leases, read-only
 inspection, single-owner `prepare`, exact
 `open` and `launch`, bounded `status`, graceful `stop-game`, MO2-only
 cooperative `close`, stranded-instance `recover-close`, and graceful full
@@ -98,9 +98,16 @@ overwrite means “classify and relocate safely,” not “delete until green.�
 Before any planned MO2 use, request the shared resource:
 
 ```text
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -Label short-task-name -EstimatedMinutes 20 -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -Label short-task-name -RuntimeRoute OCU -EstimatedMinutes 20 -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate -AccessId <literal-access-id> -RequireClosed -Compact
 ```
+
+Choose exactly one route for the complete lease: `OCU`, physical `SteamVR`, or
+`SteamVRNull`. OCU cannot coexist with SteamVR. The null-HMD route is a SteamVR
+mode, not an OCU mode, and cannot coexist with the physical SteamVR route. To
+change routes, end the session, release the access lease, perform the relevant
+runtime restore/apply transaction, and request a new lease for the new route.
+The lease and prepared session both record the route.
 
 If another task owns it, `state` is `access-busy`. The response includes its
 label, whether a session is bound, and any estimated release time. The estimate

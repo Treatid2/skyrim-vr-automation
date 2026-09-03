@@ -927,7 +927,7 @@ function Write-MO2OwnedSessionAtomic {
         }
 
         $updated = $Value
-        foreach ($propertyName in @('contractVersion', 'accessId', 'leaseId', 'acquisitionMode', 'label', 'requestedUtc', 'lastRenewedUtc', 'estimatedDurationMinutes', 'estimatedReleaseUtc', 'ownerRequestPid', 'ownerRequestStartTime')) {
+        foreach ($propertyName in @('contractVersion', 'accessId', 'leaseId', 'acquisitionMode', 'label', 'requestedUtc', 'lastRenewedUtc', 'estimatedDurationMinutes', 'estimatedReleaseUtc', 'ownerRequestPid', 'ownerRequestStartTime', 'runtimeRoute')) {
             if ($current.data.PSObject.Properties[$propertyName]) {
                 $updated | Add-Member -NotePropertyName $propertyName -NotePropertyValue $current.data.$propertyName -Force
             }
@@ -1036,6 +1036,47 @@ function Test-MO2HasAccessLease {
             -not [string]::IsNullOrWhiteSpace([string]$Lock.data.accessCredentialSha256))
 }
 
+function Resolve-MO2RuntimeRouteContract {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('OCU', 'SteamVR', 'SteamVRNull')]
+        [string]$RuntimeRoute
+    )
+
+    switch ($RuntimeRoute) {
+        'OCU' {
+            return [pscustomobject][ordered]@{
+                id = 'OCU'
+                runtimeFamily = 'OpenComposite'
+                hmdMode = 'live'
+                requiresSteamVR = $false
+                requiresNullHmd = $false
+                incompatibleWith = @('SteamVR', 'SteamVRNull')
+            }
+        }
+        'SteamVR' {
+            return [pscustomobject][ordered]@{
+                id = 'SteamVR'
+                runtimeFamily = 'SteamVR'
+                hmdMode = 'live'
+                requiresSteamVR = $true
+                requiresNullHmd = $false
+                incompatibleWith = @('OCU', 'SteamVRNull')
+            }
+        }
+        'SteamVRNull' {
+            return [pscustomobject][ordered]@{
+                id = 'SteamVRNull'
+                runtimeFamily = 'SteamVR'
+                hmdMode = 'null'
+                requiresSteamVR = $true
+                requiresNullHmd = $true
+                incompatibleWith = @('OCU', 'SteamVR')
+            }
+        }
+    }
+}
+
 function Get-MO2AccessLeaseSummary {
     param([Parameter(Mandatory)]$Lock)
 
@@ -1089,6 +1130,7 @@ function Get-MO2AccessLeaseSummary {
         estimateOverdue = $estimateOverdue
         ownerRequestPid = $(if ($Lock.data.PSObject.Properties['ownerRequestPid']) { $Lock.data.ownerRequestPid } else { $null })
         ownerRequestStartTime = $(if ($Lock.data.PSObject.Properties['ownerRequestStartTime']) { [string]$Lock.data.ownerRequestStartTime } else { $null })
+        runtimeRoute = $(if ($Lock.data.PSObject.Properties['runtimeRoute']) { $Lock.data.runtimeRoute } else { $null })
         generation = $(if ($Lock.data.PSObject.Properties['generation']) { [long]$Lock.data.generation } else { 0L })
     }
 }
@@ -1124,6 +1166,9 @@ function Invoke-MO2RequestAccess {
         [Parameter(Mandatory)]$Config,
         [string]$Label = 'automation',
         [string]$TaskId,
+        [Parameter(Mandatory)]
+        [ValidateSet('OCU', 'SteamVR', 'SteamVRNull')]
+        [string]$RuntimeRoute,
         [Nullable[int]]$EstimatedMinutes,
         [ValidateRange(0, 600)][int]$WaitSeconds = 0,
         [switch]$WhatIf
@@ -1144,6 +1189,7 @@ function Invoke-MO2RequestAccess {
     $accessId = 'access-{0}-{1}' -f $now.ToString('yyyyMMddTHHmmssZ'), ([guid]::NewGuid().ToString('N').Substring(0, 12))
     $leaseId = 'lease-{0}-{1}' -f $now.ToString('yyyyMMddTHHmmssZ'), ([guid]::NewGuid().ToString('N').Substring(0, 8))
     $estimatedReleaseUtc = if ($null -ne $EstimatedMinutes) { $now.AddMinutes([int]$EstimatedMinutes).ToString('o') } else { $null }
+    $runtimeRouteContract = Resolve-MO2RuntimeRouteContract -RuntimeRoute $RuntimeRoute
     $lease = [pscustomobject][ordered]@{
         contractVersion = $script:MO2ControlContractVersion
         accessId = $accessId
@@ -1158,6 +1204,7 @@ function Invoke-MO2RequestAccess {
         estimatedReleaseUtc = $estimatedReleaseUtc
         ownerRequestPid = $PID
         ownerRequestStartTime = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+        runtimeRoute = $runtimeRouteContract
         generation = 1L
         sessionId = $null
         sessionPath = $null
@@ -1166,7 +1213,7 @@ function Invoke-MO2RequestAccess {
     $existing = Get-MO2SessionLockRecord -Path $lockPath
     if ($WhatIf) {
         $available = -not $existing.exists
-        return New-MO2ActionResult -Config $Config -Command 'request-access' -Ok $available -State $(if ($available) { 'dry-run' } else { 'access-busy' }) -Data @{ access = $lease; current = Get-MO2AccessLeaseSummary -Lock $existing; waitSeconds = $WaitSeconds; wouldCreateLock = $available; estimateIsAdvisory = $true } -Errors $(if ($available) { @() } else { @('MO2 access is already held. The estimate never expires or transfers ownership automatically.') })
+        return New-MO2ActionResult -Config $Config -Command 'request-access' -Ok $available -State $(if ($available) { 'dry-run' } else { 'access-busy' }) -Data @{ access = $lease; current = Get-MO2AccessLeaseSummary -Lock $existing; requestedRuntimeRoute = $runtimeRouteContract; waitSeconds = $WaitSeconds; wouldCreateLock = $available; estimateIsAdvisory = $true } -Errors $(if ($available) { @() } else { @('MO2 access is already held. The estimate never expires or transfers ownership automatically.') })
     }
 
     $deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
@@ -1184,7 +1231,7 @@ function Invoke-MO2RequestAccess {
             return New-MO2ActionResult -Config $Config -Command 'request-access' -Ok $true -State 'access-acquired' -Data @{ access = $lease; lockPath = $lockPath; waitedSeconds = [math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 3); estimateIsAdvisory = $true }
         }
         if ([DateTime]::UtcNow -ge $deadline) {
-            return New-MO2ActionResult -Config $Config -Command 'request-access' -Ok $false -State 'access-busy' -Data @{ current = Get-MO2AccessLeaseSummary -Lock $attempt.current; waitedSeconds = [math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 3); requestedWaitSeconds = $WaitSeconds; retryable = $true; estimateIsAdvisory = $true } -Errors @('MO2 access is already held. Retry later or explicitly recover an abandoned lease; an overdue estimate does not unlock it.')
+            return New-MO2ActionResult -Config $Config -Command 'request-access' -Ok $false -State 'access-busy' -Data @{ current = Get-MO2AccessLeaseSummary -Lock $attempt.current; requestedRuntimeRoute = $runtimeRouteContract; waitedSeconds = [math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 3); requestedWaitSeconds = $WaitSeconds; retryable = $true; estimateIsAdvisory = $true } -Errors @('MO2 access is already held. Retry later or explicitly recover an abandoned lease; an overdue estimate does not unlock it.')
         }
         Start-Sleep -Milliseconds 500
     }
@@ -2077,11 +2124,16 @@ function Invoke-MO2Prepare {
     $arguments = @('--profile', $profileName, 'run', '--executable', $executableName)
     $explicitAccess = -not [string]::IsNullOrWhiteSpace($AccessId)
     $accessLock = $null
+    $runtimeRoute = $null
     if ($explicitAccess) {
         $accessLock = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
         if (-not [string]::IsNullOrWhiteSpace([string]$accessLock.sessionId)) {
             return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'blocked' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $accessLock } -Errors @('The access lease already has a bound session. Release that session before preparing another one.')
         }
+        if (-not $accessLock.data.PSObject.Properties['runtimeRoute']) {
+            return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'blocked' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $accessLock } -Errors @('The access lease predates the required runtime-route contract. Release it and request a new lease with -RuntimeRoute OCU, SteamVR, or SteamVRNull.')
+        }
+        $runtimeRoute = $accessLock.data.runtimeRoute
     }
     else {
         $AccessId = 'access-{0}-{1}' -f ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')), ([guid]::NewGuid().ToString('N').Substring(0, 12))
@@ -2101,6 +2153,7 @@ function Invoke-MO2Prepare {
         modListPath = (Join-Path $profileDirectory 'modlist.txt')
         executable = $executableName
         requirements = [pscustomobject][ordered]@{ skseLoader = [bool]$RequireSKSE }
+        runtimeRoute = $runtimeRoute
         mo2Path = [string]$validation.data.config.mo2Executable
         arguments = $arguments
         selectedProfileBefore = [string]$validation.data.selectedProfile
@@ -2134,6 +2187,7 @@ function Invoke-MO2Prepare {
         modListPath = (Join-Path $profileDirectory 'modlist.txt')
         executable = $executableName
         requirements = [pscustomobject][ordered]@{ skseLoader = [bool]$RequireSKSE }
+        runtimeRoute = $runtimeRoute
         controllerPath = [string]$controller.controllerPath
         ownerPid = $PID
     }
@@ -3088,7 +3142,7 @@ function Get-MO2ControlHelp {
         commands = @(
             [pscustomobject]@{ name = 'inspect'; mutation = $false; description = 'Inspect MO2 paths, profiles, registered executables, processes, RootBuilder state, overwrite usage, storage and locks.' },
             [pscustomobject]@{ name = 'validate'; mutation = $false; description = 'Validate an exact profile and registered executable. Add -RequireClosed before future state-changing operations.' },
-            [pscustomobject]@{ name = 'request-access'; mutation = $true; description = 'Atomically request the shared MO2 access lease. Supports a bounded wait and an optional advisory duration estimate.' },
+            [pscustomobject]@{ name = 'request-access'; mutation = $true; description = 'Atomically request the shared MO2 access lease for exactly one runtime route: OCU, SteamVR, or SteamVRNull.' },
             [pscustomobject]@{ name = 'access-status'; mutation = $false; description = 'Report whether access is available, held, bound to a session, or owned by the supplied AccessId.' },
             [pscustomobject]@{ name = 'renew-access'; mutation = $true; description = 'Refresh an owned access lease and optionally replace its advisory duration estimate. Never extends an automatic expiry because leases do not expire automatically.' },
             [pscustomobject]@{ name = 'release-access'; mutation = $true; description = 'Release an access-only lease after proving MO2, the game, and RootBuilder deployment are inactive.' },
@@ -3109,12 +3163,18 @@ function Get-MO2ControlHelp {
         )
         examples = @(
             '.\Invoke-MO2Control.ps1 inspect',
-            '.\Invoke-MO2Control.ps1 request-access -Label "api-test" -EstimatedMinutes 20',
+            '.\Invoke-MO2Control.ps1 request-access -Label "api-test" -RuntimeRoute OCU -EstimatedMinutes 20',
             '.\Invoke-MO2Control.ps1 prepare -AccessId $accessId -Label "api-test-run"',
             '.\Invoke-MO2Control.ps1 validate -RequireClosed',
             '.\Invoke-MO2Control.ps1 validate -Profile "Codex" -Executable "Launch MGO - Do Not Unlock" -Compact'
         )
-        note = 'Version 0.8.0 preserves the lifecycle contract, adds session-scoped durable controllers, explicit profile identity, and retained failed-to-run dialog classification.'
+        runtimeRoutes = @(
+            Resolve-MO2RuntimeRouteContract -RuntimeRoute OCU
+            Resolve-MO2RuntimeRouteContract -RuntimeRoute SteamVR
+            Resolve-MO2RuntimeRouteContract -RuntimeRoute SteamVRNull
+        )
+        runtimeRouteRule = 'A lease selects exactly one route. OCU cannot coexist with either SteamVR route; SteamVRNull is the null-HMD mode of SteamVR and cannot coexist with physical SteamVR.'
+        note = 'Version 0.9.0 preserves the lifecycle contract and carries one explicit runtime route from access request into prepared session evidence.'
     }
 
     return [pscustomobject][ordered]@{

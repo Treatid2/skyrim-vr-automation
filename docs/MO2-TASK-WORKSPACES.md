@@ -9,6 +9,13 @@ copy of the maintained primary profile and survives any number of lease yields.
 Identify the task with the stable Codex task/thread ID. `list-task -TaskId`
 reports every retained workspace owned by that task.
 
+The access request must also declare exactly one runtime route: `OCU`, physical
+`SteamVR`, or `SteamVRNull`. OCU cannot coexist with either SteamVR route, and
+the null-HMD route is a SteamVR mode rather than an OCU mode. The selected route
+belongs to the short-lived access lease and prepared session, not to the
+retained profile; switching routes therefore requires ending the session and
+requesting a new lease, but does not require rebuilding the task workspace.
+
 - On the task's first MO2 request, acquire MO2 access, run `prepare-source`, and
   run `fixture-status`. Proceed to `create -TaskId` only from
   `fixture-valid`. Creation otherwise fails closed. It clones the configured

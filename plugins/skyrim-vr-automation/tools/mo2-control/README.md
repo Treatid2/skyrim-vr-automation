@@ -6,7 +6,7 @@ inspect or validate the Skyrim VR Mod Organizer 2 installation.
 `validate-closed` is the explicit closed-state spelling of `validate
 -RequireClosed`; both commands are read-only and return the same proof.
 
-Version `0.8.0` retains cooperative access arbitration and adds a durable,
+Version `0.9.0` retains cooperative access arbitration and adds a durable,
 session-scoped controller bundle, explicit profile identity fields, retained
 failed-to-run dialog cleanup, bounded launch
 pending state, helper-to-runtime PID adoption, structural Unlock handling, and
@@ -74,7 +74,7 @@ literal paths before execution):
 ```text
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> help -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> inspect -Compact
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -Label upscaling-api-tests -TaskId <stable-task-id> -EstimatedMinutes 20 -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -Label upscaling-api-tests -TaskId <stable-task-id> -RuntimeRoute OCU -EstimatedMinutes 20 -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate -AccessId <literal-access-id> -RequireClosed -RequireSKSE -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> prepare -AccessId <literal-access-id> -Label upscaling-api-run -RequireSKSE -Compact
 ```
@@ -131,7 +131,12 @@ RootBuilder failures.
 ## Cooperative access lifecycle
 
 `request-access` atomically acquires the one shared MO2 lock and returns an
-`accessId` bearer credential plus a distinct public `leaseId`. Retain the
+`accessId` bearer credential plus a distinct public `leaseId`. Every request
+must select exactly one `-RuntimeRoute`: `OCU`, `SteamVR`, or `SteamVRNull`.
+`OCU` is incompatible with both SteamVR routes. `SteamVRNull` is SteamVR with
+the null HMD and is mutually exclusive with physical `SteamVR`. The selected
+route is retained on the lease and copied into prepared session evidence so
+runtime controllers can enforce it without inference. Retain the
 `accessId` privately. `-TaskId` (alias `-ReporterTaskId`) records an optional
 stable task identity; when omitted it resolves `CODEX_THREAD_ID` or
 `CODEX_TASK_ID` if available. If another task owns the lock, `access-busy`
@@ -162,7 +167,7 @@ The normal explicit flow uses these separate direct calls. Read each JSON
 result, then substitute its literal returned identity into the next command:
 
 ```text
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -Label weather-api-tests -TaskId <stable-task-id> -EstimatedMinutes 20 -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -Label weather-api-tests -TaskId <stable-task-id> -RuntimeRoute SteamVRNull -EstimatedMinutes 20 -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate -AccessId <literal-access-id> -RequireClosed -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> prepare -AccessId <literal-access-id> -Label weather-api-run -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <literal-controllerPath> release -SessionId <literal-session-id> -Compact

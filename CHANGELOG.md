@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Require every cooperative MO2 access request to select exactly one mutually
+  exclusive OCU, physical SteamVR, or SteamVR null-HMD route, and propagate the
+  selected route into access status and prepared session evidence.
 - Add an explicit MO2 workspace local-work catalog and candidate query. Fresh
   clones can now request the unchanged modlist or exact optional local mods,
   reject mutually exclusive variants, disable unselected candidates only in

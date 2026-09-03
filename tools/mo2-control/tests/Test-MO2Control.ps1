@@ -202,21 +202,24 @@ selected_profile=@ByteArray(Codex)
     }
     Assert-MO2Test $transitionTimedOut 'lease transitions fail boundedly while another writer owns the companion lock'
 
-    $accessDryRun = Invoke-MO2RequestAccess -Config $config -Label 'first task' -TaskId 'fixture-task' -EstimatedMinutes 15 -WhatIf
-    Assert-MO2Test ($accessDryRun.ok -and $accessDryRun.state -eq 'dry-run' -and $accessDryRun.data.estimateIsAdvisory -and $accessDryRun.data.access.ownerTaskId -eq 'fixture-task') 'access request dry-run reports an advisory estimate and explicit task identity without locking'
+    $accessDryRun = Invoke-MO2RequestAccess -Config $config -Label 'first task' -TaskId 'fixture-task' -RuntimeRoute OCU -EstimatedMinutes 15 -WhatIf
+    Assert-MO2Test ($accessDryRun.ok -and $accessDryRun.state -eq 'dry-run' -and $accessDryRun.data.estimateIsAdvisory -and $accessDryRun.data.access.ownerTaskId -eq 'fixture-task' -and $accessDryRun.data.access.runtimeRoute.id -eq 'OCU') 'access request dry-run reports an advisory estimate, task identity, and exact runtime route without locking'
     Assert-MO2Test (-not (Test-Path -LiteralPath $config.session.lockFile -PathType Leaf)) 'access request dry-run creates no lock'
-    $entryAccessDryRun = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') request-access -ConfigPath $configPath -Label 'approval fixture' -TaskId 'entry-fixture-task' -EstimatedMinutes 5 -WhatIf -Compact -NoExit | ConvertFrom-Json
+    $missingRuntimeRoute = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') request-access -ConfigPath $configPath -Label 'missing route' -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-MO2Test (-not $missingRuntimeRoute.ok -and $missingRuntimeRoute.state -eq 'missing-runtime-route' -and $missingRuntimeRoute.data.requiredParameter -eq 'RuntimeRoute') 'entry point refuses an access request without one explicit runtime route'
+    $entryAccessDryRun = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') request-access -ConfigPath $configPath -Label 'approval fixture' -TaskId 'entry-fixture-task' -RuntimeRoute SteamVR -EstimatedMinutes 5 -WhatIf -Compact -NoExit | ConvertFrom-Json
     Assert-MO2Test ($entryAccessDryRun.ok -and $entryAccessDryRun.data.access.ownerTaskId -eq 'entry-fixture-task' -and $entryAccessDryRun.data.configuration.exists -and $entryAccessDryRun.data.approval.reusableApprovalEligible -and $entryAccessDryRun.data.approval.reusablePrefix[5] -eq 'request-access') 'dictionary-backed entry-point results retain task identity, configuration, and approval metadata'
 
-    $access = Invoke-MO2RequestAccess -Config $config -Label 'first task' -EstimatedMinutes 15
+    $access = Invoke-MO2RequestAccess -Config $config -Label 'first task' -RuntimeRoute SteamVRNull -EstimatedMinutes 15
     $accessId = [string]$access.data.access.accessId
     $leaseId = [string]$access.data.access.leaseId
     Assert-MO2Test ($access.ok -and $access.state -eq 'access-acquired' -and -not [string]::IsNullOrWhiteSpace($accessId)) 'first task atomically acquires access'
     Assert-MO2Test (-not [string]::IsNullOrWhiteSpace($leaseId) -and $leaseId -ne $accessId) 'access receipt separates public lease identity from the bearer credential'
     Assert-MO2Test ([long]$access.data.access.generation -eq 1L) 'new access lease starts at generation one'
-    $busyAccess = Invoke-MO2RequestAccess -Config $config -Label 'second task' -EstimatedMinutes 5
+    Assert-MO2Test ($access.data.access.runtimeRoute.id -eq 'SteamVRNull' -and $access.data.access.runtimeRoute.runtimeFamily -eq 'SteamVR' -and $access.data.access.runtimeRoute.requiresNullHmd) 'null-HMD access records the SteamVR family and explicit null-HMD requirement'
+    $busyAccess = Invoke-MO2RequestAccess -Config $config -Label 'second task' -RuntimeRoute OCU -EstimatedMinutes 5
     Assert-MO2Test (-not $busyAccess.ok -and $busyAccess.state -eq 'access-busy' -and $busyAccess.data.retryable) 'second task receives a retryable access-busy result'
-    Assert-MO2Test ($busyAccess.data.current.leaseId -eq $leaseId -and $busyAccess.data.current.estimatedReleaseUtc) 'busy result communicates public lease identity and advisory estimate'
+    Assert-MO2Test ($busyAccess.data.current.leaseId -eq $leaseId -and $busyAccess.data.current.estimatedReleaseUtc -and $busyAccess.data.current.runtimeRoute.id -eq 'SteamVRNull' -and $busyAccess.data.requestedRuntimeRoute.id -eq 'OCU') 'busy result communicates both incompatible runtime routes, public lease identity, and advisory estimate'
     Assert-MO2Test ($busyAccess.data.current.PSObject.Properties.Name -notcontains 'accessId' -and (($busyAccess | ConvertTo-Json -Depth 12) -notmatch [regex]::Escape($accessId))) 'busy result never discloses the bearer credential'
 
     $ownedAccess = Invoke-MO2AccessStatus -Config $config -AccessId $accessId
@@ -237,7 +240,7 @@ selected_profile=@ByteArray(Codex)
 
     $explicitPrepared = Invoke-MO2Prepare -Config $config -Label 'explicit fixture test' -AccessId $accessId
     $explicitSessionId = [string]$explicitPrepared.data.session.sessionId
-    Assert-MO2Test ($explicitPrepared.ok -and $explicitPrepared.data.explicitAccess -and $explicitPrepared.data.accessId -eq $accessId) 'prepare binds an explicitly owned access lease'
+    Assert-MO2Test ($explicitPrepared.ok -and $explicitPrepared.data.explicitAccess -and $explicitPrepared.data.accessId -eq $accessId -and $explicitPrepared.data.session.runtimeRoute.id -eq 'SteamVRNull') 'prepare binds an explicitly owned access lease and preserves its runtime route'
     $boundAccessStatus = Invoke-MO2AccessStatus -Config $config -AccessId $accessId
     Assert-MO2Test ([long]$boundAccessStatus.data.access.generation -eq 3L -and $boundAccessStatus.data.access.sessionId -eq $explicitSessionId) 'session binding advances generation without losing lease identity'
     $staleOwnedSession = & $mo2Module { param($fixtureConfig, $fixtureSessionId) Get-MO2OwnedSession -Config $fixtureConfig -SessionId $fixtureSessionId } $config $explicitSessionId
@@ -245,7 +248,7 @@ selected_profile=@ByteArray(Codex)
     $staleOwnedSession.data.status = 'fixture-stale-writer'
     $null = & $mo2Module { param($fixtureOwned) Write-MO2OwnedSessionAtomic -Owned $fixtureOwned -Value $fixtureOwned.data } $staleOwnedSession
     $postStaleWriteStatus = Invoke-MO2AccessStatus -Config $config -AccessId $accessId
-    Assert-MO2Test ($inSessionRenewal.ok -and $postStaleWriteStatus.data.access.estimatedDurationMinutes -eq 45 -and [long]$postStaleWriteStatus.data.access.generation -eq 5L) 'a stale session writer preserves a concurrent serialized lease renewal'
+    Assert-MO2Test ($inSessionRenewal.ok -and $postStaleWriteStatus.data.access.estimatedDurationMinutes -eq 45 -and [long]$postStaleWriteStatus.data.access.generation -eq 5L -and $postStaleWriteStatus.data.access.runtimeRoute.id -eq 'SteamVRNull') 'a stale session writer preserves a concurrent serialized lease renewal and runtime route'
     $prematureAccessRelease = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
     Assert-MO2Test (-not $prematureAccessRelease.ok -and $prematureAccessRelease.state -eq 'session-release-required') 'access cannot be released while a session is bound'
     $explicitReleased = Invoke-MO2Release -Config $config -SessionId $explicitSessionId
@@ -257,7 +260,7 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test ($releasedAccess.ok -and $releasedAccess.state -eq 'access-released') 'task explicitly releases access when MO2 is no longer needed'
     Assert-MO2Test (-not (Test-Path -LiteralPath $config.session.lockFile -PathType Leaf)) 'explicit access release removes the shared lock'
 
-    $abandonedAccess = Invoke-MO2RequestAccess -Config $config -Label 'abandoned task'
+    $abandonedAccess = Invoke-MO2RequestAccess -Config $config -Label 'abandoned task' -RuntimeRoute OCU
     $abandonedAccessId = [string]$abandonedAccess.data.access.accessId
     $unconfirmedRecovery = Invoke-MO2RecoverAccess -Config $config -AccessId $abandonedAccessId
     Assert-MO2Test (-not $unconfirmedRecovery.ok -and $unconfirmedRecovery.state -eq 'confirmation-required') 'abandoned access is never inferred from time alone'
@@ -358,7 +361,7 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test ($recoverClosed.ok -and $recoverClosed.state -eq 'already-closed') 'recovery close is idempotent when exact MO2 is absent'
     Assert-MO2Test (-not (Test-Path -LiteralPath $config.session.lockFile -PathType Leaf)) 'already-closed recovery creates no lock'
 
-    $recoveryAccess = Invoke-MO2RequestAccess -Config $config -Label 'fixture recovery access' -EstimatedMinutes 5
+    $recoveryAccess = Invoke-MO2RequestAccess -Config $config -Label 'fixture recovery access' -RuntimeRoute SteamVR -EstimatedMinutes 5
     $recoveryAccessId = [string]$recoveryAccess.data.access.accessId
     $recoverClosedWithAccess = Invoke-MO2RecoverClose -Config $config -AccessId $recoveryAccessId -Label 'fixture recovery' -WhatIf
     Assert-MO2Test ($recoverClosedWithAccess.ok -and $recoverClosedWithAccess.state -eq 'already-closed' -and $recoverClosedWithAccess.data.accessRetained) 'recovery close accepts and retains its exact access-only lease'
