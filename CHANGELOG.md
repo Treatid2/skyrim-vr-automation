@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Add an explicit MO2 workspace local-work catalog and candidate query. Fresh
+  clones can now request the unchanged modlist or exact optional local mods,
+  reject mutually exclusive variants, disable unselected candidates only in
+  the task profile, and preserve the resolved catalog and selection evidence.
 - Add a correlated capture/interaction framework with latest committed frame
   selection, continuous or on-demand stereo capture, full-state recording,
   pose-preserving named actions, direct DevBench passthrough, orderly
@@ -15,7 +19,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   workspace reuse through the current task-resume contract.
 - Treat SteamVR physical, SteamVR null-HMD, and OpenComposite execution routes
   as provenance within one explicit Skyrim VR D3D11 bytecode compatibility
-  class while retaining the exact feature-set compatibility gate.
+  class while retaining exact route records and the feature-set compatibility
+  gate. Legacy and current SteamVR route names now normalize consistently.
 - Add bounded whole-runtime Skyrim quiet-window capture and informational
   comparison reports alongside the existing CSX timer profiler.
 - Let MO2 access requests retain an explicit stable task identity, complete

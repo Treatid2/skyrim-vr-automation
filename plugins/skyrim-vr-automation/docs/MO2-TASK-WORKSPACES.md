@@ -17,6 +17,13 @@ reports every retained workspace owned by that task.
 - On a later request, the task must explicitly choose either `resume -TaskId
   -WorkspaceId` or a fresh `create -TaskId`. The tool never silently replaces a
   retained profile or guesses among multiple workspaces.
+- Before a fresh clone, run `list-local-work-mods` and make the workspace
+  content explicit. `Modlist` selects no optional local builds.
+  `ModlistPlusLocalWorkMods` requires one or more exact catalog IDs. The tool
+  disables every unselected catalog candidate in the cloned profile and
+  rejects mutually exclusive variants, while leaving the maintained source
+  profile unchanged. A retained workspace keeps its original choice across
+  lease release and resume, and `list-task` reports that choice.
 - `resume` verifies stable task ownership, requires the newly owned access
   lease, rebinds the workspace to that lease, and selects the retained profile.
   It does not refresh the profile from the primary profile or requalify a save

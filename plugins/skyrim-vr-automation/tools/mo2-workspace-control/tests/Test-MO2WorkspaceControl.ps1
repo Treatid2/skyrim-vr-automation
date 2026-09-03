@@ -20,8 +20,10 @@ function Get-TestProfileFingerprint([string]$Path) {
 try {
     $mo2 = Join-Path $fixture 'MO2'; $profiles = Join-Path $mo2 'profiles'; $mods = Join-Path $mo2 'mods'
     $source = Join-Path $profiles 'Mad God Stable'; $loaderMod = Join-Path $mods 'Loader'; $sessions = Join-Path $fixture 'sessions'
-    foreach ($p in @($source, (Join-Path $source 'saves'), $loaderMod, (Join-Path $loaderMod 'SKSE\Plugins'), (Join-Path $mo2 'overwrite'), (Join-Path $mo2 'rb'), $sessions, (Join-Path $fixture 'archive'))) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
-    '+Loader' | Set-Content -LiteralPath (Join-Path $source 'modlist.txt') -Encoding utf8
+    $csxReleaseMod = Join-Path $mods '[NoDelete] CSX AIO Local Release'
+    $csxDevBenchMod = Join-Path $mods '[NoDelete] CSX AIO Local DevBench'
+    foreach ($p in @($source, (Join-Path $source 'saves'), $loaderMod, (Join-Path $loaderMod 'SKSE\Plugins'), $csxReleaseMod, $csxDevBenchMod, (Join-Path $mo2 'overwrite'), (Join-Path $mo2 'rb'), $sessions, (Join-Path $fixture 'archive'))) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
+    @('+Loader', '+[NoDelete] CSX AIO Local Release', '-[NoDelete] CSX AIO Local DevBench') | Set-Content -LiteralPath (Join-Path $source 'modlist.txt') -Encoding utf8
     '*Skyrim.esm' | Set-Content -LiteralPath (Join-Path $source 'plugins.txt') -Encoding utf8
     'ordinary-base-save' | Set-Content -LiteralPath (Join-Path $source 'saves\ordinary.ess') -Encoding utf8
     'known-good-save' | Set-Content -LiteralPath (Join-Path $source 'saves\Save2_KnownGood.ess') -Encoding utf8
@@ -44,6 +46,14 @@ try {
         [Text.UTF8Encoding]::new($false))
     $configPath = Join-Path $fixture 'config.json'; $lock = Join-Path $sessions 'lock.json'
     $fixtureManifestPath = Join-Path $fixture 'known-good-saves.json'
+    $localWorkCatalogPath = Join-Path $fixture 'local-work-mods.json'
+    [ordered]@{
+        contractVersion = '1.0.0'
+        candidates = @(
+            [ordered]@{ id='csx-aio-local-release'; label='CSX AIO local (DevBench off)'; description='Release-equivalent local CSX build without development bridges.'; modName='[NoDelete] CSX AIO Local Release'; exclusionGroup='csx-aio'; variant='devbench-off'; capabilities=@('csx-aio'); metadata=[ordered]@{devBenchBridgeEnabled=$false;releaseEquivalent=$true} },
+            [ordered]@{ id='csx-aio-local-devbench'; label='CSX AIO local (DevBench on)'; description='Local CSX build with DevBench bridges for automation.'; modName='[NoDelete] CSX AIO Local DevBench'; exclusionGroup='csx-aio'; variant='devbench-on'; capabilities=@('csx-aio','devbench-api'); metadata=[ordered]@{devBenchBridgeEnabled=$true;releaseEquivalent=$false} }
+        )
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $localWorkCatalogPath -Encoding utf8
     $saveFiles = @('Save2_KnownGood.ess', 'Save2_KnownGood.skse') | ForEach-Object {
         $path = Join-Path $source (Join-Path 'saves' $_)
         [ordered]@{ relativePath = $_; bytes = [long](Get-Item -LiteralPath $path).Length; sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
@@ -51,7 +61,7 @@ try {
     [ordered]@{ contractVersion='1.0.0'; sourceProfile='Mad God Stable'; profileFingerprintSha256=(Get-TestProfileFingerprint $source); defaultFixtureId='interior'; fixtures=@([ordered]@{id='interior';label='Known-good interior';location='TestCell';loadName='Save2_KnownGood';files=$saveFiles}) } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $fixtureManifestPath -Encoding utf8
     [ordered]@{
         contractVersion='0.4.0'; machine='fixture'; mo2=[ordered]@{root=$mo2;executable=$mo2Exe;ini=$ini;profilesDirectory=$profiles;modsDirectory=$mods;overwriteDirectory=(Join-Path $mo2 'overwrite');logsDirectory=(Join-Path $mo2 'logs');rootBuilderDefinitions=@();rootBuilderDataDirectory=(Join-Path $mo2 'rb');processNames=@('WorkspaceImpossibleMO2');gameProcessNames=@('WorkspaceImpossibleGame');runtimeProcessNames=@()};
-        defaults=[ordered]@{profile='Mad God Stable';testProfileSource='Mad God Stable';newGameFixtureManifest=$fixtureManifestPath;executable='Test'};storage=[ordered]@{sessionStaging=$sessions;archive=(Join-Path $fixture 'archive')};limits=[ordered]@{maxEnumeratedFiles=100;overwriteWarningFiles=10;overwriteBlockFiles=50;overwriteWarningBytes=1024;overwriteBlockBytes=4096;launchPendingGraceSeconds=30};session=[ordered]@{lockFile=$lock}
+        defaults=[ordered]@{profile='Mad God Stable';testProfileSource='Mad God Stable';newGameFixtureManifest=$fixtureManifestPath;localWorkModCatalog=$localWorkCatalogPath;executable='Test'};storage=[ordered]@{sessionStaging=$sessions;archive=(Join-Path $fixture 'archive')};limits=[ordered]@{maxEnumeratedFiles=100;overwriteWarningFiles=10;overwriteBlockFiles=50;overwriteWarningBytes=1024;overwriteBlockBytes=4096;launchPendingGraceSeconds=30};session=[ordered]@{lockFile=$lock}
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding utf8
     Import-Module (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'mo2-control\MO2Control.psm1') -Force
     $config = Read-MO2ControlConfig -ConfigPath $configPath
@@ -65,6 +75,18 @@ try {
     if ($fixtureStatusRaw -match "`r|`n") { throw 'Compact workspace output was not one line.' }
     $fixtureStatus = $fixtureStatusRaw | ConvertFrom-Json
     if (-not $fixtureStatus.ok -or $fixtureStatus.state -ne 'fixture-valid') { throw 'Fixture status did not validate the original manifest.' }
+    $localWorkMods = & $entry list-local-work-mods -ConfigPath $configPath -Compact | ConvertFrom-Json
+    if (-not $localWorkMods.ok -or $localWorkMods.state -ne 'local-work-mods-found' -or $localWorkMods.data.availableCount -ne 2) { throw 'Local-work mod discovery did not expose both CSX AIO variants.' }
+    $releaseCandidate = @($localWorkMods.data.catalog.candidates | Where-Object id -eq 'csx-aio-local-release')[0]
+    $devBenchCandidate = @($localWorkMods.data.catalog.candidates | Where-Object id -eq 'csx-aio-local-devbench')[0]
+    if (-not $releaseCandidate.available -or $releaseCandidate.metadata.devBenchBridgeEnabled -or -not $releaseCandidate.metadata.releaseEquivalent -or -not $devBenchCandidate.available -or -not $devBenchCandidate.metadata.devBenchBridgeEnabled) { throw 'CSX AIO candidate metadata did not distinguish release and DevBench builds.' }
+    if ($localWorkMods.data.approval.escalationUsuallyRequired -or -not $localWorkMods.data.approval.reusableApprovalEligible) { throw 'Local-work mod discovery was not classified as read-only and reusable.' }
+    $noLocalWorkPath = Join-Path $fixture 'config-no-local-work.json'
+    $noLocalWork = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    $noLocalWork.defaults.PSObject.Properties.Remove('localWorkModCatalog')
+    $noLocalWork | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $noLocalWorkPath -Encoding utf8
+    $noLocalWorkStatus = & $entry list-local-work-mods -ConfigPath $noLocalWorkPath -Compact | ConvertFrom-Json
+    if (-not $noLocalWorkStatus.ok -or $noLocalWorkStatus.state -ne 'catalog-not-configured' -or $noLocalWorkStatus.data.availableCount -ne 0) { throw 'A missing optional catalog did not preserve the modlist-only discovery contract.' }
     $boundedStatus = & $entry fixture-status -ConfigPath $configPath -MaxProfileFiles 2 -Compact -NoExit | ConvertFrom-Json
     if ($boundedStatus.ok -or $boundedStatus.errors[0] -notmatch 'maximum file count') { throw 'Profile traversal did not enforce its declared file-count bound.' }
     $deadlineStatus = & $entry fixture-status -ConfigPath $configPath -InternalTestFailurePoint tree-operation-deadline -Compact -NoExit | ConvertFrom-Json
@@ -110,7 +132,9 @@ try {
     $iniAfterCas = [IO.File]::ReadAllBytes($ini)
     if ($casRejected.ok -or $casRejected.errors[0] -notmatch 'changed after planning and before replacement' -or [Convert]::ToBase64String($iniAfterCas) -ceq [Convert]::ToBase64String($iniBeforeCas) -or [Text.Encoding]::UTF8.GetString($iniAfterCas) -notmatch 'injected concurrent drift') { throw 'Selected-profile mutation did not reject immediate preimage drift while preserving the live external bytes.' }
     [IO.File]::WriteAllBytes($ini, $iniBeforeCas)
-    $created = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label weather -SavePolicy FreshGame -Confirm:$false | ConvertFrom-Json
+    $conflictingSelection = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label conflicting -SavePolicy FreshGame -WorkspaceContent ModlistPlusLocalWorkMods -LocalWorkModId @('csx-aio-local-release','csx-aio-local-devbench') -Confirm:$false -NoExit | ConvertFrom-Json
+    if ($conflictingSelection.ok -or $conflictingSelection.errors[0] -notmatch 'Mutually exclusive') { throw 'Workspace creation accepted mutually exclusive CSX AIO variants.' }
+    $created = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label weather -SavePolicy FreshGame -WorkspaceContent Modlist -Confirm:$false | ConvertFrom-Json
     if (-not $created.ok -or $created.state -ne 'workspace-ready') { throw "Workspace creation failed: $($created | ConvertTo-Json -Depth 12 -Compress)" }
     if ($created.data.configuration.source -ne 'explicit' -or [IO.Path]::GetFullPath([string]$created.data.configuration.path) -ne [IO.Path]::GetFullPath($configPath)) { throw 'Workspace result did not expose exact configuration resolution provenance.' }
     if ($created.data.ownerTaskId -ne $taskId -or (Get-Content -LiteralPath $ini -Raw) -notmatch ('selected_profile=@ByteArray\(' + [regex]::Escape([string]$created.data.profileName) + '\)')) { throw 'Creation did not bind and select the task-owned workspace.' }
@@ -119,6 +143,8 @@ try {
     if (-not (Test-Path -LiteralPath $ordinaryCopied -PathType Leaf) -or (Get-FileHash -LiteralPath $ordinaryCopied -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath (Join-Path $source 'saves\ordinary.ess') -Algorithm SHA256).Hash) { throw 'Workspace did not copy the complete stable-source saves tree.' }
     if (-not $created.data.inheritedSaves -or $created.data.sourceSaveSnapshot.sha256 -ne $created.data.profileSaveSnapshot.sha256 -or $created.data.sourceSaveSnapshot.fileCount -ne 3) { throw 'Workspace did not report a verified inherited-save snapshot.' }
     if (-not $created.data.copiedWorldEntrySave -or -not $created.data.sourceIntegrity.integrityVerified -or $created.data.sourceIntegrity.runtimeQualified -or [string]::IsNullOrWhiteSpace([string]$created.data.sourceIntegrity.cloneVerifiedUtc) -or $null -ne $created.data.sourceIntegrity.runtimeQualificationEvidence -or $created.data.worldEntryFixture.id -ne 'interior' -or $null -ne $created.data.saveFixture) { throw 'Ordinary fresh creation did not preserve the integrity-verified world-entry baseline independently of SavePolicy.' }
+    $createdModList = Get-Content -LiteralPath $created.data.modListPath -Raw
+    if ($created.data.localWorkMods.workspaceContent -ne 'Modlist' -or @($created.data.localWorkMods.requestedIds).Count -ne 0 -or $createdModList -notmatch '(?m)^-\[NoDelete\] CSX AIO Local Release\r?$' -or $createdModList -notmatch '(?m)^-\[NoDelete\] CSX AIO Local DevBench\r?$') { throw 'Modlist workspace did not disable every optional CSX AIO candidate.' }
     $workspaceControlRoot = Join-Path $sessions 'workspaces'
     $partialProfile = Join-Path $profiles 'Codex interrupted create fixture'
     New-Item -ItemType Directory -Path $partialProfile -Force | Out-Null
@@ -135,8 +161,12 @@ try {
     $interruptedSelection.phase = 'selection-applied-uncommitted'
     $interruptedSelection | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $selectionJournalPath -Encoding utf8
     Remove-Item -LiteralPath $selectionReceiptPath -Force
-    $verified = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label verified -SavePolicy VerifiedFixture -Confirm:$false | ConvertFrom-Json
+    $localWorkIdsPath = Join-Path $fixture 'requested-local-work-mods.json'
+    '["csx-aio-local-devbench"]' | Set-Content -LiteralPath $localWorkIdsPath -Encoding utf8
+    $verified = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label verified -SavePolicy VerifiedFixture -WorkspaceContent ModlistPlusLocalWorkMods -LocalWorkModIdsFile $localWorkIdsPath -Confirm:$false | ConvertFrom-Json
     if (-not $verified.ok -or -not $verified.data.copiedVerifiedSaves -or $verified.data.saveFixture.id -ne 'interior') { throw 'Verified fixture workspace was not created from the configured default.' }
+    $verifiedModList = Get-Content -LiteralPath $verified.data.modListPath -Raw
+    if ($verified.data.localWorkMods.workspaceContent -ne 'ModlistPlusLocalWorkMods' -or @($verified.data.localWorkMods.requestedIds).Count -ne 1 -or $verified.data.localWorkMods.requestedIds[0] -ne 'csx-aio-local-devbench' -or $verifiedModList -notmatch '(?m)^-\[NoDelete\] CSX AIO Local Release\r?$' -or $verifiedModList -notmatch '(?m)^\+\[NoDelete\] CSX AIO Local DevBench\r?$') { throw 'Requested DevBench-enabled CSX AIO variant was not selected exclusively.' }
     $recoveredSelection = Get-Content -LiteralPath $selectionJournalPath -Raw | ConvertFrom-Json
     if ($recoveredSelection.phase -ne 'recovered-committed' -or -not (Test-Path -LiteralPath $selectionReceiptPath -PathType Leaf)) { throw 'A subsequent transaction did not discover and finalize the interrupted selected-profile journal.' }
     foreach ($name in @('Save2_KnownGood.ess', 'Save2_KnownGood.skse')) {
@@ -173,6 +203,9 @@ try {
     if ($unsafeRelease.ok -or $unsafeRelease.errors[0] -notmatch 'intentionally unavailable' -or -not (Test-Path -LiteralPath $created.data.profilePath) -or -not (Test-Path -LiteralPath (Join-Path $created.data.profilePath 'task-state.txt'))) { throw 'Deprecated workspace release did not fail closed while preserving retained task state.' }
     $listed = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
     if (-not $listed.ok -or $listed.data.count -ne 2) { throw 'Task workspace discovery did not list both retained profiles.' }
+    $listedModlist = @($listed.data.workspaces | Where-Object workspaceId -eq $created.data.workspaceId)[0]
+    $listedDevBench = @($listed.data.workspaces | Where-Object workspaceId -eq $verified.data.workspaceId)[0]
+    if ($listedModlist.workspaceContent -ne 'Modlist' -or @($listedModlist.selectedLocalWorkModIds).Count -ne 0 -or $listedDevBench.workspaceContent -ne 'ModlistPlusLocalWorkMods' -or @($listedDevBench.selectedLocalWorkModIds)[0] -ne 'csx-aio-local-devbench') { throw 'Retained workspace discovery did not expose each original local-work selection.' }
     $releasedAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
     if (-not $releasedAccess.ok -or -not (Test-Path -LiteralPath $created.data.profilePath)) { throw 'Yielding MO2 access did not preserve the retained task profile.' }
     $laterSharedMod = Join-Path $mods 'Later Shared Mod'; New-Item -ItemType Directory -Path $laterSharedMod -Force | Out-Null
@@ -229,6 +262,6 @@ try {
     if (-not (Test-Path -LiteralPath $source) -or -not (Test-Path -LiteralPath $loaderMod)) { throw 'Workspace cleanup damaged stable state.' }
     $releasedAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $nextAccessId
     if (-not $releasedAccess.ok) { throw 'Resumed access release failed.' }
-    [pscustomobject]@{ok=$true; assertions=61; workspaceId=$created.data.workspaceId} | ConvertTo-Json
+    [pscustomobject]@{ok=$true; assertions=70; workspaceId=$created.data.workspaceId} | ConvertTo-Json
 }
 finally { if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force } }
