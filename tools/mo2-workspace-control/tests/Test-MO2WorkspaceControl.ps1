@@ -23,7 +23,10 @@ try {
     $csxReleaseMod = Join-Path $mods '[NoDelete] CSX AIO Local Release'
     $csxDevBenchMod = Join-Path $mods '[NoDelete] CSX AIO Local DevBench'
     foreach ($p in @($source, (Join-Path $source 'saves'), $loaderMod, (Join-Path $loaderMod 'SKSE\Plugins'), $csxReleaseMod, $csxDevBenchMod, (Join-Path $mo2 'overwrite'), (Join-Path $mo2 'rb'), $sessions, (Join-Path $fixture 'archive'))) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
-    @('+Loader', '+[NoDelete] CSX AIO Local Release', '-[NoDelete] CSX AIO Local DevBench') | Set-Content -LiteralPath (Join-Path $source 'modlist.txt') -Encoding utf8
+    $sourceModListPath = Join-Path $source 'modlist.txt'
+    $sourceModListText = "+[NoDelete] CSX AIO Local Release`r`n+Loader`r`n-[NoDelete] CSX AIO Local DevBench`r`n"
+    $sourceModListBytes = [Text.UTF8Encoding]::new($true).GetPreamble() + [Text.UTF8Encoding]::new($false).GetBytes($sourceModListText)
+    [IO.File]::WriteAllBytes($sourceModListPath, $sourceModListBytes)
     '*Skyrim.esm' | Set-Content -LiteralPath (Join-Path $source 'plugins.txt') -Encoding utf8
     'ordinary-base-save' | Set-Content -LiteralPath (Join-Path $source 'saves\ordinary.ess') -Encoding utf8
     'known-good-save' | Set-Content -LiteralPath (Join-Path $source 'saves\Save2_KnownGood.ess') -Encoding utf8
@@ -77,6 +80,7 @@ try {
     if (-not $fixtureStatus.ok -or $fixtureStatus.state -ne 'fixture-valid') { throw 'Fixture status did not validate the original manifest.' }
     $localWorkMods = & $entry list-local-work-mods -ConfigPath $configPath -Compact | ConvertFrom-Json
     if (-not $localWorkMods.ok -or $localWorkMods.state -ne 'local-work-mods-found' -or $localWorkMods.data.availableCount -ne 2) { throw 'Local-work mod discovery did not expose both CSX AIO variants.' }
+    if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($sourceModListPath)) -cne [Convert]::ToBase64String($sourceModListBytes)) { throw 'BOM-aware local-work discovery changed the stable source modlist bytes.' }
     $releaseCandidate = @($localWorkMods.data.catalog.candidates | Where-Object id -eq 'csx-aio-local-release')[0]
     $devBenchCandidate = @($localWorkMods.data.catalog.candidates | Where-Object id -eq 'csx-aio-local-devbench')[0]
     if (-not $releaseCandidate.available -or $releaseCandidate.metadata.devBenchBridgeEnabled -or -not $releaseCandidate.metadata.releaseEquivalent -or -not $devBenchCandidate.available -or -not $devBenchCandidate.metadata.devBenchBridgeEnabled) { throw 'CSX AIO candidate metadata did not distinguish release and DevBench builds.' }
@@ -109,7 +113,10 @@ try {
         [pscustomobject]@{ ok = $true; assertions = 2; mode = 'discovery-only' } | ConvertTo-Json
         return
     }
-    $blockedCreate = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label blocked-by-cache -SavePolicy FreshGame -Confirm:$false -NoExit | ConvertFrom-Json
+    $profileCountBeforeMissingContent = @(Get-ChildItem -LiteralPath $profiles -Directory -Force).Count
+    $missingContentCreate = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label missing-content -SavePolicy FreshGame -Confirm:$false -NoExit | ConvertFrom-Json
+    if ($missingContentCreate.ok -or $missingContentCreate.state -ne 'missing-workspace-content' -or $missingContentCreate.data.requiredParameter -ne 'WorkspaceContent' -or @(Get-ChildItem -LiteralPath $profiles -Directory -Force).Count -ne $profileCountBeforeMissingContent) { throw 'Workspace creation did not reject omitted content selection without profile side effects.' }
+    $blockedCreate = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label blocked-by-cache -SavePolicy FreshGame -WorkspaceContent Modlist -Confirm:$false -NoExit | ConvertFrom-Json
     if ($blockedCreate.ok -or $blockedCreate.errors[0] -notmatch 'prepare-source') { throw 'Workspace creation did not block unmanaged ShaderCache folders in overwrite.' }
     $prepared = & $entry prepare-source -ConfigPath $configPath -AccessId $accessId -Confirm:$false -Compact | ConvertFrom-Json
     if (-not $prepared.ok -or $prepared.state -ne 'migrated' -or @($prepared.data.movedDirectories).Count -ne 3) { throw "Stable source cache preparation failed: $($prepared | ConvertTo-Json -Depth 8 -Compress)" }
@@ -117,9 +124,9 @@ try {
     if (@(Get-ChildItem -LiteralPath (Join-Path $mo2 'overwrite') -Directory -Recurse -Force | Where-Object Name -Match '^(?i:ShaderCache)(?:[.]|$)').Count -ne 0) { throw 'ShaderCache directories remained in overwrite after preparation.' }
     if ((Get-Content -LiteralPath (Join-Path $source 'modlist.txt') -Raw) -notmatch ('(?m)^\+' + [regex]::Escape([string]$prepared.data.modName) + '\r?$')) { throw 'Migrated shader-cache mod was not enabled in the stable source.' }
     foreach ($move in @($prepared.data.movedDirectories)) { if (-not (Test-Path -LiteralPath ([string]$move.destinationPath) -PathType Container)) { throw "Migrated ShaderCache destination is missing: $($move.destinationPath)" } }
-    $unqualifiedCreate = & $entry create -ConfigPath $unconfiguredPath -AccessId $accessId -TaskId $taskId -Label unqualified -SavePolicy MainMenuOnly -Confirm:$false -NoExit | ConvertFrom-Json
+    $unqualifiedCreate = & $entry create -ConfigPath $unconfiguredPath -AccessId $accessId -TaskId $taskId -Label unqualified -SavePolicy MainMenuOnly -WorkspaceContent Modlist -Confirm:$false -NoExit | ConvertFrom-Json
     if ($unqualifiedCreate.ok -or $unqualifiedCreate.errors[0] -notmatch 'valid default world-entry save') { throw 'Fresh creation did not reject an unqualified maintained source profile.' }
-    $missingFixtureCreate = & $entry create -ConfigPath $missingPath -AccessId $accessId -TaskId $taskId -Label missing-fixture -SavePolicy FreshGame -Confirm:$false -NoExit | ConvertFrom-Json
+    $missingFixtureCreate = & $entry create -ConfigPath $missingPath -AccessId $accessId -TaskId $taskId -Label missing-fixture -SavePolicy FreshGame -WorkspaceContent Modlist -Confirm:$false -NoExit | ConvertFrom-Json
     if ($missingFixtureCreate.ok -or $missingFixtureCreate.errors[0] -notmatch 'valid default world-entry save') { throw 'Fresh creation did not reject a missing maintained world-entry fixture.' }
     'stable-profile-drift' | Set-Content -LiteralPath (Join-Path $source 'fixture-drift.txt') -Encoding utf8
     $staleStatus = & $entry fixture-status -ConfigPath $configPath -Compact | ConvertFrom-Json
@@ -128,7 +135,7 @@ try {
     if (-not $refreshedFixture.ok -or -not $refreshedFixture.data.valid -or -not (Test-Path -LiteralPath $refreshedFixture.data.backupPath -PathType Leaf)) { throw 'Guarded fixture refresh did not preserve and verify the manifest.' }
     if ($refreshedFixture.data.approval.reusableApprovalEligible -or [string]::IsNullOrWhiteSpace([string]$refreshedFixture.data.approval.oneShotReason)) { throw 'Shared fixture replacement was not explicitly classified as a one-shot approval.' }
     $iniBeforeCas = [IO.File]::ReadAllBytes($ini)
-    $casRejected = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label cas-race -SavePolicy FreshGame -InternalTestFailurePoint selected-profile-before-cas -Confirm:$false -NoExit | ConvertFrom-Json
+    $casRejected = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label cas-race -SavePolicy FreshGame -WorkspaceContent Modlist -InternalTestFailurePoint selected-profile-before-cas -Confirm:$false -NoExit | ConvertFrom-Json
     $iniAfterCas = [IO.File]::ReadAllBytes($ini)
     if ($casRejected.ok -or $casRejected.errors[0] -notmatch 'changed after planning and before replacement' -or [Convert]::ToBase64String($iniAfterCas) -ceq [Convert]::ToBase64String($iniBeforeCas) -or [Text.Encoding]::UTF8.GetString($iniAfterCas) -notmatch 'injected concurrent drift') { throw 'Selected-profile mutation did not reject immediate preimage drift while preserving the live external bytes.' }
     [IO.File]::WriteAllBytes($ini, $iniBeforeCas)

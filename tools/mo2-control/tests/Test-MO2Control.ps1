@@ -277,6 +277,22 @@ selected_profile=@ByteArray(Codex)
     @('+Skyrim Script Extender for VR (SKSEVR)', '+OpenComposite Runtime Provider') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
     $ocuRouteProviderValid = Invoke-MO2Validate -Config $config -RequireClosed -RequireRuntimeRoute -OwnedAccessId $abandonedAccessId
     Assert-MO2Test ($ocuRouteProviderValid.ok -and @($ocuRouteProviderValid.checks | Where-Object { $_.name -eq 'runtime-route-provider' -and $_.status -eq 'pass' }).Count -eq 1) 'OCU route requires and accepts exactly one qualified profile-local OCU provider'
+    @('+Skyrim Script Extender for VR (SKSEVR)', '+OpenComposite Runtime Provider', '-OpenComposite Runtime Provider') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
+    $contradictoryProvider = Invoke-MO2Validate -Config $config -RequireClosed -RequireRuntimeRoute -OwnedAccessId $abandonedAccessId
+    Assert-MO2Test (-not $contradictoryProvider.ok -and @($contradictoryProvider.data.runtimeProviders.errors | Where-Object { $_ -match 'repeated or contradicted' }).Count -eq 1) 'runtime-provider discovery rejects duplicate or contradictory markers for one physical mod'
+    @('+Skyrim Script Extender for VR (SKSEVR)', '+OpenComposite Runtime Provider') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
+    $canonicalLease = Get-Content -LiteralPath $config.session.lockFile -Raw
+    $malformedLease = $canonicalLease | ConvertFrom-Json
+    $malformedLease.runtimeRoute.id = 'UnknownRuntime'
+    $malformedLease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    $unknownRoute = Invoke-MO2Validate -Config $config -RequireClosed -RequireRuntimeRoute -OwnedAccessId $abandonedAccessId
+    Assert-MO2Test (-not $unknownRoute.ok -and @($unknownRoute.checks | Where-Object { $_.name -eq 'runtime-route-provider' -and $_.status -eq 'fail' -and $_.message -match 'not supported' }).Count -eq 1) 'runtime-route validation rejects an unknown persisted route id'
+    $malformedLease = $canonicalLease | ConvertFrom-Json
+    $malformedLease.runtimeRoute.requiresSteamVR = $true
+    $malformedLease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    $contradictoryRoute = Invoke-MO2Validate -Config $config -RequireClosed -RequireRuntimeRoute -OwnedAccessId $abandonedAccessId
+    Assert-MO2Test (-not $contradictoryRoute.ok -and @($contradictoryRoute.checks | Where-Object { $_.name -eq 'runtime-route-provider' -and $_.status -eq 'fail' -and $_.message -match 'canonical' }).Count -eq 1) 'runtime-route validation rejects contradictory persisted route fields'
+    [IO.File]::WriteAllText($config.session.lockFile, $canonicalLease, [Text.UTF8Encoding]::new($false))
     @('+Skyrim Script Extender for VR (SKSEVR)', '-OpenComposite Runtime Provider') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
     $unconfirmedRecovery = Invoke-MO2RecoverAccess -Config $config -AccessId $abandonedAccessId
     Assert-MO2Test (-not $unconfirmedRecovery.ok -and $unconfirmedRecovery.state -eq 'confirmation-required') 'abandoned access is never inferred from time alone'
@@ -291,12 +307,17 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test (-not $pidReuseInspection.data.sessionLock.ownerRunning -and -not $pidReuseInspection.data.sessionLock.ownerIdentityMatched) 'session ownership rejects a reused PID with a different process start time'
     Remove-Item -LiteralPath $config.session.lockFile -Force
 
-    $prepareDryRun = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -WhatIf
+    $missingPrepareAccess = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -WhatIf
+    Assert-MO2Test (-not $missingPrepareAccess.ok -and $missingPrepareAccess.state -eq 'missing-access-id') 'prepare rejects a missing explicit access lease without side effects'
+    $sessionAccess = Invoke-MO2RequestAccess -Config $config -Label 'fixture session' -RuntimeRoute SteamVR
+    $sessionAccessId = [string]$sessionAccess.data.access.accessId
+    $prepareDryRun = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -AccessId $sessionAccessId -WhatIf
     Assert-MO2Test ($prepareDryRun.ok -and $prepareDryRun.state -eq 'dry-run') 'prepare dry-run succeeds'
-    Assert-MO2Test (-not (Test-Path -LiteralPath $config.session.lockFile -PathType Leaf)) 'prepare dry-run creates no lock'
+    $dryRunLease = Invoke-MO2AccessStatus -Config $config -AccessId $sessionAccessId
+    Assert-MO2Test ($dryRunLease.state -eq 'access-owned' -and [string]::IsNullOrWhiteSpace([string]$dryRunLease.data.access.sessionId)) 'prepare dry-run leaves the access-only lease unbound'
     Assert-MO2Test (-not (Test-Path -LiteralPath $prepareDryRun.data.sessionPath -PathType Container)) 'prepare dry-run creates no evidence directory'
 
-    $prepared = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE
+    $prepared = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -AccessId $sessionAccessId
     Assert-MO2Test ($prepared.ok -and $prepared.state -eq 'prepared') 'prepare creates an owned session'
     Assert-MO2Test (Test-Path -LiteralPath $config.session.lockFile -PathType Leaf) 'prepare creates the single-owner lock'
     Assert-MO2Test (Test-Path -LiteralPath (Join-Path $prepared.data.sessionPath 'session.json') -PathType Leaf) 'prepare creates a durable session manifest'
@@ -370,7 +391,9 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test ($releaseDryRun.ok -and $releaseDryRun.state -eq 'dry-run') 'release dry-run succeeds'
     Assert-MO2Test (Test-Path -LiteralPath $config.session.lockFile -PathType Leaf) 'release dry-run retains lock'
     $released = Invoke-MO2Release -Config $config -SessionId $sessionId
-    Assert-MO2Test ($released.ok -and $released.state -eq 'released' -and $released.data.sessionRetained) 'release retires lock and retains evidence'
+    Assert-MO2Test ($released.ok -and $released.state -eq 'session-released-access-retained' -and $released.data.sessionRetained) 'release retires the session, retains evidence, and returns the explicit lease to access-only state'
+    $releasedSessionAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $sessionAccessId
+    Assert-MO2Test ($releasedSessionAccess.ok -and $releasedSessionAccess.state -eq 'access-released') 'the retained explicit session lease releases after session retirement'
     Assert-MO2Test (-not (Test-Path -LiteralPath $config.session.lockFile -PathType Leaf)) 'release removes only the owned lock'
 
     $recoverClosed = Invoke-MO2RecoverClose -Config $config -Label 'fixture recovery' -WhatIf

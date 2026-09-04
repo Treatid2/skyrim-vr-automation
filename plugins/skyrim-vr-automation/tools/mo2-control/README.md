@@ -6,7 +6,9 @@ inspect or validate the Skyrim VR Mod Organizer 2 installation.
 `validate-closed` is the explicit closed-state spelling of `validate
 -RequireClosed`; both commands are read-only and return the same proof.
 
-Version `0.9.0` retains cooperative access arbitration and adds a durable,
+Version `1.0.0` requires a route-qualified explicit access lease for every
+prepared session and validates its complete canonical runtime-route contract
+through launch. It retains cooperative access arbitration and adds a durable,
 session-scoped controller bundle, explicit profile identity fields, retained
 failed-to-run dialog cleanup, bounded launch
 pending state, helper-to-runtime PID adoption, structural Unlock handling, and
@@ -181,9 +183,8 @@ result, then substitute its literal returned identity into the next command:
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> release-access -AccessId <literal-access-id> -Compact
 ```
 
-For backward compatibility, `prepare` without `-AccessId` still acquires an
-implicit single-session lease, and `release` removes it as before. When an
-explicit lease is used, `release` retains access and returns
+`prepare` requires the explicit `accessId` returned by `request-access`.
+`release` retains access and returns
 `session-released-access-retained`; the task must then either prepare another
 session or call `release-access`.
 
@@ -191,12 +192,12 @@ session or call `release-access`.
 
 `prepare` requires a closed game/MO2 state, validates one exact profile and
 registered executable, and creates a durable evidence manifest on staging
-storage. It either binds the caller's exact access lease or, for legacy callers,
-atomically acquires an implicit lease. It also copies the exact entry point,
-modules, and resolved configuration into the session evidence directory and
-returns `controllerPath`. Use that path for the rest of the lifecycle so a
-plugin reinstall cannot invalidate an active session. `launch` requires the returned session
-identity and uses MO2's supported command line:
+storage. It binds the caller's exact route-qualified access lease. It also
+copies the exact entry point, modules, and resolved configuration into the
+session evidence directory and returns `controllerPath`. Use that path for the
+rest of the lifecycle so a plugin reinstall cannot invalidate an active
+session. `launch` requires the returned session identity and uses MO2's
+supported command line:
 
 ```text
 ModOrganizer.exe --profile NAME run --executable NAME
@@ -222,9 +223,9 @@ refuses while a game/loader exists and cooperatively resolves
 MO2's structured `File` → `Exit` path and visible modal chain, including the VFS
 `Unlock` prompt. `stop` first closes the game and then uses the same MO2
 resolver. `release` ends only the exactly owned session after proving MO2 and
-the game are closed, while retaining the evidence directory. It removes an
-implicit lease or returns an explicit lease to access-only state. All mutation
-commands have `-WhatIf`. Evidence
+the game are closed, while retaining the evidence directory. It returns the
+explicit lease to access-only state. All mutation commands have `-WhatIf`.
+Evidence
 collection, archive verification, profile mutation, cache management, and
 recovery remain deferred until separately bounded.
 

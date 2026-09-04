@@ -113,10 +113,13 @@ Same-name processes outside the configured root are reported as unproven but
 are never used as stop, start, apply, or restore blockers.
 
 Runtime qualification invokes the independent OpenVR pose probe through the
-central bounded-process controller. A probe cannot outlive its timeout. If a
-start or qualification attempt fails, cleanup stops only SteamVR-root-owned
-processes whose creation time belongs to that attempt and reports the verified
-survivor inventory.
+central bounded-process controller. The probe and its process-tree cleanup are
+charged to the outer readiness deadline. Shared-memory protocol versions are
+admitted before size selection, and access-denied state is surfaced distinctly
+from a provider that is simply not running. A probe cannot outlive its timeout.
+If a start or qualification attempt fails, cleanup stops only
+SteamVR-root-owned processes whose creation time belongs to that attempt and
+reports the verified survivor inventory.
 
 Readiness polling keeps an incremental identity/offset cache and reads at most
 `LogTailMaxBytes` from the shared `vrserver` log. Decoding and I/O are charged

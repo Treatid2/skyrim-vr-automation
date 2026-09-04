@@ -145,8 +145,7 @@ function Get-SharedTextTail {
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][ValidateRange(1, 10000)][int]$Count,
         [Parameter(Mandatory)][ValidateRange(4096, 4194304)][int]$MaxBytes,
-        [DateTime]$DeadlineUtc = [DateTime]::MaxValue,
-        [switch]$FreshSnapshot
+        [DateTime]$DeadlineUtc = [DateTime]::MaxValue
     )
     if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before opening the log.') }
     $stream = $null
@@ -155,7 +154,7 @@ function Get-SharedTextTail {
         $capturedLength = $stream.Length
         $info = [IO.FileInfo]::new([IO.Path]::GetFullPath($Path))
         $identity = "$($info.FullName.ToLowerInvariant())|$($info.CreationTimeUtc.Ticks)"
-        $prior = if (-not $FreshSnapshot -and $script:SharedTextTailState.ContainsKey($identity)) { $script:SharedTextTailState[$identity] } else { $null }
+        $prior = if ($script:SharedTextTailState.ContainsKey($identity)) { $script:SharedTextTailState[$identity] } else { $null }
         $incremental = $null -ne $prior -and [int64]$prior.offset -le $capturedLength
         $start = if ($incremental) { [int64]$prior.offset } else { [Math]::Max([int64]0, $capturedLength - $MaxBytes) }
         if (($capturedLength - $start) -gt $MaxBytes) {
@@ -807,13 +806,15 @@ function Get-HeadPoseSharedState {
     $view = $null
     try {
         $expectedVersion = [int]$Contract['sharedMemoryVersion']
+        $requiredSize = switch ($expectedVersion) {
+            1 { 88 }
+            2 { 128 }
+            default { throw "Unsupported head-pose shared-memory version: $expectedVersion" }
+        }
         $expectedSize = if ($Contract.ContainsKey('sharedMemorySize')) {
             [int]$Contract['sharedMemorySize']
         }
-        elseif ($expectedVersion -eq 1) { 88 }
-        elseif ($expectedVersion -eq 2) { 128 }
-        else { throw "Unsupported head-pose shared-memory version: $expectedVersion" }
-        $requiredSize = if ($expectedVersion -eq 1) { 88 } elseif ($expectedVersion -eq 2) { 128 } else { 0 }
+        else { $requiredSize }
         if ($expectedSize -ne $requiredSize) {
             throw "Head-pose shared-memory version $expectedVersion requires a $requiredSize-byte contract, not $expectedSize bytes."
         }
@@ -869,6 +870,9 @@ function Get-HeadPoseSharedState {
     catch [IO.FileNotFoundException] {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The head-pose shared-memory provider is not running.' }
     }
+    catch [UnauthorizedAccessException] {
+        throw [UnauthorizedAccessException]::new('The automation identity is not authorized to read and acknowledge the head-pose shared-memory provider.', $_.Exception)
+    }
     catch {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; error = $_.Exception.Message }
     }
@@ -879,7 +883,10 @@ function Get-HeadPoseSharedState {
 }
 
 function Get-ApplicationHeadPose {
-    param([Parameter(Mandatory)]$Contract)
+    param(
+        [Parameter(Mandatory)]$Contract,
+        [DateTime]$DeadlineUtc = [DateTime]::MaxValue
+    )
     if ([string]::IsNullOrWhiteSpace($HeadPoseDriverRoot)) {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The stable head-pose driver root could not be resolved.' }
     }
@@ -890,8 +897,19 @@ function Get-ApplicationHeadPose {
     try {
         $boundedTool = Join-Path (Split-Path -Parent $PSScriptRoot) 'process-control\Invoke-BoundedProcess.ps1'
         if (-not (Test-Path -LiteralPath $boundedTool -PathType Leaf)) { throw "Bounded process controller is missing: $boundedTool" }
-        $bounded = & $boundedTool -FilePath $probePath -WorkingDirectory (Split-Path -Parent $probePath) -MaxAttempts 1 -TimeoutSeconds 10 -NoExit -Compact | ConvertFrom-Json -Depth 30
+        $probeTimeoutSeconds = 10
+        if ($DeadlineUtc -ne [DateTime]::MaxValue) {
+            $remainingMilliseconds = [long]($DeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds
+            if ($remainingMilliseconds -lt 1450) {
+                throw [TimeoutException]::new('SteamVR readiness deadline leaves insufficient time for the application-facing pose probe and bounded cleanup.')
+            }
+            $probeTimeoutSeconds = [Math]::Max(1, [Math]::Min(10, [Math]::Floor(($remainingMilliseconds - 450) / 1000)))
+        }
+        $bounded = & $boundedTool -FilePath $probePath -WorkingDirectory (Split-Path -Parent $probePath) -MaxAttempts 1 -TimeoutSeconds $probeTimeoutSeconds -TerminationGraceMilliseconds 100 -StreamDrainGraceMilliseconds 100 -NoExit -Compact | ConvertFrom-Json -Depth 30
         $attempt = if (@($bounded.attempts).Count -gt 0) { $bounded.attempts[-1] } else { $null }
+        if ($attempt -and [bool]$attempt.timedOut) {
+            throw [TimeoutException]::new("Independent OpenVR pose probe exceeded its $probeTimeoutSeconds-second share of the SteamVR readiness deadline.")
+        }
         if ($null -eq $attempt -or [string]::IsNullOrWhiteSpace([string]$attempt.stdout)) { throw "Independent OpenVR pose probe produced no bounded output. $($bounded.errors -join '; ')" }
         $payload = [string]$attempt.stdout | ConvertFrom-Json -ErrorAction Stop
         $qualified = $bounded.ok -and $payload.ok -and $payload.standing.connected -and $payload.standing.valid -and
@@ -905,6 +923,9 @@ function Get-ApplicationHeadPose {
             boundedProcess = $bounded
             observation = $payload
         }
+    }
+    catch [TimeoutException] {
+        throw
     }
     catch {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; probePath = $probePath; error = $_.Exception.Message }
@@ -946,7 +967,7 @@ function Get-NullRuntimeEvidence {
     $headPoseRegistered = $null
     $tail = @()
     if ($serverStartUtc -and (Test-Path -LiteralPath $ServerLogPath -PathType Leaf)) {
-        $tail = @(Get-SharedTextTail -Path $ServerLogPath -Count 2000 -MaxBytes $LogTailMaxBytes -DeadlineUtc $DeadlineUtc -FreshSnapshot)
+        $tail = @(Get-SharedTextTail -Path $ServerLogPath -Count 2000 -MaxBytes $LogTailMaxBytes -DeadlineUtc $DeadlineUtc)
         $minimumUtc = $serverStartUtc.AddSeconds(-3)
         foreach ($line in $tail) {
             $timestampUtc = Get-LogTimestampUtc -Line $line
@@ -967,7 +988,7 @@ function Get-NullRuntimeEvidence {
     }
     $headPoseState = Get-HeadPoseSharedState -Contract $Profile['headPoseProviderContract']
     $providerLogReady = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active -and $null -ne $headPoseLoaded -and $null -ne $headPoseRegistered
-    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider is not ready for an application-facing pose probe.' } }
+    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -DeadlineUtc $DeadlineUtc } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider is not ready for an application-facing pose probe.' } }
     return [pscustomobject][ordered]@{
         active = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active
         serverProcess = if ($server.Count -eq 1) { $server[0] } else { $null }

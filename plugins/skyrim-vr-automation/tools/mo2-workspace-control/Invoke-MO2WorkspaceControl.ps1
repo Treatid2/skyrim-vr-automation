@@ -17,7 +17,7 @@ param(
     [string]$FixtureManifestPath,
     [string]$FixtureId,
     [ValidateSet('Modlist', 'ModlistPlusLocalWorkMods')]
-    [string]$WorkspaceContent = 'Modlist',
+    [string]$WorkspaceContent,
     [string[]]$LocalWorkModId,
     [string]$LocalWorkModIdsFile,
     [string]$ModName,
@@ -47,6 +47,7 @@ param(
     [switch]$NoExit
 )
 
+$workspaceContentSupplied = $PSBoundParameters.ContainsKey('WorkspaceContent')
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $toolRoot = Split-Path -Parent $PSScriptRoot
@@ -273,7 +274,15 @@ function Get-LocalWorkModCatalog($Config, [string]$SourcePath, [string]$ModsRoot
 
     $modListPath = Join-Path $SourcePath 'modlist.txt'
     if (-not (Test-Path -LiteralPath $modListPath -PathType Leaf)) { throw "Stable source modlist does not exist: $modListPath" }
-    $modListText = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($modListPath))
+    $modListBytes = [IO.File]::ReadAllBytes($modListPath)
+    $hasBom = $modListBytes.Length -ge 3 -and $modListBytes[0] -eq 0xEF -and $modListBytes[1] -eq 0xBB -and $modListBytes[2] -eq 0xBF
+    $offset = if ($hasBom) { 3 } else { 0 }
+    try {
+        $modListText = [Text.UTF8Encoding]::new($false, $true).GetString($modListBytes, $offset, $modListBytes.Length - $offset)
+    }
+    catch {
+        throw "Stable source modlist is not valid UTF-8: $modListPath. $($_.Exception.Message)"
+    }
     $ids = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $modNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $resolved = [Collections.Generic.List[object]]::new()
@@ -1110,6 +1119,19 @@ try {
             Move-OverwriteShaderCachesToStableMod -Config $config -SourceName $sourceName -SourcePath $sourcePath -ModsRoot $modsRoot -WhatIf
         }
         $result = [pscustomobject][ordered]@{ ok = $true; command = $Command; state = [string]$preparation.state; data = $preparation }
+    }
+    elseif ($Command -eq 'create' -and -not $workspaceContentSupplied) {
+        $result = [pscustomobject][ordered]@{
+            ok = $false
+            command = $Command
+            state = 'missing-workspace-content'
+            errors = @("Command 'create' requires explicit -WorkspaceContent Modlist or ModlistPlusLocalWorkMods.")
+            data = [pscustomobject][ordered]@{
+                requiredParameter = 'WorkspaceContent'
+                allowedValues = @('Modlist', 'ModlistPlusLocalWorkMods')
+                supplied = $false
+            }
+        }
     }
     elseif ($Command -eq 'create') {
         $resolvedTaskId = Resolve-TaskId -RequestedTaskId $TaskId -Required

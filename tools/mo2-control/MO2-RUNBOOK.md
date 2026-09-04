@@ -7,7 +7,8 @@ the Skyrim VR installation. The local machine configuration is
 the resolved machine configuration; do not rediscover paths or guess profile and
 executable names when the package can report them.
 
-Version 0.9.0 provides cooperative cross-task access leases, read-only
+Version 1.0.0 requires a route-qualified explicit access lease for preparation
+and launch, and provides cooperative cross-task access leases, read-only
 inspection, single-owner `prepare`, exact
 `open` and `launch`, bounded `status`, graceful `stop-game`, MO2-only
 cooperative `close`, stranded-instance `recover-close`, and graceful full
@@ -178,8 +179,8 @@ machine configuration under the session, and binds it to the exact access
 lease. Use the returned `controllerPath` for every command that owns that
 session; it remains valid if a plugin update replaces the versioned cache from
 which `prepare` was called. `prepare` does not change MO2's selected profile or
-mod list. Legacy callers may omit AccessId;
-that creates an implicit one-session lease which `release` removes.
+mod list. `AccessId` is mandatory; callers must first acquire exactly one
+explicit OCU, SteamVR, or SteamVRNull route.
 When `-RequireSKSE` is supplied, that requirement is durable session state and
 `launch` revalidates it before starting MO2.
 

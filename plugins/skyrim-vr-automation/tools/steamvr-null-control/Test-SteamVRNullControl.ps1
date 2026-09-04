@@ -104,8 +104,18 @@ try {
     finally { $heldLock.Dispose() }
 
     $sourceText = [IO.File]::ReadAllText($entry)
-    Assert-Test ($sourceText -notmatch '\.ReadToEnd\(' -and $sourceText -notmatch '-split\s+"`r\?`n",\s*-1' -and $sourceText -match 'LogTailMaxBytes' -and $sourceText -match '-FreshSnapshot') 'SteamVR readiness polling uses a fresh bounded and correctly split text tail'
+    Assert-Test ($sourceText -notmatch '\.ReadToEnd\(' -and $sourceText -notmatch '-split\s+"`r\?`n",\s*-1' -and $sourceText -match 'LogTailMaxBytes' -and $sourceText -notmatch 'Get-SharedTextTail[^\r\n]*-FreshSnapshot') 'SteamVR readiness polling uses an incremental bounded and correctly split text tail'
     Assert-Test ($sourceText -match '\$providerLogReady -and \[bool\]\$headPoseState\.qualified' -and $sourceText -match '\$applicationHeadPose = if \(\$providerLogReady') 'application-facing pose probing waits for retained null-driver and provider log proof'
+    Assert-Test ($sourceText -match 'catch \[UnauthorizedAccessException\]' -and $sourceText -match 'not authorized to read and acknowledge') 'shared-memory authorization failure remains distinct from provider-not-ready state'
+    Assert-Test ($sourceText -match 'Get-ApplicationHeadPose -Contract .* -DeadlineUtc \$DeadlineUtc' -and $sourceText -match 'TerminationGraceMilliseconds 100 -StreamDrainGraceMilliseconds 100') 'application-facing pose probing inherits the outer deadline including bounded cleanup grace'
+
+    $invalidVersionProfilePath = Join-Path $fixture 'steamvr-null.invalid-version.profile.json'
+    $invalidVersionProfile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json -AsHashtable
+    $invalidVersionProfile['headPoseProviderContract']['sharedMemoryVersion'] = 3
+    $invalidVersionProfile['headPoseProviderContract']['sharedMemorySize'] = 0
+    $invalidVersionProfile | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $invalidVersionProfilePath -Encoding utf8
+    $invalidVersion = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $invalidVersionProfilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $invalidVersion.data.runtime.headPoseState.qualified -and $invalidVersion.data.runtime.headPoseState.error -match 'Unsupported head-pose shared-memory version') 'explicit shared-memory size cannot bypass version admission'
 
     $stop = & $entry stop -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json
     Assert-Test ($stop.ok -and $stop.state -eq 'already-stopped') 'stop recognizes an already closed SteamVR state'

@@ -107,7 +107,7 @@ try {
     $sessionCommands = @('open', 'launch', 'stop-game', 'terminate-game', 'close', 'recover-rootbuilder', 'stop', 'terminate', 'release')
     if ($Command -in $sessionCommands -and [string]::IsNullOrWhiteSpace($SessionId)) {
         $result = [pscustomobject][ordered]@{
-            contractVersion = '0.9.0'
+            contractVersion = '1.0.0'
             command = $Command
             ok = $false
             state = 'missing-session-id'
@@ -120,7 +120,7 @@ try {
     }
     elseif ($Command -eq 'request-access' -and [string]::IsNullOrWhiteSpace($RuntimeRoute)) {
         $result = [pscustomobject][ordered]@{
-            contractVersion = '0.9.0'
+            contractVersion = '1.0.0'
             command = $Command
             ok = $false
             state = 'missing-runtime-route'
@@ -131,9 +131,9 @@ try {
             data = [pscustomobject]@{ requiredParameter = 'RuntimeRoute'; allowedValues = @('OCU', 'SteamVR', 'SteamVRNull'); supplied = $false }
         }
     }
-    elseif ($Command -in @('renew-access', 'release-access', 'recover-access') -and [string]::IsNullOrWhiteSpace($AccessId)) {
+    elseif ($Command -in @('renew-access', 'release-access', 'recover-access', 'prepare') -and [string]::IsNullOrWhiteSpace($AccessId)) {
         $result = [pscustomobject][ordered]@{
-            contractVersion = '0.9.0'
+            contractVersion = '1.0.0'
             command = $Command
             ok = $false
             state = 'missing-access-id'
@@ -149,10 +149,10 @@ try {
             Invoke-MO2Inspect -Config $config -Profile $Profile -Executable $Executable
         }
         'validate' {
-            Invoke-MO2Validate -Config $config -Profile $Profile -Executable $Executable -RequireSKSE:$RequireSKSE -RequireClosed:$RequireClosed -OwnedAccessId $AccessId
+            Invoke-MO2Validate -Config $config -Profile $Profile -Executable $Executable -RequireSKSE:$RequireSKSE -RequireClosed:$RequireClosed -RequireRuntimeRoute:([bool]$AccessId) -OwnedAccessId $AccessId
         }
         'validate-closed' {
-            $validated = Invoke-MO2Validate -Config $config -Profile $Profile -Executable $Executable -RequireClosed -OwnedAccessId $AccessId
+            $validated = Invoke-MO2Validate -Config $config -Profile $Profile -Executable $Executable -RequireClosed -RequireRuntimeRoute:([bool]$AccessId) -OwnedAccessId $AccessId
             $validated.command = 'validate-closed'
             $validated
         }
@@ -217,7 +217,7 @@ try {
 }
 catch {
     $result = [pscustomobject][ordered]@{
-        contractVersion = '0.9.0'
+        contractVersion = '1.0.0'
         command = $Command
         ok = $false
         state = 'tool-error'
