@@ -388,16 +388,181 @@ async function runRenderScaleTuningLive(context) {
             facts[name] === true;
     }
 
+    function safeTerminalAssessment(waiter, identifiers) {
+        if (!waiter) return { satisfied: false, reasons: ["waiter_missing"] };
+        const reasons = [];
+        if (waiter.action !== "qualification_wait") reasons.push("action_mismatch");
+        if (waiter.transitionId !== identifiers.transitionId) {
+            reasons.push("transition_id_mismatch");
+        }
+        if (waiter.ownerId !== identifiers.ownerId) reasons.push("owner_id_mismatch");
+        const snapshot = waiter.upscalingSnapshot;
+        if (!snapshot) reasons.push("upscaling_snapshot_missing");
+        else if (snapshot.activeOperationId !== 0) {
+            reasons.push("active_operation_not_clear");
+        }
+        const facts = waiter.observation && waiter.observation.facts;
+        if (!facts) reasons.push("facts_missing");
+        else {
+            if (facts.stressSession !== true) reasons.push("stress_session_not_owned");
+            if (facts.exactCell !== true) reasons.push("exact_cell_not_proven");
+            if (facts.loadedInWorld !== true) reasons.push("in_world_not_proven");
+            if (facts.terminalClear !== true) reasons.push("terminal_not_clear");
+            if (!optionalSafetyFactClear(facts, "apiOperationClear")) {
+                reasons.push("api_operation_not_clear");
+            }
+            if (!optionalSafetyFactClear(facts, "physicalMutationClear")) {
+                reasons.push("physical_mutation_not_clear");
+            }
+        }
+        return { satisfied: reasons.length === 0, reasons };
+    }
+
     function safeTerminal(waiter, identifiers) {
-        const facts = waiter && waiter.observation && waiter.observation.facts;
-        return waiter && waiter.action === "qualification_wait" &&
-            waiter.transitionId === identifiers.transitionId &&
-            waiter.ownerId === identifiers.ownerId &&
-            waiter.upscalingSnapshot && waiter.upscalingSnapshot.activeOperationId === 0 &&
-            facts && facts.stressSession === true && facts.exactCell === true &&
-            facts.loadedInWorld === true && facts.terminalClear === true &&
-            optionalSafetyFactClear(facts, "apiOperationClear") &&
-            optionalSafetyFactClear(facts, "physicalMutationClear");
+        return safeTerminalAssessment(waiter, identifiers).satisfied;
+    }
+
+    function scalar(value) {
+        if (typeof value === "string" || typeof value === "boolean" ||
+            Number.isFinite(value)) {
+            return value;
+        }
+        return value && typeof value.name === "string" ? value.name : null;
+    }
+
+    function reasonProjection(reasons) {
+        const values = (Array.isArray(reasons) ? reasons : []).map((reason) => {
+            if (typeof reason === "string") return reason;
+            if (!reason || typeof reason !== "object") return null;
+            const category = typeof reason.category === "string" ?
+                `${reason.category}:` : "";
+            if (typeof reason.code === "string") return `${category}${reason.code}`;
+            return typeof reason.reason === "string" ? reason.reason : null;
+        }).filter(Boolean);
+        const limit = 32;
+        return {
+            values: values.slice(0, limit),
+            total: values.length,
+            truncated: values.length > limit,
+        };
+    }
+
+    function eyeIdentity(eye) {
+        if (!eye || typeof eye !== "object") return null;
+        return {
+            generation: scalar(eye.generation),
+            transitionEpoch: scalar(eye.transitionEpoch),
+            resourceRevision: scalar(eye.resourceRevision),
+            deviceIdentity: scalar(eye.deviceIdentity),
+            compositorCycleToken: scalar(eye.compositorCycleToken),
+            path: scalar(eye.path),
+        };
+    }
+
+    function recoveryAssessment(root, apply, waiter, identifiers) {
+        const safety = safeTerminalAssessment(waiter, identifiers);
+        const timeline = waiter && waiter.replacementTimeline;
+        const terminal = timeline && timeline.terminal;
+        const proof = terminal && terminal.presentationProof;
+        const reasons = [];
+        if (!root || root.ok !== true) reasons.push("scenario_not_ok");
+        if (!apply) reasons.push("apply_missing");
+        else if (apply.accepted !== true) reasons.push("apply_not_accepted");
+        if (!waiter) reasons.push("waiter_missing");
+        else if (waiter.satisfied !== true) reasons.push("waiter_not_satisfied");
+        reasons.push(...safety.reasons.map((reason) => `safe_terminal:${reason}`));
+        if (!waiter || !waiter.milestoneTimings) {
+            reasons.push("milestone_timings_missing");
+        }
+        if (!timeline) reasons.push("replacement_timeline_missing");
+        const snapshot = waiter && waiter.upscalingSnapshot;
+        const observation = waiter && waiter.observation;
+        const physical = observation && observation.physical;
+        const presentation = observation && observation.replacementPresentation;
+        const strictReasons = waiter &&
+            (waiter.strictFailureReasons || waiter.failureReasons);
+        return {
+            decision: { satisfied: reasons.length === 0, reasons },
+            scenarioOk: root && typeof root.ok === "boolean" ? root.ok : null,
+            apply: {
+                present: Boolean(apply),
+                accepted: apply && typeof apply.accepted === "boolean" ?
+                    apply.accepted : null,
+                status: scalar(apply && apply.status),
+                disposition: scalar(apply && apply.disposition),
+            },
+            waiter: {
+                present: Boolean(waiter),
+                satisfied: waiter && typeof waiter.satisfied === "boolean" ?
+                    waiter.satisfied : null,
+                outcome: scalar(waiter && waiter.outcome),
+                timedOutMilestone: scalar(waiter && waiter.timedOutMilestone),
+            },
+            milestones: {
+                presentationStable: waiter &&
+                    typeof waiter.presentationStable === "boolean" ?
+                    waiter.presentationStable : null,
+                cleanupDrained: waiter && typeof waiter.cleanupDrained === "boolean" ?
+                    waiter.cleanupDrained : null,
+                strictSatisfied: waiter && typeof waiter.strictSatisfied === "boolean" ?
+                    waiter.strictSatisfied : null,
+            },
+            failures: {
+                presentation: {
+                    mask: scalar(waiter && waiter.presentationFailureMask),
+                    reasons: reasonProjection(waiter && waiter.presentationFailureReasons),
+                },
+                cleanup: {
+                    mask: scalar(waiter && waiter.cleanupFailureMask),
+                    reasons: reasonProjection(waiter && waiter.cleanupFailureReasons),
+                },
+                strict: {
+                    mask: scalar(waiter && waiter.strictFailureMask),
+                    reasons: reasonProjection(strictReasons),
+                },
+            },
+            safeTerminal: safety,
+            controller: {
+                activeOperationId: scalar(snapshot && snapshot.activeOperationId),
+                stateRevision: scalar(snapshot && snapshot.stateRevision),
+                transitionState: scalar(snapshot && snapshot.transitionState),
+                physicalState: scalar(physical && physical.state),
+                presentationPhase: scalar(presentation && presentation.phase),
+            },
+            evidence: {
+                milestoneTimingsPresent: Boolean(waiter && waiter.milestoneTimings),
+                replacementTimelinePresent: Boolean(timeline),
+                terminalTimelinePresent: Boolean(terminal),
+            },
+            terminalIdentity: terminal ? {
+                frame: scalar(terminal.frame),
+                qpcTick: scalar(terminal.tick),
+                currentPresentationGeneration:
+                    scalar(terminal.currentPresentationGeneration),
+                currentPresentationProviderGeneration:
+                    scalar(terminal.currentPresentationProviderGeneration),
+                currentPresentationResourceRevision:
+                    scalar(terminal.currentPresentationResourceRevision),
+                replacementRequestId: scalar(terminal.replacementRequestId),
+                replacementTransitionEpoch:
+                    scalar(terminal.replacementTransitionEpoch),
+                replacementContractGeneration:
+                    scalar(terminal.replacementContractGeneration),
+                physicalMutationEpoch: scalar(terminal.physicalMutationEpoch),
+                proof: proof ? {
+                    proven: typeof proof.proven === "boolean" ? proof.proven : null,
+                    contractGeneration: scalar(proof.contractGeneration),
+                    transitionEpoch: scalar(proof.transitionEpoch),
+                    resourcePublicationGeneration:
+                        scalar(proof.resourcePublicationGeneration),
+                    resourceRevision: scalar(proof.resourceRevision),
+                    deviceIdentity: scalar(proof.deviceIdentity),
+                    compositorCycleToken: scalar(proof.compositorCycleToken),
+                    leftEye: eyeIdentity(proof.leftEye || terminal.leftEye),
+                    rightEye: eyeIdentity(proof.rightEye || terminal.rightEye),
+                } : null,
+            } : null,
+        };
     }
 
     function recoverableTerminal(waiter, identifiers) {
@@ -551,15 +716,49 @@ async function runRenderScaleTuningLive(context) {
         return Number.isSafeInteger(value) && value >= 0;
     }
 
-    function matchesMutationBoundaryGeneration(boundaryGeneration, proofGeneration) {
-        return nonNegativeInteger(boundaryGeneration) &&
-            nonNegativeInteger(proofGeneration) &&
-            (boundaryGeneration === 0 || boundaryGeneration === proofGeneration);
+    function isVendorTarget(target) {
+        return target && (target.method === "dlss" || target.method === "fsr");
+    }
+
+    function matchesMutationBoundaryGeneration(boundaryGeneration, proofGeneration, target) {
+        if (!nonNegativeInteger(boundaryGeneration) ||
+            !nonNegativeInteger(proofGeneration) || !target) {
+            return false;
+        }
+        return isVendorTarget(target) ?
+            boundaryGeneration === 0 || boundaryGeneration === proofGeneration :
+            proofGeneration === 0;
+    }
+
+    function exactNativeStereoProof(proof, target) {
+        const exactEye = (eye) => eye &&
+            positiveInteger(eye.frame) && eye.frame === proof.frame &&
+            positiveInteger(eye.qpcTick) &&
+            positiveInteger(eye.compositorCycleToken) &&
+            eye.compositorCycleToken === proof.compositorCycleToken &&
+            positiveInteger(eye.transitionEpoch) &&
+            eye.transitionEpoch === proof.transitionEpoch &&
+            eye.method === target.method && eye.backend === "none" &&
+            eye.generation === 0 && eye.deviceIdentity === proof.deviceIdentity &&
+            eye.resourceRevision === proof.resourceRevision &&
+            eye.renderWidth === proof.renderWidth &&
+            eye.renderHeight === proof.renderHeight &&
+            eye.displayWidth === proof.displayWidth &&
+            eye.displayHeight === proof.displayHeight &&
+            eye.vendorDispatchFrame === 0 && eye.vendorDispatchSerial === 0 &&
+            eye.vendorRuntimeFallback === false;
+        return positiveInteger(proof.frame) && positiveInteger(proof.qpcTick) &&
+            positiveInteger(proof.compositorCycleToken) && proof.backend === "none" &&
+            proof.contractGeneration === 0 &&
+            proof.providerRuntimeGeneration === 0 &&
+            proof.sharedVendorDispatchRequired === false &&
+            proof.vendorDispatchProven === false &&
+            exactEye(proof.leftEye) && exactEye(proof.rightEye);
     }
 
     function exactTargetProof(proof, target) {
         if (!proof || proof.proven !== true || !target) return false;
-        const vendorTarget = target.method === "dlss" || target.method === "fsr";
+        const vendorTarget = isVendorTarget(target);
         const expectedKind = vendorTarget ?
             "exact_vendor_evaluation" : "exact_native_presentation";
         if (proof.kind !== expectedKind || proof.method !== target.method ||
@@ -579,12 +778,9 @@ async function runRenderScaleTuningLive(context) {
             proof.displayHeight,
         ];
         if (!identifiers.every(positiveInteger)) return false;
-        const generationValidator = target.renderScaleMode ?
-            positiveInteger : nonNegativeInteger;
-        if (!generationValidator(proof.contractGeneration)) return false;
-        if (vendorTarget && !generationValidator(proof.providerRuntimeGeneration)) {
-            return false;
-        }
+        if (vendorTarget && (!positiveInteger(proof.contractGeneration) ||
+            !positiveInteger(proof.providerRuntimeGeneration))) return false;
+        if (!vendorTarget && !exactNativeStereoProof(proof, target)) return false;
         return target.renderScaleMode ?
             proof.renderWidth < proof.displayWidth &&
                 proof.renderHeight < proof.displayHeight :
@@ -641,7 +837,7 @@ async function runRenderScaleTuningLive(context) {
                 notRequiredEvidence.replacementTransitionEpoch &&
             matchesMutationBoundaryGeneration(
                 notRequiredEvidence.replacementContractGeneration,
-                notRequiredProof.contractGeneration) &&
+                notRequiredProof.contractGeneration, target) &&
             positiveInteger(notRequiredEvidence.replacementDeviceIdentity) &&
             notRequiredProof.deviceIdentity ===
                 notRequiredEvidence.replacementDeviceIdentity;
@@ -896,7 +1092,7 @@ async function runRenderScaleTuningLive(context) {
                     boundary.replacementTransitionEpoch ||
                 !matchesMutationBoundaryGeneration(
                     boundary.replacementContractGeneration,
-                    firstNewProof.contractGeneration) ||
+                    firstNewProof.contractGeneration, target) ||
                 firstNewProof.deviceIdentity !==
                     boundary.replacementDeviceIdentity) {
                 producerInvalid.push("first_new_generation_owner_mismatch");
@@ -1083,10 +1279,9 @@ async function runRenderScaleTuningLive(context) {
         const waiter = entries.get("qualification-wait");
         const diagnostic = scenarioDiagnostic(
             response.root, steps, `${receiptKey}:scenario`);
-        const recovered = response.root.ok === true && apply &&
-            apply.accepted === true && waiter && waiter.satisfied === true &&
-            safeTerminal(waiter, identifiers) && waiter.milestoneTimings &&
-            waiter.replacementTimeline;
+        const assessment = recoveryAssessment(
+            response.root, apply, waiter, identifiers);
+        const recovered = assessment.decision.satisfied;
         const evidence = {
             status: recovered ? "RECOVERED" : "FAILED",
             scenarioReceiptKey: `${receiptKey}:scenario`,
@@ -1094,13 +1289,17 @@ async function runRenderScaleTuningLive(context) {
             target,
             apply,
             waiter,
+            failureSnapshot: recovered ? null : assessment,
             traceStop: entries.get("failed-dlss-trace-stop") || null,
             traceRead: entries.get("failed-dlss-trace-read") || null,
         };
         retain(receiptKey, evidence);
         if (!recovered) {
             if (!waiter) await closeOpenQualification(identifiers);
-            throw diagnosticError("transition_recovery_failed", diagnostic);
+            throw diagnosticError("transition_recovery_failed", {
+                ...diagnostic,
+                recovery: assessment,
+            });
         }
         return {
             boundary: {

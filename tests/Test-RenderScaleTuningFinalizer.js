@@ -169,6 +169,15 @@ function retained(boundary, violation, identity = {}, nonStable = false) {
             ownerId: `${runId}-owner`,
             baseline: { stressSessionId: 7 },
             producer: { buildId },
+            presentationStable: !nonStable,
+            cleanupDrained: !nonStable,
+            milestoneTimings: {
+                presentation: {
+                    observed: !nonStable,
+                    frame: nonStable ? 0 : 12,
+                    elapsedMs: nonStable ? 0 : 2.5,
+                },
+            },
             target: { method: "none", qualityMode: 0, renderScaleMode: false },
             replacementTimeline: {
                 mutationExpectation: "required",
@@ -252,6 +261,16 @@ function retained(boundary, violation, identity = {}, nonStable = false) {
                     postMutationUnprovenStereoSubmitted: 0,
                 },
             },
+            diagnostics: {
+                delta: {
+                    presentation: {
+                        maximumStretchFramesBaseline: 3,
+                        maximumStretchFramesCurrent: 3,
+                        stretchCompletedEpisodes: 1,
+                        stretchCompletedFrames: 2,
+                    },
+                },
+            },
         },
         projection: {
             renderVerdict: nonStable ? "FAIL" : "PASS",
@@ -269,6 +288,8 @@ function retained(boundary, violation, identity = {}, nonStable = false) {
             } : null,
             evidenceVerdict: violation ? "FAIL" : "PASS",
             task2Verdict: violation ? "FAIL" : "PASS",
+            presentationStretchSelected: true,
+            presentationStretchTerminalRecovery: !nonStable,
             missingEvidence: [],
             invariantViolations: {
                 preMutationStretchWithoutMutation: violation ? 1 : 0,
@@ -435,6 +456,17 @@ function testPartialInterruptedFinalization() {
             reportedError: "profiler_timeout",
             failedStep: "profiler-clear-history",
             firstUnreportedStep: "qualification-dispatch",
+            recovery: {
+                decision: {
+                    satisfied: false,
+                    reasons: ["waiter_not_satisfied",
+                        "safe_terminal:active_operation_not_clear"],
+                },
+                apply: { present: true, accepted: true },
+                waiter: { present: true, satisfied: false },
+                safeTerminal: { satisfied: false,
+                    reasons: ["active_operation_not_clear"] },
+            },
         };
         writeJson(path.join(root, "raw", "live-result.json"), {
             ok: false, status: "INTERRUPTED", variant: "nvidia", runId,
@@ -472,13 +504,21 @@ function testPartialInterruptedFinalization() {
             result.summary.assayExecution.interruption
                 .undispatchedTransitionReceipts.length === 1,
         "The failed scenario diagnostic was not retained in the offline summary.");
+        assert(result.summary.assayExecution.interruption.error ===
+            "transition_scenario_failed" &&
+            result.summary.assayExecution.interruption.failure.recovery
+                .decision.reasons.includes("waiter_not_satisfied"),
+        "The interrupted pass error or compact recovery decision was lost.");
         assert(result.index.files.some((entry) =>
             entry.path.endsWith("pass-2/transitions/01/scenario.json")),
         "The raw failed scenario was omitted from the receipt index.");
         const reportText = fs.readFileSync(path.join(root, "report.md"), "utf8");
-        assert(reportText.includes("profiler-clear-history") &&
-            reportText.includes(failure.receiptKey),
-        "The interrupted report omitted the exact failed step or receipt key.");
+        assert(reportText.includes("transition_scenario_failed") &&
+            reportText.includes("profiler-clear-history") &&
+            reportText.includes(failure.receiptKey) &&
+            reportText.includes("waiter_not_satisfied") &&
+            reportText.includes("safe_terminal:active_operation_not_clear"),
+        "The interrupted report omitted the exact error, step, receipt, or recovery reason.");
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -487,6 +527,16 @@ function testPartialInterruptedFinalization() {
 function testOfflineFinalization() {
     const root = createEvidenceRoot("nvidia", true);
     try {
+        const secondPath = path.join(root, "raw", "pass-1", "transitions",
+            "02", "retained.json");
+        const secondReceipt = JSON.parse(fs.readFileSync(secondPath, "utf8"));
+        secondReceipt.waiter.diagnostics.delta.presentation = {
+            maximumStretchFramesBaseline: 13,
+            maximumStretchFramesCurrent: 13,
+            stretchCompletedEpisodes: 2,
+            stretchCompletedFrames: 11,
+        };
+        writeJson(secondPath, secondReceipt);
         const options = { root, variant: "nvidia", runId: "nvidia-test-run",
             buildId: "e".repeat(64), expectedRows: 2,
             generatedUtc: "2026-08-30T20:00:00.000Z" };
@@ -510,7 +560,22 @@ function testOfflineFinalization() {
             result.summary.stabilityNotes.transitions[0]
                 .presentationDisposition === "PresentationStretch",
         "The non-stable transition note was not summarized.");
+        assert(result.summary.presentationStretchAnomalies.selected === 2 &&
+            result.summary.presentationStretchAnomalies.recoveredPass === 1 &&
+            result.summary.presentationStretchAnomalies.unrecovered === 1 &&
+            result.summary.presentationStretchAnomalies.transitions[0]
+                .consecutiveFrames === 2,
+        "Presentation-stretch anomalies were not summarized from receipts.");
         const first = result.summary.transitions[0];
+        assert(first.presentationStretchSelected === true &&
+            first.presentationStretchConsecutiveFrames === 2 &&
+            first.presentationStretchRecovered === true &&
+            first.presentationStretchRecoveryFrame === 12 &&
+            first.presentationStretchRecoveryElapsedMs === 2.5,
+        "Recovered presentation-stretch detail was not materialized.");
+        assert(result.summary.transitions[1]
+            .presentationStretchConsecutiveFrames === "not_exposed",
+        "An inexact multi-episode stretch maximum was fabricated.");
         assert(first.task2Verdict === "INCONCLUSIVE" &&
             first.task2MissingEvidence.includes(
                 "missing_required_mutation_boundary") &&
@@ -553,7 +618,10 @@ function testOfflineFinalization() {
         assert(report.includes("Task 2/evidence: **per transition**") &&
             report.includes("Task 2 is deliberately not aggregated") &&
             report.includes("not stable: PresentationStretch") &&
-            report.includes("Non-stable terminal notes: **1**"),
+            report.includes("Non-stable terminal notes: **1**") &&
+            report.includes("Presentation stretch: **2 selected, " +
+                "1 recovered PASS, 1 unrecovered**") &&
+            report.includes("## Presentation stretch anomalies"),
         "The report still presents an aggregate Task 2 verdict.");
         const transitionCsv = fs.readFileSync(path.join(root,
             "transitions.csv"), "utf8");
@@ -567,6 +635,8 @@ function testOfflineFinalization() {
             transitionCsv.includes("terminal_left_resource_revision") &&
             transitionCsv.includes("terminal_right_resource_revision") &&
             transitionCsv.includes("stability_presentation_disposition") &&
+            transitionCsv.includes("presentation_stretch_consecutive_frames") &&
+            transitionCsv.includes("presentation_stretch_recovery_elapsed_ms") &&
             transitionCsv.includes("PresentationStretch"),
         "The compact transition table omitted diagnostic columns.");
 

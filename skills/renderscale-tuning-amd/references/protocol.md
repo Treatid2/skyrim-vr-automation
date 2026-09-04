@@ -240,6 +240,13 @@ begin, dispatch, wait, and any cancellation; never reuse either pair.
    The interrupted live result must enumerate the retained receipt keys and
    preserve every earlier completed row/pass for offline materialization.
 
+   When baseline recovery is semantically rejected after its scenario returns,
+   embed the runner's bounded recovery assessment in the interruption. Preserve
+   apply acceptance, waiter and milestone states, decoded failure masks/reasons,
+   safe-terminal blockers, controller state, evidence presence, and terminal
+   generation/epoch identity. This projection is diagnostic only: it must not
+   add calls, waits, gates, retries, or change the recovery decision.
+
    If the mutation-and-wait scenario response is lost, apply the shared
    contract's owner-correlated recovery rule immediately. Never replay the
    scenario, apply, or waiter. Recover matching terminal `lastEvidence` from
@@ -466,6 +473,15 @@ or overflowed evidence. Missing `firstPhysicalMutation` is valid only when
 `mutationExpectation` is explicitly `not_required`; otherwise it is
 `INCONCLUSIVE`. Do not synthesize a missing facet from terminal status.
 
+For None and TAA, correlate the nonzero replacement transaction generation at
+the physical-mutation boundary with an exact native presentation whose contract
+and provider generations are both zero. Require the same request, transition
+epoch, device, dimensions, positive publication generation and resource
+revision, plus coherent matching left/right eye identity. Do not require the
+transaction generation to equal native generation zero. FSR proofs retain the
+published vendor-generation rule, and all post-mutation old-generation
+rejection remains strict.
+
 
 Report phase-counter authority separately as `MATCHED`, `MISMATCHED`, or
 `INCOMPLETE`. Keep every nonzero counter visible as a reported pipeline
@@ -576,9 +592,26 @@ receipts, persist stop/final-status responses under that pass's `finalization`
 directory, then invoke the packaged shared render-scale finalizer at
 `tools/renderscale-tuning-finalizer/finalizer.js`. Use one read-only scenario
 with `continueOnError: true` and validate each
-labeled result independently. Treat an unsupported optional operation or event
-history action as `not_exposed`; it must not abort the later status, telemetry,
-or cleanup reads. During live finalization,
+labeled result independently. Every tool step in that scenario must place its
+tool input in `args`; never use `arguments`. Before dispatch, reject a batch
+unless every tool step has an `args` object containing its explicit `action`,
+for example:
+
+```json
+{
+  "label": "renderscale-status",
+  "tool": "communityshaders.renderscale",
+  "args": {
+    "action": "status",
+    "expectedBuildId": "<exact-build-id>"
+  }
+}
+```
+
+This validation is finalization-only and must not insert another read, wait,
+or gate between measured rows or passes. Treat an unsupported optional
+operation or event history action as `not_exposed`; it must not abort the later
+status, telemetry, or cleanup reads. During live finalization,
 its `collectTracePages` helper obtains the maximum page size from the live
 producer schema, pages with `afterSequence` while `moreAvailable` is true, and
 rejects gaps, duplicates, overwritten requests, or build/session changes.

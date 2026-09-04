@@ -578,6 +578,51 @@ function finalProfile(waiter) {
     };
 }
 
+function presentationStretchDetails(waiter, projection, renderVerdict) {
+    const selected = projection.presentationStretchSelected === true;
+    const presentation = waiter.diagnostics && waiter.diagnostics.delta &&
+        waiter.diagnostics.delta.presentation || {};
+    let consecutiveFrames = selected ? "not_exposed" : 0;
+    if (selected && Number.isSafeInteger(presentation.stretchCompletedEpisodes) &&
+        presentation.stretchCompletedEpisodes === 1 &&
+        Number.isSafeInteger(presentation.stretchCompletedFrames) &&
+        presentation.stretchCompletedFrames >= 0) {
+        consecutiveFrames = presentation.stretchCompletedFrames;
+    } else if (selected &&
+        Number.isSafeInteger(presentation.maximumStretchFramesBaseline) &&
+        Number.isSafeInteger(presentation.maximumStretchFramesCurrent) &&
+        presentation.maximumStretchFramesCurrent >= 0 &&
+        (presentation.maximumStretchFramesBaseline === 0 ||
+            presentation.maximumStretchFramesCurrent >
+                presentation.maximumStretchFramesBaseline)) {
+        consecutiveFrames = presentation.maximumStretchFramesCurrent;
+    }
+    const recovered = selected && renderVerdict === "PASS" &&
+        waiter.satisfied === true && waiter.presentationStable === true &&
+        waiter.cleanupDrained === true;
+    const milestone = waiter.milestoneTimings &&
+        waiter.milestoneTimings.presentation || {};
+    return {
+        selected,
+        consecutiveFrames,
+        recovered,
+        recoveryFrame: recovered && Number.isSafeInteger(milestone.frame) ?
+            milestone.frame : "not_exposed",
+        recoveryElapsedMs: recovered && Number.isFinite(milestone.elapsedMs) ?
+            milestone.elapsedMs : "not_exposed",
+    };
+}
+
+function sourceProfile(waiter) {
+    const timeline = waiter.replacementTimeline || {};
+    const proof = timeline.dispatch && timeline.dispatch.presentationProof || {};
+    return {
+        method: proof.method ?? "not_exposed",
+        qualityMode: proof.qualityMode ?? "not_exposed",
+        renderScaleMode: proof.renderScaleMode ?? "not_exposed",
+    };
+}
+
 function transitionRow(root, file, retained) {
     const identity = rowIdentity(root, file);
     const waiter = retained.waiter || {};
@@ -588,6 +633,9 @@ function transitionRow(root, file, retained) {
     const diagnostics = transitionDiagnostics(timeline);
     const boundary = timeline.firstPhysicalMutation;
     const target = waiter.target || {};
+    const renderVerdict = projection.renderVerdict ||
+        (waiter.satisfied === true ? "PASS" : "FAIL");
+    const stretch = presentationStretchDetails(waiter, projection, renderVerdict);
     const traceRequired = target.method === "dlss";
     const traceComplete = !traceRequired || ["traceReset", "traceStart", "traceStop",
         "traceRead"].every((name) => retained[name]);
@@ -595,8 +643,8 @@ function transitionRow(root, file, retained) {
     return {
         ...identity,
         target,
-        renderVerdict: projection.renderVerdict ||
-            (waiter.satisfied === true ? "PASS" : "FAIL"),
+        source: sourceProfile(waiter),
+        renderVerdict,
         task2Verdict: task2.verdict,
         task2MissingEvidence: task2.missingEvidence,
         task2ProducerInvalidEvidence: task2.producerInvalidEvidence,
@@ -619,10 +667,11 @@ function transitionRow(root, file, retained) {
         finalRenderScaleMode: profile.renderScaleMode,
         finalStateRevision: profile.stateRevision,
         nonStableNote: projection.nonStableNote || null,
-        presentationStretchSelected:
-            projection.presentationStretchSelected === true,
-        presentationStretchRecovered:
-            projection.presentationStretchTerminalRecovery === true,
+        presentationStretchSelected: stretch.selected,
+        presentationStretchConsecutiveFrames: stretch.consecutiveFrames,
+        presentationStretchRecovered: stretch.recovered,
+        presentationStretchRecoveryFrame: stretch.recoveryFrame,
+        presentationStretchRecoveryElapsedMs: stretch.recoveryElapsedMs,
         traceRequired,
         traceComplete,
         recoveryStatus: recovery ? recovery.status || "not_exposed" : "not_needed",
@@ -665,6 +714,11 @@ function csv(rows) {
         "final_render_scale_mode", "final_state_revision", "trace_required",
         "trace_complete", "recovery_status", "recovery_target",
         "recovery_receipt_key", "source_recovery_receipt_key",
+        "presentation_stretch_selected",
+        "presentation_stretch_consecutive_frames",
+        "presentation_stretch_recovered",
+        "presentation_stretch_recovery_frame",
+        "presentation_stretch_recovery_elapsed_ms",
         "boundary_exposed", "dispatch_frame",
         "dispatch_qpc_tick", "dispatch_left_generation",
         "dispatch_left_transition_epoch", "dispatch_left_resource_revision",
@@ -702,6 +756,11 @@ function csv(rows) {
             row.finalStateRevision, row.traceRequired, row.traceComplete,
             row.recoveryStatus, row.recoveryTarget, row.recoveryReceiptKey,
             row.sourceRecoveryReceiptKey,
+            row.presentationStretchSelected,
+            row.presentationStretchConsecutiveFrames,
+            row.presentationStretchRecovered,
+            row.presentationStretchRecoveryFrame,
+            row.presentationStretchRecoveryElapsedMs,
             diagnostics.boundaryExposed, diagnostics.dispatchFrame,
             diagnostics.dispatchQpcTick, diagnostics.dispatchLeft.generation,
             diagnostics.dispatchLeft.transitionEpoch,
@@ -738,6 +797,11 @@ function report(summary) {
         return (
         `| ${row.lane || "default"} | ${row.pass} | ${row.ordinal} | ` +
         `${row.renderVerdict} | ${stability} | ${row.task2Verdict} | ` +
+        `${row.presentationStretchSelected ?
+            row.presentationStretchConsecutiveFrames : "none"} | ` +
+        `${row.presentationStretchRecovered ?
+            `${row.presentationStretchRecoveryFrame}/` +
+                `${row.presentationStretchRecoveryElapsedMs} ms` : "none"} | ` +
         `${recovery} | ` +
         `${row.phaseCounterAuthorityStatus} | ` +
         `${row.reportedTask2Violations.join("; ") || "none"} | ` +
@@ -746,6 +810,16 @@ function report(summary) {
     }).join("\n");
     const interruption = summary.assayExecution.interruption;
     const failure = interruption && interruption.failure;
+    const recovery = failure && failure.recovery;
+    const recoveryDecision = recovery && recovery.decision;
+    const recoveryReasons = recoveryDecision &&
+        Array.isArray(recoveryDecision.reasons) ? recoveryDecision.reasons : [];
+    const stretchRows = summary.presentationStretchAnomalies.transitions
+        .map((entry) => `| ${entry.lane || "default"} | ${entry.pass} | ` +
+            `${entry.ordinal} | ${JSON.stringify(entry.from)} | ` +
+            `${JSON.stringify(entry.to)} | ${entry.consecutiveFrames} | ` +
+            `${entry.recovered ? "yes" : "no"} |`)
+        .join("\n");
     return `# ${summary.protocol} final report\n\n` +
         `- Assay execution: **${summary.assayExecution.status}**\n` +
         `- Transitions dispatched: **${summary.assayExecution.transitionsDispatched}/` +
@@ -765,17 +839,57 @@ function report(summary) {
             `- Failed scenario step: **${failure.failedStep || "not_exposed"}** ` +
             `(first unreported: ${failure.firstUnreportedStep || "none"}; ` +
             `receipt: ${failure.receiptKey || "not_exposed"})\n` : "") +
+        (recovery ?
+            `- Recovery decision: **${recoveryDecision &&
+                recoveryDecision.satisfied === true ? "SATISFIED" : "FAILED"}** ` +
+            `(apply accepted: ${recovery.apply && recovery.apply.accepted}; ` +
+            `waiter satisfied: ${recovery.waiter && recovery.waiter.satisfied}; ` +
+            `safe terminal: ${recovery.safeTerminal &&
+                recovery.safeTerminal.satisfied})\n` : "") +
+        (recoveryReasons.length > 0 ?
+            `- Recovery blockers: **${recoveryReasons.join("; ")}**\n` : "") +
         (summary.memoryConfirmation ?
             `- Memory confirmation: **${summary.memoryConfirmation.verdict}**\n` : "") +
+        `- Presentation stretch: **` +
+        `${summary.presentationStretchAnomalies.selected} selected, ` +
+        `${summary.presentationStretchAnomalies.recoveredPass} recovered PASS, ` +
+        `${summary.presentationStretchAnomalies.unrecovered} unrecovered**\n` +
         `\n` +
         `Task 2 is deliberately not aggregated. Reporting failure does not ` +
         `rewrite the render result, and a render pass does not hide missing ` +
         `per-transition evidence. Every raw JSON value is available in ` +
         `\`${summary.evidenceExtraction.path}\`.\n\n` +
         `## Transitions\n\n` +
-        `| Lane | Pass | Row | Render | Stability | Task 2 | Recovery | Authority | Reported violations | ` +
+        `| Lane | Pass | Row | Render | Stability | Task 2 | Stretch frames | Stretch recovery | Recovery | Authority | Reported violations | ` +
         `Missing evidence | Invalid producer evidence |\n` +
-        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n`;
+        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n\n` +
+        `## Presentation stretch anomalies\n\n` +
+        `| Lane | Pass | Row | From | To | Consecutive frames | Recovered PASS |\n` +
+        `| --- | ---: | ---: | --- | --- | ---: | --- |\n` +
+        `${stretchRows || "| none | - | - | - | - | - | - |"}\n`;
+}
+
+function presentationStretchAnomalies(rows) {
+    const selected = rows.filter((row) => row.presentationStretchSelected);
+    const recovered = selected.filter((row) =>
+        row.presentationStretchRecovered && row.renderVerdict === "PASS");
+    return {
+        selected: selected.length,
+        recoveredPass: recovered.length,
+        unrecovered: selected.length - recovered.length,
+        transitions: selected.map((row) => ({
+            lane: row.lane,
+            pass: row.pass,
+            ordinal: row.ordinal,
+            from: row.source,
+            to: row.target,
+            consecutiveFrames: row.presentationStretchConsecutiveFrames,
+            recovered: row.presentationStretchRecovered &&
+                row.renderVerdict === "PASS",
+            recoveryFrame: row.presentationStretchRecoveryFrame,
+            recoveryElapsedMs: row.presentationStretchRecoveryElapsedMs,
+        })),
+    };
 }
 
 function writeAtomic(file, content) {
@@ -814,6 +928,9 @@ function finalizeEvidence(options) {
     }
     const interrupted = interruptedLiveResult(
         root, variant, runIds[0]);
+    const interruptedPass = interrupted && interrupted.lanes && interrupted.lanes
+        .flatMap((lane) => lane.passes || [])
+        .find((pass) => pass.status === "INTERRUPTED");
     const expectedRows = options.expectedRows ??
         (existing.assayExecution &&
             existing.assayExecution.expectedTerminalReceipts) ??
@@ -886,17 +1003,17 @@ function finalizeEvidence(options) {
             transitionsDispatched: rows.length,
             expectedTransitions: expectedRows,
             interruption: interrupted ? {
-                error: interrupted.error || null,
+                error: interrupted.error || interruptedPass &&
+                    interruptedPass.error || null,
                 failure: interrupted.failure ||
-                    interrupted.lanes && interrupted.lanes
-                        .flatMap((lane) => lane.passes || [])
-                        .find((pass) => pass.status === "INTERRUPTED")?.failure || null,
+                    interruptedPass && interruptedPass.failure || null,
                 undispatchedTransitionReceipts: undispatchedFailures.map((entry) =>
                     relative(root, entry.file)),
             } : null },
         render: { verdict: renderVerdict },
         stabilityNotes: { count: nonStableTransitions.length,
             transitions: nonStableTransitions },
+        presentationStretchAnomalies: presentationStretchAnomalies(rows),
         task2Evidence: { mode: "per_transition", counts: task2Counts,
             aggregateVerdict: "NOT_COMPUTED" },
         reporting: { status: reportingStatus, reasons: reportingReasons },

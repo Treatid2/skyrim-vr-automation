@@ -221,6 +221,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
             const renderHeight = target.renderScaleMode ? 100 : 200;
             const proofKind = target.method === "dlss" || target.method === "fsr" ?
                 "exact_vendor_evaluation" : "exact_native_presentation";
+            const vendorTarget = proofKind === "exact_vendor_evaluation";
             const exactProof = () => ({
                 proven: true,
                 kind: proofKind,
@@ -231,8 +232,8 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
                 renderScaleMode: target.renderScaleMode,
                 requestId: 9,
                 transitionEpoch: 9,
-                contractGeneration: 9,
-                providerRuntimeGeneration: 11,
+                contractGeneration: vendorTarget ? 9 : 0,
+                providerRuntimeGeneration: vendorTarget ? 11 : 0,
                 resourcePublicationGeneration: 101,
                 resourceRevision: 41,
                 deviceIdentity: 100,
@@ -241,6 +242,45 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
                 displayWidth: 200,
                 displayHeight: 200,
                 compositorCycleToken: 22,
+                backend: vendorTarget ? target.method : "none",
+                sharedVendorDispatchRequired: vendorTarget,
+                vendorDispatchProven: vendorTarget,
+                leftEye: {
+                    frame: 14,
+                    qpcTick: 14,
+                    compositorCycleToken: 22,
+                    transitionEpoch: 9,
+                    method: target.method,
+                    backend: vendorTarget ? target.method : "none",
+                    generation: vendorTarget ? 9 : 0,
+                    deviceIdentity: 100,
+                    resourceRevision: 41,
+                    renderWidth,
+                    renderHeight,
+                    displayWidth: 200,
+                    displayHeight: 200,
+                    vendorDispatchFrame: vendorTarget ? 14 : 0,
+                    vendorDispatchSerial: vendorTarget ? 1 : 0,
+                    vendorRuntimeFallback: false,
+                },
+                rightEye: {
+                    frame: 14,
+                    qpcTick: 14,
+                    compositorCycleToken: 22,
+                    transitionEpoch: 9,
+                    method: target.method,
+                    backend: vendorTarget ? target.method : "none",
+                    generation: vendorTarget ? 9 : 0,
+                    deviceIdentity: 100,
+                    resourceRevision: 41,
+                    renderWidth,
+                    renderHeight,
+                    displayWidth: 200,
+                    displayHeight: 200,
+                    vendorDispatchFrame: vendorTarget ? 14 : 0,
+                    vendorDispatchSerial: vendorTarget ? 1 : 0,
+                    vendorRuntimeFallback: false,
+                },
             });
             const semanticFailure = !recovery && semanticFailureOrdinal > 0 &&
                 ((transitionOrdinal - 1) % 33) + 1 === semanticFailureOrdinal;
@@ -558,7 +598,8 @@ async function testNvidia() {
     "NVIDIA timeline facets were not projected independently.");
     assert(transitionNotifications.every((row) =>
         row.last_pre_mutation_.proof_contract_generation === 8 &&
-        row.first_new_generation_proven_.proof_contract_generation === 9),
+        row.first_new_generation_proven_.proof_contract_generation ===
+            (row.target.method === "dlss" || row.target.method === "fsr" ? 9 : 0)),
     "NVIDIA old/new generations were flattened across facets.");
     assert(transitionNotifications.every((row) => row.cleanupDrained === true),
         "Structured cleanup debt was not projected from cleanupDrained.");
@@ -937,6 +978,29 @@ async function testFailedRecoveryStopsLaterTransitions() {
         "matrix.v1.json")));
     let injected = false;
     const mock = createMock(0, (receipt, context) => {
+        if (context.recovery) {
+            receipt.satisfied = false;
+            receipt.outcome = "timeout";
+            receipt.timedOutMilestone = "strict";
+            receipt.presentationStable = true;
+            receipt.presentationFailureMask = 0;
+            receipt.presentationFailureReasons = [];
+            receipt.cleanupDrained = true;
+            receipt.cleanupFailureMask = 0;
+            receipt.cleanupFailureReasons = [];
+            receipt.strictSatisfied = false;
+            receipt.strictFailureMask = 64;
+            receipt.strictFailureReasons = [
+                { category: "lifecycle", code: "epoch_mismatch" },
+            ];
+            receipt.upscalingSnapshot.activeOperationId = 27;
+            receipt.upscalingSnapshot.transitionState = named("Stabilizing", 4);
+            receipt.observation.physical = { state: "Stabilizing" };
+            receipt.observation.replacementPresentation = {
+                phase: "awaiting_stereo",
+            };
+            return receipt;
+        }
         if (!injected && !context.baseline && !context.recovery) {
             injected = true;
             receipt.ok = false;
@@ -953,13 +1017,7 @@ async function testFailedRecoveryStopsLaterTransitions() {
     }, (root, args, state) => {
         const waiter = root.results.find((entry) =>
             entry.label === "qualification-wait");
-        if (state.recovery) {
-            const apply = root.results.find((entry) =>
-                entry.label === "recovery-profile-apply");
-            apply.result.accepted = false;
-            root.ok = false;
-            root.aborted = true;
-        } else if (waiter && waiter.result && waiter.result.ok === false) {
+        if (!state.recovery && waiter && waiter.result && waiter.result.ok === false) {
             root.ok = false;
             root.aborted = true;
         }
@@ -976,6 +1034,44 @@ async function testFailedRecoveryStopsLaterTransitions() {
     assert(result.ok === false && result.status === "INTERRUPTED" &&
         result.lanes[0].passes[0].error === "transition_recovery_failed",
     "A failed reset did not stop the assay explicitly.");
+    const failure = result.lanes[0].passes[0].failure;
+    assert(failure && failure.ok === true && failure.aborted === false &&
+        failure.stepsRun === 4 && failure.failedStep === null &&
+        failure.firstUnreportedStep === null,
+    "The successful outer recovery scenario was not distinguished from its semantic failure.");
+    const recovery = failure.recovery;
+    assert(recovery && recovery.scenarioOk === true &&
+        recovery.apply.present === true && recovery.apply.accepted === true &&
+        recovery.apply.disposition === "queued" &&
+        recovery.waiter.present === true && recovery.waiter.satisfied === false &&
+        recovery.waiter.outcome === "timeout" &&
+        recovery.waiter.timedOutMilestone === "strict",
+    "The recovery apply or waiter result was not preserved compactly.");
+    assert(recovery.milestones.presentationStable === true &&
+        recovery.milestones.cleanupDrained === true &&
+        recovery.milestones.strictSatisfied === false &&
+        recovery.failures.presentation.mask === 0 &&
+        recovery.failures.cleanup.mask === 0 &&
+        recovery.failures.strict.mask === 64 &&
+        recovery.failures.strict.reasons.values.includes(
+            "lifecycle:epoch_mismatch"),
+    "The recovery milestone failure was not retained.");
+    assert(recovery.safeTerminal.satisfied === false &&
+        recovery.safeTerminal.reasons.includes("active_operation_not_clear") &&
+        recovery.controller.activeOperationId === 27 &&
+        recovery.controller.transitionState === "Stabilizing" &&
+        recovery.controller.physicalState === "Stabilizing" &&
+        recovery.controller.presentationPhase === "awaiting_stereo",
+    "The recovery terminal/controller state was not retained.");
+    assert(recovery.evidence.milestoneTimingsPresent === true &&
+        recovery.evidence.replacementTimelinePresent === true &&
+        recovery.evidence.terminalTimelinePresent === true &&
+        recovery.terminalIdentity.proof.contractGeneration === 9 &&
+        recovery.terminalIdentity.proof.transitionEpoch === 9 &&
+        recovery.decision.reasons.includes("waiter_not_satisfied") &&
+        recovery.decision.reasons.includes(
+            "safe_terminal:active_operation_not_clear"),
+    "The recovery proof identity or exact rejection reasons were not retained.");
     const measuredApplies = mock.scenarioCalls.flatMap((call) => call.steps)
         .filter((step) => step.label === "profile-apply");
     assert(measuredApplies.length === 2,
@@ -985,6 +1081,11 @@ async function testFailedRecoveryStopsLaterTransitions() {
     assert(retained.recovery.status === "FAILED" &&
         typeof retained.recoveryReceiptKey === "string",
     "The failed recovery was not linked from the interrupted row.");
+    const recoveryEvidence = mock.stores.get(retained.recoveryReceiptKey);
+    assert(recoveryEvidence.failureSnapshot &&
+        recoveryEvidence.failureSnapshot.decision.reasons.includes(
+            "waiter_not_satisfied"),
+    "The recovery receipt did not retain the same bounded failure snapshot.");
 }
 
 async function testDeviceLossNeverAttemptsRecovery() {
@@ -1204,10 +1305,10 @@ async function testEvidenceVerdicts() {
 
     const fixedNativeGenerationZero = await runNvidiaProjectionTransform(
         (receipt, context) => {
-            if (!context.baseline &&
-                receipt.upscalingSnapshot.profiles.stable.renderScaleMode === false) {
+            const method = receipt.upscalingSnapshot.profiles.stable.method.name;
+            if (!context.baseline && (method === "none" || method === "taa")) {
                 receipt.replacementTimeline.firstPhysicalMutation
-                    .replacementContractGeneration = 0;
+                    .replacementContractGeneration = 9;
                 receipt.replacementTimeline.firstNewGenerationProven
                     .presentationProof.contractGeneration = 0;
                 receipt.replacementTimeline.firstNewGenerationProven
@@ -1216,11 +1317,48 @@ async function testEvidenceVerdicts() {
             return receipt;
         });
     const fixedNativeRows = fixedNativeGenerationZero.filter((row) =>
-        row.target.renderScaleMode === false);
+        row.target.method === "none" || row.target.method === "taa");
     assert(fixedNativeRows.length > 0 && fixedNativeRows.every((row) =>
         row.evidenceVerdict === "PASS" &&
-        row.producerInvalidEvidence.length === 0),
-    "A fixed native target rejected its valid zero generation proof.");
+        row.producerInvalidEvidence.length === 0 &&
+        row.first_new_generation_proven_.proof_contract_generation === 0),
+    "A native target did not correlate transaction generation to exact zero-generation proof.");
+
+    const mismatchedNativeEye = await runNvidiaProjectionTransform(
+        (receipt, context) => {
+            if (!context.baseline &&
+                (receipt.upscalingSnapshot.profiles.stable.method.name === "none" ||
+                    receipt.upscalingSnapshot.profiles.stable.method.name === "taa")) {
+                receipt.replacementTimeline.firstNewGenerationProven
+                    .presentationProof.leftEye.resourceRevision += 1;
+            }
+            return receipt;
+        });
+    const mismatchedNativeRows = mismatchedNativeEye.filter((row) =>
+        row.target.method === "none" || row.target.method === "taa");
+    assert(mismatchedNativeRows.length > 0 && mismatchedNativeRows.every((row) =>
+        row.evidenceVerdict === "INCONCLUSIVE" &&
+        row.producerInvalidEvidence.includes(
+            "first_new_generation_target_mismatch")),
+    "A native target accepted incoherent both-eye resource ownership.");
+
+    const mismatchedNativeOwner = await runNvidiaProjectionTransform(
+        (receipt, context) => {
+            const method = receipt.upscalingSnapshot.profiles.stable.method.name;
+            if (!context.baseline && (method === "none" || method === "taa")) {
+                receipt.replacementTimeline.firstNewGenerationProven
+                    .presentationProof.requestId += 1;
+            }
+            return receipt;
+        });
+    const mismatchedNativeOwnerRows = mismatchedNativeOwner.filter((row) =>
+        row.target.method === "none" || row.target.method === "taa");
+    assert(mismatchedNativeOwnerRows.length > 0 &&
+        mismatchedNativeOwnerRows.every((row) =>
+            row.evidenceVerdict === "INCONCLUSIVE" &&
+            row.producerInvalidEvidence.includes(
+                "first_new_generation_owner_mismatch")),
+    "A native target accepted a proof owned by another request.");
 
     const scaledGenerationZero = await runNvidiaProjectionTransform(
         (receipt, context) => {
@@ -1241,6 +1379,29 @@ async function testEvidenceVerdicts() {
             "first_new_generation_target_mismatch")),
     "A scaled target accepted a zero contract generation.");
 
+    const nativeResolutionVendorGenerationZero = await runNvidiaProjectionTransform(
+        (receipt, context) => {
+            const profile = receipt.upscalingSnapshot.profiles.stable;
+            const method = profile.method.name;
+            if (!context.baseline && !profile.renderScaleMode &&
+                (method === "dlss" || method === "fsr")) {
+                receipt.replacementTimeline.firstNewGenerationProven
+                    .presentationProof.contractGeneration = 0;
+                receipt.replacementTimeline.firstNewGenerationProven
+                    .presentationProof.providerRuntimeGeneration = 0;
+            }
+            return receipt;
+        });
+    const nativeResolutionVendorRows = nativeResolutionVendorGenerationZero.filter((row) =>
+        !row.target.renderScaleMode &&
+        (row.target.method === "dlss" || row.target.method === "fsr"));
+    assert(nativeResolutionVendorRows.length > 0 &&
+        nativeResolutionVendorRows.every((row) =>
+            row.evidenceVerdict === "INCONCLUSIVE" &&
+            row.producerInvalidEvidence.includes(
+                "first_new_generation_target_mismatch")),
+    "A native-resolution vendor target accepted generation zero.");
+
     const publishedBoundaryGenerationMismatch = await runNvidiaProjectionTransform(
         (receipt, context) => {
             if (!context.baseline) {
@@ -1249,11 +1410,20 @@ async function testEvidenceVerdicts() {
             }
             return receipt;
         });
-    assert(publishedBoundaryGenerationMismatch.every((row) =>
+    const publishedVendorRows = publishedBoundaryGenerationMismatch.filter((row) =>
+        row.target.method === "dlss" || row.target.method === "fsr");
+    const publishedNativeRows = publishedBoundaryGenerationMismatch.filter((row) =>
+        row.target.method === "none" || row.target.method === "taa");
+    assert(publishedVendorRows.length > 0 && publishedVendorRows.every((row) =>
         row.evidenceVerdict === "INCONCLUSIVE" &&
         row.producerInvalidEvidence.includes(
             "first_new_generation_owner_mismatch")),
     "A published boundary generation mismatch was accepted.");
+    assert(publishedNativeRows.length > 0 && publishedNativeRows.every((row) =>
+        row.evidenceVerdict === "PASS" &&
+        !row.producerInvalidEvidence.includes(
+            "first_new_generation_owner_mismatch")),
+    "A native transaction generation was confused with provider generation zero.");
 
     const missingMutation = await runNvidiaProjectionTransform((receipt, context) => {
         if (!context.baseline) delete receipt.replacementTimeline.firstPhysicalMutation;
@@ -1313,8 +1483,8 @@ async function testEvidenceVerdicts() {
 
     const nativeNotRequiredGenerationZero = await runNvidiaProjectionTransform(
         (receipt, context) => {
-            if (!context.baseline &&
-                receipt.upscalingSnapshot.profiles.stable.renderScaleMode === false) {
+            const method = receipt.upscalingSnapshot.profiles.stable.method.name;
+            if (!context.baseline && (method === "none" || method === "taa")) {
                 receipt.replacementTimeline.mutationExpectation = "not_required";
                 receipt.replacementTimeline.mutationExpectationReason =
                     "native_contract_reuse";
@@ -1339,7 +1509,7 @@ async function testEvidenceVerdicts() {
             return receipt;
         });
     const nativeNotRequiredRows = nativeNotRequiredGenerationZero.filter((row) =>
-        row.target.renderScaleMode === false);
+        row.target.method === "none" || row.target.method === "taa");
     assert(nativeNotRequiredRows.length > 0 && nativeNotRequiredRows.every((row) =>
         row.evidenceVerdict === "PASS" && row.mutationNotRequiredProven === true &&
         row.first_physical_mutation_ === "not_required"),
