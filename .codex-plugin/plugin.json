@@ -1,7 +1,7 @@
 {
   "name": "skyrim-vr-automation",
-  "version": "0.9.0+codex.20260830213000",
-  "description": "Codex skills for transactional Skyrim VR automation, local feedback, correlated capture and interaction, DevBench profiling, and reusable shader-cache management.",
+  "version": "0.9.0+codex.20260903132432",
+  "description": "Codex tools and skills for transactional Skyrim VR automation, correlated capture and interaction, DevBench qualification and profiling, local feedback, and reusable shader-cache management.",
   "author": {
     "name": "Treatid2",
     "url": "https://github.com/Treatid2"
@@ -21,10 +21,11 @@
     "interaction"
   ],
   "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Skyrim VR Automation",
     "shortDescription": "Safe Skyrim VR test and profiling controls.",
-    "longDescription": "Adds safety-bounded workflows for exact-profile Mod Organizer 2 sessions, correlated state/stereo capture and in-game actions, transactional profile edits, compatibility-ranked compiled shader-cache reuse, backed-up SteamVR null-HMD switching, identity-bound DevBench calls, profiler captures, bounded process retries, and a durable local automation-feedback mailbox.",
+    "longDescription": "Adds safety-bounded workflows for explicitly selected Mod Organizer 2 modlists and exact-profile sessions, correlated state/stereo capture and in-game actions, transactional profile edits, compatibility-ranked compiled shader-cache reuse, backed-up SteamVR null-HMD switching, identity-bound DevBench calls, fully unattended render-scale qualification, profiler captures, bounded process retries, and a durable local automation-feedback mailbox.",
     "developerName": "Treatid2",
     "category": "Developer Tools",
     "capabilities": [
@@ -36,11 +37,17 @@
     "privacyPolicyURL": "https://github.com/Treatid2/skyrim-vr-automation/blob/main/PRIVACY.md",
     "termsOfServiceURL": "https://github.com/Treatid2/skyrim-vr-automation/blob/main/TERMS.md",
     "defaultPrompt": [
+      "List and select one exact configured MO2 modlist.",
       "Inspect my configured MO2 environment safely.",
       "Switch SteamVR to null HMD with a recoverable backup.",
       "Run a bounded Skyrim VR test session through MO2.",
+      "Run a load-synchronized COC stability and transition-throughput test.",
+      "Run the five-second 25-step Community Shaders menu transition assay.",
+      "Run the NVIDIA 33-transition public-API render-scale tuning assay.",
+      "Run the AMD three-lane public-API render-scale tuning assay.",
       "Record and triage local feedback about the automation toolkit.",
       "Capture and compare CSX profiler evidence.",
+      "With the intended DLL already running in game, start the fully unattended CSX render-scale qualification.",
       "Prepare this task with the best compatible known-working compiled shader cache.",
       "Observe and interact with Skyrim VR through one correlated state and stereo capture session."
     ]
