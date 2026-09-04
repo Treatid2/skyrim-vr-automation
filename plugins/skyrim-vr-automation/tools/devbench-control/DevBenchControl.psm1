@@ -246,7 +246,7 @@ function Test-DevBenchMainMenuReady {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$MenuState,
-        [string[]]$AllowedMenus = @('HUD Menu', 'Main Menu')
+        [string[]]$AllowedMenus = @('HUD Menu', 'Main Menu', 'Mist Menu', 'Fader Menu')
     )
     $openMenus = if ($MenuState.PSObject.Properties['openMenus']) { @($MenuState.openMenus) } else { @() }
     $unexpected = @($openMenus | Where-Object { $_ -notin $AllowedMenus })

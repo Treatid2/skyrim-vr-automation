@@ -54,6 +54,8 @@ $modal = Test-DevBenchNoBlockingMenu -MenuState ([pscustomobject]@{ openMenus = 
 Assert-Test (-not $modal.satisfied) 'message boxes remain blocking'
 $mainReady = Test-DevBenchMainMenuReady -MenuState ([pscustomobject]@{ openMenus = @('HUD Menu', 'Main Menu'); messageBoxOpen = $false })
 Assert-Test $mainReady.satisfied 'mainMenuReady represents the normal main-menu state without treating Main Menu as blocking'
+$mainVrReady = Test-DevBenchMainMenuReady -MenuState ([pscustomobject]@{ openMenus = @('Main Menu', 'Mist Menu', 'Fader Menu'); messageBoxOpen = $false })
+Assert-Test $mainVrReady.satisfied 'mainMenuReady accepts the normal Skyrim VR mist and fader overlays'
 $mainMissing = Test-DevBenchMainMenuReady -MenuState ([pscustomobject]@{ openMenus = @('HUD Menu'); messageBoxOpen = $false })
 Assert-Test (-not $mainMissing.satisfied) 'mainMenuReady requires the main menu rather than accepting gameplay'
 $mainObscured = Test-DevBenchMainMenuReady -MenuState ([pscustomobject]@{ openMenus = @('HUD Menu', 'Main Menu', 'MessageBoxMenu'); messageBoxOpen = $true })

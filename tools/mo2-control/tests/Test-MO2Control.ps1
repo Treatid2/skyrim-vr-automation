@@ -51,11 +51,12 @@ try {
     $gameRoot = Join-Path $fixture 'Game'
     $modsRoot = Join-Path $mo2Root 'mods'
     $loaderMod = Join-Path $modsRoot 'Skyrim Script Extender for VR (SKSEVR)'
+    $ocuMod = Join-Path $modsRoot 'OpenComposite Runtime Provider'
     $staging = Join-Path $fixture 'staging'
     $archive = Join-Path $fixture 'archive'
     $sessionRoot = Join-Path $fixture 'sessions'
 
-    foreach ($directory in @($profile, $overwrite, $rootBuilderDefinitions, $rootBuilderData, $gameRoot, $loaderMod, $staging, $archive, $sessionRoot)) {
+    foreach ($directory in @($profile, $overwrite, $rootBuilderDefinitions, $rootBuilderData, $gameRoot, $loaderMod, (Join-Path $ocuMod 'root'), (Join-Path $ocuMod 'SKSE\Plugins'), $staging, $archive, $sessionRoot)) {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
 
@@ -65,7 +66,10 @@ try {
     New-Item -ItemType File -Path $mo2Exe -Force | Out-Null
     New-Item -ItemType File -Path $loader -Force | Out-Null
     New-Item -ItemType File -Path $plainGame -Force | Out-Null
-    '+Skyrim Script Extender for VR (SKSEVR)' | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
+    New-Item -ItemType File -Path (Join-Path $ocuMod 'root\openvr_api.dll') -Force | Out-Null
+    New-Item -ItemType File -Path (Join-Path $ocuMod 'root\opencomposite.ini') -Force | Out-Null
+    New-Item -ItemType File -Path (Join-Path $ocuMod 'SKSE\Plugins\OpenCompositeInput.dll') -Force | Out-Null
+    @('+Skyrim Script Extender for VR (SKSEVR)', '-OpenComposite Runtime Provider') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
 
     $definition = Join-Path $rootBuilderDefinitions 'rootbuilder_defaults.json'
     $gameData = Join-Path $rootBuilderData 'GameData.json'
@@ -150,11 +154,11 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test ($cacheInspection.data.overwrite.shaderCaches[0].role -eq 'temporary-swap' -and $cacheInspection.data.overwrite.shaderCaches[0].stale) 'inspection classifies a persistent ShaderCache.Swap tree as stale temporary state'
     Assert-MO2Test (-not $cacheValidation.ok -and @($cacheValidation.checks | Where-Object { $_.name -eq 'overwrite' -and $_.status -eq 'fail' }).Count -eq 1) 'validation blocks launch while a ShaderCache tree remains in overwrite'
     Remove-Item -LiteralPath $legacySwap -Recurse -Force
-    '-Skyrim Script Extender for VR (SKSEVR)' | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
+    @('-Skyrim Script Extender for VR (SKSEVR)', '-OpenComposite Runtime Provider') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
     $disabledOwner = Invoke-MO2Validate -Config $config -RequireClosed
     Assert-MO2Test (-not $disabledOwner.ok) 'disabled executable owner mod blocks validation'
     Assert-MO2Test (@($disabledOwner.checks | Where-Object { $_.name -eq 'registered-binary-owner-mod' -and $_.status -eq 'fail' }).Count -eq 1) 'disabled owner failure is attributable'
-    '+Skyrim Script Extender for VR (SKSEVR)' | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
+    @('+Skyrim Script Extender for VR (SKSEVR)', '-OpenComposite Runtime Provider') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
     $dialogKind = & (Get-Module MO2Control) { Get-MO2KnownDialogKind -Title 'Mod Organizer' -Texts @('Failed to write settings') }
     Assert-MO2Test ($dialogKind -eq 'failed-to-write-settings') 'known settings-write dialog is classified exactly'
     $unlockDialogKind = & (Get-Module MO2Control) { Get-MO2KnownDialogKind -Title 'vrserver.exe' -Buttons @([pscustomobject]@{name='Unlock'}) }
@@ -217,6 +221,12 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test (-not [string]::IsNullOrWhiteSpace($leaseId) -and $leaseId -ne $accessId) 'access receipt separates public lease identity from the bearer credential'
     Assert-MO2Test ([long]$access.data.access.generation -eq 1L) 'new access lease starts at generation one'
     Assert-MO2Test ($access.data.access.runtimeRoute.id -eq 'SteamVRNull' -and $access.data.access.runtimeRoute.runtimeFamily -eq 'SteamVR' -and $access.data.access.runtimeRoute.requiresNullHmd) 'null-HMD access records the SteamVR family and explicit null-HMD requirement'
+    $nullRouteProviderValid = Invoke-MO2Validate -Config $config -RequireClosed -RequireRuntimeRoute -OwnedAccessId $accessId
+    Assert-MO2Test ($nullRouteProviderValid.ok -and @($nullRouteProviderValid.checks | Where-Object { $_.name -eq 'runtime-route-provider' -and $_.status -eq 'pass' }).Count -eq 1) 'null-HMD route accepts a profile with its OCU provider disabled'
+    @('+Skyrim Script Extender for VR (SKSEVR)', '+OpenComposite Runtime Provider') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
+    $nullRouteProviderRejected = Invoke-MO2Validate -Config $config -RequireClosed -RequireRuntimeRoute -OwnedAccessId $accessId
+    Assert-MO2Test (-not $nullRouteProviderRejected.ok -and @($nullRouteProviderRejected.checks | Where-Object { $_.name -eq 'runtime-route-provider' -and $_.status -eq 'fail' }).Count -eq 1) 'null-HMD route rejects an enabled profile-local OCU provider'
+    @('+Skyrim Script Extender for VR (SKSEVR)', '-OpenComposite Runtime Provider') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
     $busyAccess = Invoke-MO2RequestAccess -Config $config -Label 'second task' -RuntimeRoute OCU -EstimatedMinutes 5
     Assert-MO2Test (-not $busyAccess.ok -and $busyAccess.state -eq 'access-busy' -and $busyAccess.data.retryable) 'second task receives a retryable access-busy result'
     Assert-MO2Test ($busyAccess.data.current.leaseId -eq $leaseId -and $busyAccess.data.current.estimatedReleaseUtc -and $busyAccess.data.current.runtimeRoute.id -eq 'SteamVRNull' -and $busyAccess.data.requestedRuntimeRoute.id -eq 'OCU') 'busy result communicates both incompatible runtime routes, public lease identity, and advisory estimate'
@@ -262,6 +272,12 @@ selected_profile=@ByteArray(Codex)
 
     $abandonedAccess = Invoke-MO2RequestAccess -Config $config -Label 'abandoned task' -RuntimeRoute OCU
     $abandonedAccessId = [string]$abandonedAccess.data.access.accessId
+    $ocuRouteProviderMissing = Invoke-MO2Validate -Config $config -RequireClosed -RequireRuntimeRoute -OwnedAccessId $abandonedAccessId
+    Assert-MO2Test (-not $ocuRouteProviderMissing.ok -and @($ocuRouteProviderMissing.checks | Where-Object { $_.name -eq 'runtime-route-provider' -and $_.status -eq 'fail' }).Count -eq 1) 'OCU route rejects a profile without an enabled OCU provider'
+    @('+Skyrim Script Extender for VR (SKSEVR)', '+OpenComposite Runtime Provider') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
+    $ocuRouteProviderValid = Invoke-MO2Validate -Config $config -RequireClosed -RequireRuntimeRoute -OwnedAccessId $abandonedAccessId
+    Assert-MO2Test ($ocuRouteProviderValid.ok -and @($ocuRouteProviderValid.checks | Where-Object { $_.name -eq 'runtime-route-provider' -and $_.status -eq 'pass' }).Count -eq 1) 'OCU route requires and accepts exactly one qualified profile-local OCU provider'
+    @('+Skyrim Script Extender for VR (SKSEVR)', '-OpenComposite Runtime Provider') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
     $unconfirmedRecovery = Invoke-MO2RecoverAccess -Config $config -AccessId $abandonedAccessId
     Assert-MO2Test (-not $unconfirmedRecovery.ok -and $unconfirmedRecovery.state -eq 'confirmation-required') 'abandoned access is never inferred from time alone'
     $recoveredAccess = Invoke-MO2RecoverAccess -Config $config -AccessId $abandonedAccessId -ConfirmAbandoned -Label 'fixture confirmed abandoned'

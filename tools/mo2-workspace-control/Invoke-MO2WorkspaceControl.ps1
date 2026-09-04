@@ -106,7 +106,7 @@ function New-WorkspaceApprovalMetadata([string]$Subcommand) {
         reusableApprovalEligible = $Subcommand -notin $oneShotCommands
         escalationUsuallyRequired = $Subcommand -notin @('inspect', 'fixture-status', 'list-task', 'list-local-work-mods')
         oneShotReason = if ($Subcommand -eq 'refresh-fixture') { 'Shared fixture replacement must remain a one-shot approval.' } elseif ($Subcommand -eq 'prepare-source') { 'Moving overwrite cache trees into a shared stable-profile mod must remain a one-shot approval.' } elseif ($Subcommand -in @('retire', 'release')) { 'Recursive owned-workspace removal must remain a one-shot approval.' } else { $null }
-        invocationRule = 'Use this literal prefix directly. Put changing access, workspace, mod, and evidence arguments afterward; do not hide the prefix in variables, -Command, pipelines, or a command string.'
+        invocationRule = 'Use this literal prefix directly. Put only supported command arguments afterward; do not hide the prefix in variables, -Command, pipelines, or a command string.'
     }
 }
 
@@ -600,7 +600,9 @@ function Set-MO2SelectedProfile($Config, [string]$TargetProfile, [string]$Operat
     $beforeValue = [string]$selection.value
     $replacement = $selection.match.Groups['prefix'].Value + '@ByteArray(' + $TargetProfile + ')'
     $afterText = $selection.text.Remove($selection.match.Index, $selection.match.Length).Insert($selection.match.Index, $replacement)
-    $afterBytes = [Text.Encoding]::UTF8.GetBytes($afterText)
+    # An already-selected profile is an exact-byte no-op; MO2 may preserve an
+    # encoding or BOM that a reconstructed UTF-8 representation would erase.
+    $afterBytes = if ($beforeValue -ceq $TargetProfile) { $beforeBytes } else { [Text.Encoding]::UTF8.GetBytes($afterText) }
     $beforeHash = Get-WorkspaceBytesSha256 -Bytes $beforeBytes
     $resultHash = Get-WorkspaceBytesSha256 -Bytes $afterBytes
     $backupPath = Join-Path $EvidenceRoot 'ModOrganizer.before.ini'

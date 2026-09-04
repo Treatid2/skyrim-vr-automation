@@ -237,6 +237,60 @@ function Get-MO2ExecutableModOwner {
     }
 }
 
+function Get-MO2ProfileRuntimeProviders {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$Profile
+    )
+
+    $profilesRoot = [IO.Path]::GetFullPath((Resolve-MO2ControlPath ([string]$Config.mo2.profilesDirectory)).TrimEnd('\'))
+    $modsRoot = if ($Config.mo2.PSObject.Properties['modsDirectory']) {
+        [IO.Path]::GetFullPath((Resolve-MO2ControlPath ([string]$Config.mo2.modsDirectory)).TrimEnd('\'))
+    }
+    else {
+        [IO.Path]::GetFullPath((Join-Path (Resolve-MO2ControlPath ([string]$Config.mo2.root)) 'mods').TrimEnd('\'))
+    }
+    $modListPath = Join-Path (Join-Path $profilesRoot $Profile) 'modlist.txt'
+    $records = @()
+    $errors = @()
+    if (-not (Test-Path -LiteralPath $modListPath -PathType Leaf)) {
+        return [pscustomobject][ordered]@{ profile = $Profile; modListPath = $modListPath; providers = @(); errors = @("Profile mod list does not exist: $modListPath") }
+    }
+
+    $lineNumber = 0
+    foreach ($line in Get-Content -LiteralPath $modListPath) {
+        $lineNumber++
+        if ($line -notmatch '^(?<marker>[+-])(?<name>.+)$') { continue }
+        $modName = $Matches.name.TrimEnd("`r")
+        try {
+            $modPath = [IO.Path]::GetFullPath((Join-Path $modsRoot $modName))
+            $directParent = [IO.Path]::GetDirectoryName($modPath)
+            if (-not $modPath.StartsWith($modsRoot + '\', [StringComparison]::OrdinalIgnoreCase) -or
+                -not [string]::Equals($directParent, $modsRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'mod name does not resolve to one direct child of the configured mods directory'
+            }
+            $openVrApi = Join-Path $modPath 'root\openvr_api.dll'
+            $openCompositeIni = Join-Path $modPath 'root\opencomposite.ini'
+            $openCompositeInput = Join-Path $modPath 'SKSE\Plugins\OpenCompositeInput.dll'
+            $hasOpenVrApi = Test-Path -LiteralPath $openVrApi -PathType Leaf
+            $hasOpenCompositeIni = Test-Path -LiteralPath $openCompositeIni -PathType Leaf
+            $hasOpenCompositeInput = Test-Path -LiteralPath $openCompositeInput -PathType Leaf
+            if (-not ($hasOpenVrApi -or $hasOpenCompositeIni -or $hasOpenCompositeInput)) { continue }
+            $classification = if ($hasOpenVrApi -and ($hasOpenCompositeIni -or $hasOpenCompositeInput)) { 'OCU' } else { 'unclassified-openvr-provider' }
+            $records += [pscustomobject][ordered]@{
+                classification = $classification; modName = $modName; modPath = $modPath
+                lineNumber = $lineNumber; marker = $Matches.marker; enabled = $Matches.marker -eq '+'
+                markers = [pscustomobject][ordered]@{
+                    rootOpenVrApi = $hasOpenVrApi; rootOpenCompositeIni = $hasOpenCompositeIni
+                    openCompositeInput = $hasOpenCompositeInput
+                }
+            }
+        }
+        catch { $errors += "modlist line $lineNumber ('$modName'): $($_.Exception.Message)" }
+    }
+    return [pscustomobject][ordered]@{ profile = $Profile; modListPath = $modListPath; providers = @($records); errors = @($errors) }
+}
+
 function Get-MO2ProcessRecords {
     param([string[]]$Names)
 
@@ -574,6 +628,7 @@ function Get-MO2InspectionData {
         }
         overwrite = $overwrite
         rootBuilder = Get-MO2RootBuilderRecords -Config $Config
+        runtimeProviders = Get-MO2ProfileRuntimeProviders -Config $Config -Profile $profile
         storage = [pscustomobject][ordered]@{
             staging = Get-MO2StorageRecord -Path ([string]$Config.storage.sessionStaging)
             archive = Get-MO2StorageRecord -Path ([string]$Config.storage.archive)
@@ -668,6 +723,7 @@ function Invoke-MO2Validate {
         [string]$Executable,
         [switch]$RequireSKSE,
         [switch]$RequireClosed,
+        [switch]$RequireRuntimeRoute,
         [string]$OwnedSessionId,
         [string]$OwnedAccessId
     )
@@ -785,6 +841,45 @@ function Invoke-MO2Validate {
     }
     else {
         $checks += New-MO2Check -Name 'session-lock' -Status 'pass' -Message 'No active MO2 control session lock exists.'
+    }
+
+    if ($RequireRuntimeRoute) {
+        $runtimeRoute = if ($data.sessionLock.exists -and $data.sessionLock.valid -and $data.sessionLock.data.PSObject.Properties['runtimeRoute']) { $data.sessionLock.data.runtimeRoute } else { $null }
+        if (-not $runtimeRoute -or [string]::IsNullOrWhiteSpace([string]$runtimeRoute.id)) {
+            $checks += New-MO2Check -Name 'runtime-route-provider' -Status 'fail' -Message 'Runtime-route qualification requires an owned lease or session with an explicit runtime route.' -Details $data.runtimeProviders
+        }
+        elseif ($data.runtimeProviders.errors.Count -gt 0) {
+            $checks += New-MO2Check -Name 'runtime-route-provider' -Status 'fail' -Message 'Runtime-provider discovery could not prove the exact profile state.' -Details $data.runtimeProviders
+        }
+        else {
+            $enabledProviders = @($data.runtimeProviders.providers | Where-Object enabled)
+            $enabledOpenVrReplacements = @($enabledProviders | Where-Object { $_.markers.rootOpenVrApi })
+            $enabledOcu = @($enabledProviders | Where-Object classification -eq 'OCU')
+            $routeId = [string]$runtimeRoute.id
+            $providerValid = if ($routeId -eq 'OCU') {
+                $enabledOcu.Count -eq 1 -and $enabledOpenVrReplacements.Count -eq 1
+            }
+            else {
+                $enabledOpenVrReplacements.Count -eq 0
+            }
+            $message = if ($providerValid -and $routeId -eq 'OCU') {
+                "The exact profile enables one qualified OCU provider: $($enabledOcu[0].modName)"
+            }
+            elseif ($providerValid) {
+                "The exact profile has no enabled OpenVR replacement for the $routeId route."
+            }
+            elseif ($routeId -eq 'OCU') {
+                "The OCU route requires exactly one enabled OCU provider and no additional root OpenVR replacement; observed OCU=$($enabledOcu.Count), root OpenVR replacements=$($enabledOpenVrReplacements.Count)."
+            }
+            else {
+                "The $routeId route is incompatible with enabled profile-local OpenVR replacement providers: $($enabledOpenVrReplacements.modName -join ', ')."
+            }
+            $details = [pscustomobject][ordered]@{ runtimeRoute = $runtimeRoute; inventory = $data.runtimeProviders }
+            $checks += New-MO2Check -Name 'runtime-route-provider' -Status $(if ($providerValid) { 'pass' } else { 'fail' }) -Message $message -Details $details
+        }
+    }
+    else {
+        $checks += New-MO2Check -Name 'runtime-route-provider' -Status 'info' -Message 'Runtime-route provider qualification was not requested.' -Details $data.runtimeProviders
     }
 
     if ($RequireClosed) {
@@ -2109,7 +2204,7 @@ function Invoke-MO2Prepare {
         [switch]$WhatIf
     )
 
-    $validation = Invoke-MO2Validate -Config $Config -Profile $Profile -Executable $Executable -RequireSKSE:$RequireSKSE -RequireClosed -OwnedAccessId $AccessId
+    $validation = Invoke-MO2Validate -Config $Config -Profile $Profile -Executable $Executable -RequireSKSE:$RequireSKSE -RequireClosed -RequireRuntimeRoute:([bool]$AccessId) -OwnedAccessId $AccessId
     if (-not $validation.ok) {
         return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'blocked' -Data @{ validation = $validation } -Warnings $validation.warnings -Errors $validation.errors
     }
@@ -2392,7 +2487,7 @@ function Invoke-MO2Launch {
 
     $resumeExistingMO2 = [string]$lockData.status -in @('game-stopped', 'stop-incomplete', 'mo2-open')
     $requireSKSE = $lockData.PSObject.Properties['requirements'] -and $lockData.requirements.PSObject.Properties['skseLoader'] -and [bool]$lockData.requirements.skseLoader
-    $validation = Invoke-MO2Validate -Config $Config -Profile ([string]$lockData.profile) -Executable ([string]$lockData.executable) -RequireSKSE:$requireSKSE -RequireClosed:(-not $resumeExistingMO2) -OwnedSessionId $SessionId
+    $validation = Invoke-MO2Validate -Config $Config -Profile ([string]$lockData.profile) -Executable ([string]$lockData.executable) -RequireSKSE:$requireSKSE -RequireClosed:(-not $resumeExistingMO2) -RequireRuntimeRoute:([bool]$lockData.runtimeRoute) -OwnedSessionId $SessionId
     if (-not $validation.ok) {
         return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'blocked' -Data @{ validation = $validation; lock = $owned } -Warnings $validation.warnings -Errors $validation.errors
     }

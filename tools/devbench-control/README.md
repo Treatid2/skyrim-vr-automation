@@ -78,8 +78,10 @@ the explicitly listed `-IgnoredMenus` (HUD by default), and always reports the
 actual timeout and final observation. This avoids the server-side `noMenu`
 condition being held open forever by Skyrim's permanent HUD menu.
 
-`mainMenuReady` instead requires `Main Menu` to be open and rejects every menu
-outside `-AllowedMainMenuMenus` (HUD and Main Menu by default). It represents a
+`mainMenuReady` instead requires `Main Menu` to be open, permits Skyrim VR's
+normal `Mist Menu` and `Fader Menu` overlays, and rejects every other menu
+outside `-AllowedMainMenuMenus` (HUD, Main Menu, Mist Menu, and Fader Menu by
+default). It represents a
 usable front-end state without pretending that Skyrim's persistent menus have
 closed.
 

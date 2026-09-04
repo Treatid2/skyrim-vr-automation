@@ -33,7 +33,7 @@ param(
     [string]$ExpectedErrorCode,
     [string]$ProgressLogPath,
     [string[]]$IgnoredMenus = @('HUD Menu'),
-    [string[]]$AllowedMainMenuMenus = @('HUD Menu', 'Main Menu'),
+    [string[]]$AllowedMainMenuMenus = @('HUD Menu', 'Main Menu', 'Mist Menu', 'Fader Menu'),
     [switch]$AcceptAlreadyLoaded,
     [switch]$AllowUnsafeTfc1,
     [switch]$AllowUnprovenGameMutation,

@@ -144,6 +144,13 @@ reports only the public lease identity, owner label/state, and advisory release
 estimate; it never discloses or echoes an access credential. `-WaitSeconds` can
 perform a bounded retry, but no task is queued indefinitely.
 
+`prepare` and every launch revalidate the exact selected profile against the
+leased route. OCU requires exactly one enabled provider containing
+`root\openvr_api.dll` plus an OpenComposite marker. SteamVR and SteamVRNull
+require every profile-local root OpenVR replacement to be disabled. Discovery
+fails closed when provider identity is ambiguous; declaring a route never
+overrides the profile's actual runtime files.
+
 `-EstimatedMinutes` is useful coordination metadata, not a deadline. The tool
 never expires, steals, or transfers a lease because its estimate elapsed.
 `renew-access` refreshes the recorded activity time and can replace the

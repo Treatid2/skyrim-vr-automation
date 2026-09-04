@@ -215,6 +215,13 @@ try {
     $resumed = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -Confirm:$false | ConvertFrom-Json
     if (-not $resumed.ok -or $resumed.state -ne 'workspace-resumed' -or $resumed.data.accessId -ne $nextAccessId -or -not (Test-Path -LiteralPath (Join-Path $created.data.profilePath 'task-state.txt'))) { throw "Retained workspace was not rebound without losing task state: $($resumed | ConvertTo-Json -Depth 12 -Compress)" }
     if ((Get-Content -LiteralPath $ini -Raw) -notmatch ('selected_profile=@ByteArray\(' + [regex]::Escape([string]$created.data.profileName) + '\)')) { throw 'Resume did not select the retained task profile.' }
+    $selectedText = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($ini))
+    $selectedWithBom = [Text.UTF8Encoding]::new($true).GetPreamble() + [Text.UTF8Encoding]::new($false).GetBytes($selectedText)
+    [IO.File]::WriteAllBytes($ini, $selectedWithBom)
+    $alreadySelectedBefore = [IO.File]::ReadAllBytes($ini)
+    $alreadySelectedResume = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -Confirm:$false | ConvertFrom-Json
+    $alreadySelectedAfter = [IO.File]::ReadAllBytes($ini)
+    if (-not $alreadySelectedResume.ok -or [Convert]::ToBase64String($alreadySelectedAfter) -cne [Convert]::ToBase64String($alreadySelectedBefore)) { throw 'Resuming an already-selected profile did not preserve exact MO2 INI bytes.' }
     $resumeJournal = Get-ChildItem -LiteralPath $workspaceControlRoot -Filter ($created.data.workspaceId + '.resume.*.journal.json') -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     $resumeJournalData = Get-Content -LiteralPath $resumeJournal.FullName -Raw | ConvertFrom-Json
     if ($resumeJournalData.phase -ne 'committed' -or -not (Test-Path -LiteralPath $resumeJournalData.manifestPreimagePath -PathType Leaf) -or [string]::IsNullOrWhiteSpace([string]$resumeJournalData.selectedProfileJournalPath)) { throw 'Committed resume did not retain a durable manifest preimage and selected-profile journal link.' }
