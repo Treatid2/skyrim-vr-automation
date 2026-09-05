@@ -509,12 +509,51 @@ selected_profile=@ByteArray(Codex)
 
         $recoveryAccess = Invoke-MO2RequestAccess -Config $config -Label 'fixture recovery access' -RuntimeRoute SteamVR -EstimatedMinutes 5
         $recoveryAccessId = [string]$recoveryAccess.data.access.accessId
-        $recoverWithRoute = Invoke-MO2RecoverClose -Config $config -AccessId $recoveryAccessId -Label 'fixture recovery' -WhatIf
-        Assert-MO2Test ($recoverWithRoute.ok -and $recoverWithRoute.state -eq 'dry-run' -and $recoverWithRoute.data.session.runtimeRoute.id -eq 'SteamVR' -and $recoverWithRoute.data.session.acquisitionMode -eq 'explicit-access') 'recovery close persists the exact route-qualified lease contract for RootBuilder relaunch'
+        $expectedRecoveryRouteFingerprint = & $mo2Module { param($route) Get-MO2RuntimeRouteContractFingerprint $route } $recoveryAccess.data.access.runtimeRoute
+        $recoverWithRoute = & $mo2Module {
+            param($fixtureConfig, $fixtureAccessId)
+            $originalDesktopCheck = (Get-Command Test-MO2InteractiveDesktop -CommandType Function).ScriptBlock
+            $originalCooperativeClose = (Get-Command Invoke-MO2CooperativeClose -CommandType Function).ScriptBlock
+            try {
+                Set-Item -Path Function:script:Test-MO2InteractiveDesktop -Value { $true }
+                Set-Item -Path Function:script:Invoke-MO2CooperativeClose -Value {
+                    param($Config, $InitialProcesses, $EvidenceDirectory, $TimeoutSeconds)
+                    [pscustomobject][ordered]@{
+                        closed = $true
+                        initialProcesses = @($InitialProcesses)
+                        finalProcesses = @()
+                        actions = @('fixture-cooperative-close')
+                        remaining = @()
+                        forceTermination = $false
+                        unrelatedProcessesTouched = @()
+                    }
+                }
+                Invoke-MO2RecoverClose -Config $fixtureConfig -AccessId $fixtureAccessId -Label 'fixture recovery'
+            }
+            finally {
+                Set-Item -Path Function:script:Test-MO2InteractiveDesktop -Value $originalDesktopCheck
+                Set-Item -Path Function:script:Invoke-MO2CooperativeClose -Value $originalCooperativeClose
+            }
+        } $config $recoveryAccessId
+        Assert-MO2Test ($recoverWithRoute.ok -and $recoverWithRoute.state -eq 'mo2-closed' -and -not $recoverWithRoute.data.close.forceTermination) 'recovery close durably adopts the exact process without force termination'
     }
     finally {
         if (-not $recoveryProcess.HasExited) { $recoveryProcess.Kill($true); $recoveryProcess.WaitForExit(5000) | Out-Null }
     }
+
+    $recoverySessionId = [string]$recoverWithRoute.data.sessionId
+    $recoveryManifest = Get-Content -LiteralPath (Join-Path ([string]$recoverWithRoute.data.sessionPath) 'session.json') -Raw | ConvertFrom-Json
+    $recoveryBoundLease = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+    $manifestRecoveryRouteFingerprint = & $mo2Module { param($route) Get-MO2RuntimeRouteContractFingerprint $route } $recoveryManifest.runtimeRoute
+    $boundRecoveryRouteFingerprint = & $mo2Module { param($route) Get-MO2RuntimeRouteContractFingerprint $route } $recoveryBoundLease.runtimeRoute
+    Assert-MO2Test ($recoveryManifest.sessionId -eq $recoverySessionId -and $manifestRecoveryRouteFingerprint -ceq $expectedRecoveryRouteFingerprint -and $recoveryManifest.status -eq 'mo2-closed') 'recovery manifest durably retains the complete canonical route and closed state'
+    Assert-MO2Test ($recoveryBoundLease.sessionId -eq $recoverySessionId -and $boundRecoveryRouteFingerprint -ceq $expectedRecoveryRouteFingerprint -and $recoveryBoundLease.accessId -eq $recoveryAccessId) 'recovery binding durably retains matching session, access, and complete route identities'
+    '{}' | Set-Content -LiteralPath $buildData -Encoding utf8
+    $recoveredRootBuilder = Invoke-MO2RecoverRootBuilder -Config $config -SessionId $recoverySessionId -StartOnly -WhatIf
+    Assert-MO2Test ($recoveredRootBuilder.ok -and $recoveredRootBuilder.state -eq 'dry-run' -and $recoveredRootBuilder.data.rootBuilderRecovery -and ($recoveredRootBuilder.data.arguments -join '|') -eq '--profile|Codex|run|--executable|Launch MGO - Do Not Unlock') 'RootBuilder launch admission consumes the persisted recovered-session route'
+    Remove-Item -LiteralPath $buildData -Force
+    $releasedRecoverySession = Invoke-MO2Release -Config $config -SessionId $recoverySessionId
+    Assert-MO2Test ($releasedRecoverySession.ok -and $releasedRecoverySession.state -eq 'session-released-access-retained') 'recovered session releases back to its explicit access lease after consumer admission'
 
     $recoverClosedWithAccess = Invoke-MO2RecoverClose -Config $config -AccessId $recoveryAccessId -Label 'fixture recovery' -WhatIf
     Assert-MO2Test ($recoverClosedWithAccess.ok -and $recoverClosedWithAccess.state -eq 'already-closed' -and $recoverClosedWithAccess.data.accessRetained) 'recovery close accepts and retains its exact access-only lease'
@@ -522,6 +561,115 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test ($recoveryAccessStatus.ok -and $recoveryAccessStatus.state -eq 'access-owned') 'already-closed recovery leaves the caller-owned access lease intact'
     $releasedRecoveryAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $recoveryAccessId
     Assert-MO2Test ($releasedRecoveryAccess.ok -and $releasedRecoveryAccess.state -eq 'access-released') 'recovery access can be released normally after closed-state proof'
+
+    $driftRecoveryProcess = Start-Process -FilePath $mo2Exe -ArgumentList @('/d', '/c', 'ping -n 30 127.0.0.1 >nul') -WindowStyle Hidden -PassThru
+    try {
+        $driftRecoveryDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        do {
+            $driftRecoveryInspection = Invoke-MO2Inspect -Config $config
+            if (@($driftRecoveryInspection.data.processes.mo2 | Where-Object id -eq $driftRecoveryProcess.Id).Count -eq 1) { break }
+            Start-Sleep -Milliseconds 50
+        } while ([DateTime]::UtcNow -lt $driftRecoveryDeadline)
+        $driftRecoveryAccess = Invoke-MO2RequestAccess -Config $config -Label 'fixture recovery drift' -RuntimeRoute SteamVR -EstimatedMinutes 5
+        $driftRecoveryAccessId = [string]$driftRecoveryAccess.data.access.accessId
+        $driftFailure = & $mo2Module {
+            param($fixtureConfig, $fixtureAccessId)
+            $originalDesktopCheck = (Get-Command Test-MO2InteractiveDesktop -CommandType Function).ScriptBlock
+            $originalAccessReader = (Get-Command Get-MO2OwnedAccessLease -CommandType Function).ScriptBlock
+            $script:RecoveryAccessReadCount = 0
+            $script:RecoveryOriginalAccessReader = $originalAccessReader
+            try {
+                Set-Item -Path Function:script:Test-MO2InteractiveDesktop -Value { $true }
+                Set-Item -Path Function:script:Get-MO2OwnedAccessLease -Value {
+                    param($Config, $AccessId)
+                    $script:RecoveryAccessReadCount++
+                    $lease = & $script:RecoveryOriginalAccessReader -Config $Config -AccessId $AccessId
+                    if ($script:RecoveryAccessReadCount -ge 2) {
+                        $lease.data.runtimeRoute = Resolve-MO2RuntimeRouteContract -RuntimeRoute SteamVRNull
+                    }
+                    return $lease
+                }
+                try {
+                    $null = Invoke-MO2RecoverClose -Config $fixtureConfig -AccessId $fixtureAccessId -Label 'fixture recovery drift'
+                    return [pscustomobject]@{ rejected = $false; message = $null }
+                }
+                catch {
+                    return [pscustomobject]@{ rejected = $true; message = $_.Exception.Message }
+                }
+            }
+            finally {
+                Set-Item -Path Function:script:Test-MO2InteractiveDesktop -Value $originalDesktopCheck
+                Set-Item -Path Function:script:Get-MO2OwnedAccessLease -Value $originalAccessReader
+                Remove-Variable -Scope Script -Name RecoveryAccessReadCount, RecoveryOriginalAccessReader -ErrorAction SilentlyContinue
+            }
+        } $config $driftRecoveryAccessId
+        $retainedFailurePath = if ($driftFailure.message -match "Evidence is retained at '([^']+)'") { $Matches[1] } else { $null }
+        $retainedFailureManifest = if (-not [string]::IsNullOrWhiteSpace($retainedFailurePath) -and (Test-Path -LiteralPath (Join-Path $retainedFailurePath 'session.json') -PathType Leaf)) { Get-Content -LiteralPath (Join-Path $retainedFailurePath 'session.json') -Raw | ConvertFrom-Json } else { $null }
+        Assert-MO2Test ($driftFailure.rejected -and $driftFailure.message -match 'runtime route changed before recovery-close binding') 'recovery binding rejects route drift inside the serialized transition'
+        Assert-MO2Test ($null -ne $retainedFailureManifest -and $retainedFailureManifest.status -eq 'recovery-closing' -and $retainedFailureManifest.runtimeRoute.id -eq 'SteamVR') 'failed recovery binding reports and retains attributable producer evidence'
+    }
+    finally {
+        if (-not $driftRecoveryProcess.HasExited) { $driftRecoveryProcess.Kill($true); $driftRecoveryProcess.WaitForExit(5000) | Out-Null }
+    }
+    $driftAccessStatus = Invoke-MO2AccessStatus -Config $config -AccessId $driftRecoveryAccessId
+    Assert-MO2Test ($driftAccessStatus.ok -and $driftAccessStatus.state -eq 'access-owned' -and $driftAccessStatus.data.access.runtimeRoute.id -eq 'SteamVR') 'failed recovery binding leaves the original route-qualified access lease unbound'
+    $releasedDriftAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $driftRecoveryAccessId
+    Assert-MO2Test ($releasedDriftAccess.ok -and $releasedDriftAccess.state -eq 'access-released') 'failed recovery binding access can be released without touching retained evidence'
+
+    $boundRecoveryProcess = Start-Process -FilePath $mo2Exe -ArgumentList @('/d', '/c', 'ping -n 30 127.0.0.1 >nul') -WindowStyle Hidden -PassThru
+    try {
+        $boundRecoveryDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        do {
+            $boundRecoveryInspection = Invoke-MO2Inspect -Config $config
+            if (@($boundRecoveryInspection.data.processes.mo2 | Where-Object id -eq $boundRecoveryProcess.Id).Count -eq 1) { break }
+            Start-Sleep -Milliseconds 50
+        } while ([DateTime]::UtcNow -lt $boundRecoveryDeadline)
+        $boundRecoveryAccess = Invoke-MO2RequestAccess -Config $config -Label 'fixture recovery competing bind' -RuntimeRoute SteamVR -EstimatedMinutes 5
+        $boundRecoveryAccessId = [string]$boundRecoveryAccess.data.access.accessId
+        $boundFailure = & $mo2Module {
+            param($fixtureConfig, $fixtureAccessId)
+            $originalDesktopCheck = (Get-Command Test-MO2InteractiveDesktop -CommandType Function).ScriptBlock
+            $originalAccessReader = (Get-Command Get-MO2OwnedAccessLease -CommandType Function).ScriptBlock
+            $script:RecoveryAccessReadCount = 0
+            $script:RecoveryOriginalAccessReader = $originalAccessReader
+            try {
+                Set-Item -Path Function:script:Test-MO2InteractiveDesktop -Value { $true }
+                Set-Item -Path Function:script:Get-MO2OwnedAccessLease -Value {
+                    param($Config, $AccessId)
+                    $script:RecoveryAccessReadCount++
+                    $lease = & $script:RecoveryOriginalAccessReader -Config $Config -AccessId $AccessId
+                    if ($script:RecoveryAccessReadCount -ge 2) {
+                        $lease.sessionId = 'fixture-competing-session'
+                        $lease.data.sessionId = 'fixture-competing-session'
+                    }
+                    return $lease
+                }
+                try {
+                    $null = Invoke-MO2RecoverClose -Config $fixtureConfig -AccessId $fixtureAccessId -Label 'fixture recovery competing bind'
+                    return [pscustomobject]@{ rejected = $false; message = $null }
+                }
+                catch {
+                    return [pscustomobject]@{ rejected = $true; message = $_.Exception.Message }
+                }
+            }
+            finally {
+                Set-Item -Path Function:script:Test-MO2InteractiveDesktop -Value $originalDesktopCheck
+                Set-Item -Path Function:script:Get-MO2OwnedAccessLease -Value $originalAccessReader
+                Remove-Variable -Scope Script -Name RecoveryAccessReadCount, RecoveryOriginalAccessReader -ErrorAction SilentlyContinue
+            }
+        } $config $boundRecoveryAccessId
+        $retainedBoundFailurePath = if ($boundFailure.message -match "Evidence is retained at '([^']+)'") { $Matches[1] } else { $null }
+        $retainedBoundFailureManifest = if (-not [string]::IsNullOrWhiteSpace($retainedBoundFailurePath) -and (Test-Path -LiteralPath (Join-Path $retainedBoundFailurePath 'session.json') -PathType Leaf)) { Get-Content -LiteralPath (Join-Path $retainedBoundFailurePath 'session.json') -Raw | ConvertFrom-Json } else { $null }
+        Assert-MO2Test ($boundFailure.rejected -and $boundFailure.message -match 'access lease acquired a session before recovery close could bind it') 'recovery binding rejects a competing session acquired inside the serialized transition'
+        Assert-MO2Test ($null -ne $retainedBoundFailureManifest -and $retainedBoundFailureManifest.status -eq 'recovery-closing' -and $retainedBoundFailureManifest.runtimeRoute.id -eq 'SteamVR') 'competing-session rejection reports and retains attributable producer evidence'
+    }
+    finally {
+        if (-not $boundRecoveryProcess.HasExited) { $boundRecoveryProcess.Kill($true); $boundRecoveryProcess.WaitForExit(5000) | Out-Null }
+    }
+    $boundAccessStatus = Invoke-MO2AccessStatus -Config $config -AccessId $boundRecoveryAccessId
+    Assert-MO2Test ($boundAccessStatus.ok -and $boundAccessStatus.state -eq 'access-owned' -and [string]::IsNullOrWhiteSpace([string]$boundAccessStatus.data.access.sessionId)) 'competing-session rejection leaves the original access lease unbound'
+    $releasedBoundAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $boundRecoveryAccessId
+    Assert-MO2Test ($releasedBoundAccess.ok -and $releasedBoundAccess.state -eq 'access-released') 'competing-session rejection access can be released without touching retained evidence'
 }
 finally {
     if (Test-Path -LiteralPath $fixture) {

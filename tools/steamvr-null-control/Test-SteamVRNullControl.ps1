@@ -111,7 +111,7 @@ try {
 
     $null = $tokens = $parseErrors = $null
     $sourceAst = [Management.Automation.Language.Parser]::ParseFile($entry, [ref]$tokens, [ref]$parseErrors)
-    $tailFunctionNames = @('Get-StreamRangeSha256', 'Get-Utf8TrailingIncompleteByteCount', 'Get-SharedTextTail')
+    $tailFunctionNames = @('Get-StreamRangeSha256', 'Get-ByteArraySha256', 'Get-Utf8TrailingIncompleteByteCount', 'Get-SharedTextTail')
     $tailFunctions = @($sourceAst.FindAll({
         param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $tailFunctionNames
@@ -166,6 +166,50 @@ try {
         [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
     } $tailPath
     Assert-Test ($boundaryRewriteTail.state.resynchronized -and $boundaryRewriteTail.lines[0] -like 'new-retained-line*' -and ($boundaryRewriteTail.lines -join '|') -notlike '*old-retained-line*') 'incremental log tail rejects a retained-window rewrite that preserves the final 64 bytes'
+
+    $firstLongLine = 'first-long-line'.PadRight(2999, 'a') + "`n"
+    $secondLongLine = 'second-long-line'.PadRight(2999, 'b') + "`n"
+    $thirdLongLine = 'third-long-line'.PadRight(2999, 'c') + "`n"
+    [IO.File]::WriteAllText($tailPath, $firstLongLine + $secondLongLine, $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    [IO.File]::AppendAllText($tailPath, $thirdLongLine, $utf8)
+    $advancedWindow = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    $rewriteStream = [IO.File]::Open($tailPath, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+    try {
+        $rewriteStream.Position = 3100
+        $rewriteStream.WriteByte([byte][char]'z')
+    }
+    finally { $rewriteStream.Dispose() }
+    $excludedPrefixRewrite = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test ($advancedWindow.state.incremental -and $advancedWindow.lines.Count -eq 1 -and $advancedWindow.lines[0] -like 'third-long-line*') 'advancing the bounded window discards completed lines whose origin leaves its continuity proof'
+    Assert-Test ($excludedPrefixRewrite.state.incremental -and ($excludedPrefixRewrite.lines -join '|') -notlike '*second-long-line*' -and $excludedPrefixRewrite.lines[0] -like 'third-long-line*') 'a rewrite outside the retained raw window cannot resurrect stale completed lines'
+
+    $partialPrefix = 'partial-prefix'.PadRight(3000, 'p')
+    [IO.File]::WriteAllText($tailPath, "complete-before-partial`n$partialPrefix", $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    [IO.File]::AppendAllText($tailPath, ('q'.ToString().PadRight(2000, 'q') + "`npartial-successor`n"), $utf8)
+    $advancedPartial = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    $partialRewrite = [IO.File]::Open($tailPath, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+    try {
+        $partialRewrite.Position = 200
+        $partialRewrite.WriteByte([byte][char]'x')
+    }
+    finally { $partialRewrite.Dispose() }
+    $excludedPartialRewrite = & $tailHarness { param($path) @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096) } $tailPath
+    Assert-Test ($advancedPartial.state.incremental -and [string]::IsNullOrEmpty([string]$advancedPartial.state.residual) -and ($advancedPartial.lines -join '|') -eq 'partial-successor') 'advancing the bounded window discards a partial line that no longer has complete continuity evidence'
+    Assert-Test (($excludedPartialRewrite -join '|') -eq 'partial-successor') 'a rewrite outside the retained raw window cannot resurrect stale partial-line text'
 
     [IO.File]::WriteAllText($tailPath, "before-large-append`n", $utf8)
     $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath

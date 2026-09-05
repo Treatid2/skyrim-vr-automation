@@ -165,6 +165,14 @@ function Get-StreamRangeSha256 {
     finally { $Stream.Position = $savedPosition }
 }
 
+function Get-ByteArraySha256 {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes)
+    if ($Bytes.Length -eq 0) { return '' }
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { return [Convert]::ToHexString($algorithm.ComputeHash($Bytes)) }
+    finally { $algorithm.Dispose() }
+}
+
 function Get-Utf8TrailingIncompleteByteCount {
     param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes)
     if ($Bytes.Length -eq 0) { return 0 }
@@ -196,11 +204,12 @@ function Get-SharedTextTail {
         $info = [IO.FileInfo]::new([IO.Path]::GetFullPath($Path))
         $identity = "$($info.FullName.ToLowerInvariant())|$($info.CreationTimeUtc.Ticks)"
         $prior = if ($script:SharedTextTailState.ContainsKey($identity)) { $script:SharedTextTailState[$identity] } else { $null }
+        $hasRetainedWindow = $null -ne $prior -and $prior.PSObject.Properties['retainedBytes'] -and $prior.PSObject.Properties['retainedOffset'] -and $prior.PSObject.Properties['startsPartial']
         $continuityMatched = $false
-        if ($null -ne $prior -and [int64]$prior.offset -le $capturedLength) {
+        if ($hasRetainedWindow -and [int64]$prior.offset -le $capturedLength) {
             $continuityMatched = [string]$prior.continuitySha256 -ceq [string](Get-StreamRangeSha256 -Stream $stream -Offset ([int64]$prior.continuityOffset) -Length ([int]$prior.continuityLength))
         }
-        $incremental = $null -ne $prior -and [int64]$prior.offset -le $capturedLength -and $continuityMatched
+        $incremental = $hasRetainedWindow -and [int64]$prior.offset -le $capturedLength -and $continuityMatched
         $start = if ($incremental) { [int64]$prior.offset } else { [Math]::Max([int64]0, $capturedLength - $MaxBytes) }
         if (($capturedLength - $start) -gt $MaxBytes) {
             $start = $capturedLength - $MaxBytes
@@ -216,38 +225,50 @@ function Get-SharedTextTail {
             if ($current -le 0) { break }
             $read += $current
         }
-        $pendingBytes = if ($incremental -and $prior.PSObject.Properties['pendingBytes']) { [byte[]]$prior.pendingBytes } else { [byte[]]@() }
-        $combinedBytes = [byte[]]::new($pendingBytes.Length + $read)
-        if ($pendingBytes.Length -gt 0) { [Array]::Copy($pendingBytes, 0, $combinedBytes, 0, $pendingBytes.Length) }
-        if ($read -gt 0) { [Array]::Copy($bytes, 0, $combinedBytes, $pendingBytes.Length, $read) }
-        $incompleteByteCount = Get-Utf8TrailingIncompleteByteCount -Bytes $combinedBytes
-        $completeByteCount = $combinedBytes.Length - $incompleteByteCount
-        $text = if ($completeByteCount -gt 0) { [Text.Encoding]::UTF8.GetString($combinedBytes, 0, $completeByteCount) } else { '' }
-        $nextPendingBytes = if ($incompleteByteCount -gt 0) { [byte[]]$combinedBytes[$completeByteCount..($combinedBytes.Length - 1)] } else { [byte[]]@() }
-        if (-not $incremental -and $start -gt 0) {
-            $firstBreak = $text.IndexOf("`n", [StringComparison]::Ordinal)
-            $text = if ($firstBreak -ge 0) { $text.Substring($firstBreak + 1) } else { '' }
+        $priorBytes = if ($incremental) { [byte[]]$prior.retainedBytes } else { [byte[]]@() }
+        $retainedBytes = [byte[]]::new($priorBytes.Length + $read)
+        if ($priorBytes.Length -gt 0) { [Array]::Copy($priorBytes, 0, $retainedBytes, 0, $priorBytes.Length) }
+        if ($read -gt 0) { [Array]::Copy($bytes, 0, $retainedBytes, $priorBytes.Length, $read) }
+        $retainedOffset = if ($incremental) { [int64]$prior.retainedOffset } else { $start }
+        $startsPartial = if ($incremental) { [bool]$prior.startsPartial } else { $start -gt 0 }
+        if ($retainedBytes.Length -gt $MaxBytes) {
+            $discardCount = $retainedBytes.Length - $MaxBytes
+            $retainedBytes = [byte[]]$retainedBytes[$discardCount..($retainedBytes.Length - 1)]
+            $retainedOffset += $discardCount
+            $startsPartial = $true
         }
-        $prefix = if ($incremental) { [string]$prior.residual } else { '' }
-        $combined = $prefix + $text
+        if ($startsPartial -and $retainedBytes.Length -gt 0) {
+            $firstBreak = [Array]::IndexOf($retainedBytes, [byte]0x0A)
+            if ($firstBreak -ge 0) {
+                $discardCount = $firstBreak + 1
+                $retainedBytes = if ($discardCount -lt $retainedBytes.Length) { [byte[]]$retainedBytes[$discardCount..($retainedBytes.Length - 1)] } else { [byte[]]@() }
+                $retainedOffset += $discardCount
+                $startsPartial = $false
+            }
+        }
+        $incompleteByteCount = if ($startsPartial) { 0 } else { Get-Utf8TrailingIncompleteByteCount -Bytes $retainedBytes }
+        $completeByteCount = $retainedBytes.Length - $incompleteByteCount
+        $combined = if (-not $startsPartial -and $completeByteCount -gt 0) { [Text.Encoding]::UTF8.GetString($retainedBytes, 0, $completeByteCount) } else { '' }
+        $nextPendingBytes = if ($incompleteByteCount -gt 0) { [byte[]]$retainedBytes[$completeByteCount..($retainedBytes.Length - 1)] } else { [byte[]]@() }
         $parts = @($combined -split '\r?\n')
         $residual = if ($combined.EndsWith("`n", [StringComparison]::Ordinal)) { '' } else { [string]$parts[-1] }
         $completed = if ($residual.Length -gt 0 -and $parts.Count -gt 1) { @($parts[0..($parts.Count - 2)]) } elseif ($residual.Length -gt 0) { @() } else { @($parts | Select-Object -SkipLast 1) }
-        $lines = @()
-        if ($incremental) { $lines = @($prior.lines) }
-        $lines = @($lines) + @($completed)
+        $lines = @($completed)
         if ($lines.Count -gt $Count) { $lines = @($lines[($lines.Count - $Count)..($lines.Count - 1)]) }
-        # Retained lines and decoder residue originate only from this bounded
-        # window, so its complete hash is the continuity proof for reuse.
-        $continuityLength = [int][Math]::Min($MaxBytes, $capturedLength)
-        $continuityOffset = $capturedLength - $continuityLength
-        $continuitySha256 = Get-StreamRangeSha256 -Stream $stream -Offset $continuityOffset -Length $continuityLength
+        # The raw retained window is the sole source of cached text and decoder
+        # residue, so the same bytes provide the complete continuity proof.
+        $continuityLength = $retainedBytes.Length
+        $continuityOffset = $retainedOffset
+        $continuitySha256 = Get-ByteArraySha256 -Bytes $retainedBytes
         $script:SharedTextTailState.Clear()
         $script:SharedTextTailState[$identity] = [pscustomobject]@{
             offset = $capturedLength
             residual = $residual
             lines = $lines
             pendingBytes = $nextPendingBytes
+            retainedBytes = $retainedBytes
+            retainedOffset = $retainedOffset
+            startsPartial = $startsPartial
             continuityOffset = $continuityOffset
             continuityLength = $continuityLength
             continuitySha256 = $continuitySha256
