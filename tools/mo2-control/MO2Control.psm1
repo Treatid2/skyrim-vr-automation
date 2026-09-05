@@ -3,6 +3,57 @@
 Set-StrictMode -Version Latest
 $script:MO2ControlContractVersion = '1.0.0'
 
+if (-not ('SkyrimVRAutomation.Native.DirectoryIdentity' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace SkyrimVRAutomation.Native {
+    public static class DirectoryIdentity {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FILE_ID_INFO {
+            public ulong VolumeSerialNumber;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+            public byte[] FileId;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(
+            string path, uint access, uint share, IntPtr security,
+            uint creation, uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandleEx(
+            SafeFileHandle handle, int infoClass, out FILE_ID_INFO info,
+            uint size);
+
+        public static string Get(string path) {
+            const uint FILE_READ_ATTRIBUTES = 0x80;
+            const uint FILE_SHARE_READ = 1, FILE_SHARE_WRITE = 2, FILE_SHARE_DELETE = 4;
+            const uint OPEN_EXISTING = 3, FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+            using (SafeFileHandle handle = CreateFileW(
+                path, FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
+                IntPtr.Zero)) {
+                if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+                FILE_ID_INFO info;
+                if (!GetFileInformationByHandleEx(
+                    handle, 18, out info,
+                    (uint)Marshal.SizeOf(typeof(FILE_ID_INFO)))) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                return info.VolumeSerialNumber.ToString("X16") + ":" +
+                    BitConverter.ToString(info.FileId).Replace("-", "");
+            }
+        }
+    }
+}
+'@
+}
+
 function Resolve-MO2ControlPath {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -237,10 +288,23 @@ function Get-MO2ExecutableModOwner {
     }
 }
 
+function Get-MO2DirectoryPhysicalIdentity {
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        return [SkyrimVRAutomation.Native.DirectoryIdentity]::Get(
+            [IO.Path]::GetFullPath($Path))
+    }
+    catch {
+        throw "physical directory identity could not be proven: $($_.Exception.Message)"
+    }
+}
+
 function Get-MO2ProfileRuntimeProviders {
     param(
         [Parameter(Mandatory)]$Config,
-        [Parameter(Mandatory)][string]$Profile
+        [Parameter(Mandatory)][string]$Profile,
+        [scriptblock]$IdentityResolver = ${function:Get-MO2DirectoryPhysicalIdentity}
     )
 
     $profilesRoot = [IO.Path]::GetFullPath((Resolve-MO2ControlPath ([string]$Config.mo2.profilesDirectory)).TrimEnd('\'))
@@ -281,9 +345,12 @@ function Get-MO2ProfileRuntimeProviders {
             if (($modItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                 throw 'runtime-provider mod directories must not be reparse points because physical identity cannot be proven'
             }
-            $providerKey = $modPath.TrimEnd('\')
+            $providerKey = & $IdentityResolver $modPath
+            if ([string]::IsNullOrWhiteSpace([string]$providerKey)) {
+                throw 'physical directory identity resolver returned no identity'
+            }
             if ($providerPaths.ContainsKey($providerKey)) {
-                throw "runtime-provider mod path is repeated or contradicted by modlist line $($providerPaths[$providerKey])"
+                throw "runtime-provider physical directory is repeated or contradicted by modlist line $($providerPaths[$providerKey])"
             }
             $providerPaths.Add($providerKey, $lineNumber)
             $classification = if ($hasOpenVrApi -and ($hasOpenCompositeIni -or $hasOpenCompositeInput)) { 'OCU' } else { 'unclassified-openvr-provider' }
@@ -1222,6 +1289,19 @@ function Resolve-MO2PersistedRuntimeRouteContract {
         throw "Persisted runtime route property 'incompatibleWith' does not match the canonical '$routeId' contract."
     }
     return $canonical
+}
+
+function Get-MO2RuntimeRouteContractFingerprint {
+    param([Parameter(Mandatory)]$RuntimeRoute)
+
+    $canonical = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $RuntimeRoute
+    return [string]::Join('|', @(
+        [string]$canonical.id,
+        [string]$canonical.runtimeFamily,
+        [string]$canonical.hmdMode,
+        [string][bool]$canonical.requiresSteamVR,
+        [string][bool]$canonical.requiresNullHmd,
+        [string]::Join(',', @($canonical.incompatibleWith))))
 }
 
 function Get-MO2AccessLeaseSummary {
@@ -2244,6 +2324,36 @@ function Resolve-MO2OwnedProcessTarget {
     }
 }
 
+function Bind-MO2PreparedAccessLease {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$AccessId,
+        [Parameter(Mandatory)][string]$LockPath,
+        [Parameter(Mandatory)]$PreparedLock,
+        [Parameter(Mandatory)]$ExpectedRuntimeRoute,
+        [Parameter(Mandatory)][string]$ExpectedRuntimeRouteFingerprint
+    )
+
+    Invoke-WithMO2LeaseTransitionLock -LockPath $LockPath -Action {
+        $currentAccess = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
+        if (-not [string]::IsNullOrWhiteSpace([string]$currentAccess.sessionId)) {
+            throw 'The access lease acquired a session before this prepare could bind it.'
+        }
+        $validatedRuntimeRoute = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $currentAccess.data.runtimeRoute
+        $currentRuntimeRouteFingerprint = Get-MO2RuntimeRouteContractFingerprint -RuntimeRoute $validatedRuntimeRoute
+        if ($currentRuntimeRouteFingerprint -cne $ExpectedRuntimeRouteFingerprint) {
+            throw "The access lease runtime route changed before session binding ('$($ExpectedRuntimeRoute.id)' to '$($validatedRuntimeRoute.id)')."
+        }
+        $bound = $currentAccess.data
+        foreach ($propertyName in @('sessionId', 'sessionPath', 'status', 'createdUtc', 'profile', 'profileName', 'profileDirectory', 'modListPath', 'executable', 'requirements', 'controllerPath', 'ownerPid')) {
+            $bound | Add-Member -NotePropertyName $propertyName -NotePropertyValue $PreparedLock.$propertyName -Force
+        }
+        $bound | Add-Member -NotePropertyName runtimeRoute -NotePropertyValue $validatedRuntimeRoute -Force
+        $bound | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $currentAccess.data) -Force
+        Write-MO2JsonAtomic -Path $LockPath -Value $bound
+    } | Out-Null
+}
+
 function Invoke-MO2Prepare {
     [CmdletBinding()]
     param(
@@ -2279,6 +2389,7 @@ function Invoke-MO2Prepare {
         return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'blocked' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $accessLock } -Errors @('The access lease already has a bound session. Release that session before preparing another one.')
     }
     $runtimeRoute = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $accessLock.data.runtimeRoute
+    $runtimeRouteFingerprint = Get-MO2RuntimeRouteContractFingerprint -RuntimeRoute $runtimeRoute
 
     $controller = New-MO2DurableSessionController -Config $Config -SessionPath $sessionPath -WhatIf
     $profileDirectory = Join-Path (Resolve-MO2ControlPath ([string]$Config.mo2.profilesDirectory)) $profileName
@@ -2341,18 +2452,7 @@ function Invoke-MO2Prepare {
     try {
         $controller = New-MO2DurableSessionController -Config $Config -SessionPath $sessionPath
         Write-MO2JsonAtomic -Path (Join-Path $sessionPath 'session.json') -Value $manifest -CreateNew
-        Invoke-WithMO2LeaseTransitionLock -LockPath $lockPath -Action {
-            $currentAccess = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
-            if (-not [string]::IsNullOrWhiteSpace([string]$currentAccess.sessionId)) {
-                throw 'The access lease acquired a session before this prepare could bind it.'
-            }
-            $bound = $currentAccess.data
-            foreach ($propertyName in @('sessionId', 'sessionPath', 'status', 'createdUtc', 'profile', 'profileName', 'profileDirectory', 'modListPath', 'executable', 'requirements', 'controllerPath', 'ownerPid')) {
-                $bound | Add-Member -NotePropertyName $propertyName -NotePropertyValue $lock.$propertyName -Force
-            }
-            $bound | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $currentAccess.data) -Force
-            Write-MO2JsonAtomic -Path $lockPath -Value $bound
-        } | Out-Null
+        Bind-MO2PreparedAccessLease -Config $Config -AccessId $AccessId -LockPath $lockPath -PreparedLock $lock -ExpectedRuntimeRoute $runtimeRoute -ExpectedRuntimeRouteFingerprint $runtimeRouteFingerprint
     }
     catch {
         throw "Failed to prepare session '$sessionId'. The evidence directory is retained at '$sessionPath'. $($_.Exception.Message)"

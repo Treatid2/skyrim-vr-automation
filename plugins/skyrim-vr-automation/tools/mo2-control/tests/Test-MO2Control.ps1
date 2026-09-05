@@ -280,6 +280,32 @@ selected_profile=@ByteArray(Codex)
     @('+Skyrim Script Extender for VR (SKSEVR)', '+OpenComposite Runtime Provider', '-OpenComposite Runtime Provider') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
     $contradictoryProvider = Invoke-MO2Validate -Config $config -RequireClosed -RequireRuntimeRoute -OwnedAccessId $abandonedAccessId
     Assert-MO2Test (-not $contradictoryProvider.ok -and @($contradictoryProvider.data.runtimeProviders.errors | Where-Object { $_ -match 'repeated or contradicted' }).Count -eq 1) 'runtime-provider discovery rejects duplicate or contradictory markers for one physical mod'
+    $aliasProvider = Join-Path $modsRoot 'OpenComposite Runtime Provider Alias'
+    New-Item -ItemType Directory -Path (Join-Path $aliasProvider 'root') -Force | Out-Null
+    New-Item -ItemType File -Path (Join-Path $aliasProvider 'root\openvr_api.dll') -Force | Out-Null
+    foreach ($markers in @(@('+', '+'), @('-', '-'), @('+', '-'), @('-', '+'))) {
+        @(
+            '+Skyrim Script Extender for VR (SKSEVR)'
+            "$($markers[0])OpenComposite Runtime Provider"
+            "$($markers[1])OpenComposite Runtime Provider Alias"
+        ) | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
+        $aliasResult = & $mo2Module {
+            param($fixtureConfig, $markersProfile)
+            Get-MO2ProfileRuntimeProviders -Config $fixtureConfig -Profile $markersProfile -IdentityResolver { param($path) 'fixture-physical-id' }
+        } $config 'Codex'
+        Assert-MO2Test (@($aliasResult.errors | Where-Object { $_ -match 'physical directory is repeated or contradicted' }).Count -eq 1) "runtime-provider identity rejects $($markers -join '/') aliases of one physical directory"
+    }
+    $physicalIdentityStable = & $mo2Module {
+        param($providerPath)
+        (Get-MO2DirectoryPhysicalIdentity -Path $providerPath) -ceq
+            (Get-MO2DirectoryPhysicalIdentity -Path (Join-Path $providerPath '.'))
+    } $ocuMod
+    Assert-MO2Test $physicalIdentityStable 'runtime-provider physical identity is stable across lexical path variants'
+    $junctionProvider = Join-Path $modsRoot 'OpenComposite Runtime Provider Junction'
+    New-Item -ItemType Junction -Path $junctionProvider -Target $ocuMod | Out-Null
+    @('+Skyrim Script Extender for VR (SKSEVR)', '+OpenComposite Runtime Provider Junction') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
+    $junctionResult = & $mo2Module { param($fixtureConfig) Get-MO2ProfileRuntimeProviders -Config $fixtureConfig -Profile 'Codex' } $config
+    Assert-MO2Test (@($junctionResult.errors | Where-Object { $_ -match 'must not be reparse points' }).Count -eq 1) 'runtime-provider discovery rejects a reparse-point provider before identity admission'
     @('+Skyrim Script Extender for VR (SKSEVR)', '+OpenComposite Runtime Provider') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
     $canonicalLease = Get-Content -LiteralPath $config.session.lockFile -Raw
     $malformedLease = $canonicalLease | ConvertFrom-Json
@@ -292,6 +318,21 @@ selected_profile=@ByteArray(Codex)
     $malformedLease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
     $contradictoryRoute = Invoke-MO2Validate -Config $config -RequireClosed -RequireRuntimeRoute -OwnedAccessId $abandonedAccessId
     Assert-MO2Test (-not $contradictoryRoute.ok -and @($contradictoryRoute.checks | Where-Object { $_.name -eq 'runtime-route-provider' -and $_.status -eq 'fail' -and $_.message -match 'canonical' }).Count -eq 1) 'runtime-route validation rejects contradictory persisted route fields'
+    foreach ($routeId in @('OCU', 'SteamVR', 'SteamVRNull')) {
+        $routeMatrix = & $mo2Module {
+            param($id)
+            $canonical = Resolve-MO2RuntimeRouteContract -RuntimeRoute $id
+            $accepted = (Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $canonical).id -ceq $id
+            $caseRejected = $false
+            $fieldRejected = $false
+            $orderRejected = $false
+            try { $bad = $canonical | ConvertTo-Json -Depth 5 | ConvertFrom-Json; $bad.id = $bad.id.ToLowerInvariant(); $null = Resolve-MO2PersistedRuntimeRouteContract $bad } catch { $caseRejected = $true }
+            try { $bad = $canonical | ConvertTo-Json -Depth 5 | ConvertFrom-Json; $bad.runtimeFamily = 'drift'; $null = Resolve-MO2PersistedRuntimeRouteContract $bad } catch { $fieldRejected = $true }
+            try { $bad = $canonical | ConvertTo-Json -Depth 5 | ConvertFrom-Json; [array]::Reverse($bad.incompatibleWith); $null = Resolve-MO2PersistedRuntimeRouteContract $bad } catch { $orderRejected = $true }
+            return $accepted -and $caseRejected -and $fieldRejected -and $orderRejected
+        } $routeId
+        Assert-MO2Test $routeMatrix "canonical $routeId route contract rejects case, field, and ordered incompatibility drift"
+    }
     [IO.File]::WriteAllText($config.session.lockFile, $canonicalLease, [Text.UTF8Encoding]::new($false))
     @('+Skyrim Script Extender for VR (SKSEVR)', '-OpenComposite Runtime Provider') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
     $unconfirmedRecovery = Invoke-MO2RecoverAccess -Config $config -AccessId $abandonedAccessId
@@ -317,8 +358,26 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test ($dryRunLease.state -eq 'access-owned' -and [string]::IsNullOrWhiteSpace([string]$dryRunLease.data.access.sessionId)) 'prepare dry-run leaves the access-only lease unbound'
     Assert-MO2Test (-not (Test-Path -LiteralPath $prepareDryRun.data.sessionPath -PathType Container)) 'prepare dry-run creates no evidence directory'
 
+    $routeBeforeDrift = & $mo2Module { Resolve-MO2RuntimeRouteContract -RuntimeRoute SteamVR }
+    $driftedLease = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+    $driftedLease.runtimeRoute = & $mo2Module { Resolve-MO2RuntimeRouteContract -RuntimeRoute OCU }
+    $driftedLease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    $routeDriftRejected = $false
+    try {
+        & $mo2Module {
+            param($fixtureConfig, $fixtureAccessId, $expectedRoute)
+            Bind-MO2PreparedAccessLease -Config $fixtureConfig -AccessId $fixtureAccessId -LockPath ([string]$fixtureConfig.session.lockFile) -PreparedLock ([pscustomobject]@{}) -ExpectedRuntimeRoute $expectedRoute -ExpectedRuntimeRouteFingerprint (Get-MO2RuntimeRouteContractFingerprint $expectedRoute)
+        } $config $sessionAccessId $routeBeforeDrift
+    }
+    catch { $routeDriftRejected = $_.Exception.Message -match 'runtime route changed before session binding' }
+    Assert-MO2Test $routeDriftRejected 'prepare revalidates the complete access runtime route inside the final serialized bind'
+    $driftedLease = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+    $driftedLease.runtimeRoute = $routeBeforeDrift
+    $driftedLease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+
     $prepared = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -AccessId $sessionAccessId
     Assert-MO2Test ($prepared.ok -and $prepared.state -eq 'prepared') 'prepare creates an owned session'
+    if (-not $prepared.ok) { throw "Fixture prepare failed after route-drift recovery: $($prepared | ConvertTo-Json -Depth 12 -Compress)" }
     Assert-MO2Test (Test-Path -LiteralPath $config.session.lockFile -PathType Leaf) 'prepare creates the single-owner lock'
     Assert-MO2Test (Test-Path -LiteralPath (Join-Path $prepared.data.sessionPath 'session.json') -PathType Leaf) 'prepare creates a durable session manifest'
     Assert-MO2Test ([bool]$prepared.data.session.requirements.skseLoader) 'prepare persists the SKSE requirement for launch revalidation'

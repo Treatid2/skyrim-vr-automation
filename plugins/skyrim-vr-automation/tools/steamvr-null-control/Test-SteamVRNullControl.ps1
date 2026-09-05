@@ -109,6 +109,54 @@ try {
     Assert-Test ($sourceText -match 'catch \[UnauthorizedAccessException\]' -and $sourceText -match 'not authorized to read and acknowledge') 'shared-memory authorization failure remains distinct from provider-not-ready state'
     Assert-Test ($sourceText -match 'Get-ApplicationHeadPose -Contract .* -DeadlineUtc \$DeadlineUtc' -and $sourceText -match 'TerminationGraceMilliseconds 100 -StreamDrainGraceMilliseconds 100') 'application-facing pose probing inherits the outer deadline including bounded cleanup grace'
 
+    $null = $tokens = $parseErrors = $null
+    $sourceAst = [Management.Automation.Language.Parser]::ParseFile($entry, [ref]$tokens, [ref]$parseErrors)
+    $tailFunctionNames = @('Get-StreamRangeSha256', 'Get-Utf8TrailingIncompleteByteCount', 'Get-SharedTextTail')
+    $tailFunctions = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $tailFunctionNames
+    }, $true) | Sort-Object { [array]::IndexOf($tailFunctionNames, $_.Name) })
+    $tailHarnessText = "`$script:SharedTextTailState = @{}`n" + (($tailFunctions | ForEach-Object { $_.Extent.Text }) -join "`n")
+    $tailHarness = New-Module -ScriptBlock ([scriptblock]::Create($tailHarnessText))
+    $tailPath = Join-Path $fixture 'incremental-tail.txt'
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $prefixBytes = $utf8.GetBytes("alpha`nprice ")
+    $euroBytes = $utf8.GetBytes([char]0x20AC)
+    [IO.File]::WriteAllBytes($tailPath, [byte[]]@($prefixBytes + $euroBytes[0..1]))
+    $firstTail = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    Assert-Test (($firstTail -join '|') -eq 'alpha|price ') 'bounded log tail keeps a partial line separate while retaining incomplete UTF-8 bytes'
+    $appendBytes = [byte[]]@($euroBytes[2]) + $utf8.GetBytes("`nnext`n")
+    $appendStream = [IO.File]::Open($tailPath, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+    try { $appendStream.Write($appendBytes, 0, $appendBytes.Length) }
+    finally { $appendStream.Dispose() }
+    $secondTail = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test (($secondTail.lines -join '|') -eq 'alpha|price €|next') 'incremental log tail preserves a UTF-8 code point split across reads'
+    Assert-Test ([bool]$secondTail.state.incremental) 'incremental log tail retains continuity across monotonic append'
+    Assert-Test ([long]$secondTail.state.bytesRead -lt [long]$secondTail.state.offset) 'incremental log tail reads only appended bytes after continuity proof'
+    $bytesBeforeResync = [long]$secondTail.state.cumulativeBytesRead
+    [IO.File]::WriteAllText($tailPath, "replacement-one`nreplacement-two`n", $utf8)
+    $replacementTail = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test ($replacementTail.state.resynchronized -and ($replacementTail.lines -join '|') -eq 'replacement-one|replacement-two' -and [long]$replacementTail.state.cumulativeBytesRead -gt $bytesBeforeResync) 'incremental log tail detects truncate-and-regrow continuity loss and resynchronizes'
+    $sameLength = ('same-length-overwrite'.PadRight(([IO.FileInfo]$tailPath).Length - 1, 'x')) + "`n"
+    [IO.File]::WriteAllText($tailPath, $sameLength, $utf8)
+    $overwriteTail = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test ($overwriteTail.state.resynchronized -and $overwriteTail.lines[-1] -like 'same-length-overwrite*') 'incremental log tail detects a same-length in-place overwrite'
+
+    $authorizationDenied = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -InternalTestFailurePoint head-pose-access-denied -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $authorizationDenied.ok -and $authorizationDenied.state -eq 'head-pose-provider-authorization-failed' -and $authorizationDenied.data.runtime.headPoseState.authorizationDenied) 'inspect translates shared-memory authorization denial into a distinct structured state'
+
     $invalidVersionProfilePath = Join-Path $fixture 'steamvr-null.invalid-version.profile.json'
     $invalidVersionProfile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json -AsHashtable
     $invalidVersionProfile['headPoseProviderContract']['sharedMemoryVersion'] = 3
@@ -135,6 +183,12 @@ try {
     $appliedReceipt = Get-Content -LiteralPath (Join-Path $evidence 'steamvr-null-receipt.json') -Raw | ConvertFrom-Json
     Assert-Test ((Test-Path -LiteralPath $appliedReceipt.profileEvidencePath -PathType Leaf) -and (Get-FileHash -LiteralPath $appliedReceipt.profileEvidencePath -Algorithm SHA256).Hash -eq $appliedReceipt.profileSha256) 'apply retains an exact receipt-bound null profile in stable evidence'
     $appliedText = [IO.File]::ReadAllText($settingsPath)
+
+    Copy-Item -LiteralPath $env:ComSpec -Destination $startupPath -Force
+    $authorizationDeniedStart = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint head-pose-access-denied-after-start -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    if (-not $authorizationDeniedStart.data.PSObject.Properties['startupCleanup']) { throw "Fixture authorization-denied start did not reach cleanup: $($authorizationDeniedStart | ConvertTo-Json -Depth 12 -Compress)" }
+    Assert-Test (-not $authorizationDeniedStart.ok -and $authorizationDeniedStart.state -eq 'head-pose-provider-authorization-failed' -and $authorizationDeniedStart.data.startupCleanup -and @($authorizationDeniedStart.data.startupCleanup.remaining).Count -eq 0) 'startup authorization denial stops every exact SteamVR process started by the attempt'
+    [IO.File]::WriteAllBytes($startupPath, [byte[]]@(0))
 
     $secondCallerApply = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -Compact -NoExit | ConvertFrom-Json
     Assert-Test ($secondCallerApply.ok -and $secondCallerApply.state -eq 'already-applied' -and $secondCallerApply.data.evidenceDirectory -eq [IO.Path]::GetFullPath($evidence)) 'a second evidence directory cannot establish a false baseline over an active authoritative apply transaction'

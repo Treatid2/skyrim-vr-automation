@@ -32,7 +32,7 @@ param(
 
     [switch]$AllowExternalDisplayRedirector,
 
-    [ValidateSet('', 'apply-after-openvr', 'restore-after-settings')]
+    [ValidateSet('', 'apply-after-openvr', 'restore-after-settings', 'head-pose-access-denied', 'head-pose-access-denied-after-start')]
     [string]$InternalTestFailurePoint = '',
 
     [switch]$IsolateExternalDisplayRedirectors,
@@ -140,6 +140,47 @@ if (-not (Get-Variable -Scope Script -Name SharedTextTailState -ErrorAction Sile
     $script:SharedTextTailState = @{}
 }
 
+function Get-StreamRangeSha256 {
+    param(
+        [Parameter(Mandatory)][IO.Stream]$Stream,
+        [Parameter(Mandatory)][long]$Offset,
+        [Parameter(Mandatory)][int]$Length
+    )
+    if ($Length -eq 0) { return '' }
+    $savedPosition = $Stream.Position
+    $bytes = [byte[]]::new($Length)
+    try {
+        $Stream.Position = $Offset
+        $read = 0
+        while ($read -lt $Length) {
+            $current = $Stream.Read($bytes, $read, $Length - $read)
+            if ($current -le 0) { break }
+            $read += $current
+        }
+        if ($read -ne $Length) { return $null }
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try { return [Convert]::ToHexString($algorithm.ComputeHash($bytes)) }
+        finally { $algorithm.Dispose() }
+    }
+    finally { $Stream.Position = $savedPosition }
+}
+
+function Get-Utf8TrailingIncompleteByteCount {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes)
+    if ($Bytes.Length -eq 0) { return 0 }
+    $continuations = 0
+    for ($index = $Bytes.Length - 1; $index -ge 0 -and $continuations -lt 4; $index--) {
+        $value = $Bytes[$index]
+        if (($value -band 0xC0) -eq 0x80) {
+            $continuations++
+            continue
+        }
+        $expected = if (($value -band 0x80) -eq 0) { 0 } elseif (($value -band 0xE0) -eq 0xC0) { 1 } elseif (($value -band 0xF0) -eq 0xE0) { 2 } elseif (($value -band 0xF8) -eq 0xF0) { 3 } else { 0 }
+        return $(if ($expected -gt $continuations) { $continuations + 1 } else { 0 })
+    }
+    return $(if ($continuations -gt 0) { $continuations } else { 0 })
+}
+
 function Get-SharedTextTail {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -155,7 +196,11 @@ function Get-SharedTextTail {
         $info = [IO.FileInfo]::new([IO.Path]::GetFullPath($Path))
         $identity = "$($info.FullName.ToLowerInvariant())|$($info.CreationTimeUtc.Ticks)"
         $prior = if ($script:SharedTextTailState.ContainsKey($identity)) { $script:SharedTextTailState[$identity] } else { $null }
-        $incremental = $null -ne $prior -and [int64]$prior.offset -le $capturedLength
+        $continuityMatched = $false
+        if ($null -ne $prior -and [int64]$prior.offset -le $capturedLength) {
+            $continuityMatched = [string]$prior.continuitySha256 -ceq [string](Get-StreamRangeSha256 -Stream $stream -Offset ([int64]$prior.continuityOffset) -Length ([int]$prior.continuityLength))
+        }
+        $incremental = $null -ne $prior -and [int64]$prior.offset -le $capturedLength -and $continuityMatched
         $start = if ($incremental) { [int64]$prior.offset } else { [Math]::Max([int64]0, $capturedLength - $MaxBytes) }
         if (($capturedLength - $start) -gt $MaxBytes) {
             $start = $capturedLength - $MaxBytes
@@ -171,21 +216,46 @@ function Get-SharedTextTail {
             if ($current -le 0) { break }
             $read += $current
         }
-        $text = if ($read -gt 0) { [Text.Encoding]::UTF8.GetString($bytes, 0, $read) } else { '' }
+        $pendingBytes = if ($incremental -and $prior.PSObject.Properties['pendingBytes']) { [byte[]]$prior.pendingBytes } else { [byte[]]@() }
+        $combinedBytes = [byte[]]::new($pendingBytes.Length + $read)
+        if ($pendingBytes.Length -gt 0) { [Array]::Copy($pendingBytes, 0, $combinedBytes, 0, $pendingBytes.Length) }
+        if ($read -gt 0) { [Array]::Copy($bytes, 0, $combinedBytes, $pendingBytes.Length, $read) }
+        $incompleteByteCount = Get-Utf8TrailingIncompleteByteCount -Bytes $combinedBytes
+        $completeByteCount = $combinedBytes.Length - $incompleteByteCount
+        $text = if ($completeByteCount -gt 0) { [Text.Encoding]::UTF8.GetString($combinedBytes, 0, $completeByteCount) } else { '' }
+        $nextPendingBytes = if ($incompleteByteCount -gt 0) { [byte[]]$combinedBytes[$completeByteCount..($combinedBytes.Length - 1)] } else { [byte[]]@() }
         if (-not $incremental -and $start -gt 0) {
             $firstBreak = $text.IndexOf("`n", [StringComparison]::Ordinal)
             $text = if ($firstBreak -ge 0) { $text.Substring($firstBreak + 1) } else { '' }
         }
         $prefix = if ($incremental) { [string]$prior.residual } else { '' }
         $combined = $prefix + $text
-        $parts = @($combined -split "`r?`n")
+        $parts = @($combined -split '\r?\n')
         $residual = if ($combined.EndsWith("`n", [StringComparison]::Ordinal)) { '' } else { [string]$parts[-1] }
         $completed = if ($residual.Length -gt 0 -and $parts.Count -gt 1) { @($parts[0..($parts.Count - 2)]) } elseif ($residual.Length -gt 0) { @() } else { @($parts | Select-Object -SkipLast 1) }
-        $lines = @($(if ($incremental) { @($prior.lines) }) + $completed)
+        $lines = @()
+        if ($incremental) { $lines = @($prior.lines) }
+        $lines = @($lines) + @($completed)
         if ($lines.Count -gt $Count) { $lines = @($lines[($lines.Count - $Count)..($lines.Count - 1)]) }
+        $continuityLength = [int][Math]::Min(64, $capturedLength)
+        $continuityOffset = $capturedLength - $continuityLength
+        $continuitySha256 = Get-StreamRangeSha256 -Stream $stream -Offset $continuityOffset -Length $continuityLength
         $script:SharedTextTailState.Clear()
-        $script:SharedTextTailState[$identity] = [pscustomobject]@{ offset = $capturedLength; residual = $residual; lines = $lines }
-        $visible = @($lines + $(if ($residual.Length -gt 0) { $residual }))
+        $script:SharedTextTailState[$identity] = [pscustomobject]@{
+            offset = $capturedLength
+            residual = $residual
+            lines = $lines
+            pendingBytes = $nextPendingBytes
+            continuityOffset = $continuityOffset
+            continuityLength = $continuityLength
+            continuitySha256 = $continuitySha256
+            incremental = $incremental
+            resynchronized = $null -ne $prior -and -not $incremental
+            bytesRead = $read
+            cumulativeBytesRead = [long]$(if ($null -ne $prior -and $prior.PSObject.Properties['cumulativeBytesRead']) { [long]$prior.cumulativeBytesRead + $read } else { $read })
+        }
+        $visible = @($lines)
+        if ($residual.Length -gt 0) { $visible += $residual }
         if ($visible.Count -gt $Count) { return @($visible[($visible.Count - $Count)..($visible.Count - 1)]) }
         return $visible
     }
@@ -986,7 +1056,24 @@ function Get-NullRuntimeEvidence {
             }
         }
     }
-    $headPoseState = Get-HeadPoseSharedState -Contract $Profile['headPoseProviderContract']
+    $headPoseAuthorizationError = $null
+    try {
+        $denyAfterStart = $InternalTestFailurePoint -eq 'head-pose-access-denied-after-start' -and
+            (Get-Variable -Scope Script -Name SteamVRStartupAttemptActive -ValueOnly -ErrorAction SilentlyContinue)
+        if ($InternalTestFailurePoint -eq 'head-pose-access-denied' -or $denyAfterStart) {
+            throw [UnauthorizedAccessException]::new('Injected head-pose shared-memory authorization failure.')
+        }
+        $headPoseState = Get-HeadPoseSharedState -Contract $Profile['headPoseProviderContract']
+    }
+    catch [UnauthorizedAccessException] {
+        $headPoseAuthorizationError = $_.Exception.Message
+        $headPoseState = [pscustomobject][ordered]@{
+            available = $false
+            qualified = $false
+            authorizationDenied = $true
+            error = $headPoseAuthorizationError
+        }
+    }
     $providerLogReady = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active -and $null -ne $headPoseLoaded -and $null -ne $headPoseRegistered
     $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -DeadlineUtc $DeadlineUtc } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider is not ready for an application-facing pose probe.' } }
     return [pscustomobject][ordered]@{
@@ -1001,6 +1088,7 @@ function Get-NullRuntimeEvidence {
         headPoseDriverLoaded = $headPoseLoaded
         headPoseDeviceRegistered = $headPoseRegistered
         headPoseState = $headPoseState
+        headPoseAuthorizationError = $headPoseAuthorizationError
         applicationHeadPose = $applicationHeadPose
         headPoseReady = $providerLogReady -and [bool]$headPoseState.qualified -and [bool]$applicationHeadPose.qualified
         dashboardProcesses = @($owned | Where-Object name -eq 'vrdashboard')
@@ -1190,8 +1278,8 @@ try {
     elseif ($Command -eq 'inspect') {
         $providerDriver = @($externalDrivers.drivers | Where-Object name -eq ([string]$profile['headPoseProviderContract']['driverName']))
         $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers
-        $state = if ($externalDrivers.errors.Count -gt 0) { 'external-driver-inventory-failed' } elseif ($providerDriver.Count -ne 1) { 'head-pose-provider-unavailable' } elseif ($externalDrivers.conflicts.Count -gt 0) { 'external-driver-conflict' } elseif ($runtime.active -and -not $runtime.headPoseReady) { 'head-pose-provider-not-ready' } elseif ($runtime.active -and $effective.active) { 'null-runtime-active-head-pose-ready' } elseif ($effective.active) { 'null-configured-runtime-stopped' } else { 'null-inactive' }
-        $result = New-Result -Ok $true -State $state -Data @{
+        $state = if ($externalDrivers.errors.Count -gt 0) { 'external-driver-inventory-failed' } elseif ($providerDriver.Count -ne 1) { 'head-pose-provider-unavailable' } elseif ($externalDrivers.conflicts.Count -gt 0) { 'external-driver-conflict' } elseif ($runtime.headPoseAuthorizationError) { 'head-pose-provider-authorization-failed' } elseif ($runtime.active -and -not $runtime.headPoseReady) { 'head-pose-provider-not-ready' } elseif ($runtime.active -and $effective.active) { 'null-runtime-active-head-pose-ready' } elseif ($effective.active) { 'null-configured-runtime-stopped' } else { 'null-inactive' }
+        $result = New-Result -Ok (-not [bool]$runtime.headPoseAuthorizationError) -State $state -Data @{
             settingsPath = $SettingsPath
             settingsSha256 = Get-HashOrNull $SettingsPath
             profilePath = $NullProfilePath
@@ -1219,6 +1307,9 @@ try {
         }
         elseif (-not $effective.active) {
             $result = New-Result -Ok $false -State 'null-not-configured' -Data @{ effective = $effective; runtime = $runtime } -Errors @('Apply the null-HMD settings transaction before starting SteamVR.')
+        }
+        elseif ($runtime.headPoseAuthorizationError) {
+            $result = New-Result -Ok $false -State 'head-pose-provider-authorization-failed' -Data @{ effective = $effective; runtime = $runtime } -Errors @([string]$runtime.headPoseAuthorizationError)
         }
         elseif ($runtime.active -and -not $runtime.headPoseReady) {
             $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers -DiagnosticDisplayOverride ([bool]$AllowExternalDisplayRedirector)
@@ -1267,6 +1358,7 @@ try {
             else {
                 $startedUtc = [DateTime]::UtcNow
                 $launcher = Start-Process -FilePath $startupPath -WindowStyle Hidden -PassThru
+                $script:SteamVRStartupAttemptActive = $true
                 $deadline = $startedUtc.AddSeconds($StartupTimeoutSeconds)
                 $logReadReserveMilliseconds = [int][Math]::Min(2000, [Math]::Max(500, $StartupTimeoutSeconds * 50))
                 $qualificationDeadline = $deadline.AddMilliseconds(-$logReadReserveMilliseconds)
@@ -1284,6 +1376,10 @@ try {
                     }
                     catch [TimeoutException] {
                         $lastRuntimeProbeError = $_.Exception.Message
+                        break
+                    }
+                    if ($runtime.headPoseAuthorizationError) {
+                        $lastRuntimeProbeError = [string]$runtime.headPoseAuthorizationError
                         break
                     }
                 } while (-not $runtime.active -or -not $runtime.headPoseReady)
@@ -1315,7 +1411,11 @@ try {
                 }
                 Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
                 $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers -DiagnosticDisplayOverride ([bool]$AllowExternalDisplayRedirector)
-                if ($runtime.active -and -not $runtime.headPoseReady) {
+                if ($runtime.headPoseAuthorizationError) {
+                    $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
+                    $result = New-Result -Ok $false -State 'head-pose-provider-authorization-failed' -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; inputContract = $inputContract; startupCleanup = $startupCleanup } -Errors @([string]$runtime.headPoseAuthorizationError, 'Exact SteamVR processes started by this attempt were stopped.')
+                }
+                elseif ($runtime.active -and -not $runtime.headPoseReady) {
                     $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
                     $result = New-Result -Ok $false -State 'head-pose-provider-not-ready' -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; inputContract = $inputContract; startupCleanup = $startupCleanup } -Errors @('SteamVR activated the Valve null display, but the synthetic standing head pose was not loaded and acknowledged; exact processes started by this attempt were stopped.')
                 }
