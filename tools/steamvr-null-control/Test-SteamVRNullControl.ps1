@@ -586,6 +586,23 @@ try {
     $earlyFailureReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
     Assert-Test ($earlyPostLaunchFailure.state -eq 'runtime-admission-exception' -and $earlyFailureReceipt.attemptId -eq $earlyPostLaunchFailure.data.runtimeAttemptId -and -not $earlyFailureReceipt.runtimeAccepted) 'early post-launch exception returns a deterministic path and current nonaccepted receipt'
 
+    $cleanupCrossesDeadline = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-early-post-launch-cleanup-crosses-deadline -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $cleanupCrossesReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    $cleanupCrossesObserved = ([DateTimeOffset]$cleanupCrossesReceipt.failureObservedUtc).UtcDateTime
+    $cleanupCrossesStartupDeadline = ([DateTimeOffset]$cleanupCrossesReceipt.startupDeadlineUtc).UtcDateTime
+    $cleanupCrossesCompleted = ([DateTimeOffset]$cleanupCrossesReceipt.startupCleanupCompletedUtc).UtcDateTime
+    $cleanupCrossesStable = ($cleanupCrossesDeadline.state -eq 'runtime-admission-exception') -and ($cleanupCrossesObserved -lt $cleanupCrossesStartupDeadline) -and ($cleanupCrossesCompleted -ge $cleanupCrossesStartupDeadline)
+    Assert-Test -Condition $cleanupCrossesStable -Name 'cleanup crossing the startup deadline cannot reclassify an earlier admission exception'
+
+    $cleanupFailureCrossesDeadline = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-early-post-launch-cleanup-crosses-deadline-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $cleanupFailureCrossesReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    $cleanupFailureObserved = ([DateTimeOffset]$cleanupFailureCrossesReceipt.failureObservedUtc).UtcDateTime
+    $cleanupFailureStartupDeadline = ([DateTimeOffset]$cleanupFailureCrossesReceipt.startupDeadlineUtc).UtcDateTime
+    $cleanupFailureCompleted = ([DateTimeOffset]$cleanupFailureCrossesReceipt.startupCleanupCompletedUtc).UtcDateTime
+    $cleanupFailureRetained = @($cleanupFailureCrossesDeadline.data.startupCleanup.errors -match 'Injected exact-attempt cleanup failure').Count -gt 0
+    $cleanupFailureStable = ($cleanupFailureCrossesDeadline.state -eq 'runtime-admission-exception') -and (-not $cleanupFailureCrossesDeadline.data.startupCleanup.verified) -and $cleanupFailureRetained -and ($cleanupFailureObserved -lt $cleanupFailureStartupDeadline) -and ($cleanupFailureCompleted -ge $cleanupFailureStartupDeadline)
+    Assert-Test -Condition $cleanupFailureStable -Name 'cleanup failure after the startup deadline preserves the earlier admission exception and exact cleanup evidence'
+
     $stageCleanupFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-accepted-receipt-publish-and-stage-cleanup-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
     $stageResiduePath = [string]$stageCleanupFailure.data.acceptedReceiptStageCleanup.path
     Assert-Test (-not $stageCleanupFailure.data.acceptedReceiptStageCleanup.verified -and $stageCleanupFailure.data.acceptedReceiptStageCleanup.remaining -and $stageCleanupFailure.data.acceptedReceiptStageCleanup.error -match 'Injected accepted runtime receipt stage cleanup failure' -and (Test-Path -LiteralPath $stageResiduePath -PathType Leaf)) 'private accepted-stage cleanup failure reports exact non-authoritative residue'
@@ -605,6 +622,8 @@ try {
         @{ result = $deadlineInputFailure; state = 'startup-deadline-exceeded'; name = 'composed deadline failure returns the common launched-failure envelope' },
         @{ result = $deadlineCleanupFailure; state = 'startup-deadline-exceeded'; name = 'deadline cleanup exception returns the common launched-failure envelope' },
         @{ result = $earlyPostLaunchFailure; state = 'runtime-admission-exception'; name = 'early exception returns the common launched-failure envelope' },
+        @{ result = $cleanupCrossesDeadline; state = 'runtime-admission-exception'; name = 'deadline-crossing cleanup returns the common launched-failure envelope' },
+        @{ result = $cleanupFailureCrossesDeadline; state = 'runtime-admission-exception'; name = 'deadline-crossing cleanup failure returns the common launched-failure envelope' },
         @{ result = $stageCleanupFailure; state = 'runtime-admission-exception'; name = 'stage residue returns the common launched-failure envelope' }
     )
     foreach ($case in $launchedFailures) {

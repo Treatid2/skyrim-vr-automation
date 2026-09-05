@@ -32,7 +32,7 @@ param(
 
     [switch]$AllowExternalDisplayRedirector,
 
-    [ValidateSet('', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'head-pose-access-denied', 'head-pose-access-denied-after-start', 'runtime-ready', 'runtime-early-post-launch-failure', 'runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-confirmation-timeout-input-contract-failure', 'runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-final-admission-timeout-input-contract-failure', 'runtime-post-receipt-timeout', 'runtime-final-boundary-timeout-cleanup-unverified', 'runtime-final-boundary-timeout-cleanup-failure', 'runtime-input-contract-failure', 'runtime-accepted-receipt-stage-failure', 'runtime-accepted-receipt-publish-failure', 'runtime-accepted-receipt-publish-and-stage-cleanup-failure')]
+    [ValidateSet('', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'head-pose-access-denied', 'head-pose-access-denied-after-start', 'runtime-ready', 'runtime-early-post-launch-failure', 'runtime-early-post-launch-cleanup-crosses-deadline', 'runtime-early-post-launch-cleanup-crosses-deadline-failure', 'runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-confirmation-timeout-input-contract-failure', 'runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-final-admission-timeout-input-contract-failure', 'runtime-post-receipt-timeout', 'runtime-final-boundary-timeout-cleanup-unverified', 'runtime-final-boundary-timeout-cleanup-failure', 'runtime-input-contract-failure', 'runtime-accepted-receipt-stage-failure', 'runtime-accepted-receipt-publish-failure', 'runtime-accepted-receipt-publish-and-stage-cleanup-failure')]
     [string]$InternalTestFailurePoint = '',
 
     [switch]$IsolateExternalDisplayRedirectors,
@@ -910,7 +910,10 @@ function Stop-ExactStartedSteamVRProcesses([DateTime]$StartedUtc) {
         $remaining = @($targets | Where-Object { Get-Process -Id ([int]$_.id) -ErrorAction SilentlyContinue })
         if ($remaining.Count -gt 0) { Start-Sleep -Milliseconds 100 }
     } while ($remaining.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
-    if ($InternalTestFailurePoint -in @('runtime-confirmation-timeout-cleanup-failure', 'runtime-final-boundary-timeout-cleanup-failure')) {
+    if ($InternalTestFailurePoint -in @('runtime-early-post-launch-cleanup-crosses-deadline', 'runtime-early-post-launch-cleanup-crosses-deadline-failure')) {
+        Start-Sleep -Milliseconds 700
+    }
+    if ($InternalTestFailurePoint -in @('runtime-confirmation-timeout-cleanup-failure', 'runtime-final-boundary-timeout-cleanup-failure', 'runtime-early-post-launch-cleanup-crosses-deadline-failure')) {
         throw [IO.IOException]::new('Injected exact-attempt cleanup failure after process handling.')
     }
     $verified = $remaining.Count -eq 0 -and $errors.Count -eq 0
@@ -1240,6 +1243,8 @@ function Get-NullRuntimeEvidence {
     $fixtureReadyPoints = @(
         'runtime-ready',
         'runtime-early-post-launch-failure',
+        'runtime-early-post-launch-cleanup-crosses-deadline',
+        'runtime-early-post-launch-cleanup-crosses-deadline-failure',
         'runtime-confirmation-timeout',
         'runtime-confirmation-timeout-receipt-failure',
         'runtime-confirmation-timeout-cleanup-failure',
@@ -1284,7 +1289,10 @@ function New-RuntimeAdmissionSnapshot {
         [int]$ProbeAttempts,
         [AllowNull()]$LastProbeError,
         [bool]$ConfirmationAttempted,
-        [bool]$ConfirmationTimedOut
+        [bool]$ConfirmationTimedOut,
+        [AllowNull()]$FailureObservedUtc = $null,
+        [AllowNull()]$StartupDeadlineUtc = $null,
+        [AllowNull()]$CleanupCompletedUtc = $null
     )
     return [ordered]@{
         state = $State
@@ -1292,6 +1300,9 @@ function New-RuntimeAdmissionSnapshot {
         lastRuntimeProbeError = $LastProbeError
         runtimeConfirmationAttempted = $ConfirmationAttempted
         runtimeConfirmationTimedOut = $ConfirmationTimedOut
+        failureObservedUtc = if ($null -ne $FailureObservedUtc) { ([DateTime]$FailureObservedUtc).ToUniversalTime().ToString('o') } else { $null }
+        startupDeadlineUtc = if ($null -ne $StartupDeadlineUtc) { ([DateTime]$StartupDeadlineUtc).ToUniversalTime().ToString('o') } else { $null }
+        startupCleanupCompletedUtc = if ($null -ne $CleanupCompletedUtc) { ([DateTime]$CleanupCompletedUtc).ToUniversalTime().ToString('o') } else { $null }
     }
 }
 
@@ -1371,6 +1382,8 @@ $lastRuntimeProbeError = $null
 $runtimeConfirmationAttempted = $false
 $runtimeConfirmationTimedOut = $false
 $startupDeadlineUtc = $null
+$failureObservedUtc = $null
+$startupCleanupCompletedUtc = $null
 try {
     if ([string]::IsNullOrWhiteSpace($OpenVRPathsPath)) { throw 'OpenVRPathsPath is required to identify the complete live transaction target.' }
     $localApplicationData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
@@ -1639,6 +1652,12 @@ try {
                 $runtimeReceipt['qualificationDeadlineUtc'] = $qualificationDeadline.ToString('o')
                 $runtimeReceipt['logReadReserveMilliseconds'] = $logReadReserveMilliseconds
                 $runtimeReceiptPersisted = $false
+                if ($InternalTestFailurePoint -in @('runtime-early-post-launch-cleanup-crosses-deadline', 'runtime-early-post-launch-cleanup-crosses-deadline-failure')) {
+                    $deadline = [DateTime]::UtcNow.AddMilliseconds(400)
+                    $startupDeadlineUtc = $deadline
+                    $runtimeReceipt['startupDeadlineUtc'] = $deadline.ToString('o')
+                    throw [InvalidOperationException]::new('Injected early post-launch admission failure before delayed cleanup.')
+                }
                 if ($InternalTestFailurePoint -eq 'runtime-early-post-launch-failure') {
                     throw [InvalidOperationException]::new('Injected early post-launch admission failure.')
                 }
@@ -2125,25 +2144,30 @@ try {
 catch {
     $primaryError = $_.Exception.Message
     $startupCleanupError = $null
-    if ($null -ne $startupAttemptStartedUtc -and -not $startupAttemptAccepted -and $null -eq $startupCleanup) {
-        try { $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startupAttemptStartedUtc }
-        catch { $startupCleanupError = $_.Exception.Message }
-    }
-    $errors = @($primaryError)
     if ($null -ne $startupAttemptStartedUtc -and -not $startupAttemptAccepted) {
+        # Freeze primary admission facts before cleanup duration can change them.
+        $failureObservedUtc = [DateTime]::UtcNow
         $admissionState = if (-not [string]::IsNullOrWhiteSpace([string]$failureState)) {
             [string]$failureState
         }
         elseif ($runtimeConfirmationTimedOut) {
             'runtime-confirmation-timeout'
         }
-        elseif ($null -ne $startupDeadlineUtc -and [DateTime]::UtcNow -ge $startupDeadlineUtc) {
+        elseif ($null -ne $startupDeadlineUtc -and $failureObservedUtc -ge $startupDeadlineUtc) {
             'startup-deadline-exceeded'
         }
         else {
             'runtime-admission-exception'
         }
         $failureState = $admissionState
+    }
+    if ($null -ne $startupAttemptStartedUtc -and -not $startupAttemptAccepted -and $null -eq $startupCleanup) {
+        try { $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startupAttemptStartedUtc }
+        catch { $startupCleanupError = $_.Exception.Message }
+        $startupCleanupCompletedUtc = [DateTime]::UtcNow
+    }
+    $errors = @($primaryError)
+    if ($null -ne $startupAttemptStartedUtc -and -not $startupAttemptAccepted) {
         if ($inputContract -is [Collections.IDictionary]) {
             $inputContract['measurementReady'] = $false
             $inputContract['measurementBlockers'] = @(@($inputContract['measurementBlockers']) + $admissionState | Select-Object -Unique)
@@ -2179,7 +2203,7 @@ catch {
         else {
             $errors += 'Exact-attempt cleanup did not verify a fully stopped runtime; inspect startupCleanup before retrying.'
         }
-        $admission = New-RuntimeAdmissionSnapshot -State $admissionState -ProbeAttempts $runtimeProbeAttempts -LastProbeError $lastRuntimeProbeError -ConfirmationAttempted $runtimeConfirmationAttempted -ConfirmationTimedOut $runtimeConfirmationTimedOut
+        $admission = New-RuntimeAdmissionSnapshot -State $admissionState -ProbeAttempts $runtimeProbeAttempts -LastProbeError $lastRuntimeProbeError -ConfirmationAttempted $runtimeConfirmationAttempted -ConfirmationTimedOut $runtimeConfirmationTimedOut -FailureObservedUtc $failureObservedUtc -StartupDeadlineUtc $startupDeadlineUtc -CleanupCompletedUtc $startupCleanupCompletedUtc
         if ($runtimeReceipt -is [Collections.IDictionary] -and -not [string]::IsNullOrWhiteSpace($runtimeReceiptPath)) {
             $runtimeReceipt['runtimeActive'] = if ($null -ne $runtime) { [bool]$runtime.active } else { $false }
             $runtimeReceipt['runtime'] = $runtime
@@ -2191,6 +2215,8 @@ catch {
             $runtimeReceipt['admissionState'] = $admissionState
             $runtimeReceipt['acceptedUtc'] = $null
             $runtimeReceipt['startupCleanup'] = $startupCleanup
+            $runtimeReceipt['failureObservedUtc'] = $admission.failureObservedUtc
+            $runtimeReceipt['startupCleanupCompletedUtc'] = $admission.startupCleanupCompletedUtc
             try {
                 $runtimeReceiptPersistenceAttempted = $true
                 Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
