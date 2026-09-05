@@ -108,7 +108,7 @@ try {
     $nullRouteArgs = @{} + $selectArgs
     $nullRouteArgs.RenderPath = 'vr-steamvr-null'
     $nullRouteSelect = Invoke-Catalog $nullRouteArgs
-    Assert-Test ($nullRouteSelect.ok -and $nullRouteSelect.state -eq 'snapshot-selected' -and $nullRouteSelect.data.selection.selected.renderFamily -eq 'vr-steamvr') 'null HMD selects a compatible physical SteamVR cache'
+    Assert-Test ($nullRouteSelect.ok -and $nullRouteSelect.state -eq 'snapshot-selected' -and $nullRouteSelect.data.selection.selected.renderFamily -eq 'vr-steamvr' -and $nullRouteSelect.data.selection.selected.exactRenderFamilyProvenance -and $nullRouteSelect.data.selection.selected.manifest.compatibility.renderPath -eq 'vr-steamvr-physical') 'null HMD prefers the canonical compatible physical SteamVR cache'
 
     $openCompositeArgs = @{} + $nullRouteArgs
     $openCompositeArgs.RenderPath = 'vr-opencomposite'

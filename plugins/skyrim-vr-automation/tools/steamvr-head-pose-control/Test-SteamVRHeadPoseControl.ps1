@@ -89,6 +89,23 @@ try {
     [ordered]@{ version = 1; external_drivers = @($installRoot) } | ConvertTo-Json | Set-Content -LiteralPath $openVrPaths -Encoding utf8
     $openVrBefore = [IO.File]::ReadAllBytes($openVrPaths)
     $evidence = Join-Path $fixture 'evidence'
+    # Fixture transactions must not depend on unrelated live SteamVR state;
+    # production process checks remain exercised outside this test scope.
+    function Get-Process {
+        [CmdletBinding(DefaultParameterSetName = 'Name')]
+        param(
+            [Parameter(ParameterSetName = 'Name')]
+            [string[]]$Name,
+            [Parameter(ParameterSetName = 'Id')]
+            [int[]]$Id
+        )
+        $fixtureSteamVrNames = @('vrserver', 'vrmonitor', 'vrcompositor', 'vrstartup')
+        if ($PSCmdlet.ParameterSetName -eq 'Name' -and $Name.Count -gt 0 -and
+            @($Name | Where-Object { $_ -notin $fixtureSteamVrNames }).Count -eq 0) {
+            return
+        }
+        return Microsoft.PowerShell.Management\Get-Process @PSBoundParameters
+    }
     $failedUpgrade = & $entry install -DriverPackagePath $bundleRoot -InstallRoot $installRoot -VRPathRegPath $entry -OpenVRPathsPath $openVrPaths -EvidenceDirectory $evidence -Upgrade -InternalTestFailurePoint install-after-replacement -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $failedUpgrade.ok -and $failedUpgrade.errors[0] -match 'exact previous install.*restored') 'injected upgrade failure reports verified rollback'
     Assert-Test ((Get-FileHash -LiteralPath $oldDll -Algorithm SHA256).Hash -eq $oldHash) 'upgrade rollback restores the exact original driver DLL'
