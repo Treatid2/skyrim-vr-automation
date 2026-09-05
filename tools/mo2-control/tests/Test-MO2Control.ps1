@@ -509,6 +509,16 @@ selected_profile=@ByteArray(Codex)
 
         $recoveryAccess = Invoke-MO2RequestAccess -Config $config -Label 'fixture recovery access' -RuntimeRoute SteamVR -EstimatedMinutes 5
         $recoveryAccessId = [string]$recoveryAccess.data.access.accessId
+        $legacyRecoveryLease = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+        $recoveryRuntimeRoute = $legacyRecoveryLease.runtimeRoute
+        $legacyRecoveryLease.PSObject.Properties.Remove('runtimeRoute')
+        $legacyRecoveryLease | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+        $sessionDirectoryCountBeforeLegacyRecovery = @(Get-ChildItem -LiteralPath $sessionRoot -Directory).Count
+        $legacyRecovery = Invoke-MO2RecoverClose -Config $config -AccessId $recoveryAccessId -Label 'fixture legacy recovery lease' -WhatIf
+        Assert-MO2Test (-not $legacyRecovery.ok -and $legacyRecovery.state -eq 'runtime-route-upgrade-required' -and $legacyRecovery.errors[0] -match 'request a new access lease') 'recovery close returns an informative blocked result for a legacy route-less access lease'
+        Assert-MO2Test (@(Get-ChildItem -LiteralPath $sessionRoot -Directory).Count -eq $sessionDirectoryCountBeforeLegacyRecovery) 'route-less recovery rejection creates no session artifact'
+        $legacyRecoveryLease | Add-Member -NotePropertyName runtimeRoute -NotePropertyValue $recoveryRuntimeRoute
+        $legacyRecoveryLease | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
         $expectedRecoveryRouteFingerprint = & $mo2Module { param($route) Get-MO2RuntimeRouteContractFingerprint $route } $recoveryAccess.data.access.runtimeRoute
         $recoverWithRoute = & $mo2Module {
             param($fixtureConfig, $fixtureAccessId)

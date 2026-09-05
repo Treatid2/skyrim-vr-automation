@@ -249,16 +249,22 @@ try {
     Assert-Test ($dry.ok -and $dry.state -eq 'dry-run') 'apply dry-run succeeds'
     Assert-Test (-not (Test-Path -LiteralPath (Join-Path $evidence 'steamvr.vrsettings.before'))) 'apply dry-run creates no backup'
 
-    $applied = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -Compact | ConvertFrom-Json
+    $profileTextBeforeApply = [IO.File]::ReadAllText($profilePath)
+    $applied = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint apply-source-drift-after-stage -Compact | ConvertFrom-Json
     Assert-Test ($applied.ok -and $applied.state -eq 'null-applied') 'apply writes effective null profile'
     if (-not $applied.ok) { throw "Fixture apply failed: $($applied.errors -join '; ')" }
     $appliedJson = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
+    $driftedSourceProfile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json -AsHashtable
     Assert-Test ($appliedJson['unrelated']['value'] -eq 7) 'apply preserves unrelated settings'
     Assert-Test ($appliedJson['dashboard']['enableDashboard'] -eq $false) 'apply disables the dashboard generic-HMD input route'
     Assert-Test ($appliedJson['driver_codex_head_pose']['eyeHeightMeters'] -eq 1.68 -and $appliedJson['TrackingOverrides']['/devices/codex_head_pose/CSX-NULL-HMD-POSE-1'] -eq '/user/head') 'apply configures the synthetic head pose and semantic override'
+    Assert-Test ($driftedSourceProfile['driver_codex_head_pose']['eyeHeightMeters'] -eq 9.25 -and $appliedJson['driver_codex_head_pose']['eyeHeightMeters'] -eq 1.68) 'apply uses the staged profile when the caller source changes before settings mutation'
     Assert-Test (Test-Path -LiteralPath (Join-Path $evidence 'steamvr-null-receipt.json')) 'apply writes hash receipt'
     $appliedReceipt = Get-Content -LiteralPath (Join-Path $evidence 'steamvr-null-receipt.json') -Raw | ConvertFrom-Json
     Assert-Test ((Test-Path -LiteralPath $appliedReceipt.profileEvidencePath -PathType Leaf) -and (Get-FileHash -LiteralPath $appliedReceipt.profileEvidencePath -Algorithm SHA256).Hash -eq $appliedReceipt.profileSha256) 'apply retains an exact receipt-bound null profile in stable evidence'
+    $appliedEvidenceProfile = Get-Content -LiteralPath $appliedReceipt.profileEvidencePath -Raw | ConvertFrom-Json -AsHashtable
+    Assert-Test ($appliedEvidenceProfile['driver_codex_head_pose']['eyeHeightMeters'] -eq 1.68 -and $appliedReceipt.profileSha256 -ne (Get-FileHash -LiteralPath $profilePath -Algorithm SHA256).Hash) 'apply receipt remains tied to the staged profile rather than the changed caller source'
+    [IO.File]::WriteAllText($profilePath, $profileTextBeforeApply, [Text.UTF8Encoding]::new($false))
     $appliedText = [IO.File]::ReadAllText($settingsPath)
 
     Copy-Item -LiteralPath $env:ComSpec -Destination $startupPath -Force

@@ -2952,6 +2952,9 @@ function Invoke-MO2RecoverClose {
     if (-not $explicitAccess) {
         return New-MO2ActionResult -Config $Config -Command 'recover-close' -Ok $false -State 'missing-access-id' -Data @{ requiredParameter = 'AccessId'; supplied = $false; targets = $targets } -Errors @('Recovery close requires -AccessId from a route-qualified request-access lease before it can adopt a running MO2 process.')
     }
+    if (-not $accessLock.data.PSObject.Properties['runtimeRoute']) {
+        return New-MO2ActionResult -Config $Config -Command 'recover-close' -Ok $false -State 'runtime-route-upgrade-required' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $accessLock; targets = $targets } -Errors @('The access lease predates runtime-route qualification. Release it and request a new access lease with an explicit RuntimeRoute before recovery.')
+    }
     $runtimeRoute = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $accessLock.data.runtimeRoute
     Assert-MO2ExactProcessTargets -Config $Config -Processes $targets
     if ($targets.Count -ne 1) {

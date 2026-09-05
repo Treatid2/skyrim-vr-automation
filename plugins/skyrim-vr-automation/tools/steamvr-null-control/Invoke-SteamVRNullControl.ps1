@@ -32,7 +32,7 @@ param(
 
     [switch]$AllowExternalDisplayRedirector,
 
-    [ValidateSet('', 'apply-after-openvr', 'restore-after-settings', 'head-pose-access-denied', 'head-pose-access-denied-after-start')]
+    [ValidateSet('', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'head-pose-access-denied', 'head-pose-access-denied-after-start')]
     [string]$InternalTestFailurePoint = '',
 
     [switch]$IsolateExternalDisplayRedirectors,
@@ -1513,6 +1513,22 @@ try {
                 }
             }
             else {
+                $profileEvidencePath = Join-Path $EvidenceDirectory 'steamvr-null.profile.applied.json'
+                $profileSha256 = Get-HashOrNull $NullProfilePath
+                Copy-FileAtomicVerified -Source $NullProfilePath -Destination $profileEvidencePath -ExpectedSha256 $profileSha256
+                $profile = Read-JsonHashtable -Path $profileEvidencePath
+                foreach ($section in @('steamvr', 'dashboard', 'driver_null', 'driver_codex_head_pose', 'TrackingOverrides', 'headPoseProviderContract', 'automationInputContract')) {
+                    if (-not $profile.ContainsKey($section)) { throw "Staged null-HMD profile is missing '$section'." }
+                }
+                if ($InternalTestFailurePoint -eq 'apply-source-drift-after-stage') {
+                    $driftedSourceProfile = Read-JsonHashtable -Path $NullProfilePath
+                    $driftedSourceProfile['driver_codex_head_pose']['eyeHeightMeters'] = 9.25
+                    Write-JsonAtomic -Path $NullProfilePath -Value $driftedSourceProfile
+                }
+                $effective = Get-EffectiveState -Settings $settings -Profile $profile
+                if ($effective.active) {
+                    throw 'SteamVR null settings already match the staged profile but no committed authoritative apply transaction owns them; refusing to create a false baseline.'
+                }
                 Copy-Item -LiteralPath $SettingsPath -Destination $backupPath
                 $beforeHash = Get-HashOrNull $backupPath
                 $openVRPathsBeforeHash = $null
@@ -1562,9 +1578,6 @@ try {
                     $afterSettings = Read-JsonHashtable -Path $SettingsPath
                     $afterEffective = Get-EffectiveState -Settings $afterSettings -Profile $profile
                     if (-not $afterEffective.active) { throw 'The written settings do not match the null-HMD profile.' }
-                    $profileSha256 = Get-HashOrNull $NullProfilePath
-                    $profileEvidencePath = Join-Path $EvidenceDirectory 'steamvr-null.profile.applied.json'
-                    Copy-FileAtomicVerified -Source $NullProfilePath -Destination $profileEvidencePath -ExpectedSha256 $profileSha256
                     $receipt = [ordered]@{
                         schemaVersion = 2
                         operation = 'apply'
