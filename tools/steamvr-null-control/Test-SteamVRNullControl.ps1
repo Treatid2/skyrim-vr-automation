@@ -653,6 +653,7 @@ try {
         @{ result = $inputContractFailure; receipt = $inputContractFailureReceipt; state = 'runtime-admission-exception'; name = 'input-contract exception returns the common launched-failure envelope' },
         @{ result = $stageFailure; receipt = $stageFailureReceipt; state = 'runtime-admission-exception'; name = 'accepted-stage exception returns the common launched-failure envelope' },
         @{ result = $finalAdmissionTimeout; receipt = $finalAdmissionReceipt; state = 'startup-deadline-exceeded'; name = 'pre-final deadline returns the common launched-failure envelope' },
+        @{ result = $noConfirmationTimeout; receipt = $noConfirmationReceipt; state = 'startup-deadline-exceeded'; name = 'no-confirmation deadline returns the common launched-failure envelope' },
         @{ result = $postReceiptTimeout; receipt = $postReceipt; state = 'startup-deadline-exceeded'; name = 'post-stage deadline returns the common launched-failure envelope' },
         @{ result = $unverifiedFinalCleanup; receipt = $unverifiedFinalCleanupReceipt; state = 'startup-deadline-exceeded'; name = 'unverified cleanup returns the common launched-failure envelope' },
         @{ result = $publishFailure; receipt = $publishFailureReceipt; state = 'runtime-admission-exception'; name = 'publication exception returns the common launched-failure envelope' },
