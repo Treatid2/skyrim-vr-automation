@@ -1290,9 +1290,9 @@ function New-RuntimeAdmissionSnapshot {
         [AllowNull()]$LastProbeError,
         [bool]$ConfirmationAttempted,
         [bool]$ConfirmationTimedOut,
-        [AllowNull()]$FailureObservedUtc = $null,
-        [AllowNull()]$StartupDeadlineUtc = $null,
-        [AllowNull()]$CleanupCompletedUtc = $null
+        [Parameter(Mandatory)][DateTime]$FailureObservedUtc,
+        [Parameter(Mandatory)][DateTime]$StartupDeadlineUtc,
+        [Parameter(Mandatory)][DateTime]$CleanupCompletedUtc
     )
     return [ordered]@{
         state = $State
@@ -1300,10 +1300,25 @@ function New-RuntimeAdmissionSnapshot {
         lastRuntimeProbeError = $LastProbeError
         runtimeConfirmationAttempted = $ConfirmationAttempted
         runtimeConfirmationTimedOut = $ConfirmationTimedOut
-        failureObservedUtc = if ($null -ne $FailureObservedUtc) { ([DateTime]$FailureObservedUtc).ToUniversalTime().ToString('o') } else { $null }
-        startupDeadlineUtc = if ($null -ne $StartupDeadlineUtc) { ([DateTime]$StartupDeadlineUtc).ToUniversalTime().ToString('o') } else { $null }
-        startupCleanupCompletedUtc = if ($null -ne $CleanupCompletedUtc) { ([DateTime]$CleanupCompletedUtc).ToUniversalTime().ToString('o') } else { $null }
+        failureObservedUtc = $FailureObservedUtc.ToUniversalTime().ToString('o')
+        startupDeadlineUtc = $StartupDeadlineUtc.ToUniversalTime().ToString('o')
+        startupCleanupCompletedUtc = $CleanupCompletedUtc.ToUniversalTime().ToString('o')
     }
+}
+
+function Set-RuntimeReceiptFailureEvidence {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Receipt,
+        [Parameter(Mandatory)][Collections.IDictionary]$Admission,
+        [Parameter(Mandatory)]$StartupCleanup
+    )
+    $Receipt['runtimeAccepted'] = $false
+    $Receipt['admissionState'] = [string]$Admission['state']
+    $Receipt['acceptedUtc'] = $null
+    $Receipt['startupDeadlineUtc'] = [string]$Admission['startupDeadlineUtc']
+    $Receipt['failureObservedUtc'] = [string]$Admission['failureObservedUtc']
+    $Receipt['startupCleanupCompletedUtc'] = [string]$Admission['startupCleanupCompletedUtc']
+    $Receipt['startupCleanup'] = $StartupCleanup
 }
 
 function New-LaunchedRuntimeFailureData {
@@ -1616,6 +1631,8 @@ try {
                     runtimeActive = $false
                     runtime = $runtime
                     startupDeadlineUtc = $null
+                    failureObservedUtc = $null
+                    startupCleanupCompletedUtc = $null
                     qualificationDeadlineUtc = $null
                     logReadReserveMilliseconds = $null
                     runtimeProbeAttempts = 0
@@ -1727,6 +1744,10 @@ try {
                     $failureState = 'startup-incomplete'
                     $failureErrors.Add('SteamVR started, but current-session Valve null-driver and active-HMD log proof was not observed before the timeout.')
                 }
+                if ($null -ne $failureState) {
+                    $failureObservedUtc = [DateTime]::UtcNow
+                    $startupDeadlineUtc = $deadline
+                }
 
                 $runtimeReceipt['runtimeActive'] = [bool]$runtime.active
                 $runtimeReceipt['runtime'] = $runtime
@@ -1757,6 +1778,8 @@ try {
                     }
                     if ([DateTime]::UtcNow -ge $deadline) {
                         $failureState = 'startup-deadline-exceeded'
+                        $failureObservedUtc = [DateTime]::UtcNow
+                        $startupDeadlineUtc = $deadline
                         $failureErrors.Add('The absolute startup deadline elapsed while staging the accepted runtime receipt.')
                     }
                 }
@@ -1764,12 +1787,11 @@ try {
                 if ($null -ne $failureState) {
                     # Cleanup is mandatory once admission fails, even if diagnostic persistence also fails.
                     $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
+                    $startupCleanupCompletedUtc = [DateTime]::UtcNow
                     $inputContract['measurementReady'] = $false
                     $inputContract['measurementBlockers'] = @($inputContract['measurementBlockers']) + $failureState
-                    $runtimeReceipt['runtimeAccepted'] = $false
-                    $runtimeReceipt['admissionState'] = $failureState
-                    $runtimeReceipt['acceptedUtc'] = $null
-                    $runtimeReceipt['startupCleanup'] = $startupCleanup
+                    $admission = New-RuntimeAdmissionSnapshot -State $failureState -ProbeAttempts $runtimeProbeAttempts -LastProbeError $lastRuntimeProbeError -ConfirmationAttempted $runtimeConfirmationAttempted -ConfirmationTimedOut $runtimeConfirmationTimedOut -FailureObservedUtc $failureObservedUtc -StartupDeadlineUtc $startupDeadlineUtc -CleanupCompletedUtc $startupCleanupCompletedUtc
+                    Set-RuntimeReceiptFailureEvidence -Receipt $runtimeReceipt -Admission $admission -StartupCleanup $startupCleanup
                     try {
                         $runtimeReceiptPersistenceAttempted = $true
                         if ($InternalTestFailurePoint -eq 'runtime-confirmation-timeout-receipt-failure') {
@@ -1789,7 +1811,6 @@ try {
                     else {
                         $failureErrors.Add('Exact-attempt cleanup did not verify a fully stopped runtime; inspect startupCleanup before retrying.')
                     }
-                    $admission = New-RuntimeAdmissionSnapshot -State $failureState -ProbeAttempts $runtimeProbeAttempts -LastProbeError $lastRuntimeProbeError -ConfirmationAttempted $runtimeConfirmationAttempted -ConfirmationTimedOut $runtimeConfirmationTimedOut
                     $failureData = New-LaunchedRuntimeFailureData -Effective $effective -Runtime $runtime -Processes $processes -Admission $admission -InputContract $inputContract -ReceiptPath $runtimeReceiptPath -AttemptId $runtimeAttemptId -ReceiptPersistenceAttempted $runtimeReceiptPersistenceAttempted -ReceiptPersisted $runtimeReceiptPersisted -ReceiptError $runtimeReceiptError -StartupCleanup $startupCleanup
                     $result = New-Result -Ok $false -State $failureState -Data $failureData -Errors @($failureErrors)
                 }
@@ -1801,13 +1822,14 @@ try {
                     }
                     if ([DateTime]::UtcNow -ge $deadline) {
                         $failureState = 'startup-deadline-exceeded'
+                        $failureObservedUtc = [DateTime]::UtcNow
+                        $startupDeadlineUtc = $deadline
                         $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
+                        $startupCleanupCompletedUtc = [DateTime]::UtcNow
                         $inputContract['measurementReady'] = $false
                         $inputContract['measurementBlockers'] = @($inputContract['measurementBlockers']) + 'startup-deadline-exceeded'
-                        $runtimeReceipt['runtimeAccepted'] = $false
-                        $runtimeReceipt['admissionState'] = 'startup-deadline-exceeded'
-                        $runtimeReceipt['acceptedUtc'] = $null
-                        $runtimeReceipt['startupCleanup'] = $startupCleanup
+                        $admission = New-RuntimeAdmissionSnapshot -State $failureState -ProbeAttempts $runtimeProbeAttempts -LastProbeError $lastRuntimeProbeError -ConfirmationAttempted $runtimeConfirmationAttempted -ConfirmationTimedOut $runtimeConfirmationTimedOut -FailureObservedUtc $failureObservedUtc -StartupDeadlineUtc $startupDeadlineUtc -CleanupCompletedUtc $startupCleanupCompletedUtc
+                        Set-RuntimeReceiptFailureEvidence -Receipt $runtimeReceipt -Admission $admission -StartupCleanup $startupCleanup
                         try {
                             $runtimeReceiptPersistenceAttempted = $true
                             Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
@@ -1826,7 +1848,6 @@ try {
                             $deadlineErrors.Add('Exact-attempt cleanup did not verify a fully stopped runtime; inspect startupCleanup before retrying.')
                         }
                         if ($runtimeReceiptError) { $deadlineErrors.Add("Runtime receipt persistence failed after cleanup: $runtimeReceiptError") }
-                        $admission = New-RuntimeAdmissionSnapshot -State $failureState -ProbeAttempts $runtimeProbeAttempts -LastProbeError $lastRuntimeProbeError -ConfirmationAttempted $runtimeConfirmationAttempted -ConfirmationTimedOut $runtimeConfirmationTimedOut
                         $failureData = New-LaunchedRuntimeFailureData -Effective $effective -Runtime $runtime -Processes $processes -Admission $admission -InputContract $inputContract -ReceiptPath $runtimeReceiptPath -AttemptId $runtimeAttemptId -ReceiptPersistenceAttempted $runtimeReceiptPersistenceAttempted -ReceiptPersisted $runtimeReceiptPersisted -ReceiptError $runtimeReceiptError -StartupCleanup $startupCleanup
                         $result = New-Result -Ok $false -State $failureState -Data $failureData -Errors @($deadlineErrors)
                     }
@@ -2146,7 +2167,7 @@ catch {
     $startupCleanupError = $null
     if ($null -ne $startupAttemptStartedUtc -and -not $startupAttemptAccepted) {
         # Freeze primary admission facts before cleanup duration can change them.
-        $failureObservedUtc = [DateTime]::UtcNow
+        if ($null -eq $failureObservedUtc) { $failureObservedUtc = [DateTime]::UtcNow }
         $admissionState = if (-not [string]::IsNullOrWhiteSpace([string]$failureState)) {
             [string]$failureState
         }
@@ -2211,12 +2232,7 @@ catch {
             $runtimeReceipt['lastRuntimeProbeError'] = $lastRuntimeProbeError
             $runtimeReceipt['runtimeConfirmationAttempted'] = $runtimeConfirmationAttempted
             $runtimeReceipt['runtimeConfirmationTimedOut'] = $runtimeConfirmationTimedOut
-            $runtimeReceipt['runtimeAccepted'] = $false
-            $runtimeReceipt['admissionState'] = $admissionState
-            $runtimeReceipt['acceptedUtc'] = $null
-            $runtimeReceipt['startupCleanup'] = $startupCleanup
-            $runtimeReceipt['failureObservedUtc'] = $admission.failureObservedUtc
-            $runtimeReceipt['startupCleanupCompletedUtc'] = $admission.startupCleanupCompletedUtc
+            Set-RuntimeReceiptFailureEvidence -Receipt $runtimeReceipt -Admission $admission -StartupCleanup $startupCleanup
             try {
                 $runtimeReceiptPersistenceAttempted = $true
                 Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt

@@ -141,14 +141,17 @@ a nonaccepted record carrying a new `attemptId`; a prior accepted attempt can
 therefore never remain current during a retry. If that replacement fails, the
 controller refuses to launch. Receipt-write failure remains diagnostic and
 cannot bypass mandatory cleanup or convert a failed attempt into success. Any
-unexpected post-launch exception returns the same explicit failed-admission
-envelope: measurement is blocked, available confirmation state is retained,
-receipt persistence is reported with any error, and cleanup is either verified
-or identified as incomplete. Its primary admission state and observation time
-are frozen before cleanup, so cleanup delay cannot turn an earlier exception
-into a startup-deadline rejection. Private accepted-stage removal is verified. A
-surviving stage remains non-authoritative and its exact path and removal error
-are returned and written to the public nonaccepted receipt when possible.
+failed admission, including an unexpected post-launch exception, returns the
+same explicit envelope: measurement is blocked, available confirmation state is
+retained, receipt persistence is reported with any error, and cleanup is either
+verified or identified as incomplete. The primary admission state, failure
+observation, active startup deadline, and cleanup completion are recorded as one
+timeline in both the returned admission object and the public nonaccepted
+receipt. These primary facts are frozen before cleanup, so cleanup delay or a
+cleanup exception cannot reclassify the failure. Private accepted-stage removal
+is verified. A surviving stage remains non-authoritative and its exact path and
+removal error are returned and written to the public nonaccepted receipt when
+possible.
 Operator diagnostics never describe unverified cleanup as successfully stopped.
 
 ```powershell
