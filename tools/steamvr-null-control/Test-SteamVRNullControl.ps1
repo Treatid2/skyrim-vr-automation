@@ -121,6 +121,8 @@ try {
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-NullRuntimeEvidence'
     }, $true))[0]
     Assert-Test ($runtimeEvidenceFunction.Extent.Text -notmatch 'Get-HashOrNull\s+\$ServerLogPath' -and $runtimeEvidenceFunction.Extent.Text -match "serverLogHashScope\s*=\s*'bounded-tail-window'") 'runtime evidence reports the bounded tail proof instead of hashing the complete growing SteamVR log'
+    Assert-Test ($runtimeEvidenceFunction.Extent.Text -match 'usable\s*=\s*\$null -ne \$tailState' -and $runtimeEvidenceFunction.Extent.Text -match 'incremental\s*=\s*\$null -ne \$tailState' -and $runtimeEvidenceFunction.Extent.Text -match 'resynchronized\s*=\s*\$null -ne \$tailState') 'runtime evidence publishes cache usability, incremental reuse, and resynchronization status'
+    Assert-Test ($sourceText -match 'if \(\$runtimeConfirmationTimedOut\)' -and $sourceText -match "State 'runtime-confirmation-timeout'" -and $sourceText -match "'runtime-confirmation-timeout'") 'a timed-out post-ready runtime confirmation cannot retain the earlier successful readiness decision'
     $tailHarnessText = "`$script:SharedTextTailState = @{}`n" + (($tailFunctions | ForEach-Object { $_.Extent.Text }) -join "`n")
     $tailHarness = New-Module -ScriptBlock ([scriptblock]::Create($tailHarnessText))
     $tailPath = Join-Path $fixture 'incremental-tail.txt'
@@ -303,6 +305,99 @@ try {
     Assert-Test (-not $postHashMutation.state.stable -and -not $postHashMutation.state.usable -and $postHashMutation.lines.Count -eq 0) 'a retained-window rewrite between continuity proof and snapshot validation fails closed'
     Assert-Test (-not $postHashRecovery.state.incremental -and $postHashRecovery.lines[0] -eq 'xtable-one') 'the poll after a rejected in-read mutation establishes a fresh current snapshot'
 
+    [IO.File]::WriteAllText($tailPath, "old-generation`n", $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    $rotatedPath = "$tailPath.rotated"
+    $rotation = & $tailHarness {
+        param($path, $rotatedPath)
+        $hook = {
+            param($phase, $stream, $capturedLength)
+            [IO.File]::Move($path, $rotatedPath)
+            [IO.File]::WriteAllText($path, "new-generation`n", [Text.UTF8Encoding]::new($false))
+        }
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -InternalMutationHook $hook)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath $rotatedPath
+    $rotationRecovery = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test (-not $rotation.state.stable -and -not $rotation.state.usable -and $rotation.lines.Count -eq 0 -and $rotation.state.error -match 'replaced') 'same-call log rotation cannot publish lines from the old open file generation'
+    Assert-Test (-not $rotationRecovery.state.incremental -and ($rotationRecovery.lines -join '|') -eq 'new-generation') 'the poll after a rejected rotation establishes the selected replacement log afresh'
+    [IO.File]::Delete($rotatedPath)
+
+    & $tailHarness { $script:SharedTextTailState.Clear() }
+    [IO.File]::WriteAllText($tailPath, "fresh-old`n", $utf8)
+    $freshRotatedPath = "$tailPath.fresh-rotated"
+    $freshRotation = & $tailHarness {
+        param($path, $rotatedPath)
+        $hook = {
+            param($phase, $stream, $capturedLength)
+            [IO.File]::Move($path, $rotatedPath)
+            [IO.File]::WriteAllText($path, "fresh-new`n", [Text.UTF8Encoding]::new($false))
+        }
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -InternalMutationHook $hook)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath $freshRotatedPath
+    Assert-Test (-not $freshRotation.state.stable -and $freshRotation.lines.Count -eq 0) 'rotation during a fresh bounded read also rejects the detached open generation'
+    [IO.File]::Delete($freshRotatedPath)
+
+    [IO.File]::WriteAllText($tailPath, "delete-old`n", $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    $deletedPath = "$tailPath.deleted"
+    $deletedSelection = & $tailHarness {
+        param($path, $deletedPath)
+        $hook = {
+            param($phase, $stream, $capturedLength)
+            [IO.File]::Move($path, $deletedPath)
+        }
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -InternalMutationHook $hook)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath $deletedPath
+    Assert-Test (-not $deletedSelection.state.stable -and -not $deletedSelection.state.usable -and $deletedSelection.lines.Count -eq 0 -and $deletedSelection.state.error -match 'could not be validated') 'deletion without replacement fails closed while the detached read handle remains open'
+    [IO.File]::Move($deletedPath, $tailPath)
+
+    [IO.File]::WriteAllText($tailPath, "captured-line`n", $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    $sameCallAppend = & $tailHarness {
+        param($path)
+        $hook = {
+            param($phase, $stream, $capturedLength)
+            [IO.File]::AppendAllText($path, "deferred-line`n", [Text.UTF8Encoding]::new($false))
+        }
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -InternalMutationHook $hook)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    $afterSameCallAppend = & $tailHarness { param($path) @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096) } $tailPath
+    Assert-Test ($sameCallAppend.state.stable -and $sameCallAppend.state.incremental -and ($sameCallAppend.lines -join '|') -eq 'captured-line') 'append-only growth after captured length preserves the accepted bounded prefix'
+    Assert-Test (($afterSameCallAppend -join '|') -eq 'captured-line|deferred-line') 'the next poll consumes append-only growth deferred by the prior bounded snapshot'
+
+    $deadlineStateBefore = & $tailHarness { @($script:SharedTextTailState.Values)[0] }
+    $deadlineResult = & $tailHarness {
+        param($path)
+        try {
+            $null = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -DeadlineUtc ([DateTime]::UtcNow.AddMilliseconds(40)) -InternalDelayAfterValidationMilliseconds 80)
+            [pscustomobject]@{ timedOut = $false; state = @($script:SharedTextTailState.Values)[0] }
+        }
+        catch [TimeoutException] {
+            [pscustomobject]@{ timedOut = $true; error = $_.Exception.Message; state = @($script:SharedTextTailState.Values)[0] }
+        }
+    } $tailPath
+    $zeroLengthDeadline = & $tailHarness {
+        $memory = [IO.MemoryStream]::new()
+        try {
+            try {
+                $null = Get-StreamRangeSha256 -Stream $memory -Offset 0 -Length 0 -DeadlineUtc ([DateTime]::UtcNow.AddMilliseconds(-1))
+                $false
+            }
+            catch [TimeoutException] { $true }
+        }
+        finally { $memory.Dispose() }
+    }
+    Assert-Test ($deadlineResult.timedOut -and $deadlineResult.error -match 'before publishing' -and [long]$deadlineResult.state.offset -eq [long]$deadlineStateBefore.offset) 'deadline expiry after validation is detected before candidate state or lines are published'
+    Assert-Test ($zeroLengthDeadline) 'zero-length continuity work still enforces an already-expired deadline'
+
     [IO.File]::WriteAllText($tailPath, ('base'.PadRight(5000, 'b') + "`n"), $utf8)
     $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
     [IO.File]::AppendAllText($tailPath, "appended-line`n", $utf8)
@@ -333,6 +428,32 @@ try {
     } $tailPath
     Assert-Test ([int]$boundedFresh.bytesRead -le 4096 -and [int]$boundedFresh.hashBytesRead -le 8192 -and ([int]$boundedFresh.bytesRead + [int]$boundedFresh.hashBytesRead) -le 12288) 'fresh runtime log evidence examines at most a small bounded multiple of the configured tail window'
     Assert-Test ([int]$boundedAppend.bytesRead -le 4096 -and [int]$boundedAppend.hashBytesRead -le 8192 -and ([int]$boundedAppend.bytesRead + [int]$boundedAppend.hashBytesRead) -le 12288) 'incremental runtime log evidence remains bounded independently of total log size'
+    Assert-Test ([int]$boundedFresh.continuityLength -le 4096 -and [int]$boundedAppend.continuityLength -le 4096) 'the retained delimiter proof is included inside the configured tail-window byte budget'
+
+    $exactCapInitial = 'p'.PadRight(100, 'p') + "`n" + 'r'.PadRight(4095, 'r')
+    [IO.File]::WriteAllText($tailPath, $exactCapInitial, $utf8)
+    $exactCapBefore = & $tailHarness {
+        param($path)
+        $null = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        @($script:SharedTextTailState.Values)[0]
+    } $tailPath
+    [IO.File]::AppendAllText($tailPath, ("`n" + 's'.PadRight(4095, 's')), $utf8)
+    $exactCapAfter = & $tailHarness {
+        param($path)
+        $null = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        @($script:SharedTextTailState.Values)[0]
+    } $tailPath
+    Assert-Test ([int]$exactCapBefore.continuityLength -eq 4096 -and [int]$exactCapAfter.continuityLength -eq 4096 -and ([int]$exactCapAfter.bytesRead + [int]$exactCapAfter.hashBytesRead) -eq 12288) 'an exact-cap framed append includes both delimiter proofs within the literal three-window I/O bound'
+
+    [IO.File]::WriteAllText($tailPath, "one`n", $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    [IO.File]::WriteAllText($tailPath, "x`n", $utf8)
+    $shorterTelemetry = & $tailHarness {
+        param($path)
+        $null = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        @($script:SharedTextTailState.Values)[0]
+    } $tailPath
+    Assert-Test (-not $shorterTelemetry.incremental -and [int]$shorterTelemetry.bytesRead -eq 2 -and [int]$shorterTelemetry.hashBytesRead -eq 2) 'log I/O telemetry counts only proof bytes actually read after pre-call shrinkage'
 
     $authorizationDenied = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -InternalTestFailurePoint head-pose-access-denied -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $authorizationDenied.ok -and $authorizationDenied.state -eq 'head-pose-provider-authorization-failed' -and $authorizationDenied.data.runtime.headPoseState.authorizationDenied) 'inspect translates shared-memory authorization denial into a distinct structured state'

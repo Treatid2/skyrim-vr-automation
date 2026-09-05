@@ -122,12 +122,16 @@ SteamVR-root-owned processes whose creation time belongs to that attempt and
 reports the verified survivor inventory.
 
 Readiness polling keeps an incremental identity/offset cache and reads at most
-`LogTailMaxBytes` from the shared `vrserver` log. Decoding and I/O are charged
-to the startup deadline, so a large historical log cannot turn one poll into an
-unbounded whole-file read. The polling loop reserves a final bounded log-read
-window and records its deadlines, attempt count, and any final probe timeout in
-the runtime receipt instead of entering a new log read after qualification time
-has expired.
+`LogTailMaxBytes` of new payload from the shared `vrserver` log. Its retained
+proof, including first-line framing, is capped to the same size. A final bounded
+read through the currently selected path rejects replacement, truncation, or
+in-place mutation before lines are published. Runtime evidence reports payload
+and proof byte counts plus cache usability, reuse, and resynchronization state.
+Decoding, hashing, and publication are charged to the startup deadline, so a
+large historical log cannot turn one poll into an unbounded whole-file read.
+The polling loop reserves a final bounded log-read window and records its
+deadlines, attempt count, and confirmation outcome in the runtime receipt. A
+timed-out confirmation invalidates readiness and performs exact-attempt cleanup.
 
 ```powershell
 .\Invoke-SteamVRNullControl.ps1 apply -EvidenceDirectory <session-evidence> -Compact

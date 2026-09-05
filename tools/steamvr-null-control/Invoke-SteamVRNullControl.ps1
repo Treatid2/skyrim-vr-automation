@@ -145,8 +145,11 @@ function Get-StreamRangeSha256 {
         [Parameter(Mandatory)][IO.Stream]$Stream,
         [Parameter(Mandatory)][long]$Offset,
         [Parameter(Mandatory)][int]$Length,
-        [DateTime]$DeadlineUtc = [DateTime]::MaxValue
+        [DateTime]$DeadlineUtc = [DateTime]::MaxValue,
+        [ref]$BytesRead
     )
+    if ($null -ne $BytesRead) { $BytesRead.Value = 0 }
+    if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before hashing the retained window.') }
     if ($Length -eq 0) { return '' }
     $savedPosition = $Stream.Position
     $bytes = [byte[]]::new($Length)
@@ -158,20 +161,35 @@ function Get-StreamRangeSha256 {
             $current = $Stream.Read($bytes, $read, $Length - $read)
             if ($current -le 0) { break }
             $read += $current
+            if ($null -ne $BytesRead) { $BytesRead.Value = $read }
+            if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired while hashing the retained window.') }
         }
         if ($read -ne $Length) { return $null }
+        if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before hashing the retained bytes.') }
         $algorithm = [Security.Cryptography.SHA256]::Create()
-        try { return [Convert]::ToHexString($algorithm.ComputeHash($bytes)) }
+        try {
+            $hash = [Convert]::ToHexString($algorithm.ComputeHash($bytes))
+            if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired while hashing the retained bytes.') }
+            return $hash
+        }
         finally { $algorithm.Dispose() }
     }
     finally { $Stream.Position = $savedPosition }
 }
 
 function Get-ByteArraySha256 {
-    param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes)
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes,
+        [DateTime]$DeadlineUtc = [DateTime]::MaxValue
+    )
+    if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before hashing the candidate bytes.') }
     if ($Bytes.Length -eq 0) { return '' }
     $algorithm = [Security.Cryptography.SHA256]::Create()
-    try { return [Convert]::ToHexString($algorithm.ComputeHash($Bytes)) }
+    try {
+        $hash = [Convert]::ToHexString($algorithm.ComputeHash($Bytes))
+        if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired while hashing the candidate bytes.') }
+        return $hash
+    }
     finally { $algorithm.Dispose() }
 }
 
@@ -197,7 +215,8 @@ function Get-SharedTextTail {
         [Parameter(Mandatory)][ValidateRange(1, 10000)][int]$Count,
         [Parameter(Mandatory)][ValidateRange(4096, 4194304)][int]$MaxBytes,
         [DateTime]$DeadlineUtc = [DateTime]::MaxValue,
-        [scriptblock]$InternalMutationHook
+        [scriptblock]$InternalMutationHook,
+        [ValidateRange(0, 10000)][int]$InternalDelayAfterValidationMilliseconds = 0
     )
     if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before opening the log.') }
     $stream = $null
@@ -209,8 +228,9 @@ function Get-SharedTextTail {
         $prior = if ($script:SharedTextTailState.ContainsKey($identity)) { $script:SharedTextTailState[$identity] } else { $null }
         $hasRetainedWindow = $null -ne $prior -and $prior.PSObject.Properties['usable'] -and [bool]$prior.usable -and $prior.PSObject.Properties['retainedBytes'] -and $prior.PSObject.Properties['retainedOffset'] -and $prior.PSObject.Properties['startsPartial']
         $continuityMatched = $false
+        $initialHashBytesRead = 0
         if ($hasRetainedWindow -and [int64]$prior.offset -le $capturedLength) {
-            $continuityMatched = [string]$prior.continuitySha256 -ceq [string](Get-StreamRangeSha256 -Stream $stream -Offset ([int64]$prior.continuityOffset) -Length ([int]$prior.continuityLength) -DeadlineUtc $DeadlineUtc)
+            $continuityMatched = [string]$prior.continuitySha256 -ceq [string](Get-StreamRangeSha256 -Stream $stream -Offset ([int64]$prior.continuityOffset) -Length ([int]$prior.continuityLength) -DeadlineUtc $DeadlineUtc -BytesRead ([ref]$initialHashBytesRead))
         }
         $incremental = $hasRetainedWindow -and [int64]$prior.offset -le $capturedLength -and $continuityMatched
         if ($InternalMutationHook) { $null = & $InternalMutationHook 'after-continuity' $stream $capturedLength }
@@ -226,6 +246,7 @@ function Get-SharedTextTail {
         while ($read -lt $readLength) {
             if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired while reading the log.') }
             $current = $stream.Read($bytes, $read, $readLength - $read)
+            if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired while reading the log.') }
             if ($current -le 0) { break }
             $read += $current
         }
@@ -234,7 +255,7 @@ function Get-SharedTextTail {
             $script:SharedTextTailState[$identity] = [pscustomobject]@{
                 usable = $false; stable = $false; offset = 0L; retainedBytes = [byte[]]@(); retainedOffset = 0L
                 startsPartial = $false; continuityOffset = 0L; continuityLength = 0; continuitySha256 = $null
-                incremental = $false; resynchronized = $true; bytesRead = $read; hashBytesRead = $(if ($hasRetainedWindow) { [int]$prior.continuityLength } else { 0 })
+                incremental = $false; resynchronized = $true; bytesRead = $read; hashBytesRead = $initialHashBytesRead
                 cumulativeBytesRead = [long]$(if ($null -ne $prior -and $prior.PSObject.Properties['cumulativeBytesRead']) { [long]$prior.cumulativeBytesRead + $read } else { $read })
                 error = "The shared log became shorter while reading its captured $readLength-byte span."
             }
@@ -266,6 +287,22 @@ function Get-SharedTextTail {
                 $leadingProofByte = [byte]0x0A
             }
         }
+        if ($null -ne $leadingProofByte -and $retainedBytes.Length -ge $MaxBytes) {
+            $nextBreak = [Array]::IndexOf($retainedBytes, [byte]0x0A)
+            if ($nextBreak -ge 0) {
+                $discardCount = $nextBreak + 1
+                if ($discardCount -lt $retainedBytes.Length) { $retainedBytes = [byte[]]$retainedBytes[$discardCount..($retainedBytes.Length - 1)] }
+                else { $retainedBytes = [byte[]]::new(0) }
+                $retainedOffset += $discardCount
+            }
+            else {
+                if ($retainedBytes.Length -gt 1) { $retainedBytes = [byte[]]$retainedBytes[1..($retainedBytes.Length - 1)] }
+                else { $retainedBytes = [byte[]]::new(0) }
+                $retainedOffset++
+                $startsPartial = $true
+                $leadingProofByte = $null
+            }
+        }
         $incompleteByteCount = if ($startsPartial) { 0 } else { Get-Utf8TrailingIncompleteByteCount -Bytes $retainedBytes }
         $completeByteCount = $retainedBytes.Length - $incompleteByteCount
         $combined = if (-not $startsPartial -and $completeByteCount -gt 0) { [Text.Encoding]::UTF8.GetString($retainedBytes, 0, $completeByteCount) } else { '' }
@@ -284,18 +321,33 @@ function Get-SharedTextTail {
         if ($retainedBytes.Length -gt 0) { [Array]::Copy($retainedBytes, 0, $continuityBytes, $(if ($hasLeadingProof) { 1 } else { 0 }), $retainedBytes.Length) }
         $continuityLength = $continuityBytes.Length
         $continuityOffset = $retainedOffset - $(if ($hasLeadingProof) { 1 } else { 0 })
-        $continuitySha256 = Get-ByteArraySha256 -Bytes $continuityBytes
-        $postReadSha256 = Get-StreamRangeSha256 -Stream $stream -Offset $continuityOffset -Length $continuityLength -DeadlineUtc $DeadlineUtc
-        $stable = $stream.Length -ge $capturedLength -and $postReadSha256 -ceq $continuitySha256
+        $continuitySha256 = Get-ByteArraySha256 -Bytes $continuityBytes -DeadlineUtc $DeadlineUtc
+        $selectedPathStream = $null
+        $selectedPathHashBytesRead = 0
+        $selectedPathError = $null
+        try {
+            if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before validating the selected log path.') }
+            $selectedPathStream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+            $selectedPathSha256 = Get-StreamRangeSha256 -Stream $selectedPathStream -Offset $continuityOffset -Length $continuityLength -DeadlineUtc $DeadlineUtc -BytesRead ([ref]$selectedPathHashBytesRead)
+            $stable = $selectedPathStream.Length -ge $capturedLength -and $selectedPathSha256 -ceq $continuitySha256
+        }
+        catch [TimeoutException] { throw }
+        catch {
+            $stable = $false
+            $selectedPathError = $_.Exception.Message
+        }
+        finally { if ($selectedPathStream) { $selectedPathStream.Dispose() } }
+        if ($InternalDelayAfterValidationMilliseconds -gt 0) { Start-Sleep -Milliseconds $InternalDelayAfterValidationMilliseconds }
+        if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before publishing the validated snapshot.') }
         if (-not $stable) {
             $script:SharedTextTailState.Clear()
             $script:SharedTextTailState[$identity] = [pscustomobject]@{
                 usable = $false; stable = $false; offset = 0L; retainedBytes = [byte[]]@(); retainedOffset = 0L
                 startsPartial = $false; continuityOffset = 0L; continuityLength = 0; continuitySha256 = $null
                 incremental = $false; resynchronized = $true; bytesRead = $read
-                hashBytesRead = ([int]$(if ($hasRetainedWindow) { [int]$prior.continuityLength } else { 0 }) + $continuityLength)
+                hashBytesRead = $initialHashBytesRead + $selectedPathHashBytesRead
                 cumulativeBytesRead = [long]$(if ($null -ne $prior -and $prior.PSObject.Properties['cumulativeBytesRead']) { [long]$prior.cumulativeBytesRead + $read } else { $read })
-                error = 'The shared log changed while its bounded tail snapshot was being validated.'
+                error = $(if ($selectedPathError) { "The selected shared log could not be validated: $selectedPathError" } else { 'The shared log changed or was replaced while its bounded tail snapshot was being validated.' })
             }
             return @()
         }
@@ -318,7 +370,7 @@ function Get-SharedTextTail {
             incremental = $incremental
             resynchronized = $null -ne $prior -and -not $incremental
             bytesRead = $read
-            hashBytesRead = ([int]$(if ($hasRetainedWindow) { [int]$prior.continuityLength } else { 0 }) + $continuityLength)
+            hashBytesRead = $initialHashBytesRead + $selectedPathHashBytesRead
             cumulativeBytesRead = [long]$(if ($null -ne $prior -and $prior.PSObject.Properties['cumulativeBytesRead']) { [long]$prior.cumulativeBytesRead + $read } else { $read })
         }
         $visible = @($lines)
@@ -1151,7 +1203,7 @@ function Get-NullRuntimeEvidence {
         steamVrProcesses = $owned
         unprovenProcesses = @($Processes | Where-Object { $_ -notin $owned })
         serverLogPath = $ServerLogPath
-        serverLogSha256 = if ($tailState -and [bool]$tailState.stable) { [string]$tailState.continuitySha256 } else { $null }
+        serverLogSha256 = if ($tailState -and [bool]$tailState.stable -and [bool]$tailState.usable) { [string]$tailState.continuitySha256 } else { $null }
         serverLogHashScope = 'bounded-tail-window'
         serverLogHashOffset = if ($tailState) { [long]$tailState.continuityOffset } else { $null }
         serverLogHashLength = if ($tailState) { [int]$tailState.continuityLength } else { 0 }
@@ -1161,6 +1213,9 @@ function Get-NullRuntimeEvidence {
             hashBytesRead = if ($tailState) { [int]$tailState.hashBytesRead } else { 0 }
             totalBytesExamined = if ($tailState) { [int]$tailState.bytesRead + [int]$tailState.hashBytesRead } else { 0 }
             stable = $null -ne $tailState -and [bool]$tailState.stable
+            usable = $null -ne $tailState -and [bool]$tailState.usable
+            incremental = $null -ne $tailState -and [bool]$tailState.incremental
+            resynchronized = $null -ne $tailState -and [bool]$tailState.resynchronized
             error = if ($tailState -and $tailState.PSObject.Properties['error']) { [string]$tailState.error } else { $null }
         }
         driverLoaded = $loaded
@@ -1444,6 +1499,8 @@ try {
                 $qualificationDeadline = $deadline.AddMilliseconds(-$logReadReserveMilliseconds)
                 $runtimeProbeAttempts = 0
                 $lastRuntimeProbeError = $null
+                $runtimeConfirmationAttempted = $false
+                $runtimeConfirmationTimedOut = $false
                 do {
                     $remainingBeforeProbeMilliseconds = [long]($qualificationDeadline - [DateTime]::UtcNow).TotalMilliseconds
                     if ($remainingBeforeProbeMilliseconds -le 0) { break }
@@ -1464,13 +1521,20 @@ try {
                     }
                 } while (-not $runtime.active -or -not $runtime.headPoseReady)
                 if ($runtime.active -and $runtime.headPoseReady -and [DateTime]::UtcNow.AddMilliseconds(2250) -lt $qualificationDeadline) {
+                    $runtimeConfirmationAttempted = $true
                     Start-Sleep -Seconds 2
                     $processes = @(Get-SteamVRProcesses)
                     try {
                         $runtimeProbeAttempts++
+                        if ($InternalTestFailurePoint -eq 'runtime-confirmation-timeout') {
+                            throw [TimeoutException]::new('Injected runtime confirmation timeout.')
+                        }
                         $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline
                     }
-                    catch [TimeoutException] { $lastRuntimeProbeError = $_.Exception.Message }
+                    catch [TimeoutException] {
+                        $lastRuntimeProbeError = $_.Exception.Message
+                        $runtimeConfirmationTimedOut = $true
+                    }
                 }
                 $runtimeReceiptPath = Join-Path $EvidenceDirectory 'steamvr-null-runtime.receipt.json'
                 $runtimeReceipt = [ordered]@{
@@ -1485,13 +1549,22 @@ try {
                     logReadReserveMilliseconds = $logReadReserveMilliseconds
                     runtimeProbeAttempts = $runtimeProbeAttempts
                     lastRuntimeProbeError = $lastRuntimeProbeError
+                    runtimeConfirmationAttempted = $runtimeConfirmationAttempted
+                    runtimeConfirmationTimedOut = $runtimeConfirmationTimedOut
+                    runtimeAccepted = -not $runtimeConfirmationTimedOut -and [bool]$runtime.active -and [bool]$runtime.headPoseReady
                     externalDrivers = $externalDrivers
                     externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector
                     externalDriverIsolationValidation = $isolationValidation
                 }
                 Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
                 $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers -DiagnosticDisplayOverride ([bool]$AllowExternalDisplayRedirector)
-                if ($runtime.headPoseAuthorizationError) {
+                if ($runtimeConfirmationTimedOut) {
+                    $inputContract['measurementReady'] = $false
+                    $inputContract['measurementBlockers'] = @($inputContract['measurementBlockers']) + 'runtime-confirmation-timeout'
+                    $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
+                    $result = New-Result -Ok $false -State 'runtime-confirmation-timeout' -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; inputContract = $inputContract; startupCleanup = $startupCleanup } -Errors @($lastRuntimeProbeError, 'The current runtime confirmation did not complete before its deadline; exact SteamVR processes started by this attempt were stopped.')
+                }
+                elseif ($runtime.headPoseAuthorizationError) {
                     $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
                     $result = New-Result -Ok $false -State 'head-pose-provider-authorization-failed' -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; inputContract = $inputContract; startupCleanup = $startupCleanup } -Errors @([string]$runtime.headPoseAuthorizationError, 'Exact SteamVR processes started by this attempt were stopped.')
                 }
