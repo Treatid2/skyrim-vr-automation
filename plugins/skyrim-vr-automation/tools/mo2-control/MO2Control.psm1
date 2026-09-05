@@ -2354,6 +2354,25 @@ function Bind-MO2PreparedAccessLease {
     } | Out-Null
 }
 
+function Get-MO2PrepareRouteAdmission {
+    param(
+        [Parameter(Mandatory)]$Validation,
+        [Parameter(Mandatory)]$AccessLock
+    )
+
+    $validatedRuntimeRoute = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $Validation.data.sessionLock.data.runtimeRoute
+    $currentRuntimeRoute = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $AccessLock.data.runtimeRoute
+    $validatedFingerprint = Get-MO2RuntimeRouteContractFingerprint -RuntimeRoute $validatedRuntimeRoute
+    $currentFingerprint = Get-MO2RuntimeRouteContractFingerprint -RuntimeRoute $currentRuntimeRoute
+    return [pscustomobject][ordered]@{
+        matched = $validatedFingerprint -ceq $currentFingerprint
+        validatedRuntimeRoute = $validatedRuntimeRoute
+        currentRuntimeRoute = $currentRuntimeRoute
+        validatedFingerprint = $validatedFingerprint
+        currentFingerprint = $currentFingerprint
+    }
+}
+
 function Invoke-MO2Prepare {
     [CmdletBinding()]
     param(
@@ -2388,8 +2407,16 @@ function Invoke-MO2Prepare {
     if (-not [string]::IsNullOrWhiteSpace([string]$accessLock.sessionId)) {
         return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'blocked' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $accessLock } -Errors @('The access lease already has a bound session. Release that session before preparing another one.')
     }
-    $runtimeRoute = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $accessLock.data.runtimeRoute
-    $runtimeRouteFingerprint = Get-MO2RuntimeRouteContractFingerprint -RuntimeRoute $runtimeRoute
+    $routeAdmission = Get-MO2PrepareRouteAdmission -Validation $validation -AccessLock $accessLock
+    $runtimeRoute = $routeAdmission.validatedRuntimeRoute
+    $runtimeRouteFingerprint = [string]$routeAdmission.validatedFingerprint
+    if (-not $routeAdmission.matched) {
+        return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'blocked' -Data @{
+            validation = $validation
+            validatedRuntimeRoute = $runtimeRoute
+            currentRuntimeRoute = $routeAdmission.currentRuntimeRoute
+        } -Errors @("The access lease runtime route changed after validation ('$($runtimeRoute.id)' to '$($routeAdmission.currentRuntimeRoute.id)'). Prepare created no session artifacts.")
+    }
 
     $controller = New-MO2DurableSessionController -Config $Config -SessionPath $sessionPath -WhatIf
     $profileDirectory = Join-Path (Resolve-MO2ControlPath ([string]$Config.mo2.profilesDirectory)) $profileName
@@ -2922,6 +2949,10 @@ function Invoke-MO2RecoverClose {
     if ($targets.Count -eq 0) {
         return New-MO2ActionResult -Config $Config -Command 'recover-close' -Ok $true -State 'already-closed' -Data @{ accessId = $AccessId; accessRetained = $explicitAccess; targets = @(); forceTermination = $false; unrelatedProcessesTouched = @() }
     }
+    if (-not $explicitAccess) {
+        return New-MO2ActionResult -Config $Config -Command 'recover-close' -Ok $false -State 'missing-access-id' -Data @{ requiredParameter = 'AccessId'; supplied = $false; targets = $targets } -Errors @('Recovery close requires -AccessId from a route-qualified request-access lease before it can adopt a running MO2 process.')
+    }
+    $runtimeRoute = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $accessLock.data.runtimeRoute
     Assert-MO2ExactProcessTargets -Config $Config -Processes $targets
     if ($targets.Count -ne 1) {
         return New-MO2ActionResult -Config $Config -Command 'recover-close' -Ok $false -State 'blocked' -Data @{ targets = $targets } -Errors @('Recovery close requires exactly one configured MO2 process; multiple instances require manual classification.')
@@ -2935,9 +2966,6 @@ function Invoke-MO2RecoverClose {
     $sessionPath = Join-Path (Resolve-MO2ControlPath ([string]$Config.storage.sessionStaging)) $sessionId
     $lockPath = Resolve-MO2ControlPath ([string]$Config.session.lockFile)
     $createdUtc = [DateTime]::UtcNow.ToString('o')
-    if (-not $explicitAccess) {
-        $AccessId = 'access-{0}-{1}' -f ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')), ([guid]::NewGuid().ToString('N').Substring(0, 12))
-    }
     $controller = New-MO2DurableSessionController -Config $Config -SessionPath $sessionPath -WhatIf
     $profileDirectory = Join-Path (Resolve-MO2ControlPath ([string]$Config.mo2.profilesDirectory)) ([string]$inspection.requested.profile)
     $manifest = [pscustomobject][ordered]@{
@@ -2951,11 +2979,12 @@ function Invoke-MO2RecoverClose {
         profileDirectory = $profileDirectory
         modListPath = (Join-Path $profileDirectory 'modlist.txt')
         executable = [string]$inspection.requested.executable
+        runtimeRoute = $runtimeRoute
         mo2Path = [string]$inspection.config.mo2Executable
         ownerPid = [int]$targets[0].id
         recovery = $true
         accessId = $AccessId
-        acquisitionMode = $(if ($explicitAccess) { 'explicit-access' } else { 'implicit-session' })
+        acquisitionMode = 'explicit-access'
         processesBefore = $inspection.processes
         windowsBefore = @(Get-MO2WindowSnapshot -Processes $targets)
         controllerPath = [string]$controller.controllerPath
@@ -2965,7 +2994,7 @@ function Invoke-MO2RecoverClose {
     $lock = [pscustomobject][ordered]@{
         contractVersion = $script:MO2ControlContractVersion
         accessId = $AccessId
-        acquisitionMode = $(if ($explicitAccess) { 'explicit-access' } else { 'implicit-session' })
+        acquisitionMode = 'explicit-access'
         label = $(if ($explicitAccess -and $accessLock.data.PSObject.Properties['label']) { [string]$accessLock.data.label } else { $safeLabel })
         requestedUtc = $(if ($explicitAccess -and $accessLock.data.PSObject.Properties['requestedUtc']) { [string]$accessLock.data.requestedUtc } else { $createdUtc })
         lastRenewedUtc = $(if ($explicitAccess -and $accessLock.data.PSObject.Properties['lastRenewedUtc']) { [string]$accessLock.data.lastRenewedUtc } else { $createdUtc })
@@ -2982,6 +3011,7 @@ function Invoke-MO2RecoverClose {
         profileDirectory = $profileDirectory
         modListPath = (Join-Path $profileDirectory 'modlist.txt')
         executable = [string]$inspection.requested.executable
+        runtimeRoute = $runtimeRoute
         controllerPath = [string]$controller.controllerPath
         ownerPid = [int]$targets[0].id
         recovery = $true
@@ -2995,21 +3025,20 @@ function Invoke-MO2RecoverClose {
         $controller = New-MO2DurableSessionController -Config $Config -SessionPath $sessionPath
         Write-MO2JsonAtomic -Path (Join-Path $sessionPath 'session.json') -Value $manifest -CreateNew
         Invoke-WithMO2LeaseTransitionLock -LockPath $lockPath -Action {
-            if ($explicitAccess) {
-                $currentAccess = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
-                if (-not [string]::IsNullOrWhiteSpace([string]$currentAccess.sessionId)) {
-                    throw 'The access lease acquired a session before recovery close could bind it.'
-                }
-                $bound = $currentAccess.data
-                foreach ($propertyName in @('sessionId', 'sessionPath', 'status', 'createdUtc', 'profile', 'profileName', 'profileDirectory', 'modListPath', 'executable', 'controllerPath', 'ownerPid', 'recovery')) {
-                    $bound | Add-Member -NotePropertyName $propertyName -NotePropertyValue $lock.$propertyName -Force
-                }
-                $bound | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $currentAccess.data) -Force
-                Write-MO2JsonAtomic -Path $lockPath -Value $bound
+            $currentAccess = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
+            if (-not [string]::IsNullOrWhiteSpace([string]$currentAccess.sessionId)) {
+                throw 'The access lease acquired a session before recovery close could bind it.'
             }
-            else {
-                Write-MO2JsonAtomic -Path $lockPath -Value $lock -CreateNew
+            $validatedRuntimeRoute = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $currentAccess.data.runtimeRoute
+            if ((Get-MO2RuntimeRouteContractFingerprint $validatedRuntimeRoute) -cne (Get-MO2RuntimeRouteContractFingerprint $runtimeRoute)) {
+                throw "The access lease runtime route changed before recovery-close binding ('$($runtimeRoute.id)' to '$($validatedRuntimeRoute.id)')."
             }
+            $bound = $currentAccess.data
+            foreach ($propertyName in @('sessionId', 'sessionPath', 'status', 'createdUtc', 'profile', 'profileName', 'profileDirectory', 'modListPath', 'executable', 'runtimeRoute', 'controllerPath', 'ownerPid', 'recovery')) {
+                $bound | Add-Member -NotePropertyName $propertyName -NotePropertyValue $lock.$propertyName -Force
+            }
+            $bound | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $currentAccess.data) -Force
+            Write-MO2JsonAtomic -Path $lockPath -Value $bound
         } | Out-Null
     }
     catch {
@@ -3386,7 +3415,7 @@ function Get-MO2ControlHelp {
             [pscustomobject]@{ name = 'stop-game'; mutation = $true; description = 'Request graceful game shutdown while retaining the exact owned MO2 process for controlled relaunch. Never force-terminates.' },
             [pscustomobject]@{ name = 'terminate-game'; mutation = $true; description = 'Terminate only launch-recorded exact game/loader PIDs after a deadlock, retain MO2, invoke exact Unlock, and require RootBuilder restoration.' },
             [pscustomobject]@{ name = 'close'; mutation = $true; description = 'Cooperatively close only exact session-owned MO2, including its exact Unlock control and MO2-owned modal windows. Never force-terminates.' },
-            [pscustomobject]@{ name = 'recover-close'; mutation = $true; description = 'Adopt one stranded exact-path MO2 into a recorded recovery session, then cooperatively close it. Never targets editor or crash-handler processes.' },
+            [pscustomobject]@{ name = 'recover-close'; mutation = $true; description = 'Use a route-qualified access lease to adopt one stranded exact-path MO2 into a recorded recovery session, then cooperatively close it. Never targets editor or crash-handler processes.' },
             [pscustomobject]@{ name = 'recover-rootbuilder'; mutation = $true; description = 'Recover one stranded RootBuilder BuildData transaction through one exact-profile launch, followed by the normal stop/Unlock path. Never deletes deployment metadata.' },
             [pscustomobject]@{ name = 'stop'; mutation = $true; description = 'Request graceful game shutdown, then cooperatively close exact owned MO2. Never force-terminates.' },
             [pscustomobject]@{ name = 'terminate'; mutation = $true; description = 'Force-terminate only owned MO2 processes after proving game absence and RootBuilder cleanup. Requires -SessionId and supports -WhatIf.' },

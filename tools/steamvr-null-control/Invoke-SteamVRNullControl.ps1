@@ -237,7 +237,9 @@ function Get-SharedTextTail {
         if ($incremental) { $lines = @($prior.lines) }
         $lines = @($lines) + @($completed)
         if ($lines.Count -gt $Count) { $lines = @($lines[($lines.Count - $Count)..($lines.Count - 1)]) }
-        $continuityLength = [int][Math]::Min(64, $capturedLength)
+        # Retained lines and decoder residue originate only from this bounded
+        # window, so its complete hash is the continuity proof for reuse.
+        $continuityLength = [int][Math]::Min($MaxBytes, $capturedLength)
         $continuityOffset = $capturedLength - $continuityLength
         $continuitySha256 = Get-StreamRangeSha256 -Stream $stream -Offset $continuityOffset -Length $continuityLength
         $script:SharedTextTailState.Clear()

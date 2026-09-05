@@ -60,10 +60,10 @@ try {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
 
-    $mo2Exe = Join-Path $mo2Root 'ModOrganizer.exe'
+    $mo2Exe = Join-Path $mo2Root 'MO2ControlFixtureProcess.exe'
     $loader = Join-Path $loaderMod 'sksevr_loader.exe'
     $plainGame = Join-Path $gameRoot 'SkyrimVR.exe'
-    New-Item -ItemType File -Path $mo2Exe -Force | Out-Null
+    Copy-Item -LiteralPath $env:ComSpec -Destination $mo2Exe -Force
     New-Item -ItemType File -Path $loader -Force | Out-Null
     New-Item -ItemType File -Path $plainGame -Force | Out-Null
     New-Item -ItemType File -Path (Join-Path $ocuMod 'root\openvr_api.dll') -Force | Out-Null
@@ -105,7 +105,7 @@ selected_profile=@ByteArray(Codex)
             logsDirectory = (Join-Path $mo2Root 'logs')
             rootBuilderDefinitions = @($definition)
             rootBuilderDataDirectory = $rootBuilderData
-            processNames = @('MO2ControlImpossibleFixtureProcess')
+            processNames = @('MO2ControlFixtureProcess')
             gameProcessNames = @('MO2ControlImpossibleFixtureGame')
             runtimeProcessNames = @()
         }
@@ -350,6 +350,22 @@ selected_profile=@ByteArray(Codex)
 
     $missingPrepareAccess = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -WhatIf
     Assert-MO2Test (-not $missingPrepareAccess.ok -and $missingPrepareAccess.state -eq 'missing-access-id') 'prepare rejects a missing explicit access lease without side effects'
+
+    foreach ($routeId in @('OCU', 'SteamVR', 'SteamVRNull')) {
+        $providerMarker = if ($routeId -eq 'OCU') { '+OpenComposite Runtime Provider' } else { '-OpenComposite Runtime Provider' }
+        @('+Skyrim Script Extender for VR (SKSEVR)', $providerMarker) | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
+        $routeAccess = Invoke-MO2RequestAccess -Config $config -Label "fixture $routeId route" -RuntimeRoute $routeId
+        $routeAccessId = [string]$routeAccess.data.access.accessId
+        $routePrepared = Invoke-MO2Prepare -Config $config -Label "fixture $routeId route" -RequireSKSE -AccessId $routeAccessId
+        $routeLaunch = if ($routePrepared.ok) { Invoke-MO2Launch -Config $config -SessionId ([string]$routePrepared.data.session.sessionId) -WhatIf } else { $null }
+        Assert-MO2Test ($routePrepared.ok -and $routePrepared.data.session.runtimeRoute.id -eq $routeId -and $routeLaunch.ok -and $routeLaunch.state -eq 'dry-run') "full prepare and launch admission preserves the canonical $routeId route"
+        if ($routePrepared.ok) {
+            $null = Invoke-MO2Release -Config $config -SessionId ([string]$routePrepared.data.session.sessionId)
+        }
+        $null = Invoke-MO2ReleaseAccess -Config $config -AccessId $routeAccessId
+    }
+    @('+Skyrim Script Extender for VR (SKSEVR)', '-OpenComposite Runtime Provider') | Set-Content -LiteralPath (Join-Path $profile 'modlist.txt') -Encoding utf8
+
     $sessionAccess = Invoke-MO2RequestAccess -Config $config -Label 'fixture session' -RuntimeRoute SteamVR
     $sessionAccessId = [string]$sessionAccess.data.access.accessId
     $prepareDryRun = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -AccessId $sessionAccessId -WhatIf
@@ -357,6 +373,27 @@ selected_profile=@ByteArray(Codex)
     $dryRunLease = Invoke-MO2AccessStatus -Config $config -AccessId $sessionAccessId
     Assert-MO2Test ($dryRunLease.state -eq 'access-owned' -and [string]::IsNullOrWhiteSpace([string]$dryRunLease.data.access.sessionId)) 'prepare dry-run leaves the access-only lease unbound'
     Assert-MO2Test (-not (Test-Path -LiteralPath $prepareDryRun.data.sessionPath -PathType Container)) 'prepare dry-run creates no evidence directory'
+
+    $validatedRouteSnapshot = Invoke-MO2Validate -Config $config -RequireClosed -RequireRuntimeRoute -OwnedAccessId $sessionAccessId
+    $routeBeforeValidationDrift = & $mo2Module { param($validationResult) Resolve-MO2PersistedRuntimeRouteContract $validationResult.data.sessionLock.data.runtimeRoute } $validatedRouteSnapshot
+    $driftedBeforeCapture = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+    $driftedBeforeCapture.runtimeRoute = & $mo2Module { Resolve-MO2RuntimeRouteContract -RuntimeRoute OCU }
+    $driftedBeforeCapture | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    $validationSnapshotAdmission = & $mo2Module {
+        param($fixtureConfig, $fixtureAccessId, $validationResult)
+        Get-MO2PrepareRouteAdmission -Validation $validationResult -AccessLock (Get-MO2OwnedAccessLease -Config $fixtureConfig -AccessId $fixtureAccessId)
+    } $config $sessionAccessId $validatedRouteSnapshot
+    Assert-MO2Test (-not $validationSnapshotAdmission.matched -and $validationSnapshotAdmission.validatedRuntimeRoute.id -eq 'SteamVR' -and $validationSnapshotAdmission.currentRuntimeRoute.id -eq 'OCU') 'prepare route admission detects drift from the exact validation snapshot before artifact creation'
+    $driftedBeforeCapture = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+    $driftedBeforeCapture.runtimeRoute = $routeBeforeValidationDrift
+    $driftedBeforeCapture | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+
+    $moduleSource = [IO.File]::ReadAllText((Join-Path $packageRoot 'MO2Control.psm1'))
+    $prepareSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Prepare \{.*?\n\}').Value
+    $routeAdmissionSource = [regex]::Match($moduleSource, '(?s)function Get-MO2PrepareRouteAdmission \{.*?\n\}').Value
+    $validatedSnapshotIndex = $routeAdmissionSource.IndexOf('$Validation.data.sessionLock.data.runtimeRoute', [StringComparison]::Ordinal)
+    $currentLeaseIndex = $routeAdmissionSource.IndexOf('$AccessLock.data.runtimeRoute', [StringComparison]::Ordinal)
+    Assert-MO2Test ($prepareSource -match 'Get-MO2PrepareRouteAdmission -Validation \$validation -AccessLock \$accessLock' -and $validatedSnapshotIndex -ge 0 -and $currentLeaseIndex -gt $validatedSnapshotIndex) 'prepare derives admission from the validated route snapshot before comparing the second lease read'
 
     $routeBeforeDrift = & $mo2Module { Resolve-MO2RuntimeRouteContract -RuntimeRoute SteamVR }
     $driftedLease = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
@@ -459,8 +496,26 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test ($recoverClosed.ok -and $recoverClosed.state -eq 'already-closed') 'recovery close is idempotent when exact MO2 is absent'
     Assert-MO2Test (-not (Test-Path -LiteralPath $config.session.lockFile -PathType Leaf)) 'already-closed recovery creates no lock'
 
-    $recoveryAccess = Invoke-MO2RequestAccess -Config $config -Label 'fixture recovery access' -RuntimeRoute SteamVR -EstimatedMinutes 5
-    $recoveryAccessId = [string]$recoveryAccess.data.access.accessId
+    $recoveryProcess = Start-Process -FilePath $mo2Exe -ArgumentList @('/d', '/c', 'ping -n 30 127.0.0.1 >nul') -WindowStyle Hidden -PassThru
+    try {
+        $recoveryDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        do {
+            $recoveryInspection = Invoke-MO2Inspect -Config $config
+            if (@($recoveryInspection.data.processes.mo2 | Where-Object id -eq $recoveryProcess.Id).Count -eq 1) { break }
+            Start-Sleep -Milliseconds 50
+        } while ([DateTime]::UtcNow -lt $recoveryDeadline)
+        $recoverMissingAccess = Invoke-MO2RecoverClose -Config $config -Label 'fixture recovery' -WhatIf
+        Assert-MO2Test (-not $recoverMissingAccess.ok -and $recoverMissingAccess.state -eq 'missing-access-id') 'recovery close requires route-qualified access before adopting a running MO2 process'
+
+        $recoveryAccess = Invoke-MO2RequestAccess -Config $config -Label 'fixture recovery access' -RuntimeRoute SteamVR -EstimatedMinutes 5
+        $recoveryAccessId = [string]$recoveryAccess.data.access.accessId
+        $recoverWithRoute = Invoke-MO2RecoverClose -Config $config -AccessId $recoveryAccessId -Label 'fixture recovery' -WhatIf
+        Assert-MO2Test ($recoverWithRoute.ok -and $recoverWithRoute.state -eq 'dry-run' -and $recoverWithRoute.data.session.runtimeRoute.id -eq 'SteamVR' -and $recoverWithRoute.data.session.acquisitionMode -eq 'explicit-access') 'recovery close persists the exact route-qualified lease contract for RootBuilder relaunch'
+    }
+    finally {
+        if (-not $recoveryProcess.HasExited) { $recoveryProcess.Kill($true); $recoveryProcess.WaitForExit(5000) | Out-Null }
+    }
+
     $recoverClosedWithAccess = Invoke-MO2RecoverClose -Config $config -AccessId $recoveryAccessId -Label 'fixture recovery' -WhatIf
     Assert-MO2Test ($recoverClosedWithAccess.ok -and $recoverClosedWithAccess.state -eq 'already-closed' -and $recoverClosedWithAccess.data.accessRetained) 'recovery close accepts and retains its exact access-only lease'
     $recoveryAccessStatus = Invoke-MO2AccessStatus -Config $config -AccessId $recoveryAccessId

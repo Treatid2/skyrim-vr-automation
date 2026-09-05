@@ -7,8 +7,9 @@ inspect or validate the Skyrim VR Mod Organizer 2 installation.
 -RequireClosed`; both commands are read-only and return the same proof.
 
 Version `1.0.0` requires a route-qualified explicit access lease for every
-prepared session and validates its complete canonical runtime-route contract
-through launch. It retains cooperative access arbitration and adds a durable,
+prepared or recovery session and validates its complete canonical runtime-route
+contract through launch. It retains cooperative access arbitration and adds a
+durable,
 session-scoped controller bundle, explicit profile identity fields, retained
 failed-to-run dialog cleanup, bounded launch
 pending state, helper-to-runtime PID adoption, structural Unlock handling, and

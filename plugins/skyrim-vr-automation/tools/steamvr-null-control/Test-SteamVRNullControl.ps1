@@ -134,7 +134,7 @@ try {
         $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
         [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
     } $tailPath
-    Assert-Test (($secondTail.lines -join '|') -eq 'alpha|price €|next') 'incremental log tail preserves a UTF-8 code point split across reads'
+    Assert-Test (($secondTail.lines -join '|') -eq ('alpha|price ' + [char]0x20AC + '|next')) 'incremental log tail preserves a UTF-8 code point split across reads'
     Assert-Test ([bool]$secondTail.state.incremental) 'incremental log tail retains continuity across monotonic append'
     Assert-Test ([long]$secondTail.state.bytesRead -lt [long]$secondTail.state.offset) 'incremental log tail reads only appended bytes after continuity proof'
     $bytesBeforeResync = [long]$secondTail.state.cumulativeBytesRead
@@ -153,6 +153,39 @@ try {
         [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
     } $tailPath
     Assert-Test ($overwriteTail.state.resynchronized -and $overwriteTail.lines[-1] -like 'same-length-overwrite*') 'incremental log tail detects a same-length in-place overwrite'
+
+    $preservedBoundary = 'boundary-tail'.PadRight(64, 'z')
+    $originalWindow = ('old-retained-line'.PadRight(512, 'a')) + "`n" + $preservedBoundary
+    [IO.File]::WriteAllText($tailPath, $originalWindow, $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    $rewrittenWindow = ('new-retained-line'.PadRight(512, 'b')) + "`n" + $preservedBoundary
+    [IO.File]::WriteAllText($tailPath, $rewrittenWindow, $utf8)
+    $boundaryRewriteTail = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test ($boundaryRewriteTail.state.resynchronized -and $boundaryRewriteTail.lines[0] -like 'new-retained-line*' -and ($boundaryRewriteTail.lines -join '|') -notlike '*old-retained-line*') 'incremental log tail rejects a retained-window rewrite that preserves the final 64 bytes'
+
+    [IO.File]::WriteAllText($tailPath, "before-large-append`n", $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    [IO.File]::AppendAllText($tailPath, ('discarded-prefix'.PadRight(5000, 'q') + "`nlarge-append-tail`n"), $utf8)
+    $largeAppendTail = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test ($largeAppendTail.state.resynchronized -and ($largeAppendTail.lines -join '|') -notlike '*before-large-append*' -and $largeAppendTail.lines[-1] -eq 'large-append-tail') 'over-bound append resynchronizes without splicing retained lines into the bounded snapshot'
+
+    Remove-Item -LiteralPath $tailPath -Force
+    [IO.File]::WriteAllText($tailPath, "recreated-file`n", $utf8)
+    [IO.File]::SetCreationTimeUtc($tailPath, [DateTime]::UtcNow.AddSeconds(5))
+    $recreatedTail = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; states = @($script:SharedTextTailState.Values) }
+    } $tailPath
+    Assert-Test (($recreatedTail.lines -join '|') -eq 'recreated-file' -and $recreatedTail.states.Count -eq 1 -and -not $recreatedTail.states[0].incremental) 'file recreation establishes a fresh bounded-tail identity and discards prior state'
 
     $authorizationDenied = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -InternalTestFailurePoint head-pose-access-denied -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $authorizationDenied.ok -and $authorizationDenied.state -eq 'head-pose-provider-authorization-failed' -and $authorizationDenied.data.runtime.headPoseState.authorizationDenied) 'inspect translates shared-memory authorization denial into a distinct structured state'
