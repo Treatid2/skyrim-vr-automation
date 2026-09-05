@@ -7,7 +7,8 @@ the Skyrim VR installation. The local machine configuration is
 the resolved machine configuration; do not rediscover paths or guess profile and
 executable names when the package can report them.
 
-Version 0.8.0 provides cooperative cross-task access leases, read-only
+Version 1.0.0 requires a route-qualified explicit access lease for preparation
+and launch, and provides cooperative cross-task access leases, read-only
 inspection, single-owner `prepare`, exact
 `open` and `launch`, bounded `status`, graceful `stop-game`, MO2-only
 cooperative `close`, stranded-instance `recover-close`, and graceful full
@@ -98,9 +99,16 @@ overwrite means “classify and relocate safely,” not “delete until green.�
 Before any planned MO2 use, request the shared resource:
 
 ```text
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -Label short-task-name -EstimatedMinutes 20 -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -Label short-task-name -RuntimeRoute OCU -EstimatedMinutes 20 -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate -AccessId <literal-access-id> -RequireClosed -Compact
 ```
+
+Choose exactly one route for the complete lease: `OCU`, physical `SteamVR`, or
+`SteamVRNull`. OCU cannot coexist with SteamVR. The null-HMD route is a SteamVR
+mode, not an OCU mode, and cannot coexist with the physical SteamVR route. To
+change routes, end the session, release the access lease, perform the relevant
+runtime restore/apply transaction, and request a new lease for the new route.
+The lease and prepared session both record the route.
 
 If another task owns it, `state` is `access-busy`. The response includes its
 label, whether a session is bound, and any estimated release time. The estimate
@@ -140,10 +148,17 @@ remain. Fresh creation also refuses to continue unless `fixture-status` is
 ```text
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> prepare-source -AccessId <literal-access-id> -Confirm:$false -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> fixture-status -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> list-local-work-mods -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> list-task -TaskId <stable-task-id> -Compact
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> create -AccessId <literal-access-id> -TaskId <stable-task-id> -Label short-test-name -SavePolicy MainMenuOnly -Confirm:$false -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> create -AccessId <literal-access-id> -TaskId <stable-task-id> -Label short-test-name -WorkspaceContent Modlist -SavePolicy MainMenuOnly -Confirm:$false -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> resume -AccessId <literal-access-id> -TaskId <stable-task-id> -WorkspaceId <exact-retained-workspace-id> -Confirm:$false -Compact
 ```
+
+`list-local-work-mods` is read-only. A fresh request must name either
+`-WorkspaceContent Modlist` or `ModlistPlusLocalWorkMods`; the latter also
+passes exact candidate IDs. Creation changes only the cloned profile, disables
+unselected catalog candidates, and records the catalog hash and applied
+selection. Resume never changes that selection.
 
 After each live use, release the evidence session and access lease but retain
 the workspace. Use workspace `retire` only when its profile is no longer
@@ -164,8 +179,8 @@ machine configuration under the session, and binds it to the exact access
 lease. Use the returned `controllerPath` for every command that owns that
 session; it remains valid if a plugin update replaces the versioned cache from
 which `prepare` was called. `prepare` does not change MO2's selected profile or
-mod list. Legacy callers may omit AccessId;
-that creates an implicit one-session lease which `release` removes.
+mod list. `AccessId` is mandatory; callers must first acquire exactly one
+explicit OCU, SteamVR, or SteamVRNull route.
 When `-RequireSKSE` is supplied, that requirement is durable session state and
 `launch` revalidates it before starting MO2.
 

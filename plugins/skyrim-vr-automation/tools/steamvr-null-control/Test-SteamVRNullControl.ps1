@@ -15,9 +15,53 @@ if (-not $resolvedFixture.StartsWith($resolvedTemp, [StringComparison]::OrdinalI
 $failures = [Collections.Generic.List[string]]::new()
 $passes = [Collections.Generic.List[string]]::new()
 $priorTransactionRoot = $env:CSX_STEAMVR_TRANSACTION_ROOT
+$poseMapping = $null
+$poseView = $null
 
 function Assert-Test([bool]$Condition, [string]$Name) {
     if ($Condition) { $passes.Add($Name) } else { $failures.Add($Name) }
+}
+
+function Test-RuntimeAdmissionReceiptTiming($Admission, $Receipt) {
+    try {
+        $admissionProperties = @($Admission.PSObject.Properties.Name)
+        $receiptProperties = @($Receipt.PSObject.Properties.Name)
+        $timingProperties = @('failureObservedUtc', 'startupDeadlineUtc', 'startupCleanupCompletedUtc')
+        if (@($timingProperties | Where-Object { $_ -notin $admissionProperties -or $_ -notin $receiptProperties }).Count -gt 0) { return $false }
+        if ($Admission.state -ne $Receipt.admissionState) { return $false }
+        foreach ($property in $timingProperties) {
+            if ([string]::IsNullOrWhiteSpace([string]$Admission.$property) -or [string]::IsNullOrWhiteSpace([string]$Receipt.$property)) { return $false }
+            if (([DateTimeOffset]$Admission.$property).UtcDateTime -ne ([DateTimeOffset]$Receipt.$property).UtcDateTime) { return $false }
+        }
+        return $true
+    }
+    catch { return $false }
+}
+
+function Assert-LaunchedFailureEnvelope($Result, [string]$ExpectedState, [string]$Name, $Receipt = $null) {
+    $dataProperties = @($Result.data.PSObject.Properties.Name)
+    $requiredProperties = @(
+        'admission', 'inputContract', 'runtimeReceiptPath', 'runtimeAttemptId',
+        'runtimeReceiptPersistenceAttempted', 'runtimeReceiptPersisted',
+        'runtimeReceiptError', 'startupCleanup', 'acceptedReceiptStageCleanup'
+    )
+    $complete = @($requiredProperties | Where-Object { $_ -notin $dataProperties }).Count -eq 0
+    $admissionProperties = @($Result.data.admission.PSObject.Properties.Name)
+    $timingProperties = @('failureObservedUtc', 'startupDeadlineUtc', 'startupCleanupCompletedUtc')
+    $timingComplete = @($timingProperties | Where-Object {
+        $_ -notin $admissionProperties -or [string]::IsNullOrWhiteSpace([string]$Result.data.admission.$_)
+    }).Count -eq 0
+    $receiptConsistent = if ($Result.data.runtimeReceiptPersisted) {
+        $null -ne $Receipt -and (Test-RuntimeAdmissionReceiptTiming -Admission $Result.data.admission -Receipt $Receipt)
+    }
+    else { $true }
+    $consistent = $Result.state -eq $ExpectedState -and
+        $Result.data.admission.state -eq $ExpectedState -and
+        -not $Result.data.inputContract.measurementReady -and
+        $Result.data.inputContract.measurementBlockers -contains $ExpectedState -and
+        -not [string]::IsNullOrWhiteSpace([string]$Result.data.runtimeReceiptPath) -and
+        -not [string]::IsNullOrWhiteSpace([string]$Result.data.runtimeAttemptId)
+    Assert-Test ($complete -and $timingComplete -and $receiptConsistent -and $consistent) $Name
 }
 
 $windowsPowerShell = Get-Command powershell.exe -ErrorAction SilentlyContinue
@@ -52,18 +96,46 @@ try {
     [IO.File]::WriteAllBytes($startupPath, [byte[]]@(0))
     $originalText = "{`r`n  `"steamvr`": { `"enableHomeApp`": true },`r`n  `"unrelated`": { `"value`": 7 }`r`n}`r`n"
     [IO.File]::WriteAllText($settingsPath, $originalText, [Text.UTF8Encoding]::new($false))
+    $headPoseMapName = "Local\CSXVRHeadPose-fixture-$([guid]::NewGuid().ToString('N'))"
     [ordered]@{
         steamvr = [ordered]@{ forcedDriver = 'null'; requireHmd = $false; activateMultipleDrivers = $true; enableHomeApp = $false }
         dashboard = [ordered]@{ enableDashboard = $false }
         driver_null = [ordered]@{ enable = $true; serialNumber = 'Fixture'; modelNumber = 'Fixture'; windowWidth = 2160; windowHeight = 1200; renderWidth = 1512; renderHeight = 1680; displayFrequency = 90.0 }
         driver_codex_head_pose = [ordered]@{ enable = $true; serialNumber = 'CSX-NULL-HMD-POSE-1'; modelNumber = 'Fixture Pose'; positionX = 0.0; eyeHeightMeters = 1.68; positionZ = 0.0; yawDegrees = 0.0; pitchDegrees = 0.0; rollDegrees = 0.0 }
         TrackingOverrides = [ordered]@{ '/devices/codex_head_pose/CSX-NULL-HMD-POSE-1' = '/user/head' }
-        headPoseProviderContract = [ordered]@{ driverName = 'codex_head_pose'; registeredDevicePath = '/devices/codex_head_pose/CSX-NULL-HMD-POSE-1'; semanticTarget = '/user/head'; sharedMemoryName = "Local\CSXVRHeadPose-fixture-$([guid]::NewGuid().ToString('N'))"; sharedMemoryVersion = 1; minimumQualifiedEyeHeightMeters = 1.0; maximumQualifiedEyeHeightMeters = 2.5 }
+        headPoseProviderContract = [ordered]@{ driverName = 'codex_head_pose'; registeredDevicePath = '/devices/codex_head_pose/CSX-NULL-HMD-POSE-1'; semanticTarget = '/user/head'; sharedMemoryName = $headPoseMapName; sharedMemoryVersion = 2; sharedMemorySize = 128; minimumQualifiedEyeHeightMeters = 1.0; maximumQualifiedEyeHeightMeters = 2.5 }
         automationInputContract = [ordered]@{ hmdPoseProvider = 'codex-head-pose-v2'; hmdPoseControl = 'shared-memory-v2'; controllerInput = 'unavailable'; dashboardInput = 'disabled'; replayReady = $false; measurementReady = $false; qualificationRequired = 'fixture qualification' }
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $profilePath -Encoding utf8
 
+    $poseMapping = [IO.MemoryMappedFiles.MemoryMappedFile]::CreateNew($headPoseMapName, 128)
+    $poseView = $poseMapping.CreateViewAccessor(0, 128, [IO.MemoryMappedFiles.MemoryMappedFileAccess]::ReadWrite)
+    $poseView.Write(0, [uint32]0x48505343)
+    $poseView.Write(4, [uint16]2)
+    $poseView.Write(6, [uint16]128)
+    $poseView.Write(8, [uint64]2)
+    $poseView.Write(16, [uint64]2)
+    $poseView.Write(24, [uint32]1)
+    $poseView.Write(28, [uint32]1)
+    $poseView.Write(32, [double]0.0)
+    $poseView.Write(40, [double]1.68)
+    $poseView.Write(48, [double]0.0)
+    $poseView.Write(56, [double]1.0)
+    $poseView.Write(64, [double]0.0)
+    $poseView.Write(72, [double]0.0)
+    $poseView.Write(80, [double]0.0)
+    $poseView.Write(88, [uint64]41)
+    $poseView.Write(96, [uint64]41)
+    $poseView.Write(104, [uint64]73)
+    $poseView.Write(112, [uint32]$PID)
+    $poseView.Write(120, [uint64][DateTime]::UtcNow.ToFileTimeUtc())
+
     $inspectBefore = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json
     Assert-Test ($inspectBefore.ok -and $inspectBefore.state -eq 'null-inactive') 'inspect identifies inactive null profile'
+    Assert-Test ($inspectBefore.data.runtime.headPoseState.qualified -and $inspectBefore.data.runtime.headPoseState.protocolValid -and $inspectBefore.data.runtime.headPoseState.driverIdentityVerified) 'inspect accepts a fully acknowledged v2 head-pose provider with verified live-process identity'
+    $poseView.Write(96, [uint64]42)
+    $nonceMismatch = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json
+    Assert-Test (-not $nonceMismatch.data.runtime.headPoseState.qualified -and -not $nonceMismatch.data.runtime.headPoseState.acknowledged) 'inspect rejects a v2 provider whose acknowledged writer nonce does not match'
+    $poseView.Write(96, [uint64]41)
     Assert-Test ((Test-Path -LiteralPath $inspectBefore.data.targetControl.directory -PathType Container) -and $inspectBefore.data.targetControl.key -match '^[0-9a-f]{64}$') 'canonical live targets map to a deterministic target-owned control directory'
 
     $heldLock = [IO.File]::Open([string]$inspectBefore.data.targetControl.lockPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
@@ -74,7 +146,367 @@ try {
     finally { $heldLock.Dispose() }
 
     $sourceText = [IO.File]::ReadAllText($entry)
-    Assert-Test ($sourceText -notmatch '\.ReadToEnd\(' -and $sourceText -match 'LogTailMaxBytes') 'SteamVR readiness polling uses a bounded byte tail instead of whole-log reads'
+    Assert-Test ($sourceText -notmatch '\.ReadToEnd\(' -and $sourceText -notmatch '-split\s+"`r\?`n",\s*-1' -and $sourceText -match 'LogTailMaxBytes' -and $sourceText -notmatch 'Get-SharedTextTail[^\r\n]*-FreshSnapshot') 'SteamVR readiness polling uses an incremental bounded and correctly split text tail'
+    Assert-Test ($sourceText -match '\$providerLogReady -and \[bool\]\$headPoseState\.qualified' -and $sourceText -match '\$applicationHeadPose = if \(\$providerLogReady') 'application-facing pose probing waits for retained null-driver and provider log proof'
+    Assert-Test ($sourceText -match 'catch \[UnauthorizedAccessException\]' -and $sourceText -match 'not authorized to read and acknowledge') 'shared-memory authorization failure remains distinct from provider-not-ready state'
+    Assert-Test ($sourceText -match 'Get-ApplicationHeadPose -Contract .* -DeadlineUtc \$DeadlineUtc' -and $sourceText -match 'TerminationGraceMilliseconds 100 -StreamDrainGraceMilliseconds 100') 'application-facing pose probing inherits the outer deadline including bounded cleanup grace'
+
+    $null = $tokens = $parseErrors = $null
+    $sourceAst = [Management.Automation.Language.Parser]::ParseFile($entry, [ref]$tokens, [ref]$parseErrors)
+    $tailFunctionNames = @('Get-StreamRangeSha256', 'Get-ByteArraySha256', 'Get-Utf8TrailingIncompleteByteCount', 'Get-SharedTextTail')
+    $tailFunctions = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $tailFunctionNames
+    }, $true) | Sort-Object { [array]::IndexOf($tailFunctionNames, $_.Name) })
+    $runtimeEvidenceFunction = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-NullRuntimeEvidence'
+    }, $true))[0]
+    Assert-Test ($runtimeEvidenceFunction.Extent.Text -notmatch 'Get-HashOrNull\s+\$ServerLogPath' -and $runtimeEvidenceFunction.Extent.Text -match "serverLogHashScope\s*=\s*'bounded-tail-window'") 'runtime evidence reports the bounded tail proof instead of hashing the complete growing SteamVR log'
+    Assert-Test ($runtimeEvidenceFunction.Extent.Text -match 'usable\s*=\s*\$null -ne \$tailState' -and $runtimeEvidenceFunction.Extent.Text -match 'incremental\s*=\s*\$null -ne \$tailState' -and $runtimeEvidenceFunction.Extent.Text -match 'resynchronized\s*=\s*\$null -ne \$tailState') 'runtime evidence publishes cache usability, incremental reuse, and resynchronization status'
+    Assert-Test ($sourceText -match "'runtime-confirmation-timeout'" -and $sourceText -match "'runtime-confirmation-timeout-receipt-failure'") 'the bounded test contract exposes runtime confirmation and receipt-failure seams'
+    $tailHarnessText = "`$script:SharedTextTailState = @{}`n" + (($tailFunctions | ForEach-Object { $_.Extent.Text }) -join "`n")
+    $tailHarness = New-Module -ScriptBlock ([scriptblock]::Create($tailHarnessText))
+    $tailPath = Join-Path $fixture 'incremental-tail.txt'
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $prefixBytes = $utf8.GetBytes("alpha`nprice ")
+    $euroBytes = $utf8.GetBytes([char]0x20AC)
+    [IO.File]::WriteAllBytes($tailPath, [byte[]]@($prefixBytes + $euroBytes[0..1]))
+    $firstTail = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    Assert-Test (($firstTail -join '|') -eq 'alpha|price ') 'bounded log tail keeps a partial line separate while retaining incomplete UTF-8 bytes'
+    $appendBytes = [byte[]]@($euroBytes[2]) + $utf8.GetBytes("`nnext`n")
+    $appendStream = [IO.File]::Open($tailPath, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+    try { $appendStream.Write($appendBytes, 0, $appendBytes.Length) }
+    finally { $appendStream.Dispose() }
+    $secondTail = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test (($secondTail.lines -join '|') -eq ('alpha|price ' + [char]0x20AC + '|next')) 'incremental log tail preserves a UTF-8 code point split across reads'
+    Assert-Test ([bool]$secondTail.state.incremental) 'incremental log tail retains continuity across monotonic append'
+    Assert-Test ([long]$secondTail.state.bytesRead -lt [long]$secondTail.state.offset) 'incremental log tail reads only appended bytes after continuity proof'
+    $bytesBeforeResync = [long]$secondTail.state.cumulativeBytesRead
+    [IO.File]::WriteAllText($tailPath, "replacement-one`nreplacement-two`n", $utf8)
+    $replacementTail = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test ($replacementTail.state.resynchronized -and ($replacementTail.lines -join '|') -eq 'replacement-one|replacement-two' -and [long]$replacementTail.state.cumulativeBytesRead -gt $bytesBeforeResync) 'incremental log tail detects truncate-and-regrow continuity loss and resynchronizes'
+    $sameLength = ('same-length-overwrite'.PadRight(([IO.FileInfo]$tailPath).Length - 1, 'x')) + "`n"
+    [IO.File]::WriteAllText($tailPath, $sameLength, $utf8)
+    $overwriteTail = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test ($overwriteTail.state.resynchronized -and $overwriteTail.lines[-1] -like 'same-length-overwrite*') 'incremental log tail detects a same-length in-place overwrite'
+
+    $preservedBoundary = 'boundary-tail'.PadRight(64, 'z')
+    $originalWindow = ('old-retained-line'.PadRight(512, 'a')) + "`n" + $preservedBoundary
+    [IO.File]::WriteAllText($tailPath, $originalWindow, $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    $rewrittenWindow = ('new-retained-line'.PadRight(512, 'b')) + "`n" + $preservedBoundary
+    [IO.File]::WriteAllText($tailPath, $rewrittenWindow, $utf8)
+    $boundaryRewriteTail = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test ($boundaryRewriteTail.state.resynchronized -and $boundaryRewriteTail.lines[0] -like 'new-retained-line*' -and ($boundaryRewriteTail.lines -join '|') -notlike '*old-retained-line*') 'incremental log tail rejects a retained-window rewrite that preserves the final 64 bytes'
+
+    $firstLongLine = 'first-long-line'.PadRight(2999, 'a') + "`n"
+    $secondLongLine = 'second-long-line'.PadRight(2999, 'b') + "`n"
+    $thirdLongLine = 'third-long-line'.PadRight(2999, 'c') + "`n"
+    [IO.File]::WriteAllText($tailPath, $firstLongLine + $secondLongLine, $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    [IO.File]::AppendAllText($tailPath, $thirdLongLine, $utf8)
+    $advancedWindow = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    $rewriteStream = [IO.File]::Open($tailPath, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+    try {
+        $rewriteStream.Position = 3100
+        $rewriteStream.WriteByte([byte][char]'z')
+    }
+    finally { $rewriteStream.Dispose() }
+    $excludedPrefixRewrite = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test ($advancedWindow.state.incremental -and $advancedWindow.lines.Count -eq 1 -and $advancedWindow.lines[0] -like 'third-long-line*') 'advancing the bounded window discards completed lines whose origin leaves its continuity proof'
+    Assert-Test ($excludedPrefixRewrite.state.incremental -and ($excludedPrefixRewrite.lines -join '|') -notlike '*second-long-line*' -and $excludedPrefixRewrite.lines[0] -like 'third-long-line*') 'a rewrite outside the retained raw window cannot resurrect stale completed lines'
+
+    $partialPrefix = 'partial-prefix'.PadRight(3000, 'p')
+    [IO.File]::WriteAllText($tailPath, "complete-before-partial`n$partialPrefix", $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    [IO.File]::AppendAllText($tailPath, ('q'.ToString().PadRight(2000, 'q') + "`npartial-successor`n"), $utf8)
+    $advancedPartial = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    $partialRewrite = [IO.File]::Open($tailPath, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+    try {
+        $partialRewrite.Position = 200
+        $partialRewrite.WriteByte([byte][char]'x')
+    }
+    finally { $partialRewrite.Dispose() }
+    $excludedPartialRewrite = & $tailHarness { param($path) @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096) } $tailPath
+    Assert-Test ($advancedPartial.state.incremental -and [string]::IsNullOrEmpty([string]$advancedPartial.state.residual) -and ($advancedPartial.lines -join '|') -eq 'partial-successor') 'advancing the bounded window discards a partial line that no longer has complete continuity evidence'
+    Assert-Test (($excludedPartialRewrite -join '|') -eq 'partial-successor') 'a rewrite outside the retained raw window cannot resurrect stale partial-line text'
+
+    [IO.File]::WriteAllText($tailPath, "before-large-append`n", $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    [IO.File]::AppendAllText($tailPath, ('discarded-prefix'.PadRight(5000, 'q') + "`nlarge-append-tail`n"), $utf8)
+    $largeAppendTail = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test ($largeAppendTail.state.resynchronized -and ($largeAppendTail.lines -join '|') -notlike '*before-large-append*' -and $largeAppendTail.lines[-1] -eq 'large-append-tail') 'over-bound append resynchronizes without splicing retained lines into the bounded snapshot'
+
+    Remove-Item -LiteralPath $tailPath -Force
+    [IO.File]::WriteAllText($tailPath, "recreated-file`n", $utf8)
+    [IO.File]::SetCreationTimeUtc($tailPath, [DateTime]::UtcNow.AddSeconds(5))
+    $recreatedTail = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; states = @($script:SharedTextTailState.Values) }
+    } $tailPath
+    Assert-Test (($recreatedTail.lines -join '|') -eq 'recreated-file' -and $recreatedTail.states.Count -eq 1 -and -not $recreatedTail.states[0].incremental) 'file recreation establishes a fresh bounded-tail identity and discards prior state'
+
+    $delimiterPrefix = 'd'.PadRight(5000, 'd')
+    [IO.File]::WriteAllText($tailPath, "$delimiterPrefix`nretained-first`nretained-second`n", $utf8)
+    $delimiterInitial = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    $delimiterMutation = & $tailHarness {
+        param($path)
+        $hook = {
+            param($phase, $stream, $capturedLength)
+            $state = @($script:SharedTextTailState.Values)[0]
+            $writer = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+            try {
+                $writer.Position = [long]$state.continuityOffset
+                $writer.WriteByte([byte][char]'x')
+            }
+            finally { $writer.Dispose() }
+        }
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -InternalMutationHook $hook)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test ($delimiterInitial.state.leadingProofByte -eq 0x0A -and $delimiterInitial.lines[0] -eq 'retained-first') 'bounded tail continuity retains the delimiter immediately before its first decoded line'
+    Assert-Test (-not $delimiterMutation.state.stable -and -not $delimiterMutation.state.usable -and $delimiterMutation.lines.Count -eq 0) 'a delimiter rewrite after the initial proof cannot publish a stale first line'
+
+    $emptyWindow = ('p'.PadRight(5000, 'p') + "`n")
+    [IO.File]::WriteAllText($tailPath, $emptyWindow, $utf8)
+    $emptyProof = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    $suffix = "`ncurrent-line`n"
+    $sameSizeReplacement = 'q'.PadRight($emptyWindow.Length - $suffix.Length, 'q') + $suffix
+    [IO.File]::WriteAllText($tailPath, $sameSizeReplacement, $utf8)
+    $afterEmptyRewrite = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test (-not $emptyProof.state.usable -and [long]$emptyProof.state.retainedOffset -gt 0) 'an empty retained window at nonzero offset is not admitted as a continuity proof'
+    Assert-Test (-not $afterEmptyRewrite.state.incremental -and $afterEmptyRewrite.lines[-1] -eq 'current-line') 'a same-length rewrite after an empty retained window is read as a fresh bounded snapshot'
+
+    [IO.File]::WriteAllText($tailPath, "stable-one`nstable-two`n", $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    $postHashMutation = & $tailHarness {
+        param($path)
+        $hook = {
+            param($phase, $stream, $capturedLength)
+            $writer = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+            try {
+                $writer.Position = 0
+                $writer.WriteByte([byte][char]'x')
+            }
+            finally { $writer.Dispose() }
+        }
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -InternalMutationHook $hook)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    $postHashRecovery = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test (-not $postHashMutation.state.stable -and -not $postHashMutation.state.usable -and $postHashMutation.lines.Count -eq 0) 'a retained-window rewrite between continuity proof and snapshot validation fails closed'
+    Assert-Test (-not $postHashRecovery.state.incremental -and $postHashRecovery.lines[0] -eq 'xtable-one') 'the poll after a rejected in-read mutation establishes a fresh current snapshot'
+
+    [IO.File]::WriteAllText($tailPath, "old-generation`n", $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    $rotatedPath = "$tailPath.rotated"
+    $rotation = & $tailHarness {
+        param($path, $rotatedPath)
+        $hook = {
+            param($phase, $stream, $capturedLength)
+            [IO.File]::Move($path, $rotatedPath)
+            [IO.File]::WriteAllText($path, "new-generation`n", [Text.UTF8Encoding]::new($false))
+        }
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -InternalMutationHook $hook)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath $rotatedPath
+    $rotationRecovery = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test (-not $rotation.state.stable -and -not $rotation.state.usable -and $rotation.lines.Count -eq 0 -and $rotation.state.error -match 'replaced') 'same-call log rotation cannot publish lines from the old open file generation'
+    Assert-Test (-not $rotationRecovery.state.incremental -and ($rotationRecovery.lines -join '|') -eq 'new-generation') 'the poll after a rejected rotation establishes the selected replacement log afresh'
+    [IO.File]::Delete($rotatedPath)
+
+    & $tailHarness { $script:SharedTextTailState.Clear() }
+    [IO.File]::WriteAllText($tailPath, "fresh-old`n", $utf8)
+    $freshRotatedPath = "$tailPath.fresh-rotated"
+    $freshRotation = & $tailHarness {
+        param($path, $rotatedPath)
+        $hook = {
+            param($phase, $stream, $capturedLength)
+            [IO.File]::Move($path, $rotatedPath)
+            [IO.File]::WriteAllText($path, "fresh-new`n", [Text.UTF8Encoding]::new($false))
+        }
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -InternalMutationHook $hook)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath $freshRotatedPath
+    Assert-Test (-not $freshRotation.state.stable -and $freshRotation.lines.Count -eq 0) 'rotation during a fresh bounded read also rejects the detached open generation'
+    [IO.File]::Delete($freshRotatedPath)
+
+    [IO.File]::WriteAllText($tailPath, "delete-old`n", $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    $deletedPath = "$tailPath.deleted"
+    $deletedSelection = & $tailHarness {
+        param($path, $deletedPath)
+        $hook = {
+            param($phase, $stream, $capturedLength)
+            [IO.File]::Move($path, $deletedPath)
+        }
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -InternalMutationHook $hook)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath $deletedPath
+    Assert-Test (-not $deletedSelection.state.stable -and -not $deletedSelection.state.usable -and $deletedSelection.lines.Count -eq 0 -and $deletedSelection.state.error -match 'could not be validated') 'deletion without replacement fails closed while the detached read handle remains open'
+    [IO.File]::Move($deletedPath, $tailPath)
+
+    [IO.File]::WriteAllText($tailPath, "captured-line`n", $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    $sameCallAppend = & $tailHarness {
+        param($path)
+        $hook = {
+            param($phase, $stream, $capturedLength)
+            [IO.File]::AppendAllText($path, "deferred-line`n", [Text.UTF8Encoding]::new($false))
+        }
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -InternalMutationHook $hook)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    $afterSameCallAppend = & $tailHarness { param($path) @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096) } $tailPath
+    Assert-Test ($sameCallAppend.state.stable -and $sameCallAppend.state.incremental -and ($sameCallAppend.lines -join '|') -eq 'captured-line') 'append-only growth after captured length preserves the accepted bounded prefix'
+    Assert-Test (($afterSameCallAppend -join '|') -eq 'captured-line|deferred-line') 'the next poll consumes append-only growth deferred by the prior bounded snapshot'
+
+    $deadlineStateBefore = & $tailHarness { @($script:SharedTextTailState.Values)[0] }
+    $deadlineResult = & $tailHarness {
+        param($path)
+        try {
+            $null = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -DeadlineUtc ([DateTime]::UtcNow.AddMilliseconds(40)) -InternalDelayAfterValidationMilliseconds 80)
+            [pscustomobject]@{ timedOut = $false; state = @($script:SharedTextTailState.Values)[0] }
+        }
+        catch [TimeoutException] {
+            [pscustomobject]@{ timedOut = $true; error = $_.Exception.Message; state = @($script:SharedTextTailState.Values)[0] }
+        }
+    } $tailPath
+    $zeroLengthDeadline = & $tailHarness {
+        $memory = [IO.MemoryStream]::new()
+        try {
+            try {
+                $null = Get-StreamRangeSha256 -Stream $memory -Offset 0 -Length 0 -DeadlineUtc ([DateTime]::UtcNow.AddMilliseconds(-1))
+                $false
+            }
+            catch [TimeoutException] { $true }
+        }
+        finally { $memory.Dispose() }
+    }
+    Assert-Test ($deadlineResult.timedOut -and $deadlineResult.error -match 'before publishing' -and [long]$deadlineResult.state.offset -eq [long]$deadlineStateBefore.offset) 'deadline expiry after validation is detected before candidate state or lines are published'
+    Assert-Test ($zeroLengthDeadline) 'zero-length continuity work still enforces an already-expired deadline'
+
+    [IO.File]::WriteAllText($tailPath, ('base'.PadRight(5000, 'b') + "`n"), $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    [IO.File]::AppendAllText($tailPath, "appended-line`n", $utf8)
+    $shortRead = & $tailHarness {
+        param($path)
+        $hook = {
+            param($phase, $stream, $capturedLength)
+            $writer = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+            try { $writer.SetLength([Math]::Max(0, $capturedLength - 256)) }
+            finally { $writer.Dispose() }
+        }
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -InternalMutationHook $hook)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test (-not $shortRead.state.stable -and -not $shortRead.state.usable -and [long]$shortRead.state.offset -eq 0 -and $shortRead.lines.Count -eq 0) 'a short read after truncation cannot advance the cached offset or publish partial evidence'
+
+    [IO.File]::WriteAllText($tailPath, ('large-log'.PadRight(100000, 'l') + "`nlatest`n"), $utf8)
+    $boundedFresh = & $tailHarness {
+        param($path)
+        $null = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        @($script:SharedTextTailState.Values)[0]
+    } $tailPath
+    [IO.File]::AppendAllText($tailPath, "more`n", $utf8)
+    $boundedAppend = & $tailHarness {
+        param($path)
+        $null = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        @($script:SharedTextTailState.Values)[0]
+    } $tailPath
+    Assert-Test ([int]$boundedFresh.bytesRead -le 4096 -and [int]$boundedFresh.hashBytesRead -le 8192 -and ([int]$boundedFresh.bytesRead + [int]$boundedFresh.hashBytesRead) -le 12288) 'fresh runtime log evidence examines at most a small bounded multiple of the configured tail window'
+    Assert-Test ([int]$boundedAppend.bytesRead -le 4096 -and [int]$boundedAppend.hashBytesRead -le 8192 -and ([int]$boundedAppend.bytesRead + [int]$boundedAppend.hashBytesRead) -le 12288) 'incremental runtime log evidence remains bounded independently of total log size'
+    Assert-Test ([int]$boundedFresh.continuityLength -le 4096 -and [int]$boundedAppend.continuityLength -le 4096) 'the retained delimiter proof is included inside the configured tail-window byte budget'
+
+    $exactCapInitial = 'p'.PadRight(100, 'p') + "`n" + 'r'.PadRight(4095, 'r')
+    [IO.File]::WriteAllText($tailPath, $exactCapInitial, $utf8)
+    $exactCapBefore = & $tailHarness {
+        param($path)
+        $null = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        @($script:SharedTextTailState.Values)[0]
+    } $tailPath
+    [IO.File]::AppendAllText($tailPath, ("`n" + 's'.PadRight(4095, 's')), $utf8)
+    $exactCapAfter = & $tailHarness {
+        param($path)
+        $null = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        @($script:SharedTextTailState.Values)[0]
+    } $tailPath
+    Assert-Test ([int]$exactCapBefore.continuityLength -eq 4096 -and [int]$exactCapAfter.continuityLength -eq 4096 -and ([int]$exactCapAfter.bytesRead + [int]$exactCapAfter.hashBytesRead) -eq 12288) 'an exact-cap framed append includes both delimiter proofs within the literal three-window I/O bound'
+
+    [IO.File]::WriteAllText($tailPath, "one`n", $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    [IO.File]::WriteAllText($tailPath, "x`n", $utf8)
+    $shorterTelemetry = & $tailHarness {
+        param($path)
+        $null = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        @($script:SharedTextTailState.Values)[0]
+    } $tailPath
+    Assert-Test (-not $shorterTelemetry.incremental -and [int]$shorterTelemetry.bytesRead -eq 2 -and [int]$shorterTelemetry.hashBytesRead -eq 2) 'log I/O telemetry counts only proof bytes actually read after pre-call shrinkage'
+
+    $authorizationDenied = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -InternalTestFailurePoint head-pose-access-denied -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $authorizationDenied.ok -and $authorizationDenied.state -eq 'head-pose-provider-authorization-failed' -and $authorizationDenied.data.runtime.headPoseState.authorizationDenied) 'inspect translates shared-memory authorization denial into a distinct structured state'
+
+    $invalidVersionProfilePath = Join-Path $fixture 'steamvr-null.invalid-version.profile.json'
+    $invalidVersionProfile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json -AsHashtable
+    $invalidVersionProfile['headPoseProviderContract']['sharedMemoryVersion'] = 3
+    $invalidVersionProfile['headPoseProviderContract']['sharedMemorySize'] = 0
+    $invalidVersionProfile | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $invalidVersionProfilePath -Encoding utf8
+    $invalidVersion = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $invalidVersionProfilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $invalidVersion.data.runtime.headPoseState.qualified -and $invalidVersion.data.runtime.headPoseState.error -match 'Unsupported head-pose shared-memory version') 'explicit shared-memory size cannot bypass version admission'
 
     $stop = & $entry stop -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json
     Assert-Test ($stop.ok -and $stop.state -eq 'already-stopped') 'stop recognizes an already closed SteamVR state'
@@ -83,15 +515,175 @@ try {
     Assert-Test ($dry.ok -and $dry.state -eq 'dry-run') 'apply dry-run succeeds'
     Assert-Test (-not (Test-Path -LiteralPath (Join-Path $evidence 'steamvr.vrsettings.before'))) 'apply dry-run creates no backup'
 
-    $applied = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -Compact | ConvertFrom-Json
+    $profileTextBeforeApply = [IO.File]::ReadAllText($profilePath)
+    $applied = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint apply-source-drift-after-stage -Compact | ConvertFrom-Json
     Assert-Test ($applied.ok -and $applied.state -eq 'null-applied') 'apply writes effective null profile'
     if (-not $applied.ok) { throw "Fixture apply failed: $($applied.errors -join '; ')" }
     $appliedJson = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
+    $driftedSourceProfile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json -AsHashtable
     Assert-Test ($appliedJson['unrelated']['value'] -eq 7) 'apply preserves unrelated settings'
     Assert-Test ($appliedJson['dashboard']['enableDashboard'] -eq $false) 'apply disables the dashboard generic-HMD input route'
     Assert-Test ($appliedJson['driver_codex_head_pose']['eyeHeightMeters'] -eq 1.68 -and $appliedJson['TrackingOverrides']['/devices/codex_head_pose/CSX-NULL-HMD-POSE-1'] -eq '/user/head') 'apply configures the synthetic head pose and semantic override'
+    Assert-Test ($driftedSourceProfile['driver_codex_head_pose']['eyeHeightMeters'] -eq 9.25 -and $appliedJson['driver_codex_head_pose']['eyeHeightMeters'] -eq 1.68) 'apply uses the staged profile when the caller source changes before settings mutation'
     Assert-Test (Test-Path -LiteralPath (Join-Path $evidence 'steamvr-null-receipt.json')) 'apply writes hash receipt'
+    $appliedReceipt = Get-Content -LiteralPath (Join-Path $evidence 'steamvr-null-receipt.json') -Raw | ConvertFrom-Json
+    Assert-Test ((Test-Path -LiteralPath $appliedReceipt.profileEvidencePath -PathType Leaf) -and (Get-FileHash -LiteralPath $appliedReceipt.profileEvidencePath -Algorithm SHA256).Hash -eq $appliedReceipt.profileSha256) 'apply retains an exact receipt-bound null profile in stable evidence'
+    $appliedEvidenceProfile = Get-Content -LiteralPath $appliedReceipt.profileEvidencePath -Raw | ConvertFrom-Json -AsHashtable
+    Assert-Test ($appliedEvidenceProfile['driver_codex_head_pose']['eyeHeightMeters'] -eq 1.68 -and $appliedReceipt.profileSha256 -ne (Get-FileHash -LiteralPath $profilePath -Algorithm SHA256).Hash) 'apply receipt remains tied to the staged profile rather than the changed caller source'
+    [IO.File]::WriteAllText($profilePath, $profileTextBeforeApply, [Text.UTF8Encoding]::new($false))
     $appliedText = [IO.File]::ReadAllText($settingsPath)
+
+    Copy-Item -LiteralPath $env:ComSpec -Destination $startupPath -Force
+    $authorizationDeniedStart = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint head-pose-access-denied-after-start -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $authorizationDeniedReceipt = Get-Content -LiteralPath (Join-Path $evidence 'steamvr-null-runtime.receipt.json') -Raw | ConvertFrom-Json
+    if (-not $authorizationDeniedStart.data.PSObject.Properties['startupCleanup']) { throw "Fixture authorization-denied start did not reach cleanup: $($authorizationDeniedStart | ConvertTo-Json -Depth 12 -Compress)" }
+    Assert-Test (-not $authorizationDeniedStart.ok -and $authorizationDeniedStart.state -eq 'head-pose-provider-authorization-failed' -and $authorizationDeniedStart.data.startupCleanup -and @($authorizationDeniedStart.data.startupCleanup.remaining).Count -eq 0) 'startup authorization denial stops every exact SteamVR process started by the attempt'
+    Assert-Test (Test-RuntimeAdmissionReceiptTiming -Admission $authorizationDeniedStart.data.admission -Receipt $authorizationDeniedReceipt) 'authorization rejection returns and persists one complete failure timeline'
+
+    $runtimeReceiptPath = Join-Path $evidence 'steamvr-null-runtime.receipt.json'
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $confirmationTimeout = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-confirmation-timeout -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $confirmationReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test (-not $confirmationTimeout.ok -and $confirmationTimeout.state -eq 'runtime-confirmation-timeout' -and $confirmationTimeout.data.runtimeReceiptPersisted -and $confirmationTimeout.data.startupCleanup.verified) 'a reachable confirmation timeout returns a cleanup-qualified failure'
+    Assert-Test ($confirmationReceipt.runtimeConfirmationAttempted -and $confirmationReceipt.runtimeConfirmationTimedOut -and -not $confirmationReceipt.runtimeAccepted -and $confirmationReceipt.admissionState -eq 'runtime-confirmation-timeout') 'confirmation-timeout receipt records attempted, timed-out, and nonaccepted state'
+    Assert-Test (Test-RuntimeAdmissionReceiptTiming -Admission $confirmationTimeout.data.admission -Receipt $confirmationReceipt) 'confirmation timeout returns and persists one complete failure timeline'
+    Assert-Test (-not $confirmationTimeout.data.inputContract.measurementReady -and $confirmationTimeout.data.inputContract.measurementBlockers -contains 'runtime-confirmation-timeout') 'confirmation timeout blocks measurement with an attributable reason'
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $receiptFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-confirmation-timeout-receipt-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $receiptFailure.ok -and $receiptFailure.state -eq 'runtime-confirmation-timeout' -and -not $receiptFailure.data.runtimeReceiptPersisted -and $receiptFailure.data.runtimeReceiptError -match 'Injected runtime receipt persistence failure') 'receipt failure preserves the original confirmation-timeout classification'
+    Assert-Test ($receiptFailure.data.startupCleanup.verified -and @($receiptFailure.data.startupCleanup.remaining).Count -eq 0) 'confirmation-timeout cleanup completes before injected receipt persistence failure'
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $cleanupFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-confirmation-timeout-cleanup-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $cleanupFailureReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test (-not $cleanupFailure.ok -and $cleanupFailure.state -eq 'runtime-confirmation-timeout' -and $cleanupFailure.data.admission.state -eq 'runtime-confirmation-timeout') 'generic cleanup fallback preserves the original confirmation-timeout admission state'
+    Assert-Test (-not $cleanupFailure.data.inputContract.measurementReady -and $cleanupFailure.data.inputContract.measurementBlockers -contains 'runtime-confirmation-timeout' -and -not $cleanupFailure.data.startupCleanup.verified) 'cleanup exceptions retain an explicit measurement blocker and unverified cleanup evidence'
+    Assert-Test ($cleanupFailure.data.runtimeReceiptPersistenceAttempted -and $cleanupFailure.data.runtimeReceiptPersisted -and $null -eq $cleanupFailure.data.runtimeReceiptError) 'cleanup failure persists a nonaccepted current-attempt receipt after the generic boundary'
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $inputContractFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-input-contract-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $inputContractFailureReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test (-not $inputContractFailure.ok -and $inputContractFailure.state -eq 'runtime-admission-exception' -and $inputContractFailure.data.admission.state -eq 'runtime-admission-exception' -and $inputContractFailure.data.startupCleanup.verified) 'input-contract construction failure returns a cleanup-qualified failed-admission envelope'
+    Assert-Test (-not $inputContractFailure.data.inputContract.available -and -not $inputContractFailure.data.inputContract.measurementReady -and $inputContractFailure.data.inputContract.measurementBlockers -contains 'runtime-admission-exception') 'unavailable input-contract evidence is represented explicitly and blocks measurement'
+    Assert-Test ($inputContractFailure.data.runtimeReceiptPersistenceAttempted -and $inputContractFailure.data.runtimeReceiptPersisted -and $null -eq $inputContractFailure.data.runtimeReceiptError) 'input-contract failure persists a nonaccepted current-attempt receipt without inventing a write error'
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $stageFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-accepted-receipt-stage-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $stageFailureReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test (-not $stageFailure.ok -and $stageFailure.state -eq 'runtime-admission-exception' -and $stageFailure.data.runtimeReceiptPersistenceAttempted -and $stageFailure.data.runtimeReceiptPersisted -and $stageFailure.errors -match 'Injected accepted runtime receipt staging failure') 'accepted-receipt staging failure returns attributable persistence state in the failed-admission envelope'
+    Assert-Test (-not $stageFailure.data.inputContract.measurementReady -and $stageFailure.data.startupCleanup.verified -and -not $stageFailureReceipt.runtimeAccepted -and $stageFailureReceipt.attemptId -eq $stageFailure.data.runtimeAttemptId) 'accepted-receipt staging failure blocks measurement and publishes only current nonaccepted authority'
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $finalAdmissionTimeout = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-final-admission-timeout -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $finalAdmissionReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test (-not $finalAdmissionTimeout.ok -and $finalAdmissionTimeout.state -eq 'startup-deadline-exceeded' -and $finalAdmissionTimeout.data.startupCleanup.verified -and -not $finalAdmissionReceipt.runtimeAccepted) 'deadline expiry after the final probe cannot publish successful runtime admission'
+    Assert-Test (Test-RuntimeAdmissionReceiptTiming -Admission $finalAdmissionTimeout.data.admission -Receipt $finalAdmissionReceipt) 'pre-final deadline returns and persists one complete failure timeline'
+    Assert-Test (-not $finalAdmissionTimeout.data.inputContract.measurementReady -and $finalAdmissionTimeout.data.inputContract.measurementBlockers -contains 'startup-deadline-exceeded') 'late final admission remains measurement-blocked'
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $noConfirmationTimeout = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-final-admission-timeout-no-confirmation -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $noConfirmationReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test (-not $noConfirmationTimeout.ok -and $noConfirmationTimeout.state -eq 'startup-deadline-exceeded' -and -not $noConfirmationReceipt.runtimeConfirmationAttempted -and -not $noConfirmationReceipt.runtimeAccepted) 'late admission without a confirmation probe also fails closed'
+    Assert-Test ($noConfirmationTimeout.data.startupCleanup.verified -and @($noConfirmationTimeout.data.startupCleanup.remaining).Count -eq 0 -and @($noConfirmationTimeout.data.startupCleanup.errors).Count -eq 0) 'late admission without a confirmation probe performs verified exact cleanup'
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $postReceiptTimeout = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-post-receipt-timeout -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $postReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test (-not $postReceiptTimeout.ok -and $postReceiptTimeout.state -eq 'startup-deadline-exceeded' -and $postReceiptTimeout.data.startupCleanup.verified) 'deadline expiry after accepted receipt staging fails closed and performs exact cleanup'
+    Assert-Test (-not $postReceipt.runtimeAccepted -and $postReceipt.admissionState -eq 'startup-deadline-exceeded') 'late staged admission publishes only a durable nonaccepted receipt'
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $unverifiedFinalCleanup = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-final-boundary-timeout-cleanup-unverified -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $unverifiedFinalCleanupReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test (-not $unverifiedFinalCleanup.ok -and $unverifiedFinalCleanup.state -eq 'startup-deadline-exceeded' -and -not $unverifiedFinalCleanup.data.startupCleanup.verified -and $unverifiedFinalCleanup.data.startupCleanup.errors -match 'Injected incomplete') 'last-boundary expiry retains structured unverified cleanup evidence'
+    Assert-Test ($unverifiedFinalCleanup.errors -match 'did not verify a fully stopped runtime' -and $unverifiedFinalCleanup.errors -notmatch 'stopped and verified') 'last-boundary cleanup diagnostics do not claim that unverified cleanup succeeded'
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $publishFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-accepted-receipt-publish-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $publishFailure.ok -and $publishFailure.state -eq 'runtime-admission-exception' -and $publishFailure.data.startupCleanup.verified -and -not $publishFailure.data.inputContract.measurementReady) 'accepted-receipt publication failure invokes the complete outer failed-admission boundary'
+    $publishFailureReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test ($publishFailure.data.runtimeReceiptPersistenceAttempted -and $publishFailure.data.runtimeReceiptPersisted -and $publishFailure.errors -match 'Injected accepted runtime receipt publication failure') 'accepted-receipt publication failure exposes attributable persistence state'
+    Assert-Test (-not $publishFailureReceipt.runtimeAccepted -and $publishFailureReceipt.attemptId -eq $publishFailure.data.runtimeAttemptId -and $publishFailure.data.acceptedReceiptStageCleanup.verified -and @(Get-ChildItem -LiteralPath $evidence -Filter 'steamvr-null-runtime.receipt.json.*.stage').Count -eq 0) 'failed accepted-receipt publication leaves current nonaccepted authority and no private stage'
+
+    $confirmationInputFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-confirmation-timeout-input-contract-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $confirmationInputFailureReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test ($confirmationInputFailure.state -eq 'runtime-confirmation-timeout' -and $confirmationInputFailure.data.admission.runtimeConfirmationTimedOut -and $confirmationInputFailure.errors -match 'Injected runtime input-contract') 'confirmation timeout remains primary when input-contract construction also fails'
+
+    $deadlineInputFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-final-admission-timeout-input-contract-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $deadlineInputFailureReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test ($deadlineInputFailure.state -eq 'startup-deadline-exceeded' -and $deadlineInputFailure.data.admission.state -eq 'startup-deadline-exceeded' -and $deadlineInputFailure.errors -match 'Injected runtime input-contract') 'pre-final deadline remains primary when input-contract construction also fails'
+
+    $deadlineCleanupFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-final-boundary-timeout-cleanup-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $deadlineCleanupFailureReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test ($deadlineCleanupFailure.state -eq 'startup-deadline-exceeded' -and -not $deadlineCleanupFailure.data.startupCleanup.verified -and $deadlineCleanupFailure.data.startupCleanup.errors -match 'Injected exact-attempt cleanup failure') 'final-boundary deadline remains primary when exact cleanup throws'
+    Assert-Test (Test-RuntimeAdmissionReceiptTiming -Admission $deadlineCleanupFailure.data.admission -Receipt $deadlineCleanupFailureReceipt) 'final-boundary cleanup failure preserves one deadline and failure timeline'
+
+    $earlyPostLaunchFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-early-post-launch-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $earlyFailureReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test ($earlyPostLaunchFailure.state -eq 'runtime-admission-exception' -and $earlyFailureReceipt.attemptId -eq $earlyPostLaunchFailure.data.runtimeAttemptId -and -not $earlyFailureReceipt.runtimeAccepted) 'early post-launch exception returns a deterministic path and current nonaccepted receipt'
+
+    $cleanupCrossesDeadline = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-early-post-launch-cleanup-crosses-deadline -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $cleanupCrossesReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    $cleanupCrossesObserved = ([DateTimeOffset]$cleanupCrossesReceipt.failureObservedUtc).UtcDateTime
+    $cleanupCrossesStartupDeadline = ([DateTimeOffset]$cleanupCrossesReceipt.startupDeadlineUtc).UtcDateTime
+    $cleanupCrossesCompleted = ([DateTimeOffset]$cleanupCrossesReceipt.startupCleanupCompletedUtc).UtcDateTime
+    $cleanupCrossesStable = ($cleanupCrossesDeadline.state -eq 'runtime-admission-exception') -and $cleanupCrossesDeadline.data.startupCleanup.verified -and @($cleanupCrossesDeadline.data.startupCleanup.remaining).Count -eq 0 -and @($cleanupCrossesDeadline.data.startupCleanup.errors).Count -eq 0 -and (Test-RuntimeAdmissionReceiptTiming -Admission $cleanupCrossesDeadline.data.admission -Receipt $cleanupCrossesReceipt) -and ($cleanupCrossesObserved -lt $cleanupCrossesStartupDeadline) -and ($cleanupCrossesCompleted -ge $cleanupCrossesStartupDeadline)
+    Assert-Test -Condition $cleanupCrossesStable -Name 'cleanup crossing the startup deadline cannot reclassify an earlier admission exception'
+
+    $cleanupFailureCrossesDeadline = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-early-post-launch-cleanup-crosses-deadline-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $cleanupFailureCrossesReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    $cleanupFailureObserved = ([DateTimeOffset]$cleanupFailureCrossesReceipt.failureObservedUtc).UtcDateTime
+    $cleanupFailureStartupDeadline = ([DateTimeOffset]$cleanupFailureCrossesReceipt.startupDeadlineUtc).UtcDateTime
+    $cleanupFailureCompleted = ([DateTimeOffset]$cleanupFailureCrossesReceipt.startupCleanupCompletedUtc).UtcDateTime
+    $cleanupFailureRetained = @($cleanupFailureCrossesDeadline.data.startupCleanup.errors -match 'Injected exact-attempt cleanup failure').Count -gt 0
+    $cleanupFailureStable = ($cleanupFailureCrossesDeadline.state -eq 'runtime-admission-exception') -and (-not $cleanupFailureCrossesDeadline.data.startupCleanup.verified) -and $cleanupFailureRetained -and (Test-RuntimeAdmissionReceiptTiming -Admission $cleanupFailureCrossesDeadline.data.admission -Receipt $cleanupFailureCrossesReceipt) -and ($cleanupFailureObserved -lt $cleanupFailureStartupDeadline) -and ($cleanupFailureCompleted -ge $cleanupFailureStartupDeadline)
+    Assert-Test -Condition $cleanupFailureStable -Name 'cleanup failure after the startup deadline preserves the earlier admission exception and exact cleanup evidence'
+
+    $stageCleanupFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-accepted-receipt-publish-and-stage-cleanup-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $stageCleanupFailureReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    $stageResiduePath = [string]$stageCleanupFailure.data.acceptedReceiptStageCleanup.path
+    Assert-Test (-not $stageCleanupFailure.data.acceptedReceiptStageCleanup.verified -and $stageCleanupFailure.data.acceptedReceiptStageCleanup.remaining -and $stageCleanupFailure.data.acceptedReceiptStageCleanup.error -match 'Injected accepted runtime receipt stage cleanup failure' -and (Test-Path -LiteralPath $stageResiduePath -PathType Leaf)) 'private accepted-stage cleanup failure reports exact non-authoritative residue'
+    Remove-Item -LiteralPath $stageResiduePath -Force
+
+    $launchedFailures = @(
+        @{ result = $authorizationDeniedStart; receipt = $authorizationDeniedReceipt; state = 'head-pose-provider-authorization-failed'; name = 'authorization rejection returns the common launched-failure envelope' },
+        @{ result = $confirmationTimeout; receipt = $confirmationReceipt; state = 'runtime-confirmation-timeout'; name = 'confirmation timeout returns the common launched-failure envelope' },
+        @{ result = $receiptFailure; receipt = $null; state = 'runtime-confirmation-timeout'; name = 'diagnostic persistence failure returns the common launched-failure envelope' },
+        @{ result = $cleanupFailure; receipt = $cleanupFailureReceipt; state = 'runtime-confirmation-timeout'; name = 'cleanup exception returns the common launched-failure envelope' },
+        @{ result = $inputContractFailure; receipt = $inputContractFailureReceipt; state = 'runtime-admission-exception'; name = 'input-contract exception returns the common launched-failure envelope' },
+        @{ result = $stageFailure; receipt = $stageFailureReceipt; state = 'runtime-admission-exception'; name = 'accepted-stage exception returns the common launched-failure envelope' },
+        @{ result = $finalAdmissionTimeout; receipt = $finalAdmissionReceipt; state = 'startup-deadline-exceeded'; name = 'pre-final deadline returns the common launched-failure envelope' },
+        @{ result = $noConfirmationTimeout; receipt = $noConfirmationReceipt; state = 'startup-deadline-exceeded'; name = 'no-confirmation deadline returns the common launched-failure envelope' },
+        @{ result = $postReceiptTimeout; receipt = $postReceipt; state = 'startup-deadline-exceeded'; name = 'post-stage deadline returns the common launched-failure envelope' },
+        @{ result = $unverifiedFinalCleanup; receipt = $unverifiedFinalCleanupReceipt; state = 'startup-deadline-exceeded'; name = 'unverified cleanup returns the common launched-failure envelope' },
+        @{ result = $publishFailure; receipt = $publishFailureReceipt; state = 'runtime-admission-exception'; name = 'publication exception returns the common launched-failure envelope' },
+        @{ result = $confirmationInputFailure; receipt = $confirmationInputFailureReceipt; state = 'runtime-confirmation-timeout'; name = 'composed confirmation failure returns the common launched-failure envelope' },
+        @{ result = $deadlineInputFailure; receipt = $deadlineInputFailureReceipt; state = 'startup-deadline-exceeded'; name = 'composed deadline failure returns the common launched-failure envelope' },
+        @{ result = $deadlineCleanupFailure; receipt = $deadlineCleanupFailureReceipt; state = 'startup-deadline-exceeded'; name = 'deadline cleanup exception returns the common launched-failure envelope' },
+        @{ result = $earlyPostLaunchFailure; receipt = $earlyFailureReceipt; state = 'runtime-admission-exception'; name = 'early exception returns the common launched-failure envelope' },
+        @{ result = $cleanupCrossesDeadline; receipt = $cleanupCrossesReceipt; state = 'runtime-admission-exception'; name = 'deadline-crossing cleanup returns the common launched-failure envelope' },
+        @{ result = $cleanupFailureCrossesDeadline; receipt = $cleanupFailureCrossesReceipt; state = 'runtime-admission-exception'; name = 'deadline-crossing cleanup failure returns the common launched-failure envelope' },
+        @{ result = $stageCleanupFailure; receipt = $stageCleanupFailureReceipt; state = 'runtime-admission-exception'; name = 'stage residue returns the common launched-failure envelope' }
+    )
+    foreach ($case in $launchedFailures) {
+        Assert-LaunchedFailureEnvelope -Result $case.result -ExpectedState $case.state -Name $case.name -Receipt $case.receipt
+    }
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $timelyReady = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-ready -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $timelyReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test ($timelyReady.ok -and $timelyReady.state -eq 'null-runtime-started-head-pose-ready' -and $timelyReady.data.inputContract.measurementReady) 'a timely final confirmation remains accepted and measurement-ready'
+    Assert-Test ($timelyReceipt.runtimeAccepted -and $timelyReceipt.admissionState -eq 'accepted' -and $timelyReceipt.acceptedUtc) 'timely admission persists an accepted receipt'
+    Stop-Process -Id ([int]$timelyReceipt.launcherPid) -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 100
+
+    $retryAfterAccepted = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-input-contract-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $retryReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test (-not $retryAfterAccepted.ok -and -not $retryReceipt.runtimeAccepted -and $retryReceipt.attemptId -eq $retryAfterAccepted.data.runtimeAttemptId -and $retryReceipt.attemptId -ne $timelyReceipt.attemptId) 'a failed retry atomically replaces prior accepted authority with its own nonaccepted receipt'
+    Assert-LaunchedFailureEnvelope -Result $retryAfterAccepted -ExpectedState 'runtime-admission-exception' -Name 'failed retry after accepted history returns the common launched-failure envelope' -Receipt $retryReceipt
+
+    [IO.File]::WriteAllBytes($startupPath, [byte[]]@(0))
 
     $secondCallerApply = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -Compact -NoExit | ConvertFrom-Json
     Assert-Test ($secondCallerApply.ok -and $secondCallerApply.state -eq 'already-applied' -and $secondCallerApply.data.evidenceDirectory -eq [IO.Path]::GetFullPath($evidence)) 'a second evidence directory cannot establish a false baseline over an active authoritative apply transaction'
@@ -104,6 +696,14 @@ try {
     [IO.File]::WriteAllText($otherSettingsPath, $originalText, [Text.UTF8Encoding]::new($false))
     $wrongPathRestore = & $entry restore -SettingsPath $otherSettingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $wrongPathRestore.ok -and $wrongPathRestore.state -eq 'blocked' -and $wrongPathRestore.errors[0] -match 'settings path') 'restore refuses a settings path different from its apply receipt'
+
+    $movedProfilePath = "$profilePath.moved"
+    Move-Item -LiteralPath $profilePath -Destination $movedProfilePath
+    try {
+        $cacheIndependentRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+        Assert-Test ($cacheIndependentRestore.ok -and $cacheIndependentRestore.data.settingsRestoreValidation.authorized) 'restore survives removal of the original versioned profile path'
+    }
+    finally { Move-Item -LiteralPath $movedProfilePath -Destination $profilePath }
 
     [IO.File]::AppendAllText($settingsPath, "`n")
     $formattingRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
@@ -168,6 +768,12 @@ try {
     $isolatedStartDry = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -WhatIf -Compact | ConvertFrom-Json
     Assert-Test ($isolatedStartDry.ok -and $isolatedStartDry.state -eq 'dry-run' -and $isolatedStartDry.data.externalDriverIsolation.enabled -and -not $isolatedStartDry.data.inputContract.measurementReady) 'isolated start validates its receipt while runtime readiness remains fail-closed'
 
+    $isolatedBytes = [IO.File]::ReadAllBytes($openVrPathsPath)
+    [IO.File]::WriteAllText($openVrPathsPath, $openVrTextBeforeIsolation, [Text.UTF8Encoding]::new($false))
+    $baselineRestoredDry = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($baselineRestoredDry.ok -and $baselineRestoredDry.data.externalDriverIsolationValidation.baselineAlreadyRestored) 'restore accepts OpenVR registrations only when they already match the exact retained pre-isolation baseline'
+    [IO.File]::WriteAllBytes($openVrPathsPath, $isolatedBytes)
+
     $isolatedText = (Get-Content -LiteralPath $openVrPathsPath -Raw | ConvertFrom-Json -AsHashtable | ConvertTo-Json -Depth 8 -Compress) + "`r`n"
     [IO.File]::WriteAllText($openVrPathsPath, $isolatedText, [Text.UTF8Encoding]::new($false))
     $formatStart = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -WhatIf -Compact -NoExit | ConvertFrom-Json
@@ -224,6 +830,24 @@ try {
     Assert-Test (-not $failedApply.ok -and $failedApply.errors[0] -match 'every exact backup was restored') 'two-file apply failure reports verified rollback to the original state'
     Assert-Test ([IO.File]::ReadAllText($settingsPath) -ceq $originalText -and [IO.File]::ReadAllText($openVrPathsPath) -ceq $openVrTextBeforeIsolation) 'two-file apply failure leaves neither target partially mutated'
 
+    $legacyReconcileBackup = Join-Path $failureEvidence 'openvrpaths.vrpath.reconcile.before'
+    Copy-Item -LiteralPath $openVrPathsPath -Destination $legacyReconcileBackup
+    $legacyReconcile = [ordered]@{
+        contractVersion = '1.0.0'; operation = 'apply-reconcile'; transactionId = [guid]::NewGuid().ToString('N'); phase = 'committed'
+        settingsPath = [IO.Path]::GetFullPath($settingsPath); openVRPathsPath = [IO.Path]::GetFullPath($openVrPathsPath)
+        evidenceDirectory = [IO.Path]::GetFullPath($failureEvidence); evidenceJournalPath = [IO.Path]::GetFullPath((Join-Path $failureEvidence 'steamvr-null-apply-reconcile.journal.json'))
+        rollbackTargets = @([ordered]@{ name = 'openvr-registrations'; path = [IO.Path]::GetFullPath($openVrPathsPath); backupPath = [IO.Path]::GetFullPath($legacyReconcileBackup); expectedHash = (Get-FileHash -LiteralPath $legacyReconcileBackup -Algorithm SHA256).Hash })
+        preparedUtc = [DateTime]::UtcNow.ToString('o'); rollback = $null; committedUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    $legacyReconcile | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath ([string]$inspectBefore.data.targetControl.journalPath) -Encoding utf8
+    $legacyReconcileInspect = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($legacyReconcileInspect.ok -and $legacyReconcileInspect.data.recoveredTransaction.operation -eq 'apply-reconcile') 'inspect accepts a committed legacy apply-reconcile journal whose sole rollback target is OpenVR registrations'
+
+    $legacyReconcile['rollbackTargets'] = @()
+    $legacyReconcile | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath ([string]$inspectBefore.data.targetControl.journalPath) -Encoding utf8
+    $invalidLegacyReconcile = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $invalidLegacyReconcile.ok -and $invalidLegacyReconcile.errors[0] -match 'OpenVR registrations rollback target') 'legacy apply-reconcile compatibility still requires its exact OpenVR rollback target'
+
     $recoveryEvidenceA = Join-Path $fixture 'recovery-evidence-a'
     $recoveryEvidenceB = Join-Path $fixture 'recovery-evidence-b'
     New-Item -ItemType Directory -Path $recoveryEvidenceA, $recoveryEvidenceB | Out-Null
@@ -263,6 +887,8 @@ try {
 }
 finally {
     $env:CSX_STEAMVR_TRANSACTION_ROOT = $priorTransactionRoot
+    if ($poseView) { $poseView.Dispose() }
+    if ($poseMapping) { $poseMapping.Dispose() }
     if (Test-Path -LiteralPath $resolvedFixture) { Remove-Item -LiteralPath $resolvedFixture -Recurse -Force }
 }
 

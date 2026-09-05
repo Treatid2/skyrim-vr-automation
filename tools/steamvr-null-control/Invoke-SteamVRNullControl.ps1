@@ -32,7 +32,7 @@ param(
 
     [switch]$AllowExternalDisplayRedirector,
 
-    [ValidateSet('', 'apply-after-openvr', 'restore-after-settings')]
+    [ValidateSet('', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'head-pose-access-denied', 'head-pose-access-denied-after-start', 'runtime-ready', 'runtime-early-post-launch-failure', 'runtime-early-post-launch-cleanup-crosses-deadline', 'runtime-early-post-launch-cleanup-crosses-deadline-failure', 'runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-confirmation-timeout-input-contract-failure', 'runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-final-admission-timeout-input-contract-failure', 'runtime-post-receipt-timeout', 'runtime-final-boundary-timeout-cleanup-unverified', 'runtime-final-boundary-timeout-cleanup-failure', 'runtime-input-contract-failure', 'runtime-accepted-receipt-stage-failure', 'runtime-accepted-receipt-publish-failure', 'runtime-accepted-receipt-publish-and-stage-cleanup-failure')]
     [string]$InternalTestFailurePoint = '',
 
     [switch]$IsolateExternalDisplayRedirectors,
@@ -66,6 +66,38 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if (-not ('SkyrimVRAutomation.Native.SharedPoseAtomics' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Threading;
+using Microsoft.Win32.SafeHandles;
+
+namespace SkyrimVRAutomation.Native {
+    public static unsafe class SharedPoseAtomics {
+        public static long ReadInt64(SafeMemoryMappedViewHandle handle, long pointerOffset, long fieldOffset) {
+            bool referenced = false;
+            handle.DangerousAddRef(ref referenced);
+            try {
+                byte* pointer = (byte*)handle.DangerousGetHandle() + pointerOffset + fieldOffset;
+                return Interlocked.Read(ref *(long*)pointer);
+            }
+            finally { if (referenced) handle.DangerousRelease(); }
+        }
+
+        public static long ExchangeInt64(SafeMemoryMappedViewHandle handle, long pointerOffset, long fieldOffset, long value) {
+            bool referenced = false;
+            handle.DangerousAddRef(ref referenced);
+            try {
+                byte* pointer = (byte*)handle.DangerousGetHandle() + pointerOffset + fieldOffset;
+                return Interlocked.Exchange(ref *(long*)pointer, value);
+            }
+            finally { if (referenced) handle.DangerousRelease(); }
+        }
+    }
+}
+'@ -CompilerOptions '/unsafe'
+}
 
 if ([string]::IsNullOrWhiteSpace($NullProfilePath)) {
     $NullProfilePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\profiles\steamvr-null.profile.json'))
@@ -108,14 +140,85 @@ if (-not (Get-Variable -Scope Script -Name SharedTextTailState -ErrorAction Sile
     $script:SharedTextTailState = @{}
 }
 
+function Get-StreamRangeSha256 {
+    param(
+        [Parameter(Mandatory)][IO.Stream]$Stream,
+        [Parameter(Mandatory)][long]$Offset,
+        [Parameter(Mandatory)][int]$Length,
+        [DateTime]$DeadlineUtc = [DateTime]::MaxValue,
+        [ref]$BytesRead
+    )
+    if ($null -ne $BytesRead) { $BytesRead.Value = 0 }
+    if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before hashing the retained window.') }
+    if ($Length -eq 0) { return '' }
+    $savedPosition = $Stream.Position
+    $bytes = [byte[]]::new($Length)
+    try {
+        $Stream.Position = $Offset
+        $read = 0
+        while ($read -lt $Length) {
+            if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired while hashing the retained window.') }
+            $current = $Stream.Read($bytes, $read, $Length - $read)
+            if ($current -le 0) { break }
+            $read += $current
+            if ($null -ne $BytesRead) { $BytesRead.Value = $read }
+            if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired while hashing the retained window.') }
+        }
+        if ($read -ne $Length) { return $null }
+        if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before hashing the retained bytes.') }
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try {
+            $hash = [Convert]::ToHexString($algorithm.ComputeHash($bytes))
+            if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired while hashing the retained bytes.') }
+            return $hash
+        }
+        finally { $algorithm.Dispose() }
+    }
+    finally { $Stream.Position = $savedPosition }
+}
+
+function Get-ByteArraySha256 {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes,
+        [DateTime]$DeadlineUtc = [DateTime]::MaxValue
+    )
+    if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before hashing the candidate bytes.') }
+    if ($Bytes.Length -eq 0) { return '' }
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = [Convert]::ToHexString($algorithm.ComputeHash($Bytes))
+        if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired while hashing the candidate bytes.') }
+        return $hash
+    }
+    finally { $algorithm.Dispose() }
+}
+
+function Get-Utf8TrailingIncompleteByteCount {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes)
+    if ($Bytes.Length -eq 0) { return 0 }
+    $continuations = 0
+    for ($index = $Bytes.Length - 1; $index -ge 0 -and $continuations -lt 4; $index--) {
+        $value = $Bytes[$index]
+        if (($value -band 0xC0) -eq 0x80) {
+            $continuations++
+            continue
+        }
+        $expected = if (($value -band 0x80) -eq 0) { 0 } elseif (($value -band 0xE0) -eq 0xC0) { 1 } elseif (($value -band 0xF0) -eq 0xE0) { 2 } elseif (($value -band 0xF8) -eq 0xF0) { 3 } else { 0 }
+        return $(if ($expected -gt $continuations) { $continuations + 1 } else { 0 })
+    }
+    return $(if ($continuations -gt 0) { $continuations } else { 0 })
+}
+
 function Get-SharedTextTail {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][ValidateRange(1, 10000)][int]$Count,
         [Parameter(Mandatory)][ValidateRange(4096, 4194304)][int]$MaxBytes,
-        [DateTime]$DeadlineUtc = [DateTime]::MaxValue
+        [DateTime]$DeadlineUtc = [DateTime]::MaxValue,
+        [scriptblock]$InternalMutationHook,
+        [ValidateRange(0, 10000)][int]$InternalDelayAfterValidationMilliseconds = 0
     )
-    if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw 'SteamVR log-tail deadline expired before opening the log.' }
+    if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before opening the log.') }
     $stream = $null
     try {
         $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
@@ -123,7 +226,14 @@ function Get-SharedTextTail {
         $info = [IO.FileInfo]::new([IO.Path]::GetFullPath($Path))
         $identity = "$($info.FullName.ToLowerInvariant())|$($info.CreationTimeUtc.Ticks)"
         $prior = if ($script:SharedTextTailState.ContainsKey($identity)) { $script:SharedTextTailState[$identity] } else { $null }
-        $incremental = $null -ne $prior -and [int64]$prior.offset -le $capturedLength
+        $hasRetainedWindow = $null -ne $prior -and $prior.PSObject.Properties['usable'] -and [bool]$prior.usable -and $prior.PSObject.Properties['retainedBytes'] -and $prior.PSObject.Properties['retainedOffset'] -and $prior.PSObject.Properties['startsPartial']
+        $continuityMatched = $false
+        $initialHashBytesRead = 0
+        if ($hasRetainedWindow -and [int64]$prior.offset -le $capturedLength) {
+            $continuityMatched = [string]$prior.continuitySha256 -ceq [string](Get-StreamRangeSha256 -Stream $stream -Offset ([int64]$prior.continuityOffset) -Length ([int]$prior.continuityLength) -DeadlineUtc $DeadlineUtc -BytesRead ([ref]$initialHashBytesRead))
+        }
+        $incremental = $hasRetainedWindow -and [int64]$prior.offset -le $capturedLength -and $continuityMatched
+        if ($InternalMutationHook) { $null = & $InternalMutationHook 'after-continuity' $stream $capturedLength }
         $start = if ($incremental) { [int64]$prior.offset } else { [Math]::Max([int64]0, $capturedLength - $MaxBytes) }
         if (($capturedLength - $start) -gt $MaxBytes) {
             $start = $capturedLength - $MaxBytes
@@ -134,26 +244,137 @@ function Get-SharedTextTail {
         $stream.Position = $start
         $read = 0
         while ($read -lt $readLength) {
-            if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw 'SteamVR log-tail deadline expired while reading the log.' }
+            if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired while reading the log.') }
             $current = $stream.Read($bytes, $read, $readLength - $read)
+            if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired while reading the log.') }
             if ($current -le 0) { break }
             $read += $current
         }
-        $text = if ($read -gt 0) { [Text.Encoding]::UTF8.GetString($bytes, 0, $read) } else { '' }
-        if (-not $incremental -and $start -gt 0) {
-            $firstBreak = $text.IndexOf("`n", [StringComparison]::Ordinal)
-            $text = if ($firstBreak -ge 0) { $text.Substring($firstBreak + 1) } else { '' }
+        if ($read -ne $readLength) {
+            $script:SharedTextTailState.Clear()
+            $script:SharedTextTailState[$identity] = [pscustomobject]@{
+                usable = $false; stable = $false; offset = 0L; retainedBytes = [byte[]]@(); retainedOffset = 0L
+                startsPartial = $false; continuityOffset = 0L; continuityLength = 0; continuitySha256 = $null
+                incremental = $false; resynchronized = $true; bytesRead = $read; hashBytesRead = $initialHashBytesRead
+                cumulativeBytesRead = [long]$(if ($null -ne $prior -and $prior.PSObject.Properties['cumulativeBytesRead']) { [long]$prior.cumulativeBytesRead + $read } else { $read })
+                error = "The shared log became shorter while reading its captured $readLength-byte span."
+            }
+            return @()
         }
-        $prefix = if ($incremental) { [string]$prior.residual } else { '' }
-        $combined = $prefix + $text
-        $parts = @($combined -split "`r?`n", -1)
+        if ($incremental) { $priorBytes = [byte[]]$prior.retainedBytes }
+        else { $priorBytes = [byte[]]::new(0) }
+        $retainedBytes = [byte[]]::new($priorBytes.Length + $read)
+        if ($priorBytes.Length -gt 0) { [Array]::Copy($priorBytes, 0, $retainedBytes, 0, $priorBytes.Length) }
+        if ($read -gt 0) { [Array]::Copy($bytes, 0, $retainedBytes, $priorBytes.Length, $read) }
+        $retainedOffset = if ($incremental) { [int64]$prior.retainedOffset } else { $start }
+        $startsPartial = if ($incremental) { [bool]$prior.startsPartial } else { $start -gt 0 }
+        $leadingProofByte = if ($incremental -and $prior.PSObject.Properties['leadingProofByte']) { $prior.leadingProofByte } else { $null }
+        if ($retainedBytes.Length -gt $MaxBytes) {
+            $discardCount = $retainedBytes.Length - $MaxBytes
+            $retainedBytes = [byte[]]$retainedBytes[$discardCount..($retainedBytes.Length - 1)]
+            $retainedOffset += $discardCount
+            $startsPartial = $true
+            $leadingProofByte = $null
+        }
+        if ($startsPartial -and $retainedBytes.Length -gt 0) {
+            $firstBreak = [Array]::IndexOf($retainedBytes, [byte]0x0A)
+            if ($firstBreak -ge 0) {
+                $discardCount = $firstBreak + 1
+                if ($discardCount -lt $retainedBytes.Length) { $retainedBytes = [byte[]]$retainedBytes[$discardCount..($retainedBytes.Length - 1)] }
+                else { $retainedBytes = [byte[]]::new(0) }
+                $retainedOffset += $discardCount
+                $startsPartial = $false
+                $leadingProofByte = [byte]0x0A
+            }
+        }
+        if ($null -ne $leadingProofByte -and $retainedBytes.Length -ge $MaxBytes) {
+            $nextBreak = [Array]::IndexOf($retainedBytes, [byte]0x0A)
+            if ($nextBreak -ge 0) {
+                $discardCount = $nextBreak + 1
+                if ($discardCount -lt $retainedBytes.Length) { $retainedBytes = [byte[]]$retainedBytes[$discardCount..($retainedBytes.Length - 1)] }
+                else { $retainedBytes = [byte[]]::new(0) }
+                $retainedOffset += $discardCount
+            }
+            else {
+                if ($retainedBytes.Length -gt 1) { $retainedBytes = [byte[]]$retainedBytes[1..($retainedBytes.Length - 1)] }
+                else { $retainedBytes = [byte[]]::new(0) }
+                $retainedOffset++
+                $startsPartial = $true
+                $leadingProofByte = $null
+            }
+        }
+        $incompleteByteCount = if ($startsPartial) { 0 } else { Get-Utf8TrailingIncompleteByteCount -Bytes $retainedBytes }
+        $completeByteCount = $retainedBytes.Length - $incompleteByteCount
+        $combined = if (-not $startsPartial -and $completeByteCount -gt 0) { [Text.Encoding]::UTF8.GetString($retainedBytes, 0, $completeByteCount) } else { '' }
+        if ($incompleteByteCount -gt 0) { $nextPendingBytes = [byte[]]$retainedBytes[$completeByteCount..($retainedBytes.Length - 1)] }
+        else { $nextPendingBytes = [byte[]]::new(0) }
+        $parts = @($combined -split '\r?\n')
         $residual = if ($combined.EndsWith("`n", [StringComparison]::Ordinal)) { '' } else { [string]$parts[-1] }
         $completed = if ($residual.Length -gt 0 -and $parts.Count -gt 1) { @($parts[0..($parts.Count - 2)]) } elseif ($residual.Length -gt 0) { @() } else { @($parts | Select-Object -SkipLast 1) }
-        $lines = @($(if ($incremental) { @($prior.lines) }) + $completed)
+        $lines = @($completed)
         if ($lines.Count -gt $Count) { $lines = @($lines[($lines.Count - $Count)..($lines.Count - 1)]) }
+        # Include the left delimiter whenever decoded text starts after byte 0;
+        # payload equality alone cannot prove that the first line stays framed.
+        $hasLeadingProof = $null -ne $leadingProofByte -and $retainedOffset -gt 0 -and -not $startsPartial
+        $continuityBytes = [byte[]]::new($retainedBytes.Length + $(if ($hasLeadingProof) { 1 } else { 0 }))
+        if ($hasLeadingProof) { $continuityBytes[0] = [byte]$leadingProofByte }
+        if ($retainedBytes.Length -gt 0) { [Array]::Copy($retainedBytes, 0, $continuityBytes, $(if ($hasLeadingProof) { 1 } else { 0 }), $retainedBytes.Length) }
+        $continuityLength = $continuityBytes.Length
+        $continuityOffset = $retainedOffset - $(if ($hasLeadingProof) { 1 } else { 0 })
+        $continuitySha256 = Get-ByteArraySha256 -Bytes $continuityBytes -DeadlineUtc $DeadlineUtc
+        $selectedPathStream = $null
+        $selectedPathHashBytesRead = 0
+        $selectedPathError = $null
+        try {
+            if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before validating the selected log path.') }
+            $selectedPathStream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+            $selectedPathSha256 = Get-StreamRangeSha256 -Stream $selectedPathStream -Offset $continuityOffset -Length $continuityLength -DeadlineUtc $DeadlineUtc -BytesRead ([ref]$selectedPathHashBytesRead)
+            $stable = $selectedPathStream.Length -ge $capturedLength -and $selectedPathSha256 -ceq $continuitySha256
+        }
+        catch [TimeoutException] { throw }
+        catch {
+            $stable = $false
+            $selectedPathError = $_.Exception.Message
+        }
+        finally { if ($selectedPathStream) { $selectedPathStream.Dispose() } }
+        if ($InternalDelayAfterValidationMilliseconds -gt 0) { Start-Sleep -Milliseconds $InternalDelayAfterValidationMilliseconds }
+        if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before publishing the validated snapshot.') }
+        if (-not $stable) {
+            $script:SharedTextTailState.Clear()
+            $script:SharedTextTailState[$identity] = [pscustomobject]@{
+                usable = $false; stable = $false; offset = 0L; retainedBytes = [byte[]]@(); retainedOffset = 0L
+                startsPartial = $false; continuityOffset = 0L; continuityLength = 0; continuitySha256 = $null
+                incremental = $false; resynchronized = $true; bytesRead = $read
+                hashBytesRead = $initialHashBytesRead + $selectedPathHashBytesRead
+                cumulativeBytesRead = [long]$(if ($null -ne $prior -and $prior.PSObject.Properties['cumulativeBytesRead']) { [long]$prior.cumulativeBytesRead + $read } else { $read })
+                error = $(if ($selectedPathError) { "The selected shared log could not be validated: $selectedPathError" } else { 'The shared log changed or was replaced while its bounded tail snapshot was being validated.' })
+            }
+            return @()
+        }
+        $usable = $retainedBytes.Length -gt 0 -or $retainedOffset -eq 0
         $script:SharedTextTailState.Clear()
-        $script:SharedTextTailState[$identity] = [pscustomobject]@{ offset = $capturedLength; residual = $residual; lines = $lines }
-        $visible = @($lines + $(if ($residual.Length -gt 0) { $residual }))
+        $script:SharedTextTailState[$identity] = [pscustomobject]@{
+            usable = $usable
+            stable = $true
+            offset = $capturedLength
+            residual = $residual
+            lines = $lines
+            pendingBytes = $nextPendingBytes
+            retainedBytes = $retainedBytes
+            retainedOffset = $retainedOffset
+            startsPartial = $startsPartial
+            leadingProofByte = $leadingProofByte
+            continuityOffset = $continuityOffset
+            continuityLength = $continuityLength
+            continuitySha256 = $continuitySha256
+            incremental = $incremental
+            resynchronized = $null -ne $prior -and -not $incremental
+            bytesRead = $read
+            hashBytesRead = $initialHashBytesRead + $selectedPathHashBytesRead
+            cumulativeBytesRead = [long]$(if ($null -ne $prior -and $prior.PSObject.Properties['cumulativeBytesRead']) { [long]$prior.cumulativeBytesRead + $read } else { $read })
+        }
+        $visible = @($lines)
+        if ($residual.Length -gt 0) { $visible += $residual }
         if ($visible.Count -gt $Count) { return @($visible[($visible.Count - $Count)..($visible.Count - 1)]) }
         return $visible
     }
@@ -292,10 +513,19 @@ function Get-JsonDifferencePaths([AllowNull()]$Expected, [AllowNull()]$Actual, [
 }
 
 function Get-NullSettingsExpectation([Collections.IDictionary]$Receipt, [string]$BackupPath) {
-    if (-not $Receipt.Contains('profilePath') -or [string]::IsNullOrWhiteSpace([string]$Receipt['profilePath'])) { throw 'The apply receipt does not identify its null-HMD profile.' }
-    $profilePath = [IO.Path]::GetFullPath([string]$Receipt['profilePath'])
-    if (-not (Test-Path -LiteralPath $profilePath -PathType Leaf)) { throw "The receipt-bound null-HMD profile is missing: $profilePath" }
-    if ((Get-HashOrNull $profilePath) -ne [string]$Receipt['profileSha256']) { throw 'The null-HMD profile hash differs from the apply receipt.' }
+    if (-not $Receipt.Contains('profileSha256') -or [string]::IsNullOrWhiteSpace([string]$Receipt['profileSha256'])) { throw 'The apply receipt does not identify its null-HMD profile hash.' }
+    $profileCandidates = [Collections.Generic.List[string]]::new()
+    foreach ($field in @('profileEvidencePath', 'profilePath')) {
+        if ($Receipt.Contains($field) -and -not [string]::IsNullOrWhiteSpace([string]$Receipt[$field])) {
+            $profileCandidates.Add([IO.Path]::GetFullPath([string]$Receipt[$field]))
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($NullProfilePath)) { $profileCandidates.Add([IO.Path]::GetFullPath($NullProfilePath)) }
+    $profilePath = @($profileCandidates | Select-Object -Unique | Where-Object {
+        (Test-Path -LiteralPath $_ -PathType Leaf) -and (Get-HashOrNull $_) -eq [string]$Receipt['profileSha256']
+    } | Select-Object -First 1)
+    if ($profilePath.Count -ne 1) { throw 'No receipt-bound or caller-supplied null-HMD profile matches the apply receipt hash.' }
+    $profilePath = [string]$profilePath[0]
     $expected = Read-JsonHashtable -Path $BackupPath
     $profile = Read-JsonHashtable -Path $profilePath
     $controlled = [Collections.Generic.List[string]]::new()
@@ -564,6 +794,24 @@ function Write-JsonAtomic {
     }
 }
 
+function Copy-FileAtomicVerified {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$ExpectedSha256
+    )
+    $temporary = "$Destination.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllBytes($temporary, [IO.File]::ReadAllBytes($Source))
+        if ((Get-HashOrNull $temporary) -ne $ExpectedSha256) { throw 'The staged null-HMD profile copy failed hash verification.' }
+        Move-Item -LiteralPath $temporary -Destination $Destination -Force
+        if ((Get-HashOrNull $Destination) -ne $ExpectedSha256) { throw 'The committed null-HMD profile evidence failed hash verification.' }
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force }
+    }
+}
+
 function Write-SteamVRTransactionJournal {
     param(
         [Parameter(Mandatory)]$Journal,
@@ -624,6 +872,8 @@ function Assert-SteamVRJournalTargets {
     )
     $settingsFull = [IO.Path]::GetFullPath($ExpectedSettingsPath)
     $openVRFull = [IO.Path]::GetFullPath($ExpectedOpenVRPathsPath)
+    $operation = if (Test-JsonDictionaryContains $Journal 'operation') { [string]$Journal['operation'] } else { '' }
+    $isLegacyApplyReconcile = [string]::Equals($operation, 'apply-reconcile', [StringComparison]::Ordinal)
     if (-not (Test-JsonDictionaryContains $Journal 'settingsPath') -or -not [string]::Equals([IO.Path]::GetFullPath([string]$Journal['settingsPath']), $settingsFull, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'The authoritative SteamVR journal settings target does not match its target-owned control directory.'
     }
@@ -639,7 +889,12 @@ function Assert-SteamVRJournalTargets {
         if ($path.ToLowerInvariant() -notin $allowed) { throw "The authoritative SteamVR journal contains an out-of-contract rollback target: $path" }
         if (-not $seen.Add($path)) { throw "The authoritative SteamVR journal repeats a rollback target: $path" }
     }
-    if (-not $seen.Contains($settingsFull)) { throw 'The authoritative SteamVR journal does not contain the SteamVR settings rollback target.' }
+    if ($isLegacyApplyReconcile) {
+        if (-not $seen.Contains($openVRFull)) { throw 'The authoritative legacy apply-reconcile journal does not contain the OpenVR registrations rollback target.' }
+    }
+    elseif (-not $seen.Contains($settingsFull)) {
+        throw 'The authoritative SteamVR journal does not contain the SteamVR settings rollback target.'
+    }
 }
 
 function Stop-ExactStartedSteamVRProcesses([DateTime]$StartedUtc) {
@@ -655,7 +910,18 @@ function Stop-ExactStartedSteamVRProcesses([DateTime]$StartedUtc) {
         $remaining = @($targets | Where-Object { Get-Process -Id ([int]$_.id) -ErrorAction SilentlyContinue })
         if ($remaining.Count -gt 0) { Start-Sleep -Milliseconds 100 }
     } while ($remaining.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
-    return [pscustomobject][ordered]@{ requested = $targets; remaining = $remaining; errors = $errors; verified = $remaining.Count -eq 0 -and $errors.Count -eq 0 }
+    if ($InternalTestFailurePoint -in @('runtime-early-post-launch-cleanup-crosses-deadline', 'runtime-early-post-launch-cleanup-crosses-deadline-failure')) {
+        Start-Sleep -Milliseconds 700
+    }
+    if ($InternalTestFailurePoint -in @('runtime-confirmation-timeout-cleanup-failure', 'runtime-final-boundary-timeout-cleanup-failure', 'runtime-early-post-launch-cleanup-crosses-deadline-failure')) {
+        throw [IO.IOException]::new('Injected exact-attempt cleanup failure after process handling.')
+    }
+    $verified = $remaining.Count -eq 0 -and $errors.Count -eq 0
+    if ($InternalTestFailurePoint -eq 'runtime-final-boundary-timeout-cleanup-unverified') {
+        $errors += 'Injected incomplete exact-attempt cleanup verification.'
+        $verified = $false
+    }
+    return [pscustomobject][ordered]@{ requested = $targets; remaining = $remaining; errors = $errors; verified = $verified }
 }
 
 function Get-EffectiveState {
@@ -716,38 +982,96 @@ function Get-EffectiveState {
     }
 }
 
+function Read-HeadPoseAtomicUInt64([IO.MemoryMappedFiles.MemoryMappedViewAccessor]$View, [long]$Offset) {
+    return [uint64][SkyrimVRAutomation.Native.SharedPoseAtomics]::ReadInt64(
+        $View.SafeMemoryMappedViewHandle,
+        $View.PointerOffset,
+        $Offset)
+}
+
+function Test-HeadPoseDriverIdentity([uint32]$CreatorPid, [uint64]$DriverStartedFileTimeUtc) {
+    if ($CreatorPid -eq 0 -or $DriverStartedFileTimeUtc -eq 0) { return $false }
+    try {
+        $process = Get-Process -Id $CreatorPid -ErrorAction Stop
+        $processStart = [uint64]$process.StartTime.ToUniversalTime().ToFileTimeUtc()
+        $now = [uint64][DateTime]::UtcNow.AddSeconds(5).ToFileTimeUtc()
+        return $processStart -le $DriverStartedFileTimeUtc -and $DriverStartedFileTimeUtc -le $now
+    }
+    catch { return $false }
+}
+
 function Get-HeadPoseSharedState {
     param([Parameter(Mandatory)]$Contract)
     $mapping = $null
     $view = $null
     try {
+        $expectedVersion = [int]$Contract['sharedMemoryVersion']
+        $requiredSize = switch ($expectedVersion) {
+            1 { 88 }
+            2 { 128 }
+            default { throw "Unsupported head-pose shared-memory version: $expectedVersion" }
+        }
+        $expectedSize = if ($Contract.ContainsKey('sharedMemorySize')) {
+            [int]$Contract['sharedMemorySize']
+        }
+        else { $requiredSize }
+        if ($expectedSize -ne $requiredSize) {
+            throw "Head-pose shared-memory version $expectedVersion requires a $requiredSize-byte contract, not $expectedSize bytes."
+        }
         $mapping = [IO.MemoryMappedFiles.MemoryMappedFile]::OpenExisting(
             [string]$Contract['sharedMemoryName'],
-            [IO.MemoryMappedFiles.MemoryMappedFileRights]::Read)
-        $view = $mapping.CreateViewAccessor(0, 88, [IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
-        $firstSequence = $view.ReadUInt64(8)
-        $state = [ordered]@{
-            magic = $view.ReadUInt32(0)
-            version = $view.ReadUInt16(4)
-            size = $view.ReadUInt16(6)
-            requestedSequence = $firstSequence
-            appliedSequence = $view.ReadUInt64(16)
-            status = $view.ReadUInt32(24)
-            flags = $view.ReadUInt32(28)
-            position = @($view.ReadDouble(32), $view.ReadDouble(40), $view.ReadDouble(48))
-            quaternion = @($view.ReadDouble(56), $view.ReadDouble(64), $view.ReadDouble(72), $view.ReadDouble(80))
+            [IO.MemoryMappedFiles.MemoryMappedFileRights]::ReadWrite)
+        # Interlocked.Read requires a writable view but does not mutate the contract.
+        $view = $mapping.CreateViewAccessor(0, $expectedSize, [IO.MemoryMappedFiles.MemoryMappedFileAccess]::ReadWrite)
+        for ($attempt = 0; $attempt -lt 10; $attempt++) {
+            $firstSequence = Read-HeadPoseAtomicUInt64 -View $view -Offset 8
+            if (($firstSequence % 2) -ne 0) {
+                [Threading.Thread]::Sleep(1)
+                continue
+            }
+            $state = [ordered]@{
+                magic = $view.ReadUInt32(0)
+                version = $view.ReadUInt16(4)
+                size = $view.ReadUInt16(6)
+                requestedSequence = $firstSequence
+                appliedSequence = Read-HeadPoseAtomicUInt64 -View $view -Offset 16
+                status = $view.ReadUInt32(24)
+                flags = $view.ReadUInt32(28)
+                position = @($view.ReadDouble(32), $view.ReadDouble(40), $view.ReadDouble(48))
+                quaternion = @($view.ReadDouble(56), $view.ReadDouble(64), $view.ReadDouble(72), $view.ReadDouble(80))
+            }
+            if ($expectedVersion -eq 2) {
+                $state['writerNonce'] = $view.ReadUInt64(88)
+                $state['acknowledgedWriterNonce'] = $view.ReadUInt64(96)
+                $state['driverInstanceNonce'] = $view.ReadUInt64(104)
+                $state['driverCreatorPid'] = $view.ReadUInt32(112)
+                $state['driverStartedFileTimeUtc'] = $view.ReadUInt64(120)
+            }
+            $secondSequence = Read-HeadPoseAtomicUInt64 -View $view -Offset 8
+            if ($firstSequence -ne $secondSequence -or ($secondSequence % 2) -ne 0) { continue }
+
+            $state['stable'] = $true
+            $state['available'] = $true
+            $state['protocolValid'] = $state.magic -eq 0x48505343 -and $state.version -eq $expectedVersion -and $state.size -eq $expectedSize
+            $state['eyeHeightQualified'] = $state.position[1] -ge [double]$Contract['minimumQualifiedEyeHeightMeters'] -and $state.position[1] -le [double]$Contract['maximumQualifiedEyeHeightMeters']
+            if ($expectedVersion -eq 2) {
+                $state['driverIdentityVerified'] = Test-HeadPoseDriverIdentity -CreatorPid $state.driverCreatorPid -DriverStartedFileTimeUtc $state.driverStartedFileTimeUtc
+                $state['acknowledged'] = $state.requestedSequence -gt 0 -and $state.appliedSequence -eq $state.requestedSequence -and $state.writerNonce -ne 0 -and $state.acknowledgedWriterNonce -eq $state.writerNonce -and $state.status -eq 1
+                $state['qualified'] = $state.protocolValid -and $state.driverIdentityVerified -and $state.driverInstanceNonce -ne 0 -and $state.acknowledged -and $state.eyeHeightQualified -and (($state.flags -band 1) -eq 1)
+            }
+            else {
+                $state['acknowledged'] = $state.requestedSequence -gt 0 -and $state.appliedSequence -eq $state.requestedSequence -and $state.status -eq 1
+                $state['qualified'] = $state.protocolValid -and $state.acknowledged -and $state.eyeHeightQualified -and (($state.flags -band 1) -eq 1)
+            }
+            return [pscustomobject]$state
         }
-        $secondSequence = $view.ReadUInt64(8)
-        $state['stable'] = $firstSequence -eq $secondSequence -and ($secondSequence % 2) -eq 0
-        $state['available'] = $true
-        $state['protocolValid'] = $state.magic -eq 0x48505343 -and $state.version -eq [int]$Contract['sharedMemoryVersion'] -and $state.size -eq 88
-        $state['acknowledged'] = $state.stable -and $state.requestedSequence -gt 0 -and $state.appliedSequence -eq $state.requestedSequence -and $state.status -eq 1
-        $state['eyeHeightQualified'] = $state.position[1] -ge [double]$Contract['minimumQualifiedEyeHeightMeters'] -and $state.position[1] -le [double]$Contract['maximumQualifiedEyeHeightMeters']
-        $state['qualified'] = $state.protocolValid -and $state.acknowledged -and $state.eyeHeightQualified -and (($state.flags -band 1) -eq 1)
-        return [pscustomobject]$state
+        throw 'The shared pose changed continuously and could not be read atomically.'
     }
     catch [IO.FileNotFoundException] {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The head-pose shared-memory provider is not running.' }
+    }
+    catch [UnauthorizedAccessException] {
+        throw [UnauthorizedAccessException]::new('The automation identity is not authorized to read and acknowledge the head-pose shared-memory provider.', $_.Exception)
     }
     catch {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; error = $_.Exception.Message }
@@ -759,7 +1083,10 @@ function Get-HeadPoseSharedState {
 }
 
 function Get-ApplicationHeadPose {
-    param([Parameter(Mandatory)]$Contract)
+    param(
+        [Parameter(Mandatory)]$Contract,
+        [DateTime]$DeadlineUtc = [DateTime]::MaxValue
+    )
     if ([string]::IsNullOrWhiteSpace($HeadPoseDriverRoot)) {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The stable head-pose driver root could not be resolved.' }
     }
@@ -770,8 +1097,19 @@ function Get-ApplicationHeadPose {
     try {
         $boundedTool = Join-Path (Split-Path -Parent $PSScriptRoot) 'process-control\Invoke-BoundedProcess.ps1'
         if (-not (Test-Path -LiteralPath $boundedTool -PathType Leaf)) { throw "Bounded process controller is missing: $boundedTool" }
-        $bounded = & $boundedTool -FilePath $probePath -WorkingDirectory (Split-Path -Parent $probePath) -MaxAttempts 1 -TimeoutSeconds 10 -NoExit -Compact | ConvertFrom-Json -Depth 30
+        $probeTimeoutSeconds = 10
+        if ($DeadlineUtc -ne [DateTime]::MaxValue) {
+            $remainingMilliseconds = [long]($DeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds
+            if ($remainingMilliseconds -lt 1450) {
+                throw [TimeoutException]::new('SteamVR readiness deadline leaves insufficient time for the application-facing pose probe and bounded cleanup.')
+            }
+            $probeTimeoutSeconds = [Math]::Max(1, [Math]::Min(10, [Math]::Floor(($remainingMilliseconds - 450) / 1000)))
+        }
+        $bounded = & $boundedTool -FilePath $probePath -WorkingDirectory (Split-Path -Parent $probePath) -MaxAttempts 1 -TimeoutSeconds $probeTimeoutSeconds -TerminationGraceMilliseconds 100 -StreamDrainGraceMilliseconds 100 -NoExit -Compact | ConvertFrom-Json -Depth 30
         $attempt = if (@($bounded.attempts).Count -gt 0) { $bounded.attempts[-1] } else { $null }
+        if ($attempt -and [bool]$attempt.timedOut) {
+            throw [TimeoutException]::new("Independent OpenVR pose probe exceeded its $probeTimeoutSeconds-second share of the SteamVR readiness deadline.")
+        }
         if ($null -eq $attempt -or [string]::IsNullOrWhiteSpace([string]$attempt.stdout)) { throw "Independent OpenVR pose probe produced no bounded output. $($bounded.errors -join '; ')" }
         $payload = [string]$attempt.stdout | ConvertFrom-Json -ErrorAction Stop
         $qualified = $bounded.ok -and $payload.ok -and $payload.standing.connected -and $payload.standing.valid -and
@@ -785,6 +1123,9 @@ function Get-ApplicationHeadPose {
             boundedProcess = $bounded
             observation = $payload
         }
+    }
+    catch [TimeoutException] {
+        throw
     }
     catch {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; probePath = $probePath; error = $_.Exception.Message }
@@ -825,8 +1166,10 @@ function Get-NullRuntimeEvidence {
     $headPoseLoaded = $null
     $headPoseRegistered = $null
     $tail = @()
+    $tailState = $null
     if ($serverStartUtc -and (Test-Path -LiteralPath $ServerLogPath -PathType Leaf)) {
         $tail = @(Get-SharedTextTail -Path $ServerLogPath -Count 2000 -MaxBytes $LogTailMaxBytes -DeadlineUtc $DeadlineUtc)
+        $tailState = @($script:SharedTextTailState.Values | Select-Object -First 1)[0]
         $minimumUtc = $serverStartUtc.AddSeconds(-3)
         foreach ($line in $tail) {
             $timestampUtc = Get-LogTimestampUtc -Line $line
@@ -845,25 +1188,86 @@ function Get-NullRuntimeEvidence {
             }
         }
     }
-    $headPoseState = Get-HeadPoseSharedState -Contract $Profile['headPoseProviderContract']
-    $applicationHeadPose = if ($server.Count -eq 1 -and [bool]$headPoseState.qualified) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider is not ready for an application-facing pose probe.' } }
-    return [pscustomobject][ordered]@{
+    $headPoseAuthorizationError = $null
+    try {
+        $denyAfterStart = $InternalTestFailurePoint -eq 'head-pose-access-denied-after-start' -and
+            (Get-Variable -Scope Script -Name SteamVRStartupAttemptActive -ValueOnly -ErrorAction SilentlyContinue)
+        if ($InternalTestFailurePoint -eq 'head-pose-access-denied' -or $denyAfterStart) {
+            throw [UnauthorizedAccessException]::new('Injected head-pose shared-memory authorization failure.')
+        }
+        $headPoseState = Get-HeadPoseSharedState -Contract $Profile['headPoseProviderContract']
+    }
+    catch [UnauthorizedAccessException] {
+        $headPoseAuthorizationError = $_.Exception.Message
+        $headPoseState = [pscustomobject][ordered]@{
+            available = $false
+            qualified = $false
+            authorizationDenied = $true
+            error = $headPoseAuthorizationError
+        }
+    }
+    $providerLogReady = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active -and $null -ne $headPoseLoaded -and $null -ne $headPoseRegistered
+    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -DeadlineUtc $DeadlineUtc } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider is not ready for an application-facing pose probe.' } }
+    $runtimeEvidence = [pscustomobject][ordered]@{
         active = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active
         serverProcess = if ($server.Count -eq 1) { $server[0] } else { $null }
         steamVrProcesses = $owned
         unprovenProcesses = @($Processes | Where-Object { $_ -notin $owned })
         serverLogPath = $ServerLogPath
-        serverLogSha256 = Get-HashOrNull $ServerLogPath
+        serverLogSha256 = if ($tailState -and [bool]$tailState.stable -and [bool]$tailState.usable) { [string]$tailState.continuitySha256 } else { $null }
+        serverLogHashScope = 'bounded-tail-window'
+        serverLogHashOffset = if ($tailState) { [long]$tailState.continuityOffset } else { $null }
+        serverLogHashLength = if ($tailState) { [int]$tailState.continuityLength } else { 0 }
+        serverLogIo = [pscustomobject][ordered]@{
+            maxBytes = $LogTailMaxBytes
+            bytesRead = if ($tailState) { [int]$tailState.bytesRead } else { 0 }
+            hashBytesRead = if ($tailState) { [int]$tailState.hashBytesRead } else { 0 }
+            totalBytesExamined = if ($tailState) { [int]$tailState.bytesRead + [int]$tailState.hashBytesRead } else { 0 }
+            stable = $null -ne $tailState -and [bool]$tailState.stable
+            usable = $null -ne $tailState -and [bool]$tailState.usable
+            incremental = $null -ne $tailState -and [bool]$tailState.incremental
+            resynchronized = $null -ne $tailState -and [bool]$tailState.resynchronized
+            error = if ($tailState -and $tailState.PSObject.Properties['error']) { [string]$tailState.error } else { $null }
+        }
         driverLoaded = $loaded
         activeHmd = $active
         headPoseDriverLoaded = $headPoseLoaded
         headPoseDeviceRegistered = $headPoseRegistered
         headPoseState = $headPoseState
+        headPoseAuthorizationError = $headPoseAuthorizationError
         applicationHeadPose = $applicationHeadPose
-        headPoseReady = $server.Count -eq 1 -and $null -ne $headPoseLoaded -and $null -ne $headPoseRegistered -and [bool]$headPoseState.qualified -and [bool]$applicationHeadPose.qualified
+        headPoseReady = $providerLogReady -and [bool]$headPoseState.qualified -and [bool]$applicationHeadPose.qualified
         dashboardProcesses = @($owned | Where-Object name -eq 'vrdashboard')
         dashboardSuppressed = $Profile['dashboard'].ContainsKey('enableDashboard') -and -not [bool]$Profile['dashboard']['enableDashboard']
     }
+    $fixtureReadyPoints = @(
+        'runtime-ready',
+        'runtime-early-post-launch-failure',
+        'runtime-early-post-launch-cleanup-crosses-deadline',
+        'runtime-early-post-launch-cleanup-crosses-deadline-failure',
+        'runtime-confirmation-timeout',
+        'runtime-confirmation-timeout-receipt-failure',
+        'runtime-confirmation-timeout-cleanup-failure',
+        'runtime-confirmation-timeout-input-contract-failure',
+        'runtime-final-admission-timeout',
+        'runtime-final-admission-timeout-no-confirmation',
+        'runtime-final-admission-timeout-input-contract-failure',
+        'runtime-post-receipt-timeout',
+        'runtime-final-boundary-timeout-cleanup-unverified',
+        'runtime-final-boundary-timeout-cleanup-failure',
+        'runtime-input-contract-failure',
+        'runtime-accepted-receipt-stage-failure',
+        'runtime-accepted-receipt-publish-failure',
+        'runtime-accepted-receipt-publish-and-stage-cleanup-failure'
+    )
+    $fixtureMode = -not [string]::IsNullOrWhiteSpace($env:CSX_STEAMVR_TRANSACTION_ROOT) -and
+        (Get-Variable -Scope Script -Name SteamVRStartupAttemptActive -ValueOnly -ErrorAction SilentlyContinue)
+    if ($fixtureMode -and $InternalTestFailurePoint -in $fixtureReadyPoints) {
+        $runtimeEvidence.active = $true
+        $runtimeEvidence.headPoseReady = $true
+        $runtimeEvidence.headPoseAuthorizationError = $null
+    }
+    return $runtimeEvidence
 }
 
 function New-Result {
@@ -876,6 +1280,74 @@ function New-Result {
         timestampUtc = [DateTime]::UtcNow.ToString('o')
         errors = @($Errors)
         data = $Data
+    }
+}
+
+function New-RuntimeAdmissionSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$State,
+        [int]$ProbeAttempts,
+        [AllowNull()]$LastProbeError,
+        [bool]$ConfirmationAttempted,
+        [bool]$ConfirmationTimedOut,
+        [Parameter(Mandatory)][DateTime]$FailureObservedUtc,
+        [Parameter(Mandatory)][DateTime]$StartupDeadlineUtc,
+        [Parameter(Mandatory)][DateTime]$CleanupCompletedUtc
+    )
+    return [ordered]@{
+        state = $State
+        runtimeProbeAttempts = $ProbeAttempts
+        lastRuntimeProbeError = $LastProbeError
+        runtimeConfirmationAttempted = $ConfirmationAttempted
+        runtimeConfirmationTimedOut = $ConfirmationTimedOut
+        failureObservedUtc = $FailureObservedUtc.ToUniversalTime().ToString('o')
+        startupDeadlineUtc = $StartupDeadlineUtc.ToUniversalTime().ToString('o')
+        startupCleanupCompletedUtc = $CleanupCompletedUtc.ToUniversalTime().ToString('o')
+    }
+}
+
+function Set-RuntimeReceiptFailureEvidence {
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Receipt,
+        [Parameter(Mandatory)][Collections.IDictionary]$Admission,
+        [Parameter(Mandatory)]$StartupCleanup
+    )
+    $Receipt['runtimeAccepted'] = $false
+    $Receipt['admissionState'] = [string]$Admission['state']
+    $Receipt['acceptedUtc'] = $null
+    $Receipt['startupDeadlineUtc'] = [string]$Admission['startupDeadlineUtc']
+    $Receipt['failureObservedUtc'] = [string]$Admission['failureObservedUtc']
+    $Receipt['startupCleanupCompletedUtc'] = [string]$Admission['startupCleanupCompletedUtc']
+    $Receipt['startupCleanup'] = $StartupCleanup
+}
+
+function New-LaunchedRuntimeFailureData {
+    param(
+        $Effective,
+        $Runtime,
+        $Processes,
+        [Parameter(Mandatory)]$Admission,
+        [Parameter(Mandatory)]$InputContract,
+        [Parameter(Mandatory)][string]$ReceiptPath,
+        [AllowNull()][string]$AttemptId,
+        [bool]$ReceiptPersistenceAttempted,
+        [bool]$ReceiptPersisted,
+        [AllowNull()]$ReceiptError,
+        [Parameter(Mandatory)]$StartupCleanup
+    )
+    return [ordered]@{
+        effective = $Effective
+        runtime = $Runtime
+        processes = @($Processes)
+        admission = $Admission
+        inputContract = $InputContract
+        runtimeReceiptPath = $ReceiptPath
+        runtimeAttemptId = $AttemptId
+        runtimeReceiptPersistenceAttempted = $ReceiptPersistenceAttempted
+        runtimeReceiptPersisted = $ReceiptPersisted
+        runtimeReceiptError = $ReceiptError
+        startupCleanup = $StartupCleanup
+        acceptedReceiptStageCleanup = $null
     }
 }
 
@@ -905,6 +1377,28 @@ $targetControl = $null
 $targetLock = $null
 $recoveredTransaction = $null
 $pendingAuthoritativeTransaction = $null
+$startupAttemptStartedUtc = $null
+$startupAttemptAccepted = $false
+$startupCleanup = $null
+$acceptedReceiptStagePath = $null
+$effective = $null
+$runtime = $null
+$processes = @()
+$inputContract = $null
+$runtimeReceiptPath = $null
+$runtimeReceipt = $null
+$runtimeReceiptPersisted = $false
+$runtimeReceiptPersistenceAttempted = $false
+$runtimeReceiptError = $null
+$runtimeAttemptId = $null
+$failureState = $null
+$runtimeProbeAttempts = 0
+$lastRuntimeProbeError = $null
+$runtimeConfirmationAttempted = $false
+$runtimeConfirmationTimedOut = $false
+$startupDeadlineUtc = $null
+$failureObservedUtc = $null
+$startupCleanupCompletedUtc = $null
 try {
     if ([string]::IsNullOrWhiteSpace($OpenVRPathsPath)) { throw 'OpenVRPathsPath is required to identify the complete live transaction target.' }
     $localApplicationData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
@@ -943,8 +1437,26 @@ try {
     if (-not (Test-Path -LiteralPath $SettingsPath -PathType Leaf)) {
         throw "SteamVR settings file does not exist: $SettingsPath"
     }
+    if (-not (Test-Path -LiteralPath $NullProfilePath -PathType Leaf) -and $Command -eq 'restore') {
+        $restoreEvidenceDirectory = if (-not [string]::IsNullOrWhiteSpace($EvidenceDirectory)) { [IO.Path]::GetFullPath($EvidenceDirectory) } elseif ($null -ne $recoveredTransaction -and (Test-JsonDictionaryContains $recoveredTransaction 'evidenceDirectory')) { [IO.Path]::GetFullPath([string]$recoveredTransaction['evidenceDirectory']) } else { $null }
+        if ($restoreEvidenceDirectory) {
+            $restoreReceiptPath = Join-Path $restoreEvidenceDirectory 'steamvr-null-receipt.json'
+            if (Test-Path -LiteralPath $restoreReceiptPath -PathType Leaf) {
+                $restoreReceiptProfile = Read-JsonHashtable -Path $restoreReceiptPath
+                foreach ($field in @('profileEvidencePath', 'profilePath')) {
+                    if ($restoreReceiptProfile.Contains($field) -and -not [string]::IsNullOrWhiteSpace([string]$restoreReceiptProfile[$field])) {
+                        $candidateProfilePath = [IO.Path]::GetFullPath([string]$restoreReceiptProfile[$field])
+                        if ((Test-Path -LiteralPath $candidateProfilePath -PathType Leaf) -and (Get-HashOrNull $candidateProfilePath) -eq [string]$restoreReceiptProfile['profileSha256']) {
+                            $NullProfilePath = $candidateProfilePath
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (-not (Test-Path -LiteralPath $NullProfilePath -PathType Leaf)) {
-        throw "Null-HMD profile does not exist: $NullProfilePath"
+        throw "Null-HMD profile does not exist and no receipt-bound evidence copy is available: $NullProfilePath"
     }
     $settings = Read-JsonHashtable -Path $SettingsPath
     $profile = Read-JsonHashtable -Path $NullProfilePath
@@ -1030,8 +1542,8 @@ try {
     elseif ($Command -eq 'inspect') {
         $providerDriver = @($externalDrivers.drivers | Where-Object name -eq ([string]$profile['headPoseProviderContract']['driverName']))
         $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers
-        $state = if ($externalDrivers.errors.Count -gt 0) { 'external-driver-inventory-failed' } elseif ($providerDriver.Count -ne 1) { 'head-pose-provider-unavailable' } elseif ($externalDrivers.conflicts.Count -gt 0) { 'external-driver-conflict' } elseif ($runtime.active -and -not $runtime.headPoseReady) { 'head-pose-provider-not-ready' } elseif ($runtime.active -and $effective.active) { 'null-runtime-active-head-pose-ready' } elseif ($effective.active) { 'null-configured-runtime-stopped' } else { 'null-inactive' }
-        $result = New-Result -Ok $true -State $state -Data @{
+        $state = if ($externalDrivers.errors.Count -gt 0) { 'external-driver-inventory-failed' } elseif ($providerDriver.Count -ne 1) { 'head-pose-provider-unavailable' } elseif ($externalDrivers.conflicts.Count -gt 0) { 'external-driver-conflict' } elseif ($runtime.headPoseAuthorizationError) { 'head-pose-provider-authorization-failed' } elseif ($runtime.active -and -not $runtime.headPoseReady) { 'head-pose-provider-not-ready' } elseif ($runtime.active -and $effective.active) { 'null-runtime-active-head-pose-ready' } elseif ($effective.active) { 'null-configured-runtime-stopped' } else { 'null-inactive' }
+        $result = New-Result -Ok (-not [bool]$runtime.headPoseAuthorizationError) -State $state -Data @{
             settingsPath = $SettingsPath
             settingsSha256 = Get-HashOrNull $SettingsPath
             profilePath = $NullProfilePath
@@ -1059,6 +1571,9 @@ try {
         }
         elseif (-not $effective.active) {
             $result = New-Result -Ok $false -State 'null-not-configured' -Data @{ effective = $effective; runtime = $runtime } -Errors @('Apply the null-HMD settings transaction before starting SteamVR.')
+        }
+        elseif ($runtime.headPoseAuthorizationError) {
+            $result = New-Result -Ok $false -State 'head-pose-provider-authorization-failed' -Data @{ effective = $effective; runtime = $runtime } -Errors @([string]$runtime.headPoseAuthorizationError)
         }
         elseif ($runtime.active -and -not $runtime.headPoseReady) {
             $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers -DiagnosticDisplayOverride ([bool]$AllowExternalDisplayRedirector)
@@ -1105,43 +1620,248 @@ try {
                 $result = New-Result -Ok $true -State 'dry-run' -Data @{ startupPath = $startupPath; effective = $effective; runtime = $runtime; externalDrivers = $externalDrivers; externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector; externalDriverIsolation = $isolation; externalDriverIsolationValidation = $isolationValidation; inputContract = $inputContract }
             }
             else {
-                $startedUtc = [DateTime]::UtcNow
-                $launcher = Start-Process -FilePath $startupPath -WindowStyle Hidden -PassThru
-                $deadline = $startedUtc.AddSeconds($StartupTimeoutSeconds)
-                do {
-                    Start-Sleep -Milliseconds 250
-                    $processes = @(Get-SteamVRProcesses)
-                    $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline
-                } while ((-not $runtime.active -or -not $runtime.headPoseReady) -and [DateTime]::UtcNow -lt $deadline)
-                if ($runtime.active -and $runtime.headPoseReady -and [DateTime]::UtcNow.AddMilliseconds(2250) -lt $deadline) {
-                    Start-Sleep -Seconds 2
-                    $processes = @(Get-SteamVRProcesses)
-                    $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline
-                }
                 $runtimeReceiptPath = Join-Path $EvidenceDirectory 'steamvr-null-runtime.receipt.json'
+                $runtimeAttemptId = [guid]::NewGuid().ToString('N')
                 $runtimeReceipt = [ordered]@{
-                    schemaVersion = 1
-                    startedUtc = $startedUtc.ToString('o')
-                    launcherPid = $launcher.Id
+                    schemaVersion = 2
+                    attemptId = $runtimeAttemptId
+                    startedUtc = $null
+                    launcherPid = $null
                     startupPath = $startupPath
-                    runtimeActive = [bool]$runtime.active
+                    runtimeActive = $false
                     runtime = $runtime
+                    startupDeadlineUtc = $null
+                    failureObservedUtc = $null
+                    startupCleanupCompletedUtc = $null
+                    qualificationDeadlineUtc = $null
+                    logReadReserveMilliseconds = $null
+                    runtimeProbeAttempts = 0
+                    lastRuntimeProbeError = $null
+                    runtimeConfirmationAttempted = $false
+                    runtimeConfirmationTimedOut = $false
+                    runtimeAccepted = $false
+                    admissionState = 'launch-pending'
+                    acceptedUtc = $null
                     externalDrivers = $externalDrivers
                     externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector
                     externalDriverIsolationValidation = $isolationValidation
                 }
-                Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
-                $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers -DiagnosticDisplayOverride ([bool]$AllowExternalDisplayRedirector)
-                if ($runtime.active -and -not $runtime.headPoseReady) {
-                    $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
-                    $result = New-Result -Ok $false -State 'head-pose-provider-not-ready' -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; inputContract = $inputContract; startupCleanup = $startupCleanup } -Errors @('SteamVR activated the Valve null display, but the synthetic standing head pose was not loaded and acknowledged; exact processes started by this attempt were stopped.')
+                $runtimeReceiptPersistenceAttempted = $true
+                try {
+                    # Replace any prior accepted authority before this attempt can launch.
+                    Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
+                    $runtimeReceiptPersisted = $true
                 }
-                elseif ($runtime.active) {
-                    $result = New-Result -Ok $true -State $(if ($AllowExternalDisplayRedirector) { 'null-runtime-started-head-pose-ready-unqualified-display-route' } else { 'null-runtime-started-head-pose-ready' }) -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; inputContract = $inputContract; externalDrivers = $externalDrivers; externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector; externalDriverIsolation = $isolation; externalDriverIsolationValidation = $isolationValidation }
+                catch {
+                    throw "The current runtime receipt could not be made nonaccepted before launch: $($_.Exception.Message)"
+                }
+                $startedUtc = [DateTime]::UtcNow
+                $launcher = Start-Process -FilePath $startupPath -WindowStyle Hidden -PassThru
+                $startupAttemptStartedUtc = $startedUtc
+                $script:SteamVRStartupAttemptActive = $true
+                $deadline = $startedUtc.AddSeconds($StartupTimeoutSeconds)
+                $startupDeadlineUtc = $deadline
+                $logReadReserveMilliseconds = [int][Math]::Min(2000, [Math]::Max(500, $StartupTimeoutSeconds * 50))
+                $qualificationDeadline = $deadline.AddMilliseconds(-$logReadReserveMilliseconds)
+                $runtimeReceipt['startedUtc'] = $startedUtc.ToString('o')
+                $runtimeReceipt['launcherPid'] = $launcher.Id
+                $runtimeReceipt['startupDeadlineUtc'] = $deadline.ToString('o')
+                $runtimeReceipt['qualificationDeadlineUtc'] = $qualificationDeadline.ToString('o')
+                $runtimeReceipt['logReadReserveMilliseconds'] = $logReadReserveMilliseconds
+                $runtimeReceiptPersisted = $false
+                if ($InternalTestFailurePoint -in @('runtime-early-post-launch-cleanup-crosses-deadline', 'runtime-early-post-launch-cleanup-crosses-deadline-failure')) {
+                    $deadline = [DateTime]::UtcNow.AddMilliseconds(400)
+                    $startupDeadlineUtc = $deadline
+                    $runtimeReceipt['startupDeadlineUtc'] = $deadline.ToString('o')
+                    throw [InvalidOperationException]::new('Injected early post-launch admission failure before delayed cleanup.')
+                }
+                if ($InternalTestFailurePoint -eq 'runtime-early-post-launch-failure') {
+                    throw [InvalidOperationException]::new('Injected early post-launch admission failure.')
+                }
+                $runtimeProbeAttempts = 0
+                $lastRuntimeProbeError = $null
+                $runtimeConfirmationAttempted = $false
+                $runtimeConfirmationTimedOut = $false
+                do {
+                    $remainingBeforeProbeMilliseconds = [long]($qualificationDeadline - [DateTime]::UtcNow).TotalMilliseconds
+                    if ($remainingBeforeProbeMilliseconds -le 0) { break }
+                    Start-Sleep -Milliseconds ([int][Math]::Min(250, $remainingBeforeProbeMilliseconds))
+                    if ([DateTime]::UtcNow -ge $qualificationDeadline) { break }
+                    $processes = @(Get-SteamVRProcesses)
+                    try {
+                        $runtimeProbeAttempts++
+                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline
+                    }
+                    catch [TimeoutException] {
+                        $lastRuntimeProbeError = $_.Exception.Message
+                        break
+                    }
+                    if ($runtime.headPoseAuthorizationError) {
+                        $lastRuntimeProbeError = [string]$runtime.headPoseAuthorizationError
+                        break
+                    }
+                } while (-not $runtime.active -or -not $runtime.headPoseReady)
+                if ($InternalTestFailurePoint -ne 'runtime-final-admission-timeout-no-confirmation' -and $runtime.active -and $runtime.headPoseReady -and [DateTime]::UtcNow.AddMilliseconds(2250) -lt $qualificationDeadline) {
+                    $runtimeConfirmationAttempted = $true
+                    Start-Sleep -Seconds 2
+                    $processes = @(Get-SteamVRProcesses)
+                    try {
+                        $runtimeProbeAttempts++
+                        if ($InternalTestFailurePoint -in @('runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-confirmation-timeout-input-contract-failure')) {
+                            throw [TimeoutException]::new('Injected runtime confirmation timeout.')
+                        }
+                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline
+                    }
+                    catch [TimeoutException] {
+                        $lastRuntimeProbeError = $_.Exception.Message
+                        $runtimeConfirmationTimedOut = $true
+                    }
+                }
+                if ($InternalTestFailurePoint -in @('runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-final-admission-timeout-input-contract-failure')) {
+                    $deadline = [DateTime]::UtcNow.AddMilliseconds(-1)
+                    $startupDeadlineUtc = $deadline
+                }
+                $failureState = $null
+                $failureErrors = [Collections.Generic.List[string]]::new()
+                if ($runtimeConfirmationTimedOut) {
+                    $failureState = 'runtime-confirmation-timeout'
+                    $failureErrors.Add([string]$lastRuntimeProbeError)
+                    $failureErrors.Add('The current runtime confirmation did not complete before its deadline.')
+                }
+                elseif ([DateTime]::UtcNow -ge $deadline) {
+                    $failureState = 'startup-deadline-exceeded'
+                    $failureErrors.Add('The absolute startup deadline elapsed before final runtime admission.')
+                }
+                elseif ($runtime.headPoseAuthorizationError) {
+                    $failureState = 'head-pose-provider-authorization-failed'
+                    $failureErrors.Add([string]$runtime.headPoseAuthorizationError)
+                }
+                elseif ($runtime.active -and -not $runtime.headPoseReady) {
+                    $failureState = 'head-pose-provider-not-ready'
+                    $failureErrors.Add('SteamVR activated the Valve null display, but the synthetic standing head pose was not loaded and acknowledged.')
+                }
+                elseif (-not $runtime.active) {
+                    $failureState = 'startup-incomplete'
+                    $failureErrors.Add('SteamVR started, but current-session Valve null-driver and active-HMD log proof was not observed before the timeout.')
+                }
+                if ($null -ne $failureState) {
+                    $failureObservedUtc = [DateTime]::UtcNow
+                    $startupDeadlineUtc = $deadline
+                }
+
+                $runtimeReceipt['runtimeActive'] = [bool]$runtime.active
+                $runtimeReceipt['runtime'] = $runtime
+                $runtimeReceipt['startupDeadlineUtc'] = $deadline.ToString('o')
+                $runtimeReceipt['runtimeProbeAttempts'] = $runtimeProbeAttempts
+                $runtimeReceipt['lastRuntimeProbeError'] = $lastRuntimeProbeError
+                $runtimeReceipt['runtimeConfirmationAttempted'] = $runtimeConfirmationAttempted
+                $runtimeReceipt['runtimeConfirmationTimedOut'] = $runtimeConfirmationTimedOut
+                if ($InternalTestFailurePoint -in @('runtime-input-contract-failure', 'runtime-confirmation-timeout-input-contract-failure', 'runtime-final-admission-timeout-input-contract-failure')) {
+                    throw [InvalidOperationException]::new('Injected runtime input-contract construction failure.')
+                }
+                $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers -DiagnosticDisplayOverride ([bool]$AllowExternalDisplayRedirector)
+
+                $runtimeReceiptPersisted = $false
+                $runtimeReceiptError = $null
+                if ($null -eq $failureState) {
+                    $runtimeReceipt['runtimeAccepted'] = $true
+                    $runtimeReceipt['admissionState'] = 'accepted'
+                    $runtimeReceipt['acceptedUtc'] = [DateTime]::UtcNow.ToString('o')
+                    $acceptedReceiptStagePath = "$runtimeReceiptPath.$([guid]::NewGuid().ToString('N')).stage"
+                    $runtimeReceiptPersistenceAttempted = $true
+                    if ($InternalTestFailurePoint -eq 'runtime-accepted-receipt-stage-failure') {
+                        throw [IO.IOException]::new('Injected accepted runtime receipt staging failure.')
+                    }
+                    Write-JsonAtomic -Path $acceptedReceiptStagePath -Value $runtimeReceipt
+                    if ($InternalTestFailurePoint -eq 'runtime-post-receipt-timeout') {
+                        $deadline = [DateTime]::UtcNow.AddMilliseconds(-1)
+                    }
+                    if ([DateTime]::UtcNow -ge $deadline) {
+                        $failureState = 'startup-deadline-exceeded'
+                        $failureObservedUtc = [DateTime]::UtcNow
+                        $startupDeadlineUtc = $deadline
+                        $failureErrors.Add('The absolute startup deadline elapsed while staging the accepted runtime receipt.')
+                    }
+                }
+
+                if ($null -ne $failureState) {
+                    # Cleanup is mandatory once admission fails, even if diagnostic persistence also fails.
+                    $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
+                    $startupCleanupCompletedUtc = [DateTime]::UtcNow
+                    $inputContract['measurementReady'] = $false
+                    $inputContract['measurementBlockers'] = @($inputContract['measurementBlockers']) + $failureState
+                    $admission = New-RuntimeAdmissionSnapshot -State $failureState -ProbeAttempts $runtimeProbeAttempts -LastProbeError $lastRuntimeProbeError -ConfirmationAttempted $runtimeConfirmationAttempted -ConfirmationTimedOut $runtimeConfirmationTimedOut -FailureObservedUtc $failureObservedUtc -StartupDeadlineUtc $startupDeadlineUtc -CleanupCompletedUtc $startupCleanupCompletedUtc
+                    Set-RuntimeReceiptFailureEvidence -Receipt $runtimeReceipt -Admission $admission -StartupCleanup $startupCleanup
+                    try {
+                        $runtimeReceiptPersistenceAttempted = $true
+                        if ($InternalTestFailurePoint -eq 'runtime-confirmation-timeout-receipt-failure') {
+                            throw [IO.IOException]::new('Injected runtime receipt persistence failure.')
+                        }
+                        Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
+                        $runtimeReceiptPersisted = $true
+                    }
+                    catch {
+                        $runtimeReceiptPersisted = $false
+                        $runtimeReceiptError = $_.Exception.Message
+                        $failureErrors.Add("Runtime receipt persistence failed after cleanup: $runtimeReceiptError")
+                    }
+                    if ([bool]$startupCleanup.verified) {
+                        $failureErrors.Add('Exact SteamVR processes started by this attempt were stopped and verified.')
+                    }
+                    else {
+                        $failureErrors.Add('Exact-attempt cleanup did not verify a fully stopped runtime; inspect startupCleanup before retrying.')
+                    }
+                    $failureData = New-LaunchedRuntimeFailureData -Effective $effective -Runtime $runtime -Processes $processes -Admission $admission -InputContract $inputContract -ReceiptPath $runtimeReceiptPath -AttemptId $runtimeAttemptId -ReceiptPersistenceAttempted $runtimeReceiptPersistenceAttempted -ReceiptPersisted $runtimeReceiptPersisted -ReceiptError $runtimeReceiptError -StartupCleanup $startupCleanup
+                    $result = New-Result -Ok $false -State $failureState -Data $failureData -Errors @($failureErrors)
                 }
                 else {
-                    $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
-                    $result = New-Result -Ok $false -State 'startup-incomplete' -Data @{ effective = $effective; runtime = $runtime; processes = $processes; runtimeReceiptPath = $runtimeReceiptPath; startupCleanup = $startupCleanup } -Errors @('SteamVR started, but current-session Valve null-driver and active-HMD log proof was not observed before the timeout; exact processes started by this attempt were stopped.')
+                    $successResult = New-Result -Ok $true -State $(if ($AllowExternalDisplayRedirector) { 'null-runtime-started-head-pose-ready-unqualified-display-route' } else { 'null-runtime-started-head-pose-ready' }) -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; runtimeAttemptId = $runtimeAttemptId; runtimeReceiptPersistenceAttempted = $runtimeReceiptPersistenceAttempted; runtimeReceiptPersisted = $runtimeReceiptPersisted; inputContract = $inputContract; externalDrivers = $externalDrivers; externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector; externalDriverIsolation = $isolation; externalDriverIsolationValidation = $isolationValidation }
+                    if ($InternalTestFailurePoint -in @('runtime-final-boundary-timeout-cleanup-unverified', 'runtime-final-boundary-timeout-cleanup-failure')) {
+                        $deadline = [DateTime]::UtcNow.AddMilliseconds(-1)
+                        $startupDeadlineUtc = $deadline
+                    }
+                    if ([DateTime]::UtcNow -ge $deadline) {
+                        $failureState = 'startup-deadline-exceeded'
+                        $failureObservedUtc = [DateTime]::UtcNow
+                        $startupDeadlineUtc = $deadline
+                        $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
+                        $startupCleanupCompletedUtc = [DateTime]::UtcNow
+                        $inputContract['measurementReady'] = $false
+                        $inputContract['measurementBlockers'] = @($inputContract['measurementBlockers']) + 'startup-deadline-exceeded'
+                        $admission = New-RuntimeAdmissionSnapshot -State $failureState -ProbeAttempts $runtimeProbeAttempts -LastProbeError $lastRuntimeProbeError -ConfirmationAttempted $runtimeConfirmationAttempted -ConfirmationTimedOut $runtimeConfirmationTimedOut -FailureObservedUtc $failureObservedUtc -StartupDeadlineUtc $startupDeadlineUtc -CleanupCompletedUtc $startupCleanupCompletedUtc
+                        Set-RuntimeReceiptFailureEvidence -Receipt $runtimeReceipt -Admission $admission -StartupCleanup $startupCleanup
+                        try {
+                            $runtimeReceiptPersistenceAttempted = $true
+                            Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
+                            $runtimeReceiptPersisted = $true
+                        }
+                        catch {
+                            $runtimeReceiptPersisted = $false
+                            $runtimeReceiptError = $_.Exception.Message
+                        }
+                        $deadlineErrors = [Collections.Generic.List[string]]::new()
+                        $deadlineErrors.Add('The absolute startup deadline elapsed at the final success boundary.')
+                        if ([bool]$startupCleanup.verified) {
+                            $deadlineErrors.Add('Exact SteamVR processes started by this attempt were stopped and verified.')
+                        }
+                        else {
+                            $deadlineErrors.Add('Exact-attempt cleanup did not verify a fully stopped runtime; inspect startupCleanup before retrying.')
+                        }
+                        if ($runtimeReceiptError) { $deadlineErrors.Add("Runtime receipt persistence failed after cleanup: $runtimeReceiptError") }
+                        $failureData = New-LaunchedRuntimeFailureData -Effective $effective -Runtime $runtime -Processes $processes -Admission $admission -InputContract $inputContract -ReceiptPath $runtimeReceiptPath -AttemptId $runtimeAttemptId -ReceiptPersistenceAttempted $runtimeReceiptPersistenceAttempted -ReceiptPersisted $runtimeReceiptPersisted -ReceiptError $runtimeReceiptError -StartupCleanup $startupCleanup
+                        $result = New-Result -Ok $false -State $failureState -Data $failureData -Errors @($deadlineErrors)
+                    }
+                    else {
+                        if ($InternalTestFailurePoint -in @('runtime-accepted-receipt-publish-failure', 'runtime-accepted-receipt-publish-and-stage-cleanup-failure')) {
+                            throw [IO.IOException]::new('Injected accepted runtime receipt publication failure.')
+                        }
+                        Move-Item -LiteralPath $acceptedReceiptStagePath -Destination $runtimeReceiptPath -Force
+                        $acceptedReceiptStagePath = $null
+                        $runtimeReceiptPersisted = $true
+                        $successResult.data.runtimeReceiptPersisted = $true
+                        $startupAttemptAccepted = $true
+                        $result = $successResult
+                    }
                 }
             }
         }
@@ -1207,6 +1927,22 @@ try {
                 }
             }
             else {
+                $profileEvidencePath = Join-Path $EvidenceDirectory 'steamvr-null.profile.applied.json'
+                $profileSha256 = Get-HashOrNull $NullProfilePath
+                Copy-FileAtomicVerified -Source $NullProfilePath -Destination $profileEvidencePath -ExpectedSha256 $profileSha256
+                $profile = Read-JsonHashtable -Path $profileEvidencePath
+                foreach ($section in @('steamvr', 'dashboard', 'driver_null', 'driver_codex_head_pose', 'TrackingOverrides', 'headPoseProviderContract', 'automationInputContract')) {
+                    if (-not $profile.ContainsKey($section)) { throw "Staged null-HMD profile is missing '$section'." }
+                }
+                if ($InternalTestFailurePoint -eq 'apply-source-drift-after-stage') {
+                    $driftedSourceProfile = Read-JsonHashtable -Path $NullProfilePath
+                    $driftedSourceProfile['driver_codex_head_pose']['eyeHeightMeters'] = 9.25
+                    Write-JsonAtomic -Path $NullProfilePath -Value $driftedSourceProfile
+                }
+                $effective = Get-EffectiveState -Settings $settings -Profile $profile
+                if ($effective.active) {
+                    throw 'SteamVR null settings already match the staged profile but no committed authoritative apply transaction owns them; refusing to create a false baseline.'
+                }
                 Copy-Item -LiteralPath $SettingsPath -Destination $backupPath
                 $beforeHash = Get-HashOrNull $backupPath
                 $openVRPathsBeforeHash = $null
@@ -1269,8 +2005,10 @@ try {
                         settingsSha256Null = Get-HashOrNull $SettingsPath
                         settingsSemanticSha256Before = Get-JsonSemanticSha256 -Path $backupPath
                         settingsSemanticSha256Null = Get-JsonSemanticSha256 -Path $SettingsPath
-                        profilePath = $NullProfilePath
-                        profileSha256 = Get-HashOrNull $NullProfilePath
+                        profilePath = $profileEvidencePath
+                        profileEvidencePath = $profileEvidencePath
+                        sourceProfilePath = $NullProfilePath
+                        profileSha256 = $profileSha256
                         externalDriverIsolation = [ordered]@{
                             enabled = [bool]$IsolateExternalDisplayRedirectors
                             openVRPathsPath = if ($IsolateExternalDisplayRedirectors) { [IO.Path]::GetFullPath($OpenVRPathsPath) } else { $null }
@@ -1344,7 +2082,8 @@ try {
                 }
                 else {
                     $isolationValidation = Get-IsolationValidation -Isolation $isolation -BackupPath $openVRPathsBackupPath -CurrentPath $OpenVRPathsPath
-                    if (-not [bool]$isolationValidation.semanticMatch) { throw 'The OpenVR registration file changed semantically after isolation. Refusing to overwrite unclassified registration drift.' }
+                    $isolationValidation | Add-Member -NotePropertyName baselineAlreadyRestored -NotePropertyValue ($openVRLiveHash -eq [string]$isolation['sha256Before'])
+                    if (-not [bool]$isolationValidation.semanticMatch -and -not [bool]$isolationValidation.baselineAlreadyRestored) { throw 'The OpenVR registration file changed semantically after isolation. Refusing to overwrite unclassified registration drift.' }
                 }
                 foreach ($target in @($isolation['targets'])) {
                     if ((Get-HashOrNull ([string]$target['manifestPath'])) -ne [string]$target['manifestSha256']) {
@@ -1424,9 +2163,147 @@ try {
     }
 }
 catch {
-    $result = New-Result -Ok $false -State 'blocked' -Data @{ settingsPath = $SettingsPath; profilePath = $NullProfilePath; evidenceDirectory = $EvidenceDirectory; targetControl = $targetControl } -Errors @($_.Exception.Message)
+    $primaryError = $_.Exception.Message
+    $startupCleanupError = $null
+    if ($null -ne $startupAttemptStartedUtc -and -not $startupAttemptAccepted) {
+        # Freeze primary admission facts before cleanup duration can change them.
+        if ($null -eq $failureObservedUtc) { $failureObservedUtc = [DateTime]::UtcNow }
+        $admissionState = if (-not [string]::IsNullOrWhiteSpace([string]$failureState)) {
+            [string]$failureState
+        }
+        elseif ($runtimeConfirmationTimedOut) {
+            'runtime-confirmation-timeout'
+        }
+        elseif ($null -ne $startupDeadlineUtc -and $failureObservedUtc -ge $startupDeadlineUtc) {
+            'startup-deadline-exceeded'
+        }
+        else {
+            'runtime-admission-exception'
+        }
+        $failureState = $admissionState
+    }
+    if ($null -ne $startupAttemptStartedUtc -and -not $startupAttemptAccepted -and $null -eq $startupCleanup) {
+        try { $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startupAttemptStartedUtc }
+        catch { $startupCleanupError = $_.Exception.Message }
+        $startupCleanupCompletedUtc = [DateTime]::UtcNow
+    }
+    $errors = @($primaryError)
+    if ($null -ne $startupAttemptStartedUtc -and -not $startupAttemptAccepted) {
+        if ($inputContract -is [Collections.IDictionary]) {
+            $inputContract['measurementReady'] = $false
+            $inputContract['measurementBlockers'] = @(@($inputContract['measurementBlockers']) + $admissionState | Select-Object -Unique)
+        }
+        else {
+            $inputContract = [ordered]@{
+                available = $false
+                measurementReady = $false
+                measurementBlockers = @($admissionState)
+            }
+        }
+        if ($startupCleanupError) {
+            $startupCleanup = [pscustomobject][ordered]@{
+                requested = $null
+                remaining = $null
+                errors = @($startupCleanupError)
+                verified = $false
+            }
+            $errors += "Startup cleanup failed before verified cleanup evidence was available: $startupCleanupError"
+        }
+        elseif ($null -eq $startupCleanup) {
+            $startupCleanup = [pscustomobject][ordered]@{
+                requested = $null
+                remaining = $null
+                errors = @('Exact-attempt cleanup returned no evidence.')
+                verified = $false
+            }
+            $errors += 'Exact-attempt cleanup returned no evidence.'
+        }
+        elseif ([bool]$startupCleanup.verified) {
+            $errors += 'Exact SteamVR processes started by this attempt were stopped and verified.'
+        }
+        else {
+            $errors += 'Exact-attempt cleanup did not verify a fully stopped runtime; inspect startupCleanup before retrying.'
+        }
+        $admission = New-RuntimeAdmissionSnapshot -State $admissionState -ProbeAttempts $runtimeProbeAttempts -LastProbeError $lastRuntimeProbeError -ConfirmationAttempted $runtimeConfirmationAttempted -ConfirmationTimedOut $runtimeConfirmationTimedOut -FailureObservedUtc $failureObservedUtc -StartupDeadlineUtc $startupDeadlineUtc -CleanupCompletedUtc $startupCleanupCompletedUtc
+        if ($runtimeReceipt -is [Collections.IDictionary] -and -not [string]::IsNullOrWhiteSpace($runtimeReceiptPath)) {
+            $runtimeReceipt['runtimeActive'] = if ($null -ne $runtime) { [bool]$runtime.active } else { $false }
+            $runtimeReceipt['runtime'] = $runtime
+            $runtimeReceipt['runtimeProbeAttempts'] = $runtimeProbeAttempts
+            $runtimeReceipt['lastRuntimeProbeError'] = $lastRuntimeProbeError
+            $runtimeReceipt['runtimeConfirmationAttempted'] = $runtimeConfirmationAttempted
+            $runtimeReceipt['runtimeConfirmationTimedOut'] = $runtimeConfirmationTimedOut
+            Set-RuntimeReceiptFailureEvidence -Receipt $runtimeReceipt -Admission $admission -StartupCleanup $startupCleanup
+            try {
+                $runtimeReceiptPersistenceAttempted = $true
+                Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
+                $runtimeReceiptPersisted = $true
+                $runtimeReceiptError = $null
+            }
+            catch {
+                $runtimeReceiptPersisted = $false
+                $runtimeReceiptError = $_.Exception.Message
+                $errors += "Failed-admission receipt persistence failed: $runtimeReceiptError"
+            }
+        }
+        $failureData = New-LaunchedRuntimeFailureData -Effective $effective -Runtime $runtime -Processes $processes -Admission $admission -InputContract $inputContract -ReceiptPath $runtimeReceiptPath -AttemptId $runtimeAttemptId -ReceiptPersistenceAttempted $runtimeReceiptPersistenceAttempted -ReceiptPersisted $runtimeReceiptPersisted -ReceiptError $runtimeReceiptError -StartupCleanup $startupCleanup
+        $failureData['settingsPath'] = $SettingsPath
+        $failureData['profilePath'] = $NullProfilePath
+        $failureData['evidenceDirectory'] = $EvidenceDirectory
+        $failureData['targetControl'] = $targetControl
+        $result = New-Result -Ok $false -State $admissionState -Data $failureData -Errors $errors
+    }
+    else {
+        if ($startupCleanupError) { $errors += "Startup cleanup failed: $startupCleanupError" }
+        $result = New-Result -Ok $false -State 'blocked' -Data @{ settingsPath = $SettingsPath; profilePath = $NullProfilePath; evidenceDirectory = $EvidenceDirectory; targetControl = $targetControl; startupCleanup = $startupCleanup } -Errors $errors
+    }
 }
 finally {
+    if ($acceptedReceiptStagePath -and (Test-Path -LiteralPath $acceptedReceiptStagePath -PathType Leaf)) {
+        $stageCleanupError = $null
+        try {
+            if ($InternalTestFailurePoint -eq 'runtime-accepted-receipt-publish-and-stage-cleanup-failure') {
+                throw [IO.IOException]::new('Injected accepted runtime receipt stage cleanup failure.')
+            }
+            Remove-Item -LiteralPath $acceptedReceiptStagePath -Force -ErrorAction Stop
+        }
+        catch { $stageCleanupError = $_.Exception.Message }
+        $stageRemaining = Test-Path -LiteralPath $acceptedReceiptStagePath -PathType Leaf
+        $acceptedReceiptStageCleanup = [ordered]@{
+            path = $acceptedReceiptStagePath
+            requested = $true
+            remaining = [bool]$stageRemaining
+            error = $stageCleanupError
+            verified = -not $stageRemaining -and [string]::IsNullOrWhiteSpace($stageCleanupError)
+        }
+        if ($null -ne $result -and $null -ne $result.data) {
+            if ($result.data -is [Collections.IDictionary]) {
+                $result.data['acceptedReceiptStageCleanup'] = $acceptedReceiptStageCleanup
+            }
+            else {
+                $result.data | Add-Member -NotePropertyName acceptedReceiptStageCleanup -NotePropertyValue $acceptedReceiptStageCleanup -Force
+            }
+            if (-not [bool]$acceptedReceiptStageCleanup.verified) {
+                $result.errors = @($result.errors) + "Accepted runtime receipt stage remains non-authoritative at '$acceptedReceiptStagePath': $stageCleanupError"
+            }
+        }
+        if (-not $result.ok -and $runtimeReceipt -is [Collections.IDictionary] -and -not [string]::IsNullOrWhiteSpace($runtimeReceiptPath)) {
+            $runtimeReceipt['acceptedReceiptStageCleanup'] = $acceptedReceiptStageCleanup
+            try {
+                $runtimeReceiptPersistenceAttempted = $true
+                Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
+                $runtimeReceiptPersisted = $true
+                $runtimeReceiptError = $null
+            }
+            catch {
+                $runtimeReceiptPersisted = $false
+                $runtimeReceiptError = $_.Exception.Message
+                $result.errors = @($result.errors) + "Runtime receipt persistence failed after stage cleanup: $runtimeReceiptError"
+            }
+            $result.data.runtimeReceiptPersistenceAttempted = $runtimeReceiptPersistenceAttempted
+            $result.data.runtimeReceiptPersisted = $runtimeReceiptPersisted
+            $result.data.runtimeReceiptError = $runtimeReceiptError
+        }
+    }
     if ($targetLock) { $targetLock.Dispose() }
 }
 

@@ -4,6 +4,19 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Require every cooperative MO2 access request to select exactly one mutually
+  exclusive OCU, physical SteamVR, or SteamVR null-HMD route, and propagate the
+  selected route into access status and prepared session evidence.
+- Retire implicit MO2 session preparation, validate the complete persisted
+  runtime-route contract through launch, and reject duplicate, contradictory,
+  or unprovable profile-local runtime providers.
+- Add an explicit MO2 workspace local-work catalog and candidate query. Fresh
+  clones can now request the unchanged modlist or exact optional local mods,
+  reject mutually exclusive variants, disable unselected candidates only in
+  the task profile, and preserve the resolved catalog and selection evidence.
+- Require an explicit workspace-content choice for every fresh clone and make
+  local-work discovery recognize a candidate on the first line of a UTF-8 BOM
+  modlist without modifying its bytes.
 - Add a correlated capture/interaction framework with latest committed frame
   selection, continuous or on-demand stereo capture, full-state recording,
   pose-preserving named actions, direct DevBench passthrough, orderly
@@ -15,7 +28,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   workspace reuse through the current task-resume contract.
 - Treat SteamVR physical, SteamVR null-HMD, and OpenComposite execution routes
   as provenance within one explicit Skyrim VR D3D11 bytecode compatibility
-  class while retaining the exact feature-set compatibility gate.
+  class while retaining exact route records and the feature-set compatibility
+  gate. Legacy and current SteamVR route names now normalize consistently.
 - Add bounded whole-runtime Skyrim quiet-window capture and informational
   comparison reports alongside the existing CSX timer profiler.
 - Let MO2 access requests retain an explicit stable task identity, complete
@@ -28,6 +42,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   canonical live targets, move recovery authority to a deterministic per-user
   journal independent of caller evidence directories, and replace repeated
   whole-log reads with deadline-charged incremental bounded-byte tails.
+- Reject unsupported head-pose shared-memory versions before size selection,
+  surface authorization failures distinctly, and charge application pose probes
+  plus process cleanup to the caller's readiness deadline.
 - Serialize head-pose driver installs/upgrades by canonical install and OpenVR
   targets, persist authoritative registration preimages, and recover interrupted
   replacement/registration phases before admitting another installer.

@@ -54,6 +54,31 @@ verified copy of that baseline. This is exact static integrity, not proof of a
 successful runtime load. A resumed task profile is intentionally left untouched
 and is not reverified after the task changes its own mod or save state.
 
+## Declare optional local work
+
+Keep the prime profile representative of the installed modlist plus mandatory
+shared diagnostics. Install local work additively under distinct mod names and
+leave it selectable per task. Copy
+`tools/mo2-workspace-control/local-work-mods.example.json` to an ignored local
+path and set `defaults.localWorkModCatalog` to it.
+
+For CSX, provide separate AIO packages from the same source head: one built
+with `DEVBENCH_BRIDGE` off to match public release behavior and one with it on
+for automation. Give them the same `exclusionGroup` so a task cannot enable
+both. Protect locally maintained packages from Wabbajack with the installation's
+supported no-delete naming convention.
+
+After installation or a modlist update, run:
+
+```powershell
+.\tools\mo2-workspace-control\Invoke-MO2WorkspaceControl.ps1 list-local-work-mods -Compact
+```
+
+Only candidates with an exact existing mod directory and one exact marker in
+the maintained profile are available. Fresh workspace requests then state
+either `-WorkspaceContent Modlist` or
+`-WorkspaceContent ModlistPlusLocalWorkMods` with exact candidate IDs.
+
 ## Upgrade
 
 ```text
