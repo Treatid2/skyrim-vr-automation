@@ -585,6 +585,7 @@ try {
     $noConfirmationTimeout = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-final-admission-timeout-no-confirmation -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
     $noConfirmationReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
     Assert-Test (-not $noConfirmationTimeout.ok -and $noConfirmationTimeout.state -eq 'startup-deadline-exceeded' -and -not $noConfirmationReceipt.runtimeConfirmationAttempted -and -not $noConfirmationReceipt.runtimeAccepted) 'late admission without a confirmation probe also fails closed'
+    Assert-Test ($noConfirmationTimeout.data.startupCleanup.verified -and @($noConfirmationTimeout.data.startupCleanup.remaining).Count -eq 0 -and @($noConfirmationTimeout.data.startupCleanup.errors).Count -eq 0) 'late admission without a confirmation probe performs verified exact cleanup'
 
     Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
     $postReceiptTimeout = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-post-receipt-timeout -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
