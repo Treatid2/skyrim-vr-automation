@@ -19,7 +19,9 @@ optional integration rather than the identity or boundary of the toolkit.
 - `tools/mo2-workspace-control` — stable-source ShaderCache evacuation plus
   unique task profiles cloned from that explicit source, with a verified copy
   of its complete saves tree, a mandatory integrity-verified world-entry save, and
-  strict ownership of newly created mods.
+  strict ownership of newly created mods. Its local-work catalog offers an
+  explicit modlist-only baseline or selected local builds without changing the
+  maintained source profile.
 - `tools/steamvr-null-control` — transactional null-HMD apply/restore and
   bounded SteamVR shutdown, with a required application-observed standing
   head-pose qualification and opt-in exact-driver isolation for conflicting
@@ -95,6 +97,12 @@ Before setup is ready, live-load one known-good save in the maintained source,
 declare it through `defaults.newGameFixtureManifest`, and require both
 `fixture-status` and the doctor's `prime-profile-world-entry-integrity` check to pass.
 See `docs/INSTALL-CODEX.md` and `docs/BREEZEHOME-SAVE.md`.
+
+Optional local builds are declared through
+`defaults.localWorkModCatalog`. Copy
+`tools/mo2-workspace-control/local-work-mods.example.json` to an ignored local
+path, replace its exact mod names, then use `list-local-work-mods` before fresh
+workspace creation.
 
 DevBench runtime discovery is supplied either explicitly or through an
 environment variable:

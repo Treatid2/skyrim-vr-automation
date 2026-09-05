@@ -293,7 +293,7 @@ function Get-NormalizedStrings([string[]]$Values) {
 
 function Get-RenderFamily([string]$Value) {
     $normalized = $Value.Trim().ToLowerInvariant()
-    if ($normalized -in @('vr-steamvr-physical', 'vr-steamvr-null')) { return 'vr-steamvr' }
+    if ($normalized -in @('steamvr-physical', 'steamvr-null', 'vr-steamvr-physical', 'vr-steamvr-null')) { return 'vr-steamvr' }
     return $normalized
 }
 
@@ -367,7 +367,7 @@ function New-CatalogSnapshot {
             if ([string]$m.inventory.treeSha256 -ieq $expected -and [string]$m.status -ceq $Status -and
                 [string]$m.compatibility.shaderCacheAbi -ceq $ShaderCacheAbi -and
                 [string]$m.compatibility.gameRuntime -ceq $GameRuntime -and
-                (Get-RenderFamily ([string]$m.compatibility.renderPath)) -ceq (Get-RenderFamily $RenderPath) -and
+                [string]$m.compatibility.renderPath -ceq $RenderPath -and
                 [string]$m.compatibility.shaderSourceSha256 -ieq $ShaderSourceSha256 -and
                 [string](Get-PropertyValue $m.compatibility 'buildId' '') -ceq [string](Get-PropertyValue $compatibility 'buildId' '') -and
                 [string](Get-PropertyValue $m.compatibility 'presetSha256' '') -ieq [string](Get-PropertyValue $compatibility 'presetSha256' '') -and
