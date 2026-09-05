@@ -144,7 +144,8 @@ function Get-StreamRangeSha256 {
     param(
         [Parameter(Mandatory)][IO.Stream]$Stream,
         [Parameter(Mandatory)][long]$Offset,
-        [Parameter(Mandatory)][int]$Length
+        [Parameter(Mandatory)][int]$Length,
+        [DateTime]$DeadlineUtc = [DateTime]::MaxValue
     )
     if ($Length -eq 0) { return '' }
     $savedPosition = $Stream.Position
@@ -153,6 +154,7 @@ function Get-StreamRangeSha256 {
         $Stream.Position = $Offset
         $read = 0
         while ($read -lt $Length) {
+            if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired while hashing the retained window.') }
             $current = $Stream.Read($bytes, $read, $Length - $read)
             if ($current -le 0) { break }
             $read += $current
@@ -194,7 +196,8 @@ function Get-SharedTextTail {
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][ValidateRange(1, 10000)][int]$Count,
         [Parameter(Mandatory)][ValidateRange(4096, 4194304)][int]$MaxBytes,
-        [DateTime]$DeadlineUtc = [DateTime]::MaxValue
+        [DateTime]$DeadlineUtc = [DateTime]::MaxValue,
+        [scriptblock]$InternalMutationHook
     )
     if ([DateTime]::UtcNow -ge $DeadlineUtc) { throw [TimeoutException]::new('SteamVR log-tail deadline expired before opening the log.') }
     $stream = $null
@@ -204,12 +207,13 @@ function Get-SharedTextTail {
         $info = [IO.FileInfo]::new([IO.Path]::GetFullPath($Path))
         $identity = "$($info.FullName.ToLowerInvariant())|$($info.CreationTimeUtc.Ticks)"
         $prior = if ($script:SharedTextTailState.ContainsKey($identity)) { $script:SharedTextTailState[$identity] } else { $null }
-        $hasRetainedWindow = $null -ne $prior -and $prior.PSObject.Properties['retainedBytes'] -and $prior.PSObject.Properties['retainedOffset'] -and $prior.PSObject.Properties['startsPartial']
+        $hasRetainedWindow = $null -ne $prior -and $prior.PSObject.Properties['usable'] -and [bool]$prior.usable -and $prior.PSObject.Properties['retainedBytes'] -and $prior.PSObject.Properties['retainedOffset'] -and $prior.PSObject.Properties['startsPartial']
         $continuityMatched = $false
         if ($hasRetainedWindow -and [int64]$prior.offset -le $capturedLength) {
-            $continuityMatched = [string]$prior.continuitySha256 -ceq [string](Get-StreamRangeSha256 -Stream $stream -Offset ([int64]$prior.continuityOffset) -Length ([int]$prior.continuityLength))
+            $continuityMatched = [string]$prior.continuitySha256 -ceq [string](Get-StreamRangeSha256 -Stream $stream -Offset ([int64]$prior.continuityOffset) -Length ([int]$prior.continuityLength) -DeadlineUtc $DeadlineUtc)
         }
         $incremental = $hasRetainedWindow -and [int64]$prior.offset -le $capturedLength -and $continuityMatched
+        if ($InternalMutationHook) { $null = & $InternalMutationHook 'after-continuity' $stream $capturedLength }
         $start = if ($incremental) { [int64]$prior.offset } else { [Math]::Max([int64]0, $capturedLength - $MaxBytes) }
         if (($capturedLength - $start) -gt $MaxBytes) {
             $start = $capturedLength - $MaxBytes
@@ -225,43 +229,81 @@ function Get-SharedTextTail {
             if ($current -le 0) { break }
             $read += $current
         }
-        $priorBytes = if ($incremental) { [byte[]]$prior.retainedBytes } else { [byte[]]@() }
+        if ($read -ne $readLength) {
+            $script:SharedTextTailState.Clear()
+            $script:SharedTextTailState[$identity] = [pscustomobject]@{
+                usable = $false; stable = $false; offset = 0L; retainedBytes = [byte[]]@(); retainedOffset = 0L
+                startsPartial = $false; continuityOffset = 0L; continuityLength = 0; continuitySha256 = $null
+                incremental = $false; resynchronized = $true; bytesRead = $read; hashBytesRead = $(if ($hasRetainedWindow) { [int]$prior.continuityLength } else { 0 })
+                cumulativeBytesRead = [long]$(if ($null -ne $prior -and $prior.PSObject.Properties['cumulativeBytesRead']) { [long]$prior.cumulativeBytesRead + $read } else { $read })
+                error = "The shared log became shorter while reading its captured $readLength-byte span."
+            }
+            return @()
+        }
+        if ($incremental) { $priorBytes = [byte[]]$prior.retainedBytes }
+        else { $priorBytes = [byte[]]::new(0) }
         $retainedBytes = [byte[]]::new($priorBytes.Length + $read)
         if ($priorBytes.Length -gt 0) { [Array]::Copy($priorBytes, 0, $retainedBytes, 0, $priorBytes.Length) }
         if ($read -gt 0) { [Array]::Copy($bytes, 0, $retainedBytes, $priorBytes.Length, $read) }
         $retainedOffset = if ($incremental) { [int64]$prior.retainedOffset } else { $start }
         $startsPartial = if ($incremental) { [bool]$prior.startsPartial } else { $start -gt 0 }
+        $leadingProofByte = if ($incremental -and $prior.PSObject.Properties['leadingProofByte']) { $prior.leadingProofByte } else { $null }
         if ($retainedBytes.Length -gt $MaxBytes) {
             $discardCount = $retainedBytes.Length - $MaxBytes
             $retainedBytes = [byte[]]$retainedBytes[$discardCount..($retainedBytes.Length - 1)]
             $retainedOffset += $discardCount
             $startsPartial = $true
+            $leadingProofByte = $null
         }
         if ($startsPartial -and $retainedBytes.Length -gt 0) {
             $firstBreak = [Array]::IndexOf($retainedBytes, [byte]0x0A)
             if ($firstBreak -ge 0) {
                 $discardCount = $firstBreak + 1
-                $retainedBytes = if ($discardCount -lt $retainedBytes.Length) { [byte[]]$retainedBytes[$discardCount..($retainedBytes.Length - 1)] } else { [byte[]]@() }
+                if ($discardCount -lt $retainedBytes.Length) { $retainedBytes = [byte[]]$retainedBytes[$discardCount..($retainedBytes.Length - 1)] }
+                else { $retainedBytes = [byte[]]::new(0) }
                 $retainedOffset += $discardCount
                 $startsPartial = $false
+                $leadingProofByte = [byte]0x0A
             }
         }
         $incompleteByteCount = if ($startsPartial) { 0 } else { Get-Utf8TrailingIncompleteByteCount -Bytes $retainedBytes }
         $completeByteCount = $retainedBytes.Length - $incompleteByteCount
         $combined = if (-not $startsPartial -and $completeByteCount -gt 0) { [Text.Encoding]::UTF8.GetString($retainedBytes, 0, $completeByteCount) } else { '' }
-        $nextPendingBytes = if ($incompleteByteCount -gt 0) { [byte[]]$retainedBytes[$completeByteCount..($retainedBytes.Length - 1)] } else { [byte[]]@() }
+        if ($incompleteByteCount -gt 0) { $nextPendingBytes = [byte[]]$retainedBytes[$completeByteCount..($retainedBytes.Length - 1)] }
+        else { $nextPendingBytes = [byte[]]::new(0) }
         $parts = @($combined -split '\r?\n')
         $residual = if ($combined.EndsWith("`n", [StringComparison]::Ordinal)) { '' } else { [string]$parts[-1] }
         $completed = if ($residual.Length -gt 0 -and $parts.Count -gt 1) { @($parts[0..($parts.Count - 2)]) } elseif ($residual.Length -gt 0) { @() } else { @($parts | Select-Object -SkipLast 1) }
         $lines = @($completed)
         if ($lines.Count -gt $Count) { $lines = @($lines[($lines.Count - $Count)..($lines.Count - 1)]) }
-        # The raw retained window is the sole source of cached text and decoder
-        # residue, so the same bytes provide the complete continuity proof.
-        $continuityLength = $retainedBytes.Length
-        $continuityOffset = $retainedOffset
-        $continuitySha256 = Get-ByteArraySha256 -Bytes $retainedBytes
+        # Include the left delimiter whenever decoded text starts after byte 0;
+        # payload equality alone cannot prove that the first line stays framed.
+        $hasLeadingProof = $null -ne $leadingProofByte -and $retainedOffset -gt 0 -and -not $startsPartial
+        $continuityBytes = [byte[]]::new($retainedBytes.Length + $(if ($hasLeadingProof) { 1 } else { 0 }))
+        if ($hasLeadingProof) { $continuityBytes[0] = [byte]$leadingProofByte }
+        if ($retainedBytes.Length -gt 0) { [Array]::Copy($retainedBytes, 0, $continuityBytes, $(if ($hasLeadingProof) { 1 } else { 0 }), $retainedBytes.Length) }
+        $continuityLength = $continuityBytes.Length
+        $continuityOffset = $retainedOffset - $(if ($hasLeadingProof) { 1 } else { 0 })
+        $continuitySha256 = Get-ByteArraySha256 -Bytes $continuityBytes
+        $postReadSha256 = Get-StreamRangeSha256 -Stream $stream -Offset $continuityOffset -Length $continuityLength -DeadlineUtc $DeadlineUtc
+        $stable = $stream.Length -ge $capturedLength -and $postReadSha256 -ceq $continuitySha256
+        if (-not $stable) {
+            $script:SharedTextTailState.Clear()
+            $script:SharedTextTailState[$identity] = [pscustomobject]@{
+                usable = $false; stable = $false; offset = 0L; retainedBytes = [byte[]]@(); retainedOffset = 0L
+                startsPartial = $false; continuityOffset = 0L; continuityLength = 0; continuitySha256 = $null
+                incremental = $false; resynchronized = $true; bytesRead = $read
+                hashBytesRead = ([int]$(if ($hasRetainedWindow) { [int]$prior.continuityLength } else { 0 }) + $continuityLength)
+                cumulativeBytesRead = [long]$(if ($null -ne $prior -and $prior.PSObject.Properties['cumulativeBytesRead']) { [long]$prior.cumulativeBytesRead + $read } else { $read })
+                error = 'The shared log changed while its bounded tail snapshot was being validated.'
+            }
+            return @()
+        }
+        $usable = $retainedBytes.Length -gt 0 -or $retainedOffset -eq 0
         $script:SharedTextTailState.Clear()
         $script:SharedTextTailState[$identity] = [pscustomobject]@{
+            usable = $usable
+            stable = $true
             offset = $capturedLength
             residual = $residual
             lines = $lines
@@ -269,12 +311,14 @@ function Get-SharedTextTail {
             retainedBytes = $retainedBytes
             retainedOffset = $retainedOffset
             startsPartial = $startsPartial
+            leadingProofByte = $leadingProofByte
             continuityOffset = $continuityOffset
             continuityLength = $continuityLength
             continuitySha256 = $continuitySha256
             incremental = $incremental
             resynchronized = $null -ne $prior -and -not $incremental
             bytesRead = $read
+            hashBytesRead = ([int]$(if ($hasRetainedWindow) { [int]$prior.continuityLength } else { 0 }) + $continuityLength)
             cumulativeBytesRead = [long]$(if ($null -ne $prior -and $prior.PSObject.Properties['cumulativeBytesRead']) { [long]$prior.cumulativeBytesRead + $read } else { $read })
         }
         $visible = @($lines)
@@ -1059,8 +1103,10 @@ function Get-NullRuntimeEvidence {
     $headPoseLoaded = $null
     $headPoseRegistered = $null
     $tail = @()
+    $tailState = $null
     if ($serverStartUtc -and (Test-Path -LiteralPath $ServerLogPath -PathType Leaf)) {
         $tail = @(Get-SharedTextTail -Path $ServerLogPath -Count 2000 -MaxBytes $LogTailMaxBytes -DeadlineUtc $DeadlineUtc)
+        $tailState = @($script:SharedTextTailState.Values | Select-Object -First 1)[0]
         $minimumUtc = $serverStartUtc.AddSeconds(-3)
         foreach ($line in $tail) {
             $timestampUtc = Get-LogTimestampUtc -Line $line
@@ -1105,7 +1151,18 @@ function Get-NullRuntimeEvidence {
         steamVrProcesses = $owned
         unprovenProcesses = @($Processes | Where-Object { $_ -notin $owned })
         serverLogPath = $ServerLogPath
-        serverLogSha256 = Get-HashOrNull $ServerLogPath
+        serverLogSha256 = if ($tailState -and [bool]$tailState.stable) { [string]$tailState.continuitySha256 } else { $null }
+        serverLogHashScope = 'bounded-tail-window'
+        serverLogHashOffset = if ($tailState) { [long]$tailState.continuityOffset } else { $null }
+        serverLogHashLength = if ($tailState) { [int]$tailState.continuityLength } else { 0 }
+        serverLogIo = [pscustomobject][ordered]@{
+            maxBytes = $LogTailMaxBytes
+            bytesRead = if ($tailState) { [int]$tailState.bytesRead } else { 0 }
+            hashBytesRead = if ($tailState) { [int]$tailState.hashBytesRead } else { 0 }
+            totalBytesExamined = if ($tailState) { [int]$tailState.bytesRead + [int]$tailState.hashBytesRead } else { 0 }
+            stable = $null -ne $tailState -and [bool]$tailState.stable
+            error = if ($tailState -and $tailState.PSObject.Properties['error']) { [string]$tailState.error } else { $null }
+        }
         driverLoaded = $loaded
         activeHmd = $active
         headPoseDriverLoaded = $headPoseLoaded

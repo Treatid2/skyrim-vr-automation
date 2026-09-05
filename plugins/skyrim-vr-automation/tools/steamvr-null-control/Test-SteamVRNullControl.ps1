@@ -116,6 +116,11 @@ try {
         param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $tailFunctionNames
     }, $true) | Sort-Object { [array]::IndexOf($tailFunctionNames, $_.Name) })
+    $runtimeEvidenceFunction = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-NullRuntimeEvidence'
+    }, $true))[0]
+    Assert-Test ($runtimeEvidenceFunction.Extent.Text -notmatch 'Get-HashOrNull\s+\$ServerLogPath' -and $runtimeEvidenceFunction.Extent.Text -match "serverLogHashScope\s*=\s*'bounded-tail-window'") 'runtime evidence reports the bounded tail proof instead of hashing the complete growing SteamVR log'
     $tailHarnessText = "`$script:SharedTextTailState = @{}`n" + (($tailFunctions | ForEach-Object { $_.Extent.Text }) -join "`n")
     $tailHarness = New-Module -ScriptBlock ([scriptblock]::Create($tailHarnessText))
     $tailPath = Join-Path $fixture 'incremental-tail.txt'
@@ -230,6 +235,104 @@ try {
         [pscustomobject]@{ lines = $lines; states = @($script:SharedTextTailState.Values) }
     } $tailPath
     Assert-Test (($recreatedTail.lines -join '|') -eq 'recreated-file' -and $recreatedTail.states.Count -eq 1 -and -not $recreatedTail.states[0].incremental) 'file recreation establishes a fresh bounded-tail identity and discards prior state'
+
+    $delimiterPrefix = 'd'.PadRight(5000, 'd')
+    [IO.File]::WriteAllText($tailPath, "$delimiterPrefix`nretained-first`nretained-second`n", $utf8)
+    $delimiterInitial = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    $delimiterMutation = & $tailHarness {
+        param($path)
+        $hook = {
+            param($phase, $stream, $capturedLength)
+            $state = @($script:SharedTextTailState.Values)[0]
+            $writer = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+            try {
+                $writer.Position = [long]$state.continuityOffset
+                $writer.WriteByte([byte][char]'x')
+            }
+            finally { $writer.Dispose() }
+        }
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -InternalMutationHook $hook)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test ($delimiterInitial.state.leadingProofByte -eq 0x0A -and $delimiterInitial.lines[0] -eq 'retained-first') 'bounded tail continuity retains the delimiter immediately before its first decoded line'
+    Assert-Test (-not $delimiterMutation.state.stable -and -not $delimiterMutation.state.usable -and $delimiterMutation.lines.Count -eq 0) 'a delimiter rewrite after the initial proof cannot publish a stale first line'
+
+    $emptyWindow = ('p'.PadRight(5000, 'p') + "`n")
+    [IO.File]::WriteAllText($tailPath, $emptyWindow, $utf8)
+    $emptyProof = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    $suffix = "`ncurrent-line`n"
+    $sameSizeReplacement = 'q'.PadRight($emptyWindow.Length - $suffix.Length, 'q') + $suffix
+    [IO.File]::WriteAllText($tailPath, $sameSizeReplacement, $utf8)
+    $afterEmptyRewrite = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test (-not $emptyProof.state.usable -and [long]$emptyProof.state.retainedOffset -gt 0) 'an empty retained window at nonzero offset is not admitted as a continuity proof'
+    Assert-Test (-not $afterEmptyRewrite.state.incremental -and $afterEmptyRewrite.lines[-1] -eq 'current-line') 'a same-length rewrite after an empty retained window is read as a fresh bounded snapshot'
+
+    [IO.File]::WriteAllText($tailPath, "stable-one`nstable-two`n", $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    $postHashMutation = & $tailHarness {
+        param($path)
+        $hook = {
+            param($phase, $stream, $capturedLength)
+            $writer = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+            try {
+                $writer.Position = 0
+                $writer.WriteByte([byte][char]'x')
+            }
+            finally { $writer.Dispose() }
+        }
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -InternalMutationHook $hook)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    $postHashRecovery = & $tailHarness {
+        param($path)
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test (-not $postHashMutation.state.stable -and -not $postHashMutation.state.usable -and $postHashMutation.lines.Count -eq 0) 'a retained-window rewrite between continuity proof and snapshot validation fails closed'
+    Assert-Test (-not $postHashRecovery.state.incremental -and $postHashRecovery.lines[0] -eq 'xtable-one') 'the poll after a rejected in-read mutation establishes a fresh current snapshot'
+
+    [IO.File]::WriteAllText($tailPath, ('base'.PadRight(5000, 'b') + "`n"), $utf8)
+    $null = & $tailHarness { param($path) Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 } $tailPath
+    [IO.File]::AppendAllText($tailPath, "appended-line`n", $utf8)
+    $shortRead = & $tailHarness {
+        param($path)
+        $hook = {
+            param($phase, $stream, $capturedLength)
+            $writer = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+            try { $writer.SetLength([Math]::Max(0, $capturedLength - 256)) }
+            finally { $writer.Dispose() }
+        }
+        $lines = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096 -InternalMutationHook $hook)
+        [pscustomobject]@{ lines = $lines; state = @($script:SharedTextTailState.Values)[0] }
+    } $tailPath
+    Assert-Test (-not $shortRead.state.stable -and -not $shortRead.state.usable -and [long]$shortRead.state.offset -eq 0 -and $shortRead.lines.Count -eq 0) 'a short read after truncation cannot advance the cached offset or publish partial evidence'
+
+    [IO.File]::WriteAllText($tailPath, ('large-log'.PadRight(100000, 'l') + "`nlatest`n"), $utf8)
+    $boundedFresh = & $tailHarness {
+        param($path)
+        $null = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        @($script:SharedTextTailState.Values)[0]
+    } $tailPath
+    [IO.File]::AppendAllText($tailPath, "more`n", $utf8)
+    $boundedAppend = & $tailHarness {
+        param($path)
+        $null = @(Get-SharedTextTail -Path $path -Count 20 -MaxBytes 4096)
+        @($script:SharedTextTailState.Values)[0]
+    } $tailPath
+    Assert-Test ([int]$boundedFresh.bytesRead -le 4096 -and [int]$boundedFresh.hashBytesRead -le 8192 -and ([int]$boundedFresh.bytesRead + [int]$boundedFresh.hashBytesRead) -le 12288) 'fresh runtime log evidence examines at most a small bounded multiple of the configured tail window'
+    Assert-Test ([int]$boundedAppend.bytesRead -le 4096 -and [int]$boundedAppend.hashBytesRead -le 8192 -and ([int]$boundedAppend.bytesRead + [int]$boundedAppend.hashBytesRead) -le 12288) 'incremental runtime log evidence remains bounded independently of total log size'
 
     $authorizationDenied = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -InternalTestFailurePoint head-pose-access-denied -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $authorizationDenied.ok -and $authorizationDenied.state -eq 'head-pose-provider-authorization-failed' -and $authorizationDenied.data.runtime.headPoseState.authorizationDenied) 'inspect translates shared-memory authorization denial into a distinct structured state'
