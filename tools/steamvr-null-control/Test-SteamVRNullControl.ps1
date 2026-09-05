@@ -122,7 +122,7 @@ try {
     }, $true))[0]
     Assert-Test ($runtimeEvidenceFunction.Extent.Text -notmatch 'Get-HashOrNull\s+\$ServerLogPath' -and $runtimeEvidenceFunction.Extent.Text -match "serverLogHashScope\s*=\s*'bounded-tail-window'") 'runtime evidence reports the bounded tail proof instead of hashing the complete growing SteamVR log'
     Assert-Test ($runtimeEvidenceFunction.Extent.Text -match 'usable\s*=\s*\$null -ne \$tailState' -and $runtimeEvidenceFunction.Extent.Text -match 'incremental\s*=\s*\$null -ne \$tailState' -and $runtimeEvidenceFunction.Extent.Text -match 'resynchronized\s*=\s*\$null -ne \$tailState') 'runtime evidence publishes cache usability, incremental reuse, and resynchronization status'
-    Assert-Test ($sourceText -match 'if \(\$runtimeConfirmationTimedOut\)' -and $sourceText -match "State 'runtime-confirmation-timeout'" -and $sourceText -match "'runtime-confirmation-timeout'") 'a timed-out post-ready runtime confirmation cannot retain the earlier successful readiness decision'
+    Assert-Test ($sourceText -match "'runtime-confirmation-timeout'" -and $sourceText -match "'runtime-confirmation-timeout-receipt-failure'") 'the bounded test contract exposes runtime confirmation and receipt-failure seams'
     $tailHarnessText = "`$script:SharedTextTailState = @{}`n" + (($tailFunctions | ForEach-Object { $_.Extent.Text }) -join "`n")
     $tailHarness = New-Module -ScriptBlock ([scriptblock]::Create($tailHarnessText))
     $tailPath = Join-Path $fixture 'incremental-tail.txt'
@@ -495,6 +495,44 @@ try {
     $authorizationDeniedStart = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint head-pose-access-denied-after-start -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
     if (-not $authorizationDeniedStart.data.PSObject.Properties['startupCleanup']) { throw "Fixture authorization-denied start did not reach cleanup: $($authorizationDeniedStart | ConvertTo-Json -Depth 12 -Compress)" }
     Assert-Test (-not $authorizationDeniedStart.ok -and $authorizationDeniedStart.state -eq 'head-pose-provider-authorization-failed' -and $authorizationDeniedStart.data.startupCleanup -and @($authorizationDeniedStart.data.startupCleanup.remaining).Count -eq 0) 'startup authorization denial stops every exact SteamVR process started by the attempt'
+
+    $runtimeReceiptPath = Join-Path $evidence 'steamvr-null-runtime.receipt.json'
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $confirmationTimeout = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-confirmation-timeout -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $confirmationReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test (-not $confirmationTimeout.ok -and $confirmationTimeout.state -eq 'runtime-confirmation-timeout' -and $confirmationTimeout.data.runtimeReceiptPersisted -and $confirmationTimeout.data.startupCleanup.verified) 'a reachable confirmation timeout returns a cleanup-qualified failure'
+    Assert-Test ($confirmationReceipt.runtimeConfirmationAttempted -and $confirmationReceipt.runtimeConfirmationTimedOut -and -not $confirmationReceipt.runtimeAccepted -and $confirmationReceipt.admissionState -eq 'runtime-confirmation-timeout') 'confirmation-timeout receipt records attempted, timed-out, and nonaccepted state'
+    Assert-Test (-not $confirmationTimeout.data.inputContract.measurementReady -and $confirmationTimeout.data.inputContract.measurementBlockers -contains 'runtime-confirmation-timeout') 'confirmation timeout blocks measurement with an attributable reason'
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $receiptFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-confirmation-timeout-receipt-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $receiptFailure.ok -and $receiptFailure.state -eq 'runtime-confirmation-timeout' -and -not $receiptFailure.data.runtimeReceiptPersisted -and $receiptFailure.data.runtimeReceiptError -match 'Injected runtime receipt persistence failure') 'receipt failure preserves the original confirmation-timeout classification'
+    Assert-Test ($receiptFailure.data.startupCleanup.verified -and @($receiptFailure.data.startupCleanup.remaining).Count -eq 0) 'confirmation-timeout cleanup completes before injected receipt persistence failure'
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $finalAdmissionTimeout = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-final-admission-timeout -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $finalAdmissionReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test (-not $finalAdmissionTimeout.ok -and $finalAdmissionTimeout.state -eq 'startup-deadline-exceeded' -and $finalAdmissionTimeout.data.startupCleanup.verified -and -not $finalAdmissionReceipt.runtimeAccepted) 'deadline expiry after the final probe cannot publish successful runtime admission'
+    Assert-Test (-not $finalAdmissionTimeout.data.inputContract.measurementReady -and $finalAdmissionTimeout.data.inputContract.measurementBlockers -contains 'startup-deadline-exceeded') 'late final admission remains measurement-blocked'
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $noConfirmationTimeout = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-final-admission-timeout-no-confirmation -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $noConfirmationReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test (-not $noConfirmationTimeout.ok -and $noConfirmationTimeout.state -eq 'startup-deadline-exceeded' -and -not $noConfirmationReceipt.runtimeConfirmationAttempted -and -not $noConfirmationReceipt.runtimeAccepted) 'late admission without a confirmation probe also fails closed'
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $postReceiptTimeout = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-post-receipt-timeout -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $postReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test (-not $postReceiptTimeout.ok -and $postReceiptTimeout.state -eq 'startup-deadline-exceeded' -and $postReceiptTimeout.data.startupCleanup.verified) 'deadline expiry during receipt publication fails closed and performs exact cleanup'
+    Assert-Test (-not $postReceipt.runtimeAccepted -and $postReceipt.admissionState -eq 'startup-deadline-exceeded') 'late post-receipt admission is corrected to a durable nonaccepted receipt'
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $timelyReady = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-ready -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $timelyReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test ($timelyReady.ok -and $timelyReady.state -eq 'null-runtime-started-head-pose-ready' -and $timelyReady.data.inputContract.measurementReady) 'a timely final confirmation remains accepted and measurement-ready'
+    Assert-Test ($timelyReceipt.runtimeAccepted -and $timelyReceipt.admissionState -eq 'accepted' -and $timelyReceipt.acceptedUtc) 'timely admission persists an accepted receipt'
+    Stop-Process -Id ([int]$timelyReceipt.launcherPid) -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 100
     [IO.File]::WriteAllBytes($startupPath, [byte[]]@(0))
 
     $secondCallerApply = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -Compact -NoExit | ConvertFrom-Json

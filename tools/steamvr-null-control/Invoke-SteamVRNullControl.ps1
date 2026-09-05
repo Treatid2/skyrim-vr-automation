@@ -32,7 +32,7 @@ param(
 
     [switch]$AllowExternalDisplayRedirector,
 
-    [ValidateSet('', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'head-pose-access-denied', 'head-pose-access-denied-after-start')]
+    [ValidateSet('', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'head-pose-access-denied', 'head-pose-access-denied-after-start', 'runtime-ready', 'runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-post-receipt-timeout')]
     [string]$InternalTestFailurePoint = '',
 
     [switch]$IsolateExternalDisplayRedirectors,
@@ -1197,7 +1197,7 @@ function Get-NullRuntimeEvidence {
     }
     $providerLogReady = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active -and $null -ne $headPoseLoaded -and $null -ne $headPoseRegistered
     $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -DeadlineUtc $DeadlineUtc } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider is not ready for an application-facing pose probe.' } }
-    return [pscustomobject][ordered]@{
+    $runtimeEvidence = [pscustomobject][ordered]@{
         active = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active
         serverProcess = if ($server.Count -eq 1) { $server[0] } else { $null }
         steamVrProcesses = $owned
@@ -1229,6 +1229,22 @@ function Get-NullRuntimeEvidence {
         dashboardProcesses = @($owned | Where-Object name -eq 'vrdashboard')
         dashboardSuppressed = $Profile['dashboard'].ContainsKey('enableDashboard') -and -not [bool]$Profile['dashboard']['enableDashboard']
     }
+    $fixtureReadyPoints = @(
+        'runtime-ready',
+        'runtime-confirmation-timeout',
+        'runtime-confirmation-timeout-receipt-failure',
+        'runtime-final-admission-timeout',
+        'runtime-final-admission-timeout-no-confirmation',
+        'runtime-post-receipt-timeout'
+    )
+    $fixtureMode = -not [string]::IsNullOrWhiteSpace($env:CSX_STEAMVR_TRANSACTION_ROOT) -and
+        (Get-Variable -Scope Script -Name SteamVRStartupAttemptActive -ValueOnly -ErrorAction SilentlyContinue)
+    if ($fixtureMode -and $InternalTestFailurePoint -in $fixtureReadyPoints) {
+        $runtimeEvidence.active = $true
+        $runtimeEvidence.headPoseReady = $true
+        $runtimeEvidence.headPoseAuthorizationError = $null
+    }
+    return $runtimeEvidence
 }
 
 function New-Result {
@@ -1270,6 +1286,9 @@ $targetControl = $null
 $targetLock = $null
 $recoveredTransaction = $null
 $pendingAuthoritativeTransaction = $null
+$startupAttemptStartedUtc = $null
+$startupAttemptAccepted = $false
+$startupCleanup = $null
 try {
     if ([string]::IsNullOrWhiteSpace($OpenVRPathsPath)) { throw 'OpenVRPathsPath is required to identify the complete live transaction target.' }
     $localApplicationData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
@@ -1493,6 +1512,7 @@ try {
             else {
                 $startedUtc = [DateTime]::UtcNow
                 $launcher = Start-Process -FilePath $startupPath -WindowStyle Hidden -PassThru
+                $startupAttemptStartedUtc = $startedUtc
                 $script:SteamVRStartupAttemptActive = $true
                 $deadline = $startedUtc.AddSeconds($StartupTimeoutSeconds)
                 $logReadReserveMilliseconds = [int][Math]::Min(2000, [Math]::Max(500, $StartupTimeoutSeconds * 50))
@@ -1520,13 +1540,13 @@ try {
                         break
                     }
                 } while (-not $runtime.active -or -not $runtime.headPoseReady)
-                if ($runtime.active -and $runtime.headPoseReady -and [DateTime]::UtcNow.AddMilliseconds(2250) -lt $qualificationDeadline) {
+                if ($InternalTestFailurePoint -ne 'runtime-final-admission-timeout-no-confirmation' -and $runtime.active -and $runtime.headPoseReady -and [DateTime]::UtcNow.AddMilliseconds(2250) -lt $qualificationDeadline) {
                     $runtimeConfirmationAttempted = $true
                     Start-Sleep -Seconds 2
                     $processes = @(Get-SteamVRProcesses)
                     try {
                         $runtimeProbeAttempts++
-                        if ($InternalTestFailurePoint -eq 'runtime-confirmation-timeout') {
+                        if ($InternalTestFailurePoint -in @('runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure')) {
                             throw [TimeoutException]::new('Injected runtime confirmation timeout.')
                         }
                         $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline
@@ -1535,6 +1555,9 @@ try {
                         $lastRuntimeProbeError = $_.Exception.Message
                         $runtimeConfirmationTimedOut = $true
                     }
+                }
+                if ($InternalTestFailurePoint -in @('runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation')) {
+                    $deadline = [DateTime]::UtcNow.AddMilliseconds(-1)
                 }
                 $runtimeReceiptPath = Join-Path $EvidenceDirectory 'steamvr-null-runtime.receipt.json'
                 $runtimeReceipt = [ordered]@{
@@ -1551,33 +1574,102 @@ try {
                     lastRuntimeProbeError = $lastRuntimeProbeError
                     runtimeConfirmationAttempted = $runtimeConfirmationAttempted
                     runtimeConfirmationTimedOut = $runtimeConfirmationTimedOut
-                    runtimeAccepted = -not $runtimeConfirmationTimedOut -and [bool]$runtime.active -and [bool]$runtime.headPoseReady
+                    runtimeAccepted = $false
+                    admissionState = 'pending'
+                    acceptedUtc = $null
                     externalDrivers = $externalDrivers
                     externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector
                     externalDriverIsolationValidation = $isolationValidation
                 }
-                Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
                 $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers -DiagnosticDisplayOverride ([bool]$AllowExternalDisplayRedirector)
+                $failureState = $null
+                $failureErrors = [Collections.Generic.List[string]]::new()
                 if ($runtimeConfirmationTimedOut) {
-                    $inputContract['measurementReady'] = $false
-                    $inputContract['measurementBlockers'] = @($inputContract['measurementBlockers']) + 'runtime-confirmation-timeout'
-                    $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
-                    $result = New-Result -Ok $false -State 'runtime-confirmation-timeout' -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; inputContract = $inputContract; startupCleanup = $startupCleanup } -Errors @($lastRuntimeProbeError, 'The current runtime confirmation did not complete before its deadline; exact SteamVR processes started by this attempt were stopped.')
+                    $failureState = 'runtime-confirmation-timeout'
+                    $failureErrors.Add([string]$lastRuntimeProbeError)
+                    $failureErrors.Add('The current runtime confirmation did not complete before its deadline.')
+                }
+                elseif ([DateTime]::UtcNow -ge $deadline) {
+                    $failureState = 'startup-deadline-exceeded'
+                    $failureErrors.Add('The absolute startup deadline elapsed before final runtime admission.')
                 }
                 elseif ($runtime.headPoseAuthorizationError) {
-                    $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
-                    $result = New-Result -Ok $false -State 'head-pose-provider-authorization-failed' -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; inputContract = $inputContract; startupCleanup = $startupCleanup } -Errors @([string]$runtime.headPoseAuthorizationError, 'Exact SteamVR processes started by this attempt were stopped.')
+                    $failureState = 'head-pose-provider-authorization-failed'
+                    $failureErrors.Add([string]$runtime.headPoseAuthorizationError)
                 }
                 elseif ($runtime.active -and -not $runtime.headPoseReady) {
-                    $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
-                    $result = New-Result -Ok $false -State 'head-pose-provider-not-ready' -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; inputContract = $inputContract; startupCleanup = $startupCleanup } -Errors @('SteamVR activated the Valve null display, but the synthetic standing head pose was not loaded and acknowledged; exact processes started by this attempt were stopped.')
+                    $failureState = 'head-pose-provider-not-ready'
+                    $failureErrors.Add('SteamVR activated the Valve null display, but the synthetic standing head pose was not loaded and acknowledged.')
                 }
-                elseif ($runtime.active) {
-                    $result = New-Result -Ok $true -State $(if ($AllowExternalDisplayRedirector) { 'null-runtime-started-head-pose-ready-unqualified-display-route' } else { 'null-runtime-started-head-pose-ready' }) -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; inputContract = $inputContract; externalDrivers = $externalDrivers; externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector; externalDriverIsolation = $isolation; externalDriverIsolationValidation = $isolationValidation }
+                elseif (-not $runtime.active) {
+                    $failureState = 'startup-incomplete'
+                    $failureErrors.Add('SteamVR started, but current-session Valve null-driver and active-HMD log proof was not observed before the timeout.')
+                }
+
+                $runtimeReceiptPersisted = $false
+                $runtimeReceiptError = $null
+                if ($null -eq $failureState) {
+                    $runtimeReceipt['runtimeAccepted'] = $true
+                    $runtimeReceipt['admissionState'] = 'accepted'
+                    $runtimeReceipt['acceptedUtc'] = [DateTime]::UtcNow.ToString('o')
+                    Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
+                    $runtimeReceiptPersisted = $true
+                    if ($InternalTestFailurePoint -eq 'runtime-post-receipt-timeout') {
+                        $deadline = [DateTime]::UtcNow.AddMilliseconds(-1)
+                    }
+                    if ([DateTime]::UtcNow -ge $deadline) {
+                        $failureState = 'startup-deadline-exceeded'
+                        $failureErrors.Add('The absolute startup deadline elapsed during final runtime admission.')
+                    }
+                }
+
+                if ($null -ne $failureState) {
+                    # Cleanup is mandatory once admission fails, even if diagnostic persistence also fails.
+                    $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
+                    $inputContract['measurementReady'] = $false
+                    $inputContract['measurementBlockers'] = @($inputContract['measurementBlockers']) + $failureState
+                    $runtimeReceipt['runtimeAccepted'] = $false
+                    $runtimeReceipt['admissionState'] = $failureState
+                    $runtimeReceipt['acceptedUtc'] = $null
+                    $runtimeReceipt['startupCleanup'] = $startupCleanup
+                    try {
+                        if ($InternalTestFailurePoint -eq 'runtime-confirmation-timeout-receipt-failure') {
+                            throw [IO.IOException]::new('Injected runtime receipt persistence failure.')
+                        }
+                        Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
+                        $runtimeReceiptPersisted = $true
+                    }
+                    catch {
+                        $runtimeReceiptPersisted = $false
+                        $runtimeReceiptError = $_.Exception.Message
+                        $failureErrors.Add("Runtime receipt persistence failed after cleanup: $runtimeReceiptError")
+                    }
+                    if ([bool]$startupCleanup.verified) {
+                        $failureErrors.Add('Exact SteamVR processes started by this attempt were stopped and verified.')
+                    }
+                    else {
+                        $failureErrors.Add('Exact-attempt cleanup did not verify a fully stopped runtime; inspect startupCleanup before retrying.')
+                    }
+                    $result = New-Result -Ok $false -State $failureState -Data @{ effective = $effective; runtime = $runtime; processes = $processes; runtimeReceiptPath = $runtimeReceiptPath; runtimeReceiptPersisted = $runtimeReceiptPersisted; runtimeReceiptError = $runtimeReceiptError; inputContract = $inputContract; startupCleanup = $startupCleanup } -Errors @($failureErrors)
                 }
                 else {
-                    $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
-                    $result = New-Result -Ok $false -State 'startup-incomplete' -Data @{ effective = $effective; runtime = $runtime; processes = $processes; runtimeReceiptPath = $runtimeReceiptPath; startupCleanup = $startupCleanup } -Errors @('SteamVR started, but current-session Valve null-driver and active-HMD log proof was not observed before the timeout; exact processes started by this attempt were stopped.')
+                    $successResult = New-Result -Ok $true -State $(if ($AllowExternalDisplayRedirector) { 'null-runtime-started-head-pose-ready-unqualified-display-route' } else { 'null-runtime-started-head-pose-ready' }) -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; runtimeReceiptPersisted = $runtimeReceiptPersisted; inputContract = $inputContract; externalDrivers = $externalDrivers; externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector; externalDriverIsolation = $isolation; externalDriverIsolationValidation = $isolationValidation }
+                    if ([DateTime]::UtcNow -ge $deadline) {
+                        $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
+                        $inputContract['measurementReady'] = $false
+                        $inputContract['measurementBlockers'] = @($inputContract['measurementBlockers']) + 'startup-deadline-exceeded'
+                        $runtimeReceipt['runtimeAccepted'] = $false
+                        $runtimeReceipt['admissionState'] = 'startup-deadline-exceeded'
+                        $runtimeReceipt['acceptedUtc'] = $null
+                        $runtimeReceipt['startupCleanup'] = $startupCleanup
+                        try { Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt }
+                        catch { $runtimeReceiptError = $_.Exception.Message }
+                        $result = New-Result -Ok $false -State 'startup-deadline-exceeded' -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; runtimeReceiptPersisted = [string]::IsNullOrWhiteSpace($runtimeReceiptError); runtimeReceiptError = $runtimeReceiptError; inputContract = $inputContract; startupCleanup = $startupCleanup } -Errors @('The absolute startup deadline elapsed at the final success boundary; exact SteamVR processes started by this attempt were stopped.')
+                    }
+                    else {
+                        $startupAttemptAccepted = $true
+                        $result = $successResult
+                    }
                 }
             }
         }
@@ -1879,7 +1971,14 @@ try {
     }
 }
 catch {
-    $result = New-Result -Ok $false -State 'blocked' -Data @{ settingsPath = $SettingsPath; profilePath = $NullProfilePath; evidenceDirectory = $EvidenceDirectory; targetControl = $targetControl } -Errors @($_.Exception.Message)
+    $startupCleanupError = $null
+    if ($null -ne $startupAttemptStartedUtc -and -not $startupAttemptAccepted -and $null -eq $startupCleanup) {
+        try { $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startupAttemptStartedUtc }
+        catch { $startupCleanupError = $_.Exception.Message }
+    }
+    $errors = @($_.Exception.Message)
+    if ($startupCleanupError) { $errors += "Startup cleanup failed: $startupCleanupError" }
+    $result = New-Result -Ok $false -State 'blocked' -Data @{ settingsPath = $SettingsPath; profilePath = $NullProfilePath; evidenceDirectory = $EvidenceDirectory; targetControl = $targetControl; startupCleanup = $startupCleanup } -Errors $errors
 }
 finally {
     if ($targetLock) { $targetLock.Dispose() }
