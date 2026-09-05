@@ -22,6 +22,23 @@ function Assert-Test([bool]$Condition, [string]$Name) {
     if ($Condition) { $passes.Add($Name) } else { $failures.Add($Name) }
 }
 
+function Assert-LaunchedFailureEnvelope($Result, [string]$ExpectedState, [string]$Name) {
+    $dataProperties = @($Result.data.PSObject.Properties.Name)
+    $requiredProperties = @(
+        'admission', 'inputContract', 'runtimeReceiptPath', 'runtimeAttemptId',
+        'runtimeReceiptPersistenceAttempted', 'runtimeReceiptPersisted',
+        'runtimeReceiptError', 'startupCleanup', 'acceptedReceiptStageCleanup'
+    )
+    $complete = @($requiredProperties | Where-Object { $_ -notin $dataProperties }).Count -eq 0
+    $consistent = $Result.state -eq $ExpectedState -and
+        $Result.data.admission.state -eq $ExpectedState -and
+        -not $Result.data.inputContract.measurementReady -and
+        $Result.data.inputContract.measurementBlockers -contains $ExpectedState -and
+        -not [string]::IsNullOrWhiteSpace([string]$Result.data.runtimeReceiptPath) -and
+        -not [string]::IsNullOrWhiteSpace([string]$Result.data.runtimeAttemptId)
+    Assert-Test ($complete -and $consistent) $Name
+}
+
 $windowsPowerShell = Get-Command powershell.exe -ErrorAction SilentlyContinue
 if ($windowsPowerShell) {
     $legacyResult = & $windowsPowerShell.Source -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $entry inspect -Compact -NoExit | ConvertFrom-Json
@@ -513,18 +530,19 @@ try {
     $cleanupFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-confirmation-timeout-cleanup-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $cleanupFailure.ok -and $cleanupFailure.state -eq 'runtime-confirmation-timeout' -and $cleanupFailure.data.admission.state -eq 'runtime-confirmation-timeout') 'generic cleanup fallback preserves the original confirmation-timeout admission state'
     Assert-Test (-not $cleanupFailure.data.inputContract.measurementReady -and $cleanupFailure.data.inputContract.measurementBlockers -contains 'runtime-confirmation-timeout' -and -not $cleanupFailure.data.startupCleanup.verified) 'cleanup exceptions retain an explicit measurement blocker and unverified cleanup evidence'
-    Assert-Test (-not $cleanupFailure.data.runtimeReceiptPersistenceAttempted -and -not $cleanupFailure.data.runtimeReceiptPersisted -and $null -eq $cleanupFailure.data.runtimeReceiptError) 'cleanup failure explicitly reports that runtime receipt persistence was not attempted'
+    Assert-Test ($cleanupFailure.data.runtimeReceiptPersistenceAttempted -and $cleanupFailure.data.runtimeReceiptPersisted -and $null -eq $cleanupFailure.data.runtimeReceiptError) 'cleanup failure persists a nonaccepted current-attempt receipt after the generic boundary'
 
     Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
     $inputContractFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-input-contract-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $inputContractFailure.ok -and $inputContractFailure.state -eq 'runtime-admission-exception' -and $inputContractFailure.data.admission.state -eq 'runtime-admission-exception' -and $inputContractFailure.data.startupCleanup.verified) 'input-contract construction failure returns a cleanup-qualified failed-admission envelope'
     Assert-Test (-not $inputContractFailure.data.inputContract.available -and -not $inputContractFailure.data.inputContract.measurementReady -and $inputContractFailure.data.inputContract.measurementBlockers -contains 'runtime-admission-exception') 'unavailable input-contract evidence is represented explicitly and blocks measurement'
-    Assert-Test (-not $inputContractFailure.data.runtimeReceiptPersistenceAttempted -and -not $inputContractFailure.data.runtimeReceiptPersisted -and $null -eq $inputContractFailure.data.runtimeReceiptError) 'pre-receipt input-contract failure exposes explicit non-persistence without inventing a write error'
+    Assert-Test ($inputContractFailure.data.runtimeReceiptPersistenceAttempted -and $inputContractFailure.data.runtimeReceiptPersisted -and $null -eq $inputContractFailure.data.runtimeReceiptError) 'input-contract failure persists a nonaccepted current-attempt receipt without inventing a write error'
 
     Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
     $stageFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-accepted-receipt-stage-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
-    Assert-Test (-not $stageFailure.ok -and $stageFailure.state -eq 'runtime-admission-exception' -and $stageFailure.data.runtimeReceiptPersistenceAttempted -and -not $stageFailure.data.runtimeReceiptPersisted -and $stageFailure.data.runtimeReceiptError -match 'Injected accepted runtime receipt staging failure') 'accepted-receipt staging failure returns attributable persistence state in the failed-admission envelope'
-    Assert-Test (-not $stageFailure.data.inputContract.measurementReady -and $stageFailure.data.startupCleanup.verified -and -not (Test-Path -LiteralPath $runtimeReceiptPath -PathType Leaf)) 'accepted-receipt staging failure blocks measurement, cleans up, and publishes no accepted receipt'
+    $stageFailureReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test (-not $stageFailure.ok -and $stageFailure.state -eq 'runtime-admission-exception' -and $stageFailure.data.runtimeReceiptPersistenceAttempted -and $stageFailure.data.runtimeReceiptPersisted -and $stageFailure.errors -match 'Injected accepted runtime receipt staging failure') 'accepted-receipt staging failure returns attributable persistence state in the failed-admission envelope'
+    Assert-Test (-not $stageFailure.data.inputContract.measurementReady -and $stageFailure.data.startupCleanup.verified -and -not $stageFailureReceipt.runtimeAccepted -and $stageFailureReceipt.attemptId -eq $stageFailure.data.runtimeAttemptId) 'accepted-receipt staging failure blocks measurement and publishes only current nonaccepted authority'
 
     Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
     $finalAdmissionTimeout = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-final-admission-timeout -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
@@ -551,8 +569,47 @@ try {
     Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
     $publishFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-accepted-receipt-publish-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $publishFailure.ok -and $publishFailure.state -eq 'runtime-admission-exception' -and $publishFailure.data.startupCleanup.verified -and -not $publishFailure.data.inputContract.measurementReady) 'accepted-receipt publication failure invokes the complete outer failed-admission boundary'
-    Assert-Test ($publishFailure.data.runtimeReceiptPersistenceAttempted -and -not $publishFailure.data.runtimeReceiptPersisted -and $publishFailure.data.runtimeReceiptError -match 'Injected accepted runtime receipt publication failure') 'accepted-receipt publication failure exposes attributable persistence state'
-    Assert-Test (-not (Test-Path -LiteralPath $runtimeReceiptPath -PathType Leaf) -and @(Get-ChildItem -LiteralPath $evidence -Filter 'steamvr-null-runtime.receipt.json.*.stage').Count -eq 0) 'failed accepted-receipt publication leaves no public accepted receipt or private stage'
+    $publishFailureReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test ($publishFailure.data.runtimeReceiptPersistenceAttempted -and $publishFailure.data.runtimeReceiptPersisted -and $publishFailure.errors -match 'Injected accepted runtime receipt publication failure') 'accepted-receipt publication failure exposes attributable persistence state'
+    Assert-Test (-not $publishFailureReceipt.runtimeAccepted -and $publishFailureReceipt.attemptId -eq $publishFailure.data.runtimeAttemptId -and $publishFailure.data.acceptedReceiptStageCleanup.verified -and @(Get-ChildItem -LiteralPath $evidence -Filter 'steamvr-null-runtime.receipt.json.*.stage').Count -eq 0) 'failed accepted-receipt publication leaves current nonaccepted authority and no private stage'
+
+    $confirmationInputFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-confirmation-timeout-input-contract-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($confirmationInputFailure.state -eq 'runtime-confirmation-timeout' -and $confirmationInputFailure.data.admission.runtimeConfirmationTimedOut -and $confirmationInputFailure.errors -match 'Injected runtime input-contract') 'confirmation timeout remains primary when input-contract construction also fails'
+
+    $deadlineInputFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-final-admission-timeout-input-contract-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($deadlineInputFailure.state -eq 'startup-deadline-exceeded' -and $deadlineInputFailure.data.admission.state -eq 'startup-deadline-exceeded' -and $deadlineInputFailure.errors -match 'Injected runtime input-contract') 'pre-final deadline remains primary when input-contract construction also fails'
+
+    $deadlineCleanupFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-final-boundary-timeout-cleanup-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($deadlineCleanupFailure.state -eq 'startup-deadline-exceeded' -and -not $deadlineCleanupFailure.data.startupCleanup.verified -and $deadlineCleanupFailure.data.startupCleanup.errors -match 'Injected exact-attempt cleanup failure') 'final-boundary deadline remains primary when exact cleanup throws'
+
+    $earlyPostLaunchFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-early-post-launch-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $earlyFailureReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test ($earlyPostLaunchFailure.state -eq 'runtime-admission-exception' -and $earlyFailureReceipt.attemptId -eq $earlyPostLaunchFailure.data.runtimeAttemptId -and -not $earlyFailureReceipt.runtimeAccepted) 'early post-launch exception returns a deterministic path and current nonaccepted receipt'
+
+    $stageCleanupFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-accepted-receipt-publish-and-stage-cleanup-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $stageResiduePath = [string]$stageCleanupFailure.data.acceptedReceiptStageCleanup.path
+    Assert-Test (-not $stageCleanupFailure.data.acceptedReceiptStageCleanup.verified -and $stageCleanupFailure.data.acceptedReceiptStageCleanup.remaining -and $stageCleanupFailure.data.acceptedReceiptStageCleanup.error -match 'Injected accepted runtime receipt stage cleanup failure' -and (Test-Path -LiteralPath $stageResiduePath -PathType Leaf)) 'private accepted-stage cleanup failure reports exact non-authoritative residue'
+    Remove-Item -LiteralPath $stageResiduePath -Force
+
+    $launchedFailures = @(
+        @{ result = $confirmationTimeout; state = 'runtime-confirmation-timeout'; name = 'confirmation timeout returns the common launched-failure envelope' },
+        @{ result = $receiptFailure; state = 'runtime-confirmation-timeout'; name = 'diagnostic persistence failure returns the common launched-failure envelope' },
+        @{ result = $cleanupFailure; state = 'runtime-confirmation-timeout'; name = 'cleanup exception returns the common launched-failure envelope' },
+        @{ result = $inputContractFailure; state = 'runtime-admission-exception'; name = 'input-contract exception returns the common launched-failure envelope' },
+        @{ result = $stageFailure; state = 'runtime-admission-exception'; name = 'accepted-stage exception returns the common launched-failure envelope' },
+        @{ result = $finalAdmissionTimeout; state = 'startup-deadline-exceeded'; name = 'pre-final deadline returns the common launched-failure envelope' },
+        @{ result = $postReceiptTimeout; state = 'startup-deadline-exceeded'; name = 'post-stage deadline returns the common launched-failure envelope' },
+        @{ result = $unverifiedFinalCleanup; state = 'startup-deadline-exceeded'; name = 'unverified cleanup returns the common launched-failure envelope' },
+        @{ result = $publishFailure; state = 'runtime-admission-exception'; name = 'publication exception returns the common launched-failure envelope' },
+        @{ result = $confirmationInputFailure; state = 'runtime-confirmation-timeout'; name = 'composed confirmation failure returns the common launched-failure envelope' },
+        @{ result = $deadlineInputFailure; state = 'startup-deadline-exceeded'; name = 'composed deadline failure returns the common launched-failure envelope' },
+        @{ result = $deadlineCleanupFailure; state = 'startup-deadline-exceeded'; name = 'deadline cleanup exception returns the common launched-failure envelope' },
+        @{ result = $earlyPostLaunchFailure; state = 'runtime-admission-exception'; name = 'early exception returns the common launched-failure envelope' },
+        @{ result = $stageCleanupFailure; state = 'runtime-admission-exception'; name = 'stage residue returns the common launched-failure envelope' }
+    )
+    foreach ($case in $launchedFailures) {
+        Assert-LaunchedFailureEnvelope -Result $case.result -ExpectedState $case.state -Name $case.name
+    }
 
     Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
     $timelyReady = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-ready -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
@@ -561,6 +618,12 @@ try {
     Assert-Test ($timelyReceipt.runtimeAccepted -and $timelyReceipt.admissionState -eq 'accepted' -and $timelyReceipt.acceptedUtc) 'timely admission persists an accepted receipt'
     Stop-Process -Id ([int]$timelyReceipt.launcherPid) -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 100
+
+    $retryAfterAccepted = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-input-contract-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $retryReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test (-not $retryAfterAccepted.ok -and -not $retryReceipt.runtimeAccepted -and $retryReceipt.attemptId -eq $retryAfterAccepted.data.runtimeAttemptId -and $retryReceipt.attemptId -ne $timelyReceipt.attemptId) 'a failed retry atomically replaces prior accepted authority with its own nonaccepted receipt'
+    Assert-LaunchedFailureEnvelope -Result $retryAfterAccepted -ExpectedState 'runtime-admission-exception' -Name 'failed retry after accepted history returns the common launched-failure envelope'
+
     [IO.File]::WriteAllBytes($startupPath, [byte[]]@(0))
 
     $secondCallerApply = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -Compact -NoExit | ConvertFrom-Json

@@ -136,13 +136,18 @@ before attempting to persist diagnostic evidence. Accepted receipt bytes are
 staged and validated privately, then the absolute deadline is checked after
 staging and again immediately before atomic publication. A late admission never
 publishes the accepted stage; it blocks measurement and cleans up the exact
-attempt. Receipt-write failure remains diagnostic and cannot bypass mandatory
-cleanup or convert a failed attempt into success. Any unexpected post-launch
-exception returns the same explicit failed-admission envelope: measurement is
-blocked, available confirmation state is retained, receipt persistence is
-reported as attempted or not attempted with any error, and cleanup is either
-verified or identified as incomplete. Operator diagnostics never describe an
-unverified cleanup as successfully stopped.
+attempt. Before launch, schema-v2 receipt authority is atomically replaced with
+a nonaccepted record carrying a new `attemptId`; a prior accepted attempt can
+therefore never remain current during a retry. If that replacement fails, the
+controller refuses to launch. Receipt-write failure remains diagnostic and
+cannot bypass mandatory cleanup or convert a failed attempt into success. Any
+unexpected post-launch exception returns the same explicit failed-admission
+envelope: measurement is blocked, available confirmation state is retained,
+receipt persistence is reported with any error, and cleanup is either verified
+or identified as incomplete. Private accepted-stage removal is verified. A
+surviving stage remains non-authoritative and its exact path and removal error
+are returned and written to the public nonaccepted receipt when possible.
+Operator diagnostics never describe unverified cleanup as successfully stopped.
 
 ```powershell
 .\Invoke-SteamVRNullControl.ps1 apply -EvidenceDirectory <session-evidence> -Compact

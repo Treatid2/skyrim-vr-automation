@@ -32,7 +32,7 @@ param(
 
     [switch]$AllowExternalDisplayRedirector,
 
-    [ValidateSet('', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'head-pose-access-denied', 'head-pose-access-denied-after-start', 'runtime-ready', 'runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-post-receipt-timeout', 'runtime-final-boundary-timeout-cleanup-unverified', 'runtime-input-contract-failure', 'runtime-accepted-receipt-stage-failure', 'runtime-accepted-receipt-publish-failure')]
+    [ValidateSet('', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'head-pose-access-denied', 'head-pose-access-denied-after-start', 'runtime-ready', 'runtime-early-post-launch-failure', 'runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-confirmation-timeout-input-contract-failure', 'runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-final-admission-timeout-input-contract-failure', 'runtime-post-receipt-timeout', 'runtime-final-boundary-timeout-cleanup-unverified', 'runtime-final-boundary-timeout-cleanup-failure', 'runtime-input-contract-failure', 'runtime-accepted-receipt-stage-failure', 'runtime-accepted-receipt-publish-failure', 'runtime-accepted-receipt-publish-and-stage-cleanup-failure')]
     [string]$InternalTestFailurePoint = '',
 
     [switch]$IsolateExternalDisplayRedirectors,
@@ -910,7 +910,7 @@ function Stop-ExactStartedSteamVRProcesses([DateTime]$StartedUtc) {
         $remaining = @($targets | Where-Object { Get-Process -Id ([int]$_.id) -ErrorAction SilentlyContinue })
         if ($remaining.Count -gt 0) { Start-Sleep -Milliseconds 100 }
     } while ($remaining.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
-    if ($InternalTestFailurePoint -eq 'runtime-confirmation-timeout-cleanup-failure') {
+    if ($InternalTestFailurePoint -in @('runtime-confirmation-timeout-cleanup-failure', 'runtime-final-boundary-timeout-cleanup-failure')) {
         throw [IO.IOException]::new('Injected exact-attempt cleanup failure after process handling.')
     }
     $verified = $remaining.Count -eq 0 -and $errors.Count -eq 0
@@ -1239,16 +1239,21 @@ function Get-NullRuntimeEvidence {
     }
     $fixtureReadyPoints = @(
         'runtime-ready',
+        'runtime-early-post-launch-failure',
         'runtime-confirmation-timeout',
         'runtime-confirmation-timeout-receipt-failure',
         'runtime-confirmation-timeout-cleanup-failure',
+        'runtime-confirmation-timeout-input-contract-failure',
         'runtime-final-admission-timeout',
         'runtime-final-admission-timeout-no-confirmation',
+        'runtime-final-admission-timeout-input-contract-failure',
         'runtime-post-receipt-timeout',
         'runtime-final-boundary-timeout-cleanup-unverified',
+        'runtime-final-boundary-timeout-cleanup-failure',
         'runtime-input-contract-failure',
         'runtime-accepted-receipt-stage-failure',
-        'runtime-accepted-receipt-publish-failure'
+        'runtime-accepted-receipt-publish-failure',
+        'runtime-accepted-receipt-publish-and-stage-cleanup-failure'
     )
     $fixtureMode = -not [string]::IsNullOrWhiteSpace($env:CSX_STEAMVR_TRANSACTION_ROOT) -and
         (Get-Variable -Scope Script -Name SteamVRStartupAttemptActive -ValueOnly -ErrorAction SilentlyContinue)
@@ -1270,6 +1275,53 @@ function New-Result {
         timestampUtc = [DateTime]::UtcNow.ToString('o')
         errors = @($Errors)
         data = $Data
+    }
+}
+
+function New-RuntimeAdmissionSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$State,
+        [int]$ProbeAttempts,
+        [AllowNull()]$LastProbeError,
+        [bool]$ConfirmationAttempted,
+        [bool]$ConfirmationTimedOut
+    )
+    return [ordered]@{
+        state = $State
+        runtimeProbeAttempts = $ProbeAttempts
+        lastRuntimeProbeError = $LastProbeError
+        runtimeConfirmationAttempted = $ConfirmationAttempted
+        runtimeConfirmationTimedOut = $ConfirmationTimedOut
+    }
+}
+
+function New-LaunchedRuntimeFailureData {
+    param(
+        $Effective,
+        $Runtime,
+        $Processes,
+        [Parameter(Mandatory)]$Admission,
+        [Parameter(Mandatory)]$InputContract,
+        [Parameter(Mandatory)][string]$ReceiptPath,
+        [AllowNull()][string]$AttemptId,
+        [bool]$ReceiptPersistenceAttempted,
+        [bool]$ReceiptPersisted,
+        [AllowNull()]$ReceiptError,
+        [Parameter(Mandatory)]$StartupCleanup
+    )
+    return [ordered]@{
+        effective = $Effective
+        runtime = $Runtime
+        processes = @($Processes)
+        admission = $Admission
+        inputContract = $InputContract
+        runtimeReceiptPath = $ReceiptPath
+        runtimeAttemptId = $AttemptId
+        runtimeReceiptPersistenceAttempted = $ReceiptPersistenceAttempted
+        runtimeReceiptPersisted = $ReceiptPersisted
+        runtimeReceiptError = $ReceiptError
+        startupCleanup = $StartupCleanup
+        acceptedReceiptStageCleanup = $null
     }
 }
 
@@ -1312,11 +1364,13 @@ $runtimeReceipt = $null
 $runtimeReceiptPersisted = $false
 $runtimeReceiptPersistenceAttempted = $false
 $runtimeReceiptError = $null
+$runtimeAttemptId = $null
 $failureState = $null
 $runtimeProbeAttempts = 0
 $lastRuntimeProbeError = $null
 $runtimeConfirmationAttempted = $false
 $runtimeConfirmationTimedOut = $false
+$startupDeadlineUtc = $null
 try {
     if ([string]::IsNullOrWhiteSpace($OpenVRPathsPath)) { throw 'OpenVRPathsPath is required to identify the complete live transaction target.' }
     $localApplicationData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
@@ -1538,13 +1592,56 @@ try {
                 $result = New-Result -Ok $true -State 'dry-run' -Data @{ startupPath = $startupPath; effective = $effective; runtime = $runtime; externalDrivers = $externalDrivers; externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector; externalDriverIsolation = $isolation; externalDriverIsolationValidation = $isolationValidation; inputContract = $inputContract }
             }
             else {
+                $runtimeReceiptPath = Join-Path $EvidenceDirectory 'steamvr-null-runtime.receipt.json'
+                $runtimeAttemptId = [guid]::NewGuid().ToString('N')
+                $runtimeReceipt = [ordered]@{
+                    schemaVersion = 2
+                    attemptId = $runtimeAttemptId
+                    startedUtc = $null
+                    launcherPid = $null
+                    startupPath = $startupPath
+                    runtimeActive = $false
+                    runtime = $runtime
+                    startupDeadlineUtc = $null
+                    qualificationDeadlineUtc = $null
+                    logReadReserveMilliseconds = $null
+                    runtimeProbeAttempts = 0
+                    lastRuntimeProbeError = $null
+                    runtimeConfirmationAttempted = $false
+                    runtimeConfirmationTimedOut = $false
+                    runtimeAccepted = $false
+                    admissionState = 'launch-pending'
+                    acceptedUtc = $null
+                    externalDrivers = $externalDrivers
+                    externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector
+                    externalDriverIsolationValidation = $isolationValidation
+                }
+                $runtimeReceiptPersistenceAttempted = $true
+                try {
+                    # Replace any prior accepted authority before this attempt can launch.
+                    Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
+                    $runtimeReceiptPersisted = $true
+                }
+                catch {
+                    throw "The current runtime receipt could not be made nonaccepted before launch: $($_.Exception.Message)"
+                }
                 $startedUtc = [DateTime]::UtcNow
                 $launcher = Start-Process -FilePath $startupPath -WindowStyle Hidden -PassThru
                 $startupAttemptStartedUtc = $startedUtc
                 $script:SteamVRStartupAttemptActive = $true
                 $deadline = $startedUtc.AddSeconds($StartupTimeoutSeconds)
+                $startupDeadlineUtc = $deadline
                 $logReadReserveMilliseconds = [int][Math]::Min(2000, [Math]::Max(500, $StartupTimeoutSeconds * 50))
                 $qualificationDeadline = $deadline.AddMilliseconds(-$logReadReserveMilliseconds)
+                $runtimeReceipt['startedUtc'] = $startedUtc.ToString('o')
+                $runtimeReceipt['launcherPid'] = $launcher.Id
+                $runtimeReceipt['startupDeadlineUtc'] = $deadline.ToString('o')
+                $runtimeReceipt['qualificationDeadlineUtc'] = $qualificationDeadline.ToString('o')
+                $runtimeReceipt['logReadReserveMilliseconds'] = $logReadReserveMilliseconds
+                $runtimeReceiptPersisted = $false
+                if ($InternalTestFailurePoint -eq 'runtime-early-post-launch-failure') {
+                    throw [InvalidOperationException]::new('Injected early post-launch admission failure.')
+                }
                 $runtimeProbeAttempts = 0
                 $lastRuntimeProbeError = $null
                 $runtimeConfirmationAttempted = $false
@@ -1574,7 +1671,7 @@ try {
                     $processes = @(Get-SteamVRProcesses)
                     try {
                         $runtimeProbeAttempts++
-                        if ($InternalTestFailurePoint -in @('runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure')) {
+                        if ($InternalTestFailurePoint -in @('runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-confirmation-timeout-input-contract-failure')) {
                             throw [TimeoutException]::new('Injected runtime confirmation timeout.')
                         }
                         $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline
@@ -1584,35 +1681,10 @@ try {
                         $runtimeConfirmationTimedOut = $true
                     }
                 }
-                if ($InternalTestFailurePoint -in @('runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation')) {
+                if ($InternalTestFailurePoint -in @('runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-final-admission-timeout-input-contract-failure')) {
                     $deadline = [DateTime]::UtcNow.AddMilliseconds(-1)
+                    $startupDeadlineUtc = $deadline
                 }
-                $runtimeReceiptPath = Join-Path $EvidenceDirectory 'steamvr-null-runtime.receipt.json'
-                $runtimeReceipt = [ordered]@{
-                    schemaVersion = 1
-                    startedUtc = $startedUtc.ToString('o')
-                    launcherPid = $launcher.Id
-                    startupPath = $startupPath
-                    runtimeActive = [bool]$runtime.active
-                    runtime = $runtime
-                    startupDeadlineUtc = $deadline.ToString('o')
-                    qualificationDeadlineUtc = $qualificationDeadline.ToString('o')
-                    logReadReserveMilliseconds = $logReadReserveMilliseconds
-                    runtimeProbeAttempts = $runtimeProbeAttempts
-                    lastRuntimeProbeError = $lastRuntimeProbeError
-                    runtimeConfirmationAttempted = $runtimeConfirmationAttempted
-                    runtimeConfirmationTimedOut = $runtimeConfirmationTimedOut
-                    runtimeAccepted = $false
-                    admissionState = 'pending'
-                    acceptedUtc = $null
-                    externalDrivers = $externalDrivers
-                    externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector
-                    externalDriverIsolationValidation = $isolationValidation
-                }
-                if ($InternalTestFailurePoint -eq 'runtime-input-contract-failure') {
-                    throw [InvalidOperationException]::new('Injected runtime input-contract construction failure.')
-                }
-                $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers -DiagnosticDisplayOverride ([bool]$AllowExternalDisplayRedirector)
                 $failureState = $null
                 $failureErrors = [Collections.Generic.List[string]]::new()
                 if ($runtimeConfirmationTimedOut) {
@@ -1636,6 +1708,18 @@ try {
                     $failureState = 'startup-incomplete'
                     $failureErrors.Add('SteamVR started, but current-session Valve null-driver and active-HMD log proof was not observed before the timeout.')
                 }
+
+                $runtimeReceipt['runtimeActive'] = [bool]$runtime.active
+                $runtimeReceipt['runtime'] = $runtime
+                $runtimeReceipt['startupDeadlineUtc'] = $deadline.ToString('o')
+                $runtimeReceipt['runtimeProbeAttempts'] = $runtimeProbeAttempts
+                $runtimeReceipt['lastRuntimeProbeError'] = $lastRuntimeProbeError
+                $runtimeReceipt['runtimeConfirmationAttempted'] = $runtimeConfirmationAttempted
+                $runtimeReceipt['runtimeConfirmationTimedOut'] = $runtimeConfirmationTimedOut
+                if ($InternalTestFailurePoint -in @('runtime-input-contract-failure', 'runtime-confirmation-timeout-input-contract-failure', 'runtime-final-admission-timeout-input-contract-failure')) {
+                    throw [InvalidOperationException]::new('Injected runtime input-contract construction failure.')
+                }
+                $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers -DiagnosticDisplayOverride ([bool]$AllowExternalDisplayRedirector)
 
                 $runtimeReceiptPersisted = $false
                 $runtimeReceiptError = $null
@@ -1686,14 +1770,18 @@ try {
                     else {
                         $failureErrors.Add('Exact-attempt cleanup did not verify a fully stopped runtime; inspect startupCleanup before retrying.')
                     }
-                    $result = New-Result -Ok $false -State $failureState -Data @{ effective = $effective; runtime = $runtime; processes = $processes; runtimeReceiptPath = $runtimeReceiptPath; runtimeReceiptPersistenceAttempted = $runtimeReceiptPersistenceAttempted; runtimeReceiptPersisted = $runtimeReceiptPersisted; runtimeReceiptError = $runtimeReceiptError; inputContract = $inputContract; startupCleanup = $startupCleanup } -Errors @($failureErrors)
+                    $admission = New-RuntimeAdmissionSnapshot -State $failureState -ProbeAttempts $runtimeProbeAttempts -LastProbeError $lastRuntimeProbeError -ConfirmationAttempted $runtimeConfirmationAttempted -ConfirmationTimedOut $runtimeConfirmationTimedOut
+                    $failureData = New-LaunchedRuntimeFailureData -Effective $effective -Runtime $runtime -Processes $processes -Admission $admission -InputContract $inputContract -ReceiptPath $runtimeReceiptPath -AttemptId $runtimeAttemptId -ReceiptPersistenceAttempted $runtimeReceiptPersistenceAttempted -ReceiptPersisted $runtimeReceiptPersisted -ReceiptError $runtimeReceiptError -StartupCleanup $startupCleanup
+                    $result = New-Result -Ok $false -State $failureState -Data $failureData -Errors @($failureErrors)
                 }
                 else {
-                    $successResult = New-Result -Ok $true -State $(if ($AllowExternalDisplayRedirector) { 'null-runtime-started-head-pose-ready-unqualified-display-route' } else { 'null-runtime-started-head-pose-ready' }) -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; runtimeReceiptPersistenceAttempted = $runtimeReceiptPersistenceAttempted; runtimeReceiptPersisted = $runtimeReceiptPersisted; inputContract = $inputContract; externalDrivers = $externalDrivers; externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector; externalDriverIsolation = $isolation; externalDriverIsolationValidation = $isolationValidation }
-                    if ($InternalTestFailurePoint -eq 'runtime-final-boundary-timeout-cleanup-unverified') {
+                    $successResult = New-Result -Ok $true -State $(if ($AllowExternalDisplayRedirector) { 'null-runtime-started-head-pose-ready-unqualified-display-route' } else { 'null-runtime-started-head-pose-ready' }) -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; runtimeAttemptId = $runtimeAttemptId; runtimeReceiptPersistenceAttempted = $runtimeReceiptPersistenceAttempted; runtimeReceiptPersisted = $runtimeReceiptPersisted; inputContract = $inputContract; externalDrivers = $externalDrivers; externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector; externalDriverIsolation = $isolation; externalDriverIsolationValidation = $isolationValidation }
+                    if ($InternalTestFailurePoint -in @('runtime-final-boundary-timeout-cleanup-unverified', 'runtime-final-boundary-timeout-cleanup-failure')) {
                         $deadline = [DateTime]::UtcNow.AddMilliseconds(-1)
+                        $startupDeadlineUtc = $deadline
                     }
                     if ([DateTime]::UtcNow -ge $deadline) {
+                        $failureState = 'startup-deadline-exceeded'
                         $startupCleanup = Stop-ExactStartedSteamVRProcesses -StartedUtc $startedUtc
                         $inputContract['measurementReady'] = $false
                         $inputContract['measurementBlockers'] = @($inputContract['measurementBlockers']) + 'startup-deadline-exceeded'
@@ -1719,10 +1807,12 @@ try {
                             $deadlineErrors.Add('Exact-attempt cleanup did not verify a fully stopped runtime; inspect startupCleanup before retrying.')
                         }
                         if ($runtimeReceiptError) { $deadlineErrors.Add("Runtime receipt persistence failed after cleanup: $runtimeReceiptError") }
-                        $result = New-Result -Ok $false -State 'startup-deadline-exceeded' -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; runtimeReceiptPersistenceAttempted = $runtimeReceiptPersistenceAttempted; runtimeReceiptPersisted = $runtimeReceiptPersisted; runtimeReceiptError = $runtimeReceiptError; inputContract = $inputContract; startupCleanup = $startupCleanup } -Errors @($deadlineErrors)
+                        $admission = New-RuntimeAdmissionSnapshot -State $failureState -ProbeAttempts $runtimeProbeAttempts -LastProbeError $lastRuntimeProbeError -ConfirmationAttempted $runtimeConfirmationAttempted -ConfirmationTimedOut $runtimeConfirmationTimedOut
+                        $failureData = New-LaunchedRuntimeFailureData -Effective $effective -Runtime $runtime -Processes $processes -Admission $admission -InputContract $inputContract -ReceiptPath $runtimeReceiptPath -AttemptId $runtimeAttemptId -ReceiptPersistenceAttempted $runtimeReceiptPersistenceAttempted -ReceiptPersisted $runtimeReceiptPersisted -ReceiptError $runtimeReceiptError -StartupCleanup $startupCleanup
+                        $result = New-Result -Ok $false -State $failureState -Data $failureData -Errors @($deadlineErrors)
                     }
                     else {
-                        if ($InternalTestFailurePoint -eq 'runtime-accepted-receipt-publish-failure') {
+                        if ($InternalTestFailurePoint -in @('runtime-accepted-receipt-publish-failure', 'runtime-accepted-receipt-publish-and-stage-cleanup-failure')) {
                             throw [IO.IOException]::new('Injected accepted runtime receipt publication failure.')
                         }
                         Move-Item -LiteralPath $acceptedReceiptStagePath -Destination $runtimeReceiptPath -Force
@@ -2041,7 +2131,19 @@ catch {
     }
     $errors = @($primaryError)
     if ($null -ne $startupAttemptStartedUtc -and -not $startupAttemptAccepted) {
-        $admissionState = if ([string]::IsNullOrWhiteSpace([string]$failureState)) { 'runtime-admission-exception' } else { [string]$failureState }
+        $admissionState = if (-not [string]::IsNullOrWhiteSpace([string]$failureState)) {
+            [string]$failureState
+        }
+        elseif ($runtimeConfirmationTimedOut) {
+            'runtime-confirmation-timeout'
+        }
+        elseif ($null -ne $startupDeadlineUtc -and [DateTime]::UtcNow -ge $startupDeadlineUtc) {
+            'startup-deadline-exceeded'
+        }
+        else {
+            'runtime-admission-exception'
+        }
+        $failureState = $admissionState
         if ($inputContract -is [Collections.IDictionary]) {
             $inputContract['measurementReady'] = $false
             $inputContract['measurementBlockers'] = @(@($inputContract['measurementBlockers']) + $admissionState | Select-Object -Unique)
@@ -2052,9 +2154,6 @@ catch {
                 measurementReady = $false
                 measurementBlockers = @($admissionState)
             }
-        }
-        if ($runtimeReceiptPersistenceAttempted -and [string]::IsNullOrWhiteSpace([string]$runtimeReceiptError)) {
-            $runtimeReceiptError = $primaryError
         }
         if ($startupCleanupError) {
             $startupCleanup = [pscustomobject][ordered]@{
@@ -2080,19 +2179,36 @@ catch {
         else {
             $errors += 'Exact-attempt cleanup did not verify a fully stopped runtime; inspect startupCleanup before retrying.'
         }
-        $admission = [ordered]@{
-            state = $admissionState
-            runtimeProbeAttempts = $runtimeProbeAttempts
-            lastRuntimeProbeError = $lastRuntimeProbeError
-            runtimeConfirmationAttempted = $runtimeConfirmationAttempted
-            runtimeConfirmationTimedOut = $runtimeConfirmationTimedOut
+        $admission = New-RuntimeAdmissionSnapshot -State $admissionState -ProbeAttempts $runtimeProbeAttempts -LastProbeError $lastRuntimeProbeError -ConfirmationAttempted $runtimeConfirmationAttempted -ConfirmationTimedOut $runtimeConfirmationTimedOut
+        if ($runtimeReceipt -is [Collections.IDictionary] -and -not [string]::IsNullOrWhiteSpace($runtimeReceiptPath)) {
+            $runtimeReceipt['runtimeActive'] = if ($null -ne $runtime) { [bool]$runtime.active } else { $false }
+            $runtimeReceipt['runtime'] = $runtime
+            $runtimeReceipt['runtimeProbeAttempts'] = $runtimeProbeAttempts
+            $runtimeReceipt['lastRuntimeProbeError'] = $lastRuntimeProbeError
+            $runtimeReceipt['runtimeConfirmationAttempted'] = $runtimeConfirmationAttempted
+            $runtimeReceipt['runtimeConfirmationTimedOut'] = $runtimeConfirmationTimedOut
+            $runtimeReceipt['runtimeAccepted'] = $false
+            $runtimeReceipt['admissionState'] = $admissionState
+            $runtimeReceipt['acceptedUtc'] = $null
+            $runtimeReceipt['startupCleanup'] = $startupCleanup
+            try {
+                $runtimeReceiptPersistenceAttempted = $true
+                Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
+                $runtimeReceiptPersisted = $true
+                $runtimeReceiptError = $null
+            }
+            catch {
+                $runtimeReceiptPersisted = $false
+                $runtimeReceiptError = $_.Exception.Message
+                $errors += "Failed-admission receipt persistence failed: $runtimeReceiptError"
+            }
         }
-        $result = New-Result -Ok $false -State $admissionState -Data @{
-            settingsPath = $SettingsPath; profilePath = $NullProfilePath; evidenceDirectory = $EvidenceDirectory; targetControl = $targetControl
-            effective = $effective; runtime = $runtime; processes = $processes; admission = $admission; inputContract = $inputContract
-            runtimeReceiptPath = $runtimeReceiptPath; runtimeReceiptPersistenceAttempted = $runtimeReceiptPersistenceAttempted
-            runtimeReceiptPersisted = $runtimeReceiptPersisted; runtimeReceiptError = $runtimeReceiptError; startupCleanup = $startupCleanup
-        } -Errors $errors
+        $failureData = New-LaunchedRuntimeFailureData -Effective $effective -Runtime $runtime -Processes $processes -Admission $admission -InputContract $inputContract -ReceiptPath $runtimeReceiptPath -AttemptId $runtimeAttemptId -ReceiptPersistenceAttempted $runtimeReceiptPersistenceAttempted -ReceiptPersisted $runtimeReceiptPersisted -ReceiptError $runtimeReceiptError -StartupCleanup $startupCleanup
+        $failureData['settingsPath'] = $SettingsPath
+        $failureData['profilePath'] = $NullProfilePath
+        $failureData['evidenceDirectory'] = $EvidenceDirectory
+        $failureData['targetControl'] = $targetControl
+        $result = New-Result -Ok $false -State $admissionState -Data $failureData -Errors $errors
     }
     else {
         if ($startupCleanupError) { $errors += "Startup cleanup failed: $startupCleanupError" }
@@ -2101,7 +2217,50 @@ catch {
 }
 finally {
     if ($acceptedReceiptStagePath -and (Test-Path -LiteralPath $acceptedReceiptStagePath -PathType Leaf)) {
-        Remove-Item -LiteralPath $acceptedReceiptStagePath -Force -ErrorAction SilentlyContinue
+        $stageCleanupError = $null
+        try {
+            if ($InternalTestFailurePoint -eq 'runtime-accepted-receipt-publish-and-stage-cleanup-failure') {
+                throw [IO.IOException]::new('Injected accepted runtime receipt stage cleanup failure.')
+            }
+            Remove-Item -LiteralPath $acceptedReceiptStagePath -Force -ErrorAction Stop
+        }
+        catch { $stageCleanupError = $_.Exception.Message }
+        $stageRemaining = Test-Path -LiteralPath $acceptedReceiptStagePath -PathType Leaf
+        $acceptedReceiptStageCleanup = [ordered]@{
+            path = $acceptedReceiptStagePath
+            requested = $true
+            remaining = [bool]$stageRemaining
+            error = $stageCleanupError
+            verified = -not $stageRemaining -and [string]::IsNullOrWhiteSpace($stageCleanupError)
+        }
+        if ($null -ne $result -and $null -ne $result.data) {
+            if ($result.data -is [Collections.IDictionary]) {
+                $result.data['acceptedReceiptStageCleanup'] = $acceptedReceiptStageCleanup
+            }
+            else {
+                $result.data | Add-Member -NotePropertyName acceptedReceiptStageCleanup -NotePropertyValue $acceptedReceiptStageCleanup -Force
+            }
+            if (-not [bool]$acceptedReceiptStageCleanup.verified) {
+                $result.errors = @($result.errors) + "Accepted runtime receipt stage remains non-authoritative at '$acceptedReceiptStagePath': $stageCleanupError"
+            }
+        }
+        if (-not $result.ok -and $runtimeReceipt -is [Collections.IDictionary] -and -not [string]::IsNullOrWhiteSpace($runtimeReceiptPath)) {
+            $runtimeReceipt['acceptedReceiptStageCleanup'] = $acceptedReceiptStageCleanup
+            try {
+                $runtimeReceiptPersistenceAttempted = $true
+                Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
+                $runtimeReceiptPersisted = $true
+                $runtimeReceiptError = $null
+            }
+            catch {
+                $runtimeReceiptPersisted = $false
+                $runtimeReceiptError = $_.Exception.Message
+                $result.errors = @($result.errors) + "Runtime receipt persistence failed after stage cleanup: $runtimeReceiptError"
+            }
+            $result.data.runtimeReceiptPersistenceAttempted = $runtimeReceiptPersistenceAttempted
+            $result.data.runtimeReceiptPersisted = $runtimeReceiptPersisted
+            $result.data.runtimeReceiptError = $runtimeReceiptError
+        }
     }
     if ($targetLock) { $targetLock.Dispose() }
 }
