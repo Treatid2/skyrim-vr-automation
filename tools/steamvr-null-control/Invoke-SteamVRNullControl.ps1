@@ -32,7 +32,7 @@ param(
 
     [switch]$AllowExternalDisplayRedirector,
 
-    [ValidateSet('', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'head-pose-access-denied', 'head-pose-access-denied-after-start', 'runtime-ready', 'runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-post-receipt-timeout')]
+    [ValidateSet('', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'head-pose-access-denied', 'head-pose-access-denied-after-start', 'runtime-ready', 'runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-post-receipt-timeout', 'runtime-accepted-receipt-publish-failure')]
     [string]$InternalTestFailurePoint = '',
 
     [switch]$IsolateExternalDisplayRedirectors,
@@ -1235,7 +1235,8 @@ function Get-NullRuntimeEvidence {
         'runtime-confirmation-timeout-receipt-failure',
         'runtime-final-admission-timeout',
         'runtime-final-admission-timeout-no-confirmation',
-        'runtime-post-receipt-timeout'
+        'runtime-post-receipt-timeout',
+        'runtime-accepted-receipt-publish-failure'
     )
     $fixtureMode = -not [string]::IsNullOrWhiteSpace($env:CSX_STEAMVR_TRANSACTION_ROOT) -and
         (Get-Variable -Scope Script -Name SteamVRStartupAttemptActive -ValueOnly -ErrorAction SilentlyContinue)
@@ -1289,6 +1290,7 @@ $pendingAuthoritativeTransaction = $null
 $startupAttemptStartedUtc = $null
 $startupAttemptAccepted = $false
 $startupCleanup = $null
+$acceptedReceiptStagePath = $null
 try {
     if ([string]::IsNullOrWhiteSpace($OpenVRPathsPath)) { throw 'OpenVRPathsPath is required to identify the complete live transaction target.' }
     $localApplicationData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
@@ -1612,14 +1614,14 @@ try {
                     $runtimeReceipt['runtimeAccepted'] = $true
                     $runtimeReceipt['admissionState'] = 'accepted'
                     $runtimeReceipt['acceptedUtc'] = [DateTime]::UtcNow.ToString('o')
-                    Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
-                    $runtimeReceiptPersisted = $true
+                    $acceptedReceiptStagePath = "$runtimeReceiptPath.$([guid]::NewGuid().ToString('N')).stage"
+                    Write-JsonAtomic -Path $acceptedReceiptStagePath -Value $runtimeReceipt
                     if ($InternalTestFailurePoint -eq 'runtime-post-receipt-timeout') {
                         $deadline = [DateTime]::UtcNow.AddMilliseconds(-1)
                     }
                     if ([DateTime]::UtcNow -ge $deadline) {
                         $failureState = 'startup-deadline-exceeded'
-                        $failureErrors.Add('The absolute startup deadline elapsed during final runtime admission.')
+                        $failureErrors.Add('The absolute startup deadline elapsed while staging the accepted runtime receipt.')
                     }
                 }
 
@@ -1667,6 +1669,13 @@ try {
                         $result = New-Result -Ok $false -State 'startup-deadline-exceeded' -Data @{ effective = $effective; runtime = $runtime; runtimeReceiptPath = $runtimeReceiptPath; runtimeReceiptPersisted = [string]::IsNullOrWhiteSpace($runtimeReceiptError); runtimeReceiptError = $runtimeReceiptError; inputContract = $inputContract; startupCleanup = $startupCleanup } -Errors @('The absolute startup deadline elapsed at the final success boundary; exact SteamVR processes started by this attempt were stopped.')
                     }
                     else {
+                        if ($InternalTestFailurePoint -eq 'runtime-accepted-receipt-publish-failure') {
+                            throw [IO.IOException]::new('Injected accepted runtime receipt publication failure.')
+                        }
+                        Move-Item -LiteralPath $acceptedReceiptStagePath -Destination $runtimeReceiptPath -Force
+                        $acceptedReceiptStagePath = $null
+                        $runtimeReceiptPersisted = $true
+                        $successResult.data.runtimeReceiptPersisted = $true
                         $startupAttemptAccepted = $true
                         $result = $successResult
                     }
@@ -1981,6 +1990,9 @@ catch {
     $result = New-Result -Ok $false -State 'blocked' -Data @{ settingsPath = $SettingsPath; profilePath = $NullProfilePath; evidenceDirectory = $EvidenceDirectory; targetControl = $targetControl; startupCleanup = $startupCleanup } -Errors $errors
 }
 finally {
+    if ($acceptedReceiptStagePath -and (Test-Path -LiteralPath $acceptedReceiptStagePath -PathType Leaf)) {
+        Remove-Item -LiteralPath $acceptedReceiptStagePath -Force -ErrorAction SilentlyContinue
+    }
     if ($targetLock) { $targetLock.Dispose() }
 }
 

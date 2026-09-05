@@ -132,11 +132,12 @@ large historical log cannot turn one poll into an unbounded whole-file read.
 The polling loop reserves a final bounded log-read window and records its
 deadlines, attempt count, and confirmation outcome in the runtime receipt. A
 timed-out confirmation invalidates readiness and performs exact-attempt cleanup
-before attempting to persist diagnostic evidence. Final admission checks the
-absolute deadline after receipt publication and again at the success boundary;
-late admission is corrected to a nonaccepted receipt, blocks measurement, and
-cleans up the exact attempt. Receipt-write failure remains diagnostic and cannot
-bypass mandatory cleanup or convert a failed attempt into success.
+before attempting to persist diagnostic evidence. Accepted receipt bytes are
+staged and validated privately, then the absolute deadline is checked after
+staging and again immediately before atomic publication. A late admission never
+publishes the accepted stage; it blocks measurement and cleans up the exact
+attempt. Receipt-write failure remains diagnostic and cannot bypass mandatory
+cleanup or convert a failed attempt into success.
 
 ```powershell
 .\Invoke-SteamVRNullControl.ps1 apply -EvidenceDirectory <session-evidence> -Compact

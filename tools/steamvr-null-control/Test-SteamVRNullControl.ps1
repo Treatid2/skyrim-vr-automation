@@ -523,8 +523,13 @@ try {
     Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
     $postReceiptTimeout = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-post-receipt-timeout -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
     $postReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
-    Assert-Test (-not $postReceiptTimeout.ok -and $postReceiptTimeout.state -eq 'startup-deadline-exceeded' -and $postReceiptTimeout.data.startupCleanup.verified) 'deadline expiry during receipt publication fails closed and performs exact cleanup'
-    Assert-Test (-not $postReceipt.runtimeAccepted -and $postReceipt.admissionState -eq 'startup-deadline-exceeded') 'late post-receipt admission is corrected to a durable nonaccepted receipt'
+    Assert-Test (-not $postReceiptTimeout.ok -and $postReceiptTimeout.state -eq 'startup-deadline-exceeded' -and $postReceiptTimeout.data.startupCleanup.verified) 'deadline expiry after accepted receipt staging fails closed and performs exact cleanup'
+    Assert-Test (-not $postReceipt.runtimeAccepted -and $postReceipt.admissionState -eq 'startup-deadline-exceeded') 'late staged admission publishes only a durable nonaccepted receipt'
+
+    Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
+    $publishFailure = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-accepted-receipt-publish-failure -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $publishFailure.ok -and $publishFailure.state -eq 'blocked' -and $publishFailure.data.startupCleanup.verified) 'accepted-receipt publication failure invokes the outer exact-attempt cleanup boundary'
+    Assert-Test (-not (Test-Path -LiteralPath $runtimeReceiptPath -PathType Leaf) -and @(Get-ChildItem -LiteralPath $evidence -Filter 'steamvr-null-runtime.receipt.json.*.stage').Count -eq 0) 'failed accepted-receipt publication leaves no public accepted receipt or private stage'
 
     Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
     $timelyReady = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-ready -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
