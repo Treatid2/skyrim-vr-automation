@@ -54,6 +54,11 @@
       "entryPoint": "tools/profiler-control/Measure-CSXProfiler.ps1"
     },
     {
+      "name": "render-scale-qualification",
+      "version": "1.0.0",
+      "entryPoint": "tools/render-scale-qualification/Start-CSXRenderScaleQualification.ps1"
+    },
+    {
       "name": "shader-cache-control",
       "version": "3.1.0",
       "entryPoint": "tools/shader-cache-control/Invoke-CSXShaderCacheCatalog.ps1"
