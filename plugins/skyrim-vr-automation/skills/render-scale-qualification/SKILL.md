@@ -1,11 +1,11 @@
 ---
 name: render-scale-qualification
-description: Run the fully unattended CSX VR render-scale qualification when the user invokes $render-scale-qualification, asks to start render-scale qualification, or contextually says start after confirming the intended DLL is running in game at the controlled start scene. Attach to that exact session and return its final verdict without building, deploying, or launching.
+description: Run the fully unattended CSX VR render-scale qualification only when the user invokes $render-scale-qualification or explicitly asks to start render-scale qualification. Attach to that exact session and return its final verdict without building, deploying, or launching.
 ---
 
 # Render-scale qualification
 
-Run the packaged revision-4 qualification once and return its final result.
+Run the packaged revision-5 qualification once and return its final result.
 The package owns capture, image-model evaluation, telemetry validation,
 evidence finalization, and verdict generation.
 
@@ -17,8 +17,9 @@ diagnosis when the package reports an infrastructure problem.
 
 - Require the intended CSX DLL and Skyrim VR session to be running already at
   the controlled start scene.
-- When that context is established, treat `start render-scale qualification`
-  or a contextual `start` as authorization to run this package once.
+- When that context is established, require `start render-scale qualification`
+  or an equivalent explicit request to run this package once. A bare or
+  contextual `start` is not sufficient authorization.
 - Never build, configure, deploy, redeploy, launch, restart, reload, switch an
   MO2 profile, or edit game or mod configuration in this workflow.
 - Never substitute a runtime, fixture, GPU matrix, baseline, capture source,
