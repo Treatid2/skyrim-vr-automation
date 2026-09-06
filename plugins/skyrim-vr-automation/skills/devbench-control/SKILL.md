@@ -88,8 +88,9 @@ or construct HTTP or MCP requests ad hoc.
    wait or classify the live DevBench service as unavailable.
 14. A server action's client transport envelope must exceed its `timeoutMs`.
    The selected controller derives `ceil(timeoutMs / 1000) + 5` seconds and
-   reports it as `requestTimeoutSeconds`; this never extends the server
-   measurement deadline. Set `-MaxTransientRetries 0` for ownership-bearing
+   binds it to the request and remaining operation budget at dispatch, then
+   reports the effective deadline; this never extends the server measurement
+   deadline. Set `-MaxTransientRetries 0` for ownership-bearing
    actions. If their response is lost, inspect the existing owner on the same
    lane and never replay the action or clean up its evidence prematurely.
 15. Preserve `invocationEvidencePath` for failed bundled calls. Never run
