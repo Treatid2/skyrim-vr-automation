@@ -159,6 +159,21 @@ try {
     $refreshedFixture = & $entry refresh-fixture -ConfigPath $configPath -AccessId $accessId -Confirm:$false -Compact | ConvertFrom-Json
     if (-not $refreshedFixture.ok -or -not $refreshedFixture.data.valid -or -not (Test-Path -LiteralPath $refreshedFixture.data.backupPath -PathType Leaf)) { throw 'Guarded fixture refresh did not preserve and verify the manifest.' }
     if ($refreshedFixture.data.approval.reusableApprovalEligible -or [string]::IsNullOrWhiteSpace([string]$refreshedFixture.data.approval.oneShotReason)) { throw 'Shared fixture replacement was not explicitly classified as a one-shot approval.' }
+    $overwriteRoot = Join-Path $mo2 'overwrite'
+    $realOverwriteRoot = Join-Path $mo2 'overwrite-reparse-target'
+    Move-Item -LiteralPath $overwriteRoot -Destination $realOverwriteRoot -ErrorAction Stop
+    try {
+        New-Item -ItemType Junction -Path $overwriteRoot -Target $realOverwriteRoot -ErrorAction Stop | Out-Null
+        $reparseCreate = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label reparse-overwrite -SavePolicy FreshGame -WorkspaceContent Modlist -Confirm:$false -NoExit | ConvertFrom-Json
+        if ($reparseCreate.ok -or @($reparseCreate.errors | Where-Object { $_ -match 'reparse point' }).Count -ne 1 -or
+            (Test-Path -LiteralPath (Join-Path $realOverwriteRoot '.codex-workspace-output-owner.json'))) {
+            throw 'Workspace creation did not reject a reparse-point MO2 Overwrite root before ownership writes.'
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $overwriteRoot) { Remove-Item -LiteralPath $overwriteRoot -Force }
+        Move-Item -LiteralPath $realOverwriteRoot -Destination $overwriteRoot -ErrorAction Stop
+    }
     $iniBeforeCas = [IO.File]::ReadAllBytes($ini)
     $casRejected = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label cas-race -SavePolicy FreshGame -WorkspaceContent Modlist -InternalTestFailurePoint selected-profile-before-cas -Confirm:$false -NoExit | ConvertFrom-Json
     $iniAfterCas = [IO.File]::ReadAllBytes($ini)
@@ -228,6 +243,16 @@ try {
     $preparedCache = & $catalogEntry prepare -CatalogRoot $catalogRoot -CachePath $created.data.runtimeOutput.cachePath -ProfilePath $created.data.modListPath -ModsPath $mods -BindToOverwrite -EvidenceDirectory $created.data.runtimeOutput.cacheEvidenceDirectory -BuildId $created.data.runtimeOutput.cachePrepareArguments.BuildId -ShaderCacheAbi $created.data.runtimeOutput.cachePrepareArguments.ShaderCacheAbi -WorkspaceId $created.data.workspaceId -OwnershipId $created.data.ownershipId -OwnerMarkerPath $created.data.runtimeOutput.ownerMarkerPath -OwnerMarkerSha256 $created.data.runtimeOutput.ownerMarkerSha256 -ShaderSourceSha256 $shaderSourceSha256 -RequireMaterializedOutput -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json
     $preparedIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
     if (-not $preparedCache.ok -or -not $preparedIsolation.ok -or -not $preparedIsolation.cachePlan.verification.ok -or [int]$preparedIsolation.cachePlan.verification.requiredProviderFiles -ne 2) { throw "Prepared Overwrite provider-shadow verification failed. Prepare: $($preparedCache | ConvertTo-Json -Depth 20 -Compress) Isolation: $($preparedIsolation | ConvertTo-Json -Depth 20 -Compress)" }
+    $cachePlanPath = [string]$created.data.runtimeOutput.cachePlanPath
+    $cachePlanBytes = [IO.File]::ReadAllBytes($cachePlanPath)
+    $malformedCachePlan = Get-Content -LiteralPath $cachePlanPath -Raw | ConvertFrom-Json -Depth 40
+    $malformedCachePlan.PSObject.Properties.Remove('preparedTreeSha256')
+    $malformedCachePlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $cachePlanPath -Encoding utf8
+    $malformedPlanIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
+    if ($malformedPlanIsolation.ok -or @($malformedPlanIsolation.errors | Where-Object { $_ -match 'missing required state or preparation fields' }).Count -ne 1) {
+        throw 'MO2 launch isolation did not reject a malformed cache-plan shape with structured evidence.'
+    }
+    [IO.File]::WriteAllBytes($cachePlanPath, $cachePlanBytes)
     $buildManifestPath = [string]$created.data.runtimeOutput.communityShadersPlugin.manifestPath
     $buildManifestBytes = [IO.File]::ReadAllBytes($buildManifestPath)
     Add-Content -LiteralPath $buildManifestPath -Value ' ' -Encoding utf8
@@ -322,6 +347,38 @@ try {
         (Test-Path -LiteralPath $interruptedOutputMarker) -or (Test-Path -LiteralPath $interruptedCachePath) -or
         (Test-Path -LiteralPath $interruptedBackupPath) -or (Test-Path -LiteralPath $interruptedOutputProfile)) {
         throw 'Startup recovery did not restore absent output trees and release exact Overwrite ownership.'
+    }
+    foreach ($plannedMarkerPresent in @($true, $false)) {
+        $plannedSuffix = if ($plannedMarkerPresent) { 'marker-created' } else { 'marker-absent' }
+        $plannedWorkspaceId = 'interrupted-planned-' + $plannedSuffix
+        $plannedOwnershipId = 'interrupted-planned-owner-' + $plannedSuffix
+        $plannedProfile = Join-Path $profiles ('Codex ' + $plannedWorkspaceId)
+        New-Item -ItemType Directory -Path $plannedProfile -Force | Out-Null
+        $plannedManifest = Join-Path $workspaceControlRoot ($plannedWorkspaceId + '.json')
+        $plannedJournal = Join-Path $workspaceControlRoot ($plannedWorkspaceId + '.creation.journal.json')
+        $plannedMarker = Join-Path $mo2 'overwrite\.codex-workspace-output-owner.json'
+        $plannedMarkerHash = [string]::new([char]'A', 64)
+        if ($plannedMarkerPresent) {
+            [pscustomobject]@{
+                workspaceId = $plannedWorkspaceId; ownershipId = $plannedOwnershipId
+                mode = 'mo2-overwrite-output'; overwritePath = (Join-Path $mo2 'overwrite')
+            } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $plannedMarker -Encoding utf8
+            $plannedMarkerHash = (Get-FileHash -LiteralPath $plannedMarker -Algorithm SHA256).Hash
+        }
+        [ordered]@{
+            contractVersion = '2.0.0'; operation = 'create'; phase = 'output-owner-planned'
+            workspaceId = $plannedWorkspaceId; ownershipId = $plannedOwnershipId
+            profilePath = $plannedProfile; manifestPath = $plannedManifest
+            overwriteOwnerMarkerPath = $plannedMarker; overwriteOwnerMarkerSha256 = $plannedMarkerHash
+            cachePath = $interruptedCachePath; backupPath = $interruptedBackupPath
+            cachePathExistedBefore = $false; backupPathExistedBefore = $false
+        } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $plannedJournal -Encoding utf8
+        $plannedRecovery = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
+        $plannedJournalResult = Get-Content -LiteralPath $plannedJournal -Raw | ConvertFrom-Json
+        if (-not $plannedRecovery.ok -or $plannedJournalResult.phase -ne 'rolled-back' -or
+            (Test-Path -LiteralPath $plannedProfile) -or (Test-Path -LiteralPath $plannedMarker)) {
+            throw "Startup recovery could not safely resolve a durable planned ownership claim ($plannedSuffix)."
+        }
     }
     $partialProfile = Join-Path $profiles 'Codex interrupted create fixture'
     New-Item -ItemType Directory -Path $partialProfile -Force | Out-Null

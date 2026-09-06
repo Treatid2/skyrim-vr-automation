@@ -122,11 +122,18 @@ function Write-WorkspaceJsonAtomic([string]$Path, $Value) {
     finally { if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force } }
 }
 
-function New-WorkspaceOutputOwnerMarker([string]$Path, $Value) {
+function New-WorkspaceOutputOwnerMarkerPayload($Value) {
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 12))
+    return [pscustomobject]@{ bytes = $bytes; sha256 = (Get-WorkspaceBytesSha256 -Bytes $bytes) }
+}
+
+function New-WorkspaceOutputOwnerMarker([string]$Path, $Value, $Payload = $null) {
     $parent = Split-Path -Parent $Path
     if (-not (Test-Path -LiteralPath $parent -PathType Container)) { throw "MO2 Overwrite root does not exist: $parent" }
-    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 12))
-    $expectedHash = Get-WorkspaceBytesSha256 -Bytes $bytes
+    Assert-NoWorkspaceReparsePoint -Path $parent -Purpose 'MO2 Overwrite root'
+    if ($null -eq $Payload) { $Payload = New-WorkspaceOutputOwnerMarkerPayload -Value $Value }
+    $bytes = [byte[]]$Payload.bytes
+    $expectedHash = [string]$Payload.sha256
     $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     try {
         $stream.Write($bytes, 0, $bytes.Length)
@@ -1223,11 +1230,11 @@ function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
             $restored = & $transactionTool restore -CachePath $backupPath -RelativeCachePath 'backup' -EvidenceDirectory $backupEvidenceDirectory -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
             if (-not $restored.ok) { throw "Interrupted workspace backup recovery failed: $($restored.errors -join '; ')" }
         }
-        if ($null -ne $overwriteMarkerPath -and -not $backupExistedBefore) {
+        if ($null -ne $overwriteMarkerPath -and -not $backupExistedBefore -and (Test-Path -LiteralPath $backupPath)) {
             $null = Assert-WorkspaceOutputOwnerMarker -Path $overwriteMarkerPath -ExpectedSha256 $markerSha256 -WorkspaceId ([string]$journal['workspaceId']) -OwnershipId ([string]$journal['ownershipId']) -OverwritePath ([string]$Config.mo2.overwriteDirectory)
             Remove-WorkspaceCreatedOutputTree -Path $backupPath -OverwritePath ([string]$Config.mo2.overwriteDirectory) -Purpose 'Interrupted task-created backup tree'
         }
-        if ($null -ne $overwriteMarkerPath -and -not $cacheExistedBefore) {
+        if ($null -ne $overwriteMarkerPath -and -not $cacheExistedBefore -and (Test-Path -LiteralPath $cachePath)) {
             $null = Assert-WorkspaceOutputOwnerMarker -Path $overwriteMarkerPath -ExpectedSha256 $markerSha256 -WorkspaceId ([string]$journal['workspaceId']) -OwnershipId ([string]$journal['ownershipId']) -OverwritePath ([string]$Config.mo2.overwriteDirectory)
             Remove-WorkspaceCreatedOutputTree -Path $cachePath -OverwritePath ([string]$Config.mo2.overwriteDirectory) -Purpose 'Interrupted task-created ShaderCache tree'
         }
@@ -1988,6 +1995,13 @@ try {
                         ownerTaskId = $resolvedTaskId; mode = 'mo2-overwrite-output'; overwritePath = $runtimeOutputPath
                         createdUtc = [DateTime]::UtcNow.ToString('o')
                     }
+                    $runtimeMarkerPayload = New-WorkspaceOutputOwnerMarkerPayload -Value $runtimeMarker
+                    $runtimeMarkerHash = [string]$runtimeMarkerPayload.sha256
+                    $journal.overwriteOwnerMarkerSha256 = $runtimeMarkerHash
+                    $journal.cachePathExistedBefore = $cachePathExistedBefore
+                    $journal.backupPathExistedBefore = $backupPathExistedBefore
+                    $journal.phase = 'output-owner-planned'
+                    Write-WorkspaceJsonAtomic -Path $creationJournalPath -Value $journal
                     if ($InternalTestFailurePoint -eq 'owner-marker-before-claim') {
                         $null = New-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -Value ([pscustomobject][ordered]@{
                             contractVersion = '1.1.0'; workspaceId = 'competing-workspace'; ownershipId = 'competing-owner'
@@ -1995,15 +2009,12 @@ try {
                             createdUtc = [DateTime]::UtcNow.ToString('o')
                         })
                     }
-                    $runtimeMarkerHash = New-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -Value $runtimeMarker
+                    $runtimeMarkerHash = New-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -Value $runtimeMarker -Payload $runtimeMarkerPayload
                     $runtimeMarkerCreated = $true
                     $manifest.runtimeOutput.ownerMarkerSha256 = $runtimeMarkerHash
                     $manifest.runtimeOutput.cachePrepareArguments.OwnerMarkerSha256 = $runtimeMarkerHash
                     $manifest.runtimeOutput.cachePathExistedBefore = $cachePathExistedBefore
                     $manifest.runtimeOutput.backupPathExistedBefore = $backupPathExistedBefore
-                    $journal.overwriteOwnerMarkerSha256 = $runtimeMarkerHash
-                    $journal.cachePathExistedBefore = $cachePathExistedBefore
-                    $journal.backupPathExistedBefore = $backupPathExistedBefore
                     $journal.phase = 'output-owner-claimed'
                     Write-WorkspaceJsonAtomic -Path $creationJournalPath -Value $journal
 

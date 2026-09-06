@@ -121,6 +121,10 @@ Prepare a closed task cache immediately before launching MO2:
   -ProfilePath 'D:\MO2\profiles\Codex Task - Example\modlist.txt' `
   -ModsPath 'D:\MO2\mods' `
   -BindToOverwrite `
+  -WorkspaceId '<workspace identity>' `
+  -OwnershipId '<ownership identity>' `
+  -OwnerMarkerPath 'D:\MO2\overwrite\.codex-workspace-output-owner.json' `
+  -OwnerMarkerSha256 '<exact owner-marker SHA-256>' `
   -EvidenceDirectory 'D:\Evidence\task-id\shader-cache' `
   -ShaderCacheAbi '<exact ABI>' `
   -ShaderSourceSha256 '<exact source-tree SHA-256>' `

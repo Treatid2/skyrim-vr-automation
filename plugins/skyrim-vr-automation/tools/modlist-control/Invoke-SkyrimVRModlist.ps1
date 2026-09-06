@@ -70,6 +70,9 @@ function Assert-ModlistConfigurationComplete($Config, [string]$Path) {
         if ($null -eq $Config -or -not $Config.PSObject.Properties[$required] -or $null -eq $Config.$required) {
             throw "Configuration is missing required object '$required': $Path"
         }
+        if ($Config.$required -isnot [pscustomobject]) {
+            throw "Configuration field '$required' must be a JSON object: $Path"
+        }
     }
 }
 

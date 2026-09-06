@@ -41,6 +41,13 @@ try {
     $incompleteRegister = & $entry register -Name incomplete -ConfigPath $incompleteSource -UserRoot $fixture -NoExit | ConvertFrom-Json
     Assert-ModlistTest (-not $incompleteRegister.ok -and $incompleteRegister.errors[0] -match "missing required object 'session'") 'register rejects a configuration missing any shared required object'
 
+    $scalarSource = Join-Path $fixture 'scalar-source.json'
+    $scalarConfiguration = Get-Content -LiteralPath $source -Raw | ConvertFrom-Json
+    $scalarConfiguration.storage = 'not-an-object'
+    $scalarConfiguration | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $scalarSource -Encoding utf8
+    $scalarRegister = & $entry register -Name scalar -ConfigPath $scalarSource -UserRoot $fixture -NoExit | ConvertFrom-Json
+    Assert-ModlistTest (-not $scalarRegister.ok -and $scalarRegister.errors[0] -match "field 'storage' must be a JSON object") 'register rejects scalar values for required configuration objects'
+
     $main = & $entry register -Name main -ConfigPath $source -UserRoot $fixture -NoExit | ConvertFrom-Json
     $synergy = & $entry register -Name synergy -ConfigPath $source -UserRoot $fixture -NoExit | ConvertFrom-Json
     Assert-ModlistTest ($main.ok -and $synergy.ok) 'register creates two exact named configs'
@@ -67,6 +74,13 @@ try {
     $incompleteSelection | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $synergyPath -Encoding utf8
     $rejectedSelection = & $entry select -Name synergy -UserRoot $fixture -NoExit | ConvertFrom-Json
     Assert-ModlistTest (-not $rejectedSelection.ok -and $rejectedSelection.errors[0] -match "missing required object 'storage'") 'select applies the same complete-configuration validator as register'
+    [IO.File]::WriteAllBytes($synergyPath, $synergyBytes)
+
+    $scalarSelection = Get-Content -LiteralPath $synergyPath -Raw | ConvertFrom-Json
+    $scalarSelection.storage = 'not-an-object'
+    $scalarSelection | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $synergyPath -Encoding utf8
+    $rejectedScalarSelection = & $entry select -Name synergy -UserRoot $fixture -NoExit | ConvertFrom-Json
+    Assert-ModlistTest (-not $rejectedScalarSelection.ok -and $rejectedScalarSelection.errors[0] -match "field 'storage' must be a JSON object") 'select rejects scalar values for required configuration objects'
     [IO.File]::WriteAllBytes($synergyPath, $synergyBytes)
 
     $env:SKYRIM_VR_AUTOMATION_MODLIST = 'synergy'

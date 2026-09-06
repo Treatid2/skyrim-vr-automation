@@ -727,6 +727,13 @@ function Get-MO2OverwriteWorkspaceIsolation {
         catch { $errors.Add("Shader-cache plan is unreadable: $planPath. $($_.Exception.Message)") }
     }
     elseif ($RequirePreparedCache) { $errors.Add("Task launch requires the bound shader-cache prepare plan: $planPath") }
+    $planComplete = $null -ne $plan
+    foreach ($requiredPlanField in @('state', 'requireMaterializedOutput', 'preparedTreeSha256')) {
+        if ($planComplete -and -not $plan.PSObject.Properties[$requiredPlanField]) { $planComplete = $false }
+    }
+    if ($null -ne $plan -and -not $planComplete) {
+        $errors.Add('Shader-cache plan is missing required state or preparation fields.')
+    }
     if ($null -ne $plan -and $null -ne $cacheProviders -and $null -ne $cacheInventory) {
         $binding = if ($plan.PSObject.Properties['cacheBinding']) { $plan.cacheBinding } else { $null }
         $bindingComplete = $null -ne $binding
@@ -746,8 +753,8 @@ function Get-MO2OverwriteWorkspaceIsolation {
             (Test-MO2SamePath ([string]$binding.ownerMarkerPath) $expectedMarkerPath) -and
             [string]$binding.ownerMarkerSha256 -ceq [string]$output.ownerMarkerSha256 -and
             (Test-MO2CommunityShadersBuildBinding -Expected $binding.communityShadersPlugin -Current $currentBuild)
-        $restored = -not $RequirePreparedCache -and $completionExists -and [string]$plan.state -ceq 'restored' -and $bindingCurrent
-        $prepared = [string]$plan.state -ceq 'prepared' -and $bindingCurrent -and
+        $restored = $planComplete -and -not $RequirePreparedCache -and $completionExists -and [string]$plan.state -ceq 'restored' -and $bindingCurrent
+        $prepared = $planComplete -and [string]$plan.state -ceq 'prepared' -and $bindingCurrent -and
             [bool]$plan.requireMaterializedOutput
         if (-not ($restored -or $prepared)) { $errors.Add('Shader-cache plan is not bound to the exact task profile and MO2 Overwrite tree.') }
         if ($RequirePreparedCache -and $prepared) {
@@ -755,7 +762,7 @@ function Get-MO2OverwriteWorkspaceIsolation {
             $shadowReceipt = if ($plan.PSObject.Properties['providerShadow'] -and $null -ne $plan.providerShadow -and $plan.providerShadow.PSObject.Properties['receipt']) { $plan.providerShadow.receipt } else { $null }
             $coverage = Get-MO2OverwriteProviderShadowVerification -Receipt $shadowReceipt -ProviderResult $cacheProviders -Inventory $cacheInventory -RelativePath 'ShaderCache' -RequiredCountProperty 'requiredLowerProviderFiles'
             foreach ($coverageError in @($coverage.errors)) { $errors.Add([string]$coverageError) }
-            if (-not $AllowPreparedCacheGrowth -and [string]$cacheInventory.treeSha256 -cne [string]$plan.preparedTreeSha256) {
+            if ($planComplete -and -not $AllowPreparedCacheGrowth -and [string]$cacheInventory.treeSha256 -cne [string]$plan.preparedTreeSha256) {
                 $errors.Add('MO2 Overwrite ShaderCache changed after prepare and before its first launch.')
             }
             if ($null -eq $shadowReceipt -or -not $shadowReceipt.PSObject.Properties['bindingMode'] -or
