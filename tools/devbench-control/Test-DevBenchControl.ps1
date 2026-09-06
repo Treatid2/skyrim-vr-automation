@@ -157,6 +157,9 @@ $renderSnapshot = [pscustomobject]@{
 }
 $renderStable = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus (New-TestRenderScaleStatus)
 Assert-Test ($renderStable.satisfied -and $renderStable.stereoEvidence -eq 'render_scale_fidelity') 'render-scale stability requires a latched coherent stereo contract'
+$wrongScaledProfile = New-TestUpscalingProfile -Method 'fsr'
+$wrongScaledTarget = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus (New-TestRenderScaleStatus) -ExpectedProfile $wrongScaledProfile
+Assert-Test (-not $wrongScaledTarget.satisfied -and $wrongScaledTarget.reasons -contains 'effective scaled profile does not match the expected target') 'targeted scaled stability rejects a different effective profile'
 $gatedStatus = New-TestRenderScaleStatus
 $gatedStatus.vendorWorkGate.loadingMenu = $true
 $renderGated = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus $gatedStatus
@@ -208,6 +211,10 @@ $nativeFsrProfile = New-TestUpscalingProfile -Method 'fsr' -RenderScale $false
 $nativeFsrSnapshot = New-TestNativeSnapshot -RequestedProfile $nativeFsrProfile -EffectiveProfile $nativeFsrProfile -StableProfile $nativeFsrProfile -ProfilePresence 27
 $nativeFsrStable = Test-DevBenchUpscalingStable -UpscalingSnapshot $nativeFsrSnapshot -RenderScaleStatus (New-TestRenderScaleStatus -RenderScale $false)
 Assert-Test ($nativeFsrStable.satisfied -and $nativeFsrStable.method -eq 'fsr') 'native-resolution stability follows the effective method without prescribing DLSS or FSR'
+$nativePhysicalStatus = New-TestRenderScaleStatus -RenderScale $false
+$nativePhysicalStatus.controller.stable.active = $true
+$nativePhysicalState = Test-DevBenchUpscalingStable -UpscalingSnapshot (New-TestNativeSnapshot -RequestedProfile $nativeProfile) -RenderScaleStatus $nativePhysicalStatus
+Assert-Test (-not $nativePhysicalState.satisfied -and $nativePhysicalState.reasons -contains 'an active physical render-scale contract remains for a native-resolution profile') 'native-resolution stability rejects a contradictory active physical contract'
 $mismatchedProfile = New-TestUpscalingProfile -Method 'fsr' -RenderScale $false
 $nativeMismatchSnapshot = New-TestNativeSnapshot -RequestedProfile $mismatchedProfile -EffectiveProfile $nativeProfile -StableProfile $nativeFsrProfile -ProfilePresence 27
 $nativeMismatch = Test-DevBenchUpscalingStable -UpscalingSnapshot $nativeMismatchSnapshot -RenderScaleStatus (New-TestRenderScaleStatus -RenderScale $false)
@@ -227,6 +234,14 @@ $invalidExpected = Test-DevBenchUpscalingStable -UpscalingSnapshot (New-TestNati
 Assert-Test (-not $invalidExpected.satisfied -and $invalidExpected.reasons -contains 'the expected upscaling profile has invalid field types') 'expected profile boolean fields reject truthy strings'
 $missingSnapshotFields = Test-DevBenchUpscalingStable -UpscalingSnapshot ([pscustomobject]@{}) -RenderScaleStatus ([pscustomobject]@{})
 Assert-Test (-not $missingSnapshotFields.satisfied -and $missingSnapshotFields.reasons -contains 'render-scale controller telemetry is missing') 'missing optional snapshot fields fail closed without a strict-mode exception'
+$partialRenderStatus = New-TestRenderScaleStatus
+$partialRenderStatus.controller.PSObject.Properties.Remove('fidelity')
+$partialRenderState = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus $partialRenderStatus
+Assert-Test (-not $partialRenderState.satisfied -and $partialRenderState.reasons -contains 'render-scale fidelity telemetry is missing') 'partial active controller telemetry fails closed without a strict-mode exception'
+$partialProfileSnapshot = $renderSnapshot | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+$partialProfileSnapshot.profiles.effective.PSObject.Properties.Remove('qualityMode')
+$partialProfileState = Test-DevBenchUpscalingStable -UpscalingSnapshot $partialProfileSnapshot -RenderScaleStatus (New-TestRenderScaleStatus)
+Assert-Test (-not $partialProfileState.satisfied -and $partialProfileState.reasons -contains 'the effective upscaling profile has invalid field types') 'partial effective profiles fail closed without a strict-mode exception'
 
 $resourcePublication = Get-DevBenchResourcePublicationTelemetry -Response ([pscustomobject]@{
         status = [pscustomobject]@{
@@ -360,7 +375,7 @@ Assert-Test ($entryPointText -match 'not-retried-indeterminate') 'ambiguous muta
 Assert-Test ($entryPointText -match 'Update-InvocationEvidence -State \$\(if \(\$indeterminateMutation\) \{ ''indeterminate'' \}') 'indeterminate mutation outcomes are durably journaled'
 Assert-Test ($entryPointText -match '\$headers = \$null[\s\S]{0,300}probeError') 'wait probe transport failures force full session and identity rebind'
 Assert-Test ($entryPointText -match '-TimeoutSec \(Get-RequestTimeoutSeconds\)') 'wait requests consume only their remaining operation budget'
-Assert-Test ($entryPointText -match '\$operationDeadlineUtc = \[DateTime\]::UtcNow.AddSeconds\(\$TimeoutSeconds\)' -and $entryPointText -notmatch '\[Math\]::Min\(15,') 'blocking calls use the declared operation budget instead of a fixed 15-second transport cap'
+Assert-Test ($entryPointText -match '\$operationStartedUtc = \[DateTime\]::UtcNow' -and $entryPointText -match '\$operationDeadlineUtc = \$operationStartedUtc.AddSeconds\(\$TimeoutSeconds\)' -and $entryPointText -notmatch '\[Math\]::Min\(15,') 'blocking calls use the declared operation budget instead of a fixed 15-second transport cap'
 Assert-Test ($entryPointText -notmatch 'Start-Sleep -Milliseconds \$currentDelay') 'wait poll delays cannot exceed the operation deadline'
 Assert-Test ($entryPointText -match 'mcp-session-reinitialized') 'bounded waits reinitialize invalidated MCP sessions'
 Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$Command -eq ''wait''\)') 'unsatisfied waits fail even without RequireSuccess'
@@ -374,10 +389,14 @@ Assert-Test ($entryPointText -match '\[int\]\$RequestTimeoutSeconds = 15') 'cont
 Assert-Test ($entryPointText -match '\$arguments\.ContainsKey\(''timeoutMs''\)') 'controller detects a server-owned timeout budget'
 Assert-Test ($entryPointText -match 'Ceiling\(\$serverTimeoutMilliseconds / 1000\.0\)') 'controller converts the server budget without truncation'
 Assert-Test ($entryPointText -match '\$serverTimeoutSeconds \+ 5') 'controller keeps a five-second receipt envelope beyond the server budget'
-Assert-Test ($entryPointText -match '\$script:operationDeadlineUtc = \[DateTime\]::UtcNow.AddSeconds\(\$requiredOperationSeconds\)') 'server-owned waits extend the actual operation deadline before dispatch'
+Assert-Test ($entryPointText -match 'function Set-ServerWaitBudgetAtDispatch' -and $entryPointText -match '\$script:operationDeadlineUtc = \$now.AddSeconds\(\$requiredOperationSeconds\)' -and $entryPointText -match 'Set-ServerWaitBudgetAtDispatch -Arguments \$Arguments') 'server-owned waits extend the actual operation deadline at dispatch'
 Assert-Test ($entryPointText -match 'operationDeadlineUtc = \$script:operationDeadlineUtc.ToString') 'receipts expose the effective operation deadline'
+Assert-Test ($entryPointText -match 'serverTimeoutDispatchRemainingSeconds') 'receipts expose the remaining dispatch allowance for a server-owned wait'
 Assert-Test ($entryPointText -match 'function Close-AllMcpSessions') 'controller retains cleanup evidence for every issued MCP session'
 Assert-Test ($entryPointText -match 'Close-McpSessionForRebind') 'session rebind requires a successful prior cleanup reconciliation'
+Assert-Test ($entryPointText -match "DevBenchMcpSessionId" -and $entryPointText -match "returned malformed JSON") 'malformed initialization JSON preserves an already-issued MCP session identity'
+Assert-Test ($entryPointText -match "DevBenchCleanupUncertain" -and $entryPointText -match 'refusing automatic rebind') 'uncertain partial-session cleanup is never classified for automatic rebind'
+Assert-Test ($entryPointText -match "invocationRecord\['sessionCleanup'\]") 'final MCP cleanup evidence is written to the durable invocation journal'
 Assert-Test ($entryPointText -match 'method = ''tools/list''[\s\S]{0,400}currentTools') 'performance boundaries refresh the live tool registry'
 Assert-Test ($entryPointText -match 'function Invoke-ToolRpc[\s\S]{0,300}Invoke-McpRequest') 'tool calls use the shared deadline-bounded request path'
 Assert-Test ($entryPointText -match 'requestTimeoutSeconds = \$script:requestTimeoutSecondsForRpc') 'receipts expose the effective request timeout'

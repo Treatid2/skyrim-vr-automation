@@ -104,8 +104,9 @@ save availability.
 arguments contain `timeoutMs`, the controller automatically raises the request
 timeout to at least `ceil(timeoutMs / 1000) + 5` seconds and reports the
 effective value as `requestTimeoutSeconds`. It also extends the actual operation
-deadline to cover that server budget plus the receipt allowance, and reports
-the effective deadline and duration. This does not extend the server's own
+deadline at dispatch to cover that server budget plus the receipt allowance,
+and reports the effective deadline, duration, requested server timeout, and
+remaining dispatch allowance. This does not extend the server's own
 measurement deadline. Use `-MaxTransientRetries 0` for ownership-bearing
 or otherwise non-replayable actions. If their response is lost, recover their
 existing owner/status instead of sending the action again.
@@ -187,8 +188,9 @@ eyes to be valid and vendor-evaluated on the same presentation path, clean
 vendor lifecycle state, and no relatch, recovery, fallback, retirement, or
 memory-trim work. Native-resolution DLSS, FSR, TAA/AA, and DLAA use the
 authoritative upscaling service: requested and effective profiles must agree,
-the controller must be idle, and no transition or recovery condition may be
-present. Native-resolution stereo confidence comes from consecutive advancing
+the controller state must agree with its transition state, and no active
+physical render-scale contract or recovery condition may be present.
+Native-resolution stereo confidence comes from consecutive advancing
 world frames because the render-scale logger intentionally has no active
 physical stereo contract in that mode.
 
