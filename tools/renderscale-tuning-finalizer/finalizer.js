@@ -653,6 +653,35 @@ function sourceProfile(waiter) {
     };
 }
 
+function exposedBackend(value) {
+    return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function actualBackend(waiter, target) {
+    if (target.method === "none" || target.method === "taa") return "none";
+    if (target.method !== "dlss" && target.method !== "fsr") {
+        return "not_exposed";
+    }
+    if (target.renderScaleMode === false) {
+        const execution = waiter.nativeVendorExecution ||
+            waiter.observation && waiter.observation.nativeVendorExecution;
+        return exposedBackend(execution && execution.actualBackend) ||
+            "not_exposed";
+    }
+    if (target.renderScaleMode !== true) return "not_exposed";
+    const timeline = waiter.replacementTimeline || {};
+    const proof = timeline.terminal &&
+        timeline.terminal.presentationProof || {};
+    const direct = exposedBackend(proof.backend);
+    if (direct) return direct;
+    const left = exposedBackend(proof.leftEye && proof.leftEye.backend);
+    const right = exposedBackend(proof.rightEye && proof.rightEye.backend);
+    if (left && left === right) return left;
+    const dispatch = waiter.status && waiter.status.fsrDispatch;
+    return exposedBackend(dispatch && dispatch.actualDispatchBackend) ||
+        "not_exposed";
+}
+
 function transitionRow(root, file, retained) {
     const identity = rowIdentity(root, file);
     const waiter = retained.waiter || {};
@@ -674,6 +703,7 @@ function transitionRow(root, file, retained) {
         ...identity,
         target,
         source: sourceProfile(waiter),
+        actualBackend: actualBackend(waiter, target),
         renderVerdict,
         task2Verdict: task2.verdict,
         task2MissingEvidence: task2.missingEvidence,
@@ -730,7 +760,8 @@ function csvCell(value) {
 function csv(rows) {
     const columns = [
         "lane", "pass", "ordinal", "method", "quality_mode", "render_scale_mode",
-        "render_verdict", "stability_status", "stability_presentation_disposition",
+        "actual_backend", "render_verdict", "stability_status",
+        "stability_presentation_disposition",
         "stability_left_eye_path", "stability_right_eye_path",
         "stability_controller_state", "stability_presentation_phase",
         "stability_failure_codes", "task2_verdict", "mutation_expectation",
@@ -766,7 +797,8 @@ function csv(rows) {
         const diagnostics = row.diagnostics;
         const note = row.nonStableNote;
         const values = [row.lane, row.pass, row.ordinal, row.target.method,
-            row.target.qualityMode, row.target.renderScaleMode, row.renderVerdict,
+            row.target.qualityMode, row.target.renderScaleMode, row.actualBackend,
+            row.renderVerdict,
             note ? note.status : "stable",
             note ? note.presentationDisposition : "n/a",
             note ? note.leftEyePath : "n/a",
@@ -826,7 +858,8 @@ function report(summary) {
                 "started after reset" : row.recoveryStatus;
         return (
         `| ${row.lane || "default"} | ${row.pass} | ${row.ordinal} | ` +
-        `${row.renderVerdict} | ${stability} | ${row.task2Verdict} | ` +
+        `${row.actualBackend} | ${row.renderVerdict} | ${stability} | ` +
+        `${row.task2Verdict} | ` +
         `${row.presentationStretchSelected ?
             row.presentationStretchConsecutiveFrames : "none"} | ` +
         `${row.presentationStretchRecovered ?
@@ -890,9 +923,9 @@ function report(summary) {
         `per-transition evidence. Every raw JSON value is available in ` +
         `\`${summary.evidenceExtraction.path}\`.\n\n` +
         `## Transitions\n\n` +
-        `| Lane | Pass | Row | Render | Stability | Task 2 | Stretch frames | Stretch recovery | Recovery | Authority | Reported violations | ` +
+        `| Lane | Pass | Row | Actual backend | Render | Stability | Task 2 | Stretch frames | Stretch recovery | Recovery | Authority | Reported violations | ` +
         `Missing evidence | Invalid producer evidence |\n` +
-        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n\n` +
+        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n\n` +
         `## Presentation stretch anomalies\n\n` +
         `| Lane | Pass | Row | From | To | Consecutive frames | Recovered PASS |\n` +
         `| --- | ---: | ---: | --- | --- | ---: | --- |\n` +
@@ -1012,6 +1045,10 @@ function finalizeEvidence(options) {
     }
     if (rows.some((row) => !row.traceComplete)) {
         reportingReasons.push("required_trace_evidence_incomplete");
+    }
+    if (rows.some((row) => row.renderVerdict === "PASS" &&
+        row.actualBackend === "not_exposed")) {
+        reportingReasons.push("reporting_contract_incomplete");
     }
     if (variant === "amd" && (!liveResult || !liveResult.traceCapability ||
         liveResult.traceCapability.status !== "supported")) {

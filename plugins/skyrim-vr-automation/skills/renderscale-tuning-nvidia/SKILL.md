@@ -61,8 +61,10 @@ calculate a positioning-admission result, inspect individual payload shapes,
 or emit a positioning verdict in the client. The runner validates the
 successful outer scenario, required labeled tool entries, exact scene, and
 snapshot, then emits the compact positioning `notify()`. In particular,
-`position-renderscale.result` is an opaque payload: its outer presence is
-required, but no nested `result` or adapter field is required.
+the runner requires `position-renderscale.result.status.adapter.available:
+true` and NVIDIA vendor ID `0x10DE`/4318 before it can begin a baseline. The
+client still passes the complete scenario root unchanged; it must not add a
+second adapter-shape admission gate.
 
 ## Uninterrupted measurement
 

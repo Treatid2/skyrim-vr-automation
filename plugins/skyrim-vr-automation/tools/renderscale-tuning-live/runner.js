@@ -206,6 +206,7 @@ async function runRenderScaleTuningLive(context) {
         const sceneResult = results.get("position-scene");
         const snapshotResult = results.get("position-snapshot");
         const capabilitiesResult = results.get("position-capabilities");
+        const renderScaleResult = results.get("position-renderscale");
         if (!sceneResult || sceneResult.playerLoaded !== true ||
             !sceneResult.cell ||
             sceneResult.cell.editorId !== "WhiterunDragonsreach") {
@@ -218,6 +219,28 @@ async function runRenderScaleTuningLive(context) {
             (!capabilitiesResult || !capabilitiesResult.capabilities)) {
             throw new Error("positioning_capabilities_missing");
         }
+        const adapter = renderScaleResult && renderScaleResult.status &&
+            renderScaleResult.status.adapter;
+        if (!adapter || adapter.available !== true) {
+            throw diagnosticError("positioning_adapter_unavailable", {
+                reason: "adapter_identity_not_available",
+                variant,
+                adapter: adapter || null,
+            });
+        }
+        const vendorId = typeof adapter.vendorId === "string" &&
+            /^(?:0x[0-9a-f]+|[0-9]+)$/i.test(adapter.vendorId) ?
+            Number(adapter.vendorId) : adapter.vendorId;
+        const expectedVendorId = variant === "amd" ? 0x1002 : 0x10de;
+        if (!Number.isSafeInteger(vendorId) || vendorId !== expectedVendorId) {
+            throw diagnosticError("positioning_adapter_vendor_mismatch", {
+                reason: "adapter_vendor_mismatch",
+                variant,
+                expectedVendorId,
+                actualVendorId: Number.isSafeInteger(vendorId) ? vendorId : null,
+                adapter,
+            });
+        }
         return {
             cellEditorId: sceneResult.cell.editorId,
             boundary: terminalBoundary({
@@ -225,6 +248,7 @@ async function runRenderScaleTuningLive(context) {
             }),
             capabilities: capabilitiesResult &&
                 capabilitiesResult.capabilities || {},
+            adapter: { ...adapter, vendorId },
         };
     }
 
@@ -235,6 +259,7 @@ async function runRenderScaleTuningLive(context) {
         status: "admitted",
         cellEditorId: positioning.cellEditorId,
         buildId,
+        adapterVendorId: positioning.adapter.vendorId,
     });
 
     function targetFor(boundary, destination, fsrRuntime) {
@@ -1438,7 +1463,23 @@ async function runRenderScaleTuningLive(context) {
         const response = await scenario(steps, receiptKey);
         const entries = requireScenario(response.root, steps, receiptKey);
         const start = entries.get("measured-stress-start");
-        const sessionId = start.status.session.id;
+        const session = start && start.status && start.status.session;
+        if (!session || session.active !== true ||
+            !Number.isSafeInteger(session.id) || session.id < 1) {
+            const diagnostic = scenarioDiagnostic(
+                response.root, steps, receiptKey, "ownership");
+            diagnostic.ownership = {
+                status: "uncertain",
+                reason: "measured_stress_session_identity_missing",
+                cleanupAttempted: false,
+                baselineSessionId: baselineResult.stressSessionId,
+                reportedSessionId: session && session.id !== undefined ?
+                    session.id : null,
+            };
+            throw diagnosticError(
+                "measured_stress_session_identity_missing", diagnostic);
+        }
+        const sessionId = session.id;
         return sessionId;
     }
 

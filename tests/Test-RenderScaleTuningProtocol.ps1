@@ -350,10 +350,14 @@ foreach ($variant in $variants) {
     Assert-Contains $skill 'No other `before` or `after`' $variant.Name
     Assert-Contains $skill 'do not infer aliases' $variant.Name
     Assert-Contains $skill 'compact positioning `notify()`' $variant.Name
-    Assert-Contains $skill '`position-renderscale.result` is an opaque payload' $variant.Name
-    Assert-Contains $skill 'no nested `result` or adapter field is required' $variant.Name
-    Assert-Contains $skill 'not by another client-side adapter-shape admission gate' $variant.Name
-    Assert-True (-not $skill.Contains("Require the structured positioning receipt's bound adapter", [StringComparison]::Ordinal)) "$($variant.Name) still blocks startup on an adapter receipt shape."
+    Assert-Contains $skill '`position-renderscale.result.status.adapter.available: true`' $variant.Name
+    Assert-Contains $skill 'before it can begin a baseline' $variant.Name
+    Assert-Contains $skill 'must not add a second adapter-shape admission gate' $variant.Name
+    if ($variant.Name -eq 'renderscale-tuning-nvidia') {
+        Assert-Contains $skill 'NVIDIA vendor ID `0x10DE`/4318' $variant.Name
+    } else {
+        Assert-Contains $skill 'AMD vendor ID `0x1002`/4098' $variant.Name
+    }
     Assert-Contains $skill 'Do not end the positioning `functions.exec`' $variant.Name
     Assert-Contains $skill 'tools/renderscale-tuning-live/runner.js' $variant.Name
     Assert-Contains $skill 'The runner is the executable live contract' $variant.Name

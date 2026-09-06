@@ -34,7 +34,9 @@ function publicProfile(method = "dlss", qualityMode = "native_aa", renderScaleMo
     };
 }
 
-function positioningRoot(capabilities = {}, flatSnapshot = false) {
+function positioningRoot(capabilities = {}, flatSnapshot = false,
+    vendorId = Object.hasOwn(capabilities, "supportedFSRRuntimeMask") ?
+        0x1002 : 0x10de) {
     const snapshot = { stateRevision: 1 };
     if (flatSnapshot) snapshot.effective = publicProfile();
     else snapshot.profiles = { effective: publicProfile() };
@@ -60,7 +62,9 @@ function positioningRoot(capabilities = {}, flatSnapshot = false) {
                 label: "position-snapshot",
                 result: { snapshot },
             },
-            { label: "position-renderscale", result: {} },
+            { label: "position-renderscale", result: {
+                status: { adapter: { available: true, vendorId } },
+            } },
         ],
     };
 }
@@ -947,27 +951,27 @@ async function testInformationalReasonIsNotFailure() {
     "An informational reason fabricated a failed step.");
 }
 
-async function testPositionRenderScalePayloadIsOpaque() {
+async function testPositionRenderScaleAdapterAdmission() {
     const matrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
         "matrix.v1.json")));
     const admittedRoot = positioningRoot();
     const renderScaleEntry = admittedRoot.results.find((entry) =>
         entry.label === "position-renderscale");
-    assert(renderScaleEntry &&
-        !Object.prototype.hasOwnProperty.call(renderScaleEntry.result, "result"),
-    "Positioning fixture unexpectedly contains a nested result.");
+    assert(renderScaleEntry && renderScaleEntry.result.status.adapter.available ===
+        true && renderScaleEntry.result.status.adapter.vendorId === 0x10de,
+    "Positioning fixture does not identify the expected NVIDIA adapter.");
     const admitted = createMock(0);
     const admittedResult = await runRenderScaleTuningLive({
         ...admitted.context,
         variant: "nvidia",
-        runId: "opaque-position-renderscale",
+        runId: "valid-position-renderscale-adapter",
         buildId,
         positioningRoot: admittedRoot,
         matrix,
     });
     assert(admittedResult.ok === true,
-        "An opaque position-renderscale payload was rejected.");
+        "A valid NVIDIA positioning adapter was rejected.");
 
     const missingRoot = positioningRoot();
     const missingEntry = missingRoot.results.find((entry) =>
@@ -992,6 +996,73 @@ async function testPositionRenderScalePayloadIsOpaque() {
     "A missing outer position-renderscale result was not rejected.");
     assert(rejected.scenarioCalls.length === 0,
         "The runner mutated the game after invalid positioning evidence.");
+
+    for (const [name, root, expectedError] of [
+        ["unavailable", positioningRoot(), "positioning_adapter_unavailable"],
+        ["wrong-vendor", positioningRoot({}, false, 0x1002),
+            "positioning_adapter_vendor_mismatch"],
+    ]) {
+        if (name === "unavailable") {
+            root.results.find((entry) => entry.label === "position-renderscale")
+                .result.status.adapter.available = false;
+        }
+        const mock = createMock(0);
+        let admissionError = null;
+        try {
+            await runRenderScaleTuningLive({
+                ...mock.context,
+                variant: "nvidia",
+                runId: `${name}-position-renderscale-adapter`,
+                buildId,
+                positioningRoot: root,
+                matrix,
+            });
+        } catch (caught) {
+            admissionError = caught;
+        }
+        assert(admissionError && admissionError.message === expectedError &&
+            admissionError.diagnostic,
+        `${name} positioning adapter did not fail with durable diagnostics.`);
+        assert(mock.scenarioCalls.length === 0,
+            `${name} positioning adapter mutated the game before rejection.`);
+    }
+}
+
+async function testMalformedMeasuredStressOwnershipIsRetained() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    let malformed = false;
+    const mock = createMock(0, null, (root, args) => {
+        if (malformed) return root;
+        const entry = root.results.find((candidate) =>
+            candidate.label === "measured-stress-start");
+        if (entry) {
+            malformed = true;
+            delete entry.result.status.session.id;
+        }
+        return root;
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "nvidia",
+        runId: "malformed-measured-stress-owner",
+        buildId,
+        positioningRoot: positioningRoot(),
+        matrix,
+    });
+    const failure = result.lanes[0].passes[0].failure;
+    assert(result.ok === false && result.status === "INTERRUPTED" &&
+        result.lanes[0].passes[0].error ===
+            "measured_stress_session_identity_missing" &&
+        failure && failure.phase === "ownership" &&
+        failure.ownership.status === "uncertain" &&
+        failure.ownership.cleanupAttempted === false &&
+        failure.receiptKey.endsWith(":handoff"),
+    "Malformed measured-stress ownership did not fail closed with attribution.");
+    const retained = mock.stores.get("malformed-measured-stress-owner:live-result");
+    assert(retained && retained.lanes[0].passes[0].failure === failure,
+        "Malformed measured-stress ownership evidence was not retained.");
 }
 
 async function testUnsafeTransitionRestoresBaselineAndContinues() {
@@ -2040,7 +2111,8 @@ Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
     testAdmissionRejectsMalformedInputs(), testEvidenceVerdicts(),
     testScenarioFailureRetention(), testInformationalReasonIsNotFailure(),
     testOptionalTerminalFacts(), testSafeUnstableBaselineContinues(),
-    testFlatTerminalBoundary(), testPositionRenderScalePayloadIsOpaque(),
+    testFlatTerminalBoundary(), testPositionRenderScaleAdapterAdmission(),
+    testMalformedMeasuredStressOwnershipIsRetained(),
     testUnsafeTransitionRestoresBaselineAndContinues(),
     testAmdUnsafeTransitionUsesLaneBaseline(),
     testFailedRecoveryStopsLaterTransitions(),

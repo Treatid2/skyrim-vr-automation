@@ -39,6 +39,7 @@ $requiredFiles = @(
     'skills/renderscale-tuning-amd/references/matrix.v1.json',
     'tools/renderscale-tuning-live/runner.js',
     'tools/renderscale-tuning-finalizer/finalizer.js',
+    'tools/fork-reciprocal-search/validate-campaign.js',
     'skills/shader-cache-control/SKILL.md',
     'skills/shader-cache-control/agents/openai.yaml',
     'plugins/skyrim-vr-automation/.codex-plugin/plugin.json',
