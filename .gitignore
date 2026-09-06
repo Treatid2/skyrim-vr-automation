@@ -1,6 +1,7 @@
 # Machine-specific configuration and transient state
 **/config/machine.local.json
 **/config/*.local.json
+**/config/.fixture-refresh-*/
 **/sessions/
 
 # Generated evidence and reports

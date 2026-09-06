@@ -18,6 +18,7 @@ $tests = @(
     @{ Name = 'steamvr-null-control'; Path = 'tools\steamvr-null-control\Test-SteamVRNullControl.ps1'; Arguments = @() },
     @{ Name = 'steamvr-head-pose-control'; Path = 'tools\steamvr-head-pose-control\Test-SteamVRHeadPoseControl.ps1'; Arguments = @() },
     @{ Name = 'devbench-control'; Path = 'tools\devbench-control\Test-DevBenchControl.ps1'; Arguments = @() },
+    @{ Name = 'capture-interaction-control'; Path = 'tools\capture-interaction-control\Test-CaptureInteractionControl.ps1'; Arguments = @() },
     @{ Name = 'profiler-control'; Path = 'tools\profiler-control\Test-ProfilerControl.ps1'; Arguments = @() },
     @{ Name = 'shader-cache-control'; Path = 'tools\shader-cache-control\Test-CSXShaderCacheControl.ps1'; Arguments = @() },
     @{ Name = 'shader-cache-catalog'; Path = 'tools\shader-cache-control\Test-CSXShaderCacheCatalog.ps1'; Arguments = @() },

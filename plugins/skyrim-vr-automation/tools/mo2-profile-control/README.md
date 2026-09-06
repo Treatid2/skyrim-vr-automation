@@ -38,6 +38,11 @@ path, retain an exact modlist backup, and record all displaced providers plus a
 postcondition. MO2 overwrite, unmanaged files, and archives are outside this
 proof; use VFS evidence when those sources matter.
 
+For more than one winning path in a direct `pwsh -File` invocation, use
+`-WinningPathsFile`. It accepts either a JSON string array or one relative path
+per line (blank lines and `#` comments are ignored), then combines and
+deduplicates those entries with any inline `-WinningPaths` values.
+
 For noninteractive orchestration, pass `-Confirm:$false` only after the caller
 has authorized the exact transaction. A bare `-Confirm` requests an interactive
 PowerShell prompt and is converted into a clear blocked error when no prompt

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skyrim VR Capture and Interaction"
+  short_description: "Observe current frames and act through correlated Skyrim VR captures."
+  default_prompt: "Use $capture-interaction-control to start or operate a correlated Skyrim VR observation and interaction session."

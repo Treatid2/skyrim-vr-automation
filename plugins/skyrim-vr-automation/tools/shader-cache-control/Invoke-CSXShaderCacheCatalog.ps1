@@ -21,6 +21,7 @@ param(
     [string]$FeatureSetSha256,
     [string]$GameRuntime = 'SkyrimVR-1.4.15',
     [string]$RenderPath = 'vr',
+    [string]$BytecodeCompatibilityClass = 'skyrimvr-d3d11',
     [string[]]$Tags = @(),
     [string[]]$RequiredTags = @(),
     [ValidateSet('known-working', 'unverified')]
@@ -277,6 +278,7 @@ function Assert-CompatibilityInput {
     if ([string]::IsNullOrWhiteSpace($ShaderCacheAbi)) { throw '-ShaderCacheAbi is required.' }
     if ([string]::IsNullOrWhiteSpace($GameRuntime)) { throw '-GameRuntime is required.' }
     if ([string]::IsNullOrWhiteSpace($RenderPath)) { throw '-RenderPath is required.' }
+    if ([string]::IsNullOrWhiteSpace($BytecodeCompatibilityClass)) { throw '-BytecodeCompatibilityClass is required.' }
     $script:ShaderSourceSha256 = Assert-Hash $ShaderSourceSha256 'ShaderSourceSha256'
     if (-not [string]::IsNullOrWhiteSpace($PresetSha256)) { $script:PresetSha256 = Assert-Hash $PresetSha256 'PresetSha256' }
     if (-not [string]::IsNullOrWhiteSpace($FeatureSetSha256)) { $script:FeatureSetSha256 = Assert-Hash $FeatureSetSha256 'FeatureSetSha256' }
@@ -291,7 +293,7 @@ function Get-NormalizedStrings([string[]]$Values) {
 
 function Get-RenderFamily([string]$Value) {
     $normalized = $Value.Trim().ToLowerInvariant()
-    if ($normalized -in @('vr-steamvr-physical', 'vr-steamvr-null')) { return 'vr-steamvr' }
+    if ($normalized -in @('steamvr-physical', 'steamvr-null', 'vr-steamvr-physical', 'vr-steamvr-null')) { return 'vr-steamvr' }
     return $normalized
 }
 
@@ -299,6 +301,7 @@ function New-CompatibilityRecord {
     return [pscustomobject][ordered]@{
         shaderCacheAbi = $ShaderCacheAbi
         gameRuntime = $GameRuntime
+        bytecodeCompatibilityClass = $BytecodeCompatibilityClass
         renderPath = $RenderPath
         renderFamily = Get-RenderFamily $RenderPath
         shaderSourceSha256 = $ShaderSourceSha256
@@ -364,7 +367,7 @@ function New-CatalogSnapshot {
             if ([string]$m.inventory.treeSha256 -ieq $expected -and [string]$m.status -ceq $Status -and
                 [string]$m.compatibility.shaderCacheAbi -ceq $ShaderCacheAbi -and
                 [string]$m.compatibility.gameRuntime -ceq $GameRuntime -and
-                (Get-RenderFamily ([string]$m.compatibility.renderPath)) -ceq (Get-RenderFamily $RenderPath) -and
+                [string]$m.compatibility.renderPath -ceq $RenderPath -and
                 [string]$m.compatibility.shaderSourceSha256 -ieq $ShaderSourceSha256 -and
                 [string](Get-PropertyValue $m.compatibility 'buildId' '') -ceq [string](Get-PropertyValue $compatibility 'buildId' '') -and
                 [string](Get-PropertyValue $m.compatibility 'presetSha256' '') -ieq [string](Get-PropertyValue $compatibility 'presetSha256' '') -and
@@ -429,9 +432,9 @@ function Select-CatalogSnapshot($Storage) {
         if ([string]$m.status -cne 'known-working') { $reasons += 'not-known-working' }
         if ([string]$m.compatibility.shaderCacheAbi -cne $ShaderCacheAbi) { $reasons += 'shader-cache-abi-mismatch' }
         if ([string]$m.compatibility.gameRuntime -cne $GameRuntime) { $reasons += 'game-runtime-mismatch' }
+        $candidateBytecodeClass = [string](Get-PropertyValue $m.compatibility 'bytecodeCompatibilityClass' $(if ([string]$m.compatibility.gameRuntime -like 'SkyrimVR*') { 'skyrimvr-d3d11' } else { [string]$m.compatibility.renderPath }))
+        if ($candidateBytecodeClass -cne $BytecodeCompatibilityClass) { $reasons += 'bytecode-compatibility-class-mismatch' }
         $candidateRenderFamily = Get-RenderFamily ([string]$m.compatibility.renderPath)
-        $requestedRenderFamily = Get-RenderFamily $RenderPath
-        if ($candidateRenderFamily -cne $requestedRenderFamily) { $reasons += 'render-family-mismatch' }
         $candidateFeatureSet = [string](Get-PropertyValue $m.compatibility 'featureSetSha256' '')
         if (-not [string]::IsNullOrWhiteSpace($FeatureSetSha256)) {
             if ([string]::IsNullOrWhiteSpace($candidateFeatureSet)) { $reasons += 'feature-set-unknown' }
@@ -456,8 +459,9 @@ function Select-CatalogSnapshot($Storage) {
             exactShaderSource = $sourceExact
             exactBuild = $buildExact
             exactPreset = $presetExact
+            exactRenderPathProvenance = $renderPathExact
+            bytecodeCompatibilityClass = $candidateBytecodeClass
             exactFeatureSet = $featureSetExact
-            exactRenderPath = $renderPathExact
             renderFamily = $candidateRenderFamily
             files = [int]$m.inventory.files
             bytes = [long]$m.inventory.bytes

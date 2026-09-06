@@ -18,7 +18,7 @@ param(
     [string]$WorkspaceManifestPath,
     [string]$ExpectedBuildId,
     [string]$ExpectedArtifactSha256,
-    [ValidateSet('noBlockingMenu', 'playerLoaded', 'toolAvailable', 'serviceReady')]
+    [ValidateSet('noBlockingMenu', 'mainMenuReady', 'playerLoaded', 'toolAvailable', 'serviceReady')]
     [string]$Condition = 'noBlockingMenu',
     [ValidateRange(1, 600)]
     [int]$TimeoutSeconds = 30,
@@ -33,6 +33,7 @@ param(
     [string]$ExpectedErrorCode,
     [string]$ProgressLogPath,
     [string[]]$IgnoredMenus = @('HUD Menu'),
+    [string[]]$AllowedMainMenuMenus = @('HUD Menu', 'Main Menu', 'Mist Menu', 'Fader Menu'),
     [switch]$AcceptAlreadyLoaded,
     [switch]$AllowUnsafeTfc1,
     [switch]$AllowUnprovenGameMutation,
@@ -43,6 +44,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $argumentsJsonSupplied = $PSBoundParameters.ContainsKey('ArgumentsJson')
+$readOnlyCall = $false
 $endpoint = $null
 $runtimeIdentity = $null
 $transportRetries = [Collections.Generic.List[object]]::new()
@@ -104,6 +106,7 @@ function Initialize-InvocationEvidence {
         runtimeSha256 = if (-not [string]::IsNullOrWhiteSpace($RuntimePath) -and (Test-Path -LiteralPath $RuntimePath -PathType Leaf)) { (Get-FileHash -LiteralPath $RuntimePath -Algorithm SHA256).Hash } else { $null }
         requestedArguments = if ($Command -eq 'call') { $ArgumentsJson } else { $null }
         requestedArgumentsSha256 = if ($Command -eq 'call') { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($ArgumentsJson))) } else { $null }
+        requestMode = if ($Command -eq 'call') { 'unclassified' } else { $null }
         commandId = $null
         workspaceManifestPath = if ([string]::IsNullOrWhiteSpace($WorkspaceManifestPath)) { $null } else { [IO.Path]::GetFullPath($WorkspaceManifestPath) }
         workspaceManifestSha256 = if (-not [string]::IsNullOrWhiteSpace($WorkspaceManifestPath) -and (Test-Path -LiteralPath $WorkspaceManifestPath -PathType Leaf)) { (Get-FileHash -LiteralPath $WorkspaceManifestPath -Algorithm SHA256).Hash } else { $null }
@@ -500,6 +503,9 @@ try {
     if ($Command -eq 'call') {
         if ([string]::IsNullOrWhiteSpace($Tool)) { throw 'Tool is required for call.' }
         try { $arguments = $ArgumentsJson | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { throw "ArgumentsJson is invalid: $($_.Exception.Message)" }
+        $readOnlyCall = Test-DevBenchReadOnlyRequest -ToolName $Tool -Arguments $arguments
+        $script:invocationRecord.requestMode = if ($readOnlyCall) { 'read-only' } else { 'mutation-capable' }
+        Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord
         if ($arguments.Contains('commandId')) { $script:invocationRecord.commandId = [string]$arguments['commandId']; Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord }
         $unsafeTfc1Path = Find-UnsafeTfc1 -Value $arguments
         if ($unsafeTfc1Path -and -not $AllowUnsafeTfc1) {
@@ -524,7 +530,7 @@ try {
         $tools = @($session.tools)
         $runtimeIdentity = $session.runtimeIdentity
         if (-not $SkipRuntimeIdentityVerification) {
-            if ($Command -eq 'call' -and -not $runtimeIdentity.complete) {
+            if ($Command -eq 'call' -and -not $readOnlyCall -and -not $runtimeIdentity.complete) {
                 throw "Mutation-capable DevBench calls require complete runtime identity. Missing: $($runtimeIdentity.missing -join ', ')."
             }
         }
@@ -539,8 +545,8 @@ try {
     elseif ($Command -eq 'call') {
         if (@($tools | Where-Object name -eq $Tool).Count -ne 1) { throw "Tool '$Tool' is not present in the authoritative tools/list response." }
         Update-InvocationEvidence -State 'dispatching'
-        $data = Invoke-ToolRpc -Name $Tool -Arguments $arguments -Headers $headers -Mutation
-        $semantic = Get-DevBenchSemanticStatus -Content @($data.content)
+        $data = Invoke-ToolRpc -Name $Tool -Arguments $arguments -Headers $headers -Mutation:(-not $readOnlyCall)
+        $semantic = Get-DevBenchCallSemanticStatus -ToolName $Tool -Arguments $arguments -Content @($data.content)
         if ($Tool -eq 'communityshaders.profiler' -and -not $semantic.known) {
             $profilerPayload = @($data.content | Select-Object -First 1)
             if ($profilerPayload.Count -eq 1 -and -not $profilerPayload[0].PSObject.Properties['error']) {
@@ -570,7 +576,7 @@ try {
     }
     else {
         if ($Condition -in @('toolAvailable', 'serviceReady') -and [string]::IsNullOrWhiteSpace($Tool)) { throw "Condition '$Condition' requires -Tool." }
-        $requiredTool = if ($Condition -eq 'noBlockingMenu') { 'menu' } elseif ($Condition -eq 'playerLoaded') { 'inspect' } else { $null }
+        $requiredTool = if ($Condition -in @('noBlockingMenu', 'mainMenuReady')) { 'menu' } elseif ($Condition -eq 'playerLoaded') { 'inspect' } else { $null }
         $waitArguments = @{}
         $waitArgumentsResolved = $Condition -ne 'serviceReady'
         $serviceProbe = $null
@@ -634,10 +640,14 @@ try {
                     continue
                 }
             }
-            if ($Condition -eq 'noBlockingMenu') {
+            if ($Condition -in @('noBlockingMenu', 'mainMenuReady')) {
                 try {
                     $menu = @(Invoke-ToolRpc -Name 'menu' -Arguments @{ action = 'list' } -Headers $headers).content | Select-Object -First 1
-                    $observation = Test-DevBenchNoBlockingMenu -MenuState $menu -IgnoredMenus $IgnoredMenus
+                    $observation = if ($Condition -eq 'mainMenuReady') {
+                        Test-DevBenchMainMenuReady -MenuState $menu -AllowedMenus $AllowedMainMenuMenus
+                    } else {
+                        Test-DevBenchNoBlockingMenu -MenuState $menu -IgnoredMenus $IgnoredMenus
+                    }
                 }
                 catch {
                     if (-not (Test-WaitRetryableException -Exception $_.Exception)) { throw }

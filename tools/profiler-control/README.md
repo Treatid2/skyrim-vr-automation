@@ -68,3 +68,32 @@ Run the synthetic regression suite after changing either script:
 ```powershell
 .\Test-ProfilerControl.ps1
 ```
+
+## Whole-runtime quiet windows
+
+`Measure-SkyrimQuietWindow.ps1` records engine frame throughput and process CPU
+use for Skyrim, SteamVR, Virtual Desktop, and the dashboard across a bounded
+quiet window. It uses DevBench only for identity-bound frame boundaries; it
+does not enable the CSX profiler.
+
+```powershell
+.\Measure-SkyrimQuietWindow.ps1 `
+  -RuntimePath $runtimePath `
+  -Condition 'null HMD; DevBench on; Whiterun clear' `
+  -Scene 'WhiterunOrigin' `
+  -OutputPath '.\evidence\quiet-30s.json'
+```
+
+`Compare-SkyrimPerformance.ps1` compares two or more such captures and writes
+JSON, CSV, and Markdown. Comparisons are deliberately informational: establish
+repeatability for a scene and runtime route before adding project-specific
+thresholds.
+
+```powershell
+.\Compare-SkyrimPerformance.ps1 `
+  -InputPath @('.\baseline.json', '.\candidate.json') `
+  -ReferenceLabel 'baseline' `
+  -OutputDirectory '.\comparison'
+
+.\Test-SkyrimPerformance.ps1
+```

@@ -24,6 +24,8 @@ param(
 
     [string[]]$WinningPaths,
 
+    [string]$WinningPathsFile,
+
     [switch]$RegisterEnabled,
 
     [string]$EvidenceDirectory,
@@ -41,6 +43,27 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+function Resolve-WinningPathInput([string[]]$Inline, [string]$File) {
+    $values = [Collections.Generic.List[string]]::new()
+    foreach ($value in @($Inline)) { if (-not [string]::IsNullOrWhiteSpace($value)) { $values.Add($value.Trim()) } }
+    if (-not [string]::IsNullOrWhiteSpace($File)) {
+        $resolved = [IO.Path]::GetFullPath($File)
+        if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) { throw "WinningPathsFile does not exist: $resolved" }
+        $raw = Get-Content -LiteralPath $resolved -Raw
+        $parsed = $null
+        $jsonArray = $raw.TrimStart().StartsWith('[')
+        try { $parsed = $raw | ConvertFrom-Json -Depth 5 -ErrorAction Stop } catch { if ($jsonArray) { throw 'WinningPathsFile begins as JSON but is not a valid JSON string array.' } }
+        $entries = if ($jsonArray) { @($parsed) } else { @($raw -split '\r?\n' | Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') }) }
+        foreach ($entry in $entries) {
+            if ($entry -isnot [string] -or [string]::IsNullOrWhiteSpace($entry)) { throw 'WinningPathsFile must contain a JSON string array or one relative path per line.' }
+            $values.Add($entry.Trim())
+        }
+    }
+    return @($values | Select-Object -Unique)
+}
+
+$resolvedWinningPaths = @(Resolve-WinningPathInput -Inline $WinningPaths -File $WinningPathsFile)
 
 function New-ProfileApprovalMetadata([string]$Subcommand) {
     $hostExecutable = [string][Environment]::ProcessPath
@@ -556,7 +579,7 @@ if ($Command -in @('register', 'register-winning')) {
     if (Test-Path -LiteralPath $backupPath -PathType Leaf) { throw "Refusing to overwrite an existing exact backup: $backupPath" }
     $winningPlan = $null
     if ($Command -eq 'register-winning') {
-        $winningPlan = Resolve-WinningPlan -Bytes $beforeBytes -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $ModsDirectory -Paths $WinningPaths
+        $winningPlan = Resolve-WinningPlan -Bytes $beforeBytes -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $ModsDirectory -Paths $resolvedWinningPaths
         $effectivePlacement = if ([string]::IsNullOrWhiteSpace([string]$winningPlan.placeBeforeMod)) { 'End' } else { 'Before' }
         $effectiveRelative = [string]$winningPlan.placeBeforeMod
         $afterBytes = Add-ModLine -Bytes $beforeBytes -Name $ModName -Enabled $true -LinePlacement $effectivePlacement -RelativeName $effectiveRelative
@@ -568,7 +591,7 @@ if ($Command -in @('register', 'register-winning')) {
     }
     if (Test-ProfileShouldProcess -Caller $PSCmdlet -Target $resolvedProfile -Action "$Command exact MO2 mod '$ModName' at $effectivePlacement") {
         $afterLine = Get-ModLineRecord -Bytes $afterBytes -Name $ModName
-        $winnerProof = if ($Command -eq 'register-winning') { Test-WinningPostcondition -Bytes $afterBytes -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $ModsDirectory -Paths $WinningPaths } else { $null }
+        $winnerProof = if ($Command -eq 'register-winning') { Test-WinningPostcondition -Bytes $afterBytes -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $ModsDirectory -Paths $resolvedWinningPaths } else { $null }
         $receipt = [pscustomobject][ordered]@{
             operation = $Command; profilePath = $resolvedProfile
             profileName = $profileName; profileDirectory = $profileDirectory; modListPath = $resolvedProfile
@@ -580,7 +603,7 @@ if ($Command -in @('register', 'register-winning')) {
             param([byte[]]$liveBytes)
             $line = Get-ModLineRecord -Bytes $liveBytes -Name $ModName
             if ($line.marker -cne $afterLine.marker) { throw 'Registration marker postcondition failed.' }
-            if ($Command -eq 'register-winning') { return Test-WinningPostcondition -Bytes $liveBytes -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $ModsDirectory -Paths $WinningPaths }
+            if ($Command -eq 'register-winning') { return Test-WinningPostcondition -Bytes $liveBytes -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $ModsDirectory -Paths $resolvedWinningPaths }
             return [pscustomobject]@{ verified = $true; marker = $line.marker }
         }
         $null = Invoke-ProfileMutationTransaction -Path $resolvedProfile -ExpectedBeforeBytes $beforeBytes -AfterBytes $afterBytes -EvidenceRoot $resolvedEvidence -BackupPath $backupPath -ReceiptPath $receiptPath -Receipt $receipt -Postcondition $postcondition
@@ -591,12 +614,12 @@ elseif ($Command -eq 'ensure-winner') {
     if ([string]::IsNullOrWhiteSpace($ModDirectory)) { throw '-ModDirectory is required for ensure-winner.' }
     $resolvedModDirectory = [IO.Path]::GetFullPath($ModDirectory)
     $withoutTarget = Remove-ModLine -Bytes $beforeBytes -Name $ModName
-    $winningPlan = Resolve-WinningPlan -Bytes $withoutTarget -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $ModsDirectory -Paths $WinningPaths
+    $winningPlan = Resolve-WinningPlan -Bytes $withoutTarget -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $ModsDirectory -Paths $resolvedWinningPaths
     $effectivePlacement = if ([string]::IsNullOrWhiteSpace([string]$winningPlan.placeBeforeMod)) { 'End' } else { 'Before' }
     $effectiveRelative = [string]$winningPlan.placeBeforeMod
     $afterBytes = Add-ModLine -Bytes $withoutTarget -Name $ModName -Enabled $true -LinePlacement $effectivePlacement -RelativeName $effectiveRelative
     if (Test-ProfileShouldProcess -Caller $PSCmdlet -Target $resolvedProfile -Action "enable and place '$ModName' before every enabled loose-file provider") {
-        $winnerProof = Test-WinningPostcondition -Bytes $afterBytes -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $ModsDirectory -Paths $WinningPaths
+        $winnerProof = Test-WinningPostcondition -Bytes $afterBytes -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $ModsDirectory -Paths $resolvedWinningPaths
         $receipt = [pscustomobject][ordered]@{
             operation = 'ensure-winner'; profilePath = $resolvedProfile
             profileName = $profileName; profileDirectory = $profileDirectory; modListPath = $resolvedProfile
@@ -604,7 +627,7 @@ elseif ($Command -eq 'ensure-winner') {
             resultMarker = '+'; placement = $effectivePlacement; relativeToMod = $effectiveRelative
             winnerProof = $winnerProof; providerPlan = $winningPlan
         }
-        $postcondition = { param([byte[]]$liveBytes) Test-WinningPostcondition -Bytes $liveBytes -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $ModsDirectory -Paths $WinningPaths }
+        $postcondition = { param([byte[]]$liveBytes) Test-WinningPostcondition -Bytes $liveBytes -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $ModsDirectory -Paths $resolvedWinningPaths }
         $null = Invoke-ProfileMutationTransaction -Path $resolvedProfile -ExpectedBeforeBytes $beforeBytes -AfterBytes $afterBytes -EvidenceRoot $resolvedEvidence -BackupPath $backupPath -ReceiptPath $receiptPath -Receipt $receipt -Postcondition $postcondition
     }
 }

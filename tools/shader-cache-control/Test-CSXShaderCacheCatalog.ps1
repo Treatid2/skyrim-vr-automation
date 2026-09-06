@@ -52,7 +52,8 @@ try {
         ShaderCacheAbi = 'abi-1'
         ShaderSourceSha256 = $shaderSource
         GameRuntime = 'SkyrimVR-1.4.15'
-        RenderPath = 'vr'
+        RenderPath = 'steamvr-physical'
+        BytecodeCompatibilityClass = 'skyrimvr-d3d11'
         BuildId = 'build-fixture'
         PresetSha256 = $preset
         FeatureSetSha256 = $featureSet
@@ -92,11 +93,12 @@ try {
 
     $selectArgs = @{} + $common
     $selectArgs.Command = 'select'
+    $selectArgs.RenderPath = 'steamvr-null'
     $selectArgs.RequiredTags = @('quality')
     $select = Invoke-Catalog $selectArgs
-    Assert-Test ($select.ok -and $select.state -eq 'snapshot-selected') 'selection finds an exact source, build, preset, runtime, render-path, ABI, and tag match'
+    Assert-Test ($select.ok -and $select.state -eq 'snapshot-selected') 'selection finds an exact bytecode-compatible source across physical and null SteamVR provenance'
     Assert-Test ($select.data.selection.selected.exactShaderSource -and $select.data.selection.selected.exactBuild -and $select.data.selection.selected.exactPreset) 'selection reports why the preferred snapshot won'
-    Assert-Test ($select.data.selection.selected.exactFeatureSet -and $select.data.selection.selected.renderFamily -eq 'vr') 'selection reports the exact feature set and canonical render family'
+    Assert-Test (-not $select.data.selection.selected.exactRenderPathProvenance -and $select.data.selection.selected.bytecodeCompatibilityClass -eq 'skyrimvr-d3d11' -and $select.data.selection.selected.exactFeatureSet) 'selection separates bytecode compatibility from exact render-route provenance while retaining the feature-set gate'
 
     $physicalRouteCapture = @{} + $captureArgs
     $physicalRouteCapture.RenderPath = 'vr-steamvr-physical'
@@ -107,6 +109,11 @@ try {
     $nullRouteArgs.RenderPath = 'vr-steamvr-null'
     $nullRouteSelect = Invoke-Catalog $nullRouteArgs
     Assert-Test ($nullRouteSelect.ok -and $nullRouteSelect.state -eq 'snapshot-selected' -and $nullRouteSelect.data.selection.selected.renderFamily -eq 'vr-steamvr') 'null HMD selects a compatible physical SteamVR cache'
+
+    $openCompositeArgs = @{} + $nullRouteArgs
+    $openCompositeArgs.RenderPath = 'vr-opencomposite'
+    $openCompositeSelect = Invoke-Catalog $openCompositeArgs
+    Assert-Test ($openCompositeSelect.ok -and $openCompositeSelect.state -eq 'snapshot-selected' -and $openCompositeSelect.data.selection.selected.bytecodeCompatibilityClass -eq 'skyrimvr-d3d11') 'OpenComposite selects the same bytecode-compatible Skyrim VR cache while retaining distinct route provenance'
 
     $unknownFeatureArgs = @{} + $nullRouteArgs
     $unknownFeatureArgs.FeatureSetSha256 = 'E' * 64

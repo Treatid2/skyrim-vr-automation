@@ -19,7 +19,9 @@ optional integration rather than the identity or boundary of the toolkit.
 - `tools/mo2-workspace-control` — stable-source ShaderCache evacuation plus
   unique task profiles cloned from that explicit source, with a verified copy
   of its complete saves tree, a mandatory integrity-verified world-entry save, and
-  strict ownership of newly created mods.
+  strict ownership of newly created mods. Its local-work catalog offers an
+  explicit modlist-only baseline or selected local builds without changing the
+  maintained source profile.
 - `tools/steamvr-null-control` — transactional null-HMD apply/restore and
   bounded SteamVR shutdown, with a required application-observed standing
   head-pose qualification and opt-in exact-driver isolation for conflicting
@@ -34,6 +36,9 @@ optional integration rather than the identity or boundary of the toolkit.
 - `tools/shader-cache-control` — provider discovery, physical cache
   snapshot/restore transactions, compatibility-ranked known-working cache
   catalogs, task seeding/restoration/promotion, and comparison reports.
+- `tools/capture-interaction-control` — correlated full-state recording, latest
+  committed stereo-frame observations, named atomic actions, direct DevBench
+  passthrough, and UTC-safe save-boundary waits.
 - `tools/process-control` — bounded exact-process execution with classified,
   evidence-backed retries for known transient failures.
 - `tools/build-test-control` — CTest-aware branch testing with a direct-test
@@ -46,7 +51,7 @@ versioned shared-memory pose contract, but it is not the bootstrap provider.
 
 ## Codex plugin
 
-The repository publishes a Codex marketplace plugin. Its six skills connect a
+The repository publishes a Codex marketplace plugin. Its seven skills connect a
 new task to the bundled implementations and their operational contracts:
 
 - `$feedback-control` records unexpected automation behaviour and concrete
@@ -60,6 +65,8 @@ new task to the bundled implementations and their operational contracts:
 - `$shader-cache-control` prepares tasks from compatible known-working compiled
   caches, restores prior state, promotes verified results, and compares trees
   by SHA-256.
+- `$capture-interaction-control` provides a current-frame observation/action
+  loop over correlated DevBench state, stereo screenshots, and input receipts.
 
 Install from the public Git marketplace:
 
@@ -90,6 +97,12 @@ Before setup is ready, live-load one known-good save in the maintained source,
 declare it through `defaults.newGameFixtureManifest`, and require both
 `fixture-status` and the doctor's `prime-profile-world-entry-integrity` check to pass.
 See `docs/INSTALL-CODEX.md` and `docs/BREEZEHOME-SAVE.md`.
+
+Optional local builds are declared through
+`defaults.localWorkModCatalog`. Copy
+`tools/mo2-workspace-control/local-work-mods.example.json` to an ignored local
+path, replace its exact mod names, then use `list-local-work-mods` before fresh
+workspace creation.
 
 DevBench runtime discovery is supplied either explicitly or through an
 environment variable:

@@ -31,7 +31,9 @@ try {
     if ($null -ne $registerRestored.marker -or (Get-FileHash -LiteralPath $profile -Algorithm SHA256).Hash -ne $originalHash) { throw 'Register restore did not remove the owned marker byte-identically.' }
 
     $winnerRegisterEvidence = Join-Path $fixture 'register-winner-evidence'
-    $registeredWinner = & $script register-winning -ProfilePath $profile -ModName 'New Test Mod' -ModDirectory $newMod -ModsDirectory $mods -WinningPaths 'SKSE\Plugins\Example.dll' -EvidenceDirectory $winnerRegisterEvidence -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
+    $winningPathsFile = Join-Path $fixture 'winning-paths.json'
+    '["SKSE\\Plugins\\Example.dll"]' | Set-Content -LiteralPath $winningPathsFile -Encoding utf8
+    $registeredWinner = & $script register-winning -ProfilePath $profile -ModName 'New Test Mod' -ModDirectory $newMod -ModsDirectory $mods -WinningPathsFile $winningPathsFile -EvidenceDirectory $winnerRegisterEvidence -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
     $winnerLines = Get-Content -LiteralPath $profile
     if (-not $registeredWinner.enabled -or $winnerLines[1] -ne '+New Test Mod') { throw 'Register-winning did not enable and place the target before the earliest enabled provider.' }
     $winnerReceipt = Get-Content -LiteralPath (Join-Path $winnerRegisterEvidence 'modlist-control.receipt.json') -Raw | ConvertFrom-Json

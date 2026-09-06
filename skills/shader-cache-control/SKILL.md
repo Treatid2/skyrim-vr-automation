@@ -34,11 +34,13 @@ replacement is never implied by a request to compare caches.
 ## Task cache lifecycle
 
 1. For a Skyrim task that may compile CSX shaders, determine the exact cache
-   path, shader-cache ABI, game runtime, render path and family,
+   path, shader-cache ABI, game runtime, render path and family, bytecode
+   compatibility class,
    shader-source SHA-256, effective feature-set SHA-256 when available, build
    identity, preset SHA-256, and task tags. Physical and null SteamVR may share
-   the `vr-steamvr` render family, but a supplied feature-set fingerprint must
-   still match. Do not infer semantic
+   a render family, while physical SteamVR, null SteamVR, and OpenComposite may
+   share the explicit `skyrimvr-d3d11` bytecode class. A supplied feature-set
+   fingerprint must still match. Do not infer semantic
    compatibility from names or timestamps.
 2. With MO2 and Skyrim closed, call catalog `prepare` before the MO2 session.
    Retain `shader-cache-task.plan.json` with the task evidence. No compatible
@@ -48,7 +50,7 @@ replacement is never implied by a request to compare caches.
 3. Never clear a live cache merely to get a clean experiment. Use the task plan
    and exact seeding transaction. A source mismatch requires both
    `-AllowSourceMismatch` and a written `-CompatibilityReason`; it never
-   bypasses ABI, runtime, render-family, feature-set, known-working, or
+   bypasses ABI, runtime, bytecode-class, feature-set, known-working, or
    required-tag gates.
 4. After MO2 and Skyrim are closed, call catalog `complete` before releasing
    the task workspace. It preserves the task result and restores the exact

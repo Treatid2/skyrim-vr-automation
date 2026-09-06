@@ -1,0 +1,69 @@
+{
+  "contractVersion": "1.0.0",
+  "posePolicy": "observe-current-physical-tracked-set-and-preserve-all-poses",
+  "actions": [
+    {
+      "name": "neutral",
+      "kind": "tracked-set",
+      "description": "Submit one neutral frame while preserving current HMD and controller poses.",
+      "defaults": { "holdMs": 50 }
+    },
+    {
+      "name": "accept",
+      "kind": "button-pulse",
+      "description": "Pulse the right OpenVR trigger button.",
+      "defaults": { "controller": "right", "buttonMask": 8589934592, "holdMs": 80 }
+    },
+    {
+      "name": "back",
+      "kind": "button-pulse",
+      "description": "Pulse the right OpenVR application-menu button.",
+      "defaults": { "controller": "right", "buttonMask": 2, "holdMs": 80 }
+    },
+    {
+      "name": "move-forward",
+      "kind": "axis-pulse",
+      "description": "Hold the left primary axis forward for a bounded interval.",
+      "defaults": { "controller": "left", "axis": 0, "x": 0.0, "y": 1.0, "holdMs": 250 }
+    },
+    {
+      "name": "move-back",
+      "kind": "axis-pulse",
+      "description": "Hold the left primary axis backward for a bounded interval.",
+      "defaults": { "controller": "left", "axis": 0, "x": 0.0, "y": -1.0, "holdMs": 250 }
+    },
+    {
+      "name": "turn-left",
+      "kind": "axis-pulse",
+      "description": "Pulse the right primary axis left.",
+      "defaults": { "controller": "right", "axis": 0, "x": -1.0, "y": 0.0, "holdMs": 100 }
+    },
+    {
+      "name": "turn-right",
+      "kind": "axis-pulse",
+      "description": "Pulse the right primary axis right.",
+      "defaults": { "controller": "right", "axis": 0, "x": 1.0, "y": 0.0, "holdMs": 100 }
+    },
+    {
+      "name": "axis-pulse",
+      "kind": "axis-pulse",
+      "description": "Pulse a selected OpenVR controller axis with explicit x/y values.",
+      "required": ["controller", "axis", "x", "y"],
+      "defaults": { "holdMs": 100 }
+    },
+    {
+      "name": "button-pulse",
+      "kind": "button-pulse",
+      "description": "Pulse an explicit OpenVR controller button mask.",
+      "required": ["controller", "buttonMask"],
+      "defaults": { "holdMs": 80 }
+    },
+    {
+      "name": "key-tap",
+      "kind": "keyboard",
+      "description": "Tap a named DevBench keyboard key.",
+      "required": ["key"],
+      "defaults": { "holdMs": 50 }
+    }
+  ]
+}

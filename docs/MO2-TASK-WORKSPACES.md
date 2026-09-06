@@ -9,6 +9,13 @@ copy of the maintained primary profile and survives any number of lease yields.
 Identify the task with the stable Codex task/thread ID. `list-task -TaskId`
 reports every retained workspace owned by that task.
 
+The access request must also declare exactly one runtime route: `OCU`, physical
+`SteamVR`, or `SteamVRNull`. OCU cannot coexist with either SteamVR route, and
+the null-HMD route is a SteamVR mode rather than an OCU mode. The selected route
+belongs to the short-lived access lease and prepared session, not to the
+retained profile; switching routes therefore requires ending the session and
+requesting a new lease, but does not require rebuilding the task workspace.
+
 - On the task's first MO2 request, acquire MO2 access, run `prepare-source`, and
   run `fixture-status`. Proceed to `create -TaskId` only from
   `fixture-valid`. Creation otherwise fails closed. It clones the configured
@@ -17,6 +24,13 @@ reports every retained workspace owned by that task.
 - On a later request, the task must explicitly choose either `resume -TaskId
   -WorkspaceId` or a fresh `create -TaskId`. The tool never silently replaces a
   retained profile or guesses among multiple workspaces.
+- Before a fresh clone, run `list-local-work-mods` and make the workspace
+  content explicit. `Modlist` selects no optional local builds.
+  `ModlistPlusLocalWorkMods` requires one or more exact catalog IDs. The tool
+  disables every unselected catalog candidate in the cloned profile and
+  rejects mutually exclusive variants, while leaving the maintained source
+  profile unchanged. A retained workspace keeps its original choice across
+  lease release and resume, and `list-task` reports that choice.
 - `resume` verifies stable task ownership, requires the newly owned access
   lease, rebinds the workspace to that lease, and selects the retained profile.
   It does not refresh the profile from the primary profile or requalify a save

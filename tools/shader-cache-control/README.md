@@ -27,8 +27,8 @@ recovery.
 `Invoke-CSXShaderCacheCatalog.ps1` composes those primitives into reusable task
 cache management. It stores immutable, content-addressed cache objects and
 separate snapshot manifests carrying the cache ABI, game runtime, render path,
-shader-source hash, optional build, preset, and effective feature-set hashes,
-normalized tags, status,
+shader-source hash, explicit bytecode compatibility class, optional build,
+preset, and effective feature-set hashes, normalized tags, status,
 and receipt provenance. There is no mutable index to repair: `list` validates
 the manifests and derives the catalog view from disk.
 
@@ -48,7 +48,8 @@ than evidence copies.
 ```powershell
 .\Invoke-CSXShaderCacheTransaction.ps1 providers `
   -ProfilePath 'D:\MO2\profiles\Profile\modlist.txt' `
-  -ModsPath 'D:\MO2\mods' -DeepInventory
+  -ModsPath 'D:\MO2\mods' -DeepInventory `
+  -EvidenceDirectory 'D:\Evidence\provider-inventory'
 
 .\Invoke-CSXShaderCacheTransaction.ps1 snapshot `
   -CachePath 'D:\MO2\mods\Cache Mod\ShaderCache' `
@@ -81,15 +82,18 @@ Configure a permanent catalog outside MO2 and the checkout:
 `CSX_SHADER_CACHE_CATALOG_ROOT`, the configured path, `CODEX_HOME`, and the
 user-local application-data fallback. A catalog candidate is never accepted
 from its label alone. The hard compatibility gates are known-working status,
-exact shader-cache ABI, game runtime, render family, required tags, and—by
-default—exact shader-source SHA-256. `vr-steamvr-physical` and
-`vr-steamvr-null` share the `vr-steamvr` render family because the display
-driver does not alter CSX shader bytecode. Other render paths remain distinct.
-Supply `-FeatureSetSha256` whenever an effective feature-set fingerprint is
-available; then an absent or different fingerprint is a hard exclusion. Among
-compatible candidates, exact source, feature-set, build, preset, and observed
-render-path matches rank first, followed by broader verified coverage and
+exact shader-cache ABI, game runtime, bytecode compatibility class, required
+tags, and—by default—exact shader-source SHA-256. Supply
+`-FeatureSetSha256` whenever an effective feature-set fingerprint is available;
+then an absent or different fingerprint is a hard exclusion. Among compatible
+candidates, exact source, feature-set, build, preset, and observed render-path
+matches rank first, followed by broader verified coverage and
 recency. `select` returns both the ranking and explicit exclusion reasons.
+
+The exact render path remains immutable provenance and an exact-match ranking
+signal. The default `skyrimvr-d3d11` class deliberately permits reuse across
+SteamVR physical, SteamVR null-HMD, and OpenComposite when every bytecode input
+matches; use a different explicit class when a route is proven bytecode-affecting.
 
 First admit a receipt-proven snapshot:
 
@@ -148,7 +152,7 @@ caller explicitly classifies the task result as `known-working`. An unverified
 or failed task result is still preserved as evidence but is not added to the
 catalog. A shader-source mismatch remains excluded unless
 `-AllowSourceMismatch` is accompanied by a concrete `-CompatibilityReason`;
-this exception does not bypass ABI, runtime, render-family, feature-set, status,
+this exception does not bypass ABI, runtime, bytecode-class, feature-set, status,
 or tag gates.
 Repeated `complete` calls return the immutable existing completion. A retry
 after restoration but before completion publication accepts only one committed
@@ -171,7 +175,11 @@ silence an unknown ABI mismatch.
 `SKSE\Plugins\CommunityShaders.dll`). It enumerates every physical provider,
 marks the earliest enabled mod provider as the winner among enabled loose mods,
 and explicitly leaves overwrite, unmanaged-file, archive, and runtime
-deployment resolution to separate VFS evidence.
+deployment resolution to separate VFS evidence. `-DeepInventory` returns only
+the bounded file count, byte count, and tree hash inline. When
+`-EvidenceDirectory` is supplied, the complete entry list is written to
+`providers.inventory.json`; use `-IncludeInventoryEntries` only when a caller
+explicitly needs that potentially large list in the command response.
 
 Restore never silently discards the current tree: it copies the displaced
 contents into the evidence directory, verifies that copy, and only then removes
