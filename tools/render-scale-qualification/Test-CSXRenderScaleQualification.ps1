@@ -1582,7 +1582,7 @@ try {
     $humanReview.reviewer.kind = 'human'
     $humanResult = Test-CSXVisualReview -EvidenceDirectory $candidateRoot -RunRaw $raw -VisualIndex $candidateIndex -Review $humanReview -BaselineVisualIndex $baselineIndex
     Assert-Test (-not $humanResult.ok -and ($humanResult.errors -join ' | ') -match 'human|image_model') `
-        'Protocol revision 4 accepted a human visual review.'
+        'Protocol revision 5 accepted a human visual review.'
     $duplicateReview = ($review | ConvertTo-Json -Depth 100 | ConvertFrom-Json -Depth 100)
     $duplicateReview.samples[0].candidateArtifacts[2] = $duplicateReview.samples[0].candidateArtifacts[1]
     Assert-Test (-not (Test-CSXVisualReview -EvidenceDirectory $candidateRoot -RunRaw $raw -VisualIndex $candidateIndex -Review $duplicateReview -BaselineVisualIndex $baselineIndex).ok) 'A duplicated candidate artifact binding was accepted.'

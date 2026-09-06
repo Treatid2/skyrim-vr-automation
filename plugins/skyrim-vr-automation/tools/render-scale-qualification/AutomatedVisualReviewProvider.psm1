@@ -148,9 +148,13 @@ function Invoke-CSXProviderCommand {
             try { $process.Kill($true) } catch { }
             [void]$process.WaitForExit(1000)
         }
-        if ($process.HasExited) { $process.WaitForExit() }
-        $stdout = $stdoutTask.GetAwaiter().GetResult()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $stdout = ''
+        $stderr = ''
+        if ($process.HasExited) {
+            $process.WaitForExit()
+            $stdout = $stdoutTask.GetAwaiter().GetResult()
+            $stderr = $stderrTask.GetAwaiter().GetResult()
+        }
         return [pscustomobject][ordered]@{
             exitCode = $(if ($process.HasExited) { $process.ExitCode } else { $null })
             stdout = $stdout
