@@ -66,8 +66,11 @@ $transportRetries = [Collections.Generic.List[object]]::new()
 $ownedMcpSessions = [Collections.Generic.List[object]]::new()
 $invocationEvidencePath = $null
 $invocationRecord = $null
-$operationDeadlineUtc = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+$operationStartedUtc = [DateTime]::UtcNow
+$operationDeadlineUtc = $operationStartedUtc.AddSeconds($TimeoutSeconds)
 $effectiveOperationTimeoutSeconds = $TimeoutSeconds
+$serverTimeoutMilliseconds = $null
+$serverTimeoutDispatchRemainingSeconds = $null
 Import-Module (Join-Path $PSScriptRoot 'DevBenchControl.psm1') -Force
 $script:requestTimeoutSecondsForRpc = $RequestTimeoutSeconds
 
@@ -76,6 +79,28 @@ function Get-RequestTimeoutSeconds {
     $remainingSeconds = ($script:operationDeadlineUtc - [DateTime]::UtcNow).TotalSeconds
     if ($remainingSeconds -lt 1) { throw [TimeoutException]::new('The DevBench operation deadline expired before another request could start.') }
     return [int][Math]::Max(1, [Math]::Min($script:requestTimeoutSecondsForRpc, [Math]::Ceiling($remainingSeconds)))
+}
+
+function Set-ServerWaitBudgetAtDispatch([hashtable]$Arguments) {
+    if ($null -eq $Arguments -or -not $Arguments.ContainsKey('timeoutMs') -or $null -eq $Arguments.timeoutMs) { return }
+    $serverTimeoutMilliseconds = [double]$Arguments.timeoutMs
+    if ($serverTimeoutMilliseconds -le 0) { return }
+    $script:serverTimeoutMilliseconds = $serverTimeoutMilliseconds
+    $serverTimeoutSeconds = [int][Math]::Ceiling($serverTimeoutMilliseconds / 1000.0)
+    $requiredOperationSeconds = $serverTimeoutSeconds + 5
+    $now = [DateTime]::UtcNow
+    $remainingSeconds = ($script:operationDeadlineUtc - $now).TotalSeconds
+    if ($remainingSeconds -lt $requiredOperationSeconds) {
+        $script:operationDeadlineUtc = $now.AddSeconds($requiredOperationSeconds)
+        $script:effectiveOperationTimeoutSeconds = [int][Math]::Ceiling(
+            ($script:operationDeadlineUtc - $script:operationStartedUtc).TotalSeconds)
+    }
+    $script:serverTimeoutDispatchRemainingSeconds = [Math]::Round(
+        ($script:operationDeadlineUtc - $now).TotalSeconds,
+        3)
+    $script:requestTimeoutSecondsForRpc = [Math]::Max(
+        $RequestTimeoutSeconds,
+        $requiredOperationSeconds)
 }
 
 function Start-OperationDelay([int]$RequestedMilliseconds) {
@@ -128,6 +153,8 @@ function Initialize-InvocationEvidence {
         requestedOperationTimeoutSeconds = $TimeoutSeconds
         effectiveOperationTimeoutSeconds = $effectiveOperationTimeoutSeconds
         operationDeadlineUtc = $script:operationDeadlineUtc.ToString('o')
+        serverTimeoutMilliseconds = $serverTimeoutMilliseconds
+        serverTimeoutDispatchRemainingSeconds = $serverTimeoutDispatchRemainingSeconds
         commandId = $null
         workspaceManifestPath = if ([string]::IsNullOrWhiteSpace($WorkspaceManifestPath)) { $null } else { [IO.Path]::GetFullPath($WorkspaceManifestPath) }
         workspaceManifestSha256 = if (-not [string]::IsNullOrWhiteSpace($WorkspaceManifestPath) -and (Test-Path -LiteralPath $WorkspaceManifestPath -PathType Leaf)) { (Get-FileHash -LiteralPath $WorkspaceManifestPath -Algorithm SHA256).Hash } else { $null }
@@ -151,6 +178,8 @@ function Update-InvocationEvidence {
     $script:invocationRecord.runtimeIdentity = $runtimeIdentity
     $script:invocationRecord.effectiveOperationTimeoutSeconds = $effectiveOperationTimeoutSeconds
     $script:invocationRecord.operationDeadlineUtc = $script:operationDeadlineUtc.ToString('o')
+    $script:invocationRecord.serverTimeoutMilliseconds = $serverTimeoutMilliseconds
+    $script:invocationRecord.serverTimeoutDispatchRemainingSeconds = $serverTimeoutDispatchRemainingSeconds
     $script:invocationRecord.transportRetries = @($transportRetries)
     $script:invocationRecord.semantic = $Semantic
     $script:invocationRecord.data = $Data
@@ -283,7 +312,21 @@ function Invoke-McpRequest {
         $attempt++
         try {
             $response = Invoke-WebRequest -UseBasicParsing -Method Post -Uri $Endpoint -Headers $Headers -Body $body -TimeoutSec (Get-RequestTimeoutSeconds)
-            return [pscustomobject]@{ response = $response; json = ($response.Content | ConvertFrom-Json -Depth 50); attempts = $attempt }
+            try {
+                $json = $response.Content | ConvertFrom-Json -Depth 50 -ErrorAction Stop
+            }
+            catch {
+                $parseFailure = [IO.InvalidDataException]::new(
+                    "DevBench returned malformed JSON: $($_.Exception.Message)",
+                    $_.Exception)
+                $returnedSession = $response.Headers['Mcp-Session-Id']
+                $returnedSessionId = if ($returnedSession -is [array]) { [string]$returnedSession[0] } else { [string]$returnedSession }
+                if (-not [string]::IsNullOrWhiteSpace($returnedSessionId)) {
+                    $parseFailure.Data['DevBenchMcpSessionId'] = $returnedSessionId
+                }
+                throw $parseFailure
+            }
+            return [pscustomobject]@{ response = $response; json = $json; attempts = $attempt }
         }
         catch {
             $statusCode = $null
@@ -324,6 +367,7 @@ function Invoke-McpRequest {
 
 function Invoke-ToolRpc {
     param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation)
+    Set-ServerWaitBudgetAtDispatch -Arguments $Arguments
     $rpc = Invoke-McpRequest -Endpoint $endpoint -Headers $Headers -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/call'; params = @{ name = $Name; arguments = $Arguments } } -Mutation:$Mutation
     if ($rpc.json.PSObject.Properties['error']) { throw "DevBench tools/call failed: $($rpc.json.error | ConvertTo-Json -Compress)" }
     if ($rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
@@ -384,6 +428,10 @@ function Get-PerformanceMeasurementGuard {
 
 function Test-WaitRetryableException {
     param([Parameter(Mandatory)]$Exception)
+    if ([bool]$Exception.Data['DevBenchCleanupUncertain'] -or
+        [string]$Exception.Message -match 'cleanup is uncertain|refusing automatic rebind') {
+        return $false
+    }
     $message = [string]$Exception.Message
     $statusCode = $null
     try { $statusCode = [int]$Exception.Response.StatusCode } catch { $statusCode = $null }
@@ -494,12 +542,30 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
         return [pscustomobject][ordered]@{ headers = $sessionHeaders; tools = $sessionTools; runtimeIdentity = $identity; sessionId = $sessionId }
     }
     catch {
+        if ($null -eq $sessionHeaders) {
+            $returnedSessionId = [string]$_.Exception.Data['DevBenchMcpSessionId']
+            if (-not [string]::IsNullOrWhiteSpace($returnedSessionId)) {
+                $sessionHeaders = @{
+                    Accept = 'application/json, text/event-stream'
+                    'Content-Type' = 'application/json'
+                    'Mcp-Session-Id' = $returnedSessionId
+                }
+                $ownedMcpSessions.Add([pscustomobject][ordered]@{
+                    sessionId = $returnedSessionId
+                    headers = $sessionHeaders
+                    openedUtc = [DateTime]::UtcNow.ToString('o')
+                    cleanup = $null
+                })
+            }
+        }
         if ($null -ne $sessionHeaders) {
             $partialCleanup = Close-OwnedMcpSession -Endpoint $endpoint -Headers $sessionHeaders
             if (-not $partialCleanup.ok) {
-                throw [InvalidOperationException]::new(
+                $cleanupFailure = [InvalidOperationException]::new(
                     "DevBench MCP initialization failed and session '$($partialCleanup.sessionId)' cleanup is uncertain; refusing automatic rebind. $($partialCleanup.error)",
                     $_.Exception)
+                $cleanupFailure.Data['DevBenchCleanupUncertain'] = $true
+                throw $cleanupFailure
             }
         }
         throw
@@ -679,19 +745,6 @@ try {
         }
         if ($arguments.ContainsKey('timeoutMs') -and $null -ne $arguments.timeoutMs) {
             $serverTimeoutMilliseconds = [double]$arguments.timeoutMs
-            if ($serverTimeoutMilliseconds -gt 0) {
-                # Transport must outlive the server wait so cleanup cannot destroy its evidence.
-                $serverTimeoutSeconds = [int][Math]::Ceiling($serverTimeoutMilliseconds / 1000.0)
-                $script:requestTimeoutSecondsForRpc = [Math]::Max(
-                    $RequestTimeoutSeconds,
-                    $serverTimeoutSeconds + 5
-                )
-                $requiredOperationSeconds = $serverTimeoutSeconds + 5
-                if ($requiredOperationSeconds -gt $effectiveOperationTimeoutSeconds) {
-                    $effectiveOperationTimeoutSeconds = $requiredOperationSeconds
-                    $script:operationDeadlineUtc = [DateTime]::UtcNow.AddSeconds($requiredOperationSeconds)
-                }
-            }
         }
     }
     $headers = $null
@@ -1201,6 +1254,10 @@ catch {
 
 $sessionCleanup = Close-AllMcpSessions
 $result | Add-Member -NotePropertyName sessionCleanup -NotePropertyValue $sessionCleanup
+if ($invocationRecord -and -not [string]::IsNullOrWhiteSpace($invocationEvidencePath)) {
+    $invocationRecord['sessionCleanup'] = $sessionCleanup
+    Write-JsonAtomic -Path $invocationEvidencePath -Value $invocationRecord
+}
 
 $parameters = @{ InputObject = $result; Depth = 50 }
 if ($Compact) { $parameters['Compress'] = $true }

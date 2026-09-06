@@ -153,7 +153,7 @@ if ($RequirePerformanceNeutral) {
     $data.performanceGuard = $guard
     $data.performanceWindow = [pscustomobject]@{valid=(-not $distorted);applicable=$true;sameEpoch=$true;before=$guard;after=$guard;reason=$(if ($distorted) {'performance-probe-distorted'} else {'performance-window-neutral'})}
 }
-[pscustomobject]@{ok=$true;runtimeIdentity=[pscustomobject]@{complete=$true;verified=$true;listenerPid=$listenerPid;process=[pscustomobject]@{path='C:\Fixture\SkyrimVR.exe';startTimeUtc='2026-08-28T00:00:00Z'};build=[pscustomobject]@{buildId='fixture'};artifact=[pscustomobject]@{path='C:\Fixture\CommunityShaders.dll';sha256='AA'}};invocationEvidencePath=(Join-Path $EvidenceDirectory "$EvidenceLabel.json");data=[pscustomobject]$data;errors=@()} | ConvertTo-Json -Depth 20 -Compress
+[pscustomobject]@{ok=$true;runtimeIdentity=[pscustomobject]@{complete=$true;verified=$true;listenerPid=$listenerPid;process=[pscustomobject]@{path='C:\Fixture\SkyrimVR.exe';startTimeUtc='2026-08-28T00:00:00Z'};build=[pscustomobject]@{buildId='fixture'};artifact=[pscustomobject]@{path='C:\Fixture\CommunityShaders.dll';sha256='AA'}};invocationEvidencePath=(Join-Path $EvidenceDirectory "$EvidenceLabel.json");sessionCleanup=[pscustomobject]@{attempted=$true;ok=$true;state='all_closed'};data=[pscustomobject]$data;errors=@()} | ConvertTo-Json -Depth 20 -Compress
 '@, [Text.UTF8Encoding]::new($false))
     $env:CSX_PROFILER_TEST_STATE = $statePath
     $env:CSX_PROFILER_CONTROL_ROOT = Join-Path $resolvedTestRoot 'profiler-control'
@@ -168,6 +168,7 @@ if ($RequirePerformanceNeutral) {
     Assert-Test (@($measuredRecords.runtimeIdentityFingerprint | Sort-Object -Unique).Count -eq 1 -and @($measurementReceipt.runtimeIdentityObservations).Count -ge 7) 'measurement binds every accepted response and sample to one verified runtime identity'
     Assert-Test ($measurement.summary.schemaVersion -eq 3 -and @($measurement.summary.performanceObservations).Count -ge 5) 'measurement preserves performance-neutrality evidence in summary schema 3'
     Assert-Test (@($measurement.summary.performanceObservations | Where-Object { -not $_.window.valid -or $_.guard.performanceEpoch -ne 7 }).Count -eq 0) 'measurement retains one valid performance epoch across the capture'
+    Assert-Test (@($measurement.summary.performanceObservations | Where-Object { -not $_.sessionCleanup.ok }).Count -eq 0) 'measurement preserves final MCP cleanup evidence for every guarded profiler call'
 
     $recoveryMirror = Join-Path $resolvedTestRoot 'interrupted-profiler.journal.json'
     $authoritativeJournal = Join-Path $env:CSX_PROFILER_CONTROL_ROOT 'transaction.journal.json'
@@ -226,6 +227,8 @@ if ($RequirePerformanceNeutral) {
     ) -ge 0) 'profiler capture retains render-scale preparation telemetry'
     Assert-Test ($null -ne $measurement.summary.preparation.before -and
         $null -ne $measurement.summary.preparation.after) 'profiler summary exposes before and after preparation traces'
+    Assert-Test (-not $measurement.summary.resourcePublication.before.PSObject.Properties['preparation'] -and
+        -not $measurement.summary.resourcePublication.after.PSObject.Properties['preparation']) 'profiler summary serializes each preparation trace only once'
 
     $profilerSkill = Get-Content -LiteralPath (Join-Path $PSScriptRoot `
         '..\..\skills\profiler-control\SKILL.md') -Raw

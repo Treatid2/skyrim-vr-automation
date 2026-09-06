@@ -72,6 +72,12 @@ namespace SkyrimVRAutomation.LiveThreadContext
         public static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
 
         [DllImport("kernel32.dll", SetLastError=true)]
+        public static extern bool IsWow64Process2(
+            IntPtr process,
+            out ushort processMachine,
+            out ushort nativeMachine);
+
+        [DllImport("kernel32.dll", SetLastError=true)]
         public static extern bool ReadProcessMemory(
             IntPtr process,
             ulong address,
@@ -152,6 +158,22 @@ try {
     if ($processHandle -eq [IntPtr]::Zero) {
         throw "OpenProcess failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
     }
+    [UInt16]$processMachine = 0
+    [UInt16]$nativeMachine = 0
+    if (-not [SkyrimVRAutomation.LiveThreadContext.NativeMethods]::IsWow64Process2(
+            $processHandle,
+            [ref]$processMachine,
+            [ref]$nativeMachine)) {
+        throw "IsWow64Process2 failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+    }
+    $identity | Add-Member -NotePropertyName architecture -NotePropertyValue ([pscustomobject][ordered]@{
+        processMachine = '0x{0:X4}' -f $processMachine
+        nativeMachine = '0x{0:X4}' -f $nativeMachine
+    })
+    if ($processMachine -ne 0 -or $nativeMachine -ne 0x8664) {
+        $state = 'target-architecture-mismatch'
+        throw "The target process is not native AMD64 (processMachine=0x$('{0:X4}' -f $processMachine), nativeMachine=0x$('{0:X4}' -f $nativeMachine))."
+    }
 
     $contextBytes = 0x4D0
     $threadAccess = 0x0002 -bor 0x0008 -bor 0x0040
@@ -170,30 +192,28 @@ try {
         if ($threadHandle -eq [IntPtr]::Zero) {
             throw "OpenThread failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
         }
-
-        $threadOwner = [SkyrimVRAutomation.LiveThreadContext.NativeMethods]::GetProcessIdOfThread($threadHandle)
-        if ($threadOwner -ne [uint32]$ProcessId) {
-            [SkyrimVRAutomation.LiveThreadContext.NativeMethods]::CloseHandle($threadHandle) | Out-Null
-            $state = 'thread-mismatch'
-            throw "Thread '$ThreadId' is now owned by process '$threadOwner', not '$ProcessId'."
-        }
-        $liveProcess = Get-Process -Id $ProcessId -ErrorAction Stop
-        $liveThread = @($liveProcess.Threads | Where-Object Id -eq $ThreadId)
-        if ($liveThread.Count -ne 1 -or
-            $liveProcess.StartTime.ToUniversalTime().Ticks -ne $expectedStartUtc.Ticks -or
-            $liveThread[0].StartTime.ToUniversalTime().Ticks -ne $expectedThreadStartTimeUtc.Ticks) {
-            [SkyrimVRAutomation.LiveThreadContext.NativeMethods]::CloseHandle($threadHandle) | Out-Null
-            $state = 'thread-mismatch'
-            throw "Thread '$ThreadId' identity changed before sample '$sample'."
-        }
-
-        $allocation = [Runtime.InteropServices.Marshal]::AllocHGlobal($contextBytes + 16)
-        # Stay in signed pointer-width arithmetic; Windows PowerShell cannot
-        # reliably bind a masked UInt64 back to IntPtr.
-        $alignedAddress = ($allocation.ToInt64() + [Int64]15) -band [Int64]-16
-        $aligned = [IntPtr]::new([Int64]$alignedAddress)
+        $allocation = [IntPtr]::Zero
         $suspended = $false
         try {
+            $threadOwner = [SkyrimVRAutomation.LiveThreadContext.NativeMethods]::GetProcessIdOfThread($threadHandle)
+            if ($threadOwner -ne [uint32]$ProcessId) {
+                $state = 'thread-mismatch'
+                throw "Thread '$ThreadId' is now owned by process '$threadOwner', not '$ProcessId'."
+            }
+            $liveProcess = Get-Process -Id $ProcessId -ErrorAction Stop
+            $liveThread = @($liveProcess.Threads | Where-Object Id -eq $ThreadId)
+            if ($liveThread.Count -ne 1 -or
+                $liveProcess.StartTime.ToUniversalTime().Ticks -ne $expectedStartUtc.Ticks -or
+                $liveThread[0].StartTime.ToUniversalTime().Ticks -ne $expectedThreadStartTimeUtc.Ticks) {
+                $state = 'thread-mismatch'
+                throw "Thread '$ThreadId' identity changed before sample '$sample'."
+            }
+
+            $allocation = [Runtime.InteropServices.Marshal]::AllocHGlobal($contextBytes + 16)
+            # Stay in signed pointer-width arithmetic; Windows PowerShell cannot
+            # reliably bind a masked UInt64 back to IntPtr.
+            $alignedAddress = ($allocation.ToInt64() + [Int64]15) -band [Int64]-16
+            $aligned = [IntPtr]::new([Int64]$alignedAddress)
             [Runtime.InteropServices.Marshal]::Copy(
                 (New-Object byte[] $contextBytes),
                 0,
@@ -276,7 +296,9 @@ try {
                     $errors.Add("ResumeThread retry failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())")
                 }
             }
-            [Runtime.InteropServices.Marshal]::FreeHGlobal($allocation)
+            if ($allocation -ne [IntPtr]::Zero) {
+                [Runtime.InteropServices.Marshal]::FreeHGlobal($allocation)
+            }
             [void][SkyrimVRAutomation.LiveThreadContext.NativeMethods]::CloseHandle(
                 $threadHandle)
         }
