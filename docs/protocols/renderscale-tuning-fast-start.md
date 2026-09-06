@@ -28,9 +28,10 @@ reads:
   capabilities payload to select runnable lanes;
 - `position-snapshot`: an authoritative public snapshot used as the initial
   measurement boundary;
-- `position-renderscale`: an outer `result` field. Its payload is preserved as
-  opaque evidence and no nested `result`, adapter shape, or vendor field gates
-  startup.
+- `position-renderscale`: a `status.adapter` object with `available: true` and
+  the exact requested vendor ID: NVIDIA `0x10DE`/4318 or AMD `0x1002`/4098.
+  The runner owns this admission and rejects the wrong adapter before the first
+  baseline; the client still passes the complete scenario root unchanged.
 
 The positioning scenario owns one 60,000 ms `position-settle` wait immediately
 after the COC and before these observations. This startup stabilization is

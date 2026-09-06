@@ -50,6 +50,8 @@ Assert-True ((Get-FileHash -LiteralPath $fastStartSource -Algorithm SHA256).Hash
 $fastStart = Get-Content -LiteralPath $fastStartSource -Raw
 Assert-Contains $fastStart 'Pass the positioning receipt unchanged' 'Shared tuning fast-start contract'
 Assert-Contains $fastStart 'The client does not search, normalize, or validate positioning' 'Shared tuning fast-start contract'
+Assert-Contains $fastStart 'NVIDIA `0x10DE`/4318 or AMD `0x1002`/4098' 'Shared tuning fast-start contract'
+Assert-Contains $fastStart 'rejects the wrong adapter before the first baseline' 'Shared tuning fast-start contract'
 Assert-True (-not $fastStart.Contains('Pass the initial boundary already decoded during positioning', [StringComparison]::Ordinal)) 'Shared tuning fast-start still delegates boundary decoding to the client.'
 $runnerRelative = 'tools\renderscale-tuning-live\runner.js'
 $runnerSource = Join-Path $repositoryRoot $runnerRelative

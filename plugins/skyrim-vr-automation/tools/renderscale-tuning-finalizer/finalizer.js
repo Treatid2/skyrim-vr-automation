@@ -695,7 +695,8 @@ function transitionRow(root, file, retained) {
     const renderVerdict = projection.renderVerdict ||
         (waiter.satisfied === true ? "PASS" : "FAIL");
     const stretch = presentationStretchDetails(waiter, projection, renderVerdict);
-    const traceRequired = target.method === "dlss";
+    const traceRequired = retained.variant === "nvidia" &&
+        target.method === "dlss";
     const traceComplete = !traceRequired || ["traceReset", "traceStart", "traceStop",
         "traceRead"].every((name) => retained[name]);
     const recovery = retained.recovery || null;

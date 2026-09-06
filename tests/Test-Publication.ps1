@@ -96,7 +96,8 @@ foreach ($manifestRelative in @(
     if ($pluginManifest.license -ne 'GPL-3.0-or-later') {
         $violations.Add([pscustomobject]@{ file = $manifestRelative; issue = 'license is not GPL-3.0-or-later' })
     }
-    $mcpPath = Join-Path (Split-Path -Parent $manifestPath) '..\' ([string]$pluginManifest.mcpServers)
+    $pluginRoot = Split-Path -Parent (Split-Path -Parent $manifestPath)
+    $mcpPath = Join-Path -Path $pluginRoot -ChildPath ([string]$pluginManifest.mcpServers)
     if ($pluginManifest.mcpServers -ne './.mcp.json' -or
         -not (Test-Path -LiteralPath $mcpPath -PathType Leaf)) {
         $violations.Add([pscustomobject]@{ file = $manifestRelative; issue = 'mcpServers does not resolve to the packaged MCP configuration' })
