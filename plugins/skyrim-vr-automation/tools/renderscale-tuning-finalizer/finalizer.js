@@ -165,13 +165,12 @@ function qualificationWait(value) {
     return value && value.action === "qualification_wait" ? value : null;
 }
 
-function interruptedLiveResult(root, variant, runId) {
+function readLiveResult(root, variant, runId) {
     const file = path.join(root, "raw", "live-result.json");
     if (!fs.existsSync(file)) return null;
     const value = readJson(file);
-    if (value.status !== "INTERRUPTED") return null;
     if (value.variant !== variant || value.runId !== runId) {
-        throw new Error("interrupted_result_identity_mismatch");
+        throw new Error("live_result_identity_mismatch");
     }
     return value;
 }
@@ -616,10 +615,41 @@ function presentationStretchDetails(waiter, projection, renderVerdict) {
 function sourceProfile(waiter) {
     const timeline = waiter.replacementTimeline || {};
     const proof = timeline.dispatch && timeline.dispatch.presentationProof || {};
+    const leftPresent = Object.hasOwn(proof, "leftEye");
+    const rightPresent = Object.hasOwn(proof, "rightEye");
+    const left = proof.leftEye;
+    const right = proof.rightEye;
+    if (leftPresent !== rightPresent) {
+        throw new Error("source_profile_method_incomplete");
+    }
+    if (leftPresent && (!left || typeof left !== "object" ||
+        !right || typeof right !== "object")) {
+        throw new Error("source_profile_method_invalid");
+    }
+    const leftMethod = left && typeof left === "object" ? left.method : undefined;
+    const rightMethod = right && typeof right === "object" ? right.method : undefined;
+    const leftExposed = leftMethod !== null && leftMethod !== undefined;
+    const rightExposed = rightMethod !== null && rightMethod !== undefined;
+    let method = "not_exposed";
+    if (leftExposed !== rightExposed) {
+        throw new Error("source_profile_method_incomplete");
+    }
+    if (leftExposed && rightExposed) {
+        if (typeof leftMethod !== "string" || typeof rightMethod !== "string" ||
+            leftMethod.length === 0 || rightMethod.length === 0) {
+            throw new Error("source_profile_method_invalid");
+        }
+        if (leftMethod !== rightMethod) {
+            throw new Error("source_profile_method_mismatch");
+        }
+        method = leftMethod;
+    }
     return {
-        method: proof.method ?? "not_exposed",
-        qualityMode: proof.qualityMode ?? "not_exposed",
-        renderScaleMode: proof.renderScaleMode ?? "not_exposed",
+        method,
+        qualityMode: Object.hasOwn(proof, "qualityMode") ?
+            proof.qualityMode : "not_exposed",
+        renderScaleMode: Object.hasOwn(proof, "renderScaleMode") ?
+            proof.renderScaleMode : "not_exposed",
     };
 }
 
@@ -915,10 +945,6 @@ function finalizeEvidence(options) {
         transitionWasDispatched(entry.value));
     const undispatchedFailures = allRetained.filter((entry) =>
         !transitionWasDispatched(entry.value));
-    const rows = retained.map(({ file, value }) => transitionRow(root, file, value))
-        .sort((left, right) => (left.lane || "").localeCompare(right.lane || "") ||
-            left.pass - right.pass || left.ordinal - right.ordinal);
-
     const existingSummaryPath = path.join(root, "summary.json");
     const existing = fs.existsSync(existingSummaryPath) ? readJson(existingSummaryPath) : {};
     const runIds = unique([options.runId, existing.runId]);
@@ -926,8 +952,17 @@ function finalizeEvidence(options) {
     if (runIds.length !== 1 || buildIds.length !== 1) {
         throw new Error("finalization_identity_ambiguous");
     }
-    const interrupted = interruptedLiveResult(
-        root, variant, runIds[0]);
+    for (const entry of allRetained) {
+        if (!entry.value || entry.value.variant !== variant) {
+            throw new Error("terminal_receipt_variant_mismatch");
+        }
+    }
+    const rows = retained.map(({ file, value }) => transitionRow(root, file, value))
+        .sort((left, right) => (left.lane || "").localeCompare(right.lane || "") ||
+            left.pass - right.pass || left.ordinal - right.ordinal);
+    const liveResult = readLiveResult(root, variant, runIds[0]);
+    const interrupted = liveResult && liveResult.status === "INTERRUPTED" ?
+        liveResult : null;
     const interruptedPass = interrupted && interrupted.lanes && interrupted.lanes
         .flatMap((lane) => lane.passes || [])
         .find((pass) => pass.status === "INTERRUPTED");
@@ -978,6 +1013,10 @@ function finalizeEvidence(options) {
     if (rows.some((row) => !row.traceComplete)) {
         reportingReasons.push("required_trace_evidence_incomplete");
     }
+    if (variant === "amd" && (!liveResult || !liveResult.traceCapability ||
+        liveResult.traceCapability.status !== "supported")) {
+        reportingReasons.push("amd_trace_capability_evidence_incomplete");
+    }
     const deployment = deploymentVerification(root, buildIds[0], options);
     if (!deployment.complete) reportingReasons.push(deployment.reason);
     const reportingStatus = reportingReasons.length === 0 ? "COMPLETE" : "INCOMPLETE";
@@ -1019,6 +1058,9 @@ function finalizeEvidence(options) {
         reporting: { status: reportingStatus, reasons: reportingReasons },
         reportingContract: { complete: reportingStatus === "COMPLETE",
             status: reportingStatus, reasons: reportingReasons },
+        traceCapability: variant === "amd" ?
+            liveResult && liveResult.traceCapability || { status: "missing" } :
+            { status: "not_applicable" },
         deploymentVerification: deployment,
         memoryConfirmation: baselineOnlyInterrupted ?
             baselineOnlyMemoryConfirmation() : existing.memoryConfirmation,

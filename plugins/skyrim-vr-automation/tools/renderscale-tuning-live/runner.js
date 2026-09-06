@@ -127,21 +127,51 @@ async function runRenderScaleTuningLive(context) {
     // Qualification producers have used flat profiles and wrapped public
     // snapshots. Decode either shape without changing the measured sequence.
     function terminalBoundary(waiter) {
-        const snapshot = waiter.upscalingSnapshot;
+        const snapshot = waiter && waiter.upscalingSnapshot;
+        if (!snapshot || typeof snapshot !== "object") {
+            throw diagnosticError("effective_profile_missing", {
+                reason: "upscaling_snapshot_missing",
+            });
+        }
         const profile = snapshot.effective ||
             (snapshot.profiles && snapshot.profiles.effective);
         const enumName = (value, names = null) =>
             value && typeof value === "object" ? value.name :
                 names && Number.isSafeInteger(value) ? names[value] : value;
+        if (!profile || typeof profile !== "object") {
+            throw diagnosticError("effective_profile_missing", {
+                reason: "effective_profile_missing",
+            });
+        }
+        const decoded = {
+            method: enumName(profile.method),
+            qualityMode: enumName(profile.qualityMode, qualityName),
+            renderScaleMode: profile.renderScaleMode,
+            dlssProfile: enumName(profile.dlssProfile),
+            fsrRuntime: enumName(profile.fsrRuntime),
+        };
+        const validName = (value) =>
+            typeof value === "string" && value.length > 0;
+        if (!Number.isSafeInteger(snapshot.stateRevision) ||
+            snapshot.stateRevision < 0 || !validName(decoded.method) ||
+            !validName(decoded.qualityMode) ||
+            typeof decoded.renderScaleMode !== "boolean" ||
+            !validName(decoded.dlssProfile) || !validName(decoded.fsrRuntime)) {
+            throw diagnosticError("effective_profile_invalid", {
+                reason: "effective_profile_shape_invalid",
+                stateRevision: snapshot.stateRevision ?? null,
+                fields: {
+                    method: decoded.method ?? null,
+                    qualityMode: decoded.qualityMode ?? null,
+                    renderScaleMode: decoded.renderScaleMode ?? null,
+                    dlssProfile: decoded.dlssProfile ?? null,
+                    fsrRuntime: decoded.fsrRuntime ?? null,
+                },
+            });
+        }
         return {
             revision: snapshot.stateRevision,
-            profile: {
-                method: enumName(profile.method),
-                qualityMode: enumName(profile.qualityMode, qualityName),
-                renderScaleMode: profile.renderScaleMode,
-                dlssProfile: enumName(profile.dlssProfile),
-                fsrRuntime: enumName(profile.fsrRuntime),
-            },
+            profile: decoded,
         };
     }
 
@@ -176,7 +206,8 @@ async function runRenderScaleTuningLive(context) {
         const sceneResult = results.get("position-scene");
         const snapshotResult = results.get("position-snapshot");
         const capabilitiesResult = results.get("position-capabilities");
-        if (!sceneResult || !sceneResult.cell ||
+        if (!sceneResult || sceneResult.playerLoaded !== true ||
+            !sceneResult.cell ||
             sceneResult.cell.editorId !== "WhiterunDragonsreach") {
             throw new Error("positioning_scene_mismatch");
         }
@@ -1434,6 +1465,7 @@ async function runRenderScaleTuningLive(context) {
                 waiter = await recoverTerminal(identifiers);
             } catch {
                 retain(retainedKey, {
+                    variant,
                     scenarioReceiptKey: receiptKey,
                     scenario: scenarioFailure && scenarioFailure.diagnostic || null,
                     waiter: null,
@@ -1445,6 +1477,7 @@ async function runRenderScaleTuningLive(context) {
             projection = transitionProjection(waiter, target);
             diagnostic = scenarioFailure && scenarioFailure.diagnostic || null;
             retained = {
+                variant,
                 scenarioReceiptKey: receiptKey,
                 scenario: diagnostic,
                 sourceRecoveryReceiptKey: boundary.recoveryReceiptKey || null,
@@ -1461,6 +1494,7 @@ async function runRenderScaleTuningLive(context) {
             projection = waiter ? transitionProjection(waiter, target) : null;
             diagnostic = scenarioDiagnostic(response.root, steps, receiptKey);
             retained = {
+                variant,
                 scenarioReceiptKey: receiptKey,
                 scenario: diagnostic,
                 sourceRecoveryReceiptKey: boundary.recoveryReceiptKey || null,
@@ -1560,8 +1594,42 @@ async function runRenderScaleTuningLive(context) {
                 limit: matrix.traceReadLimit, expectedBuildId: buildId,
             }),
         ];
-        const response = await scenario(steps, receiptKey);
-        const entries = requireScenario(response.root, steps, receiptKey);
+        const unavailableTraceAction = (error) => {
+            const diagnostic = error && error.diagnostic;
+            const traceStep = diagnostic && [
+                diagnostic.failedStep,
+                diagnostic.firstUnreportedStep,
+            ].some((label) => typeof label === "string" &&
+                label.startsWith("amd-dlss-trace-"));
+            const reported = diagnostic && [
+                diagnostic.reportedError,
+                ...(diagnostic.reportedSteps || []).map((step) => step.error),
+            ].filter((value) => typeof value === "string").join(" ");
+            const unavailable =
+                /(?:unsupported|unknown|unrecognized|not[ _-](?:available|exposed|implemented)|missing)[\s\S]*(?:action|operation)|(?:action|operation)[\s\S]*(?:unsupported|unknown|unrecognized|not[ _-](?:available|exposed|implemented)|missing)/i
+                    .test(reported || "");
+            return traceStep && unavailable ? diagnostic : null;
+        };
+        let response;
+        try {
+            response = await scenario(steps, receiptKey);
+        } catch (error) {
+            const diagnostic = unavailableTraceAction(error);
+            if (diagnostic) {
+                return { status: "unsupported", receiptKey, diagnostic };
+            }
+            throw error;
+        }
+        let entries;
+        try {
+            entries = requireScenario(response.root, steps, receiptKey);
+        } catch (error) {
+            const diagnostic = unavailableTraceAction(error);
+            if (diagnostic) {
+                return { status: "unsupported", receiptKey, diagnostic };
+            }
+            throw error;
+        }
         const read = entries.get("amd-dlss-trace-read");
         const capture = read && read.capture;
         const summary = capture && capture.summary;
@@ -1570,6 +1638,7 @@ async function runRenderScaleTuningLive(context) {
             summary.setConstantsCalls !== 0 || summary.evaluateCalls !== 0) {
             throw new Error("amd_dlss_trace_not_empty");
         }
+        return { status: "supported", receiptKey };
     }
 
     async function status(lane, pass, suffix) {
@@ -1640,6 +1709,7 @@ async function runRenderScaleTuningLive(context) {
     }
 
     async function cooldown(lane, pass) {
+        await status(lane, pass, "cooldown-start");
         const receiptKey = `${runId}:${lane.id}:pass-${pass}:cooldown`;
         const steps = [{ label: "memory-cooldown", wait: 10000 }];
         const response = await scenario(steps, receiptKey);
@@ -1655,10 +1725,24 @@ async function runRenderScaleTuningLive(context) {
                 runnable: true,
             }];
         }
+        const supported = capabilities.supportedFSRRuntimeMask;
         const unavailable = capabilities.fsrRuntimeUnavailableConditions;
-        const fsr3 = (capabilities.supportedFSRRuntimeMask & 1) !== 0 &&
+        const validUnavailable = Array.isArray(unavailable) &&
+            unavailable.length === 2 && unavailable.every((entry) =>
+                entry && typeof entry === "object" &&
+                Number.isSafeInteger(entry.mask) && entry.mask >= 0);
+        if (!Number.isSafeInteger(supported) || supported < 0 || supported > 3 ||
+            !validUnavailable) {
+            throw diagnosticError("amd_capabilities_invalid", {
+                reason: "fsr_runtime_capability_shape_invalid",
+                supportedFSRRuntimeMask: supported ?? null,
+                unavailableConditionCount: Array.isArray(unavailable) ?
+                    unavailable.length : null,
+            });
+        }
+        const fsr3 = (supported & 1) !== 0 &&
             unavailable[0].mask === 0;
-        const fsr4 = (capabilities.supportedFSRRuntimeMask & 2) !== 0;
+        const fsr4 = (supported & 2) !== 0;
         const fsr4Unavailable = unavailable[1].mask !== 0;
         return matrix.lanes.map((lane) => ({
             ...lane,
@@ -1668,12 +1752,14 @@ async function runRenderScaleTuningLive(context) {
     }
 
     let boundary = positioning.boundary;
-    const summary = { ok: true, status: "COMPLETE", variant, runId, lanes: [] };
+    const summary = { ok: true, status: "COMPLETE", variant, runId,
+        traceCapability: variant === "amd" ? null : { status: "not_applicable" },
+        lanes: [] };
     let passSequence = 0;
     const selectedLanes = lanes();
     if (variant === "amd" && selectedLanes.some((lane) => lane.runnable)) {
         try {
-            await retainAmdTraceCapability();
+            summary.traceCapability = await retainAmdTraceCapability();
         } catch (error) {
             summary.ok = false;
             summary.status = "INTERRUPTED";

@@ -49,7 +49,8 @@ function positioningRoot(capabilities = {}, flatSnapshot = false) {
             { label: "position-state", result: {} },
             {
                 label: "position-scene",
-                result: { cell: { editorId: "WhiterunDragonsreach" } },
+                result: { playerLoaded: true,
+                    cell: { editorId: "WhiterunDragonsreach" } },
             },
             {
                 label: "position-capabilities",
@@ -695,6 +696,161 @@ async function testAmd() {
     const amdTransitionTrace = mock.scenarioCalls.some((call) =>
         call.steps.some((step) => step.label === "dlss-trace-start"));
     assert(amdTransitionTrace === false, "AMD matrix started a per-row DLSS trace.");
+    assert(result.traceCapability.status === "supported",
+        "AMD trace capability was not classified as supported.");
+    const retainedKeys = [...mock.stores.keys()];
+    const cooldownStart = retainedKeys.indexOf(
+        "amd-test:explicit_fsr3:pass-1:cooldown-start");
+    const cooldownWait = retainedKeys.indexOf(
+        "amd-test:explicit_fsr3:pass-1:cooldown");
+    const cooldownEnd = retainedKeys.indexOf(
+        "amd-test:explicit_fsr3:pass-1:cooldown-end");
+    assert(cooldownStart >= 0 && cooldownWait > cooldownStart &&
+        cooldownEnd > cooldownWait,
+    "AMD cooldown boundary evidence was not retained around the wait.");
+}
+
+async function testAmdUnsupportedTraceContinues() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-amd", "references",
+        "matrix.v1.json")));
+    const mock = createMock(0, null, (root, args) => {
+        if (!args.steps.some((step) => step.label === "amd-dlss-trace-status")) {
+            return root;
+        }
+        return {
+            ok: false,
+            aborted: true,
+            stepsRun: 1,
+            results: [{
+                label: "amd-dlss-trace-status",
+                ok: false,
+                error: "unsupported action dlss_trace_status",
+                result: { ok: false, error: "unsupported action" },
+            }],
+        };
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "amd",
+        runId: "amd-unsupported-trace",
+        buildId,
+        positioningRoot: positioningRoot({
+            supportedFSRRuntimeMask: 1,
+            fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }],
+        }),
+        matrix,
+    });
+    assert(result.ok === true && result.status === "COMPLETE" &&
+        result.traceCapability.status === "unsupported",
+    "An unavailable optional AMD trace action aborted runnable FSR lanes.");
+    assert(result.lanes.filter((lane) => lane.status === "COMPLETE")
+        .every((lane) => lane.passes.length === 2),
+    "AMD lanes did not finish after optional trace classification.");
+}
+
+async function testAmdExposedTraceFailureStops() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-amd", "references",
+        "matrix.v1.json")));
+    const mock = createMock(0, null, (root, args) => {
+        if (!args.steps.some((step) => step.label === "amd-dlss-trace-status")) {
+            return root;
+        }
+        return {
+            ok: false,
+            aborted: true,
+            stepsRun: 2,
+            results: [root.results[0], {
+                label: "amd-dlss-trace-reset",
+                ok: false,
+                error: "trace lifecycle reset failed",
+                result: { ok: false, error: "trace lifecycle reset failed" },
+            }],
+        };
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "amd",
+        runId: "amd-failed-trace",
+        buildId,
+        positioningRoot: positioningRoot({
+            supportedFSRRuntimeMask: 1,
+            fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }],
+        }),
+        matrix,
+    });
+    assert(result.ok === false && result.status === "INTERRUPTED" &&
+        result.error === "scenario_failed",
+    "A failing exposed AMD trace action was treated as unsupported.");
+}
+
+async function testAdmissionRejectsMalformedInputs() {
+    const nvidiaMatrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const unloaded = positioningRoot();
+    unloaded.results.find((entry) => entry.label === "position-scene")
+        .result.playerLoaded = false;
+    for (const [root, expected] of [
+        [unloaded, "positioning_scene_mismatch"],
+        [positioningRoot({}, false), "effective_profile_missing"],
+    ]) {
+        if (expected === "effective_profile_missing") {
+            delete root.results.find((entry) =>
+                entry.label === "position-snapshot").result.snapshot.profiles.effective;
+        }
+        try {
+            await runRenderScaleTuningLive({
+                ...createMock(0).context, variant: "nvidia",
+                runId: `invalid-${expected}`, buildId,
+                positioningRoot: root, matrix: nvidiaMatrix,
+            });
+            throw new Error(`Expected ${expected}.`);
+        } catch (error) {
+            assert(error.message === expected,
+                `Unexpected positioning admission error: ${error.message}`);
+        }
+    }
+    const malformed = positioningRoot();
+    malformed.results.find((entry) => entry.label === "position-snapshot")
+        .result.snapshot.profiles.effective.method = named("");
+    try {
+        await runRenderScaleTuningLive({
+            ...createMock(0).context, variant: "nvidia",
+            runId: "invalid-effective-profile", buildId,
+            positioningRoot: malformed, matrix: nvidiaMatrix,
+        });
+        throw new Error("Expected invalid effective profile.");
+    } catch (error) {
+        assert(error.message === "effective_profile_invalid" && error.diagnostic &&
+            error.diagnostic.reason === "effective_profile_shape_invalid",
+        `Unexpected malformed profile classification: ${error.message}`);
+    }
+
+    const amdMatrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-amd", "references",
+        "matrix.v1.json")));
+    for (const capabilities of [
+        { supportedFSRRuntimeMask: 4,
+            fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 0 }] },
+        { supportedFSRRuntimeMask: 1,
+            fsrRuntimeUnavailableConditions: [{ mask: 0 }] },
+        { supportedFSRRuntimeMask: 1,
+            fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: -1 }] },
+    ]) {
+        try {
+            await runRenderScaleTuningLive({
+                ...createMock(0).context, variant: "amd",
+                runId: "invalid-amd-capabilities", buildId,
+                positioningRoot: positioningRoot(capabilities), matrix: amdMatrix,
+            });
+            throw new Error("Expected invalid AMD capabilities.");
+        } catch (error) {
+            assert(error.message === "amd_capabilities_invalid",
+                `Unexpected AMD capability error: ${error.message}`);
+        }
+    }
 }
 
 async function testScenarioFailureRetention() {
@@ -1879,7 +2035,9 @@ async function testEvidenceVerdicts() {
     "A partial eye observation was treated as submitted mixed stereo.");
 }
 
-Promise.all([testNvidia(), testAmd(), testEvidenceVerdicts(),
+Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
+    testAmdExposedTraceFailureStops(),
+    testAdmissionRejectsMalformedInputs(), testEvidenceVerdicts(),
     testScenarioFailureRetention(), testInformationalReasonIsNotFailure(),
     testOptionalTerminalFacts(), testSafeUnstableBaselineContinues(),
     testFlatTerminalBoundary(), testPositionRenderScalePayloadIsOpaque(),
