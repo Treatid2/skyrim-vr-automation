@@ -49,6 +49,16 @@ function Write-PackageResult($Value) {
 }
 
 try {
+    $baselineArgumentsSupplied = $PSBoundParameters.ContainsKey('BaselinePath') -or
+        $PSBoundParameters.ContainsKey('ExpectedBaselineBuildId')
+    if (-not $PrMode -and $baselineArgumentsSupplied) {
+        throw 'Baseline inputs require -PrMode; local qualification cannot silently ignore them.'
+    }
+    if ($PrMode -and
+        ([string]::IsNullOrWhiteSpace($BaselinePath) -or [string]::IsNullOrWhiteSpace($ExpectedBaselineBuildId))) {
+        throw 'PR mode requires -BaselinePath and -ExpectedBaselineBuildId.'
+    }
+
     $resolvedRuntime = Get-StableRuntimePath
     if ([string]::IsNullOrWhiteSpace($resolvedRuntime)) {
         throw 'No running DevBench runtime was selected. Pass -RuntimePath, set CSX_DEVBENCH_RUNTIME_PATH, or configure devBenchRuntimePath in %LOCALAPPDATA%\SkyrimVRAutomation\machine.local.json before saying start.'
@@ -96,9 +106,6 @@ try {
     }
     if ($artifactSha256 -match '^[A-Fa-f0-9]{64}$') { $arguments.ExpectedArtifactSha256 = $artifactSha256 }
     if ($PrMode) {
-        if ([string]::IsNullOrWhiteSpace($BaselinePath) -or [string]::IsNullOrWhiteSpace($ExpectedBaselineBuildId)) {
-            throw 'PR mode requires -BaselinePath and -ExpectedBaselineBuildId.'
-        }
         $arguments.PrMode = $true
         $arguments.BaselinePath = $BaselinePath
         $arguments.ExpectedBaselineBuildId = $ExpectedBaselineBuildId
