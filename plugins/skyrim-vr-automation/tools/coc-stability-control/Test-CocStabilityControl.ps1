@@ -200,6 +200,36 @@ foreach ($required in @(
     }
 }
 
+$rejectedFixture = Join-Path ([IO.Path]::GetTempPath()) (
+    'coc-stability-rejected-' + [Guid]::NewGuid().ToString('N')
+)
+try {
+    New-Item -ItemType Directory -Path $rejectedFixture | Out-Null
+    $rejectedStatePath = Join-Path $rejectedFixture 'state.json'
+    [pscustomobject][ordered]@{
+        schema = 'csx-coc-stability-state-v1'
+        outcome = 'scenario-rejected'
+        endpoint = 'http://127.0.0.1:1/mcp'
+        ownerId = 'rejected-owner'
+        protocolConfigPath = $configPath
+        scenarioRunId = $null
+        dispatchFailure = [pscustomobject]@{ error = 'fixture dispatch rejection' }
+    } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $rejectedStatePath -Encoding utf8
+    $rejectedStatus = & $scriptPath status -StatePath $rejectedStatePath `
+        -Compact -NoExit | ConvertFrom-Json -Depth 30
+    if ($rejectedStatus.ok -or $rejectedStatus.state -ne 'failed' -or
+        $null -ne $rejectedStatus.data.scenarioRunId -or
+        $rejectedStatus.errors[0] -ne 'fixture dispatch rejection' -or
+        $rejectedStatus.data.dispatchFailure.error -ne 'fixture dispatch rejection') {
+        throw 'Rejected scenario status did not preserve the terminal dispatch failure.'
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $rejectedFixture) {
+        Remove-Item -LiteralPath $rejectedFixture -Recurse -Force
+    }
+}
+
 [pscustomobject][ordered]@{
     ok = $true
     exactTransitions = 20

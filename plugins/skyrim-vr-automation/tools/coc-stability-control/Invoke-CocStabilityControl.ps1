@@ -126,37 +126,64 @@ try {
         if ([string]$state.schema -ne 'csx-coc-stability-state-v1') {
             throw 'The state is not owned by COC stability control.'
         }
-        $protocolConfig = Get-Content -LiteralPath ([string]$state.protocolConfigPath) -Raw |
-            ConvertFrom-Json -Depth 30
-        $statusReceipt = Invoke-CocMcpTool -Endpoint ([string]$state.endpoint) `
-            -Tool 'scenario' -Arguments @{
-                action = 'status'
-                runId = [uint64]$state.scenarioRunId
-            } -TimeoutSeconds 20
-        $scenarioDone = [bool]$statusReceipt.value.done
-        $scenarioOk = -not $scenarioDone -or [bool]$statusReceipt.value.ok
-        $analysis = Get-CocQualificationAnalysis -Scenario $statusReceipt.value `
-            -ProtocolConfig $protocolConfig
-        $result = [pscustomobject][ordered]@{
-            schema = 'csx-coc-stability-control-v1'
-            ok = $scenarioOk
-            command = 'status'
-            timestampUtc = [DateTime]::UtcNow.ToString('o')
-            state = if (-not $scenarioDone) {
-                'running'
-            } elseif ($scenarioOk) {
-                'complete'
-            } else {
-                'failed'
+        if ([string]$state.outcome -ceq 'scenario-rejected') {
+            $dispatchFailure = if ($state.PSObject.Properties['dispatchFailure']) {
+                $state.dispatchFailure
+            } else { $null }
+            $dispatchError = if ($null -ne $dispatchFailure -and
+                $dispatchFailure.PSObject.Properties['error']) {
+                [string]$dispatchFailure.error
+            } else { 'Scenario dispatch was rejected without an error detail.' }
+            $result = [pscustomobject][ordered]@{
+                schema = 'csx-coc-stability-control-v1'
+                ok = $false
+                command = 'status'
+                timestampUtc = [DateTime]::UtcNow.ToString('o')
+                state = 'failed'
+                data = [pscustomobject]@{
+                    statePath = $resolvedStatePath
+                    ownerId = [string]$state.ownerId
+                    scenarioRunId = $null
+                    scenario = $null
+                    analysis = $null
+                    dispatchFailure = $dispatchFailure
+                }
+                errors = @($dispatchError)
             }
-            data = [pscustomobject]@{
-                statePath = $resolvedStatePath
-                ownerId = [string]$state.ownerId
-                scenarioRunId = [uint64]$state.scenarioRunId
-                scenario = $statusReceipt.value
-                analysis = $analysis
+        }
+        else {
+            $protocolConfig = Get-Content -LiteralPath ([string]$state.protocolConfigPath) -Raw |
+                ConvertFrom-Json -Depth 30
+            $statusReceipt = Invoke-CocMcpTool -Endpoint ([string]$state.endpoint) `
+                -Tool 'scenario' -Arguments @{
+                    action = 'status'
+                    runId = [uint64]$state.scenarioRunId
+                } -TimeoutSeconds 20
+            $scenarioDone = [bool]$statusReceipt.value.done
+            $scenarioOk = -not $scenarioDone -or [bool]$statusReceipt.value.ok
+            $analysis = Get-CocQualificationAnalysis -Scenario $statusReceipt.value `
+                -ProtocolConfig $protocolConfig
+            $result = [pscustomobject][ordered]@{
+                schema = 'csx-coc-stability-control-v1'
+                ok = $scenarioOk
+                command = 'status'
+                timestampUtc = [DateTime]::UtcNow.ToString('o')
+                state = if (-not $scenarioDone) {
+                    'running'
+                } elseif ($scenarioOk) {
+                    'complete'
+                } else {
+                    'failed'
+                }
+                data = [pscustomobject]@{
+                    statePath = $resolvedStatePath
+                    ownerId = [string]$state.ownerId
+                    scenarioRunId = [uint64]$state.scenarioRunId
+                    scenario = $statusReceipt.value
+                    analysis = $analysis
+                }
+                errors = if ($scenarioOk) { @() } else { @([string]$statusReceipt.value.error) }
             }
-            errors = if ($scenarioOk) { @() } else { @([string]$statusReceipt.value.error) }
         }
     }
     else {

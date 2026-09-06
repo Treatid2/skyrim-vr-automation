@@ -9,6 +9,36 @@ Set-StrictMode -Version Latest
 $scriptPath = Join-Path $PSScriptRoot 'Invoke-CocEvidenceControl.ps1'
 $script = Get-Content -LiteralPath $scriptPath -Raw
 
+$tokens = $null
+$parseErrors = $null
+$scriptAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $scriptPath, [ref]$tokens, [ref]$parseErrors
+)
+$ownedProcessFunction = $scriptAst.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-OwnedProcess'
+    }, $true)
+if ($parseErrors.Count -ne 0 -or $null -eq $ownedProcessFunction) {
+    throw 'Could not isolate Get-OwnedProcess for inaccessible-process coverage.'
+}
+$ownedProcessSource = $ownedProcessFunction.ToString().Replace(
+    '$process = Get-Process -Id ([int]$pidValue.Value) -ErrorAction SilentlyContinue',
+    '$process = $script:InaccessibleProcessFixture'
+)
+Invoke-Expression $ownedProcessSource
+$script:InaccessibleProcessFixture = [pscustomobject]@{}
+$script:InaccessibleProcessFixture | Add-Member -MemberType ScriptProperty `
+    -Name StartTime -Value { throw 'Access denied fixture' }
+$inaccessibleState = [pscustomobject]@{
+    monitorPid = 42
+    monitorStartedUtc = [DateTime]::UtcNow.ToString('o')
+}
+$inaccessibleResult = Get-OwnedProcess $inaccessibleState 'monitorPid' 'monitorStartedUtc'
+if ($null -ne $inaccessibleResult) {
+    throw 'An inaccessible process identity was accepted as owned.'
+}
+
 foreach ($requiredText in @(
     "[ValidateSet('inspect', 'arm', 'status', 'capture-hang', 'stop')]",
     "'-ma'",

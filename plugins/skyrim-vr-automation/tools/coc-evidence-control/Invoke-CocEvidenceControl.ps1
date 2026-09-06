@@ -282,19 +282,22 @@ function Get-OwnedProcess($State, [string]$PidProperty, [string]$StartedProperty
     if (-not $pidValue -or -not $startedValue) { return $null }
     $process = Get-Process -Id ([int]$pidValue.Value) -ErrorAction SilentlyContinue
     if (-not $process) { return $null }
-    $expectedValue = $startedValue.Value
-    $expected = if ($expectedValue -is [DateTime]) {
-        $expectedValue.ToUniversalTime()
-    } elseif ($expectedValue -is [DateTimeOffset]) {
-        $expectedValue.UtcDateTime
-    } else {
-        [DateTimeOffset]::Parse(
-            [string]$expectedValue,
-            [Globalization.CultureInfo]::InvariantCulture,
-            [Globalization.DateTimeStyles]::RoundtripKind
-        ).UtcDateTime
+    try {
+        $expectedValue = $startedValue.Value
+        $expected = if ($expectedValue -is [DateTime]) {
+            $expectedValue.ToUniversalTime()
+        } elseif ($expectedValue -is [DateTimeOffset]) {
+            $expectedValue.UtcDateTime
+        } else {
+            [DateTimeOffset]::Parse(
+                [string]$expectedValue,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind
+            ).UtcDateTime
+        }
+        $actual = $process.StartTime.ToUniversalTime()
     }
-    $actual = $process.StartTime.ToUniversalTime()
+    catch { return $null }
     if ([math]::Abs(($actual - $expected).TotalSeconds) -gt 2) { return $null }
     return $process
 }
