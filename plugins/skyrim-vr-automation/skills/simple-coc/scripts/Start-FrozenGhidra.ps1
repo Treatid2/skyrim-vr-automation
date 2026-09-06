@@ -86,7 +86,8 @@ try {
         ProfilePath = $ProfilePath
         ModsPath = $ModsPath
         RelativeCachePath = 'SKSE\Plugins\CommunityShaders.dll'
-        DeepInventory = $false
+        DeepInventory = $true
+        IncludeInventoryEntries = $true
         NoExit = $true
         Compact = $true
     }

@@ -121,7 +121,7 @@ $receiptOk = -not (Test-Path -LiteralPath (
     $expectedProject = 'CSX-{0}-{1}' -f (
         $buildId.Substring(0, 16)
     ), ($artifactSha256.Substring(0, 16).ToLowerInvariant())
-    Assert-Test $prepared.ok 'Authorized frozen Ghidra preparation failed.'
+    Assert-Test $prepared.ok "Authorized frozen Ghidra preparation failed: $($prepared | ConvertTo-Json -Depth 20 -Compress)"
     Assert-Test (
         $prepared.binding.projectName -ceq $expectedProject
     ) 'Build-specific Ghidra project key is incorrect.'

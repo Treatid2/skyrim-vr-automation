@@ -64,6 +64,16 @@
       "entryPoint": "tools/capture-interaction-control/Invoke-CaptureInteraction.ps1"
     },
     {
+      "name": "coc-evidence-control",
+      "version": "1.0.0",
+      "entryPoint": "tools/coc-evidence-control/Invoke-CocEvidenceControl.ps1"
+    },
+    {
+      "name": "coc-stability-control",
+      "version": "1.0.0",
+      "entryPoint": "tools/coc-stability-control/Invoke-CocStabilityControl.ps1"
+    },
+    {
       "name": "process-control",
       "version": "1.0.0",
       "entryPoint": "tools/process-control/Invoke-BoundedProcess.ps1"
