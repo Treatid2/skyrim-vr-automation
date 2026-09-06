@@ -64,8 +64,11 @@ particular drive letter for the plugin itself.
   backup; use a new evidence directory only after the prior transaction has
   been restored. An active committed apply owns its original evidence folder.
 - `restore` must use the evidence directory from its corresponding apply and
-  must verify the receipt and backup hashes. Isolation restore must fail closed
-  on registration or suppressed-manifest drift. Retain all backups afterward.
+  must verify the receipt, retained profile, and backup hashes. New apply
+  receipts retain the exact profile bytes in their evidence directory; a
+  legacy receipt may use another profile path only after an exact hash match.
+  Isolation restore must fail closed on registration or suppressed-manifest
+  drift. Retain all backups afterward.
 - Use `-SettingsPath` and `-SteamVRRoot` for nonstandard installations. Never
   silently fall back to the default installation paths.
 - Invoke the controller with PowerShell 7 `pwsh.exe`. Do not work around its

@@ -149,6 +149,96 @@ function Get-DevBenchSemanticStatus {
     }
 }
 
+function Test-DevBenchReadOnlyRequest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ToolName,
+        [Parameter(Mandatory)][Collections.IDictionary]$Arguments
+    )
+
+    $action = if ($Arguments.Contains('action')) { [string]$Arguments['action'] } else { '' }
+    $kind = if ($Arguments.Contains('kind')) { [string]$Arguments['kind'] } else { '' }
+    if ($ToolName -eq 'inspect') {
+        return $kind -in @('state', 'health', 'vm', 'scene', 'mods', 'player', 'inventory', 'quests', 'effects', 'refs', 'registrants', 'screenshots', 'extensions')
+    }
+    if ($ToolName -eq 'menu') { return $action -eq 'list' }
+    if ($ToolName -eq 'record') { return $action -eq 'status' }
+    if ($ToolName -eq 'input') { return $action -in @('observe', 'status') }
+    return $false
+}
+
+function Get-DevBenchCallSemanticStatus {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ToolName,
+        [Parameter(Mandatory)][Collections.IDictionary]$Arguments,
+        [AllowEmptyCollection()][object[]]$Content
+    )
+
+    $semantic = Get-DevBenchSemanticStatus -Content $Content
+    if ($semantic.known) { return $semantic }
+    $payloads = @($Content)
+    if ($payloads.Count -ne 1 -or $null -eq $payloads[0] -or $payloads[0] -is [string] -or $payloads[0] -is [ValueType]) {
+        return $semantic
+    }
+    $payload = $payloads[0]
+
+    if ($ToolName -eq 'record' -and $Arguments.Contains('action') -and [string]$Arguments['action'] -eq 'start') {
+        $actionProperty = $payload.PSObject.Properties['action']
+        $recordingProperty = $payload.PSObject.Properties['recording']
+        if ($actionProperty -and $recordingProperty) {
+            $reasons = [Collections.Generic.List[string]]::new()
+            if ([string]$actionProperty.Value -ne 'start') { $reasons.Add("content.action is '$($actionProperty.Value)', expected 'start'") }
+            if (-not [bool]$recordingProperty.Value) { $reasons.Add('content.recording is false after record start') }
+            if ($Arguments.Contains('correlationId')) {
+                $correlationProperty = $payload.PSObject.Properties['correlationId']
+                if (-not $correlationProperty -or [string]$correlationProperty.Value -cne [string]$Arguments['correlationId']) {
+                    $reasons.Add('content.correlationId does not match the requested recording correlation')
+                }
+            }
+            return [pscustomobject][ordered]@{
+                known = $true
+                ok = $reasons.Count -eq 0
+                outcome = if ($reasons.Count -eq 0) { 'record-start-contract-satisfied' } else { 'record-start-contract-failed' }
+                guarded = $false
+                transient = $false
+                codes = @()
+                states = @()
+                reasons = @($reasons)
+                schedulerOnly = $false
+                schedulerReceiptPaths = @()
+                explicitOutcomeEvidence = @('content.action', 'content.recording', 'content.correlationId')
+            }
+        }
+    }
+
+    if (Test-DevBenchReadOnlyRequest -ToolName $ToolName -Arguments $Arguments) {
+        $properties = @($payload.PSObject.Properties)
+        $errorProperty = $payload.PSObject.Properties['error']
+        if ($errorProperty -and $null -ne $errorProperty.Value) {
+            $semantic.known = $true
+            $semantic.ok = $false
+            $semantic.outcome = 'read-contract-failed'
+            $semantic.reasons = @("content.error is '$($errorProperty.Value)'")
+            return $semantic
+        }
+        $action = if ($Arguments.Contains('action')) { [string]$Arguments['action'] } else { '' }
+        $contractSatisfied =
+            ($ToolName -eq 'inspect' -and $properties.Count -gt 0) -or
+            ($ToolName -eq 'menu' -and $payload.PSObject.Properties['openMenus'] -and $payload.PSObject.Properties['messageBoxOpen']) -or
+            ($ToolName -eq 'record' -and $payload.PSObject.Properties['recording'] -and $payload.PSObject.Properties['state']) -or
+            ($ToolName -eq 'input' -and $action -eq 'observe' -and $payload.PSObject.Properties['frame']) -or
+            ($ToolName -eq 'input' -and $action -eq 'status' -and $payload.PSObject.Properties['device'])
+        if ($contractSatisfied) {
+            $semantic.known = $true
+            $semantic.ok = $true
+            $semantic.outcome = 'read-contract-satisfied'
+            $semantic.explicitOutcomeEvidence = @($semantic.explicitOutcomeEvidence) + "tool:$ToolName"
+        }
+    }
+    return $semantic
+}
+
 function Get-DevBenchServiceState {
     [CmdletBinding()]
     param([AllowEmptyCollection()][object[]]$Content)
@@ -246,7 +336,7 @@ function Test-DevBenchMainMenuReady {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$MenuState,
-        [string[]]$AllowedMenus = @('HUD Menu', 'Main Menu')
+        [string[]]$AllowedMenus = @('HUD Menu', 'Main Menu', 'Mist Menu', 'Fader Menu')
     )
     $openMenus = if ($MenuState.PSObject.Properties['openMenus']) { @($MenuState.openMenus) } else { @() }
     $unexpected = @($openMenus | Where-Object { $_ -notin $AllowedMenus })
@@ -328,4 +418,4 @@ function Resolve-DevBenchServiceProbeArguments {
     return [pscustomobject][ordered]@{ arguments = $resolved; source = 'schema-registry-envelope'; synthesizedAction = $action }
 }
 
-Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchRuntimeExpectations, Resolve-DevBenchServiceProbeArguments
+Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchRuntimeExpectations, Resolve-DevBenchServiceProbeArguments

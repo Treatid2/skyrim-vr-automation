@@ -3,7 +3,7 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [ValidateSet('create', 'resume', 'list-task', 'inspect', 'fixture-status', 'refresh-fixture', 'prepare-source', 'complete-output', 'create-mod', 'register-mod', 'ensure-mod-wins', 'retire', 'release')]
+    [ValidateSet('create', 'resume', 'list-task', 'list-local-work-mods', 'inspect', 'fixture-status', 'refresh-fixture', 'prepare-source', 'complete-output', 'create-mod', 'register-mod', 'ensure-mod-wins', 'retire', 'release')]
     [string]$Command,
 
     [string]$ConfigPath,
@@ -16,6 +16,10 @@ param(
     [string]$SavePolicy = 'MainMenuOnly',
     [string]$FixtureManifestPath,
     [string]$FixtureId,
+    [ValidateSet('Modlist', 'ModlistPlusLocalWorkMods')]
+    [string]$WorkspaceContent,
+    [string[]]$LocalWorkModId,
+    [string]$LocalWorkModIdsFile,
     [string]$ModName,
     [string]$ModDirectory,
     [ValidateSet('End', 'Before', 'After')]
@@ -43,6 +47,7 @@ param(
     [switch]$NoExit
 )
 
+$workspaceContentSupplied = $PSBoundParameters.ContainsKey('WorkspaceContent')
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $toolRoot = Split-Path -Parent $PSScriptRoot
@@ -70,18 +75,39 @@ function Resolve-WorkspaceWinningPaths([string[]]$Inline, [string]$File) {
 
 $resolvedWinningPaths = @(Resolve-WorkspaceWinningPaths -Inline $WinningPaths -File $WinningPathsFile)
 
+function Resolve-WorkspaceStringList([string[]]$Inline, [string]$File, [string]$Purpose) {
+    $values = [Collections.Generic.List[string]]::new()
+    foreach ($value in @($Inline)) {
+        if (-not [string]::IsNullOrWhiteSpace($value)) { $values.Add($value.Trim()) }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($File)) {
+        $resolved = [IO.Path]::GetFullPath($File)
+        if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) { throw "$Purpose file does not exist: $resolved" }
+        $raw = Get-Content -LiteralPath $resolved -Raw
+        try { $parsed = $raw | ConvertFrom-Json -Depth 5 -ErrorAction Stop }
+        catch { throw "$Purpose file must be a valid JSON string array. $($_.Exception.Message)" }
+        foreach ($entry in @($parsed)) {
+            if ($entry -isnot [string] -or [string]::IsNullOrWhiteSpace($entry)) { throw "$Purpose file must contain only non-empty strings." }
+            $values.Add($entry.Trim())
+        }
+    }
+    return @($values | Select-Object -Unique)
+}
+
+$resolvedLocalWorkModIds = @(Resolve-WorkspaceStringList -Inline $LocalWorkModId -File $LocalWorkModIdsFile -Purpose 'LocalWorkModIds')
+
 function New-WorkspaceApprovalMetadata([string]$Subcommand) {
     $hostExecutable = [string][Environment]::ProcessPath
     if ([string]::IsNullOrWhiteSpace($hostExecutable)) { $hostExecutable = [string](Get-Process -Id $PID -ErrorAction Stop).Path }
     $entryPoint = [IO.Path]::GetFullPath($PSCommandPath)
-    $oneShotCommands = @('refresh-fixture', 'complete-output', 'retire', 'release')
+    $oneShotCommands = @('refresh-fixture', 'prepare-source', 'complete-output', 'retire', 'release')
     return [pscustomobject][ordered]@{
         hostExecutable = $hostExecutable; entryPoint = $entryPoint; subcommand = $Subcommand
         reusablePrefix = @($hostExecutable, '-NoProfile', '-NonInteractive', '-File', $entryPoint, $Subcommand)
         reusableApprovalEligible = $Subcommand -notin $oneShotCommands
-        escalationUsuallyRequired = $Subcommand -notin @('inspect', 'fixture-status', 'list-task', 'prepare-source')
-        oneShotReason = if ($Subcommand -eq 'refresh-fixture') { 'Shared fixture replacement must remain a one-shot approval.' } elseif ($Subcommand -eq 'complete-output') { 'Restoring the exact pre-task MO2 Overwrite backup tree must remain a one-shot approval.' } elseif ($Subcommand -in @('retire', 'release')) { 'Recursive owned-workspace removal must remain a one-shot approval.' } else { $null }
-        invocationRule = 'Use this literal prefix directly. Put changing access, workspace, mod, and evidence arguments afterward; do not hide the prefix in variables, -Command, pipelines, or a command string.'
+        escalationUsuallyRequired = $Subcommand -notin @('inspect', 'fixture-status', 'list-task', 'list-local-work-mods')
+        oneShotReason = if ($Subcommand -eq 'refresh-fixture') { 'Shared fixture replacement must remain a one-shot approval.' } elseif ($Subcommand -eq 'prepare-source') { 'Moving overwrite cache trees into a shared stable-profile mod must remain a one-shot approval.' } elseif ($Subcommand -eq 'complete-output') { 'Restoring the exact pre-task MO2 Overwrite backup tree must remain a one-shot approval.' } elseif ($Subcommand -in @('retire', 'release')) { 'Recursive owned-workspace removal must remain a one-shot approval.' } else { $null }
+        invocationRule = 'Use this literal prefix directly. Put only supported command arguments afterward; do not hide the prefix in variables, -Command, pipelines, or a command string.'
     }
 }
 
@@ -861,6 +887,127 @@ function Resolve-DirectProfilePath([string]$ProfilesRoot, [string]$ProfileName) 
     return $resolvedPath
 }
 
+function Get-LocalWorkModCatalog($Config, [string]$SourcePath, [string]$ModsRoot) {
+    $configured = if ($Config.defaults.PSObject.Properties['localWorkModCatalog']) { [string]$Config.defaults.localWorkModCatalog } else { '' }
+    if ([string]::IsNullOrWhiteSpace($configured)) {
+        return [pscustomobject][ordered]@{
+            configured = $false; path = $null; sha256 = $null; contractVersion = $null
+            candidates = @(); guidance = @(
+                'No local-work mod catalog is configured. Modlist workspaces remain available.',
+                'Set defaults.localWorkModCatalog to an exact local JSON catalog to offer optional local builds.'
+            )
+        }
+    }
+    $catalogPath = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($configured))
+    if (-not (Test-Path -LiteralPath $catalogPath -PathType Leaf)) { throw "Configured local-work mod catalog does not exist: $catalogPath" }
+    try { $catalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json -Depth 20 -ErrorAction Stop }
+    catch { throw "Local-work mod catalog is not valid JSON: $catalogPath. $($_.Exception.Message)" }
+    if ([string]$catalog.contractVersion -cne '1.0.0') { throw "Unsupported local-work mod catalog contractVersion '$($catalog.contractVersion)'; expected '1.0.0'." }
+    if (-not $catalog.PSObject.Properties['candidates']) { throw 'Local-work mod catalog is missing candidates.' }
+
+    $modListPath = Join-Path $SourcePath 'modlist.txt'
+    if (-not (Test-Path -LiteralPath $modListPath -PathType Leaf)) { throw "Stable source modlist does not exist: $modListPath" }
+    $modListBytes = [IO.File]::ReadAllBytes($modListPath)
+    $hasBom = $modListBytes.Length -ge 3 -and $modListBytes[0] -eq 0xEF -and $modListBytes[1] -eq 0xBB -and $modListBytes[2] -eq 0xBF
+    $offset = if ($hasBom) { 3 } else { 0 }
+    try {
+        $modListText = [Text.UTF8Encoding]::new($false, $true).GetString($modListBytes, $offset, $modListBytes.Length - $offset)
+    }
+    catch {
+        throw "Stable source modlist is not valid UTF-8: $modListPath. $($_.Exception.Message)"
+    }
+    $ids = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $modNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $resolved = [Collections.Generic.List[object]]::new()
+    foreach ($candidate in @($catalog.candidates)) {
+        foreach ($required in @('id', 'label', 'modName')) {
+            if (-not $candidate.PSObject.Properties[$required] -or [string]::IsNullOrWhiteSpace([string]$candidate.$required)) { throw "Local-work mod candidate is missing required property '$required'." }
+        }
+        $id = [string]$candidate.id
+        $label = [string]$candidate.label
+        $modName = [string]$candidate.modName
+        if ($id -cnotmatch '^[a-z0-9][a-z0-9._-]{0,63}$') { throw "Local-work mod candidate id is malformed: $id" }
+        if (-not $ids.Add($id)) { throw "Local-work mod candidate id is duplicated: $id" }
+        if (-not $modNames.Add($modName)) { throw "Local-work mod name is duplicated in the catalog: $modName" }
+        if ($modName -in @('.', '..') -or $modName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or $modName.Contains([IO.Path]::DirectorySeparatorChar) -or $modName.Contains([IO.Path]::AltDirectorySeparatorChar)) { throw "Local-work mod candidate has an invalid direct mod name: $modName" }
+        $modDirectory = [IO.Path]::GetFullPath((Join-Path $ModsRoot $modName))
+        $markerMatches = @([regex]::Matches($modListText, "(?m)^(?<marker>[+-])$([regex]::Escape($modName))`r?$"))
+        $reasons = [Collections.Generic.List[string]]::new()
+        if (-not (Test-Path -LiteralPath $modDirectory -PathType Container)) { $reasons.Add('mod-directory-missing') }
+        if ($markerMatches.Count -eq 0) { $reasons.Add('source-marker-missing') }
+        elseif ($markerMatches.Count -gt 1) { $reasons.Add('source-marker-ambiguous') }
+        $resolved.Add([pscustomobject][ordered]@{
+            id = $id; label = $label; description = if ($candidate.PSObject.Properties['description']) { [string]$candidate.description } else { '' }
+            modName = $modName; modDirectory = $modDirectory
+            exclusionGroup = if ($candidate.PSObject.Properties['exclusionGroup']) { [string]$candidate.exclusionGroup } else { '' }
+            variant = if ($candidate.PSObject.Properties['variant']) { [string]$candidate.variant } else { '' }
+            capabilities = if ($candidate.PSObject.Properties['capabilities']) { @($candidate.capabilities | ForEach-Object { [string]$_ }) } else { @() }
+            metadata = if ($candidate.PSObject.Properties['metadata']) { $candidate.metadata } else { $null }
+            available = $reasons.Count -eq 0; unavailableReasons = @($reasons)
+            sourceMarker = if ($markerMatches.Count -eq 1) { [string]$markerMatches[0].Groups['marker'].Value } else { $null }
+        })
+    }
+    return [pscustomobject][ordered]@{
+        configured = $true; path = $catalogPath; sha256 = (Get-FileHash -LiteralPath $catalogPath -Algorithm SHA256).Hash
+        contractVersion = [string]$catalog.contractVersion; candidates = @($resolved)
+        guidance = @(
+            'Request WorkspaceContent=Modlist for the original modlist baseline.',
+            'Request WorkspaceContent=ModlistPlusLocalWorkMods with one or more exact available candidate IDs for local work.'
+        )
+    }
+}
+
+function Resolve-LocalWorkModSelection($Catalog, [string]$Content, [string[]]$RequestedIds) {
+    $requested = @($RequestedIds | Select-Object -Unique)
+    if ($Content -eq 'Modlist' -and $requested.Count -gt 0) { throw 'WorkspaceContent Modlist cannot include LocalWorkModId values.' }
+    if ($Content -eq 'ModlistPlusLocalWorkMods' -and $requested.Count -eq 0) { throw 'WorkspaceContent ModlistPlusLocalWorkMods requires at least one LocalWorkModId.' }
+    if ($requested.Count -gt 0 -and -not $Catalog.configured) { throw 'Local-work mods were requested, but defaults.localWorkModCatalog is not configured.' }
+    $selected = [Collections.Generic.List[object]]::new()
+    foreach ($id in $requested) {
+        $matches = @($Catalog.candidates | Where-Object { [string]$_.id -ceq $id })
+        if ($matches.Count -ne 1) { throw "Unknown local-work mod candidate id '$id'. Run list-local-work-mods and choose an exact available id." }
+        if (-not $matches[0].available) { throw "Local-work mod candidate '$id' is unavailable: $(@($matches[0].unavailableReasons) -join ', ')." }
+        $selected.Add($matches[0])
+    }
+    $conflicts = @($selected | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.exclusionGroup) } | Group-Object exclusionGroup | Where-Object Count -gt 1)
+    if ($conflicts.Count -gt 0) { throw "Mutually exclusive local-work mod candidates were requested together: $(@($conflicts.Name) -join ', ')." }
+    return [pscustomobject][ordered]@{
+        workspaceContent = $Content; requestedIds = $requested; selected = @($selected)
+        disabledCandidateIds = @($Catalog.candidates | Where-Object { [string]$_.id -notin $requested } | ForEach-Object { [string]$_.id })
+    }
+}
+
+function Set-LocalWorkModSelection([string]$ModListPath, $Catalog, $Selection) {
+    $bytes = [IO.File]::ReadAllBytes($ModListPath)
+    $hasBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+    $offset = if ($hasBom) { 3 } else { 0 }
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes, $offset, $bytes.Length - $offset)
+    $selectedIds = @($Selection.requestedIds)
+    $applied = [Collections.Generic.List[object]]::new()
+    foreach ($candidate in @($Catalog.candidates)) {
+        $pattern = "(?m)^(?<marker>[+-])(?<name>$([regex]::Escape([string]$candidate.modName)))`r?$"
+        $matches = @([regex]::Matches($text, $pattern))
+        if ($matches.Count -eq 0) {
+            $applied.Add([pscustomobject][ordered]@{ id = [string]$candidate.id; modName = [string]$candidate.modName; markerBefore = $null; markerAfter = $null; status = 'marker-absent' })
+            continue
+        }
+        if ($matches.Count -gt 1) { throw "Expected at most one task-profile marker for local-work mod '$($candidate.modName)'; found $($matches.Count)." }
+        $target = if ([string]$candidate.id -cin $selectedIds) { '+' } else { '-' }
+        $before = [string]$matches[0].Groups['marker'].Value
+        $expression = [regex]::new($pattern)
+        $text = $expression.Replace($text, { param($match) $target + $match.Groups['name'].Value + $(if ($match.Value.EndsWith("`r")) { "`r" } else { '' }) }, 1)
+        $applied.Add([pscustomobject][ordered]@{ id = [string]$candidate.id; modName = [string]$candidate.modName; markerBefore = $before; markerAfter = $target; status = 'applied' })
+    }
+    $payload = [Text.UTF8Encoding]::new($false).GetBytes($text)
+    $resultBytes = if ($hasBom) { [byte[]](0xEF, 0xBB, 0xBF) + $payload } else { $payload }
+    Write-WorkspaceBytesAtomic -Path $ModListPath -Bytes $resultBytes
+    return [pscustomobject][ordered]@{
+        modListPath = $ModListPath; workspaceContent = [string]$Selection.workspaceContent
+        requestedIds = @($Selection.requestedIds); applied = @($applied)
+        resultSha256 = (Get-FileHash -LiteralPath $ModListPath -Algorithm SHA256).Hash
+    }
+}
+
 function Get-ProfileSnapshot([string]$Path) {
     $inventory = Get-BoundedTreeInventory -Path $Path -Purpose 'MO2 profile'
     $records = [Collections.Generic.List[object]]::new()
@@ -1152,7 +1299,9 @@ function Set-MO2SelectedProfile($Config, [string]$TargetProfile, [string]$Operat
     $beforeValue = [string]$selection.value
     $replacement = $selection.match.Groups['prefix'].Value + '@ByteArray(' + $TargetProfile + ')'
     $afterText = $selection.text.Remove($selection.match.Index, $selection.match.Length).Insert($selection.match.Index, $replacement)
-    $afterBytes = [Text.Encoding]::UTF8.GetBytes($afterText)
+    # An already-selected profile is an exact-byte no-op; MO2 may preserve an
+    # encoding or BOM that a reconstructed UTF-8 representation would erase.
+    $afterBytes = if ($beforeValue -ceq $TargetProfile) { $beforeBytes } else { [Text.Encoding]::UTF8.GetBytes($afterText) }
     $beforeHash = Get-WorkspaceBytesSha256 -Bytes $beforeBytes
     $resultHash = Get-WorkspaceBytesSha256 -Bytes $afterBytes
     $backupPath = Join-Path $EvidenceRoot 'ModOrganizer.before.ini'
@@ -1391,12 +1540,18 @@ function Get-TaskWorkspaces($Config, [string]$ResolvedTaskId) {
             $manifest = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
             if ($manifest.PSObject.Properties['ownerTaskId'] -and [string]$manifest.ownerTaskId -ceq $ResolvedTaskId) {
                 $profilePath = [IO.Path]::GetFullPath([string]$manifest.profilePath)
+                [string[]]$selectedLocalWorkModIds = @()
+                if ($manifest.PSObject.Properties['localWorkMods'] -and @($manifest.localWorkMods.requestedIds).Count -gt 0) {
+                    $selectedLocalWorkModIds = @($manifest.localWorkMods.requestedIds | ForEach-Object { [string]$_ })
+                }
                 $items += [pscustomobject][ordered]@{
                     workspaceId = [string]$manifest.workspaceId; status = [string]$manifest.status
                     profileName = [string]$manifest.profileName; profileDirectory = $profilePath
                     profileExists = Test-Path -LiteralPath $profilePath -PathType Container
                     resumable = ([string]$manifest.status -in @('ready', 'retained')) -and (Test-Path -LiteralPath $profilePath -PathType Container)
                     sourceProfile = [string]$manifest.sourceProfile; accessId = [string]$manifest.accessId
+                    workspaceContent = if ($manifest.PSObject.Properties['localWorkMods']) { [string]$manifest.localWorkMods.workspaceContent } else { 'legacy-unspecified' }
+                    selectedLocalWorkModIds = $selectedLocalWorkModIds
                     createdUtc = [string]$manifest.createdUtc; lastResumedUtc = if ($manifest.PSObject.Properties['lastResumedUtc']) { [string]$manifest.lastResumedUtc } else { $null }
                     manifestPath = $file.FullName
                 }
@@ -1433,6 +1588,111 @@ function Get-OverwriteShaderCacheDirectories($Config) {
     return @($roots)
 }
 
+function Get-DirectorySummary([string]$Path) {
+    $files = @(Get-ChildItem -LiteralPath $Path -File -Recurse -Force)
+    return [pscustomobject][ordered]@{
+        files = $files.Count
+        bytes = [long](($files | Measure-Object -Property Length -Sum).Sum ?? 0)
+    }
+}
+
+function Move-OverwriteShaderCachesToStableMod($Config, [string]$SourceName, [string]$SourcePath, [string]$ModsRoot, [switch]$WhatIf) {
+    $overwriteRoot = [IO.Path]::GetFullPath([string]$Config.mo2.overwriteDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $cacheDirectories = @(Get-OverwriteShaderCacheDirectories -Config $Config)
+    if ($cacheDirectories.Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            state = 'clean'; sourceProfile = $SourceName; overwriteDirectory = $overwriteRoot
+            movedDirectories = @(); modName = $null; modDirectory = $null; receiptPath = $null
+        }
+    }
+
+    $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
+    $modName = 'CSX Legacy Shader Cache - ' + $stamp
+    $modDirectory = [IO.Path]::GetFullPath((Join-Path $ModsRoot $modName))
+    if (-not $modDirectory.StartsWith($ModsRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'Generated shader-cache mod path escaped the configured mods directory.' }
+    if (Test-Path -LiteralPath $modDirectory) { throw "Generated shader-cache mod already exists: $modDirectory" }
+    $modListPath = Join-Path $SourcePath 'modlist.txt'
+    if (-not (Test-Path -LiteralPath $modListPath -PathType Leaf)) { throw "Stable source modlist does not exist: $modListPath" }
+    $evidenceRoot = Join-Path (Join-Path ([string]$Config.storage.sessionStaging) 'source-preparation') ($stamp + '-' + (Get-SafeName $SourceName))
+    $profileEvidence = Join-Path $evidenceRoot 'profile-registration'
+    $receiptPath = Join-Path $evidenceRoot 'shader-cache-migration.receipt.json'
+    $moves = @($cacheDirectories | ForEach-Object {
+        $relative = [IO.Path]::GetRelativePath($overwriteRoot, $_.FullName)
+        if ([IO.Path]::IsPathRooted($relative) -or $relative.StartsWith('..')) { throw "Shader-cache source escaped overwrite: $($_.FullName)" }
+        $summary = Get-DirectorySummary -Path $_.FullName
+        [pscustomobject][ordered]@{
+            relativePath = $relative; sourcePath = $_.FullName
+            destinationPath = [IO.Path]::GetFullPath((Join-Path $modDirectory $relative))
+            files = $summary.files; bytes = $summary.bytes
+        }
+    })
+    if ($WhatIf) {
+        return [pscustomobject][ordered]@{
+            state = 'migration-planned'; sourceProfile = $SourceName; overwriteDirectory = $overwriteRoot
+            movedDirectories = $moves; modName = $modName; modDirectory = $modDirectory; receiptPath = $receiptPath
+        }
+    }
+
+    $profileTool = Join-Path $toolRoot 'mo2-profile-control\Invoke-MO2ProfileControl.ps1'
+    $modListBefore = [IO.File]::ReadAllBytes($modListPath)
+    try {
+        New-Item -ItemType Directory -Path $modDirectory -Force | Out-Null
+        foreach ($move in $moves) {
+            $destinationParent = Split-Path -Parent ([string]$move.destinationPath)
+            if (-not (Test-Path -LiteralPath $destinationParent -PathType Container)) { New-Item -ItemType Directory -Path $destinationParent -Force | Out-Null }
+            [IO.Directory]::Move([string]$move.sourcePath, [string]$move.destinationPath)
+        }
+        $blockingProcessNames = @(
+            @($Config.mo2.processNames)
+            @($Config.mo2.gameProcessNames)
+            @($Config.mo2.runtimeProcessNames)
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique
+        if ($blockingProcessNames.Count -eq 0) { $blockingProcessNames = @('ModOrganizer', 'SkyrimVR', 'sksevr_loader') }
+        $registration = & $profileTool register -ProfilePath $modListPath -ModName $modName -ModDirectory $modDirectory -Placement End -RegisterEnabled -EvidenceDirectory $profileEvidence -BlockingProcessNames $blockingProcessNames -Confirm:$false | ConvertFrom-Json
+        if (-not $registration.enabled) { throw 'Stable source profile did not enable the migrated shader-cache mod.' }
+        $remaining = @(Get-OverwriteShaderCacheDirectories -Config $Config)
+        if ($remaining.Count -ne 0) { throw "Overwrite shader-cache postcondition failed; remaining: $($remaining.FullName -join ', ')" }
+        foreach ($move in $moves) {
+            if (Test-Path -LiteralPath ([string]$move.sourcePath)) { throw "Shader-cache source still exists after move: $($move.sourcePath)" }
+            if (-not (Test-Path -LiteralPath ([string]$move.destinationPath) -PathType Container)) { throw "Shader-cache destination is missing after move: $($move.destinationPath)" }
+            $after = Get-DirectorySummary -Path ([string]$move.destinationPath)
+            if ($after.files -ne $move.files -or $after.bytes -ne $move.bytes) { throw "Shader-cache move summary mismatch: $($move.relativePath)" }
+        }
+        $receipt = [pscustomobject][ordered]@{
+            contractVersion = '1.0.0'; operation = 'move-overwrite-shader-caches-to-stable-mod'
+            sourceProfile = $SourceName; sourceProfileDirectory = $SourcePath; overwriteDirectory = $overwriteRoot
+            modName = $modName; modDirectory = $modDirectory; movedDirectories = $moves
+            profileRegistrationReceipt = [string]$registration.receiptPath; completedUtc = [DateTime]::UtcNow.ToString('o')
+        }
+        Write-WorkspaceJsonAtomic -Path $receiptPath -Value $receipt
+        return [pscustomobject][ordered]@{
+            state = 'migrated'; sourceProfile = $SourceName; overwriteDirectory = $overwriteRoot
+            movedDirectories = $moves; modName = $modName; modDirectory = $modDirectory; receiptPath = $receiptPath
+        }
+    }
+    catch {
+        $failure = $_.Exception.Message
+        $rollbackErrors = @()
+        try { Write-WorkspaceBytesAtomic -Path $modListPath -Bytes $modListBefore } catch { $rollbackErrors += "modlist: $($_.Exception.Message)" }
+        foreach ($move in @($moves | Sort-Object { ([string]$_.relativePath).Length } -Descending)) {
+            if (Test-Path -LiteralPath ([string]$move.destinationPath) -PathType Container) {
+                try {
+                    $sourceParent = Split-Path -Parent ([string]$move.sourcePath)
+                    if (-not (Test-Path -LiteralPath $sourceParent -PathType Container)) { New-Item -ItemType Directory -Path $sourceParent -Force | Out-Null }
+                    [IO.Directory]::Move([string]$move.destinationPath, [string]$move.sourcePath)
+                }
+                catch { $rollbackErrors += "$($move.relativePath): $($_.Exception.Message)" }
+            }
+        }
+        try {
+            if ((Test-Path -LiteralPath $modDirectory -PathType Container) -and @(Get-ChildItem -LiteralPath $modDirectory -Force).Count -eq 0) { Remove-Item -LiteralPath $modDirectory -Force }
+        }
+        catch { $rollbackErrors += "mod directory: $($_.Exception.Message)" }
+        if ($rollbackErrors.Count -gt 0) { throw "Shader-cache migration failed. Rollback needs attention: $($rollbackErrors -join '; '). Original failure: $failure" }
+        throw "Shader-cache migration failed and was rolled back. $failure"
+    }
+}
+
 $resolvedConfig = $null
 try {
     $script:TreeOperationDeadlineUtc = if ($InternalTestFailurePoint -eq 'tree-operation-deadline') { [DateTime]::UtcNow.AddMilliseconds(-1) } else { [DateTime]::UtcNow.AddSeconds($TreeOperationTimeoutSeconds) }
@@ -1462,6 +1722,25 @@ try {
                 ownerTaskId = $resolvedTaskId; count = $workspaces.Count; workspaces = $workspaces
                 unavailableWorkspaces = @($allWorkspaces | Where-Object { -not $_.resumable })
                 guidance = if ($workspaces.Count -eq 0) { 'This task has no retained workspace. After acquiring MO2 access, explicitly create a fresh workspace.' } else { 'After acquiring MO2 access, explicitly resume one listed WorkspaceId or explicitly create a fresh workspace.' }
+            }
+        }
+    }
+    elseif ($Command -eq 'list-local-work-mods') {
+        $sourceName = if (-not [string]::IsNullOrWhiteSpace($SourceProfile)) { $SourceProfile } elseif ($config.defaults.PSObject.Properties['testProfileSource']) { [string]$config.defaults.testProfileSource } else { throw 'defaults.testProfileSource is required for local-work mod discovery.' }
+        $sourcePath = Resolve-DirectProfilePath -ProfilesRoot $profilesRoot -ProfileName $sourceName
+        if (-not (Test-Path -LiteralPath $sourcePath -PathType Container)) { throw "Stable source profile does not exist: $sourceName" }
+        $catalog = Get-LocalWorkModCatalog -Config $config -SourcePath $sourcePath -ModsRoot $modsRoot
+        $result = [pscustomobject][ordered]@{
+            ok = $true; command = $Command; state = $(if (-not $catalog.configured) { 'catalog-not-configured' } elseif (@($catalog.candidates | Where-Object available).Count -eq 0) { 'no-local-work-mods-available' } else { 'local-work-mods-found' })
+            data = [pscustomobject][ordered]@{
+                sourceProfile = $sourceName; sourceProfileDirectory = $sourcePath
+                catalog = $catalog; availableCount = @($catalog.candidates | Where-Object available).Count
+                requestContract = [pscustomobject][ordered]@{
+                    modlist = '-WorkspaceContent Modlist'
+                    modlistPlusLocalWorkMods = '-WorkspaceContent ModlistPlusLocalWorkMods -LocalWorkModId <exact-id>'
+                    multipleIdsFile = '-WorkspaceContent ModlistPlusLocalWorkMods -LocalWorkModIdsFile <json-string-array-path>'
+                    retainedWorkspace = 'Resume preserves the original selection; request a fresh create to change local-work mods.'
+                }
             }
         }
     }
@@ -1523,13 +1802,26 @@ try {
         $sourcePath = Resolve-DirectProfilePath -ProfilesRoot $profilesRoot -ProfileName $sourceName
         $null = Assert-AccessAndClosed -Config $config -OwnedAccessId $AccessId -Profile $sourceName -AllowOverwriteShaderCaches
         if (-not (Test-Path -LiteralPath $sourcePath -PathType Container)) { throw "Stable source profile does not exist: $sourceName" }
-        $preparation = [pscustomobject][ordered]@{
-            state = 'overwrite-preserved'; sourceProfile = $sourceName; sourceProfilePath = $sourcePath
-            overwritePath = [IO.Path]::GetFullPath([string]$config.mo2.overwriteDirectory)
-            shaderCacheDirectories = @(Get-OverwriteShaderCacheDirectories -Config $config | Select-Object -ExpandProperty FullName)
-            guidance = 'Source preparation no longer moves generated cache content. Workspace prepare snapshots and binds the exact MO2 Overwrite trees.'
+        $preparation = if ($PSCmdlet.ShouldProcess([string]$config.mo2.overwriteDirectory, "move every ShaderCache folder into a new enabled mod in stable profile '$sourceName'")) {
+            Move-OverwriteShaderCachesToStableMod -Config $config -SourceName $sourceName -SourcePath $sourcePath -ModsRoot $modsRoot
+        }
+        else {
+            Move-OverwriteShaderCachesToStableMod -Config $config -SourceName $sourceName -SourcePath $sourcePath -ModsRoot $modsRoot -WhatIf
         }
         $result = [pscustomobject][ordered]@{ ok = $true; command = $Command; state = [string]$preparation.state; data = $preparation }
+    }
+    elseif ($Command -eq 'create' -and -not $workspaceContentSupplied) {
+        $result = [pscustomobject][ordered]@{
+            ok = $false
+            command = $Command
+            state = 'missing-workspace-content'
+            errors = @("Command 'create' requires explicit -WorkspaceContent Modlist or ModlistPlusLocalWorkMods.")
+            data = [pscustomobject][ordered]@{
+                requiredParameter = 'WorkspaceContent'
+                allowedValues = @('Modlist', 'ModlistPlusLocalWorkMods')
+                supplied = $false
+            }
+        }
     }
     elseif ($Command -eq 'create') {
         $resolvedTaskId = Resolve-TaskId -RequestedTaskId $TaskId -Required
@@ -1537,6 +1829,10 @@ try {
         $sourcePath = Resolve-DirectProfilePath -ProfilesRoot $profilesRoot -ProfileName $sourceName
         $validation = Assert-AccessAndClosed -Config $config -OwnedAccessId $AccessId -Profile $sourceName -AllowOverwriteShaderCaches
         if (-not (Test-Path -LiteralPath $sourcePath -PathType Container)) { throw "Stable source profile does not exist: $sourceName" }
+        $unmanagedCaches = @(Get-OverwriteShaderCacheDirectories -Config $config)
+        if ($unmanagedCaches.Count -gt 0) { throw "Overwrite contains ShaderCache folders. Run prepare-source for '$sourceName' before creating a task workspace: $($unmanagedCaches.FullName -join ', ')" }
+        $localWorkCatalog = Get-LocalWorkModCatalog -Config $config -SourcePath $sourcePath -ModsRoot $modsRoot
+        $localWorkSelection = Resolve-LocalWorkModSelection -Catalog $localWorkCatalog -Content $WorkspaceContent -RequestedIds $resolvedLocalWorkModIds
         $workspaceId = '{0}-{1}-{2}' -f ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ').ToLowerInvariant()), (Get-SafeName $Label), ([guid]::NewGuid().ToString('N').Substring(0, 8))
         $ownershipId = [guid]::NewGuid().ToString('N')
         $profileName = 'Codex Task - ' + $workspaceId
@@ -1590,6 +1886,12 @@ try {
                 warranty = 'Exact source and save bytes were verified at clone creation. This does not assert a live game load. Resumed task profiles are preserved as-is and are not reverified after task edits.'
             }
             saveFixture = $fixture; sourceSaveSnapshot = $sourceSaveSnapshot; initialModNames = $initialMods; protectedSharedModNames = $initialMods; createdMods = @(); registeredMods = @(); inheritedSaves = $true
+            localWorkMods = [pscustomobject][ordered]@{
+                workspaceContent = [string]$localWorkSelection.workspaceContent; requestedIds = @($localWorkSelection.requestedIds)
+                selected = @($localWorkSelection.selected); disabledCandidateIds = @($localWorkSelection.disabledCandidateIds)
+                catalog = [pscustomobject][ordered]@{ configured = [bool]$localWorkCatalog.configured; path = $localWorkCatalog.path; sha256 = $localWorkCatalog.sha256; contractVersion = $localWorkCatalog.contractVersion }
+                application = $null
+            }
             creationJournalPath = $creationJournalPath
             runtimeOutput = [pscustomobject][ordered]@{
                 state = 'planned'; mode = 'mo2-overwrite-output'; executable = $runtimeExecutable
@@ -1652,6 +1954,8 @@ try {
                         Copy-Item -LiteralPath ([string]$file.fullPath) -Destination $target
                         Assert-TreeOperationBudget -Purpose 'Stable source profile copy'
                     }
+                    $localWorkApplication = Set-LocalWorkModSelection -ModListPath (Join-Path $profilePath 'modlist.txt') -Catalog $localWorkCatalog -Selection $localWorkSelection
+                    $manifest.localWorkMods.application = $localWorkApplication
                     New-Item -ItemType Directory -Path (Join-Path $profilePath 'saves') -Force | Out-Null
                     $profileSaveSnapshot = Get-SaveTreeSnapshot -ProfilePath $profilePath
                     if ([string]$profileSaveSnapshot.sha256 -cne [string]$sourceSaveSnapshot.sha256 -or [int]$profileSaveSnapshot.fileCount -ne [int]$sourceSaveSnapshot.fileCount) { throw 'Complete source save-tree copy verification failed.' }
@@ -1721,7 +2025,7 @@ try {
                     if (-not $backupSnapshot.ok) { throw "Could not snapshot MO2 Overwrite backup: $($backupSnapshot.errors -join '; ')" }
                     $backupSnapshotCreated = $true
                     $null = Assert-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -ExpectedSha256 $runtimeMarkerHash -WorkspaceId $workspaceId -OwnershipId $ownershipId -OverwritePath $runtimeOutputPath
-                    $backupProviders = & $transactionTool providers -ProfilePath (Join-Path $profilePath 'modlist.txt') -ModsPath $modsRoot -RelativeCachePath 'backup' -DeepInventory -NoExit -Confirm:$false | ConvertFrom-Json
+                    $backupProviders = & $transactionTool providers -ProfilePath (Join-Path $profilePath 'modlist.txt') -ModsPath $modsRoot -RelativeCachePath 'backup' -DeepInventory -IncludeInventoryEntries -NoExit -Confirm:$false | ConvertFrom-Json
                     if (-not $backupProviders.ok) { throw "Could not inspect the task profile's backup providers: $($backupProviders.errors -join '; ')" }
                     $null = Assert-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -ExpectedSha256 $runtimeMarkerHash -WorkspaceId $workspaceId -OwnershipId $ownershipId -OverwritePath $runtimeOutputPath
                     $backupShadow = Copy-WorkspaceProviderTreeShadow -ProviderResult $backupProviders -TargetPath $runtimeBackupPath -RelativePath 'backup' -Purpose 'MO2 Overwrite backup provider union'
@@ -1826,6 +2130,7 @@ try {
         }
         elseif ($WhatIfPreference) {
             $selectionEvidence = Join-Path (Split-Path -Parent $manifestPath) ($workspaceId + '-create-select')
+            $manifest.localWorkMods.application = [pscustomobject][ordered]@{ state = 'planned'; requestedIds = @($localWorkSelection.requestedIds); candidateCount = @($localWorkCatalog.candidates).Count }
             $manifest | Add-Member -NotePropertyName selectedProfileTransaction -NotePropertyValue (Set-MO2SelectedProfile -Config $config -TargetProfile $profileName -Operation 'select-created-task-workspace' -EvidenceRoot $selectionEvidence -WhatIf)
         }
         $result = [pscustomobject][ordered]@{ ok = $true; command = $Command; state = $(if ($WhatIfPreference) { 'dry-run' } else { 'workspace-ready' }); data = $manifest }

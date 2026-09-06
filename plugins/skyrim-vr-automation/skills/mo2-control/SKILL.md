@@ -52,6 +52,10 @@ are:
    verified, and selected. On later requests, require an explicit
    `resume -TaskId -WorkspaceId` or fresh `create -TaskId`. Never silently
    replace, refresh, or requalify a retained profile after task-local edits.
+   Before fresh creation, run `list-local-work-mods`; pass
+   `-WorkspaceContent Modlist` for no local build, or
+   `ModlistPlusLocalWorkMods` plus exact available candidate IDs. Resume
+   preserves the original selection.
    Before any closed-state mutation, run `validate -AccessId <literal-access-id>
    -RequireClosed` and account for every warning or block.
 3. Use `-WhatIf` when the command supports it and the requested change has not

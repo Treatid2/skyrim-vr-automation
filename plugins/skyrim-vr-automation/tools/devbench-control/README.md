@@ -38,6 +38,13 @@ equivalents). The controller queries the CSX registry bridge and hashes the
 deployed DLL, binding source build, physical artifact, endpoint, and process in
 one evidence record.
 
+Mutation-capable calls require that complete identity. The controller keeps a
+strict, action-sensitive allowlist for read-only inspection: built-in
+`inspect` kinds, `menu list`, `record status`, and tracked-input
+observation/status. Those calls may proceed when listener and process identity
+are verified even if build or deployed-artifact provenance is unavailable.
+They do not broaden the mutation boundary.
+
 `ok` reflects transport success unless `-RequireSuccess` is supplied. Every
 call also reports `transportOk` and a normalized `semantic` result, so an API
 payload such as `idempotency_conflict` cannot be mistaken for successful work.
@@ -46,6 +53,10 @@ its legacy response does not carry a generic top-level `ok`: `status` must
 contain a frame-bearing status object, while `enable` and `disable` must report
 the requested observed state. This keeps profiler collection fail-closed
 without misclassifying a valid bridge response as unknown.
+Structured responses from allowlisted read-only calls establish a successful
+read contract. `record start` has a separate adapter that requires
+`action=start`, `recording=true`, and the requested correlation ID before
+`-RequireSuccess` accepts the result.
 Replay completion receipts containing only scheduler facts such as `done`,
 `runId`, and `stepsRun` are classified as
 `scheduler-complete-unverified`, not semantic success. A replay response must
@@ -78,8 +89,10 @@ the explicitly listed `-IgnoredMenus` (HUD by default), and always reports the
 actual timeout and final observation. This avoids the server-side `noMenu`
 condition being held open forever by Skyrim's permanent HUD menu.
 
-`mainMenuReady` instead requires `Main Menu` to be open and rejects every menu
-outside `-AllowedMainMenuMenus` (HUD and Main Menu by default). It represents a
+`mainMenuReady` instead requires `Main Menu` to be open, permits Skyrim VR's
+normal `Mist Menu` and `Fader Menu` overlays, and rejects every other menu
+outside `-AllowedMainMenuMenus` (HUD, Main Menu, Mist Menu, and Fader Menu by
+default). It represents a
 usable front-end state without pretending that Skyrim's persistent menus have
 closed.
 
