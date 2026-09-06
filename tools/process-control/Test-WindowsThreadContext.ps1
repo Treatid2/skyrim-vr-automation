@@ -63,6 +63,7 @@ try {
             $capture.capturedSamples -ne 2 -or
             $capture.identity.processId -ne $helper.Id -or
             $capture.identity.threadId -ne $thread.Id -or
+            [string]::IsNullOrWhiteSpace([string]$capture.identity.threadStartTimeUtc) -or
             $capture.records[0].rip -notmatch '^0x[0-9A-F]+$' -or
             $capture.records[0].rsp -notmatch '^0x[0-9A-F]+$') {
             throw "Thread-context capture returned an invalid contract under '$hostPath'."
@@ -97,6 +98,7 @@ try {
         ok = $true
         testedHosts = @($results)
         identityMismatchGuard = $true
+        perSampleThreadIdentityGuard = $true
     } | ConvertTo-Json -Depth 5
 }
 finally {

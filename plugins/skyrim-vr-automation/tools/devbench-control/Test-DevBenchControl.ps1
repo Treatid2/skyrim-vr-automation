@@ -110,6 +110,7 @@ function New-TestRenderScaleStatus([bool]$RenderScale = $true) {
     $presentationEye = { param([uint32]$Frame) [pscustomobject]@{ frame = $Frame; valid = $true; path = 'VendorEvaluated'; loadingOrMenuContext = $false; transitionCooldown = $false } }
     [pscustomobject]@{
         frame = 105
+        upscalingSnapshot = [pscustomobject]@{ stateRevision = 12 }
         modeStatus = $(if ($RenderScale) { 'Active' } else { 'Disabled' })
         vendorWorkGate = [pscustomobject]@{
             active = $false; completedWorldFrame = $true; loadingMenu = $false; loadingPresentationActive = $false
@@ -146,6 +147,7 @@ function New-TestRenderScaleStatus([bool]$RenderScale = $true) {
 
 $renderProfile = New-TestUpscalingProfile
 $renderSnapshot = [pscustomobject]@{
+    stateRevision = 12
     profilePresence = 27; flags = 57; activeOperationId = 0
     transitionState = [pscustomobject]@{ name = 'active'; value = 6 }
     renderScaleStatus = [pscustomobject]@{ name = 'active'; value = 5 }
@@ -172,6 +174,7 @@ function New-TestNativeSnapshot {
     if ($null -eq $EffectiveProfile) { $EffectiveProfile = $RequestedProfile }
     if ($null -eq $StableProfile) { $StableProfile = $EffectiveProfile }
     [pscustomobject]@{
+        stateRevision = 12
         profilePresence = $ProfilePresence; flags = 1; activeOperationId = 0
         transitionState = [pscustomobject]@{ name = $TransitionState; value = $(if ($TransitionState -eq 'active') { 6 } else { 0 }) }
         renderScaleStatus = [pscustomobject]@{ name = 'disabled'; value = 0 }
@@ -209,6 +212,19 @@ $mismatchedProfile = New-TestUpscalingProfile -Method 'fsr' -RenderScale $false
 $nativeMismatchSnapshot = New-TestNativeSnapshot -RequestedProfile $mismatchedProfile -EffectiveProfile $nativeProfile -StableProfile $nativeFsrProfile -ProfilePresence 27
 $nativeMismatch = Test-DevBenchUpscalingStable -UpscalingSnapshot $nativeMismatchSnapshot -RenderScaleStatus (New-TestRenderScaleStatus -RenderScale $false)
 Assert-Test (-not $nativeMismatch.satisfied -and $nativeMismatch.reasons -contains 'requested and effective profiles differ') 'native-resolution stability rejects profile divergence'
+$statusProfileMismatch = New-TestRenderScaleStatus
+$mismatchedPhysicalSnapshot = $renderSnapshot | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+$mismatchedPhysicalSnapshot.renderScaleStatus = [pscustomobject]@{ name = 'disabled'; value = 0 }
+$renderStatusMismatch = Test-DevBenchUpscalingStable -UpscalingSnapshot $mismatchedPhysicalSnapshot -RenderScaleStatus $statusProfileMismatch
+Assert-Test (-not $renderStatusMismatch.satisfied -and $renderStatusMismatch.reasons -contains 'render-scale status disagrees with the effective profile') 'physical render-scale status must agree with the effective profile'
+$revisionMismatchStatus = New-TestRenderScaleStatus
+$revisionMismatchStatus.upscalingSnapshot.stateRevision = 13
+$revisionMismatch = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus $revisionMismatchStatus
+Assert-Test (-not $revisionMismatch.satisfied -and $revisionMismatch.reasons -contains 'upscaling and render-scale observations are not revision-correlated') 'cross-RPC upscaling evidence requires a shared state revision'
+$invalidExpectedProfile = New-TestUpscalingProfile -RenderScale $false
+$invalidExpectedProfile.renderScaleMode = 'false'
+$invalidExpected = Test-DevBenchUpscalingStable -UpscalingSnapshot (New-TestNativeSnapshot -RequestedProfile $nativeProfile) -RenderScaleStatus (New-TestRenderScaleStatus -RenderScale $false) -ExpectedProfile $invalidExpectedProfile
+Assert-Test (-not $invalidExpected.satisfied -and $invalidExpected.reasons -contains 'the expected upscaling profile has invalid field types') 'expected profile boolean fields reject truthy strings'
 $missingSnapshotFields = Test-DevBenchUpscalingStable -UpscalingSnapshot ([pscustomobject]@{}) -RenderScaleStatus ([pscustomobject]@{})
 Assert-Test (-not $missingSnapshotFields.satisfied -and $missingSnapshotFields.reasons -contains 'render-scale controller telemetry is missing') 'missing optional snapshot fields fail closed without a strict-mode exception'
 
@@ -351,13 +367,18 @@ Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$Command -eq ''wait
 Assert-Test ($entryPointText -match 'function Close-McpSession') 'entry point defines deterministic MCP session cleanup'
 Assert-Test ($entryPointText -match '-Method Delete') 'owned MCP sessions are closed through the server lifecycle endpoint'
 Assert-Test ($entryPointText -match "state = 'already_absent'") 'an already-retired MCP session is a successful cleanup'
-Assert-Test ($entryPointText -match 'Close-McpSession -Endpoint \$endpoint -Headers \$sessionHeaders') 'partially opened MCP sessions are cleaned before rethrowing'
+Assert-Test ($entryPointText -match 'Close-OwnedMcpSession -Endpoint \$endpoint -Headers \$sessionHeaders') 'partially opened MCP sessions are cleaned before rethrowing'
 Assert-Test ($entryPointText -match 'Add-Member -NotePropertyName sessionCleanup') 'controller results preserve a structured session cleanup receipt'
 Assert-Test ($entryPointText -match "clientInfo = @\{ name = 'DevBenchControl'; version = '1\.5' \}") 'MCP client identity records the timeout-envelope revision'
 Assert-Test ($entryPointText -match '\[int\]\$RequestTimeoutSeconds = 15') 'controller exposes its default request timeout'
 Assert-Test ($entryPointText -match '\$arguments\.ContainsKey\(''timeoutMs''\)') 'controller detects a server-owned timeout budget'
 Assert-Test ($entryPointText -match 'Ceiling\(\$serverTimeoutMilliseconds / 1000\.0\)') 'controller converts the server budget without truncation'
 Assert-Test ($entryPointText -match '\$serverTimeoutSeconds \+ 5') 'controller keeps a five-second receipt envelope beyond the server budget'
+Assert-Test ($entryPointText -match '\$script:operationDeadlineUtc = \[DateTime\]::UtcNow.AddSeconds\(\$requiredOperationSeconds\)') 'server-owned waits extend the actual operation deadline before dispatch'
+Assert-Test ($entryPointText -match 'operationDeadlineUtc = \$script:operationDeadlineUtc.ToString') 'receipts expose the effective operation deadline'
+Assert-Test ($entryPointText -match 'function Close-AllMcpSessions') 'controller retains cleanup evidence for every issued MCP session'
+Assert-Test ($entryPointText -match 'Close-McpSessionForRebind') 'session rebind requires a successful prior cleanup reconciliation'
+Assert-Test ($entryPointText -match 'method = ''tools/list''[\s\S]{0,400}currentTools') 'performance boundaries refresh the live tool registry'
 Assert-Test ($entryPointText -match 'function Invoke-ToolRpc[\s\S]{0,300}Invoke-McpRequest') 'tool calls use the shared deadline-bounded request path'
 Assert-Test ($entryPointText -match 'requestTimeoutSeconds = \$script:requestTimeoutSecondsForRpc') 'receipts expose the effective request timeout'
 Assert-Test ($entryPointText -match '\[string\]\$EvidenceLabel') 'runtime binding evidence accepts an explicit invocation label'

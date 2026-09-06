@@ -624,6 +624,25 @@ function Get-DevBenchRenderScalePreparationTelemetry {
     }
 }
 
+function Test-DevBenchUpscalingProfileShape {
+    [CmdletBinding()]
+    param($Profile)
+
+    if ($null -eq $Profile -or $Profile -is [string] -or
+        $Profile -is [ValueType]) {
+        return $false
+    }
+    foreach ($name in @('method', 'qualityMode', 'dlssProfile', 'fsrRuntime')) {
+        $property = $Profile.PSObject.Properties[$name]
+        if (-not $property -or $null -eq $property.Value -or
+            [string]::IsNullOrWhiteSpace([string](Get-DevBenchNamedValue $property.Value))) {
+            return $false
+        }
+    }
+    $renderScaleMode = $Profile.PSObject.Properties['renderScaleMode']
+    return $null -ne $renderScaleMode -and $renderScaleMode.Value -is [bool]
+}
+
 function Test-DevBenchUpscalingProfilesEqual {
     [CmdletBinding()]
     param(
@@ -631,6 +650,10 @@ function Test-DevBenchUpscalingProfilesEqual {
         [Parameter(Mandatory)]$Right
     )
 
+    if (-not (Test-DevBenchUpscalingProfileShape $Left) -or
+        -not (Test-DevBenchUpscalingProfileShape $Right)) {
+        return $false
+    }
     foreach ($name in @('method', 'qualityMode', 'renderScaleMode', 'dlssProfile', 'fsrRuntime')) {
         $leftProperty = $Left.PSObject.Properties[$name]
         $rightProperty = $Right.PSObject.Properties[$name]
@@ -669,9 +692,11 @@ function Test-DevBenchUpscalingStable {
     $hasRequested = ($profilePresence -band [uint32]0x2) -ne 0 -and $null -ne $requestedProfile
     $hasEffective = ($profilePresence -band [uint32]0x8) -ne 0 -and $null -ne $effectiveProfile
     $hasStable = ($profilePresence -band [uint32]0x10) -ne 0 -and $null -ne $stableProfile
+    $expectedProfileValid = $null -eq $ExpectedProfile -or
+        (Test-DevBenchUpscalingProfileShape $ExpectedProfile)
+    Require-StableValue $expectedProfileValid 'the expected upscaling profile has invalid field types'
     $expectsNativeProfile = $null -ne $ExpectedProfile -and
-        $ExpectedProfile.PSObject.Properties['renderScaleMode'] -and
-        -not [bool]$ExpectedProfile.renderScaleMode
+        $expectedProfileValid -and -not $ExpectedProfile.renderScaleMode
     $criticalConditions = @(
         'loading_transition', 'relatch_pending', 'transition_pending',
         'first_world_frame_pending', 'post_load_recovery',
@@ -717,12 +742,25 @@ function Test-DevBenchUpscalingStable {
         $null -ne $renderEyeHeight -and [uint32]$renderEyeHeight -gt 0
     ) 'upscaling dimensions are not materialized'
 
-    $method = if ($hasEffective) { Get-DevBenchNamedValue $effectiveProfile.method } else { $null }
+    $effectiveProfileValid = $hasEffective -and
+        (Test-DevBenchUpscalingProfileShape $effectiveProfile)
+    Require-StableValue (-not $hasEffective -or $effectiveProfileValid) 'the effective upscaling profile has invalid field types'
+    $method = if ($effectiveProfileValid) { Get-DevBenchNamedValue $effectiveProfile.method } else { $null }
     $qualityMode = if ($hasEffective) { Get-DevBenchNamedValue $effectiveProfile.qualityMode } else { $null }
-    $effectiveRenderScaleMode = if ($hasEffective) { [bool]$effectiveProfile.renderScaleMode } else { $false }
+    $effectiveRenderScaleMode = if ($effectiveProfileValid) { $effectiveProfile.renderScaleMode } else { $false }
     $dlssProfile = if ($hasEffective) { Get-DevBenchNamedValue $effectiveProfile.dlssProfile } else { $null }
     $fsrRuntime = if ($hasEffective) { Get-DevBenchNamedValue $effectiveProfile.fsrRuntime } else { $null }
     $frame = Get-DevBenchTelemetryMember $renderStatus 'frame'
+    $snapshotRevision = Get-DevBenchTelemetryMember $snapshot 'stateRevision'
+    $correlatedSnapshot = Get-DevBenchTelemetryMember $renderStatus 'upscalingSnapshot'
+    $correlatedRevision = Get-DevBenchTelemetryMember $correlatedSnapshot 'stateRevision'
+    Require-StableValue (
+        $null -ne $snapshotRevision -and $null -ne $correlatedRevision -and
+        [uint64]$snapshotRevision -eq [uint64]$correlatedRevision
+    ) 'upscaling and render-scale observations are not revision-correlated'
+    if ($effectiveProfileValid) {
+        Require-StableValue ($renderScaleActive -eq $effectiveRenderScaleMode) 'render-scale status disagrees with the effective profile'
+    }
     $controller = Get-DevBenchTelemetryMember $renderStatus 'controller'
     $gate = Get-DevBenchTelemetryMember $renderStatus 'vendorWorkGate'
     if ($null -eq $controller -or $null -eq $gate) {
@@ -1074,4 +1112,4 @@ function Test-DevBenchPerformanceWindow {
     }
 }
 
-Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow
+Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow

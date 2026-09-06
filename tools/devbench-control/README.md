@@ -103,18 +103,19 @@ save availability.
 `call` uses a 15-second request timeout by default. When the top-level tool
 arguments contain `timeoutMs`, the controller automatically raises the request
 timeout to at least `ceil(timeoutMs / 1000) + 5` seconds and reports the
-effective value as `requestTimeoutSeconds`. This transport envelope does not
-extend the server's measurement deadline; it only leaves bounded time for the
-terminal receipt to return. Use `-MaxTransientRetries 0` for ownership-bearing
+effective value as `requestTimeoutSeconds`. It also extends the actual operation
+deadline to cover that server budget plus the receipt allowance, and reports
+the effective deadline and duration. This does not extend the server's own
+measurement deadline. Use `-MaxTransientRetries 0` for ownership-bearing
 or otherwise non-replayable actions. If their response is lost, recover their
 existing owner/status instead of sending the action again.
 
-Each controller invocation closes its owned Streamable HTTP MCP session before
-returning and reports the outcome under `sessionCleanup`. This prevents serial
-protocol steps from exhausting DevBench's bounded session table. A cleanup 404
-means the server already retired the session and is successful. Any other
-cleanup failure remains diagnostic evidence but does not replace the primary
-call or wait result.
+Each controller invocation tracks every Streamable HTTP MCP session it opens,
+closes all of them before returning, and reports every outcome under
+`sessionCleanup.sessions`. This prevents retries from leaking an earlier
+session and exhausting DevBench's bounded session table. A cleanup 404 means
+the server already retired the session and is successful. A wait will not bind
+a replacement session while cleanup of the prior session is uncertain.
 
 `wait -Condition noBlockingMenu` polls the menu tool client-side, ignores only
 the explicitly listed `-IgnoredMenus` (HUD by default), and always reports the
@@ -174,7 +175,11 @@ a new load transition.
 
 `upscalingStable` is the fail-closed barrier for paced cell-transition tests.
 It requires the exact `-ExpectedCell`, a loaded player, no blocking menu, and a
-CSX profile that remains unchanged across advancing frames. The destination's
+CSX profile that remains unchanged across advancing frames. Its public API
+snapshot must share a state revision with the render-scale diagnostic snapshot,
+and the physical render-scale status must agree with the effective profile.
+Expected profiles use typed fields; JSON strings cannot stand in for booleans.
+The destination's
 requested settings determine the method, quality, and render-scale state; the
 barrier does not impose a profile. When render-scale is active it additionally
 requires its physical contract to be latched and active, both

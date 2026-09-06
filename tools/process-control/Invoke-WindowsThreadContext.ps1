@@ -62,6 +62,12 @@ namespace SkyrimVRAutomation.LiveThreadContext
         [DllImport("kernel32.dll", SetLastError=true)]
         public static extern uint ResumeThread(IntPtr thread);
 
+        [DllImport("kernel32.dll")]
+        public static extern uint GetProcessIdOfThread(IntPtr thread);
+
+        [DllImport("kernel32.dll")]
+        public static extern uint GetCurrentThreadId();
+
         [DllImport("kernel32.dll", SetLastError=true)]
         public static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
 
@@ -114,11 +120,19 @@ try {
         throw 'The live process does not match the expected path and start-time identity.'
     }
 
+    $currentThreadId = [SkyrimVRAutomation.LiveThreadContext.NativeMethods]::GetCurrentThreadId()
+    if ([uint32]$ThreadId -eq $currentThreadId) {
+        $state = 'thread-mismatch'
+        throw "Refusing to suspend the sampler's current thread '$ThreadId'."
+    }
+
     $threadMatches = @($process.Threads | Where-Object Id -eq $ThreadId)
     if ($threadMatches.Count -ne 1) {
         $state = 'thread-mismatch'
         throw "Thread '$ThreadId' is not owned exactly once by process '$ProcessId'."
     }
+    $expectedThreadStartTimeUtc = $threadMatches[0].StartTime.ToUniversalTime()
+    $identity | Add-Member -NotePropertyName threadStartTimeUtc -NotePropertyValue $expectedThreadStartTimeUtc.ToString('o')
 
     $modules = @($process.Modules | ForEach-Object {
         $moduleSize = [Int64]$_.ModuleMemorySize
@@ -155,6 +169,22 @@ try {
             [UInt32]$ThreadId)
         if ($threadHandle -eq [IntPtr]::Zero) {
             throw "OpenThread failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+        }
+
+        $threadOwner = [SkyrimVRAutomation.LiveThreadContext.NativeMethods]::GetProcessIdOfThread($threadHandle)
+        if ($threadOwner -ne [uint32]$ProcessId) {
+            [SkyrimVRAutomation.LiveThreadContext.NativeMethods]::CloseHandle($threadHandle) | Out-Null
+            $state = 'thread-mismatch'
+            throw "Thread '$ThreadId' is now owned by process '$threadOwner', not '$ProcessId'."
+        }
+        $liveProcess = Get-Process -Id $ProcessId -ErrorAction Stop
+        $liveThread = @($liveProcess.Threads | Where-Object Id -eq $ThreadId)
+        if ($liveThread.Count -ne 1 -or
+            $liveProcess.StartTime.ToUniversalTime().Ticks -ne $expectedStartUtc.Ticks -or
+            $liveThread[0].StartTime.ToUniversalTime().Ticks -ne $expectedThreadStartTimeUtc.Ticks) {
+            [SkyrimVRAutomation.LiveThreadContext.NativeMethods]::CloseHandle($threadHandle) | Out-Null
+            $state = 'thread-mismatch'
+            throw "Thread '$ThreadId' identity changed before sample '$sample'."
         }
 
         $allocation = [Runtime.InteropServices.Marshal]::AllocHGlobal($contextBytes + 16)

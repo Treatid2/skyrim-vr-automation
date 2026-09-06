@@ -63,9 +63,11 @@ $endpoint = $null
 $headers = $null
 $runtimeIdentity = $null
 $transportRetries = [Collections.Generic.List[object]]::new()
+$ownedMcpSessions = [Collections.Generic.List[object]]::new()
 $invocationEvidencePath = $null
 $invocationRecord = $null
 $operationDeadlineUtc = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+$effectiveOperationTimeoutSeconds = $TimeoutSeconds
 Import-Module (Join-Path $PSScriptRoot 'DevBenchControl.psm1') -Force
 $script:requestTimeoutSecondsForRpc = $RequestTimeoutSeconds
 
@@ -123,6 +125,9 @@ function Initialize-InvocationEvidence {
         requestedArguments = if ($Command -eq 'call') { $ArgumentsJson } else { $null }
         requestedArgumentsSha256 = if ($Command -eq 'call') { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($ArgumentsJson))) } else { $null }
         requestMode = if ($Command -eq 'call') { 'unclassified' } else { $null }
+        requestedOperationTimeoutSeconds = $TimeoutSeconds
+        effectiveOperationTimeoutSeconds = $effectiveOperationTimeoutSeconds
+        operationDeadlineUtc = $script:operationDeadlineUtc.ToString('o')
         commandId = $null
         workspaceManifestPath = if ([string]::IsNullOrWhiteSpace($WorkspaceManifestPath)) { $null } else { [IO.Path]::GetFullPath($WorkspaceManifestPath) }
         workspaceManifestSha256 = if (-not [string]::IsNullOrWhiteSpace($WorkspaceManifestPath) -and (Test-Path -LiteralPath $WorkspaceManifestPath -PathType Leaf)) { (Get-FileHash -LiteralPath $WorkspaceManifestPath -Algorithm SHA256).Hash } else { $null }
@@ -144,6 +149,8 @@ function Update-InvocationEvidence {
     $script:invocationRecord.state = $State
     $script:invocationRecord.endpoint = $endpoint
     $script:invocationRecord.runtimeIdentity = $runtimeIdentity
+    $script:invocationRecord.effectiveOperationTimeoutSeconds = $effectiveOperationTimeoutSeconds
+    $script:invocationRecord.operationDeadlineUtc = $script:operationDeadlineUtc.ToString('o')
     $script:invocationRecord.transportRetries = @($transportRetries)
     $script:invocationRecord.semantic = $Semantic
     $script:invocationRecord.data = $Data
@@ -336,7 +343,14 @@ function Invoke-ToolRpc {
 function Get-PerformanceMeasurementGuard {
     param([object[]]$Tools, [hashtable]$Headers)
     $probeTool = 'skyrimvrupscaler.temporalProbe'
-    $probeToolCount = @($Tools | Where-Object name -eq $probeTool).Count
+    $registry = Invoke-McpRequest -Endpoint $endpoint -Headers $Headers -Payload @{
+        jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/list'; params = @{}
+    }
+    if ($registry.json.PSObject.Properties['error']) {
+        throw "DevBench tools/list failed while qualifying performance state: $($registry.json.error | ConvertTo-Json -Compress)"
+    }
+    $currentTools = @($registry.json.result.tools)
+    $probeToolCount = @($currentTools | Where-Object name -eq $probeTool).Count
     if ($probeToolCount -eq 0) {
         return [pscustomobject][ordered]@{
             applicable = $false
@@ -346,6 +360,8 @@ function Get-PerformanceMeasurementGuard {
             physicalStateKnown = $true
             reason = 'standalone-temporal-probe-not-registered'
             tool = $probeTool
+            registryToolCount = $currentTools.Count
+            registryObservedUtc = [DateTime]::UtcNow.ToString('o')
         }
     }
     if ($probeToolCount -ne 1) {
@@ -361,6 +377,8 @@ function Get-PerformanceMeasurementGuard {
         physicalStateKnown = [bool]$assessment.physicalStateKnown
         reason = [string]$assessment.reason
         tool = $probeTool
+        registryToolCount = $currentTools.Count
+        registryObservedUtc = [DateTime]::UtcNow.ToString('o')
     }
 }
 
@@ -408,6 +426,43 @@ function Close-McpSession {
     }
 }
 
+function Close-OwnedMcpSession {
+    param([string]$Endpoint, [hashtable]$Headers)
+    $sessionId = if ($null -ne $Headers -and $Headers.ContainsKey('Mcp-Session-Id')) {
+        [string]$Headers['Mcp-Session-Id']
+    } else { $null }
+    $owned = @($ownedMcpSessions | Where-Object sessionId -eq $sessionId | Select-Object -Last 1)
+    if ($owned.Count -eq 1 -and $null -ne $owned[0].cleanup) { return $owned[0].cleanup }
+    $cleanup = Close-McpSession -Endpoint $Endpoint -Headers $Headers
+    if ($owned.Count -eq 1) { $owned[0].cleanup = $cleanup }
+    return $cleanup
+}
+
+function Close-AllMcpSessions {
+    $cleanups = [Collections.Generic.List[object]]::new()
+    foreach ($owned in @($ownedMcpSessions)) {
+        if ($null -eq $owned.cleanup) {
+            $owned.cleanup = Close-McpSession -Endpoint $endpoint -Headers $owned.headers
+        }
+        $cleanups.Add($owned.cleanup)
+    }
+    return [pscustomobject][ordered]@{
+        attempted = $cleanups.Count -gt 0
+        ok = @($cleanups | Where-Object { -not $_.ok }).Count -eq 0
+        state = if ($cleanups.Count -eq 0) { 'not_opened' } elseif (@($cleanups | Where-Object { -not $_.ok }).Count -gt 0) { 'cleanup_failed' } else { 'all_closed' }
+        sessions = @($cleanups)
+    }
+}
+
+function Close-McpSessionForRebind {
+    param([hashtable]$Headers)
+    $cleanup = Close-OwnedMcpSession -Endpoint $endpoint -Headers $Headers
+    if (-not $cleanup.ok) {
+        throw "DevBench MCP session '$($cleanup.sessionId)' could not be reconciled before rebind: $($cleanup.error)"
+    }
+    return $cleanup
+}
+
 function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
     $baseHeaders = @{ Accept = 'application/json, text/event-stream'; 'Content-Type' = 'application/json' }
     $sessionHeaders = $null
@@ -421,6 +476,12 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
         $sessionId = if ($sessionHeader -is [array]) { [string]$sessionHeader[0] } else { [string]$sessionHeader }
         if ([string]::IsNullOrWhiteSpace($sessionId)) { throw 'DevBench did not return an MCP session ID.' }
         $sessionHeaders = @{ Accept = 'application/json, text/event-stream'; 'Content-Type' = 'application/json'; 'Mcp-Session-Id' = $sessionId }
+        $ownedMcpSessions.Add([pscustomobject][ordered]@{
+            sessionId = $sessionId
+            headers = $sessionHeaders
+            openedUtc = [DateTime]::UtcNow.ToString('o')
+            cleanup = $null
+        })
         Invoke-WebRequest -UseBasicParsing -Method Post -Uri $endpoint -Headers $sessionHeaders -Body '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' -TimeoutSec (Get-RequestTimeoutSeconds) | Out-Null
         $listRpc = Invoke-McpRequest -Endpoint $endpoint -Headers $sessionHeaders -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/list'; params = @{} }
         if ($listRpc.json.PSObject.Properties['error']) { throw "DevBench tools/list failed: $($listRpc.json.error | ConvertTo-Json -Compress)" }
@@ -434,7 +495,12 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
     }
     catch {
         if ($null -ne $sessionHeaders) {
-            Close-McpSession -Endpoint $endpoint -Headers $sessionHeaders | Out-Null
+            $partialCleanup = Close-OwnedMcpSession -Endpoint $endpoint -Headers $sessionHeaders
+            if (-not $partialCleanup.ok) {
+                throw [InvalidOperationException]::new(
+                    "DevBench MCP initialization failed and session '$($partialCleanup.sessionId)' cleanup is uncertain; refusing automatic rebind. $($partialCleanup.error)",
+                    $_.Exception)
+            }
         }
         throw
     }
@@ -620,6 +686,11 @@ try {
                     $RequestTimeoutSeconds,
                     $serverTimeoutSeconds + 5
                 )
+                $requiredOperationSeconds = $serverTimeoutSeconds + 5
+                if ($requiredOperationSeconds -gt $effectiveOperationTimeoutSeconds) {
+                    $effectiveOperationTimeoutSeconds = $requiredOperationSeconds
+                    $script:operationDeadlineUtc = [DateTime]::UtcNow.AddSeconds($requiredOperationSeconds)
+                }
             }
         }
     }
@@ -738,6 +809,9 @@ try {
                     throw "ExpectedProfileJson requires '$name'."
                 }
             }
+            if (-not (Test-DevBenchUpscalingProfileShape $expectedUpscalingProfile)) {
+                throw 'ExpectedProfileJson fields have invalid types; renderScaleMode must be a JSON boolean and the named profile fields must be non-empty.'
+            }
         }
         $requiredTools = switch ($Condition) {
             { $_ -in @('noBlockingMenu', 'mainMenuReady') } { @('menu') }
@@ -803,6 +877,7 @@ try {
                 }
                 catch {
                     if (-not (Test-WaitRetryableException -Exception $_.Exception)) { throw }
+                    Close-McpSessionForRebind -Headers $headers | Out-Null
                     $headers = $null
                     $observation = [pscustomobject][ordered]@{ satisfied = $false; retryable = $true; phase = 'tools-list'; probeError = $_.Exception.Message }
                     Start-OperationDelay -RequestedMilliseconds $currentDelay
@@ -845,6 +920,7 @@ try {
                 }
                 catch {
                     if (-not (Test-WaitRetryableException -Exception $_.Exception)) { throw }
+                    Close-McpSessionForRebind -Headers $headers | Out-Null
                     $headers = $null
                     $observation = [pscustomobject][ordered]@{ satisfied = $false; retryable = $true; probeError = $_.Exception.Message }
                 }
@@ -878,6 +954,7 @@ try {
                 }
                 catch {
                     if (-not (Test-WaitRetryableException -Exception $_.Exception)) { throw }
+                    Close-McpSessionForRebind -Headers $headers | Out-Null
                     $headers = $null
                     $observation = [pscustomobject][ordered]@{ satisfied = $false; state = $null; retryable = $true; probeError = $_.Exception.Message }
                 }
@@ -987,6 +1064,7 @@ try {
                     }
                     catch {
                         if (-not (Test-WaitRetryableException -Exception $_.Exception)) { throw }
+                        Close-McpSessionForRebind -Headers $headers | Out-Null
                         $headers = $null
                         $service = [pscustomobject][ordered]@{
                             ready = $false
@@ -1085,6 +1163,8 @@ try {
         semantic = $semantic
         transportRetries = @($transportRetries)
         requestTimeoutSeconds = $script:requestTimeoutSecondsForRpc
+        operationTimeoutSeconds = $effectiveOperationTimeoutSeconds
+        operationDeadlineUtc = $script:operationDeadlineUtc.ToString('o')
         data = $data
         errors = $(if ($semanticFailure) { @($semantic.reasons) } else { @() })
     }
@@ -1112,12 +1192,14 @@ catch {
         semantic = $null
         transportRetries = @($transportRetries)
         requestTimeoutSeconds = $script:requestTimeoutSecondsForRpc
+        operationTimeoutSeconds = $effectiveOperationTimeoutSeconds
+        operationDeadlineUtc = $script:operationDeadlineUtc.ToString('o')
         data = $null
         errors = @($failureMessage)
     }
 }
 
-$sessionCleanup = Close-McpSession -Endpoint $endpoint -Headers $headers
+$sessionCleanup = Close-AllMcpSessions
 $result | Add-Member -NotePropertyName sessionCleanup -NotePropertyValue $sessionCleanup
 
 $parameters = @{ InputObject = $result; Depth = 50 }
