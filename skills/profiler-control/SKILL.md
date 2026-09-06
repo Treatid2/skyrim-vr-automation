@@ -21,13 +21,29 @@ comparing data. Use these entry points:
    in scope.
 2. Establish the exact build, MO2 profile, scene, HMD mode, resolution, shader
    state, warm-up, sample count, and interval before comparing captures.
-3. Supply `ContextJson` with the exact environment and treatment. A capture may
-   enable the CSX profiler and then must verify restoration of its prior state.
-   That mutation requires the user's run or measurement authority; a request to
-   review existing data does not.
-4. Write to a dedicated evidence directory outside live MO2 overwrite and
+3. Supply `ContextJson` with the exact environment and treatment. A capture
+   enables the CSX profiler, so that mutation requires the user's run or
+   measurement authority; a request to review existing data does not.
+4. Before enabling or sampling the profiler, require the central controller to
+   read the registered standalone `skyrimvrupscaler.temporalProbe` status and
+   prove a neutral physical state and ownership epoch. Recheck the same epoch
+   throughout the capture. A changed, legacy, or unproven probe fails closed;
+   profiler restoration still runs and never disarms the probe.
+5. When `communityshaders.profiler_api` is exposed, call `snapshot`, preserve
+   the initial enabled state, then call `set_enabled` with `enabled: true` and
+   require its nested snapshot to be available and enabled before
+   `start_capture`. Treat `disabled` from `start_capture` as a failed capture,
+   never as unsupported or a successful arm. Restore the initial enabled state
+   after the bounded capture when control remains responsive.
+6. Write to a dedicated evidence directory outside live MO2 overwrite and
    shader-cache trees. Keep raw JSON; summaries alone cannot be re-analysed.
-5. Compare at least two raw captures with matching context fingerprints and
+   Preserve the collector's before/after normalized resource-publication
+   telemetry and render-scale preparation trace with the timer data. Keep raw
+   preparation events and stage summaries for admission/early exit,
+   shader-cache deferral, SSS/SSGI, DLSS/FSR/FSR4, D3D creation, total,
+   request-to-prepared, and prepared-to-creator. Missing fields are evidence,
+   never inferred.
+7. Compare at least two raw captures with matching context fingerprints and
    identify the reference explicitly. Reject captures without at least three
    unique fresh frames or with non-finite metrics.
    Treat the total as the active CSX profiler block, not whole-frame cost. Do
