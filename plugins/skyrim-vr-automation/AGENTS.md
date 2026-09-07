@@ -1,10 +1,11 @@
 # Automation repository rules
 
-- Treat `dev` as the sole integration line for ongoing automation work. A
-  temporary worktree branch is not complete until its commits are integrated
-  into `dev`; update `main` only through a `dev`-to-`main` pull request, and
-  keep local `main` aligned with the latest merged `origin/main`. Open or merge
-  that pull request only when the user explicitly instructs it.
+- Treat `main` as the sole integration line and keep local `main` aligned with
+  the latest merged `origin/main`. Develop in scoped feature branches; a
+  temporary worktree is not complete until its commits are pushed to its named
+  branch and represented by a pull request targeting `main`. Never push
+  directly to `main`. Open or merge that pull request only when the user
+  explicitly instructs it.
 - Treat every game, MO2, SteamVR, profile, and cache mutation as an attributable
   transaction. Inspect first and preserve its result with the test record.
 - Never silently fall back to a different MO2 profile, executable, runtime,
@@ -26,18 +27,16 @@
 - Machine-specific paths belong only in ignored `machine.local.json` files,
   explicit parameters, or documented environment variables.
 - Never rotate an installed Codex plugin cache while any automation protocol
-  is active in any chat. Build and commit the marketplace package, then defer
-  installation until every run is terminal. Use the guarded repository
-  installer instead of direct `codex plugin add`, and fully reload the Codex
-  host after installation; a new chat alone is not a safe pickup boundary.
-- After every committed change that affects installed plugin behavior, skills,
-  tools, MCP configuration, manifests, or packaged AI guidance, automatically
-  rotate both plugin manifest cache identities, rebuild the managed marketplace
-  source from that exact commit, reinstall it with the guarded installer, and
-  verify the registered version plus source, marketplace, and installed-cache
-  hashes without waiting for a separate user request. If a protocol is active,
-  complete every step except installed-cache rotation and perform that rotation
-  as soon as all runs are terminal.
+  is active in any chat. Feature branches validate source/package parity but do
+  not rotate the installed cache. After an authorized merge to `main` that
+  affects installed plugin behavior, skills, tools, MCP configuration,
+  manifests, or packaged AI guidance, rotate both plugin manifest cache
+  identities once from the final integrated tree, rebuild the managed
+  marketplace package, and reinstall it with the guarded repository installer
+  instead of direct `codex plugin add`. Verify the registered version plus
+  source, marketplace, and installed-cache hashes, then fully reload the Codex
+  host; a new chat alone is not a safe pickup boundary. If a protocol is
+  active, defer installation until every run is terminal.
 - When an automation command behaves unexpectedly, its contract is ambiguous,
   or a concrete safety issue or enhancement is discovered, submit it through
   `tools/feedback-control/Invoke-AutomationFeedback.ps1`. Claim that feedback
