@@ -8,6 +8,29 @@ Set-StrictMode -Version Latest
 
 $scriptPath = Join-Path $PSScriptRoot 'Invoke-CocEvidenceControl.ps1'
 $script = Get-Content -LiteralPath $scriptPath -Raw
+$completionWorkerPath = Join-Path $PSScriptRoot 'Complete-CocHangCapture.ps1'
+$completionWorkerScript = Get-Content -LiteralPath $completionWorkerPath -Raw
+$workerTokens = $null
+$workerParseErrors = $null
+[System.Management.Automation.Language.Parser]::ParseFile(
+    $completionWorkerPath, [ref]$workerTokens, [ref]$workerParseErrors
+) | Out-Null
+if ($workerParseErrors.Count -ne 0) {
+    throw 'The hang-capture completion worker does not parse.'
+}
+foreach ($requiredText in @(
+        'csx-coc-hang-capture-v1',
+        'captureWorkerPid',
+        'captureWorkerStartedUtc',
+        'targetStartedUtc',
+        'procDumpExitCode',
+        "'capture-complete'",
+        "'capture-failed'"
+    )) {
+    if (-not $completionWorkerScript.Contains($requiredText, [StringComparison]::Ordinal)) {
+        throw "The hang-capture completion worker is missing: $requiredText"
+    }
+}
 
 $tokens = $null
 $parseErrors = $null
@@ -38,6 +61,14 @@ $inaccessibleResult = Get-OwnedProcess $inaccessibleState 'monitorPid' 'monitorS
 if ($null -ne $inaccessibleResult) {
     throw 'An inaccessible process identity was accepted as owned.'
 }
+$script:InaccessibleProcessFixture = Get-Process -Id $PID
+$replacementState = [pscustomobject]@{
+    monitorPid = $PID
+    monitorStartedUtc = [DateTime]::UtcNow.AddHours(-1).ToString('o')
+}
+if ($null -ne (Get-OwnedProcess $replacementState 'monitorPid' 'monitorStartedUtc')) {
+    throw 'A reused PID with a different start time was accepted as owned.'
+}
 
 foreach ($requiredText in @(
     "[ValidateSet('inspect', 'arm', 'status', 'capture-hang', 'stop')]",
@@ -64,6 +95,13 @@ foreach ($requiredText in @(
     "trigger = 'operator-confirmed-hang'",
     'Stop-OwnedProcDumpMonitor',
     'Get-OwnedHangCapture',
+    'Get-OwnedCancellation',
+    'Get-OwnedTarget',
+    'targetStartedUtc',
+    'cleanupComplete',
+    'Get-ValidatedCaptureCompletion',
+    'captureReceiptPath',
+    'Complete-CocHangCapture.ps1',
     'captureStartedUtc',
     "-NotePropertyValue 'capture-running' -Force",
     'captureActive',
@@ -155,16 +193,19 @@ try {
     }
     $capture = [Diagnostics.Process]::Start($startInfo)
     $statePath = Join-Path $fixture 'state.json'
+    $targetStartedUtc = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+    $captureStartedUtc = $capture.StartTime.ToUniversalTime().ToString('o')
     [pscustomobject][ordered]@{
         schema = 'csx-coc-evidence-state-v1'
         monitorPid = [int]::MaxValue
         monitorStartedUtc = [DateTime]::UtcNow.ToString('o')
         targetName = 'pwsh.exe'
         targetPid = $PID
+        targetStartedUtc = $targetStartedUtc
         captureDirectory = $fixture
         procDump = [pscustomobject]@{ path = $pwsh }
         capturePid = $capture.Id
-        captureStartedUtc = $capture.StartTime.ToUniversalTime().ToString('o')
+        captureStartedUtc = $captureStartedUtc
         captureState = 'capture-running'
     } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8
 
@@ -181,9 +222,45 @@ try {
     $capture.WaitForExit()
     $exited = & $scriptPath status -StatePath $statePath -Compact -NoExit |
         ConvertFrom-Json -Depth 20
-    if ($exited.ok -or $exited.state -ne 'capture-exited' -or
-        @($exited.errors)[0] -notlike '*hang capture*') {
+    if ($exited.ok -or $exited.state -ne 'capture-evidence-partial' -or
+        @($exited.errors)[0] -notlike '*validated completion receipt*') {
         throw "Status misclassified an exited persisted hang capture: $($exited | ConvertTo-Json -Depth 10 -Compress)"
+    }
+
+    $unrelatedDump = Join-Path $fixture 'older-unrelated.dmp'
+    [IO.File]::WriteAllBytes($unrelatedDump, [byte[]](1, 2, 3))
+    $withUnrelatedDump = & $scriptPath status -StatePath $statePath `
+        -Compact -NoExit | ConvertFrom-Json -Depth 20
+    if ($withUnrelatedDump.ok -or
+        $withUnrelatedDump.state -ne 'capture-evidence-partial') {
+        throw 'An unrelated dump was accepted as completion of the current capture.'
+    }
+
+    $currentDump = Join-Path $fixture 'current.dmp'
+    [IO.File]::WriteAllBytes($currentDump, [byte[]](4, 5, 6, 7))
+    $receiptPath = Join-Path $fixture 'current.json'
+    [pscustomobject]@{
+        schema = 'csx-coc-hang-capture-v1'
+        dumpPath = $currentDump
+        length = 4
+        targetPid = $PID
+        targetStartedUtc = $targetStartedUtc
+        captureWorkerPid = $capture.Id
+        captureWorkerStartedUtc = $captureStartedUtc
+        procDumpExitCode = 0
+    } | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding utf8
+    $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $state | Add-Member -NotePropertyName captureDumpPath `
+        -NotePropertyValue $currentDump -Force
+    $state | Add-Member -NotePropertyName captureReceiptPath `
+        -NotePropertyValue $receiptPath -Force
+    $state | ConvertTo-Json -Depth 10 |
+        Set-Content -LiteralPath $statePath -Encoding utf8
+    $complete = & $scriptPath status -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if (-not $complete.ok -or $complete.state -ne 'capture-complete' -or
+        [string]$complete.data.completionReceiptPath -cne $receiptPath) {
+        throw 'Exact nonempty dump and matching receipt were not accepted as completion.'
     }
 }
 finally {

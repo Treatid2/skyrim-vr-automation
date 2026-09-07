@@ -142,8 +142,9 @@ for ($ordinal = 1; $ordinal -le 20; $ordinal++) {
 }
 $analysis = Get-CocQualificationAnalysis -Scenario ([pscustomobject]@{
         results = @($results)
-    }) -ProtocolConfig $config
-if (-not $analysis.available -or $analysis.transitions.Count -ne 20 -or
+    }) -ProtocolConfig $config -ExpectedOwnerId 'test-owner'
+if (-not $analysis.available -or -not $analysis.complete -or
+    $analysis.transitions.Count -ne 20 -or
     $analysis.timings.strictFrames.p95 -ne 24 -or
     $analysis.transitions[0].cleanupTailFrames -ne 5 -or
     $analysis.totals.vendorFailures -ne 0 -or
@@ -166,9 +167,84 @@ $missingLabelAnalysis = Get-CocQualificationAnalysis -Scenario (
     }
 ) -ProtocolConfig $config
 if (-not $missingLabelAnalysis.available -or
+    $missingLabelAnalysis.complete -or
+    $missingLabelAnalysis.missingEvidence.Count -ne 40 -or
     $missingLabelAnalysis.transitions.Count -ne 20 -or
     @($missingLabelAnalysis.transitions | Where-Object receiptPresent).Count -ne 0) {
     throw 'Missing scenario labels did not remain absent receipt evidence.'
+}
+$partialDisposition = Get-CocScenarioDisposition -Scenario ([pscustomobject]@{
+        done = $true
+        ok = $true
+        results = @()
+    }) -Analysis $missingLabelAnalysis
+if ($partialDisposition.ok -or
+    $partialDisposition.state -ne 'evidence-partial' -or
+    $partialDisposition.evidenceComplete -or
+    @($partialDisposition.errors).Count -ne 1) {
+    throw 'Terminal execution with incomplete evidence was reported as qualified success.'
+}
+
+$missingStatusAnalysis = Get-CocQualificationAnalysis -Scenario (
+    [pscustomobject]@{
+        results = @($results | Where-Object { $_.label -ne 'coc-01-status' })
+    }
+) -ProtocolConfig $config -ExpectedOwnerId 'test-owner'
+if ($missingStatusAnalysis.complete -or
+    'coc-01-status' -notin @($missingStatusAnalysis.missingEvidence)) {
+    throw 'A missing mandatory status receipt was accepted as complete evidence.'
+}
+
+$incompleteStatusResults = @($results | ForEach-Object {
+        if ($_.label -eq 'coc-01-status') {
+            [pscustomobject]@{ label = $_.label; result = [pscustomobject]@{} }
+        } else { $_ }
+    })
+$incompleteStatusAnalysis = Get-CocQualificationAnalysis -Scenario (
+    [pscustomobject]@{ results = $incompleteStatusResults }
+) -ProtocolConfig $config -ExpectedOwnerId 'test-owner'
+if ($incompleteStatusAnalysis.complete -or
+    'coc-01-status.preparation' -notin @($incompleteStatusAnalysis.missingEvidence)) {
+    throw 'Structurally incomplete status evidence was accepted as complete.'
+}
+$completeDisposition = Get-CocScenarioDisposition -Scenario ([pscustomobject]@{
+        done = $true
+        ok = $true
+        results = @($results)
+    }) -Analysis $analysis
+if (-not $completeDisposition.ok -or
+    $completeDisposition.state -ne 'complete' -or
+    -not $completeDisposition.evidenceComplete) {
+    throw 'A complete successful transcript was not accepted.'
+}
+$runningDisposition = Get-CocScenarioDisposition -Scenario ([pscustomobject]@{
+        done = $false
+        ok = $true
+        results = @()
+    }) -Analysis $missingLabelAnalysis
+if (-not $runningDisposition.ok -or $runningDisposition.state -ne 'running') {
+    throw 'A running partial transcript was not preserved as provisional evidence.'
+}
+
+$ownershipConflict = Test-CocBaseline -Results @{
+    state = [pscustomobject]@{ value = [pscustomobject]@{ playerLoaded = $true } }
+    scene = [pscustomobject]@{ value = [pscustomobject]@{ cell = 'WindhelmExterior01' } }
+    upscaling = [pscustomobject]@{ value = [pscustomobject]@{} }
+    renderscale = [pscustomobject]@{
+        value = [pscustomobject]@{
+            status = [pscustomobject]@{
+                session = [pscustomobject]@{ active = $true }
+                cpuPerformance = [pscustomobject]@{ active = $false }
+                gpuPerformance = [pscustomobject]@{ active = $false }
+            }
+        }
+    }
+    image = [pscustomobject]@{ value = [pscustomobject]@{} }
+} -ExpectedCell 'WindhelmExterior01'
+if (-not $ownershipConflict.ownershipConflict -or
+    $ownershipConflict.ownershipConflicts.Count -ne 1 -or
+    $ownershipConflict.ownershipConflicts[0] -notlike '*unowned stress*') {
+    throw 'A foreign diagnostic session was not classified as an ownership conflict.'
 }
 
 $moduleScript = Get-Content -LiteralPath $modulePath -Raw
@@ -177,7 +253,9 @@ foreach ($required in @(
     "Get-CocPropertyValue -Value `$cell -Name 'editorId'",
     "Get-CocPropertyValue -Value `$state -Name 'playerLoaded'",
     'ConvertTo-CocBoolean',
-    'if ($matches.Count -eq 0) { return $null }'
+    'if ($matches.Count -eq 0) { return $null }',
+    'dispatch-claim-failed',
+    'evidence-partial'
 )) {
     if (-not $moduleScript.Contains($required, [StringComparison]::Ordinal)) {
         throw "COC stability module is missing safe optional-field handling: $required"
@@ -187,16 +265,70 @@ foreach ($required in @(
 $script = Get-Content -LiteralPath $scriptPath -Raw
 foreach ($required in @(
     '[Diagnostics.Stopwatch]::GetTimestamp()',
-    '[IO.FileMode]::CreateNew',
+    'New-CocDispatchClaim',
     "'baseline-complete'",
     "'deadline'",
     "-Tool 'communityshaders.menu'",
     "-Tool 'scenario'",
     'Start-ThreadJob',
-    'CollectorStatePath'
+    'CollectorStatePath',
+    'expectedProcessStartTimeUtc',
+    'dispatch-interrupted'
 )) {
     if (-not $script.Contains($required, [StringComparison]::Ordinal)) {
         throw "COC stability controller is missing: $required"
+    }
+}
+
+$claimFixture = Join-Path ([IO.Path]::GetTempPath()) (
+    'coc-claim-' + [Guid]::NewGuid().ToString('N')
+)
+try {
+    New-Item -ItemType Directory -Path $claimFixture | Out-Null
+    $claimPath = Join-Path $claimFixture 'dispatch.claim'
+    $firstClaim = New-CocDispatchClaim -Path $claimPath -Source 'first'
+    $secondClaim = New-CocDispatchClaim -Path $claimPath -Source 'second'
+    $failedClaim = New-CocDispatchClaim -Path $claimFixture -Source 'invalid'
+    if (-not $firstClaim.ok -or $firstClaim.state -ne 'dispatch-claimed' -or
+        -not $secondClaim.ok -or
+        $secondClaim.state -ne 'dispatch-already-claimed' -or
+        $failedClaim.ok -or $failedClaim.state -ne 'dispatch-claim-failed') {
+        throw 'Dispatch claim outcomes do not distinguish ownership from I/O failure.'
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $claimFixture -PathType Container) {
+        Remove-Item -LiteralPath $claimFixture -Recurse -Force
+    }
+}
+
+$invalidAcceptedFixture = Join-Path ([IO.Path]::GetTempPath()) (
+    'coc-stability-invalid-accepted-' + [Guid]::NewGuid().ToString('N')
+)
+try {
+    New-Item -ItemType Directory -Path $invalidAcceptedFixture | Out-Null
+    $invalidAcceptedPath = Join-Path $invalidAcceptedFixture 'state.json'
+    [pscustomobject][ordered]@{
+        schema = 'csx-coc-stability-state-v1'
+        outcome = 'scenario-accepted'
+        endpoint = 'http://127.0.0.1:1/mcp'
+        ownerId = 'invalid-owner'
+        expectedPid = 0
+        expectedProcessStartTimeUtc = $null
+        protocolConfigPath = $configPath
+        scenarioRunId = $null
+    } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $invalidAcceptedPath -Encoding utf8
+    $invalidAcceptedStatus = & $scriptPath status -StatePath $invalidAcceptedPath `
+        -Compact -NoExit | ConvertFrom-Json -Depth 30
+    if ($invalidAcceptedStatus.ok -or
+        $invalidAcceptedStatus.state -ne 'journal-invalid' -or
+        @($invalidAcceptedStatus.errors).Count -lt 3) {
+        throw 'Malformed accepted state was not rejected before endpoint access.'
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $invalidAcceptedFixture) {
+        Remove-Item -LiteralPath $invalidAcceptedFixture -Recurse -Force
     }
 }
 

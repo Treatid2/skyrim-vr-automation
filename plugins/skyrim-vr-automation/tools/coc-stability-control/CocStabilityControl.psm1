@@ -65,6 +65,30 @@ function Open-CocMcpSession {
     return [pscustomobject]@{ id = $sessionId; headers = $headers }
 }
 
+function Assert-CocProcessLifetime {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$ProcessId,
+        [Parameter(Mandatory)][string]$ExpectedStartTimeUtc
+    )
+
+    try {
+        $expectedStart = [DateTimeOffset]::Parse(
+            $ExpectedStartTimeUtc,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind
+        ).UtcDateTime
+        $process = Get-Process -Id $ProcessId -ErrorAction Stop
+        $actualStart = $process.StartTime.ToUniversalTime()
+    }
+    catch {
+        throw "Expected process identity is inaccessible: $($_.Exception.Message)"
+    }
+    if ([Math]::Abs(($actualStart - $expectedStart).TotalSeconds) -gt 2) {
+        throw "PID $ProcessId no longer denotes the admitted process."
+    }
+}
+
 function Invoke-CocMcpTool {
     [CmdletBinding()]
     param(
@@ -72,12 +96,34 @@ function Invoke-CocMcpTool {
         [Parameter(Mandatory)][string]$Tool,
         [Parameter(Mandatory)][Collections.IDictionary]$Arguments,
         [pscustomobject]$Session,
+        [ValidateRange(0, [int]::MaxValue)][int]$ExpectedProcessId = 0,
+        [string]$ExpectedProcessStartTimeUtc,
         [ValidateRange(1, 180)][int]$TimeoutSeconds = 20
     )
+
+    if ($ExpectedProcessId -gt 0) {
+        if ([string]::IsNullOrWhiteSpace($ExpectedProcessStartTimeUtc)) {
+            throw 'An expected process start time is required with ExpectedProcessId.'
+        }
+        Assert-CocProcessLifetime -ProcessId $ExpectedProcessId `
+            -ExpectedStartTimeUtc $ExpectedProcessStartTimeUtc
+    }
 
     if ($null -eq $Session) {
         $Session = Open-CocMcpSession -Endpoint $Endpoint `
             -TimeoutSeconds $TimeoutSeconds
+    }
+
+    if ($ExpectedProcessId -gt 0) {
+        $health = Invoke-CocMcpTool -Endpoint $Endpoint -Tool 'inspect' `
+            -Arguments @{ kind = 'health' } -Session $Session `
+            -TimeoutSeconds $TimeoutSeconds
+        $healthPid = Get-CocPropertyValue -Value $health.value -Name 'pid'
+        if ($null -eq $healthPid -or [int]$healthPid -ne $ExpectedProcessId) {
+            throw "DevBench endpoint process identity changed; expected PID $ExpectedProcessId."
+        }
+        Assert-CocProcessLifetime -ProcessId $ExpectedProcessId `
+            -ExpectedStartTimeUtc $ExpectedProcessStartTimeUtc
     }
 
     $call = Invoke-CocMcpRequest -Endpoint $Endpoint `
@@ -268,13 +314,19 @@ function Test-CocBaseline {
     )
 
     $reasons = [Collections.Generic.List[string]]::new()
+    $ownershipConflicts = [Collections.Generic.List[string]]::new()
     foreach ($name in @('state', 'scene', 'upscaling', 'renderscale', 'image')) {
         if (-not $Results.ContainsKey($name) -or $null -eq $Results[$name]) {
             $reasons.Add("baseline '$name' is incomplete")
         }
     }
     if ($reasons.Count -gt 0) {
-        return [pscustomobject]@{ acceptable = $false; reasons = @($reasons) }
+        return [pscustomobject]@{
+            acceptable = $false
+            ownershipConflict = $false
+            ownershipConflicts = @()
+            reasons = @($reasons)
+        }
     }
 
     $state = $Results.state.value
@@ -323,11 +375,15 @@ function Test-CocBaseline {
         }
         $diagnostic.active = [bool]$activeProperty.Value
         if ($diagnostic.active) {
-            $reasons.Add("an unowned $($diagnostic.name) session is already active")
+            $conflict = "an unowned $($diagnostic.name) session is already active"
+            $reasons.Add($conflict)
+            $ownershipConflicts.Add($conflict)
         }
     }
     return [pscustomobject][ordered]@{
         acceptable = $reasons.Count -eq 0
+        ownershipConflict = $ownershipConflicts.Count -gt 0
+        ownershipConflicts = @($ownershipConflicts)
         reasons = @($reasons | Select-Object -Unique)
         actualCell = $actualCell
         stability = $stability
@@ -466,7 +522,8 @@ function Get-CocQualificationAnalysis {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$Scenario,
-        [Parameter(Mandatory)]$ProtocolConfig
+        [Parameter(Mandatory)]$ProtocolConfig,
+        [string]$ExpectedOwnerId
     )
 
     $records = @(Get-CocPropertyValue -Value $Scenario -Name 'results')
@@ -478,6 +535,7 @@ function Get-CocQualificationAnalysis {
     }
 
     $transitions = [Collections.Generic.List[object]]::new()
+    $missingEvidence = [Collections.Generic.List[string]]::new()
     for ($ordinal = 1; $ordinal -le [int]$ProtocolConfig.transitionCount; $ordinal++) {
         $prefix = "coc-$($ordinal.ToString('D2'))"
         $receipt = Get-CocScenarioRecordPayload -Records $records `
@@ -490,8 +548,11 @@ function Get-CocQualificationAnalysis {
             [string]$ProtocolConfig.startCellEditorId
         }
         if ($null -eq $receipt) {
+            $missingEvidence.Add("$prefix-wait")
+            if ($null -eq $statusReceipt) { $missingEvidence.Add("$prefix-status") }
             $transitions.Add([pscustomobject][ordered]@{
                 ordinal = $ordinal; destination = $cell; receiptPresent = $false
+                statusReceiptPresent = $null -ne $statusReceipt
                 presentationElapsedMs = $null; presentationElapsedFrames = $null
                 cleanupElapsedMs = $null; cleanupElapsedFrames = $null
                 strictElapsedMs = $null; strictElapsedFrames = $null
@@ -507,6 +568,8 @@ function Get-CocQualificationAnalysis {
             })
             continue
         }
+
+        if ($null -eq $statusReceipt) { $missingEvidence.Add("$prefix-status") }
 
         $presentationMs = Get-CocFirstNumber $receipt @('presentationElapsedMs')
         $presentationFrames = Get-CocFirstNumber $receipt @('presentationElapsedFrames')
@@ -533,24 +596,57 @@ function Get-CocQualificationAnalysis {
         } else {
             Get-DevBenchRenderScalePreparationTelemetry -Response $statusReceipt
         }
+        $resourcePublication = Get-DevBenchResourcePublicationTelemetry `
+            -Response $observation
+        if (-not [bool]$resourcePublication.available) {
+            $missingEvidence.Add("$prefix-wait.resourcePublication")
+        }
+        if ($null -ne $statusReceipt -and -not [bool]$preparation.available) {
+            $missingEvidence.Add("$prefix-status.preparation")
+        }
+        $transitionId = Get-CocPropertyValue -Value $receipt -Name 'transitionId'
+        $receiptOwnerId = Get-CocPropertyValue -Value $receipt -Name 'ownerId'
+        $presentationStable = ConvertTo-CocBoolean (Get-CocPropertyValue -Value $receipt -Name 'presentationStable')
+        $cleanupDrained = ConvertTo-CocBoolean (Get-CocPropertyValue -Value $receipt -Name 'cleanupDrained')
+        $strictSatisfied = ConvertTo-CocBoolean (Get-CocPropertyValue -Value $receipt -Name 'strictSatisfied')
+        if ($null -eq $transitionId -or [uint64]$transitionId -ne [uint64]$ordinal) {
+            $missingEvidence.Add("$prefix-wait.transitionId")
+        }
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedOwnerId) -and
+            [string]$receiptOwnerId -cne $ExpectedOwnerId) {
+            $missingEvidence.Add("$prefix-wait.ownerId")
+        }
+        foreach ($required in @(
+                @{ name = 'presentationStable'; value = $presentationStable },
+                @{ name = 'cleanupDrained'; value = $cleanupDrained },
+                @{ name = 'strictSatisfied'; value = $strictSatisfied },
+                @{ name = 'presentationElapsedMs'; value = $presentationMs },
+                @{ name = 'cleanupElapsedMs'; value = $cleanupMs },
+                @{ name = 'strictElapsedMs'; value = $strictMs }
+            )) {
+            if ($null -eq $required.value) {
+                $missingEvidence.Add("$prefix-wait.$($required.name)")
+            }
+        }
         $transitions.Add([pscustomobject][ordered]@{
             ordinal = $ordinal
             destination = $cell
             receiptPresent = $true
-            transitionId = Get-CocPropertyValue -Value $receipt -Name 'transitionId'
-            ownerId = Get-CocPropertyValue -Value $receipt -Name 'ownerId'
+            statusReceiptPresent = $null -ne $statusReceipt
+            transitionId = $transitionId
+            ownerId = $receiptOwnerId
             timedOutMilestone = Get-CocPropertyValue -Value $receipt -Name 'timedOutMilestone'
-            presentationStable = ConvertTo-CocBoolean (Get-CocPropertyValue -Value $receipt -Name 'presentationStable')
+            presentationStable = $presentationStable
             presentationFailureMask = Get-CocPropertyValue -Value $receipt -Name 'presentationFailureMask'
             presentationFailureReasons = @(Get-CocPropertyValue -Value $receipt -Name 'presentationFailureReasons')
             presentationElapsedMs = $presentationMs
             presentationElapsedFrames = $presentationFrames
-            cleanupDrained = ConvertTo-CocBoolean (Get-CocPropertyValue -Value $receipt -Name 'cleanupDrained')
+            cleanupDrained = $cleanupDrained
             cleanupFailureMask = Get-CocPropertyValue -Value $receipt -Name 'cleanupFailureMask'
             cleanupFailureReasons = @(Get-CocPropertyValue -Value $receipt -Name 'cleanupFailureReasons')
             cleanupElapsedMs = $cleanupMs
             cleanupElapsedFrames = $cleanupFrames
-            strictSatisfied = ConvertTo-CocBoolean (Get-CocPropertyValue -Value $receipt -Name 'strictSatisfied')
+            strictSatisfied = $strictSatisfied
             strictFailureMask = Get-CocPropertyValue -Value $receipt -Name 'strictFailureMask'
             strictFailureReasons = @(Get-CocPropertyValue -Value $receipt -Name 'strictFailureReasons')
             strictElapsedMs = $strictMs
@@ -561,7 +657,7 @@ function Get-CocQualificationAnalysis {
             timing = Get-CocPropertyValue -Value $receipt -Name 'timing'
             frames = Get-CocPropertyValue -Value $receipt -Name 'frames'
             observation = $observation
-            resourcePublication = Get-DevBenchResourcePublicationTelemetry -Response $observation
+            resourcePublication = $resourcePublication
             preparation = $preparation
             producer = Get-CocPropertyValue -Value $receipt -Name 'producer'
             retryCount = Get-CocFirstNumber $receipt @('retryCount', 'retries', 'observation.retryCount', 'observation.retries')
@@ -602,8 +698,13 @@ function Get-CocQualificationAnalysis {
     $preparationSamples = @($transitions | ForEach-Object { $_.preparation })
     $availablePreparation = @($preparationSamples | Where-Object { [bool]$_.available })
     $exactPreparation = @($availablePreparation | Where-Object { [bool]$_.filterApplied })
+    $unknownPresentation = @($transitions | Where-Object { $null -eq $_.presentationStable }).Count
+    $unknownCleanup = @($transitions | Where-Object { $null -eq $_.cleanupDrained }).Count
+    $unknownStrict = @($transitions | Where-Object { $null -eq $_.strictSatisfied }).Count
     return [pscustomobject][ordered]@{
         available = $true
+        complete = $missingEvidence.Count -eq 0
+        missingEvidence = @($missingEvidence | Select-Object -Unique)
         canonicalMilestone = 'strict'
         strictFrameTargets = $strictTargets
         transitions = @($transitions)
@@ -629,6 +730,9 @@ function Get-CocQualificationAnalysis {
             presentationFailures = @($transitions | Where-Object { $_.presentationStable -eq $false }).Count
             cleanupFailures = @($transitions | Where-Object { $_.cleanupDrained -eq $false }).Count
             strictFailures = @($transitions | Where-Object { $_.strictSatisfied -eq $false }).Count
+            unknownPresentation = $unknownPresentation
+            unknownCleanup = $unknownCleanup
+            unknownStrict = $unknownStrict
         }
         cleanupDebtRanked = $cleanupDebtRanked
         resourcePublication = [pscustomobject][ordered]@{
@@ -661,4 +765,94 @@ function Get-CocQualificationAnalysis {
     }
 }
 
-Export-ModuleMember -Function Invoke-CocMcpTool, New-CocMeasuredScenario, Test-CocBaseline, Get-CocQualificationAnalysis
+function New-CocDispatchClaim {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Source
+    )
+
+    $claim = $null
+    try {
+        $claim = [IO.File]::Open(
+            $Path, [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write, [IO.FileShare]::Read
+        )
+    }
+    catch {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            return [pscustomobject]@{
+                ok = $true
+                state = 'dispatch-already-claimed'
+                source = $Source
+                error = $null
+            }
+        }
+        return [pscustomobject]@{
+            ok = $false
+            state = 'dispatch-claim-failed'
+            source = $Source
+            error = $_.Exception.Message
+        }
+    }
+
+    try {
+        $writer = [IO.StreamWriter]::new($claim)
+        $writer.Write($Source)
+        $writer.Flush()
+        $writer.Dispose()
+        $claim = $null
+        return [pscustomobject]@{
+            ok = $true
+            state = 'dispatch-claimed'
+            source = $Source
+            error = $null
+        }
+    }
+    catch {
+        if ($claim) { $claim.Dispose() }
+        return [pscustomobject]@{
+            ok = $false
+            state = 'dispatch-claim-failed'
+            source = $Source
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function Get-CocScenarioDisposition {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Scenario,
+        [Parameter(Mandatory)]$Analysis
+    )
+
+    $done = [bool](Get-CocPropertyValue -Value $Scenario -Name 'done')
+    $executionOk = -not $done -or
+        [bool](Get-CocPropertyValue -Value $Scenario -Name 'ok')
+    $evidenceComplete = -not $done -or
+        ($Analysis.PSObject.Properties['complete'] -and [bool]$Analysis.complete)
+    $ok = $executionOk -and $evidenceComplete
+    $state = if (-not $done) {
+        'running'
+    } elseif (-not $executionOk) {
+        'failed'
+    } elseif (-not $evidenceComplete) {
+        'evidence-partial'
+    } else { 'complete' }
+    $errors = if (-not $executionOk) {
+        @([string](Get-CocPropertyValue -Value $Scenario -Name 'error'))
+    } elseif (-not $evidenceComplete) {
+        @("Scenario execution completed but mandatory evidence is incomplete: $(@($Analysis.missingEvidence) -join ', ')")
+    } else { @() }
+    return [pscustomobject][ordered]@{
+        ok = $ok
+        state = $state
+        executionComplete = $done
+        executionOk = $executionOk
+        evidenceComplete = $evidenceComplete
+        errors = $errors
+    }
+}
+
+Export-ModuleMember -Function Invoke-CocMcpTool, New-CocDispatchClaim, New-CocMeasuredScenario, Test-CocBaseline, Get-CocQualificationAnalysis, Get-CocScenarioDisposition
