@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Require an MO2-backed SteamVR null-HMD run to select and validate its exact
+  task profile before the null-HMD transition, preventing an enabled OCU
+  provider from surviving into the SteamVR route.
 - Require every cooperative MO2 access request to select exactly one mutually
   exclusive OCU, physical SteamVR, or SteamVR null-HMD route, and propagate the
   selected route into access status and prepared session evidence.

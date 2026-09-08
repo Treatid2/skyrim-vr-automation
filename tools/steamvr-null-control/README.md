@@ -170,8 +170,11 @@ requires SteamVR to be closed and uses the bundled native package by default.
 
 Launch Skyrim only after `start` or `inspect` returns current-session runtime
 proof, and do not interpret the `-unqualified` state as replay or measurement
-readiness. Also use an MO2 profile that disables OpenComposite; a running null
-SteamVR instance does not prove an application bypassing SteamVR is attached to
-it.
+readiness. For an MO2-backed run, acquire a `SteamVRNull` MO2 access lease,
+select the exact task workspace, and pass closed-state runtime-route validation
+before applying or starting null-HMD. The `runtime-route-provider` check must
+prove that the profile disables OpenComposite and every other root OpenVR
+replacement. A running null SteamVR instance does not prove an application
+bypassing SteamVR is attached to it.
 
 Run `Test-SteamVRNullControl.ps1` after changing the control contract.

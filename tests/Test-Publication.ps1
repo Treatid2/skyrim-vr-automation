@@ -90,6 +90,24 @@ foreach ($relativePath in @('skills/feedback-control/SKILL.md', 'skills/mo2-cont
     }
 }
 
+$nullHmdSkill = Get-Content -LiteralPath (Join-Path $repositoryRoot 'skills/steamvr-null-hmd/SKILL.md') -Raw
+$mo2Admission = $nullHmdSkill.IndexOf('complete MO2 route admission before any', [StringComparison]::Ordinal)
+$nullMutation = $nullHmdSkill.IndexOf('Before `apply` or `restore`', [StringComparison]::Ordinal)
+if ($mo2Admission -lt 0 -or $nullMutation -lt 0 -or $mo2Admission -gt $nullMutation) {
+    $violations.Add([pscustomobject]@{
+        file = 'skills/steamvr-null-hmd/SKILL.md'
+        issue = 'MO2 SteamVRNull route admission must precede null-HMD mutation'
+    })
+}
+foreach ($requiredMarker in @('runtime-route-provider', '-RuntimeRoute SteamVRNull')) {
+    if (-not $nullHmdSkill.Contains($requiredMarker, [StringComparison]::Ordinal)) {
+        $violations.Add([pscustomobject]@{
+            file = 'skills/steamvr-null-hmd/SKILL.md'
+            issue = "missing null-HMD admission contract marker: $requiredMarker"
+        })
+    }
+}
+
 $result = [pscustomobject][ordered]@{
     ok = $violations.Count -eq 0
     trackedFiles = $trackedFiles.Count

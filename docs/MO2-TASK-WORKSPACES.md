@@ -24,6 +24,12 @@ requesting a new lease, but does not require rebuilding the task workspace.
 - On a later request, the task must explicitly choose either `resume -TaskId
   -WorkspaceId` or a fresh `create -TaskId`. The tool never silently replaces a
   retained profile or guesses among multiple workspaces.
+- For `SteamVRNull`, select the task workspace and run closed-state validation
+  with the owned access lease before applying or starting null-HMD. The
+  `runtime-route-provider` check must prove that the exact selected profile has
+  no enabled OCU or other root OpenVR replacement. Only then transition the
+  runtime and continue with MO2 prepare and launch. This ordering prevents a
+  null-HMD run from inheriting an OCU-enabled profile.
 - Before a fresh clone, run `list-local-work-mods` and make the workspace
   content explicit. `Modlist` selects no optional local builds.
   `ModlistPlusLocalWorkMods` requires one or more exact catalog IDs. The tool
