@@ -14,6 +14,7 @@ $tests = @(
     @{ Name = 'modlist-control'; Path = 'tools\modlist-control\Test-ModlistControl.ps1'; Arguments = @() },
     @{ Name = 'feedback-control'; Path = 'tools\feedback-control\Test-AutomationFeedback.ps1'; Arguments = @() },
     @{ Name = 'mo2-control'; Path = 'tools\mo2-control\tests\Test-MO2Control.ps1'; Arguments = $(if ($IncludeLiveMO2) { @('-IncludeLive') } else { @() }) },
+    @{ Name = 'mo2-steamvr-exclusions'; Path = 'tools\mo2-control\tests\Test-MO2SteamVRExclusions.ps1'; Arguments = @() },
     @{ Name = 'mo2-profile-control'; Path = 'tools\mo2-profile-control\tests\Test-MO2ProfileControl.ps1'; Arguments = @() },
     @{ Name = 'mo2-workspace-control'; Path = 'tools\mo2-workspace-control\tests\Test-MO2WorkspaceControl.ps1'; Arguments = @() },
     @{ Name = 'steamvr-null-control'; Path = 'tools\steamvr-null-control\Test-SteamVRNullControl.ps1'; Arguments = @() },

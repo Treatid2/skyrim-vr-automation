@@ -3,6 +3,10 @@
 MO2 Control is the shared, machine-readable entry point for Codex tasks that
 inspect or validate the Skyrim VR Mod Organizer 2 installation.
 
+Version `1.1.0` adds explicit `configure-steamvr-exclusions` maintenance and
+read-only `steamVrExclusions` inspection. Paths come from the resolved machine
+configuration; the implementation does not depend on a modlist name.
+
 Version `1.0.0` makes task launch authorization independently verify the cache
 materialization receipt, the complete generated `backup` shadow, prepared tree
 hashes, and every current lower-provider path. The first launch rejects
@@ -146,6 +150,35 @@ Profile fallback is never accepted as success. Quarantined
 RootBuilder failures.
 
 ## Cooperative access lifecycle
+
+### SteamVR VFS exclusion maintenance
+
+When a game starts SteamVR as a virtualized child, SteamVR can remain registered
+with MO2 after the game exits. Prevent this by explicitly adding SteamVR runtime
+executables to the selected MO2 instance's blacklist:
+
+```text
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> configure-steamvr-exclusions -ConfigPath <exact-machine-config> -AccessId <owned-access-id> -WhatIf -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> configure-steamvr-exclusions -ConfigPath <exact-machine-config> -AccessId <owned-access-id> -Compact
+```
+
+Acquire an access-only lease and validate closed state first. The command
+preserves existing exclusions and appends only missing `vrserver.exe`,
+`vrcompositor.exe`, `vrmonitor.exe`, `vrdashboard.exe`, and
+`vrwebhelper.exe` entries, case-insensitively. It preserves unrelated INI bytes,
+backs up the original, verifies the result, and is idempotent. A missing key
+requires a recognized MO2 default baseline; ambiguous settings fail closed.
+MO2, the game/loaders, and SteamVR helpers must be stopped. Release the lease
+afterward. No task profile clone or game launch is needed.
+
+This is a one-shot, authorized configuration change, never an implicit effect
+of inspection or launch. It does not close Steam or SteamVR. Already-injected
+processes need a separately authorized shutdown; adding exclusions cannot
+retroactively unload their VFS hooks. Do not blacklist Skyrim or SKSE.
+
+The existing `close` / `validate -RequireClosed` lifecycle proves MO2/game
+process closure, not the absence of VFS hooks in other processes. Do not report
+a completely clean VFS session solely from that result.
 
 `request-access` atomically acquires the one shared MO2 lock and returns an
 `accessId` bearer credential plus a distinct public `leaseId`. Retain the

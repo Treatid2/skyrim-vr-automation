@@ -4,6 +4,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Add modlist-agnostic SteamVR VFS blacklist inspection and explicit,
+  lease-gated `configure-steamvr-exclusions` maintenance with preview,
+  idempotence, preserved INI bytes, exact backups, and verified writes.
+  Clarify that MO2 Unlock/process exit does not establish VFS detachment and
+  that Steam/runtime shutdown remains separately authorized.
 - Materialize and hash-verify every lower-provider `ShaderCache` and generated
   `backup` path into each task-owned MO2 runtime output, reject stale or missing
   shadows before launch, permit only isolated task-output growth on retained

@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('inspect', 'validate', 'validate-closed', 'request-access', 'access-status', 'renew-access', 'release-access', 'recover-access', 'prepare', 'open', 'launch', 'status', 'stop-game', 'terminate-game', 'close', 'recover-close', 'recover-rootbuilder', 'stop', 'terminate', 'release', 'help')]
+    [ValidateSet('inspect', 'validate', 'validate-closed', 'request-access', 'access-status', 'renew-access', 'release-access', 'recover-access', 'configure-steamvr-exclusions', 'prepare', 'open', 'launch', 'status', 'stop-game', 'terminate-game', 'close', 'recover-close', 'recover-rootbuilder', 'stop', 'terminate', 'release', 'help')]
     [string]$Command = 'help',
 
     [string]$ConfigPath,
@@ -55,7 +55,7 @@ function New-MO2ApprovalMetadata {
         $hostExecutable = [string](Get-Process -Id $PID -ErrorAction Stop).Path
     }
     $entryPoint = [IO.Path]::GetFullPath($PSCommandPath)
-    $oneShotCommands = @('recover-access', 'terminate-game', 'terminate')
+    $oneShotCommands = @('recover-access', 'terminate-game', 'terminate', 'configure-steamvr-exclusions')
     $readOnlyCommands = @('inspect', 'validate', 'validate-closed', 'access-status', 'status', 'help')
     return [pscustomobject][ordered]@{
         hostExecutable = $hostExecutable
@@ -64,7 +64,7 @@ function New-MO2ApprovalMetadata {
         reusablePrefix = @($hostExecutable, '-NoProfile', '-NonInteractive', '-File', $entryPoint, $Subcommand)
         reusableApprovalEligible = $Subcommand -notin $oneShotCommands
         escalationUsuallyRequired = $Subcommand -notin $readOnlyCommands
-        oneShotReason = if ($Subcommand -in $oneShotCommands) { 'Recovery ownership transfer or forced process termination must remain a one-shot approval.' } else { $null }
+        oneShotReason = if ($Subcommand -eq 'configure-steamvr-exclusions') { 'Changing the selected installation-wide VFS exclusions requires one-shot approval for the exact configuration.' } elseif ($Subcommand -in $oneShotCommands) { 'Recovery ownership transfer or forced process termination must remain a one-shot approval.' } else { $null }
         invocationRule = 'Use the literal host, entry-point, and subcommand shown here. Put changing IDs and paths afterward; do not wrap the call in -Command, variables, pipelines, or a command string.'
     }
 }
@@ -110,7 +110,7 @@ try {
     $sessionCommands = @('open', 'launch', 'stop-game', 'terminate-game', 'close', 'recover-rootbuilder', 'stop', 'terminate', 'release')
     if ($Command -in $sessionCommands -and [string]::IsNullOrWhiteSpace($SessionId)) {
         $result = [pscustomobject][ordered]@{
-            contractVersion = '0.8.0'
+            contractVersion = '1.1.0'
             command = $Command
             ok = $false
             state = 'missing-session-id'
@@ -121,9 +121,9 @@ try {
             data = [pscustomobject]@{ requiredParameter = 'SessionId'; supplied = $false }
         }
     }
-    elseif ($Command -in @('renew-access', 'release-access', 'recover-access') -and [string]::IsNullOrWhiteSpace($AccessId)) {
+    elseif ($Command -in @('renew-access', 'release-access', 'recover-access', 'configure-steamvr-exclusions') -and [string]::IsNullOrWhiteSpace($AccessId)) {
         $result = [pscustomobject][ordered]@{
-            contractVersion = '0.8.0'
+            contractVersion = '1.1.0'
             command = $Command
             ok = $false
             state = 'missing-access-id'
@@ -160,6 +160,9 @@ try {
         }
         'recover-access' {
             Invoke-MO2RecoverAccess -Config $config -AccessId $AccessId -Label $Label -ConfirmAbandoned:$ConfirmAbandoned -WhatIf:$WhatIf
+        }
+        'configure-steamvr-exclusions' {
+            Invoke-MO2ConfigureSteamVRExclusions -Config $config -AccessId $AccessId -WhatIf:$WhatIf
         }
         'prepare' {
             Invoke-MO2Prepare -Config $config -Profile $Profile -Executable $Executable -RequireSKSE:$RequireSKSE -Label $Label -AccessId $AccessId -WhatIf:$WhatIf
@@ -207,7 +210,7 @@ try {
 }
 catch {
     $result = [pscustomobject][ordered]@{
-        contractVersion = '0.8.0'
+        contractVersion = '1.1.0'
         command = $Command
         ok = $false
         state = 'tool-error'

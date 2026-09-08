@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 Set-StrictMode -Version Latest
-$script:MO2ControlContractVersion = '1.0.0'
+$script:MO2ControlContractVersion = '1.1.0'
 
 function Resolve-MO2ControlPath {
     param([Parameter(Mandatory)][string]$Path)
@@ -1302,6 +1302,314 @@ function New-MO2Check {
     }
 }
 
+function Get-MO2SteamVRExclusionEntries {
+    return @('vrserver.exe', 'vrcompositor.exe', 'vrmonitor.exe', 'vrdashboard.exe', 'vrwebhelper.exe')
+}
+
+function Get-MO2BytesSha256 {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($algorithm.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant() }
+    finally { $algorithm.Dispose() }
+}
+
+function ConvertFrom-MO2IniEscapedName {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    # Detect QSettings aliases only; do not rewrite unrelated serialized names.
+    return [regex]::Replace($Value, '%(?:U([0-9a-f]{4})|([0-9a-f]{2}))', {
+        param($match)
+        $digits = if ($match.Groups[1].Success) { $match.Groups[1].Value } else { $match.Groups[2].Value }
+        return [string][char][Convert]::ToInt32($digits, 16)
+    }, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+}
+
+function Get-MO2SteamVRExclusionPlan {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $iniPath = [IO.Path]::GetFullPath((Resolve-MO2ControlPath $Path))
+    $item = Get-Item -LiteralPath $iniPath -ErrorAction Stop
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'The configured MO2 INI must be a regular file, not a directory or reparse point.'
+    }
+    $bytes = [IO.File]::ReadAllBytes($iniPath)
+    $offset = 0
+    $encodingName = 'utf8'
+    $encoding = [Text.UTF8Encoding]::new($false, $true)
+    if ($bytes.Length -ge 4 -and $bytes[0] -eq 0x2b -and $bytes[1] -eq 0x2f -and $bytes[2] -eq 0x76 -and $bytes[3] -in @(0x38, 0x39, 0x2b, 0x2f)) {
+        throw 'UTF-7 MO2 INI encoding is unsupported; no file was changed.'
+    }
+    if ($bytes.Length -ge 4 -and (($bytes[0] -eq 0xff -and $bytes[1] -eq 0xfe -and $bytes[2] -eq 0 -and $bytes[3] -eq 0) -or
+            ($bytes[0] -eq 0 -and $bytes[1] -eq 0 -and $bytes[2] -eq 0xfe -and $bytes[3] -eq 0xff))) {
+        throw 'UTF-32 MO2 INI encoding is unsupported; no file was changed.'
+    }
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf) {
+        $offset = 3
+        $encodingName = 'utf8-bom'
+    }
+    elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xff -and $bytes[1] -eq 0xfe) {
+        $offset = 2
+        $encodingName = 'utf16-le-bom'
+        $encoding = [Text.UnicodeEncoding]::new($false, $true, $true)
+    }
+    elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xfe -and $bytes[1] -eq 0xff) {
+        $offset = 2
+        $encodingName = 'utf16-be-bom'
+        $encoding = [Text.UnicodeEncoding]::new($true, $true, $true)
+    }
+    try { $text = $encoding.GetString($bytes, $offset, $bytes.Length - $offset) }
+    catch { throw "Unsupported or invalid MO2 INI encoding: $($_.Exception.Message)" }
+    if ($text.Contains([char]0)) { throw 'NUL bytes or unsupported BOM-less UTF-16 in MO2 INI; no file was changed.' }
+
+    $lines = @([regex]::Matches($text, '[^\r\n]*(?:\r\n|\n|\r|$)') | Where-Object Length -GT 0)
+    $section = ''
+    $settingsHeaders = @()
+    $generalHeaders = @()
+    $blacklistLines = @()
+    $versionLines = @()
+    $versionAliases = $false
+    $settingsEnd = $text.Length
+    $newline = $null
+    foreach ($line in $lines) {
+        $content = $line.Value.TrimEnd([char[]]"`r`n")
+        $ending = $line.Value.Substring($content.Length)
+        if ($null -eq $newline -and $ending.Length -gt 0) { $newline = $ending }
+        if ($content -match '^\s*\[([^\]]+)\]\s*$') {
+            if ($section -ieq 'Settings') { $settingsEnd = $line.Index }
+            $rawSection = $Matches[1]
+            $section = ConvertFrom-MO2IniEscapedName -Value $rawSection.Trim()
+            if ($section -ieq 'Settings' -and $rawSection -ine 'Settings') { throw 'An encoded or whitespace-ambiguous Settings section alias is unsupported; no file was changed.' }
+            if ($section -ieq 'General' -and $rawSection -ine 'General') { $versionAliases = $true }
+            if ($section -ieq 'Settings') { $settingsHeaders += $line }
+            if ($section -ieq 'General') { $generalHeaders += $line }
+        }
+        elseif ($content -match '^\s*\[') { throw 'Ambiguous or malformed MO2 INI section header; no file was changed.' }
+        elseif ($content -match '^\s*([^;#][^=]*?)\s*=') {
+            $rawKey = $Matches[1].Trim()
+            $logicalKey = (ConvertFrom-MO2IniEscapedName -Value $rawKey).Replace('\', '/')
+            $fullKey = if ($section -eq '' -or $section -ieq 'General') { $logicalKey } else { $section.Replace('\', '/') + '/' + $logicalKey }
+            if ($fullKey -ieq 'Settings/executable_blacklist') {
+                if ($section -ine 'Settings' -or $rawKey -ine 'executable_blacklist') { throw 'An encoded or grouped executable_blacklist alias is unsupported; no file was changed.' }
+                $blacklistLines += $line
+            }
+            if ($section -ieq 'General' -and $logicalKey -ieq 'version') {
+                if ($rawKey -ine 'version') { $versionAliases = $true }
+                $versionLines += $line
+            }
+        }
+    }
+    if ($settingsHeaders.Count -gt 1 -or $blacklistLines.Count -gt 1) {
+        throw 'Duplicate Settings sections or executable_blacklist keys are ambiguous; no file was changed.'
+    }
+    if ($null -eq $newline) { $newline = "`r`n" }
+    $keyPresent = $blacklistLines.Count -eq 1
+    $prefix = 'executable_blacklist='
+    $suffix = ''
+    $payload = ''
+    if ($keyPresent) {
+        $content = $blacklistLines[0].Value.TrimEnd([char[]]"`r`n")
+        $match = [regex]::Match($content, '^(?<prefix>\s*executable_blacklist\s*=\s*)(?<value>.*?)(?<suffix>[ \t]*)$', 'IgnoreCase')
+        $prefix = $match.Groups['prefix'].Value
+        $suffix = $match.Groups['suffix'].Value
+        $payload = $match.Groups['value'].Value
+        $quoted = $payload.StartsWith('"') -and $payload.EndsWith('"') -and $payload.Length -ge 2
+        if ($quoted) {
+            $payload = $payload.Substring(1, $payload.Length - 2)
+        }
+        elseif ($payload.Contains(';')) { throw 'An unquoted executable_blacklist contains a QSettings semicolon comment; no file was changed.' }
+        # QSettings escape sequences, variant/list encodings and inline annotations
+        # require semantic decoding. Refuse them instead of rewriting user entries.
+        if ($payload -match '["\\,@]' -or $payload.Contains('#')) {
+            throw 'Unsupported or ambiguous QSettings executable_blacklist serialization; no file was changed.'
+        }
+    }
+    else {
+        if ($versionAliases -or $generalHeaders.Count -ne 1 -or $versionLines.Count -ne 1 -or
+            $versionLines[0].Value.Trim() -notmatch '^version\s*=\s*(?:"2\.5\.2"|2\.5\.2)$') {
+            throw 'An absent executable_blacklist may only be materialized for the verified MO2 2.5.2 default baseline; unknown or ambiguous version.'
+        }
+        # MO2 v2.5.2 src/settings.cpp, Settings::executableBlacklist default.
+        # https://github.com/ModOrganizer2/modorganizer/blob/v2.5.2/src/settings.cpp
+        $payload = 'Chrome.exe;Firefox.exe;TSVNCache.exe;TGitCache.exe;Steam.exe;GameOverlayUI.exe;Discord.exe;GalaxyClient.exe;Spotify.exe;Brave.exe'
+    }
+    # MO2 passes tokens directly to usvfs: a whitespace-padded filename is not
+    # proof of an effective exclusion. Preserve it and append the exact name.
+    $entries = @($payload.Split(';') | Where-Object { $_.Length -gt 0 })
+    $required = @(Get-MO2SteamVRExclusionEntries)
+    $missing = @($required | Where-Object { $entries -inotcontains $_ })
+    $updatedText = $text
+    if ($missing.Count -gt 0) {
+        $separator = if ($payload.Length -gt 0 -and -not $payload.EndsWith(';')) { ';' } else { '' }
+        $replacementLine = $prefix + '"' + $payload + $separator + ($missing -join ';') + '"' + $suffix
+        if ($keyPresent) {
+            $originalLine = $blacklistLines[0]
+            $contentLength = $originalLine.Value.TrimEnd([char[]]"`r`n").Length
+            $updatedText = $text.Remove($originalLine.Index, $contentLength).Insert($originalLine.Index, $replacementLine)
+        }
+        else {
+            $insertAt = if ($settingsHeaders.Count -eq 1) { $settingsEnd } else { $text.Length }
+            $before = $text.Substring(0, $insertAt)
+            $separation = if ($before.Length -gt 0 -and -not $before.EndsWith("`n") -and -not $before.EndsWith("`r")) { $newline } else { '' }
+            $header = if ($settingsHeaders.Count -eq 0) { '[Settings]' + $newline } else { '' }
+            $updatedText = $text.Insert($insertAt, $separation + $header + $replacementLine + $newline)
+        }
+    }
+    $body = $encoding.GetBytes($updatedText)
+    $updatedBytes = [byte[]]::new($offset + $body.Length)
+    [Array]::Copy($bytes, 0, $updatedBytes, 0, $offset)
+    [Array]::Copy($body, 0, $updatedBytes, $offset, $body.Length)
+    $originalHash = Get-MO2BytesSha256 -Bytes $bytes
+    return [pscustomobject]@{
+        bytes = $bytes
+        updatedBytes = $updatedBytes
+        updatedSha256 = Get-MO2BytesSha256 -Bytes $updatedBytes
+        status = [pscustomobject][ordered]@{
+            iniPath = $iniPath
+            state = $(if ($missing.Count -eq 0) { 'configured' } else { 'missing-exclusions' })
+            complete = $missing.Count -eq 0
+            keyPresent = $keyPresent
+            defaultBaseline = $(if (-not $keyPresent) { 'MO2 2.5.2' } else { $null })
+            entries = $entries
+            requiredEntries = $required
+            missingEntries = $missing
+            encoding = $encodingName
+            originalSha256 = $originalHash
+            error = $null
+        }
+    }
+}
+
+function Get-MO2SteamVRExclusionStatus {
+    param([Parameter(Mandatory)][string]$Path)
+    try { return (Get-MO2SteamVRExclusionPlan -Path $Path).status }
+    catch {
+        return [pscustomobject][ordered]@{
+            iniPath = $Path; state = 'unavailable'; complete = $false
+            requiredEntries = @(Get-MO2SteamVRExclusionEntries); missingEntries = @()
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function Get-MO2SteamVRExclusionProcesses {
+    param([Parameter(Mandatory)]$Config)
+    $runtimeNames = @((Get-MO2SteamVRExclusionEntries) | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_) }) + @('vrstartup')
+    return [pscustomobject]@{
+        mo2 = @(Get-MO2ProcessRecords -Names (@($Config.mo2.processNames) + @([IO.Path]::GetFileNameWithoutExtension([string]$Config.mo2.executable))))
+        game = @(Get-MO2ProcessRecords -Names @($Config.mo2.gameProcessNames))
+        steamVr = @(Get-MO2ProcessRecords -Names (@($Config.mo2.runtimeProcessNames) + $runtimeNames))
+    }
+}
+
+function Invoke-MO2ConfigureSteamVRExclusions {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$AccessId, [switch]$WhatIf)
+
+    # This is installation-INI maintenance, not a game task: require an exact
+    # access-only lease, but neither create a session nor clone a game profile.
+    $owned = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
+    $operation = {
+        $current = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
+        if (-not [string]::IsNullOrWhiteSpace([string]$current.sessionId)) {
+            return New-MO2ActionResult -Config $Config -Command 'configure-steamvr-exclusions' -Ok $false -State 'blocked' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $current } -Errors @('INI maintenance requires an access-only lease; release its exact bound session first.')
+        }
+        $processes = Get-MO2SteamVRExclusionProcesses -Config $Config
+        if ($processes.mo2.Count -gt 0 -or $processes.game.Count -gt 0 -or $processes.steamVr.Count -gt 0) {
+            return New-MO2ActionResult -Config $Config -Command 'configure-steamvr-exclusions' -Ok $false -State 'blocked' -Data @{ processes = $processes } -Errors @('MO2, the game/loader and SteamVR (including vrstartup and helpers) must be closed. Exclusions cannot unload existing VFS hooks. No processes were stopped.')
+        }
+        $plan = Get-MO2SteamVRExclusionPlan -Path ([string]$Config.mo2.ini)
+        $data = [ordered]@{
+            iniPath = $plan.status.iniPath
+            addedEntries = @($plan.status.missingEntries)
+            statusBefore = $plan.status
+            statusAfter = $null
+            originalSha256 = $plan.status.originalSha256
+            updatedSha256 = $plan.updatedSha256
+            maintenancePath = $null; backupPath = $null; receiptPath = $null
+            wouldChange = -not $plan.status.complete
+            processesBefore = $processes
+            noProcessesStopped = $true
+        }
+        if ($WhatIf -or $plan.status.complete) {
+            if ($plan.status.complete) { $data.statusAfter = $plan.status }
+            return New-MO2ActionResult -Config $Config -Command 'configure-steamvr-exclusions' -Ok $true -State $(if ($WhatIf) { 'dry-run' } else { 'already-configured' }) -Data $data
+        }
+
+        $stagingRoot = [IO.Path]::GetFullPath((Resolve-MO2ControlPath ([string]$Config.storage.sessionStaging)))
+        $maintenanceId = 'steamvr-exclusions-{0}-{1}' -f [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'), [guid]::NewGuid().ToString('N')
+        $data.maintenancePath = Join-Path $stagingRoot $maintenanceId
+        $data.backupPath = Join-Path $data.maintenancePath 'ModOrganizer.ini.before'
+        $data.receiptPath = Join-Path $data.maintenancePath 'receipt.json'
+        $temporary = "$($data.iniPath).$maintenanceId.tmp"
+        $replaced = $false
+        $result = $null
+        $rollback = [ordered]@{ attempted = $false; restored = $false; error = $null }
+        try {
+            New-Item -ItemType Directory -Path $data.maintenancePath -ErrorAction Stop | Out-Null
+            [IO.File]::WriteAllBytes($data.backupPath, $plan.bytes)
+            if ((Get-MO2BytesSha256 -Bytes ([IO.File]::ReadAllBytes($data.backupPath))) -cne $data.originalSha256) { throw 'The exact INI backup did not verify.' }
+            Write-MO2JsonAtomic -Path (Join-Path $data.maintenancePath 'before.json') -Value ([pscustomobject]@{
+                command = 'configure-steamvr-exclusions'; timestampUtc = [DateTime]::UtcNow.ToString('o')
+                access = Get-MO2AccessLeaseSummary -Lock $current; data = $data
+            }) -CreateNew
+            [IO.File]::WriteAllBytes($temporary, $plan.updatedBytes)
+            if ((Get-MO2BytesSha256 -Bytes ([IO.File]::ReadAllBytes($temporary))) -cne $data.updatedSha256) { throw 'The staged INI did not verify.' }
+
+            # Recheck the process boundary and exact source immediately before
+            # atomic replacement; never overwrite an external INI edit.
+            $finalProcesses = Get-MO2SteamVRExclusionProcesses -Config $Config
+            if ($finalProcesses.mo2.Count -gt 0 -or $finalProcesses.game.Count -gt 0 -or $finalProcesses.steamVr.Count -gt 0) { throw 'MO2, the game or SteamVR started during exclusion preparation; INI unchanged.' }
+            $finalItem = Get-Item -LiteralPath $data.iniPath -ErrorAction Stop
+            if ($finalItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'The configured INI became a reparse point; replacement refused.' }
+            if ((Get-MO2BytesSha256 -Bytes ([IO.File]::ReadAllBytes($data.iniPath))) -cne $data.originalSha256) { throw 'The configured INI changed during exclusion preparation; replacement refused.' }
+            [IO.File]::Replace($temporary, $data.iniPath, [NullString]::Value)
+            $replaced = $true
+            $verified = Get-MO2SteamVRExclusionPlan -Path $data.iniPath
+            if (-not $verified.status.complete -or $verified.status.originalSha256 -cne $data.updatedSha256) { throw 'The replaced INI did not pass exact hash and exclusion verification.' }
+            $data.statusAfter = $verified.status
+            $result = New-MO2ActionResult -Config $Config -Command 'configure-steamvr-exclusions' -Ok $true -State 'configured' -Data $data
+            Write-MO2JsonAtomic -Path $data.receiptPath -Value $result -CreateNew
+            $receipt = ConvertFrom-MO2JsonText ([IO.File]::ReadAllText($data.receiptPath))
+            if (-not $receipt.ok -or $receipt.data.updatedSha256 -cne $data.updatedSha256) { throw 'The durable exclusion receipt did not verify.' }
+            return $result
+        }
+        catch {
+            $failure = $_.Exception.Message
+            if ($replaced) {
+                $rollback.attempted = $true
+                try {
+                    $rollbackProcesses = Get-MO2SteamVRExclusionProcesses -Config $Config
+                    if ($rollbackProcesses.mo2.Count -gt 0 -or $rollbackProcesses.game.Count -gt 0 -or $rollbackProcesses.steamVr.Count -gt 0) { throw 'MO2, the game or SteamVR started after replacement; automatic rollback refused. The exact backup is retained.' }
+                    [IO.File]::WriteAllBytes($temporary, $plan.bytes)
+                    if ((Get-MO2BytesSha256 -Bytes ([IO.File]::ReadAllBytes($temporary))) -cne $data.originalSha256) { throw 'The staged rollback INI did not verify.' }
+                    # An unrelated post-write edit must not be destroyed by rollback.
+                    if ((Get-Item -LiteralPath $data.iniPath -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'The INI became a reparse point after replacement; automatic rollback refused.' }
+                    if ((Get-MO2BytesSha256 -Bytes ([IO.File]::ReadAllBytes($data.iniPath))) -cne $data.updatedSha256) { throw 'INI changed after replacement; automatic rollback refused. Restore the retained backup only after classifying the external edit.' }
+                    [IO.File]::Replace($temporary, $data.iniPath, [NullString]::Value)
+                    $rollback.restored = (Get-MO2BytesSha256 -Bytes ([IO.File]::ReadAllBytes($data.iniPath))) -ceq $data.originalSha256
+                    if (-not $rollback.restored) { throw 'Rollback hash verification failed.' }
+                    $data.statusAfter = $plan.status
+                }
+                catch { $rollback.error = $_.Exception.Message }
+            }
+            $data['rollback'] = $rollback
+            $result = New-MO2ActionResult -Config $Config -Command 'configure-steamvr-exclusions' -Ok $false -State $(if ($replaced -and -not $rollback.restored) { 'rollback-failed' } elseif ($replaced) { 'rolled-back' } else { 'failed-unchanged' }) -Data $data -Errors @($failure, $rollback.error)
+            try { Write-MO2JsonAtomic -Path $data.receiptPath -Value $result }
+            catch { $result.errors += "Could not persist failure receipt: $($_.Exception.Message)" }
+            return $result
+        }
+        finally {
+            try {
+                if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force -ErrorAction Stop }
+            }
+            catch {
+                if ($null -ne $result) { $result.warnings += "The exact transaction temporary file remains at '$temporary': $($_.Exception.Message)" }
+            }
+        }
+    }
+    if ($WhatIf) { return & $operation }
+    return Invoke-WithMO2LeaseTransitionLock -LockPath $owned.path -Action $operation
+}
+
 function Get-MO2InspectionData {
     param(
         [Parameter(Mandatory)]$Config,
@@ -1353,6 +1661,7 @@ function Get-MO2InspectionData {
         selectedTaskWorkspace = $selectedTaskWorkspace
         profiles = @($profiles)
         executables = @($executables)
+        steamVrExclusions = Get-MO2SteamVRExclusionStatus -Path $mo2Ini
         processes = [pscustomobject][ordered]@{
             mo2 = @($mo2Processes)
             game = @($gameProcesses)
@@ -3905,6 +4214,7 @@ function Get-MO2ControlHelp {
             [pscustomobject]@{ name = 'renew-access'; mutation = $true; description = 'Refresh an owned access lease and optionally replace its advisory duration estimate. Never extends an automatic expiry because leases do not expire automatically.' },
             [pscustomobject]@{ name = 'release-access'; mutation = $true; description = 'Release an access-only lease after proving MO2, the game, and RootBuilder deployment are inactive.' },
             [pscustomobject]@{ name = 'recover-access'; mutation = $true; description = 'Explicitly recover a confirmed abandoned access lease after closed-state proof. Requires AccessId and ConfirmAbandoned; estimates never authorize recovery.' },
+            [pscustomobject]@{ name = 'configure-steamvr-exclusions'; mutation = $true; description = 'Append five SteamVR helper exclusions to only the selected installation INI, preserving existing entries with exact backup and receipt. Requires an access-only AccessId and closed MO2/game/SteamVR; supports WhatIf. Never stops processes or mutates profiles.' },
             [pscustomobject]@{ name = 'prepare'; mutation = $true; description = 'Validate closed state and create a durable evidence session. Pass AccessId to bind an explicit lease; legacy implicit single-session use remains supported.' },
             [pscustomobject]@{ name = 'open'; mutation = $true; description = 'Open only the exact configured MO2 executable and profile in an owned session. Does not launch the game. -StartOnly returns after the durable receipt is written.' },
             [pscustomobject]@{ name = 'launch'; mutation = $true; description = 'Launch one exact registered executable under one exact profile. Requires -SessionId; -StartOnly returns after the durable receipt is written.' },
@@ -3942,4 +4252,4 @@ function Get-MO2ControlHelp {
     }
 }
 
-Export-ModuleMember -Function Read-MO2ControlConfig, Get-MO2TaskWorkspaceIsolation, Invoke-MO2Inspect, Invoke-MO2Validate, Invoke-MO2RequestAccess, Invoke-MO2AccessStatus, Invoke-MO2RenewAccess, Invoke-MO2ReleaseAccess, Invoke-MO2RecoverAccess, Invoke-MO2Prepare, Invoke-MO2Open, Invoke-MO2Launch, Invoke-MO2Status, Invoke-MO2StopGame, Invoke-MO2TerminateGame, Invoke-MO2Close, Invoke-MO2RecoverClose, Invoke-MO2RecoverRootBuilder, Invoke-MO2Stop, Invoke-MO2Terminate, Invoke-MO2Release, Get-MO2ControlHelp
+Export-ModuleMember -Function Read-MO2ControlConfig, Get-MO2TaskWorkspaceIsolation, Invoke-MO2Inspect, Invoke-MO2Validate, Invoke-MO2RequestAccess, Invoke-MO2AccessStatus, Invoke-MO2RenewAccess, Invoke-MO2ReleaseAccess, Invoke-MO2RecoverAccess, Invoke-MO2ConfigureSteamVRExclusions, Invoke-MO2Prepare, Invoke-MO2Open, Invoke-MO2Launch, Invoke-MO2Status, Invoke-MO2StopGame, Invoke-MO2TerminateGame, Invoke-MO2Close, Invoke-MO2RecoverClose, Invoke-MO2RecoverRootBuilder, Invoke-MO2Stop, Invoke-MO2Terminate, Invoke-MO2Release, Get-MO2ControlHelp

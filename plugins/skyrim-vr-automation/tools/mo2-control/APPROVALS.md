@@ -51,6 +51,8 @@ by the host environment.
 Do not propose reusable approval for:
 
 - `recover-access`, because it transfers an abandoned lease;
+- `configure-steamvr-exclusions`, because it rewrites the selected installation's
+  MO2 INI under an exact backup transaction;
 - workspace `recover-legacy-selection`, because it changes the shared MO2
   selected profile after exact legacy-workspace classification;
 - `terminate-game` or `terminate`, because they force process termination;

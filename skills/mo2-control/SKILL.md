@@ -1,6 +1,6 @@
 ---
 name: mo2-control
-description: "Inspect and operate Mod Organizer 2 through the bundled exact-profile, single-owner controls. Use for MO2 or Mod Organizer inspection, validation, launch, game cycling, shutdown, session recovery, exact mod enable/disable transactions, package deployment planning, or Skyrim VR test-session orchestration. Also use when a user asks whether MO2 or Skyrim is closed, which profile or executable is configured, or how to preserve evidence from an MO2 run."
+description: "Inspect and operate Mod Organizer 2 through the bundled exact-profile, single-owner controls. Use for MO2 or Mod Organizer inspection, validation, launch, game cycling, shutdown, session recovery, SteamVR VFS exclusions, exact mod enable/disable transactions, package deployment planning, or Skyrim VR test-session orchestration. Also use when a user asks whether MO2 or Skyrim is closed, which profile or executable is configured, or how to preserve evidence from an MO2 run."
 ---
 
 # MO2 Control
@@ -10,7 +10,7 @@ edit `modlist.txt` ad hoc.
 
 ## Load the applicable contract
 
-- For access requests, inspection, validation, prepare, open, launch, status,
+- For access requests, inspection, validation, configure-steamvr-exclusions, prepare, open, launch, status,
   stop-game, close, recover-close, stop, terminate, release, or recovery, read
   `../../tools/mo2-control/MO2-RUNBOOK.md` completely before acting. Read
   `../../tools/mo2-control/README.md` when command or schema details matter.
@@ -119,6 +119,11 @@ are:
 
 ## Safety and authority
 
+- For an explicitly requested SteamVR VFS blacklist fix, follow the runbook's
+  `configure-steamvr-exclusions` maintenance path for the resolved MO2 config.
+  This INI-only operation uses an access lease but does not create or select a
+  test profile. It neither launches nor stops any process. An Unlock action or
+  a successful MO2 close alone does not prove that SteamVR has released VFS hooks.
 - Inspection is read-only. A user's request to diagnose or report does not
   authorize profile, package, process, or filesystem mutation.
 - Never accept a fallback profile or executable. Use the exact configured

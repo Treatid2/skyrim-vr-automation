@@ -273,6 +273,30 @@ the actual route independently.
 
 ## Failure and recovery matrix
 
+### SteamVR keeps MO2 locked after Skyrim exits
+
+Inspect the exact runtime process identities and whether they still load the
+selected installation's `usvfs_x64.dll`. SteamVR being alive is not itself a
+failure: a separately started, unhooked runtime may legitimately remain open.
+The distinction is surviving VFS participation. MO2's Unlock action releases
+its interface, not the hooks in those other processes.
+
+For an explicitly authorized prevention change, use
+`configure-steamvr-exclusions` through the resolved machine configuration.
+Read the maintenance section in `README.md`, acquire an access-only lease,
+validate closed state, preview with `-WhatIf`, then apply and retain its backup
+receipt before releasing access. This installation-INI maintenance operation
+does not create or select a test profile. Never use a particular modlist's name
+or paths as an implicit target.
+
+The command will not terminate processes. If hooked SteamVR survives, use the
+SteamVR controller only after runtime shutdown is authorized; ordinary MO2
+shutdown does not authorize closing Steam, other games, or crash-log editors.
+Exit the already-hooked runtime before testing the new exclusions, and verify
+on the next controlled launch that Skyrim still sees its mods while SteamVR
+does not inherit the VFS. Do not treat the prevention change as live-qualified
+before that check.
+
 ### Missing profile or fallback warning
 
 Symptom: MO2 says the selected profile does not exist and chooses a different

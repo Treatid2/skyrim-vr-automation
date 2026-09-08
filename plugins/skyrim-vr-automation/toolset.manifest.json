@@ -25,7 +25,7 @@
     },
     {
       "name": "mo2-control",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "entryPoint": "tools/mo2-control/Invoke-MO2Control.ps1"
     },
     {
