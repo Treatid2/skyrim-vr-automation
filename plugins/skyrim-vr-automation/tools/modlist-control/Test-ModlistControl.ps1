@@ -65,6 +65,10 @@ try {
     [ordered]@{ schemaVersion = 1; name = 'Not Safe'; selectedAtUtc = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json | Set-Content -LiteralPath $activePath -Encoding utf8
     $invalidActive = & $entry resolve -UserRoot $fixture -NoExit | ConvertFrom-Json
     Assert-ModlistTest (-not $invalidActive.ok -and -not $invalidActive.data.exists -and $invalidActive.data.source -eq 'active-modlist-invalid') 'resolve preserves an invalid active-selection failure even when a fallback path exists'
+    '{ malformed' | Set-Content -LiteralPath $activePath -Encoding utf8
+    $malformedList = & $entry list -UserRoot $fixture -NoExit | ConvertFrom-Json
+    Assert-ModlistTest (-not $malformedList.ok -and $malformedList.state -eq 'active-selection-invalid' -and
+        @($malformedList.data.modlists).Count -eq 2 -and $malformedList.errors[0] -match 'JSON') 'list reports named configurations even when the active-selection JSON is malformed'
     [IO.File]::WriteAllBytes($activePath, $activeBytes)
 
     $synergyPath = Get-MO2ControlNamedConfigPath -Name synergy -UserRoot $fixture

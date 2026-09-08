@@ -54,6 +54,15 @@ param(
     [switch]$SkipRuntimeIdentityVerification
 )
 $argsObject = $ArgumentsJson | ConvertFrom-Json -Depth 80
+[IO.File]::AppendAllText((Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'calls.log'), "$Tool/$($argsObject.action)`n")
+if ($Tool -eq 'record' -and $argsObject.action -eq 'stop' -and $env:CAPTURE_INTERACTION_FAIL_CLEANUP -eq '1') {
+  [pscustomobject]@{ok=$false;data=$null;errors=@('fixture record stop failure')} | ConvertTo-Json -Compress
+  return
+}
+if ($Tool -eq 'communityshaders.screenshot' -and $argsObject.action -eq 'request_cancel' -and $env:CAPTURE_INTERACTION_FAIL_CLEANUP -eq '1') {
+  [pscustomobject]@{ok=$false;data=$null;errors=@('fixture screenshot cancel failure')} | ConvertTo-Json -Compress
+  return
+}
 $frame = [pscustomobject]@{
   tMs=0; seq=1; originCode=1
   hmd=[pscustomobject]@{available=$true;connected=$true;valid=$true;index=0;trackingResult=200;matrix=@(1,0,0,0,0,1,0,0,0,0,1,0);velocity=@(0,0,0);angularVelocity=@(0,0,0)}
@@ -61,7 +70,18 @@ $frame = [pscustomobject]@{
   right=[pscustomobject]@{available=$true;connected=$true;valid=$true;index=2;trackingResult=200;matrix=@(1,0,0,0.2,0,1,0,1,0,0,1,-0.3);velocity=@(0,0,0);angularVelocity=@(0,0,0);controller=[pscustomobject]@{packetNumber=1;pressed=0;touched=0;axes=@(@(0,0),@(0,0),@(0,0),@(0,0),@(0,0))}}
 }
 if ($Tool -eq 'communityshaders.screenshot') {
-  if ($argsObject.action -in @('sequence_start','capture')) { $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='running';terminal=$false}} }
+  if ($argsObject.action -eq 'sequence_start' -and $env:CAPTURE_INTERACTION_FAIL_VISUAL_START -eq '1') {
+    [pscustomobject]@{ok=$false;data=$null;errors=@('fixture visual start failure')} | ConvertTo-Json -Compress
+    return
+  }
+  if ($argsObject.action -in @('sequence_start','capture')) {
+    $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='running';terminal=$false}}
+    if ($argsObject.action -eq 'sequence_start' -and $env:CAPTURE_INTERACTION_BREAK_SESSION_DIRECTORY) {
+      $target = [string]$env:CAPTURE_INTERACTION_BREAK_SESSION_DIRECTORY
+      if (Test-Path -LiteralPath $target -PathType Container) { Remove-Item -LiteralPath $target -Recurse -Force }
+      'blocked-session-directory' | Set-Content -LiteralPath $target -Encoding utf8
+    }
+  }
   elseif ($argsObject.action -eq 'request_get') {
     $image=Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'frame-left.png'
     if (-not (Test-Path $image)) { [IO.File]::WriteAllBytes($image,[byte[]](1,2,3)) }
@@ -98,9 +118,24 @@ else { $value=[pscustomobject]@{ok=$true} }
     $stopped = & $entry stop -SessionDirectory $session -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
     Assert-Test ($stopped.ok -and $stopped.state -eq 'stopped' -and $stopped.data.recording.stopReceipt.path -eq 'recording.json') 'stop finalizes visual capture before state recording and persists receipts'
 
+    $env:CAPTURE_INTERACTION_FAIL_VISUAL_START = '1'
+    $env:CAPTURE_INTERACTION_FAIL_CLEANUP = '1'
+    $failedVisualSession = Join-Path $root 'failed-visual-session'
+    $failedVisual = & $entry start -SessionDirectory $failedVisualSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 500 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test (-not $failedVisual.ok -and $failedVisual.state -eq 'cleanup-uncertain' -and $failedVisual.data.sessionId -and $failedVisual.data.recordAccepted -and $failedVisual.data.cleanup.errors.Count -eq 1) 'visual-start failure returns recording identity and truthful uncertain cleanup evidence'
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_VISUAL_START -ErrorAction SilentlyContinue
+
+    $failedStateSession = Join-Path $root 'failed-state-session'
+    $env:CAPTURE_INTERACTION_BREAK_SESSION_DIRECTORY = $failedStateSession
+    $failedState = & $entry start -SessionDirectory $failedStateSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 500 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test (-not $failedState.ok -and $failedState.state -eq 'cleanup-uncertain' -and $failedState.data.screenshotRequestId -eq 'req-1' -and $failedState.data.cleanup.errors.Count -ge 2) 'state-persistence failure returns screenshot and recording recovery identities when cleanup also fails'
+
     [pscustomobject]@{ ok=$true; sessionPath=$started.data.statePath; actionCount=(Get-CaptureInteractionActionCatalog).actions.Count } | ConvertTo-Json -Compress
 }
 finally {
     Remove-Item Env:CAPTURE_INTERACTION_FAKE_ROOT -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_VISUAL_START -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_CLEANUP -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_BREAK_SESSION_DIRECTORY -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
 }

@@ -148,9 +148,11 @@ physical `overwrite\ShaderCache` path. After optional seeding it inventories
 all enabled providers in exact modlist priority order and copies every missing
 provider path into Overwrite. Existing Overwrite or seed files remain
 authoritative. Every copied source is checked for stability and the target is
-SHA-256 verified; complete path coverage is then written to
-`shader-cache-provider-shadow.receipt.json` together with the final prepared
-inventory and `preparedTreeSha256`. This full shadow is required because MO2
+SHA-256 verified; complete path coverage and the final `preparedInventory` are
+then written to `shader-cache-provider-shadow.receipt.json`. The task plan
+records the corresponding `preparedTreeSha256`; consumers must validate both
+artifacts and require their hashes to agree. This full shadow is required
+because MO2
 writes modifications to the original provider of an existing virtual path;
 new paths naturally use Overwrite, but existing mod paths must first be made
 Overwrite winners. `-CacheModName` remains available for older explicitly

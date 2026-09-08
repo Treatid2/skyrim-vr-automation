@@ -5,6 +5,7 @@ param([switch]$DiscoveryOnly)
 
 $ErrorActionPreference = 'Stop'
 $entry = Join-Path (Split-Path -Parent $PSScriptRoot) 'Invoke-MO2WorkspaceControl.ps1'
+$powerShell = (Get-Process -Id $PID).Path
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('mo2-workspace-control-' + [guid]::NewGuid().ToString('N'))
 $taskId = 'codex-test-task-001'
 $priorProfileControlRoot = $env:CSX_MO2_PROFILE_CONTROL_ROOT
@@ -143,6 +144,40 @@ try {
     if ($missingContentCreate.ok -or $missingContentCreate.state -ne 'missing-workspace-content' -or $missingContentCreate.data.requiredParameter -ne 'WorkspaceContent' -or @(Get-ChildItem -LiteralPath $profiles -Directory -Force).Count -ne $profileCountBeforeMissingContent) { throw 'Workspace creation did not reject omitted content selection without profile side effects.' }
     $blockedCreate = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label blocked-by-cache -SavePolicy FreshGame -WorkspaceContent Modlist -Confirm:$false -NoExit | ConvertFrom-Json
     if ($blockedCreate.ok -or $blockedCreate.errors[0] -notmatch 'prepare-source') { throw 'Workspace creation did not block unmanaged ShaderCache folders in overwrite.' }
+    $migrationOverwrite = Join-Path $mo2 'overwrite'
+    $migrationTarget = Join-Path $mo2 'overwrite-prepare-source-reparse-target'
+    $sourceModListBeforeReparse = [IO.File]::ReadAllBytes((Join-Path $source 'modlist.txt'))
+    $modCountBeforeReparse = @(Get-ChildItem -LiteralPath $mods -Directory -Force).Count
+    Move-Item -LiteralPath $migrationOverwrite -Destination $migrationTarget -ErrorAction Stop
+    try {
+        New-Item -ItemType Junction -Path $migrationOverwrite -Target $migrationTarget -ErrorAction Stop | Out-Null
+        $reparsePrepare = & $entry prepare-source -ConfigPath $configPath -AccessId $accessId -Confirm:$false -Compact -NoExit | ConvertFrom-Json
+        if ($reparsePrepare.ok -or @($reparsePrepare.errors | Where-Object { $_ -match 'reparse point' }).Count -ne 1 -or
+            @(Get-ChildItem -LiteralPath $mods -Directory -Force).Count -ne $modCountBeforeReparse -or
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $source 'modlist.txt'))) -cne [Convert]::ToBase64String($sourceModListBeforeReparse)) {
+            throw 'prepare-source did not reject a reparse-point Overwrite root before moving caches or editing the stable profile.'
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $migrationOverwrite) { Remove-Item -LiteralPath $migrationOverwrite -Force }
+        Move-Item -LiteralPath $migrationTarget -Destination $migrationOverwrite -ErrorAction Stop
+    }
+    $nestedReparseTarget = Join-Path $mo2 'overwrite-nested-reparse-target'
+    $nestedReparsePath = Join-Path $migrationOverwrite 'aaa-reparse'
+    New-Item -ItemType Directory -Path $nestedReparseTarget -Force | Out-Null
+    try {
+        New-Item -ItemType Junction -Path $nestedReparsePath -Target $nestedReparseTarget -ErrorAction Stop | Out-Null
+        $nestedReparsePrepare = & $entry prepare-source -ConfigPath $configPath -AccessId $accessId -Confirm:$false -Compact -NoExit | ConvertFrom-Json
+        if ($nestedReparsePrepare.ok -or @($nestedReparsePrepare.errors | Where-Object { $_ -match 'reparse point' }).Count -ne 1 -or
+            @(Get-ChildItem -LiteralPath $mods -Directory -Force).Count -ne $modCountBeforeReparse -or
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $source 'modlist.txt'))) -cne [Convert]::ToBase64String($sourceModListBeforeReparse)) {
+            throw 'prepare-source did not reject a nested Overwrite reparse point before moving caches or editing the stable profile.'
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $nestedReparsePath) { Remove-Item -LiteralPath $nestedReparsePath -Force }
+        if (Test-Path -LiteralPath $nestedReparseTarget) { Remove-Item -LiteralPath $nestedReparseTarget -Recurse -Force }
+    }
     $prepared = & $entry prepare-source -ConfigPath $configPath -AccessId $accessId -Confirm:$false -Compact | ConvertFrom-Json
     if (-not $prepared.ok -or $prepared.state -ne 'migrated' -or @($prepared.data.movedDirectories).Count -ne 3) { throw "Stable source cache preparation failed: $($prepared | ConvertTo-Json -Depth 8 -Compress)" }
     if ($prepared.data.approval.reusableApprovalEligible -or [string]::IsNullOrWhiteSpace([string]$prepared.data.approval.oneShotReason)) { throw 'Shader-cache migration was not classified as one-shot.' }
@@ -207,8 +242,26 @@ try {
     if (@(Get-Content -LiteralPath $created.data.modListPath | Where-Object { $_ -like '+Codex Runtime Output -*' }).Count -ne 0) { throw 'Workspace registered a runtime-output mod instead of using MO2 Overwrite.' }
     $initialIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId
     if (-not $initialIsolation.ok -or -not $initialIsolation.backupVerification.ok -or [int]$initialIsolation.backupVerification.requiredProviderFiles -ne 2) { throw "Fresh workspace Overwrite isolation was not valid and unprepared: $($initialIsolation | ConvertTo-Json -Depth 12 -Compress)" }
+    $transactionController = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'
+    $hiddenTransactionController = $transactionController + '.fixture-hidden'
+    Move-Item -LiteralPath $transactionController -Destination $hiddenTransactionController -ErrorAction Stop
+    try {
+        $missingControllerIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId
+        if ($missingControllerIsolation.ok -or @($missingControllerIsolation.errors | Where-Object { $_ -match 'Expected exactly one shader-cache transaction controller' }).Count -ne 1) {
+            throw 'A missing shader-cache transaction controller escaped the structured isolation result.'
+        }
+    }
+    finally { Move-Item -LiteralPath $hiddenTransactionController -Destination $transactionController -ErrorAction Stop }
     $workspaceManifestPath = Join-Path (Join-Path $sessions 'workspaces') ($created.data.workspaceId + '.json')
     $workspaceManifestBytes = [IO.File]::ReadAllBytes($workspaceManifestPath)
+    $missingCompletionManifest = Get-Content -LiteralPath $workspaceManifestPath -Raw | ConvertFrom-Json -Depth 40
+    $missingCompletionManifest.runtimeOutput.PSObject.Properties.Remove('cacheCompletionPath')
+    $missingCompletionManifest | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $workspaceManifestPath -Encoding utf8
+    $missingCompletionIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId
+    if ($missingCompletionIsolation.ok -or @($missingCompletionIsolation.errors | Where-Object { $_ -match "lacks required path 'cacheCompletionPath'" }).Count -ne 1) {
+        throw 'A missing runtime-output completion path escaped structured launch isolation.'
+    }
+    [IO.File]::WriteAllBytes($workspaceManifestPath, $workspaceManifestBytes)
     $malformedWorkspaceManifest = Get-Content -LiteralPath $workspaceManifestPath -Raw | ConvertFrom-Json -Depth 40
     $malformedWorkspaceManifest.runtimeOutput.shadowReceipt.copied = @([pscustomobject]@{ winnerClass = 'copied-provider' })
     $malformedWorkspaceManifest | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $workspaceManifestPath -Encoding utf8
@@ -240,6 +293,19 @@ try {
     $catalogEntry = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'shader-cache-control\Invoke-CSXShaderCacheCatalog.ps1'
     $catalogRoot = Join-Path $fixture 'shader-cache-catalog'
     $shaderSourceSha256 = [string]::new([char]'A', 64)
+    function Complete-RearmedTestOutput($Workspace, [string]$OwnedAccessId) {
+        $output = $Workspace.data.runtimeOutput
+        $prepared = & $catalogEntry prepare -CatalogRoot $catalogRoot -CachePath $output.cachePath -ProfilePath $Workspace.data.modListPath -ModsPath $mods -BindToOverwrite -EvidenceDirectory $output.cacheEvidenceDirectory -BuildId $output.cachePrepareArguments.BuildId -ShaderCacheAbi $output.cachePrepareArguments.ShaderCacheAbi -WorkspaceId $Workspace.data.workspaceId -OwnershipId $Workspace.data.ownershipId -OwnerMarkerPath $output.ownerMarkerPath -OwnerMarkerSha256 $output.ownerMarkerSha256 -ShaderSourceSha256 $shaderSourceSha256 -RequireMaterializedOutput -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json
+        if (-not $prepared.ok) { throw "Rearmed shader-cache preparation failed: $($prepared | ConvertTo-Json -Depth 12 -Compress)" }
+        $rearmedCache = Join-Path $output.cachePath 'latest-build\generated-in-game.pso'
+        $rearmedBackup = Join-Path $output.backupPath 'latest-build\generated-in-game.bin'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $rearmedCache), (Split-Path -Parent $rearmedBackup) -Force | Out-Null
+        'rearmed-generated-cache' | Set-Content -LiteralPath $rearmedCache -Encoding utf8
+        'rearmed-generated-backup' | Set-Content -LiteralPath $rearmedBackup -Encoding utf8
+        $completedCache = & $catalogEntry complete -CatalogRoot $catalogRoot -CachePath $output.cachePath -EvidenceDirectory $output.cacheEvidenceDirectory -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json
+        $completedOutput = & $entry complete-output -ConfigPath $configPath -AccessId $OwnedAccessId -TaskId $taskId -WorkspaceId $Workspace.data.workspaceId -Confirm:$false | ConvertFrom-Json
+        if (-not $completedCache.ok -or -not $completedOutput.ok) { throw 'Rearmed workspace output did not complete.' }
+    }
     $preparedCache = & $catalogEntry prepare -CatalogRoot $catalogRoot -CachePath $created.data.runtimeOutput.cachePath -ProfilePath $created.data.modListPath -ModsPath $mods -BindToOverwrite -EvidenceDirectory $created.data.runtimeOutput.cacheEvidenceDirectory -BuildId $created.data.runtimeOutput.cachePrepareArguments.BuildId -ShaderCacheAbi $created.data.runtimeOutput.cachePrepareArguments.ShaderCacheAbi -WorkspaceId $created.data.workspaceId -OwnershipId $created.data.ownershipId -OwnerMarkerPath $created.data.runtimeOutput.ownerMarkerPath -OwnerMarkerSha256 $created.data.runtimeOutput.ownerMarkerSha256 -ShaderSourceSha256 $shaderSourceSha256 -RequireMaterializedOutput -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json
     $preparedIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
     if (-not $preparedCache.ok -or -not $preparedIsolation.ok -or -not $preparedIsolation.cachePlan.verification.ok -or [int]$preparedIsolation.cachePlan.verification.requiredProviderFiles -ne 2) { throw "Prepared Overwrite provider-shadow verification failed. Prepare: $($preparedCache | ConvertTo-Json -Depth 20 -Compress) Isolation: $($preparedIsolation | ConvertTo-Json -Depth 20 -Compress)" }
@@ -251,6 +317,14 @@ try {
     $malformedPlanIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
     if ($malformedPlanIsolation.ok -or @($malformedPlanIsolation.errors | Where-Object { $_ -match 'missing required state or preparation fields' }).Count -ne 1) {
         throw 'MO2 launch isolation did not reject a malformed cache-plan shape with structured evidence.'
+    }
+    [IO.File]::WriteAllBytes($cachePlanPath, $cachePlanBytes)
+    $missingCatalogPlan = Get-Content -LiteralPath $cachePlanPath -Raw | ConvertFrom-Json -Depth 40
+    $missingCatalogPlan.PSObject.Properties.Remove('catalog')
+    $missingCatalogPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $cachePlanPath -Encoding utf8
+    $missingCatalogIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
+    if ($missingCatalogIsolation.ok -or @($missingCatalogIsolation.errors | Where-Object { $_ -match 'recovery-catalog' }).Count -ne 1) {
+        throw 'MO2 launch isolation accepted a cache plan without the recovery catalog required by completion.'
     }
     [IO.File]::WriteAllBytes($cachePlanPath, $cachePlanBytes)
     $buildManifestPath = [string]$created.data.runtimeOutput.communityShadersPlugin.manifestPath
@@ -487,8 +561,27 @@ try {
     $nextAccess = Invoke-MO2RequestAccess -Config $config -Label fixture-resume -RuntimeRoute SteamVRNull; $nextAccessId = [string]$nextAccess.data.access.accessId
     $wrongOwner = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId 'different-task' -WorkspaceId $created.data.workspaceId -NoExit -Confirm:$false | ConvertFrom-Json
     if ($wrongOwner.ok -or $wrongOwner.errors[0] -notmatch 'different task') { throw 'A different task identity was allowed to resume the retained workspace.' }
+    $overwriteBeforeInterruptedResume = Get-TestProfileFingerprint (Join-Path $mo2 'overwrite')
+    & $powerShell -NoProfile -NonInteractive -File $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -InternalTestFailurePoint resume-interrupt-after-output-rearm -Confirm:$false -NoExit | Out-Null
+    if ($LASTEXITCODE -ne 91) { throw 'Interrupted resume fixture did not terminate after publishing recoverable output-rearm evidence.' }
+    $null = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
+    $interruptedResumeJournal = Get-ChildItem -LiteralPath $workspaceControlRoot -Filter ($created.data.workspaceId + '.resume.*.journal.json') -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    $interruptedResumeData = Get-Content -LiteralPath $interruptedResumeJournal.FullName -Raw | ConvertFrom-Json
+    $postRecoveryManifest = Get-Content -LiteralPath (Join-Path $workspaceControlRoot ($created.data.workspaceId + '.json')) -Raw | ConvertFrom-Json
+    if ($interruptedResumeData.phase -ne 'rolled-back' -or
+        [string]$postRecoveryManifest.accessId -ne [string]$accessId -or
+        (Test-Path -LiteralPath (Join-Path $mo2 'overwrite\.codex-workspace-output-owner.json')) -or
+        (Get-TestProfileFingerprint (Join-Path $mo2 'overwrite')) -cne $overwriteBeforeInterruptedResume) {
+        throw 'Startup recovery did not roll back the interrupted runtime-output rearm, exact manifest, and Overwrite tree.'
+    }
     $resumed = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -Confirm:$false | ConvertFrom-Json
     if (-not $resumed.ok -or $resumed.state -ne 'workspace-resumed' -or $resumed.data.accessId -ne $nextAccessId -or -not (Test-Path -LiteralPath (Join-Path $created.data.profilePath 'task-state.txt'))) { throw "Retained workspace was not rebound without losing task state: $($resumed | ConvertTo-Json -Depth 12 -Compress)" }
+    if ([string]$resumed.data.runtimeOutput.cacheEvidenceDirectory -ceq [string]$created.data.runtimeOutput.cacheEvidenceDirectory -or
+        @($resumed.data.runtimeOutputHistory).Count -ne 1 -or
+        (Test-Path -LiteralPath ([string]$resumed.data.runtimeOutput.cacheCompletionPath))) {
+        throw 'Retained workspace resume did not create a fresh output transaction while preserving the completed transaction history.'
+    }
+    Complete-RearmedTestOutput -Workspace $resumed -OwnedAccessId $nextAccessId
     if ((Get-Content -LiteralPath $ini -Raw) -notmatch ('selected_profile=@ByteArray\(' + [regex]::Escape([string]$created.data.profileName) + '\)')) { throw 'Resume did not select the retained task profile.' }
     $selectedText = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($ini))
     $selectedWithBom = [Text.UTF8Encoding]::new($true).GetPreamble() + [Text.UTF8Encoding]::new($false).GetBytes($selectedText)
@@ -517,7 +610,8 @@ try {
     $lateClaim = & $entry register-mod -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -ModName 'Later Shared Mod' -ModDirectory $laterSharedMod -NoExit -Confirm:$false | ConvertFrom-Json
     if ($lateClaim.ok -or $lateClaim.errors[0] -notmatch 'protected shared mod') { throw 'Resume did not protect a shared mod added after workspace creation.' }
     $resumedVerified = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $verified.data.workspaceId -Confirm:$false | ConvertFrom-Json
-    if (-not $resumedVerified.ok) { throw 'Second retained workspace could not be explicitly resumed.' }
+    if (-not $resumedVerified.ok) { throw "Second retained workspace could not be explicitly resumed: $($resumedVerified | ConvertTo-Json -Depth 12 -Compress)" }
+    Complete-RearmedTestOutput -Workspace $resumedVerified -OwnedAccessId $nextAccessId
     $releasedVerified = & $entry retire -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $verified.data.workspaceId -Confirm:$false | ConvertFrom-Json
     if (-not $releasedVerified.ok -or (Test-Path -LiteralPath $verified.data.profilePath)) { throw "Verified fixture workspace retirement failed: $($releasedVerified | ConvertTo-Json -Depth 12 -Compress)" }
     $resumedAgain = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -Confirm:$false | ConvertFrom-Json

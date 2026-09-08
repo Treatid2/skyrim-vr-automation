@@ -122,7 +122,13 @@ try {
     $resolvedUserRoot = if ([string]::IsNullOrWhiteSpace($UserRoot)) { Get-MO2ControlUserRoot } else { [IO.Path]::GetFullPath($UserRoot) }
     $modlistsDirectory = Get-MO2ControlModlistsDirectory -UserRoot $resolvedUserRoot
     $activePath = Get-MO2ControlActiveModlistPath -UserRoot $resolvedUserRoot
-    $active = Read-ActiveModlist -Path $activePath
+    $active = $null
+    $activeError = $null
+    try { $active = Read-ActiveModlist -Path $activePath }
+    catch {
+        if ($Command -ne 'list') { throw }
+        $activeError = $_.Exception.Message
+    }
     $activeName = if ($null -eq $active) { $null } else { [string]$active.name }
 
     switch ($Command) {
@@ -132,14 +138,15 @@ try {
             }
             else { @() }
             $items = @($files | ForEach-Object { Read-ModlistSummary -File $_ -SelectedName $activeName })
-            $selectionValid = [string]::IsNullOrWhiteSpace($activeName) -or @($items | Where-Object { $_.name -ceq $activeName -and $_.validJson }).Count -eq 1
+            $selectionValid = [string]::IsNullOrWhiteSpace($activeError) -and
+                ([string]::IsNullOrWhiteSpace($activeName) -or @($items | Where-Object { $_.name -ceq $activeName -and $_.validJson }).Count -eq 1)
             $result = New-ModlistResult -Ok $selectionValid -State $(if (-not $selectionValid) { 'active-selection-invalid' } elseif ($items.Count -eq 0) { 'empty' } elseif ([string]::IsNullOrWhiteSpace($activeName)) { 'selection-required' } else { 'ready' }) -Data ([pscustomobject][ordered]@{
                 userRoot = $resolvedUserRoot
                 modlistsDirectory = $modlistsDirectory
                 activeModlistPath = $activePath
                 active = $active
                 modlists = $items
-            }) -Errors $(if ($selectionValid) { @() } else { @("Active modlist '$activeName' does not resolve to exactly one valid named configuration.") })
+            }) -Errors $(if ($selectionValid) { @() } elseif (-not [string]::IsNullOrWhiteSpace($activeError)) { @($activeError) } else { @("Active modlist '$activeName' does not resolve to exactly one valid named configuration.") })
         }
         'resolve' {
             if (-not [string]::IsNullOrWhiteSpace($Name)) {

@@ -213,6 +213,43 @@ function Add-ActionLog($State, $Entry) {
     return $path
 }
 
+function Invoke-CaptureStartupCleanup($Recovery) {
+    $errors = [Collections.Generic.List[string]]::new()
+    $screenshotTerminal = $null
+    $recordStop = $null
+    if (-not [string]::IsNullOrWhiteSpace([string]$Recovery.screenshotRequestId)) {
+        try {
+            $cancel = New-ScreenshotCommand ([string]$Recovery.sessionId) 'request_cancel'
+            $cancel['requestId'] = [string]$Recovery.screenshotRequestId
+            $null = Invoke-DevBench -Tool $screenshotTool -Arguments $cancel -Runtime ([string]$Recovery.runtimePath) -RequireSuccess
+            $transientState = [pscustomobject]@{ sessionId = $Recovery.sessionId; runtimePath = $Recovery.runtimePath }
+            $screenshotTerminal = Wait-ScreenshotTerminal -RequestId ([string]$Recovery.screenshotRequestId) -State $transientState
+        }
+        catch { $errors.Add("screenshot: $($_.Exception.Message)") }
+    }
+    if ([bool]$Recovery.recordAccepted) {
+        try { $recordStop = (Invoke-DevBench -Tool 'record' -Arguments @{ action = 'stop' } -Runtime ([string]$Recovery.runtimePath) -RequireSuccess).value }
+        catch { $errors.Add("record: $($_.Exception.Message)") }
+    }
+    $Recovery.cleanup = [pscustomobject][ordered]@{
+        state = $(if ($errors.Count -eq 0) { 'verified' } else { 'uncertain' })
+        attemptedUtc = [DateTime]::UtcNow.ToString('o')
+        screenshotTerminal = $screenshotTerminal
+        recordStop = $recordStop
+        errors = @($errors)
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Recovery.receiptPath)) {
+        try { Write-JsonAtomic -Path ([string]$Recovery.receiptPath) -Value $Recovery }
+        catch { $errors.Add("recovery-receipt: $($_.Exception.Message)") }
+    }
+    if ($errors.Count -gt 0) {
+        $Recovery.cleanup.state = 'uncertain'
+        $Recovery.cleanup.errors = @($errors)
+    }
+    return $Recovery
+}
+
+$failureData = $null
 try {
     if ($Command -eq 'capabilities') {
         if ([string]::IsNullOrWhiteSpace($RuntimePath)) { throw '-RuntimePath or CSX_DEVBENCH_RUNTIME_PATH is required.' }
@@ -235,6 +272,13 @@ try {
         if ($VisualMode -ne 'none') { New-Item -ItemType Directory -Path $framesDirectory -Force | Out-Null }
         $sessionId = [guid]::NewGuid().ToString()
         $recordCall = Invoke-DevBench -Tool 'record' -Arguments @{ action = 'start'; intervalMs = $RecordIntervalMs; allowNoPlayer = [bool]$AllowNoPlayer; correlationId = $sessionId } -Runtime $RuntimePath -RequireSuccess
+        $failureData = [pscustomobject][ordered]@{
+            contractVersion = '1.0.0'; operation = 'capture-start-recovery'; sessionId = $sessionId
+            runtimePath = [IO.Path]::GetFullPath($RuntimePath); sessionDirectory = $resolvedSessionDirectory
+            intendedStatePath = $resolvedStatePath; receiptPath = (Join-Path $resolvedSessionDirectory 'capture-start-recovery.json')
+            recordAccepted = $true; recordStartReceipt = $recordCall.value; screenshotRequestId = $null
+            screenshotStartReceipt = $null; cleanup = $null
+        }
         $screenshotState = [pscustomobject][ordered]@{ requestId = $null; startReceipt = $null }
         try {
             if ($VisualMode -eq 'sequence') {
@@ -253,11 +297,14 @@ try {
                 if ($receipt.Count -ne 1) { throw 'Screenshot sequence did not expose an accepted request receipt.' }
                 $screenshotState.requestId = [string]$receipt[0].requestId
                 $screenshotState.startReceipt = $receipt[0]
+                $failureData.screenshotRequestId = [string]$receipt[0].requestId
+                $failureData.screenshotStartReceipt = $receipt[0]
             }
         }
         catch {
-            try { $null = Invoke-DevBench -Tool 'record' -Arguments @{ action = 'stop' } -Runtime $RuntimePath } catch {}
-            throw "Visual capture start failed after recording began; recording was rolled back. $($_.Exception.Message)"
+            $startupFailure = $_.Exception.Message
+            $failureData = Invoke-CaptureStartupCleanup -Recovery $failureData
+            throw "Visual capture start failed after recording began; cleanup is '$($failureData.cleanup.state)'. $startupFailure"
         }
         $state = [pscustomobject][ordered]@{
             contractVersion = '1.0.0'; sessionId = $sessionId; status = 'active'
@@ -269,16 +316,11 @@ try {
         }
         try { Write-JsonAtomic -Path $resolvedStatePath -Value $state }
         catch {
-            if ($screenshotState.requestId) {
-                try {
-                    $cancel = New-ScreenshotCommand $sessionId 'request_cancel'
-                    $cancel['requestId'] = [string]$screenshotState.requestId
-                    $null = Invoke-DevBench -Tool $screenshotTool -Arguments $cancel -Runtime $RuntimePath
-                } catch {}
-            }
-            try { $null = Invoke-DevBench -Tool 'record' -Arguments @{ action = 'stop' } -Runtime $RuntimePath } catch {}
-            throw "Session-state persistence failed after capture start; started services were rolled back. $($_.Exception.Message)"
+            $startupFailure = $_.Exception.Message
+            $failureData = Invoke-CaptureStartupCleanup -Recovery $failureData
+            throw "Session-state persistence failed after capture start; cleanup is '$($failureData.cleanup.state)'. $startupFailure"
         }
+        $failureData = $null
         $result = [pscustomobject][ordered]@{ ok = $true; command = $Command; state = 'session-started'; data = $state; errors = @() }
     }
     else {
@@ -382,7 +424,8 @@ try {
     }
 }
 catch {
-    $result = [pscustomobject][ordered]@{ ok = $false; command = $Command; state = 'tool-error'; data = $null; errors = @($_.Exception.Message) }
+    $failureState = if ($failureData -and $failureData.cleanup -and [string]$failureData.cleanup.state -eq 'uncertain') { 'cleanup-uncertain' } else { 'tool-error' }
+    $result = [pscustomobject][ordered]@{ ok = $false; command = $Command; state = $failureState; data = $failureData; errors = @($_.Exception.Message) }
 }
 
 $json = @{ InputObject = $result; Depth = 100 }

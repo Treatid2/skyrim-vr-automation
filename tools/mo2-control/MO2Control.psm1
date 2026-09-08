@@ -568,6 +568,29 @@ function Get-MO2OverwriteWorkspaceIsolation {
     $output = $manifest.runtimeOutput
     $errors = [Collections.Generic.List[string]]::new()
     $checks = [Collections.Generic.List[object]]::new()
+    $requiredOutputPaths = @(
+        'overwritePath', 'cachePath', 'backupPath', 'ownerMarkerPath',
+        'cachePlanPath', 'cacheCompletionPath', 'backupCompletionPath'
+    )
+    foreach ($field in $requiredOutputPaths) {
+        if ($null -eq $output -or -not $output.PSObject.Properties[$field] -or
+            [string]::IsNullOrWhiteSpace([string]$output.$field)) {
+            $errors.Add("Task runtime-output manifest lacks required path '$field'.")
+        }
+    }
+    foreach ($field in @('mode', 'executable', 'ownerMarkerSha256')) {
+        if ($null -eq $output -or -not $output.PSObject.Properties[$field] -or
+            [string]::IsNullOrWhiteSpace([string]$output.$field)) {
+            $errors.Add("Task runtime-output manifest lacks required field '$field'.")
+        }
+    }
+    if ($errors.Count -gt 0) {
+        return [pscustomobject][ordered]@{
+            applicable = $true; ok = $false; profile = $Profile; executable = $Executable
+            workspace = $Owned; runtimeOutput = $output; cachePlan = $null
+            backupVerification = $null; checks = @($checks); errors = @($errors)
+        }
+    }
     if ([string]$manifest.status -cne 'ready') { $errors.Add("Task workspace status must be 'ready' before launch; observed '$($manifest.status)'.") }
     if ([string]::IsNullOrWhiteSpace($AccessId) -or [string]$manifest.accessId -cne $AccessId) { $errors.Add('Task workspace and MO2 session must use the exact explicit access lease.') }
 
@@ -634,9 +657,9 @@ function Get-MO2OverwriteWorkspaceIsolation {
         }
     }
 
-    $transactionTool = Resolve-MO2ShaderCacheTransactionTool
     $cacheProviders = $null; $backupProviders = $null; $cacheInventory = $null; $backupInventory = $null; $currentBuild = $null
     try {
+        $transactionTool = Resolve-MO2ShaderCacheTransactionTool
         if (-not $outputCompleted) {
             $currentBuild = Resolve-MO2CommunityShadersBuildBinding -TransactionTool $transactionTool -ProfilePath $modListPath -ModsPath $modsRoot
             $cacheProviders = ConvertFrom-MO2JsonText ([string](& $transactionTool providers -ProfilePath $modListPath -ModsPath $modsRoot -RelativeCachePath 'ShaderCache' -DeepInventory -IncludeInventoryEntries -NoExit -Confirm:$false))
@@ -728,11 +751,27 @@ function Get-MO2OverwriteWorkspaceIsolation {
     }
     elseif ($RequirePreparedCache) { $errors.Add("Task launch requires the bound shader-cache prepare plan: $planPath") }
     $planComplete = $null -ne $plan
-    foreach ($requiredPlanField in @('state', 'requireMaterializedOutput', 'preparedTreeSha256')) {
+    foreach ($requiredPlanField in @(
+        'state', 'requireMaterializedOutput', 'preparedTreeSha256', 'cachePath',
+        'evidenceDirectory', 'beforeTreeSha256', 'transactionReceiptPath',
+        'catalog', 'cacheBinding', 'providerShadow'
+    )) {
         if ($planComplete -and -not $plan.PSObject.Properties[$requiredPlanField]) { $planComplete = $false }
     }
+    if ($planComplete) {
+        foreach ($requiredTextField in @('state', 'preparedTreeSha256', 'cachePath', 'evidenceDirectory', 'beforeTreeSha256', 'transactionReceiptPath')) {
+            if ([string]::IsNullOrWhiteSpace([string]$plan.$requiredTextField)) { $planComplete = $false }
+        }
+        $planComplete = $planComplete -and $null -ne $plan.catalog -and
+            $plan.catalog.PSObject.Properties['path'] -and
+            -not [string]::IsNullOrWhiteSpace([string]$plan.catalog.path) -and
+            $null -ne $plan.cacheBinding -and $null -ne $plan.providerShadow -and
+            $plan.providerShadow.PSObject.Properties['receipt'] -and
+            $null -ne $plan.providerShadow.receipt -and
+            (Test-Path -LiteralPath ([string]$plan.transactionReceiptPath) -PathType Leaf)
+    }
     if ($null -ne $plan -and -not $planComplete) {
-        $errors.Add('Shader-cache plan is missing required state or preparation fields.')
+        $errors.Add('Shader-cache plan is missing required state or preparation fields, including binding, provider, or recovery-catalog evidence.')
     }
     if ($null -ne $plan -and $null -ne $cacheProviders -and $null -ne $cacheInventory) {
         $binding = if ($plan.PSObject.Properties['cacheBinding']) { $plan.cacheBinding } else { $null }
@@ -855,7 +894,31 @@ function Get-MO2TaskWorkspaceIsolation {
     }
 
     $output = $manifest.runtimeOutput
+    foreach ($requiredField in @('mode', 'executable')) {
+        if (-not $output.PSObject.Properties[$requiredField] -or [string]::IsNullOrWhiteSpace([string]$output.$requiredField)) {
+            $errors.Add("Task runtime-output manifest lacks required field '$requiredField'.")
+        }
+    }
+    if ($errors.Count -gt 0) {
+        return [pscustomobject][ordered]@{
+            applicable = $true; ok = $false; profile = $Profile
+            executable = $Executable; workspace = $owned; runtimeOutput = $output
+            cachePlan = $null; backupVerification = $null; checks = @($checks); errors = @($errors)
+        }
+    }
     if ([string]$output.mode -ceq 'mo2-overwrite-output') {
+        foreach ($requiredPath in @('cacheCompletionPath', 'backupCompletionPath')) {
+            if (-not $output.PSObject.Properties[$requiredPath] -or [string]::IsNullOrWhiteSpace([string]$output.$requiredPath)) {
+                $errors.Add("Task runtime-output manifest lacks required path '$requiredPath'.")
+            }
+        }
+        if ($errors.Count -gt 0) {
+            return [pscustomobject][ordered]@{
+                applicable = $true; ok = $false; profile = $Profile
+                executable = $Executable; workspace = $owned; runtimeOutput = $output
+                cachePlan = $null; backupVerification = $null; checks = @($checks); errors = @($errors)
+            }
+        }
         return Get-MO2OverwriteWorkspaceIsolation -Config $Config -Owned $owned -Profile $Profile -Executable $Executable -AccessId $AccessId -RequirePreparedCache:$RequirePreparedCache -AllowPreparedCacheGrowth:$AllowPreparedCacheGrowth
     }
     $profilesRoot = [IO.Path]::GetFullPath((Resolve-MO2ControlPath ([string]$Config.mo2.profilesDirectory)))

@@ -35,8 +35,29 @@ try {
     if ([math]::Abs([double]$candidate.fpsDeltaPercent - 10.0) -gt 0.000001) { throw 'FPS percent delta is incorrect.' }
     if ([math]::Abs([double]$candidate.skyrimCoreDelta - 0.2) -gt 0.000001) { throw 'CPU-core delta is incorrect.' }
     if ($candidate.scene -ne 'unspecified') { throw 'Legacy capture without scene was not normalized.' }
-    [pscustomobject]@{ ok = $true; tests = 4 } | ConvertTo-Json
+
+    $quietControl = Join-Path $root 'fake-quiet-devbench.ps1'
+    $quietState = Join-Path $root 'quiet-state.txt'
+    '0' | Set-Content -LiteralPath $quietState -Encoding ascii
+    $quietRuntime = Join-Path $root 'runtime.json'
+    '{}' | Set-Content -LiteralPath $quietRuntime -Encoding utf8
+    [IO.File]::WriteAllText($quietControl, @'
+param([string]$Command,[string]$Tool,[string]$ArgumentsJson,[string]$RuntimePath,[string]$EvidenceDirectory,[string]$EvidenceLabel,[switch]$NoExit,[switch]$Compact)
+Start-Sleep -Milliseconds 100
+$frame = [int](Get-Content -LiteralPath $env:CSX_QUIET_TEST_STATE -Raw)
+$frame += 120
+$frame | Set-Content -LiteralPath $env:CSX_QUIET_TEST_STATE -Encoding ascii
+[pscustomobject]@{ok=$true;runtimeIdentity=[pscustomobject]@{health=[pscustomobject]@{pid=$PID;exe='fixture';frame=$frame};build=[pscustomobject]@{buildId='fixture'}}} | ConvertTo-Json -Depth 8 -Compress
+'@, [Text.UTF8Encoding]::new($false))
+    $env:CSX_QUIET_TEST_STATE = $quietState
+    $quietOutput = Join-Path $root 'quiet.json'
+    $quiet = & (Join-Path $PSScriptRoot 'Measure-SkyrimQuietWindow.ps1') -OutputPath $quietOutput -Condition fixture -Scene SyntheticScene -RuntimePath $quietRuntime -Samples 2 -IntervalMilliseconds 50 -DevBenchControlPath $quietControl | ConvertFrom-Json
+    $quietCapture = Get-Content -LiteralPath $quietOutput -Raw | ConvertFrom-Json
+    if (-not $quiet.ok -or $quietCapture.schemaVersion -ne 2 -or $quietCapture.frameCounterElapsedSeconds -le $quietCapture.elapsedSeconds -or $quietCapture.measurementIntervals.frameBoundaryMethod -ne 'request-midpoint') { throw 'Quiet-window counters did not use their matched observation intervals.' }
+    Remove-Item Env:CSX_QUIET_TEST_STATE -ErrorAction SilentlyContinue
+    [pscustomobject]@{ ok = $true; tests = 5 } | ConvertTo-Json
 }
 finally {
+    Remove-Item Env:CSX_QUIET_TEST_STATE -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $root -PathType Container) { Remove-Item -LiteralPath $root -Recurse -Force }
 }

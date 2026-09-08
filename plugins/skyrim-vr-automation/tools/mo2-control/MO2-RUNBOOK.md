@@ -146,8 +146,9 @@ or resume one while holding access. On the first request, prepare the configured
 stable source and create a task workspace. On later requests, select an exact
 retained WorkspaceId or explicitly request a fresh clone. Pass the returned
 task profile explicitly to `prepare`.
-`prepare-source` now reports existing cache trees without moving them. Creation
-binds the workspace to snapshotted MO2 Overwrite output, removes the cloned
+Except under `-WhatIf`, `prepare-source` transactionally moves legacy cache
+trees from Overwrite into a newly enabled stable-profile mod. Creation binds
+the workspace to snapshotted MO2 Overwrite output, removes the cloned
 profile's game and `Synthesis` custom-overwrite mappings, and materializes the
 enabled `backup` provider union there. Cache catalog preparation does the same
 for `ShaderCache`. Fresh creation also requires `fixture-status` to be
@@ -160,7 +161,6 @@ for `ShaderCache`. Fresh creation also requires `fixture-status` to be
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> list-task -TaskId <stable-task-id> -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> create -AccessId <literal-access-id> -TaskId <stable-task-id> -Label short-test-name -WorkspaceContent Modlist -SavePolicy MainMenuOnly -Confirm:$false -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> resume -AccessId <literal-access-id> -TaskId <stable-task-id> -WorkspaceId <exact-retained-workspace-id> -Confirm:$false -Compact
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> complete-output -AccessId <literal-access-id> -TaskId <stable-task-id> -WorkspaceId <exact-workspace-id> -Confirm:$false -Compact
 ```
 
 `list-local-work-mods` is read-only. A fresh request must name either
@@ -270,8 +270,12 @@ the actual route independently.
    use the same durable controller for the bounded escalation `stop-game`,
    `terminate`, then `release`; the
    latter two commands prove game/RootBuilder absence and exact lock ownership.
-   `release -SessionId` ends the evidence session. For an explicitly requested
-   lease it deliberately retains access, so call `release-access -AccessId`
+   `release -SessionId` ends the evidence session. After the game, MO2, and
+   evidence session are closed, complete the shader-cache catalog transaction,
+   then run workspace `complete-output -AccessId <literal-access-id> -TaskId
+   <stable-task-id> -WorkspaceId <exact-workspace-id> -Confirm:$false`. This
+   preserves generated output, restores the exact pre-task Overwrite trees, and
+   releases the owner marker. Finally call `release-access -AccessId`
    immediately unless another MO2 session is about to begin.
 2. Collect only files attributable to the session. Common sources include:
    - CSX/SKSE/MO2 logs;
