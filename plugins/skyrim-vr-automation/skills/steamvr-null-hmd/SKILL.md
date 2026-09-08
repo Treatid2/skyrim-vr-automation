@@ -45,7 +45,12 @@ particular drive letter for the plugin itself.
    target-owned transaction journal, rather than this caller-selected folder,
    is authoritative. Preview
    `apply` or `restore` with `-WhatIf`, then perform the authorized operation
-   using the same `-EvidenceDirectory`.
+   using the same `-EvidenceDirectory`. For an MO2-backed `apply` or `start`,
+   pass the exact admitted `-MO2AccessId <literal-access-id>` and
+   `-MO2Profile <literal-profile-name>` on every call. The controller repeats
+   the closed-state `SteamVRNull` provider admission and binds its public proof
+   into the transaction receipt; it refuses a changed profile or provider
+   inventory at `start`. Never use `-Standalone` for Skyrim through MO2.
 6. Parse the JSON postcondition. After `apply`, require `state` to be
    `null-applied` and the effective profile checks to match. If isolation was
    requested, also require a conflict-free inventory and a receipt containing

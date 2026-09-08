@@ -20,6 +20,17 @@ param(
 
     [string]$EvidenceDirectory,
 
+    [string]$MO2AccessId,
+
+    [string]$MO2Profile,
+
+    [string]$MO2ConfigPath,
+
+    [switch]$Standalone,
+
+    [Parameter(DontShow)]
+    [switch]$InternalTestRequireMO2Admission,
+
     [ValidateRange(100, 60000)]
     [int]$TransactionLockTimeoutMilliseconds = 5000,
 
@@ -1283,6 +1294,65 @@ function New-Result {
     }
 }
 
+function Get-MO2NullAdmission {
+    $fixtureMode = -not $InternalTestRequireMO2Admission -and -not [string]::IsNullOrWhiteSpace($env:CSX_STEAMVR_TRANSACTION_ROOT) -and
+        [IO.Path]::GetFullPath($SettingsPath).StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()), [StringComparison]::OrdinalIgnoreCase)
+    if ($fixtureMode) {
+        return [pscustomobject][ordered]@{
+            mode = 'fixture'; runtimeRoute = 'SteamVRNull'; profile = $null
+            leaseId = $null; validatedUtc = [DateTime]::UtcNow.ToString('o')
+        }
+    }
+    if ($Standalone) {
+        if (-not [string]::IsNullOrWhiteSpace($MO2AccessId) -or -not [string]::IsNullOrWhiteSpace($MO2Profile) -or -not [string]::IsNullOrWhiteSpace($MO2ConfigPath)) {
+            throw '-Standalone cannot be combined with MO2 admission parameters.'
+        }
+        return [pscustomobject][ordered]@{
+            mode = 'standalone'; runtimeRoute = 'SteamVRNull'; profile = $null
+            leaseId = $null; validatedUtc = [DateTime]::UtcNow.ToString('o')
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($MO2AccessId) -or [string]::IsNullOrWhiteSpace($MO2Profile)) {
+        throw 'Null-HMD apply/start requires -MO2AccessId and -MO2Profile from an owned SteamVRNull workspace. Use -Standalone only when no MO2-backed application will be launched.'
+    }
+
+    $mo2Entry = Join-Path (Split-Path -Parent $PSScriptRoot) 'mo2-control\Invoke-MO2Control.ps1'
+    if (-not (Test-Path -LiteralPath $mo2Entry -PathType Leaf)) { throw "MO2 route-admission controller is missing: $mo2Entry" }
+    $arguments = @('validate', '-AccessId', $MO2AccessId, '-Profile', $MO2Profile, '-RequireClosed', '-Compact', '-NoExit')
+    if (-not [string]::IsNullOrWhiteSpace($MO2ConfigPath)) { $arguments += @('-ConfigPath', $MO2ConfigPath) }
+    $validationText = & $mo2Entry @arguments
+    $validation = $validationText | ConvertFrom-Json -Depth 20 -ErrorAction Stop
+    $routeChecks = @($validation.checks | Where-Object name -eq 'runtime-route-provider')
+    $routeId = if ($routeChecks.Count -eq 1 -and $routeChecks[0].details.runtimeRoute) { [string]$routeChecks[0].details.runtimeRoute.id } else { $null }
+    if (-not $validation.ok -or $routeChecks.Count -ne 1 -or $routeChecks[0].status -ne 'pass' -or $routeId -cne 'SteamVRNull') {
+        $failures = @($validation.checks | Where-Object status -eq 'fail' | ForEach-Object message)
+        throw "MO2 null-HMD admission failed for exact profile '$MO2Profile': $($failures -join '; ')"
+    }
+    $enabledReplacements = @($validation.data.runtimeProviders.providers | Where-Object { $_.enabled -and $_.markers.rootOpenVrApi })
+    if ($enabledReplacements.Count -ne 0) { throw 'MO2 null-HMD admission returned pass while an enabled profile-local OpenVR replacement remained.' }
+    $inventoryJson = $validation.data.runtimeProviders | ConvertTo-Json -Depth 8 -Compress
+    $inventoryHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($inventoryJson)))
+    return [pscustomobject][ordered]@{
+        mode = 'mo2'; runtimeRoute = $routeId; profile = [string]$validation.data.requested.profile
+        leaseId = [string]$validation.data.sessionLock.leaseId; validatedUtc = [DateTime]::UtcNow.ToString('o')
+        providerInventorySha256 = $inventoryHash; enabledOpenVrReplacementCount = 0
+        validationContractVersion = [string]$validation.contractVersion
+    }
+}
+
+function Assert-MO2NullAdmissionMatchesReceipt($Admission, $Receipt) {
+    if (-not $Receipt.ContainsKey('mo2Admission')) { throw 'The apply receipt predates mandatory MO2/null-HMD admission. Restore it and create a new admitted transaction.' }
+    $recorded = $Receipt['mo2Admission']
+    foreach ($field in @('mode', 'runtimeRoute', 'profile', 'leaseId')) {
+        if ([string]$recorded[$field] -cne [string]$Admission.$field) {
+            throw "Current MO2/null-HMD admission differs from the apply receipt at '$field'."
+        }
+    }
+    if ([string]$Admission.mode -eq 'mo2' -and [string]$recorded['providerInventorySha256'] -cne [string]$Admission.providerInventorySha256) {
+        throw 'The exact MO2 runtime-provider inventory changed after null-HMD apply; revalidate and create a new transaction.'
+    }
+}
+
 function New-RuntimeAdmissionSnapshot {
     param(
         [Parameter(Mandatory)][string]$State,
@@ -1473,6 +1543,7 @@ try {
     $effective = Get-EffectiveState -Settings $settings -Profile $profile
     $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile
     $externalDrivers = Get-ExternalDriverInventory -Path $OpenVRPathsPath
+    $mo2Admission = if ($Command -in @('apply', 'start')) { Get-MO2NullAdmission } else { $null }
     $authoritativeEvidenceDirectory = if ($null -ne $recoveredTransaction -and (Test-JsonDictionaryContains $recoveredTransaction 'evidenceDirectory')) { [string]$recoveredTransaction['evidenceDirectory'] } else { $null }
     $authoritativeOwnsAppliedState = $effective.active -and $null -ne $recoveredTransaction -and (
         ([string]$recoveredTransaction['operation'] -eq 'apply' -and [string]$recoveredTransaction['phase'] -eq 'committed') -or
@@ -1555,6 +1626,7 @@ try {
             inputContract = $inputContract
             targetControl = $targetControl
             recoveredTransaction = $recoveredTransaction
+            mutationAdmission = 'apply/start require an owned SteamVRNull MO2 profile or explicit standalone mode'
         }
     }
     elseif ($Command -eq 'start') {
@@ -1601,6 +1673,7 @@ try {
             $receiptPath = Join-Path $EvidenceDirectory 'steamvr-null-receipt.json'
             if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) { throw "Apply receipt is missing: $receiptPath" }
             $applyReceipt = Read-JsonHashtable -Path $receiptPath
+            Assert-MO2NullAdmissionMatchesReceipt -Admission $mo2Admission -Receipt $applyReceipt
             $isolation = if ($applyReceipt.ContainsKey('externalDriverIsolation')) { $applyReceipt['externalDriverIsolation'] } else { $null }
             $isolationValidation = if ($null -ne $isolation -and [bool]$isolation['enabled']) {
                 $isolationBackupPath = [string]$isolation['backupPath']
@@ -1617,7 +1690,7 @@ try {
             }
             elseif ($WhatIf) {
                 $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers -DiagnosticDisplayOverride ([bool]$AllowExternalDisplayRedirector)
-                $result = New-Result -Ok $true -State 'dry-run' -Data @{ startupPath = $startupPath; effective = $effective; runtime = $runtime; externalDrivers = $externalDrivers; externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector; externalDriverIsolation = $isolation; externalDriverIsolationValidation = $isolationValidation; inputContract = $inputContract }
+                $result = New-Result -Ok $true -State 'dry-run' -Data @{ startupPath = $startupPath; effective = $effective; runtime = $runtime; externalDrivers = $externalDrivers; externalDisplayRedirectorAllowed = [bool]$AllowExternalDisplayRedirector; externalDriverIsolation = $isolation; externalDriverIsolationValidation = $isolationValidation; inputContract = $inputContract; mo2Admission = $mo2Admission }
             }
             else {
                 $runtimeReceiptPath = Join-Path $EvidenceDirectory 'steamvr-null-runtime.receipt.json'
@@ -1893,12 +1966,16 @@ try {
 
         if ($Command -eq 'apply') {
             if ($authoritativeOwnsAppliedState) {
+                $ownedReceiptPath = if ([string]$recoveredTransaction['operation'] -eq 'apply') { [string]$recoveredTransaction['receiptPath'] } else { Join-Path $authoritativeEvidenceDirectory 'steamvr-null-receipt.json' }
+                if (-not (Test-Path -LiteralPath $ownedReceiptPath -PathType Leaf)) { throw "Committed apply receipt is missing: $ownedReceiptPath" }
+                Assert-MO2NullAdmissionMatchesReceipt -Admission $mo2Admission -Receipt (Read-JsonHashtable -Path $ownedReceiptPath)
                 $result = New-Result -Ok $true -State 'already-applied' -Data @{
                     settingsPath = $SettingsPath
-                    receiptPath = if ([string]$recoveredTransaction['operation'] -eq 'apply') { [string]$recoveredTransaction['receiptPath'] } else { Join-Path $authoritativeEvidenceDirectory 'steamvr-null-receipt.json' }
+                    receiptPath = $ownedReceiptPath
                     evidenceDirectory = $authoritativeEvidenceDirectory
                     targetControl = $targetControl
                     effective = $effective
+                    mo2Admission = $mo2Admission
                 }
             }
             elseif ($effective.active) {
@@ -1924,6 +2001,7 @@ try {
                         wouldBackupPath = if ($IsolateExternalDisplayRedirectors) { $openVRPathsBackupPath } else { $null }
                         targets = $isolationTargets
                     }
+                    mo2Admission = $mo2Admission
                 }
             }
             else {
@@ -2020,6 +2098,7 @@ try {
                             targets = $isolationTargets
                             mutation = $isolationMutation
                         }
+                        mo2Admission = $mo2Admission
                     }
                     Write-JsonAtomic -Path $receiptPath -Value $receipt
                     $journal['phase'] = 'committed'; $journal['committedUtc'] = [DateTime]::UtcNow.ToString('o'); $journal['receiptPath'] = $receiptPath
@@ -2040,6 +2119,7 @@ try {
                     settingsSemanticSha256Null = Get-JsonSemanticSha256 -Path $SettingsPath
                     effective = $afterEffective
                     externalDriverIsolation = $receipt['externalDriverIsolation']
+                    mo2Admission = $mo2Admission
                     targetControl = $targetControl
                 }
             }

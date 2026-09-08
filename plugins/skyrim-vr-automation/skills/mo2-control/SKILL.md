@@ -61,7 +61,12 @@ are:
    For `SteamVRNull`, this validation is the admission gate for the runtime
    transition: require the `runtime-route-provider` check to pass before the
    null-HMD controller may apply or start. An enabled OCU or unclassified root
-   OpenVR provider is a hard failure, not a warning to carry into the run.
+   OpenVR provider is a hard failure, not a warning to carry into the run. A
+   fresh `SteamVR` or `SteamVRNull` clone automatically disables inherited root
+   OpenVR providers in that task profile, verifies the resulting route, and
+   leaves the maintained source profile untouched. Resuming a retained profile
+   never makes that correction silently; an incompatible retained profile is
+   blocked until its owner explicitly repairs it or requests a fresh clone.
 3. Use `-WhatIf` when the command supports it and the requested change has not
    already been proven in an isolated fixture.
 4. For a live run, call `prepare -AccessId` with the owned lease, retain its

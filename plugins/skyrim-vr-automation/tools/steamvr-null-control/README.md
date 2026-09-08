@@ -155,9 +155,9 @@ possible.
 Operator diagnostics never describe unverified cleanup as successfully stopped.
 
 ```powershell
-.\Invoke-SteamVRNullControl.ps1 apply -EvidenceDirectory <session-evidence> -Compact
-.\Invoke-SteamVRNullControl.ps1 apply -EvidenceDirectory <session-evidence> -IsolateExternalDisplayRedirectors -Compact
-.\Invoke-SteamVRNullControl.ps1 start -EvidenceDirectory <session-evidence> -Compact
+.\Invoke-SteamVRNullControl.ps1 apply -MO2AccessId <access-id> -MO2Profile <task-profile> -EvidenceDirectory <session-evidence> -Compact
+.\Invoke-SteamVRNullControl.ps1 apply -MO2AccessId <access-id> -MO2Profile <task-profile> -EvidenceDirectory <session-evidence> -IsolateExternalDisplayRedirectors -Compact
+.\Invoke-SteamVRNullControl.ps1 start -MO2AccessId <access-id> -MO2Profile <task-profile> -EvidenceDirectory <session-evidence> -Compact
 .\Invoke-SteamVRNullControl.ps1 inspect -Compact
 .\Invoke-SteamVRNullControl.ps1 stop -Compact
 .\Invoke-SteamVRNullControl.ps1 stop -Force -Compact
@@ -172,9 +172,13 @@ Launch Skyrim only after `start` or `inspect` returns current-session runtime
 proof, and do not interpret the `-unqualified` state as replay or measurement
 readiness. For an MO2-backed run, acquire a `SteamVRNull` MO2 access lease,
 select the exact task workspace, and pass closed-state runtime-route validation
-before applying or starting null-HMD. The `runtime-route-provider` check must
-prove that the profile disables OpenComposite and every other root OpenVR
-replacement. A running null SteamVR instance does not prove an application
-bypassing SteamVR is attached to it.
+before applying or starting null-HMD. Pass that exact lease's bearer
+`-MO2AccessId` and selected `-MO2Profile` to both `apply` and `start`. The
+controller independently repeats the `runtime-route-provider` check, requires
+the `SteamVRNull` route, and binds the public admission proof into the apply
+receipt. `start` rejects lease, profile, or provider-inventory drift. The
+explicit `-Standalone` escape is for non-MO2 SteamVR diagnostics only and must
+not be used for Skyrim through MO2. A running null SteamVR instance does not
+prove an application bypassing SteamVR is attached to it.
 
 Run `Test-SteamVRNullControl.ps1` after changing the control contract.

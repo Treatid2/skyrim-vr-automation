@@ -375,6 +375,61 @@ function Set-LocalWorkModSelection([string]$ModListPath, $Catalog, $Selection) {
     }
 }
 
+function Set-WorkspaceRuntimeRouteSelection([string]$ModListPath, $Config, $RuntimeRoute) {
+    $routeId = [string]$RuntimeRoute.id
+    if ($routeId -notin @('OCU', 'SteamVR', 'SteamVRNull')) {
+        throw "Workspace runtime route is unsupported: '$routeId'."
+    }
+    if ($routeId -eq 'OCU') {
+        return [pscustomobject][ordered]@{
+            state = 'deferred-to-route-validation'; runtimeRoute = $RuntimeRoute
+            modListPath = $ModListPath; changed = $false; disabledProviders = @()
+            resultSha256 = (Get-FileHash -LiteralPath $ModListPath -Algorithm SHA256).Hash
+        }
+    }
+
+    $profileName = Split-Path -Leaf (Split-Path -Parent $ModListPath)
+    $inventory = (Invoke-MO2Inspect -Config $Config -Profile $profileName).data.runtimeProviders
+    if (@($inventory.errors).Count -gt 0) {
+        throw "Runtime-provider discovery could not prove the cloned profile state: $(@($inventory.errors) -join '; ')"
+    }
+    $targets = @($inventory.providers | Where-Object { $_.enabled -and $_.markers.rootOpenVrApi })
+    if ($targets.Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            state = 'already-compatible'; runtimeRoute = $RuntimeRoute
+            modListPath = $ModListPath; changed = $false; disabledProviders = @()
+            resultSha256 = (Get-FileHash -LiteralPath $ModListPath -Algorithm SHA256).Hash
+        }
+    }
+
+    $bytes = [IO.File]::ReadAllBytes($ModListPath)
+    $hasBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+    $offset = if ($hasBom) { 3 } else { 0 }
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes, $offset, $bytes.Length - $offset)
+    $disabled = [Collections.Generic.List[object]]::new()
+    foreach ($provider in $targets) {
+        $pattern = "(?m)^\+(?<name>$([regex]::Escape([string]$provider.modName)))`r?$"
+        $matches = @([regex]::Matches($text, $pattern))
+        if ($matches.Count -ne 1) {
+            throw "Expected exactly one enabled marker for inherited runtime provider '$($provider.modName)'; found $($matches.Count)."
+        }
+        $expression = [regex]::new($pattern)
+        $text = $expression.Replace($text, { param($match) '-' + $match.Groups['name'].Value + $(if ($match.Value.EndsWith("`r")) { "`r" } else { '' }) }, 1)
+        $disabled.Add([pscustomobject][ordered]@{
+            classification = [string]$provider.classification; modName = [string]$provider.modName
+            lineNumber = [int]$provider.lineNumber; markerBefore = '+'; markerAfter = '-'
+        })
+    }
+    $payload = [Text.UTF8Encoding]::new($false).GetBytes($text)
+    $resultBytes = if ($hasBom) { [byte[]](0xEF, 0xBB, 0xBF) + $payload } else { $payload }
+    Write-WorkspaceBytesAtomic -Path $ModListPath -Bytes $resultBytes
+    return [pscustomobject][ordered]@{
+        state = 'incompatible-providers-disabled'; runtimeRoute = $RuntimeRoute
+        modListPath = $ModListPath; changed = $true; disabledProviders = @($disabled)
+        resultSha256 = (Get-FileHash -LiteralPath $ModListPath -Algorithm SHA256).Hash
+    }
+}
+
 function Get-ProfileSnapshot([string]$Path) {
     $inventory = Get-BoundedTreeInventory -Path $Path -Purpose 'MO2 profile'
     $records = [Collections.Generic.List[object]]::new()
@@ -872,12 +927,12 @@ function Get-TaskWorkspaces($Config, [string]$ResolvedTaskId) {
     return @($items)
 }
 
-function Assert-AccessAndClosed($Config, [string]$OwnedAccessId, [string]$Profile, [switch]$AllowOverwriteShaderCaches) {
+function Assert-AccessAndClosed($Config, [string]$OwnedAccessId, [string]$Profile, [switch]$AllowOverwriteShaderCaches, [switch]$RequireRuntimeRoute) {
     if ([string]::IsNullOrWhiteSpace($OwnedAccessId)) { throw '-AccessId is required for workspace mutation.' }
     $access = Invoke-MO2AccessStatus -Config $Config -AccessId $OwnedAccessId
     if (-not $access.ok -or -not $access.data.owned) { throw 'The exact MO2 access lease is not owned by this task.' }
     if (-not [string]::IsNullOrWhiteSpace([string]$access.data.access.sessionId)) { throw 'Release the active MO2 evidence session before mutating a test workspace.' }
-    $validation = Invoke-MO2Validate -Config $Config -Profile $Profile -RequireClosed -OwnedAccessId $OwnedAccessId
+    $validation = Invoke-MO2Validate -Config $Config -Profile $Profile -RequireClosed -RequireRuntimeRoute:$RequireRuntimeRoute -OwnedAccessId $OwnedAccessId
     if (-not $validation.ok) {
         $failedChecks = @($validation.checks | Where-Object status -eq 'fail')
         $onlyExpectedCaches = $AllowOverwriteShaderCaches -and $failedChecks.Count -eq 1 -and $failedChecks[0].name -eq 'overwrite' -and @($validation.data.overwrite.shaderCaches).Count -gt 0
@@ -1138,6 +1193,9 @@ try {
         $sourceName = if (-not [string]::IsNullOrWhiteSpace($SourceProfile)) { $SourceProfile } elseif ($config.defaults.PSObject.Properties['testProfileSource']) { [string]$config.defaults.testProfileSource } else { throw 'defaults.testProfileSource is required; test workspaces never infer a stable source from the ordinary session default.' }
         $sourcePath = Resolve-DirectProfilePath -ProfilesRoot $profilesRoot -ProfileName $sourceName
         $validation = Assert-AccessAndClosed -Config $config -OwnedAccessId $AccessId -Profile $sourceName
+        $accessStatus = Invoke-MO2AccessStatus -Config $config -AccessId $AccessId
+        if (-not $accessStatus.ok -or -not $accessStatus.data.owned) { throw 'The exact MO2 access lease is not owned by this task.' }
+        $runtimeRoute = $accessStatus.data.access.runtimeRoute
         if (-not (Test-Path -LiteralPath $sourcePath -PathType Container)) { throw "Stable source profile does not exist: $sourceName" }
         $unmanagedCaches = @(Get-OverwriteShaderCacheDirectories -Config $config)
         if ($unmanagedCaches.Count -gt 0) { throw "Overwrite contains ShaderCache folders. Run prepare-source for '$sourceName' before creating a task workspace: $($unmanagedCaches.FullName -join ', ')" }
@@ -1193,6 +1251,7 @@ try {
                 catalog = [pscustomobject][ordered]@{ configured = [bool]$localWorkCatalog.configured; path = $localWorkCatalog.path; sha256 = $localWorkCatalog.sha256; contractVersion = $localWorkCatalog.contractVersion }
                 application = $null
             }
+            runtimeRoute = $runtimeRoute; runtimeRouteApplication = $null; runtimeRouteAdmission = $null
             creationJournalPath = $creationJournalPath
             saveGuidance = 'Every fresh clone requires and copies an integrity-verified default world-entry fixture plus the complete source saves tree. Static integrity does not assert a successful live load. MainMenuOnly and FreshGame still describe test authorization; use VerifiedFixture for an exact declared load target. Resumed profiles are preserved without save reverification. See docs/BREEZEHOME-SAVE.md.'
             ownershipRule = 'The workspace may change only its cloned profile and mods it created and registered. Existing shared mod directories are immutable; profile-local enable/disable markers are allowed.'
@@ -1229,6 +1288,19 @@ try {
                     }
                     $localWorkApplication = Set-LocalWorkModSelection -ModListPath (Join-Path $profilePath 'modlist.txt') -Catalog $localWorkCatalog -Selection $localWorkSelection
                     $manifest.localWorkMods.application = $localWorkApplication
+                    $runtimeRouteApplication = Set-WorkspaceRuntimeRouteSelection -ModListPath (Join-Path $profilePath 'modlist.txt') -Config $config -RuntimeRoute $runtimeRoute
+                    $manifest.runtimeRouteApplication = $runtimeRouteApplication
+                    if ([string]$runtimeRoute.id -in @('SteamVR', 'SteamVRNull')) {
+                        $routeValidation = Invoke-MO2Validate -Config $config -Profile $profileName -RequireClosed -RequireRuntimeRoute -OwnedAccessId $AccessId
+                        $routeCheck = @($routeValidation.checks | Where-Object name -eq 'runtime-route-provider')
+                        if ($routeCheck.Count -ne 1 -or $routeCheck[0].status -ne 'pass') {
+                            throw "Fresh workspace did not establish the leased $($runtimeRoute.id) runtime route: $($routeValidation.errors -join '; ')"
+                        }
+                        $manifest.runtimeRouteAdmission = [pscustomobject][ordered]@{
+                            state = 'qualified'; validatedUtc = [DateTime]::UtcNow.ToString('o')
+                            check = $routeCheck[0]; profile = $profileName
+                        }
+                    }
                     New-Item -ItemType Directory -Path (Join-Path $profilePath 'saves') -Force | Out-Null
                     $profileSaveSnapshot = Get-SaveTreeSnapshot -ProfilePath $profilePath
                     if ([string]$profileSaveSnapshot.sha256 -cne [string]$sourceSaveSnapshot.sha256 -or [int]$profileSaveSnapshot.fileCount -ne [int]$sourceSaveSnapshot.fileCount) { throw 'Complete source save-tree copy verification failed.' }
@@ -1296,7 +1368,7 @@ try {
             $available = @(Get-TaskWorkspaces -Config $config -ResolvedTaskId $resolvedTaskId | Where-Object profileExists)
             throw "Retained workspace '$WorkspaceId' has no profile directory at '$profilePath'. Valid retained workspaces: $((@($available.workspaceId) -join ', ') ?? '<none>'). Request a fresh workspace if none remain."
         }
-        $null = Assert-AccessAndClosed -Config $config -OwnedAccessId $AccessId -Profile ([string]$workspace.data.profile)
+        $null = Assert-AccessAndClosed -Config $config -OwnedAccessId $AccessId -Profile ([string]$workspace.data.profile) -RequireRuntimeRoute
         $approved = $PSCmdlet.ShouldProcess($profilePath, "bind retained workspace to access '$AccessId' and select profile '$($workspace.data.profile)'")
         if ($approved) {
             $resume = Invoke-WithWorkspaceTransactionLock -Config $config -Action {

@@ -30,6 +30,12 @@ requesting a new lease, but does not require rebuilding the task workspace.
   no enabled OCU or other root OpenVR replacement. Only then transition the
   runtime and continue with MO2 prepare and launch. This ordering prevents a
   null-HMD run from inheriting an OCU-enabled profile.
+- A fresh `SteamVR` or `SteamVRNull` clone route-shapes only the new task
+  profile: every inherited root OpenVR provider is disabled, the result is
+  validated, and the maintained source profile remains byte-for-byte
+  untouched. `resume` does not rewrite an existing task profile; it fails
+  closed when that retained profile no longer satisfies its newly leased
+  runtime route.
 - Before a fresh clone, run `list-local-work-mods` and make the workspace
   content explicit. `Modlist` selects no optional local builds.
   `ModlistPlusLocalWorkMods` requires one or more exact catalog IDs. The tool

@@ -118,6 +118,11 @@ try {
     $poseView.Write(28, [uint32]1)
     $poseView.Write(32, [double]0.0)
     $poseView.Write(40, [double]1.68)
+
+    $missingAdmission = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestRequireMO2Admission -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $missingAdmission.ok -and $missingAdmission.errors[0] -match 'requires -MO2AccessId and -MO2Profile') 'live null-HMD mutation refuses to bypass MO2 route admission implicitly'
+    $standaloneAdmission = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestRequireMO2Admission -Standalone -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($standaloneAdmission.ok -and $standaloneAdmission.state -eq 'dry-run' -and $standaloneAdmission.data.mo2Admission.mode -eq 'standalone') 'explicit standalone mode remains available without authorizing an MO2-backed launch'
     $poseView.Write(48, [double]0.0)
     $poseView.Write(56, [double]1.0)
     $poseView.Write(64, [double]0.0)
