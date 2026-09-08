@@ -151,11 +151,12 @@ function Invoke-CocMcpTool {
             $content.Add($item)
         }
     }
+    $firstContent = if ($content.Count -gt 0) { $content[0] } else { $null }
     return [pscustomobject][ordered]@{
         tool = $Tool
         sessionId = $Session.id
         content = @($content)
-        value = @($content | Select-Object -First 1)[0]
+        value = $firstContent
         rawResult = $call.json.result
     }
 }
@@ -584,11 +585,14 @@ function Get-CocQualificationAnalysis {
             [Math]::Round($strictFrames - $presentationFrames, 3)
         } else { $null }
         $observation = Get-CocPropertyValue -Value $receipt -Name 'observation'
-        $transitionEpoch = Get-CocPathValue -Value $observation `
-            -Path 'physical.stable.transitionEpoch'
-        if ($null -eq $transitionEpoch) {
+        $transitionEpoch = $null
+        if ($null -ne $observation) {
             $transitionEpoch = Get-CocPathValue -Value $observation `
-                -Path 'upscalingSnapshot.stable.transitionEpoch'
+                -Path 'physical.stable.transitionEpoch'
+            if ($null -eq $transitionEpoch) {
+                $transitionEpoch = Get-CocPathValue -Value $observation `
+                    -Path 'upscalingSnapshot.stable.transitionEpoch'
+            }
         }
         $preparation = if ($null -ne $transitionEpoch) {
             Get-DevBenchRenderScalePreparationTelemetry -Response $statusReceipt `
@@ -609,7 +613,9 @@ function Get-CocQualificationAnalysis {
         $presentationStable = ConvertTo-CocBoolean (Get-CocPropertyValue -Value $receipt -Name 'presentationStable')
         $cleanupDrained = ConvertTo-CocBoolean (Get-CocPropertyValue -Value $receipt -Name 'cleanupDrained')
         $strictSatisfied = ConvertTo-CocBoolean (Get-CocPropertyValue -Value $receipt -Name 'strictSatisfied')
-        if ($null -eq $transitionId -or [uint64]$transitionId -ne [uint64]$ordinal) {
+        $transitionIdNumber = ConvertTo-CocNumber $transitionId
+        if ($null -eq $transitionIdNumber -or $transitionIdNumber -lt 0 -or
+            $transitionIdNumber -ne [double]$ordinal) {
             $missingEvidence.Add("$prefix-wait.transitionId")
         }
         if (-not [string]::IsNullOrWhiteSpace($ExpectedOwnerId) -and
@@ -841,9 +847,21 @@ function Get-CocScenarioDisposition {
         'evidence-partial'
     } else { 'complete' }
     $errors = if (-not $executionOk) {
-        @([string](Get-CocPropertyValue -Value $Scenario -Name 'error'))
+        $executionError = [string](Get-CocPropertyValue -Value $Scenario -Name 'error')
+        if ([string]::IsNullOrWhiteSpace($executionError)) {
+            $executionError = 'Scenario execution failed without an error detail.'
+        }
+        @($executionError)
     } elseif (-not $evidenceComplete) {
-        @("Scenario execution completed but mandatory evidence is incomplete: $(@($Analysis.missingEvidence) -join ', ')")
+        $missingEvidence = if ($Analysis.PSObject.Properties['missingEvidence']) {
+            @($Analysis.missingEvidence)
+        } elseif ($Analysis.PSObject.Properties['reason'] -and
+            -not [string]::IsNullOrWhiteSpace([string]$Analysis.reason)) {
+            @([string]$Analysis.reason)
+        } else {
+            @('qualification analysis is unavailable')
+        }
+        @("Scenario execution completed but mandatory evidence is incomplete: $($missingEvidence -join ', ')")
     } else { @() }
     return [pscustomobject][ordered]@{
         ok = $ok

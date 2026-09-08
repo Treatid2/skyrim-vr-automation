@@ -93,10 +93,12 @@ try {
     }
     $procDump = [Diagnostics.Process]::Start($startInfo)
     if (-not $procDump) { throw 'ProcDump hang capture did not start.' }
+    $outputTask = $procDump.StandardOutput.ReadToEndAsync()
+    $errorTask = $procDump.StandardError.ReadToEndAsync()
     $procDump.WaitForExit()
+    $output = $outputTask.GetAwaiter().GetResult().Trim()
+    $errorOutput = $errorTask.GetAwaiter().GetResult().Trim()
     $procDumpExitCode = $procDump.ExitCode
-    $output = $procDump.StandardOutput.ReadToEnd().Trim()
-    $errorOutput = $procDump.StandardError.ReadToEnd().Trim()
     if ($procDumpExitCode -ne 0) {
         throw "ProcDump hang capture exited with code $procDumpExitCode`: $output $errorOutput"
     }

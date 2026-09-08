@@ -43,7 +43,12 @@ function Write-AtomicJson {
 
 function Get-JobResult($Job) {
     if ($Job.State -eq 'Completed') {
-        return @(Receive-Job -Job $Job -Keep | Select-Object -Last 1)[0]
+        $output = @(Receive-Job -Job $Job -Keep)
+        if ($output.Count -gt 0) { return $output[-1] }
+        return [pscustomobject]@{
+            ok = $false
+            error = 'The completed background job produced no result.'
+        }
     }
     $reason = if ($Job.ChildJobs.Count -gt 0 -and $Job.ChildJobs[0].JobStateInfo.Reason) {
         $Job.ChildJobs[0].JobStateInfo.Reason.Message
@@ -51,6 +56,34 @@ function Get-JobResult($Job) {
         "job state is $($Job.State)"
     }
     return [pscustomobject]@{ ok = $false; error = $reason }
+}
+
+function Get-CocFixtureAnomalies($Value) {
+    $anomalies = [Collections.Generic.List[string]]::new()
+    if ($null -eq $Value) {
+        $anomalies.Add('prepare_coc returned no fixture receipt')
+        return @($anomalies)
+    }
+
+    $missingFields = @(
+        @('ready', 'persisted', 'promptRequired') | Where-Object {
+            $null -eq $Value.PSObject.Properties[$_]
+        }
+    )
+    if ($missingFields.Count -gt 0) {
+        $anomalies.Add('prepare_coc omitted a required fixture field')
+    }
+    if ($Value.PSObject.Properties['ready'] -and -not [bool]$Value.ready) {
+        $anomalies.Add('prepare_coc reported ready:false')
+    }
+    if ($Value.PSObject.Properties['persisted'] -and [bool]$Value.persisted) {
+        $anomalies.Add('prepare_coc reported persisted:true')
+    }
+    if ($Value.PSObject.Properties['promptRequired'] -and
+        [bool]$Value.promptRequired) {
+        $anomalies.Add('prepare_coc reported promptRequired:true')
+    }
+    return @($anomalies)
 }
 
 $toolJobScript = {
@@ -225,6 +258,9 @@ try {
             else {
                 $protocolConfig = Get-Content -LiteralPath ([string]$state.protocolConfigPath) -Raw |
                     ConvertFrom-Json -Depth 30
+                if ([string]$protocolConfig.schema -ne 'csx-coc-stability-protocol-v1') {
+                    throw 'The COC stability protocol config schema is unsupported.'
+                }
                 $statusReceipt = Invoke-CocMcpTool -Endpoint $journalEndpoint `
                     -Tool 'scenario' -Arguments @{
                         action = 'status'
@@ -309,24 +345,7 @@ try {
                 expectedBuildId = $ExpectedBuildId
             } -TimeoutSeconds 15 -ExpectedProcessId $ExpectedPid `
             -ExpectedProcessStartTimeUtc $expectedProcessStartTimeUtc
-        $fixtureAnomalies = [Collections.Generic.List[string]]::new()
-        if ($null -eq $fixture.value) {
-            $fixtureAnomalies.Add('prepare_coc returned no fixture receipt')
-        }
-        elseif (@('ready', 'persisted', 'promptRequired') | Where-Object {
-                $null -eq $fixture.value.PSObject.Properties[$_]
-            }) {
-            $fixtureAnomalies.Add('prepare_coc omitted a required fixture field')
-        }
-        elseif (-not [bool]$fixture.value.ready) {
-            $fixtureAnomalies.Add('prepare_coc reported ready:false')
-        }
-        elseif ([bool]$fixture.value.persisted) {
-            $fixtureAnomalies.Add('prepare_coc reported persisted:true')
-        }
-        elseif ([bool]$fixture.value.promptRequired) {
-            $fixtureAnomalies.Add('prepare_coc reported promptRequired:true')
-        }
+        $fixtureAnomalies = @(Get-CocFixtureAnomalies -Value $fixture.value)
 
         $phase = 'baseline-and-dispatch'
         $originTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()

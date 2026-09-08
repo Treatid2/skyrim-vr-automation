@@ -207,6 +207,45 @@ if ($incompleteStatusAnalysis.complete -or
     'coc-01-status.preparation' -notin @($incompleteStatusAnalysis.missingEvidence)) {
     throw 'Structurally incomplete status evidence was accepted as complete.'
 }
+
+$malformedReceiptResults = @($results | ConvertTo-Json -Depth 50 |
+    ConvertFrom-Json -Depth 50)
+$firstWait = $malformedReceiptResults | Where-Object label -eq 'coc-01-wait' |
+    Select-Object -First 1
+$firstWait.result.PSObject.Properties.Remove('observation')
+$firstWait.result.transitionId = 'not-a-transition'
+$malformedReceiptAnalysis = Get-CocQualificationAnalysis -Scenario (
+    [pscustomobject]@{ results = $malformedReceiptResults }
+) -ProtocolConfig $config -ExpectedOwnerId 'test-owner'
+if ($malformedReceiptAnalysis.complete -or
+    'coc-01-wait.transitionId' -notin @($malformedReceiptAnalysis.missingEvidence) -or
+    'coc-01-wait.resourcePublication' -notin @($malformedReceiptAnalysis.missingEvidence)) {
+    throw 'Missing observation or malformed transition identity escaped evidence classification.'
+}
+
+$unavailableDisposition = Get-CocScenarioDisposition -Scenario ([pscustomobject]@{
+        done = $true
+        ok = $true
+        results = @()
+    }) -Analysis ([pscustomobject]@{
+        available = $false
+        reason = 'The scenario transcript has no result records.'
+    })
+if ($unavailableDisposition.ok -or
+    $unavailableDisposition.state -ne 'evidence-partial' -or
+    @($unavailableDisposition.errors)[0] -notlike '*no result records*') {
+    throw 'Unavailable qualification analysis did not remain evidence-partial.'
+}
+
+$undetailedFailure = Get-CocScenarioDisposition -Scenario ([pscustomobject]@{
+        done = $true
+        ok = $false
+        results = @()
+    }) -Analysis $missingLabelAnalysis
+if ($undetailedFailure.ok -or $undetailedFailure.state -ne 'failed' -or
+    [string]::IsNullOrWhiteSpace([string](@($undetailedFailure.errors)[0]))) {
+    throw 'A failed scenario without an error property lost its failure detail.'
+}
 $completeDisposition = Get-CocScenarioDisposition -Scenario ([pscustomobject]@{
         done = $true
         ok = $true
@@ -280,6 +319,49 @@ foreach ($required in @(
     }
 }
 
+$controllerTokens = $null
+$controllerParseErrors = $null
+$controllerAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $scriptPath, [ref]$controllerTokens, [ref]$controllerParseErrors
+)
+if ($controllerParseErrors.Count -ne 0) {
+    throw 'The COC stability controller does not parse.'
+}
+foreach ($functionName in @('Get-JobResult', 'Get-CocFixtureAnomalies')) {
+    $functionAst = $controllerAst.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $functionName
+        }, $true)
+    if ($null -eq $functionAst) {
+        throw "The controller helper is missing: $functionName"
+    }
+    Invoke-Expression $functionAst.ToString()
+}
+
+$emptyJob = $null
+try {
+    $emptyJob = Start-ThreadJob -ScriptBlock {}
+    Wait-Job -Job $emptyJob | Out-Null
+    $emptyJobResult = Get-JobResult $emptyJob
+    if ($emptyJobResult.ok -or
+        [string]::IsNullOrWhiteSpace([string]$emptyJobResult.error)) {
+        throw 'A completed background job without output was accepted.'
+    }
+}
+finally {
+    if ($emptyJob) { Remove-Job -Job $emptyJob -Force }
+}
+
+$fixtureAnomalies = @(Get-CocFixtureAnomalies -Value ([pscustomobject]@{
+            ready = $false
+            persisted = $true
+            promptRequired = $true
+        }))
+if ($fixtureAnomalies.Count -ne 3) {
+    throw 'Independent prepare_coc defects were collapsed into one anomaly.'
+}
+
 $claimFixture = Join-Path ([IO.Path]::GetTempPath()) (
     'coc-claim-' + [Guid]::NewGuid().ToString('N')
 )
@@ -329,6 +411,41 @@ try {
 finally {
     if (Test-Path -LiteralPath $invalidAcceptedFixture) {
         Remove-Item -LiteralPath $invalidAcceptedFixture -Recurse -Force
+    }
+}
+
+$invalidProtocolFixture = Join-Path ([IO.Path]::GetTempPath()) (
+    'coc-stability-invalid-protocol-' + [Guid]::NewGuid().ToString('N')
+)
+try {
+    New-Item -ItemType Directory -Path $invalidProtocolFixture | Out-Null
+    $invalidProtocolPath = Join-Path $invalidProtocolFixture 'protocol.json'
+    '{"schema":"unrelated-protocol"}' |
+        Set-Content -LiteralPath $invalidProtocolPath -Encoding utf8
+    $invalidProtocolStatePath = Join-Path $invalidProtocolFixture 'state.json'
+    $currentStart = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+    [pscustomobject][ordered]@{
+        schema = 'csx-coc-stability-state-v1'
+        outcome = 'scenario-accepted'
+        endpoint = 'http://127.0.0.1:1/mcp'
+        ownerId = 'invalid-protocol-owner'
+        expectedPid = $PID
+        expectedProcessStartTimeUtc = $currentStart
+        protocolConfigPath = $invalidProtocolPath
+        scenarioRunId = 1
+    } | ConvertTo-Json -Depth 10 |
+        Set-Content -LiteralPath $invalidProtocolStatePath -Encoding utf8
+    $invalidProtocolStatus = & $scriptPath status `
+        -StatePath $invalidProtocolStatePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 30
+    if ($invalidProtocolStatus.ok -or
+        @($invalidProtocolStatus.errors)[0] -notlike '*schema is unsupported*') {
+        throw 'Status did not reject an unrelated protocol schema before endpoint access.'
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $invalidProtocolFixture) {
+        Remove-Item -LiteralPath $invalidProtocolFixture -Recurse -Force
     }
 }
 

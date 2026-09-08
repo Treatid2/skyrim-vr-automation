@@ -377,6 +377,31 @@ function Stop-OwnedProcDumpMonitor($Owned, $Monitor) {
     }
 }
 
+function Stop-HangCaptureWorker([Diagnostics.Process]$Capture) {
+    $startedUtc = try {
+        $Capture.StartTime.ToUniversalTime().ToString('o')
+    } catch { $null }
+    try {
+        if (-not $Capture.HasExited) { $Capture.Kill() }
+        $exited = $Capture.WaitForExit(5000)
+        return [pscustomobject]@{
+            cleanupComplete = [bool]$exited -and [bool]$Capture.HasExited
+            capturePid = $Capture.Id
+            captureStartedUtc = $startedUtc
+            captureExited = [bool]$exited -and [bool]$Capture.HasExited
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            cleanupComplete = $false
+            capturePid = $Capture.Id
+            captureStartedUtc = $startedUtc
+            captureExited = $false
+            error = $_.Exception.Message
+        }
+    }
+}
+
 function Get-ValidatedCaptureCompletion($State) {
     if (-not $State.PSObject.Properties['captureState'] -or
         [string]$State.captureState -notin @('capture-running', 'capture-complete') -or
@@ -759,9 +784,13 @@ try {
         }
         $capture = [Diagnostics.Process]::Start($startInfo)
         if (-not $capture) { throw 'ProcDump hang capture did not start.' }
+        $captureStartedUtc = $capture.StartTime.ToUniversalTime().ToString('o')
+        $outputTask = $capture.StandardOutput.ReadToEndAsync()
+        $errorTask = $capture.StandardError.ReadToEndAsync()
         $failureData = [pscustomobject]@{
             statePath = $owned.path
             capturePid = $capture.Id
+            captureStartedUtc = $captureStartedUtc
             dumpPath = $dumpPath
             receiptPath = $receiptPath
             cleanup = $null
@@ -770,7 +799,7 @@ try {
             $owned.data | Add-Member -NotePropertyName capturePid `
                 -NotePropertyValue $capture.Id -Force
             $owned.data | Add-Member -NotePropertyName captureStartedUtc `
-                -NotePropertyValue $capture.StartTime.ToUniversalTime().ToString('o') -Force
+                -NotePropertyValue $captureStartedUtc -Force
             $owned.data | Add-Member -NotePropertyName captureState `
                 -NotePropertyValue 'capture-running' -Force
             $owned.data | Add-Member -NotePropertyName captureDumpPath `
@@ -783,19 +812,12 @@ try {
         }
         catch {
             $publicationError = $_.Exception.Message
-            try {
-                $rollback = Stop-OwnedProcDumpMonitor -Owned $owned -Monitor $capture
-            }
-            catch {
-                $failureData | Add-Member -NotePropertyName cleanupError `
-                    -NotePropertyValue $_.Exception.Message -Force
-                throw "Hang-capture state publication failed and ProcDump cancellation failed: $publicationError; $($_.Exception.Message)"
-            }
+            $rollback = Stop-HangCaptureWorker -Capture $capture
             $failureData.cleanup = $rollback
             if (-not $rollback.cleanupComplete) {
-                throw "Hang-capture state publication failed and ProcDump cleanup is incomplete: $publicationError"
+                throw "Hang-capture state publication failed and completion-worker cleanup is incomplete: $publicationError"
             }
-            throw "Hang-capture state publication failed; ProcDump was cancelled: $publicationError"
+            throw "Hang-capture state publication failed; the completion worker was stopped: $publicationError"
         }
         $completed = $capture.WaitForExit($CaptureTimeoutSeconds * 1000)
         if (-not $completed) {
@@ -817,8 +839,8 @@ try {
             }
         }
         else {
-            $output = $capture.StandardOutput.ReadToEnd().Trim()
-            $errorOutput = $capture.StandardError.ReadToEnd().Trim()
+            $output = $outputTask.GetAwaiter().GetResult().Trim()
+            $errorOutput = $errorTask.GetAwaiter().GetResult().Trim()
             $completedState = Get-Content -LiteralPath $owned.path -Raw |
                 ConvertFrom-Json -Depth 30
             $validatedCompletion = Get-ValidatedCaptureCompletion $completedState

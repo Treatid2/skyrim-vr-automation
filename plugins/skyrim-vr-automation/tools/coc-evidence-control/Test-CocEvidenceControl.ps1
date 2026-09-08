@@ -24,6 +24,7 @@ foreach ($requiredText in @(
         'captureWorkerStartedUtc',
         'targetStartedUtc',
         'procDumpExitCode',
+        'ReadToEndAsync',
         "'capture-complete'",
         "'capture-failed'"
     )) {
@@ -45,10 +46,14 @@ $ownedProcessFunction = $scriptAst.Find({
 if ($parseErrors.Count -ne 0 -or $null -eq $ownedProcessFunction) {
     throw 'Could not isolate Get-OwnedProcess for inaccessible-process coverage.'
 }
-$ownedProcessSource = $ownedProcessFunction.ToString().Replace(
+$ownedProcessOriginal = $ownedProcessFunction.ToString()
+$ownedProcessSource = $ownedProcessOriginal.Replace(
     '$process = Get-Process -Id ([int]$pidValue.Value) -ErrorAction SilentlyContinue',
     '$process = $script:InaccessibleProcessFixture'
 )
+if ($ownedProcessSource -ceq $ownedProcessOriginal) {
+    throw 'Get-OwnedProcess no longer contains the expected process lookup to stub.'
+}
 Invoke-Expression $ownedProcessSource
 $script:InaccessibleProcessFixture = [pscustomobject]@{}
 $script:InaccessibleProcessFixture | Add-Member -MemberType ScriptProperty `
@@ -94,6 +99,8 @@ foreach ($requiredText in @(
     "triggerPolicy = 'unhandled-exception'",
     "trigger = 'operator-confirmed-hang'",
     'Stop-OwnedProcDumpMonitor',
+    'Stop-HangCaptureWorker',
+    '$Capture.Kill()',
     'Get-OwnedHangCapture',
     'Get-OwnedCancellation',
     'Get-OwnedTarget',
@@ -111,6 +118,14 @@ foreach ($requiredText in @(
     if (-not $script.Contains($requiredText, [StringComparison]::Ordinal)) {
         throw "COC evidence controller is missing: $requiredText"
     }
+}
+
+$captureRollback = $script.IndexOf(
+    '$rollback = Stop-HangCaptureWorker -Capture $capture',
+    [StringComparison]::Ordinal
+)
+if ($captureRollback -lt 0) {
+    throw 'Hang-capture publication rollback does not stop the exact worker.'
 }
 
 foreach ($forbiddenText in @(
@@ -158,7 +173,7 @@ if ($captureStart -lt 0 -or $capturePublication -lt $captureStart -or
 }
 foreach ($rollback in @(
     'Evidence state publication failed; the ProcDump monitor was cancelled',
-    'Hang-capture state publication failed; ProcDump was cancelled',
+    'Hang-capture state publication failed; the completion worker was stopped',
     'Stop-OwnedProcDumpMonitor -Owned $owned -Monitor $ownedProcess'
 )) {
     if (-not $script.Contains($rollback, [StringComparison]::Ordinal)) {
