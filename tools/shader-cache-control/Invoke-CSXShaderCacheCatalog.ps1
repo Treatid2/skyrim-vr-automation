@@ -317,6 +317,13 @@ function Get-RenderFamily([string]$Value) {
     return $normalized
 }
 
+function Get-RenderPathProvenanceClass([string]$Value) {
+    $normalized = $Value.Trim().ToLowerInvariant()
+    if ($normalized -in @('vr-steamvr-physical', 'vr-steamvr-null')) { return 'vr-steamvr-canonical' }
+    if ($normalized -in @('steamvr-physical', 'steamvr-null')) { return 'vr-steamvr-legacy' }
+    return $normalized
+}
+
 function New-CompatibilityRecord {
     return [pscustomobject][ordered]@{
         shaderCacheAbi = $ShaderCacheAbi
@@ -445,6 +452,7 @@ function Select-CatalogSnapshot($Storage) {
     $catalog = Get-CatalogRecords $layout
     $required = @(Get-NormalizedStrings $RequiredTags)
     $requestedRenderFamily = Get-RenderFamily $RenderPath
+    $requestedRenderPathProvenanceClass = Get-RenderPathProvenanceClass $RenderPath
     $eligible = @()
     $excluded = @()
     foreach ($record in @($catalog.records)) {
@@ -474,7 +482,8 @@ function Select-CatalogSnapshot($Storage) {
         $featureSetExact = -not [string]::IsNullOrWhiteSpace($FeatureSetSha256) -and $candidateFeatureSet -ieq $FeatureSetSha256
         $renderPathExact = [string]$m.compatibility.renderPath -ceq $RenderPath
         $renderFamilyExact = $candidateRenderFamily -ceq $requestedRenderFamily
-        $score = $(if ($sourceExact) { 1000000 } else { 0 }) + $(if ($featureSetExact) { 100000 } else { 0 }) + $(if ($buildExact) { 10000 } else { 0 }) + $(if ($presetExact) { 1000 } else { 0 }) + $(if ($renderPathExact) { 100 } else { 0 }) + $(if ($renderFamilyExact) { 50 } else { 0 }) + ($required.Count * 10)
+        $renderPathProvenanceClassExact = (Get-RenderPathProvenanceClass ([string]$m.compatibility.renderPath)) -ceq $requestedRenderPathProvenanceClass
+        $score = $(if ($sourceExact) { 1000000 } else { 0 }) + $(if ($featureSetExact) { 100000 } else { 0 }) + $(if ($buildExact) { 10000 } else { 0 }) + $(if ($presetExact) { 1000 } else { 0 }) + $(if ($renderPathExact) { 100 } else { 0 }) + $(if ($renderFamilyExact) { 50 } else { 0 }) + $(if ($renderPathProvenanceClassExact) { 25 } else { 0 }) + ($required.Count * 10)
         $eligible += [pscustomobject][ordered]@{
             snapshotId = [string]$m.snapshotId
             score = $score
@@ -483,6 +492,7 @@ function Select-CatalogSnapshot($Storage) {
             exactPreset = $presetExact
             exactRenderPathProvenance = $renderPathExact
             exactRenderFamilyProvenance = $renderFamilyExact
+            exactRenderPathProvenanceClass = $renderPathProvenanceClassExact
             bytecodeCompatibilityClass = $candidateBytecodeClass
             exactFeatureSet = $featureSetExact
             renderFamily = $candidateRenderFamily

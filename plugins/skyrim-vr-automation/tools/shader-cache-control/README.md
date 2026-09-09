@@ -87,8 +87,9 @@ tags, and—by default—exact shader-source SHA-256. Supply
 `-FeatureSetSha256` whenever an effective feature-set fingerprint is available;
 then an absent or different fingerprint is a hard exclusion. Among compatible
 candidates, exact source, feature-set, build, preset, and observed render-path
-matches rank first, followed by broader verified coverage and
-recency. `select` returns both the ranking and explicit exclusion reasons.
+matches rank first. Within one render family, the request's provenance class
+(`vr-steamvr-*` or legacy `steamvr-*`) ranks ahead of broader verified coverage
+and recency. `select` returns both the ranking and explicit exclusion reasons.
 
 The exact render path remains immutable provenance and an exact-match ranking
 signal. The default `skyrimvr-d3d11` class deliberately permits reuse across
