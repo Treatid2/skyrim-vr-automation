@@ -679,6 +679,11 @@ function Test-DevBenchUpscalingStable {
     function Require-StableValue([bool]$Condition, [string]$Reason) {
         if (-not $Condition) { $reasons.Add($Reason) }
     }
+    function Get-RequiredStableTelemetry($Source, [string]$Name, [string]$Reason) {
+        $value = Get-DevBenchTelemetryMember $Source $Name
+        Require-StableValue ($null -ne $value) $Reason
+        return $value
+    }
 
     $profilePresence = if ($snapshot.PSObject.Properties['profilePresence']) { [uint32]$snapshot.profilePresence } else { [uint32]0 }
     $flags = if ($snapshot.PSObject.Properties['flags']) { [uint64]$snapshot.flags } else { [uint64]0 }
@@ -805,25 +810,31 @@ function Test-DevBenchUpscalingStable {
         $property = $gate.PSObject.Properties[$name]
         if ($property) { Require-StableValue (-not [bool]$property.Value) "vendor work gate '$name' remains active" }
     }
-    $postLoadRecovery = Get-DevBenchTelemetryMember $controller 'postLoadRecovery'
+    $postLoadRecovery = Get-RequiredStableTelemetry $controller 'postLoadRecovery' 'post-load render-scale recovery telemetry is missing'
     if ($null -ne $postLoadRecovery) {
-        Require-StableValue (-not [bool](Get-DevBenchTelemetryMember $postLoadRecovery 'active')) 'post-load render-scale recovery is active'
+        $postLoadRecoveryActive = Get-RequiredStableTelemetry $postLoadRecovery 'active' 'post-load render-scale recovery active telemetry is missing'
+        Require-StableValue ($null -eq $postLoadRecoveryActive -or -not [bool]$postLoadRecoveryActive) 'post-load render-scale recovery is active'
     }
-    $memoryTrim = Get-DevBenchTelemetryMember $controller 'memoryTrim'
+    $memoryTrim = Get-RequiredStableTelemetry $controller 'memoryTrim' 'render-scale memory trim telemetry is missing'
     if ($null -ne $memoryTrim) {
-        Require-StableValue (-not [bool](Get-DevBenchTelemetryMember $memoryTrim 'pending')) 'render-scale memory trim is pending'
+        $memoryTrimPending = Get-RequiredStableTelemetry $memoryTrim 'pending' 'render-scale memory trim pending telemetry is missing'
+        Require-StableValue ($null -eq $memoryTrimPending -or -not [bool]$memoryTrimPending) 'render-scale memory trim is pending'
     }
-    $retirement = Get-DevBenchTelemetryMember $controller 'retirement'
+    $retirement = Get-RequiredStableTelemetry $controller 'retirement' 'render-scale resource retirement telemetry is missing'
     if ($null -ne $retirement) {
+        $pendingSets = Get-RequiredStableTelemetry $retirement 'pendingSets' 'render-scale retirement pending-set telemetry is missing'
+        $fencePending = Get-RequiredStableTelemetry $retirement 'fencePending' 'render-scale retirement fence telemetry is missing'
+        $capacityBlocked = Get-RequiredStableTelemetry $retirement 'capacityBlocked' 'render-scale retirement capacity telemetry is missing'
         Require-StableValue (
-            [uint32](Get-DevBenchTelemetryMember $retirement 'pendingSets') -eq 0 -and
-            -not [bool](Get-DevBenchTelemetryMember $retirement 'fencePending') -and
-            -not [bool](Get-DevBenchTelemetryMember $retirement 'capacityBlocked')
+            $null -ne $pendingSets -and [uint32]$pendingSets -eq 0 -and
+            $null -ne $fencePending -and -not [bool]$fencePending -and
+            $null -ne $capacityBlocked -and -not [bool]$capacityBlocked
         ) 'render-scale resource retirement is pending'
     }
-    $engineTargetRetirement = Get-DevBenchTelemetryMember $controller 'engineTargetRetirement'
+    $engineTargetRetirement = Get-RequiredStableTelemetry $controller 'engineTargetRetirement' 'engine render-target retirement telemetry is missing'
     if ($null -ne $engineTargetRetirement) {
-        Require-StableValue (-not [bool](Get-DevBenchTelemetryMember $engineTargetRetirement 'pending')) 'engine render-target retirement is pending'
+        $engineTargetPending = Get-RequiredStableTelemetry $engineTargetRetirement 'pending' 'engine render-target retirement pending telemetry is missing'
+        Require-StableValue ($null -eq $engineTargetPending -or -not [bool]$engineTargetPending) 'engine render-target retirement is pending'
     }
 
     $stereoEvidence = 'native_pipeline_frames'

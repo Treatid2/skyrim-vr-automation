@@ -1275,8 +1275,15 @@ catch {
 $sessionCleanup = Close-AllMcpSessions
 $result | Add-Member -NotePropertyName sessionCleanup -NotePropertyValue $sessionCleanup
 if ($invocationRecord -and -not [string]::IsNullOrWhiteSpace($invocationEvidencePath)) {
-    $invocationRecord['sessionCleanup'] = $sessionCleanup
-    Write-JsonAtomic -Path $invocationEvidencePath -Value $invocationRecord
+    try {
+        $invocationRecord['sessionCleanup'] = $sessionCleanup
+        Write-JsonAtomic -Path $invocationEvidencePath -Value $invocationRecord
+    }
+    catch {
+        $journalError = "Session cleanup evidence could not be journaled: $($_.Exception.Message)"
+        $result.errors = @($result.errors) + $journalError
+        $result | Add-Member -NotePropertyName evidenceJournalFinalized -NotePropertyValue $false -Force
+    }
 }
 
 $parameters = @{ InputObject = $result; Depth = 50 }
