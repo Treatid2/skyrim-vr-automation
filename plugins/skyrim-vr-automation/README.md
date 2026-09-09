@@ -125,10 +125,16 @@ legacy `ShaderCache*` trees from overwrite into an enabled stable-source mod,
 then uses its own cloned workspace profile and may remove only mods that its
 workspace proved were new;
 tasks release MO2 access whenever
-they can continue without it. Null-HMD apply takes an exact backup and
+they can continue without it while retaining the workspace and its profile-local
+changes for exact later resume. Ending a run, turn, or task does not authorize
+workspace retirement; destructive retirement requires explicit discard or
+replacement intent, or a separately stated policy that proves the environment
+obsolete. Null-HMD apply takes an exact backup and
 restore verifies its receipt; optional display-driver isolation also preserves
 and hash-verifies the exact OpenVR registration file and refuses drift before
-restoration. Profile edits are exact-marker transactions;
+restoration. Virtual Desktop and `VirtualDesktop.Streamer` are not null-HMD or
+profile-mutation blockers; an enabled profile-local OCU/OpenComposite provider
+conflicts with the SteamVR null-HMD route. Profile edits are exact-marker transactions;
 cache restoration retains the displaced tree and verifies both sides before
 cleanup. Nothing here deletes unclassified MO2 overwrite content or shader
 caches.

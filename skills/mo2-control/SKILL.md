@@ -106,9 +106,13 @@ are:
    If the game main thread is deadlocked, `terminate-game` is the only forced
    game recovery: it targets launch-recorded identities, retains MO2, invokes
    exact Unlock, and requires RootBuilder cleanup. `release-access` is the
-   normal yield path and preserves the task workspace. Use workspace `retire`
-   only when that exact profile is no longer wanted; workspace `release` is a
-   deprecated destructive alias.
+   normal yield path and preserves the task workspace. Reacquire access and
+   `resume` that exact workspace on later work. Never infer discard intent from
+   the end of a run, turn, or task, and do not revert profile-local changes.
+   Use workspace `retire` only after explicit direction to discard or replace
+   that exact environment, or when a separately stated policy proves it
+   obsolete; the deprecated workspace `release` command fails closed without
+   mutation.
 9. Preserve session identifiers, receipts, hashes, logs, screenshots, dumps,
    and the pre/post inspection results with the test record.
 
@@ -159,4 +163,9 @@ are:
 
 When SteamVR null-HMD state is also involved, apply the
 `$steamvr-null-hmd` skill before launching MO2. Restore the prior runtime state
-only when the user's requested workflow includes restoration.
+only when the user's requested workflow includes restoration. That shared
+runtime restoration is independent of the retained task workspace and must not
+rewrite or retire its profile. Virtual Desktop and `VirtualDesktop.Streamer`
+are not blockers for profile mutation or null-HMD. The conflicting null-HMD
+route is an enabled profile-local OCU/OpenComposite provider, which the exact
+runtime-route admission check must reject.
