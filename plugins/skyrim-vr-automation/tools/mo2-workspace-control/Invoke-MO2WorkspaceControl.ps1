@@ -1018,7 +1018,7 @@ try {
     }
 
     if ($Command -eq 'release') {
-        throw 'Workspace release is intentionally unavailable because it previously deleted retained task state. Yield scarce MO2 access with Invoke-MO2Control.ps1 release-access; destroy a finished workspace only with the explicit retire command.'
+        throw 'Workspace release is intentionally unavailable because it previously deleted retained task state. Yield scarce MO2 access with Invoke-MO2Control.ps1 release-access. Use explicit retire only after direction to discard or replace that exact environment, or when a separately stated retention policy proves it obsolete.'
     }
 
     if ($Command -eq 'list-task') {
