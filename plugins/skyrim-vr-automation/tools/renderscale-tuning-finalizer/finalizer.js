@@ -283,23 +283,35 @@ function evidenceValues(root) {
         path.extname(file).toLowerCase() === ".json").sort() : [];
     const columns = ["source_path", "lane", "pass", "ordinal",
         "json_pointer", "value_type", "value_json"];
-    const lines = [columns.join(",")];
     const stats = { rawJsonFiles: files.length, values: 0, nullValues: 0,
         emptyContainers: 0 };
-    for (const file of files) {
-        const source = relative(root, file);
-        const identity = rawIdentity(root, file);
-        flattenJson(readJson(file), "", (pointer, type, valueJson) => {
-            stats.values += 1;
-            if (type === "null") stats.nullValues += 1;
-            if (type === "empty_array" || type === "empty_object") {
-                stats.emptyContainers += 1;
+    writeAtomic(path.join(root, "evidence-values.csv"), (descriptor) => {
+        let buffer = `${columns.join(",")}\n`;
+        const emit = (line) => {
+            // Bound aggregate memory even when the CSV exceeds V8's string limit.
+            if (buffer.length + line.length > 64 * 1024) {
+                fs.writeFileSync(descriptor, buffer);
+                buffer = "";
             }
-            lines.push([source, identity.lane, identity.pass, identity.ordinal,
-                pointer, type, valueJson].map(csvCell).join(","));
-        });
-    }
-    return { text: `${lines.join("\n")}\n`, stats };
+            if (line.length >= 64 * 1024) fs.writeFileSync(descriptor, line);
+            else buffer += line;
+        };
+        for (const file of files) {
+            const source = relative(root, file);
+            const identity = rawIdentity(root, file);
+            flattenJson(readJson(file), "", (pointer, type, valueJson) => {
+                stats.values += 1;
+                if (type === "null") stats.nullValues += 1;
+                if (type === "empty_array" || type === "empty_object") {
+                    stats.emptyContainers += 1;
+                }
+                emit(`${[source, identity.lane, identity.pass, identity.ordinal,
+                    pointer, type, valueJson].map(csvCell).join(",")}\n`);
+            });
+        }
+        fs.writeFileSync(descriptor, buffer);
+    });
+    return { stats };
 }
 
 function normalizeTask2(retained) {
@@ -842,12 +854,34 @@ function presentationStretchAnomalies(rows) {
 
 function writeAtomic(file, content) {
     const temporary = `${file}.tmp-finalizer`;
-    fs.writeFileSync(temporary, content);
-    fs.renameSync(temporary, file);
+    let descriptor;
+    try {
+        descriptor = fs.openSync(temporary, "w");
+        try {
+            if (typeof content === "function") content(descriptor);
+            else fs.writeFileSync(descriptor, content);
+        } finally {
+            fs.closeSync(descriptor);
+        }
+        fs.renameSync(temporary, file);
+    } finally {
+        if (descriptor !== undefined) fs.rmSync(temporary, { force: true });
+    }
 }
 
 function sha256(file) {
-    return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+    const hash = crypto.createHash("sha256");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    const descriptor = fs.openSync(file, "r");
+    try {
+        let bytes;
+        while ((bytes = fs.readSync(descriptor, buffer, 0, buffer.length, null)) > 0) {
+            hash.update(buffer.subarray(0, bytes));
+        }
+    } finally {
+        fs.closeSync(descriptor);
+    }
+    return hash.digest("hex");
 }
 
 function materializeReceiptJournal(root, runId) {
@@ -1044,7 +1078,6 @@ function finalizeEvidence(options) {
     writeAtomic(path.join(root, "summary.json"), summaryText);
     writeAtomic(path.join(root, "transitions.csv"), csvText);
     writeAtomic(path.join(root, "report.md"), reportText);
-    writeAtomic(path.join(root, "evidence-values.csv"), extraction.text);
 
     const files = walk(root).filter((file) =>
         path.basename(file) !== "receipt-index.json" &&

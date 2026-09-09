@@ -42,7 +42,11 @@ optional integration rather than the identity or boundary of the toolkit.
   multi-state comparison reports.
 - `tools/renderscale-tuning-live` and `tools/renderscale-tuning-finalizer` —
   identity-bound NVIDIA or AMD render-scale assay execution and restartable,
-  lossless evidence finalization.
+  lossless evidence finalization. CSV extraction and receipt checksums use
+  incremental file I/O so combined evidence can exceed JavaScript's string
+  limit. Each individual raw JSON receipt must still fit in memory; failed
+  CSV validation or writing preserves the previous reports and removes the
+  partial temporary CSV.
 - `tools/shader-cache-control` — provider discovery, physical cache
   snapshot/restore transactions, compatibility-ranked known-working cache
   catalogs, task seeding/restoration/promotion, and comparison reports.

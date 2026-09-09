@@ -959,6 +959,146 @@ function testUnsafeEvidenceNumberFailsClosed() {
     }
 }
 
+function testStreamedEvidence() {
+    const root = createEvidenceRoot();
+    const readFile = fs.readFileSync;
+    try {
+        const csvPath = path.join(root, "evidence-values.csv");
+        const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+            buildId: "e".repeat(64), expectedRows: 2 };
+        const initial = finalizeEvidence(options).summary.evidenceExtraction;
+        const value = 'quotes " and commas,\nUnicode: 雪 🐉'.repeat(4096);
+        writeJson(path.join(root, "raw/z-stream.json"), {
+            "a/~": [null, [], {}, false, 0, value],
+        });
+        // Hashing must not materialize the generated CSV as one buffer either.
+        fs.readFileSync = (file, ...args) => {
+            assert(file !== csvPath, "Receipt indexing read the entire CSV.");
+            return readFile(file, ...args);
+        };
+        const result = finalizeEvidence(options);
+        fs.readFileSync = readFile;
+        const actual = readFile(csvPath, "utf8");
+        const expected = [
+            'raw/z-stream.json,,,,/a~1~0/0,null,null',
+            'raw/z-stream.json,,,,/a~1~0/1,empty_array,[]',
+            'raw/z-stream.json,,,,/a~1~0/2,empty_object,{}',
+            'raw/z-stream.json,,,,/a~1~0/3,boolean,false',
+            'raw/z-stream.json,,,,/a~1~0/4,number,0',
+            `raw/z-stream.json,,,,/a~1~0/5,string,"${JSON.stringify(value)
+                .replace(/"/g, '""')}"`,
+            "",
+        ].join("\n");
+        assert(actual.endsWith(expected),
+            "Streaming changed CSV escaping, row order, or a large Unicode value.");
+        const stats = result.summary.evidenceExtraction;
+        assert(stats.rawJsonFiles === initial.rawJsonFiles + 1 &&
+            stats.values === initial.values + 6 &&
+            stats.nullValues === initial.nullValues + 1 &&
+            stats.emptyContainers === initial.emptyContainers + 2,
+        "Streamed extraction counts are incorrect.");
+        const indexed = result.index.files.find(file => file.path === "evidence-values.csv");
+        assert(indexed.sha256 === sha(csvPath) &&
+            indexed.bytes === Buffer.byteLength(actual),
+        "Streamed checksum or UTF-8 byte count differs from the written CSV.");
+    } finally {
+        fs.readFileSync = readFile;
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testEvidenceBeyondStringLimit() {
+    if (!process.argv.includes("--large-evidence")) return;
+    const root = createEvidenceRoot();
+    try {
+        const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+            buildId: "e".repeat(64), expectedRows: 2 };
+        const initial = finalizeEvidence(options).summary.evidenceExtraction;
+        const csvPath = path.join(root, "evidence-values.csv");
+        const expectedHash = crypto.createHash("sha256").update(fs.readFileSync(csvPath));
+        const limit = require("node:buffer").constants.MAX_STRING_LENGTH;
+        const payload = "x".repeat(8 * 1024 * 1024);
+        const count = Math.ceil(limit / payload.length);
+        for (let index = 0; index < count; index += 1) {
+            const source = `raw/z-large/${String(index).padStart(3, "0")}.json`;
+            writeJson(path.join(root, source), payload);
+            expectedHash.update(`${source},,,,,string,"""${payload}"""\n`);
+        }
+        const result = finalizeEvidence(options);
+        const indexed = result.index.files.find(file => file.path === "evidence-values.csv");
+        assert(indexed.bytes > limit && indexed.sha256 === expectedHash.digest("hex") &&
+            result.summary.evidenceExtraction.values === initial.values + count,
+        "Evidence beyond the JavaScript string limit was truncated or changed.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testEvidenceWriteFailures() {
+    for (const failure of ["parse", "numeric", "write", "rename"]) {
+        const root = createEvidenceRoot();
+        const writeFile = fs.writeFileSync;
+        const rename = fs.renameSync;
+        const open = fs.openSync;
+        const close = fs.closeSync;
+        const descriptors = new Set();
+        try {
+            const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+                buildId: "e".repeat(64), expectedRows: 2 };
+            finalizeEvidence(options);
+            const outputs = ["summary.json", "transitions.csv", "report.md",
+                "evidence-values.csv", "receipt-index.json"];
+            const before = outputs.map(name => sha(path.join(root, name)));
+            const temporary = path.join(root, "evidence-values.csv.tmp-finalizer");
+            fs.openSync = (file, ...args) => {
+                const descriptor = open(file, ...args);
+                if (file === temporary) descriptors.add(descriptor);
+                return descriptor;
+            };
+            fs.closeSync = (descriptor) => {
+                close(descriptor);
+                descriptors.delete(descriptor);
+            };
+            if (failure === "parse" || failure === "numeric") {
+                // A valid large row forces buffered output before validation fails.
+                writeJson(path.join(root, "raw/z-large.json"), "x".repeat(100000));
+                writeFile(path.join(root, "raw/zz-invalid.json"),
+                    failure === "parse" ? "{" : "9007199254740993");
+            } else if (failure === "write") {
+                fs.writeFileSync = (file, ...args) => {
+                    if (descriptors.has(file)) {
+                        writeFile(file, "partial output");
+                        throw new Error("injected_disk_full");
+                    }
+                    return writeFile(file, ...args);
+                };
+            } else {
+                fs.renameSync = (source, ...args) => {
+                    if (source === temporary) throw new Error("injected_rename_failure");
+                    return rename(source, ...args);
+                };
+            }
+            let error;
+            try { finalizeEvidence(options); } catch (caught) { error = caught; }
+            assert(error && (failure === "parse" ? error instanceof SyntaxError :
+                error.message === ({ numeric: "evidence_numeric_value_not_lossless",
+                    write: "injected_disk_full", rename: "injected_rename_failure" })[failure]),
+            `${failure} did not propagate the evidence failure.`);
+            assert(descriptors.size === 0 && !fs.existsSync(temporary),
+                `${failure} leaked a file descriptor or partial CSV.`);
+            assert(JSON.stringify(before) === JSON.stringify(outputs.map(name =>
+                sha(path.join(root, name)))),
+            `${failure} replaced previously finalized evidence.`);
+        } finally {
+            fs.writeFileSync = writeFile;
+            fs.renameSync = rename;
+            fs.openSync = open;
+            fs.closeSync = close;
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    }
+}
+
 function testActualBackendProjection() {
     const root = createEvidenceRoot();
     const firstPath = path.join(root, "raw", "pass-1", "transitions",
@@ -1116,6 +1256,8 @@ Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testValidationLeavesEvidenceUntouched)
     .then(testVariantAndSourceProfileValidation)
     .then(testActualBackendProjection)
+    .then(testStreamedEvidence).then(testEvidenceWriteFailures)
+    .then(testEvidenceBeyondStringLimit)
     .then(testUnsafeEvidenceNumberFailsClosed).then(() => {
         process.stdout.write("Render-scale tuning finalizer tests passed.\n");
     }).catch((error) => {
