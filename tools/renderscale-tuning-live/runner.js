@@ -247,10 +247,16 @@ async function runRenderScaleTuningLive(context) {
     }
     const retainedReceiptKeys = [];
     let verifiedAdapter = null;
+    let cleanupMode = false;
+    const cleanupEvidenceErrors = [];
 
     async function retain(key, value) {
         store(key, value);
-        await receiptJournal.write(key, value);
+        try { await receiptJournal.write(key, value); }
+        catch (error) {
+            if (!cleanupMode) throw error;
+            cleanupEvidenceErrors.push({ receiptKey: key, error: String(error.message || error) });
+        }
         if (!retainedReceiptKeys.includes(key)) retainedReceiptKeys.push(key);
     }
 
@@ -259,7 +265,9 @@ async function runRenderScaleTuningLive(context) {
         if (!retainedReceiptKeys.includes(key)) retainedReceiptKeys.push(key);
         summary.receiptKeys = [...retainedReceiptKeys];
         summary.evidenceRoot = receiptJournal.root;
+        summary.cleanupEvidenceErrors = cleanupEvidenceErrors;
         await retain(key, summary);
+        if (receiptJournal.drain) await receiptJournal.drain();
     }
 
     const quality = Object.freeze({
@@ -2022,6 +2030,8 @@ async function runRenderScaleTuningLive(context) {
     }
 
     async function cleanup(lane, pass, stressSessionId) {
+        cleanupMode = true;
+        try {
         const before = await status(lane, pass, "final-status-before-cleanup");
         const render = before.get("render-status").status;
         const cpu = before.get("cpu-status").cpuPerformance;
@@ -2065,6 +2075,7 @@ async function runRenderScaleTuningLive(context) {
         const response = await scenario(steps, receiptKey);
         requireScenario(response.root, steps, receiptKey);
         await status(lane, pass, "final-status-after-cleanup");
+        } finally { cleanupMode = false; }
     }
 
     async function cooldown(lane, pass) {
@@ -2169,10 +2180,14 @@ async function runRenderScaleTuningLive(context) {
                 await cleanup(lane, pass, stressSessionId);
                 stressSessionId = 0;
                 passSummary.status = "COMPLETE";
+                notify({ lane: lane.id, pass, phase: "pass_complete", status: "COMPLETE" });
                 if (pass === 1) await cooldown(lane, pass);
             } catch (error) {
                 if (stressSessionId) {
-                    try { await cleanup(lane, pass, stressSessionId); } catch { }
+                    try { await cleanup(lane, pass, stressSessionId); }
+                    catch (cleanupError) {
+                        passSummary.cleanupError = String(cleanupError.message || cleanupError);
+                    }
                 }
                 summary.ok = false;
                 summary.status = "INTERRUPTED";

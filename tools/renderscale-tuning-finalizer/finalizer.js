@@ -296,10 +296,8 @@ function evidenceValues(root) {
             if (line.length >= 64 * 1024) fs.writeFileSync(descriptor, line);
             else buffer += line;
         };
-        for (const file of files) {
-            const source = relative(root, file);
-            const identity = rawIdentity(root, file);
-            flattenJson(readJson(file), "", (pointer, type, valueJson) => {
+        const extract = (value, source, identity) => {
+            flattenJson(value, "", (pointer, type, valueJson) => {
                 stats.values += 1;
                 if (type === "null") stats.nullValues += 1;
                 if (type === "empty_array" || type === "empty_object") {
@@ -308,6 +306,20 @@ function evidenceValues(root) {
                 emit(`${[source, identity.lane, identity.pass, identity.ordinal,
                     pointer, type, valueJson].map(csvCell).join(",")}\n`);
             });
+        };
+        for (const file of files) {
+            extract(readJson(file), relative(root, file), rawIdentity(root, file));
+        }
+        const document = path.join(rawRoot, "journal.ndjson");
+        if (fs.existsSync(document)) {
+            stats.journalRecords = 0;
+            for (const { entry } of journalLines(document)) {
+                const row = entry.receiptKey.match(/:([^:]+):pass-(\d+):transition-(\d+)(?::|$)/);
+                extract(entry, `raw/journal.ndjson#sequence=${entry.sequence}`, {
+                    lane: row?.[1] || "", pass: row?.[2] || "", ordinal: row?.[3] || "",
+                });
+                stats.journalRecords++;
+            }
         }
         fs.writeFileSync(descriptor, buffer);
     });
@@ -884,19 +896,68 @@ function sha256(file) {
     return hash.digest("hex");
 }
 
+function* journalLines(file) {
+    const fd = fs.openSync(file, "r");
+    let offset = 0, parts = [], length = 0;
+    try {
+        const buffer = Buffer.allocUnsafe(64 * 1024);
+        let bytes;
+        while ((bytes = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+            let start = 0;
+            for (let i = 0; i < bytes; i++) {
+                if (buffer[i] !== 10) continue;
+                parts.push(Buffer.from(buffer.subarray(start, i)));
+                length += i - start;
+                yield { entry: JSON.parse(Buffer.concat(parts, length).toString("utf8")), offset, length };
+                offset += length + 1; parts = []; length = 0; start = i + 1;
+            }
+            if (start < bytes) {
+                parts.push(Buffer.from(buffer.subarray(start, bytes))); length += bytes - start;
+            }
+        }
+        if (length) throw new Error("receipt_journal_incomplete_line");
+    } finally { fs.closeSync(fd); }
+}
+
+function readJournalRevision(reference) {
+    if (reference.offset === undefined) return readJson(reference.file).value;
+    const fd = fs.openSync(reference.file, "r");
+    try {
+        const buffer = Buffer.allocUnsafe(reference.length);
+        let read = 0;
+        while (read < buffer.length) {
+            const bytes = fs.readSync(fd, buffer, read, buffer.length - read, reference.offset + read);
+            if (!bytes) throw new Error("receipt_journal_truncated");
+            read += bytes;
+        }
+        return JSON.parse(buffer.toString("utf8")).value;
+    } finally { fs.closeSync(fd); }
+}
+
 function materializeReceiptJournal(root, runId) {
     const directory = path.join(root, "raw", "journal");
-    if (!fs.existsSync(directory)) return;
+    const document = path.join(root, "raw", "journal.ndjson");
     const latest = new Map();
-    for (const name of fs.readdirSync(directory).sort()) {
-        if (!/^\d{6}\.json$/.test(name)) continue;
-        const entry = readJson(path.join(directory, name));
-        if (!entry.receiptKey.startsWith(`${runId}:`)) {
+    const retain = (entry, reference) => {
+        if (typeof entry.receiptKey !== "string" || !entry.receiptKey.startsWith(`${runId}:`)) {
             throw new Error("receipt_journal_run_mismatch");
         }
-        latest.set(entry.receiptKey.slice(runId.length + 1), entry.value);
+        latest.set(entry.receiptKey.slice(runId.length + 1), reference);
+    };
+    for (const name of fs.existsSync(directory) ? fs.readdirSync(directory).sort() : []) {
+        if (!/^\d{6}\.json$/.test(name)) continue;
+        const file = path.join(directory, name);
+        retain(readJson(file), { file });
     }
-    for (const [key, value] of latest) {
+    if (fs.existsSync(document)) {
+        if (latest.size) throw new Error("receipt_journal_formats_mixed");
+        let sequence = 0;
+        for (const { entry, offset, length } of journalLines(document)) {
+            if (entry.sequence !== ++sequence) throw new Error("receipt_journal_sequence_gap");
+            retain(entry, { file: document, offset, length });
+        }
+    }
+    for (const [key, reference] of latest) {
         let relativePath;
         if (/^startup-(prepare|positioning)$/.test(key)) {
             relativePath = `raw/startup/${key.slice(8)}.json`;
@@ -912,6 +973,7 @@ function materializeReceiptJournal(root, runId) {
                     pass[3].includes("cleanup") ? `finalization/${pass[3]}` : pass[3]) + ".json";
             else continue;
         }
+        const value = readJournalRevision(reference);
         const file = path.join(root, relativePath);
         if (fs.existsSync(file)) {
             if (JSON.stringify(readJson(file)) !== JSON.stringify(value)) {

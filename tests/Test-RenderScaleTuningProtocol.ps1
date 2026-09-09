@@ -59,6 +59,11 @@ Assert-True (Test-Path -LiteralPath $runnerPlugin -PathType Leaf) 'Missing packa
 Assert-True ((Get-FileHash -LiteralPath $runnerSource -Algorithm SHA256).Hash -eq
     (Get-FileHash -LiteralPath $runnerPlugin -Algorithm SHA256).Hash) 'Deterministic tuning runner source/package parity failed.'
 $runner = Get-Content -LiteralPath $runnerSource -Raw
+foreach ($name in @('durable-worker.js', 'journal-worker.js', 'handoff.js', 'Invoke-RenderScaleTuningWorker.ps1', 'README.md')) {
+    $relative = "tools\renderscale-tuning-live\$name"
+    Assert-True ((Get-FileHash -LiteralPath (Join-Path $repositoryRoot $relative)).Hash -eq
+        (Get-FileHash -LiteralPath (Join-Path $repositoryRoot "plugins\skyrim-vr-automation\$relative")).Hash) "Worker package parity failed: $name"
+}
 $finalizerRelative = 'tools\renderscale-tuning-finalizer\finalizer.js'
 $finalizerSource = Join-Path $repositoryRoot $finalizerRelative
 $finalizerPlugin = Join-Path $repositoryRoot "plugins\skyrim-vr-automation\$finalizerRelative"
@@ -288,10 +293,18 @@ foreach ($variant in $variants) {
     Assert-Contains $skill 'does not authorize' $variant.Name
     Assert-Contains $skill 'VR FPS Stabilizer' $variant.Name
     Assert-Contains $skill 'outside this assay' $variant.Name
-    Assert-Contains $skill 'Direct `mcp__devbench_vr__*` tools are the only' $variant.Name
-    Assert-Contains $skill 'Do not enumerate tools or inspect fallbacks' $variant.Name
-    Assert-Contains $skill 'if a named tool is not callable' $variant.Name
-    Assert-Contains $skill 'never use the bundled controller' $variant.Name
+    if ($variant.Name -eq 'renderscale-tuning-nvidia') {
+        foreach ($token in @('hidden detached Node worker', 'raw/journal.ndjson',
+            'A save backlog never aborts or slows measurement', 'every five completed transitions',
+            'same selected DevBench MCP', 'one persistent session', 'Startup uses direct')) {
+            Assert-Contains $skill $token $variant.Name
+        }
+    } else {
+        Assert-Contains $skill 'Direct `mcp__devbench_vr__*` tools are the only' $variant.Name
+        Assert-Contains $skill 'Do not enumerate tools or inspect fallbacks' $variant.Name
+        Assert-Contains $skill 'if a named tool is not callable' $variant.Name
+        Assert-Contains $skill 'never use the bundled controller' $variant.Name
+    }
     Assert-True (-not $skill.Contains('evidence-values.csv', [StringComparison]::Ordinal)) "$($variant.Name) moved finalization into startup instructions."
     Assert-Contains $live '../../../docs/protocols/renderscale-tuning-fast-start.md' $variant.Name
     Assert-Contains $skill 'first `mcp__devbench_vr__communityshaders_menu`' $variant.Name
@@ -708,6 +721,7 @@ Assert-True (-not $simpleCsmProtocol.Contains('renderscale-tuning-amd', [StringC
 
 foreach ($script in @(
     'tests\Test-RenderScaleTuningLiveRunner.js',
+    'tests\Test-RenderScaleTuningWorker.js',
     'tests\Test-RenderScaleTuningFinalizer.js'
 )) {
     $output = & node (Join-Path $repositoryRoot $script) 2>&1

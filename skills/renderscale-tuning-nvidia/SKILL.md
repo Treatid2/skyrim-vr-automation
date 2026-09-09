@@ -72,14 +72,12 @@ the verified identity of its exact stress session. Missing or mismatched
 identity stops measurement with diagnostics, without a positioning gate or
 extra tool call.
 
-Do not end the positioning `functions.exec` after the scenario response. In
-that same cell, load `tools/renderscale-tuning-live/runner.js` and
-`skills/renderscale-tuning-nvidia/references/matrix.v1.json` from the current
-plugin root with one parallel local read. Evaluate the runner source as
-`runRenderScaleTuningLive` and await it with the already-admitted
-`positioningRoot` unchanged, `variant: "nvidia"`, the bound Build ID, the
-parsed matrix, a short run-unique ID, and the cell's `tools`, `store`, and
-`notify` functions. Do not extract, normalize, or validate positioning fields
+Do not end the positioning `functions.exec` before handing the admitted
+startup to `tools/renderscale-tuning-live/handoff.js`. Load it from the current
+plugin root in that same cell. It starts a hidden detached Node worker, which
+loads `tools/renderscale-tuning-live/runner.js` and the unchanged matrix.
+Pass `positioningRoot` unchanged, the bound Build ID and run ID, and both exact
+startup envelopes. Do not extract, normalize, or validate positioning fields
 in the client; the runner exclusively owns positioning admission.
 Use this loader shape, substituting only the current plugin root and the local
 positioning/build variables. Reuse the run ID assigned to startup receipts;
@@ -87,23 +85,38 @@ positioning/build variables. Reuse the run ID assigned to startup receipts;
 responses:
 
 ```javascript
-const support = await Promise.all([
-  tools.exec_command({cmd:"Get-Content -Raw -LiteralPath 'tools\\renderscale-tuning-live\\runner.js'",workdir:"<plugin-root>",shell:"powershell",login:false}),
-  tools.exec_command({cmd:"Get-Content -Raw -LiteralPath 'skills\\renderscale-tuning-nvidia\\references\\matrix.v1.json'",workdir:"<plugin-root>",shell:"powershell",login:false})
-]);
-const runLive = new Function(`${support[0].output}\nreturn runRenderScaleTuningLive;`)();
-const liveResult = await runLive({tools,store,notify,variant:"nvidia",runId,buildId,positioningRoot,startupReceipts:{prepare:prepareEnvelope,positioning:positioningEnvelope},matrix:JSON.parse(support[1].output)});
-text({status:liveResult.status,evidenceRoot:liveResult.evidenceRoot});
+const support = await tools.exec_command({cmd:"Get-Content -Raw -LiteralPath 'tools\\renderscale-tuning-live\\handoff.js'",workdir:"<plugin-root>",shell:"powershell",login:false});
+if (support.exit_code !== 0) throw new Error("worker_handoff_unavailable");
+const startWorker = new Function(`${support.output}\nreturn startRenderScaleTuningWorker;`)();
+const worker = await startWorker({tools,runId,buildId,positioningRoot,startupReceipts:{prepare:prepareEnvelope,positioning:positioningEnvelope},pluginRoot:"<plugin-root>"});
+store(`${runId}:worker`,worker);
+text(worker);
 ```
 
 The runner is the executable live contract. After positioning, it creates
 a new run directory under the current workspace's `artifacts/renderscale-tuning`.
-Every received scenario and every row revision is appended to `raw/journal`
-before the next operation; older revisions and run directories are never
-overwritten. Do not pass a custom `receiptJournal` in a live run (that injection
-exists only for offline tests). Print only the final status and evidence path;
-the complete live result is already journaled. Partial runs remain useful for
+Every received scenario and every row revision is queued as an immutable copy
+before the next operation. A separate writer appends complete receipts to one
+`raw/journal.ndjson` document. The queue may drain during later transitions or
+passes; never wait for disk acknowledgements or flushes between them. A save
+backlog never aborts or slows measurement. Preserve all fields, raw traces,
+per-transition timings, and later revisions; compact status is not evidence.
+Flush the entire document after measurement and cleanup before claiming that
+evidence is saved. Generate CSVs, hashes, and report files afterward.
+Do not pass a custom `receiptJournal` in a live run (that injection exists only
+for offline tests). Partial runs remain useful for
 comparison: report missing metrics explicitly instead of discarding evidence.
+
+Once the worker launch is acknowledged, the positioning cell may end. Monitor
+its exact `worker-status.json` with read-only local calls at intervals of at
+most five seconds. Emit a concise update after every five completed transitions,
+at pass boundaries, and at completion. Progress questions are status reads;
+they never cancel, restart, or replay the worker. A missing exec cell is not
+evidence that the detached worker stopped. Check `worker-terminal.json` if a
+terminal status replacement failed. Do not launch a competing worker or clear
+its endpoint ownership lock. Report timing gaps diagnostically, without stopping
+because evidence saving or status delivery is behind. See
+`tools/renderscale-tuning-live/README.md` after measurement for recovery details.
  Each strict waiter owns a 20-second
 terminal budget. An unsatisfied terminal receipt records a compact non-stable
 note, including its presentation disposition and eye paths. A safely closed
@@ -153,6 +166,9 @@ outside this assay.
 The explicit NVIDIA command selects this lane. Vendor execution and backend
 correctness are qualified by the baseline and measured waiters, not by another
 client-side adapter-shape admission gate. Missing optional native-generation
-evidence is a tooling gap. Direct `mcp__devbench_vr__*` tools are the only
-permitted transport. Do not enumerate tools or inspect fallbacks; if a named
-tool is not callable, stop and never use the bundled controller.
+evidence is a tooling gap. Startup uses direct `mcp__devbench_vr__*` tools.
+After positioning, the packaged worker uses the same selected DevBench MCP
+HTTP endpoint from this plugin's `.mcp.json`, with one persistent session and
+the positioned PID and bound Build ID. This post-position handoff is the sole
+transport exception; do not enumerate tools, select an alternate endpoint,
+retry failed mutations, or use the bundled controller.

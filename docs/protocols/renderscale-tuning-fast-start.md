@@ -11,6 +11,15 @@ When this file is loaded at finalization, use its live-action sections only to
 audit preserved receipts. Never replay an action merely because it is
 described below.
 
+NVIDIA's post-position execution uses the packaged detached worker. It keeps
+the selected DevBench MCP endpoint and protocol matrix, while separating the
+measurement loop from chat and disk handling. Queue immutable complete
+receipts before the next operation, append one `raw/journal.ndjson` document
+on a dedicated writer, and flush only after measurement and cleanup. A save
+backlog never gates the next transition or pass. The startup prefix is unchanged.
+Every five transitions, pass boundary, and completion gets a compact status
+update read independently from the worker. AMD retains its cell-owned path.
+
 ## Validate the one positioning response
 
 The packaged live runner exclusively validates the decoded positioning root.
@@ -46,15 +55,16 @@ separate from each mutation's 20,000 ms strict waiter.
 
 The synchronous response is the positioning observation. The live skill
 decodes the MCP envelope exactly once from `content[0].text` and passes the
-root unchanged to the runner in the same orchestration cell. The runner owns
+root unchanged to the runner. NVIDIA hands it to the persistent worker from
+the positioning cell; AMD stays in that cell. The runner owns
 the fixed checks and reports positioning as soon as it admits the response.
 The client must not create an evidence directory, decode Base64, hash files,
 recursively search the response, or read this contract first. A failed
 scenario or required field stops without replaying the COC.
 
-After the positioning response, the same orchestration cell loads the packaged
-deterministic runner and matrix in parallel and starts the baseline without
-another model handoff. Pass the positioning receipt unchanged; the runner
+After the positioning response, the packaged deterministic runner and matrix
+start without another model handoff. AMD loads them in the positioning cell;
+NVIDIA loads its handoff there and starts the worker. Pass the positioning receipt unchanged; the runner
 admits it and decodes its snapshot once, then reads only each strict waiter's
 documented qualification snapshot. The client does not search, normalize, or
 validate positioning. Do not load
@@ -89,10 +99,12 @@ Every later mutation and ownership scenario remains synchronous with
 Reuse the post-position public snapshot and its exact `stateRevision` when it
 is complete, has no active operation, and still matches the bound Build ID.
 
-After that one prescribed live-path/matrix read and until transition 1 has
+After the prescribed runner handoff and until transition 1 has
 been dispatched, do not run another local command, create evidence, locate a
 ledger, hash/serialize a receipt, search source, inspect a schema, or prepare a
-report. Only compile and run the baseline, handoff, and transition 1's 5,000 ms
+report. NVIDIA's handoff request, process ownership lock, asynchronous journal,
+and status publisher are the permitted setup exception. Only compile and run
+the baseline, handoff, and transition 1's 5,000 ms
 settle. The ledger path is the repository-relative
 `docs/development/vr-render-scale-comparison-ledger.csv`; never search for it.
 
@@ -222,8 +234,9 @@ The terminal `qualification-wait` receipt is the transition boundary. Its
 closed owner, zero active operation, exact PID/Build ID, and unresolved-mutation
 state are the complete safety decision for starting the next row. Do not add a
 post-wait operation read, status read, final snapshot, hash, report update,
-source search, or model pause before starting the next row. Save each received
-envelope and row revision to the append-only receipt journal first. Do not invent another previous-transition safety gate.
+source search, or model pause before starting the next row. Queue each received
+envelope and row revision in the append-only receipt journal first. NVIDIA
+does not await its disk write. Do not invent another previous-transition safety gate.
 
 When the 20,000 ms waiter returns unsatisfied but this safety decision passes,
 record `nonStableNote` with `status: not_stable`, the terminal presentation
@@ -265,16 +278,18 @@ an earlier completed pass or row.
 
 The orchestration cell and packaged runner are only a response-handling
 boundary. Every nested live call must still use the installed plugin's selected
-direct DevBench MCP tools; this does not authorize an external controller,
-HTTP call, alternate local transport, or fallback lane.
+DevBench MCP endpoint. NVIDIA's packaged worker connects to that exact endpoint
+through one persistent HTTP MCP session; this does not authorize an external
+controller, alternate local transport, or fallback lane.
 
-Keep the complete measured pass in that one live orchestration cell; do not
+For AMD, keep the complete measured pass in that one live orchestration cell; do not
 end the cell between rows. After storing and classifying a terminal receipt,
 emit the compact progress projection with `notify()` and immediately call the
 next synchronous scenario. The next scenario owns its initial five-second
 wait. Use `yield_control()` when a user update is due while the cell continues;
 never return to model reasoning, local commands, or evidence processing between
-safe rows. Stop the loop in the cell on an unsafe terminal receipt.
+safe rows. Stop the loop in the cell on an unsafe terminal receipt. NVIDIA
+keeps both passes in its detached worker, so status questions cannot cancel it.
 
 When a terminal row proves the game remains loaded in the exact scene but its
 operation or physical mutation is stuck, preserve that failed row and make one
@@ -318,7 +333,9 @@ when a new qualification owner exists, or when the response was lost; use the
 owner-correlated recovery rule in those cases.
 
 During measurement, journal every received terminal response and trace
-lifecycle receipt losslessly before the next operation. At finalization,
+lifecycle receipt losslessly before the next operation. NVIDIA queues each
+immutable revision without waiting for disk, then drains and flushes after
+measurement and cleanup. At finalization,
 materialize the latest revisions from disk without first printing them to
 chat,
 then make one cumulative evidence-read batch for operation/event history,

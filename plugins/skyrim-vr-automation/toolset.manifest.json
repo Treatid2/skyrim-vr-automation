@@ -9,6 +9,11 @@
   "devBenchProtocolVersion": "2026-08-26",
   "tools": [
     {
+      "name": "renderscale-tuning-worker",
+      "version": "1.0.0",
+      "entryPoint": "tools/renderscale-tuning-live/Invoke-RenderScaleTuningWorker.ps1"
+    },
+    {
       "name": "modlist-control",
       "version": "1.0.0",
       "entryPoint": "tools/modlist-control/Invoke-SkyrimVRModlist.ps1"

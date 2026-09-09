@@ -2276,7 +2276,7 @@ async function testDurableReceiptOrdering() {
     "A later trace update overwrote the earlier received evidence.");
 }
 
-Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
+if (require.main === module) Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
     testNativeReusePassability(), testPerRowTracePagination(),
     testDurableReceiptOrdering(),
     testAmdExposedTraceFailureStops(),
@@ -2295,3 +2295,5 @@ Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
     process.stderr.write(`${error.stack || error}\n`);
     process.exitCode = 1;
 });
+
+module.exports = { createMock, positioningRoot, envelope, buildId };

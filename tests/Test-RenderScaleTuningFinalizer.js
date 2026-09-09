@@ -1210,7 +1210,7 @@ function testTraceCompletenessPassability() {
     }
 }
 
-function testJournalOnlyPartialFinalization() {
+function testJournalOnlyPartialFinalization(document = false) {
     const root = createEvidenceRoot();
     try {
         const runId = "nvidia-test-run";
@@ -1224,7 +1224,15 @@ function testJournalOnlyPartialFinalization() {
             sequence: 2, receiptKey: `${runId}:nvidia:pass-1:transition-1`, value: row,
         });
         fs.rmSync(path.join(root, "raw/pass-1"), { recursive: true });
-        const before = sha(path.join(journal, "000001.json"));
+        let original = path.join(journal, "000001.json");
+        if (document) {
+            original = path.join(root, "raw/journal.ndjson");
+            const records = ["000001.json", "000002.json"].map(name =>
+                JSON.stringify(JSON.parse(fs.readFileSync(path.join(journal, name), "utf8"))));
+            fs.writeFileSync(original, records.join("\n") + "\n");
+            fs.rmSync(journal, { recursive: true });
+        }
+        const before = sha(original);
         const options = { root, variant: "nvidia", runId,
             buildId: "e".repeat(64), expectedRows: 66 };
         let result = finalizeEvidence(options);
@@ -1233,9 +1241,20 @@ function testJournalOnlyPartialFinalization() {
             result.summary.transitions[0].renderVerdict === "PASS",
         "Partial journal evidence was discarded instead of reported.");
         result = finalizeEvidence(options);
-        assert(sha(path.join(journal, "000001.json")) === before &&
+        assert(sha(original) === before &&
             result.summary.transitions.length === 1,
         "Restarting offline finalization changed or duplicated earlier evidence.");
+        const reconstructed = JSON.parse(fs.readFileSync(path.join(root,
+            "raw/lane-nvidia/pass-1/transitions/01/retained.json"), "utf8"));
+        assert(JSON.stringify(reconstructed) === JSON.stringify(row),
+            "Journal reconstruction changed raw evidence or timing fields.");
+        if (document) {
+            fs.appendFileSync(original, '{"sequence":3');
+            let rejected = false;
+            try { finalizeEvidence(options); }
+            catch (error) { rejected = error.message === "receipt_journal_incomplete_line"; }
+            assert(rejected, "A truncated document was silently declared complete.");
+        }
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -1244,6 +1263,7 @@ function testJournalOnlyPartialFinalization() {
 Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testTraceCompletenessPassability)
     .then(testJournalOnlyPartialFinalization)
+    .then(() => testJournalOnlyPartialFinalization(true))
     .then(testPagingResume).then(testDeploymentVerification)
     .then(testOfflineFinalization)
     .then(testReportingSeparation).then(testUnownedViolationRemainsReported)
