@@ -4,6 +4,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Enforce MO2 `SteamVRNull` admission inside null-HMD `apply` and `start`, bind
+  the exact lease, profile, and provider inventory into the transaction
+  receipt, and route-shape fresh SteamVR task clones so inherited OCU providers
+  cannot survive into the SteamVR route.
+- Bind null-HMD admission to the MO2 entry point with actual named parameters,
+  preserve its structured validation errors, and treat a Virtual Desktop driver
+  registration as inventory evidence rather than a null-HMD conflict.
 - Stop treating configured runtime processes such as
   `VirtualDesktop.Streamer` as profile-mutation blockers. MO2 and game processes
   still gate mutations, while exact runtime-route admission continues to reject
