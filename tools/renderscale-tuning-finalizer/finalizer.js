@@ -165,13 +165,12 @@ function qualificationWait(value) {
     return value && value.action === "qualification_wait" ? value : null;
 }
 
-function interruptedLiveResult(root, variant, runId) {
+function readLiveResult(root, variant, runId) {
     const file = path.join(root, "raw", "live-result.json");
     if (!fs.existsSync(file)) return null;
     const value = readJson(file);
-    if (value.status !== "INTERRUPTED") return null;
     if (value.variant !== variant || value.runId !== runId) {
-        throw new Error("interrupted_result_identity_mismatch");
+        throw new Error("live_result_identity_mismatch");
     }
     return value;
 }
@@ -616,11 +615,71 @@ function presentationStretchDetails(waiter, projection, renderVerdict) {
 function sourceProfile(waiter) {
     const timeline = waiter.replacementTimeline || {};
     const proof = timeline.dispatch && timeline.dispatch.presentationProof || {};
+    const leftPresent = Object.hasOwn(proof, "leftEye");
+    const rightPresent = Object.hasOwn(proof, "rightEye");
+    const left = proof.leftEye;
+    const right = proof.rightEye;
+    if (leftPresent !== rightPresent) {
+        throw new Error("source_profile_method_incomplete");
+    }
+    if (leftPresent && (!left || typeof left !== "object" ||
+        !right || typeof right !== "object")) {
+        throw new Error("source_profile_method_invalid");
+    }
+    const leftMethod = left && typeof left === "object" ? left.method : undefined;
+    const rightMethod = right && typeof right === "object" ? right.method : undefined;
+    const leftExposed = leftMethod !== null && leftMethod !== undefined;
+    const rightExposed = rightMethod !== null && rightMethod !== undefined;
+    let method = "not_exposed";
+    if (leftExposed !== rightExposed) {
+        throw new Error("source_profile_method_incomplete");
+    }
+    if (leftExposed && rightExposed) {
+        if (typeof leftMethod !== "string" || typeof rightMethod !== "string" ||
+            leftMethod.length === 0 || rightMethod.length === 0) {
+            throw new Error("source_profile_method_invalid");
+        }
+        if (leftMethod !== rightMethod) {
+            throw new Error("source_profile_method_mismatch");
+        }
+        method = leftMethod;
+    }
     return {
-        method: proof.method ?? "not_exposed",
-        qualityMode: proof.qualityMode ?? "not_exposed",
-        renderScaleMode: proof.renderScaleMode ?? "not_exposed",
+        method,
+        qualityMode: Object.hasOwn(proof, "qualityMode") ?
+            proof.qualityMode : "not_exposed",
+        renderScaleMode: Object.hasOwn(proof, "renderScaleMode") ?
+            proof.renderScaleMode : "not_exposed",
     };
+}
+
+function exposedBackend(value) {
+    return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function actualBackend(waiter, target) {
+    if (target.method === "none" || target.method === "taa") return "none";
+    if (target.method !== "dlss" && target.method !== "fsr") {
+        return "not_exposed";
+    }
+    if (target.renderScaleMode === false) {
+        const execution = waiter.nativeVendorExecution ||
+            waiter.observation && waiter.observation.nativeVendorExecution;
+        return exposedBackend(execution && execution.actualBackend) ||
+            "not_exposed";
+    }
+    if (target.renderScaleMode !== true) return "not_exposed";
+    const timeline = waiter.replacementTimeline || {};
+    const proof = timeline.terminal &&
+        timeline.terminal.presentationProof || {};
+    const direct = exposedBackend(proof.backend);
+    if (direct) return direct;
+    const left = exposedBackend(proof.leftEye && proof.leftEye.backend);
+    const right = exposedBackend(proof.rightEye && proof.rightEye.backend);
+    if (left && left === right) return left;
+    const dispatch = waiter.status && waiter.status.fsrDispatch;
+    return exposedBackend(dispatch && dispatch.actualDispatchBackend) ||
+        "not_exposed";
 }
 
 function transitionRow(root, file, retained) {
@@ -636,7 +695,8 @@ function transitionRow(root, file, retained) {
     const renderVerdict = projection.renderVerdict ||
         (waiter.satisfied === true ? "PASS" : "FAIL");
     const stretch = presentationStretchDetails(waiter, projection, renderVerdict);
-    const traceRequired = target.method === "dlss";
+    const traceRequired = retained.variant === "nvidia" &&
+        target.method === "dlss";
     const traceComplete = !traceRequired || ["traceReset", "traceStart", "traceStop",
         "traceRead"].every((name) => retained[name]);
     const recovery = retained.recovery || null;
@@ -644,6 +704,7 @@ function transitionRow(root, file, retained) {
         ...identity,
         target,
         source: sourceProfile(waiter),
+        actualBackend: actualBackend(waiter, target),
         renderVerdict,
         task2Verdict: task2.verdict,
         task2MissingEvidence: task2.missingEvidence,
@@ -700,7 +761,8 @@ function csvCell(value) {
 function csv(rows) {
     const columns = [
         "lane", "pass", "ordinal", "method", "quality_mode", "render_scale_mode",
-        "render_verdict", "stability_status", "stability_presentation_disposition",
+        "actual_backend", "render_verdict", "stability_status",
+        "stability_presentation_disposition",
         "stability_left_eye_path", "stability_right_eye_path",
         "stability_controller_state", "stability_presentation_phase",
         "stability_failure_codes", "task2_verdict", "mutation_expectation",
@@ -736,7 +798,8 @@ function csv(rows) {
         const diagnostics = row.diagnostics;
         const note = row.nonStableNote;
         const values = [row.lane, row.pass, row.ordinal, row.target.method,
-            row.target.qualityMode, row.target.renderScaleMode, row.renderVerdict,
+            row.target.qualityMode, row.target.renderScaleMode, row.actualBackend,
+            row.renderVerdict,
             note ? note.status : "stable",
             note ? note.presentationDisposition : "n/a",
             note ? note.leftEyePath : "n/a",
@@ -796,7 +859,8 @@ function report(summary) {
                 "started after reset" : row.recoveryStatus;
         return (
         `| ${row.lane || "default"} | ${row.pass} | ${row.ordinal} | ` +
-        `${row.renderVerdict} | ${stability} | ${row.task2Verdict} | ` +
+        `${row.actualBackend} | ${row.renderVerdict} | ${stability} | ` +
+        `${row.task2Verdict} | ` +
         `${row.presentationStretchSelected ?
             row.presentationStretchConsecutiveFrames : "none"} | ` +
         `${row.presentationStretchRecovered ?
@@ -860,9 +924,9 @@ function report(summary) {
         `per-transition evidence. Every raw JSON value is available in ` +
         `\`${summary.evidenceExtraction.path}\`.\n\n` +
         `## Transitions\n\n` +
-        `| Lane | Pass | Row | Render | Stability | Task 2 | Stretch frames | Stretch recovery | Recovery | Authority | Reported violations | ` +
+        `| Lane | Pass | Row | Actual backend | Render | Stability | Task 2 | Stretch frames | Stretch recovery | Recovery | Authority | Reported violations | ` +
         `Missing evidence | Invalid producer evidence |\n` +
-        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n\n` +
+        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n\n` +
         `## Presentation stretch anomalies\n\n` +
         `| Lane | Pass | Row | From | To | Consecutive frames | Recovered PASS |\n` +
         `| --- | ---: | ---: | --- | --- | ---: | --- |\n` +
@@ -915,10 +979,6 @@ function finalizeEvidence(options) {
         transitionWasDispatched(entry.value));
     const undispatchedFailures = allRetained.filter((entry) =>
         !transitionWasDispatched(entry.value));
-    const rows = retained.map(({ file, value }) => transitionRow(root, file, value))
-        .sort((left, right) => (left.lane || "").localeCompare(right.lane || "") ||
-            left.pass - right.pass || left.ordinal - right.ordinal);
-
     const existingSummaryPath = path.join(root, "summary.json");
     const existing = fs.existsSync(existingSummaryPath) ? readJson(existingSummaryPath) : {};
     const runIds = unique([options.runId, existing.runId]);
@@ -926,8 +986,17 @@ function finalizeEvidence(options) {
     if (runIds.length !== 1 || buildIds.length !== 1) {
         throw new Error("finalization_identity_ambiguous");
     }
-    const interrupted = interruptedLiveResult(
-        root, variant, runIds[0]);
+    for (const entry of allRetained) {
+        if (!entry.value || entry.value.variant !== variant) {
+            throw new Error("terminal_receipt_variant_mismatch");
+        }
+    }
+    const rows = retained.map(({ file, value }) => transitionRow(root, file, value))
+        .sort((left, right) => (left.lane || "").localeCompare(right.lane || "") ||
+            left.pass - right.pass || left.ordinal - right.ordinal);
+    const liveResult = readLiveResult(root, variant, runIds[0]);
+    const interrupted = liveResult && liveResult.status === "INTERRUPTED" ?
+        liveResult : null;
     const interruptedPass = interrupted && interrupted.lanes && interrupted.lanes
         .flatMap((lane) => lane.passes || [])
         .find((pass) => pass.status === "INTERRUPTED");
@@ -978,6 +1047,14 @@ function finalizeEvidence(options) {
     if (rows.some((row) => !row.traceComplete)) {
         reportingReasons.push("required_trace_evidence_incomplete");
     }
+    if (rows.some((row) => row.renderVerdict === "PASS" &&
+        row.actualBackend === "not_exposed")) {
+        reportingReasons.push("reporting_contract_incomplete");
+    }
+    if (variant === "amd" && (!liveResult || !liveResult.traceCapability ||
+        liveResult.traceCapability.status !== "supported")) {
+        reportingReasons.push("amd_trace_capability_evidence_incomplete");
+    }
     const deployment = deploymentVerification(root, buildIds[0], options);
     if (!deployment.complete) reportingReasons.push(deployment.reason);
     const reportingStatus = reportingReasons.length === 0 ? "COMPLETE" : "INCOMPLETE";
@@ -1019,6 +1096,9 @@ function finalizeEvidence(options) {
         reporting: { status: reportingStatus, reasons: reportingReasons },
         reportingContract: { complete: reportingStatus === "COMPLETE",
             status: reportingStatus, reasons: reportingReasons },
+        traceCapability: variant === "amd" ?
+            liveResult && liveResult.traceCapability || { status: "missing" } :
+            { status: "not_applicable" },
         deploymentVerification: deployment,
         memoryConfirmation: baselineOnlyInterrupted ?
             baselineOnlyMemoryConfirmation() : existing.memoryConfirmation,

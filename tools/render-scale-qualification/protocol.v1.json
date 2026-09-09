@@ -1,6 +1,6 @@
 {
   "schema": "csx-render-scale-pr-v1",
-  "protocolRevision": 4,
+  "protocolRevision": 5,
   "name": "CSX VR render-scale unattended qualification",
   "requiredMethodsCommit": "b46edeaed14c41ad41225641c3a4943f1db25db6",
   "transitionTimingOrigin": "qualification_dispatch",
@@ -145,7 +145,7 @@
       "promptFile": "visual-review.prompt.v1.md",
       "promptSha256": "1d0926fc81e2b4b3dc7f51eee2b30ef08ce40fd9715aeeeda674b71aed46ac04",
       "outputSchemaFile": "visual-review.output-schema.v1.json",
-      "outputSchemaSha256": "bab27931bd21dfe86c7675d4e37f37061031adbf124576952e03ddfb16d54470",
+      "outputSchemaSha256": "5dd5e20421174a1b0a9e41ef8f5c393fe1b2dcfc9039fd0c01497751e57c8c11",
       "presentationPasses": 2,
       "presentationOrder": "blinded_swapped_ab",
       "parallelReplicates": 3,

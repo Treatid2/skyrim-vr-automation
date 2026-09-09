@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $script:CSXCodexVisualReviewModel = 'gpt-5.6-sol'
+$script:CSXCodexModelProbePrompt = 'Reply with READY only.'
 $script:CSXCodexRequiredRootHelpFeatures = @(
     '--ask-for-approval'
 )
@@ -126,17 +127,20 @@ function Invoke-CSXProviderCommand {
     param(
         [Parameter(Mandatory)][string]$ExecutablePath,
         [Parameter(Mandatory)][string[]]$Arguments,
-        [Parameter(Mandatory)][int]$TimeoutMilliseconds
+        [Parameter(Mandatory)][int]$TimeoutMilliseconds,
+        [switch]$CloseStandardInput
     )
 
     $workingDirectory = Split-Path -Parent $ExecutablePath
     $startInfo = New-CSXProviderProcessStartInfo -ExecutablePath $ExecutablePath `
-        -Arguments $Arguments -WorkingDirectory $workingDirectory
+        -Arguments $Arguments -WorkingDirectory $workingDirectory `
+        -RedirectStandardInput:$CloseStandardInput
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     $startedUtc = [DateTimeOffset]::UtcNow
     try {
         if (-not $process.Start()) { throw 'Process.Start returned false.' }
+        if ($CloseStandardInput) { $process.StandardInput.Close() }
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         $timedOut = -not $process.WaitForExit($TimeoutMilliseconds)
@@ -144,9 +148,13 @@ function Invoke-CSXProviderCommand {
             try { $process.Kill($true) } catch { }
             [void]$process.WaitForExit(1000)
         }
-        if ($process.HasExited) { $process.WaitForExit() }
-        $stdout = $stdoutTask.GetAwaiter().GetResult()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $stdout = ''
+        $stderr = ''
+        if ($process.HasExited) {
+            $process.WaitForExit()
+            $stdout = $stdoutTask.GetAwaiter().GetResult()
+            $stderr = $stderrTask.GetAwaiter().GetResult()
+        }
         return [pscustomobject][ordered]@{
             exitCode = $(if ($process.HasExited) { $process.ExitCode } else { $null })
             stdout = $stdout
@@ -166,6 +174,7 @@ function Get-CSXCodexVisualReviewProviderPreflight {
     param(
         [string]$CodexExecutable = 'codex',
         [ValidateRange(100, 15000)][int]$CommandTimeoutMilliseconds = 5000,
+        [ValidateRange(1000, 60000)][int]$ModelProbeTimeoutMilliseconds = 30000,
         [scriptblock]$CommandAdapter
     )
 
@@ -174,6 +183,7 @@ function Get-CSXCodexVisualReviewProviderPreflight {
     $versionResult = $null
     $rootHelpResult = $null
     $execHelpResult = $null
+    $modelProbeResult = $null
     try {
         $executablePath = Resolve-CSXCodexExecutablePath -CodexExecutable $CodexExecutable
         if ($CommandAdapter) {
@@ -205,7 +215,7 @@ function Get-CSXCodexVisualReviewProviderPreflight {
             $errors.Add('Codex --version timed out.')
         }
         elseif ([int](Get-CSXProviderPropertyValue $versionResult 'exitCode' -1) -ne 0) {
-            $errors.Add("Codex --version failed: $([string](Get-CSXProviderPropertyValue $versionResult 'stderr' '')).Trim()")
+            $errors.Add("Codex --version failed: $(([string](Get-CSXProviderPropertyValue $versionResult 'stderr' '')).Trim())")
         }
         elseif ($versionText -notmatch '(?m)^codex-cli\s+(?<version>\S+)\s*$') {
             $errors.Add('Codex --version did not return a codex-cli version identifier.')
@@ -219,7 +229,7 @@ function Get-CSXCodexVisualReviewProviderPreflight {
             $errors.Add('Codex --help timed out.')
         }
         elseif ([int](Get-CSXProviderPropertyValue $rootHelpResult 'exitCode' -1) -ne 0) {
-            $errors.Add("Codex --help failed: $([string](Get-CSXProviderPropertyValue $rootHelpResult 'stderr' '')).Trim()")
+            $errors.Add("Codex --help failed: $(([string](Get-CSXProviderPropertyValue $rootHelpResult 'stderr' '')).Trim())")
         }
     }
     if ($null -eq $execHelpResult) {
@@ -230,7 +240,7 @@ function Get-CSXCodexVisualReviewProviderPreflight {
             $errors.Add('Codex exec --help timed out.')
         }
         elseif ([int](Get-CSXProviderPropertyValue $execHelpResult 'exitCode' -1) -ne 0) {
-            $errors.Add("Codex exec --help failed: $([string](Get-CSXProviderPropertyValue $execHelpResult 'stderr' '')).Trim()")
+            $errors.Add("Codex exec --help failed: $(([string](Get-CSXProviderPropertyValue $execHelpResult 'stderr' '')).Trim())")
         }
     }
 
@@ -250,6 +260,43 @@ function Get-CSXCodexVisualReviewProviderPreflight {
         $errors.Add("Codex exec --help omits required features: $($missingFeatures -join ', ')")
     }
 
+    if ($errors.Count -eq 0) {
+        $modelProbeArguments = [string[]]@(
+            '--ask-for-approval', 'never',
+            'exec',
+            '--ephemeral',
+            '--ignore-user-config',
+            '--skip-git-repo-check',
+            '--sandbox', 'read-only',
+            '--json',
+            '--model', $script:CSXCodexVisualReviewModel,
+            $script:CSXCodexModelProbePrompt
+        )
+        try {
+            if ($CommandAdapter) {
+                $modelProbeResult = & $CommandAdapter $executablePath $modelProbeArguments $ModelProbeTimeoutMilliseconds
+            }
+            else {
+                $modelProbeResult = Invoke-CSXProviderCommand -ExecutablePath $executablePath `
+                    -Arguments $modelProbeArguments -TimeoutMilliseconds $ModelProbeTimeoutMilliseconds `
+                    -CloseStandardInput
+            }
+            if ($null -eq $modelProbeResult) {
+                $errors.Add('Codex model capability probe did not return a result.')
+            }
+            elseif ([bool](Get-CSXProviderPropertyValue $modelProbeResult 'timedOut' $false)) {
+                $errors.Add("Codex model capability probe timed out for '$($script:CSXCodexVisualReviewModel)'.")
+            }
+            elseif ([int](Get-CSXProviderPropertyValue $modelProbeResult 'exitCode' -1) -ne 0) {
+                $probeError = ([string](Get-CSXProviderPropertyValue $modelProbeResult 'stderr' '')).Trim()
+                $errors.Add("Codex model capability probe failed for '$($script:CSXCodexVisualReviewModel)': $probeError")
+            }
+        }
+        catch {
+            $errors.Add("Codex model capability probe failed for '$($script:CSXCodexVisualReviewModel)': $($_.Exception.Message)")
+        }
+    }
+
     $version = $null
     if ($versionText -match '(?m)^codex-cli\s+(?<version>\S+)\s*$') {
         $version = $Matches.version
@@ -263,6 +310,21 @@ function Get-CSXCodexVisualReviewProviderPreflight {
         versionSha256 = $(if ($versionText) { Get-CSXProviderTextSha256 $versionText } else { $null })
         rootHelpSha256 = $(if ($rootHelpText) { Get-CSXProviderTextSha256 $rootHelpText } else { $null })
         execHelpSha256 = $(if ($execHelpText) { Get-CSXProviderTextSha256 $execHelpText } else { $null })
+        model = $script:CSXCodexVisualReviewModel
+        modelProbe = [pscustomobject][ordered]@{
+            attempted = $null -ne $modelProbeResult
+            ok = $null -ne $modelProbeResult -and
+                -not [bool](Get-CSXProviderPropertyValue $modelProbeResult 'timedOut' $false) -and
+                [int](Get-CSXProviderPropertyValue $modelProbeResult 'exitCode' -1) -eq 0
+            timeoutMilliseconds = $ModelProbeTimeoutMilliseconds
+            exitCode = Get-CSXProviderPropertyValue $modelProbeResult 'exitCode'
+            timedOut = [bool](Get-CSXProviderPropertyValue $modelProbeResult 'timedOut' $false)
+            stdoutSha256 = $(
+                $probeOutput = [string](Get-CSXProviderPropertyValue $modelProbeResult 'stdout' '')
+                if ($probeOutput) { Get-CSXProviderTextSha256 $probeOutput } else { $null }
+            )
+            stderr = ([string](Get-CSXProviderPropertyValue $modelProbeResult 'stderr' '')).Trim()
+        }
         features = [pscustomobject]$features
         missingFeatures = @($missingFeatures)
         errors = @($errors)

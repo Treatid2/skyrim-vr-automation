@@ -19,6 +19,7 @@ $hosts = @($currentHost, $windowsPowerShell) |
     Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
     Select-Object -Unique
 $helper = $null
+$wow64Helper = $null
 $results = [System.Collections.Generic.List[object]]::new()
 
 try {
@@ -63,6 +64,7 @@ try {
             $capture.capturedSamples -ne 2 -or
             $capture.identity.processId -ne $helper.Id -or
             $capture.identity.threadId -ne $thread.Id -or
+            [string]::IsNullOrWhiteSpace([string]$capture.identity.threadStartTimeUtc) -or
             $capture.records[0].rip -notmatch '^0x[0-9A-F]+$' -or
             $capture.records[0].rsp -notmatch '^0x[0-9A-F]+$') {
             throw "Thread-context capture returned an invalid contract under '$hostPath'."
@@ -78,6 +80,7 @@ try {
     $mismatchArguments = @(
         '-NoProfile',
         '-NonInteractive',
+        '-ExecutionPolicy', 'Bypass',
         '-File', $tool,
         '-ProcessId', $helper.Id,
         '-ThreadId', $thread.Id,
@@ -93,15 +96,52 @@ try {
         throw 'The exact process identity guard did not fail closed.'
     }
 
+    $wow64PowerShell = Join-Path $env:SystemRoot 'SysWOW64\WindowsPowerShell\v1.0\powershell.exe'
+    $targetArchitectureGuard = $false
+    if ([Environment]::Is64BitOperatingSystem -and
+        (Test-Path -LiteralPath $wow64PowerShell -PathType Leaf)) {
+        $wow64Helper = Start-Process -FilePath $wow64PowerShell `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 120') `
+            -WindowStyle Hidden -PassThru
+        Start-Sleep -Milliseconds 500
+        $wow64Helper = Get-Process -Id $wow64Helper.Id -ErrorAction Stop
+        $wow64Thread = @($wow64Helper.Threads | Sort-Object StartTime | Select-Object -First 1)[0]
+        $wow64Arguments = @(
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', $tool,
+            '-ProcessId', $wow64Helper.Id,
+            '-ThreadId', $wow64Thread.Id,
+            '-ExpectedProcessPath', $wow64Helper.Path,
+            '-ExpectedStartTimeUtc', $wow64Helper.StartTime.ToUniversalTime().ToString('o'),
+            '-Samples', 1,
+            '-NoExit')
+        $wow64Output = @(& $currentHost @wow64Arguments 2>&1)
+        $wow64Result = ($wow64Output -join [Environment]::NewLine) | ConvertFrom-Json
+        if ($wow64Result.ok -or
+            $wow64Result.state -ne 'target-architecture-mismatch' -or
+            $wow64Result.capturedSamples -ne 0) {
+            throw 'The target architecture guard did not reject a WOW64 helper.'
+        }
+        $targetArchitectureGuard = $true
+    }
+
     [pscustomobject][ordered]@{
         ok = $true
         testedHosts = @($results)
         identityMismatchGuard = $true
+        perSampleThreadIdentityGuard = $true
+        targetArchitectureGuard = $targetArchitectureGuard
     } | ConvertTo-Json -Depth 5
 }
 finally {
     if ($null -ne $helper -and
         $null -ne (Get-Process -Id $helper.Id -ErrorAction SilentlyContinue)) {
         Stop-Process -Id $helper.Id -Force
+    }
+    if ($null -ne $wow64Helper -and
+        $null -ne (Get-Process -Id $wow64Helper.Id -ErrorAction SilentlyContinue)) {
+        Stop-Process -Id $wow64Helper.Id -Force
     }
 }

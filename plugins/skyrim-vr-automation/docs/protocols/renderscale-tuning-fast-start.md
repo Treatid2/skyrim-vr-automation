@@ -32,6 +32,14 @@ reads:
   opaque evidence and no nested `result`, adapter shape, or vendor field gates
   startup.
 
+The runner verifies adapter identity from the existing stress-start receipts
+and terminal waiters. Their `status.adapter` must identify NVIDIA
+`0x10DE`/4318 or AMD `0x1002`/4098 for the requested assay. A safe non-stable
+waiter can omit status and retain the verified identity of its exact stress
+session. Missing or mismatched identity stops measurement with retained
+diagnostics. This adds no positioning gate or tool call; the positioning
+render-scale payload remains opaque.
+
 The positioning scenario owns one 60,000 ms `position-settle` wait immediately
 after the COC and before these observations. This startup stabilization is
 separate from each mutation's 20,000 ms strict waiter.

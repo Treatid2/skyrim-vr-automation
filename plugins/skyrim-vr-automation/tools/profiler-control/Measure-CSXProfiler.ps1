@@ -192,6 +192,7 @@ function Invoke-ProfilerAction([string]$Action, [switch]$ForRestore) {
     }
     $call = & $control call @controlArguments -RequirePerformanceNeutral:(-not $ForRestore) | ConvertFrom-Json -Depth 80
     if (-not $call.ok) { throw "DevBench profiler '$Action' failed: $($call.errors -join '; ')" }
+    $callCleanup = if ($call.PSObject.Properties['sessionCleanup']) { $call.sessionCleanup } else { $null }
     if (-not $ForRestore -and $call.data) {
         $performanceGuard = if ($call.data.PSObject.Properties['performanceGuard']) { $call.data.performanceGuard } else { $null }
         $performanceWindow = if ($call.data.PSObject.Properties['performanceWindow']) { $call.data.performanceWindow } else { $null }
@@ -201,6 +202,7 @@ function Invoke-ProfilerAction([string]$Action, [switch]$ForRestore) {
             guard = $performanceGuard
             window = $performanceWindow
             evidencePath = $call.invocationEvidencePath
+            sessionCleanup = $callCleanup
         })
         if ($null -eq $performanceGuard -or $null -eq $performanceWindow -or -not $performanceWindow.valid) {
             throw "DevBench profiler '$Action' did not preserve a valid performance-neutrality window."
@@ -229,9 +231,14 @@ function Invoke-ProfilerAction([string]$Action, [switch]$ForRestore) {
         throw "DevBench runtime identity changed during profiler capture; refusing to mix samples or mutate the replacement runtime. Expected $($script:expectedRuntimeIdentityFingerprint), observed $identityFingerprint."
     }
     $script:receipt.runtimeIdentityObservations = @($script:receipt.runtimeIdentityObservations) + @([pscustomobject][ordered]@{
-        action = $Action; observedUtc = [DateTime]::UtcNow.ToString('o'); fingerprint = $identityFingerprint; evidencePath = $call.invocationEvidencePath
+        action = $Action; observedUtc = [DateTime]::UtcNow.ToString('o'); fingerprint = $identityFingerprint
+        evidencePath = $call.invocationEvidencePath; sessionCleanup = $callCleanup
     })
-    return [pscustomobject][ordered]@{ payload = $payload[0]; runtimeIdentity = $call.runtimeIdentity; stableRuntimeIdentity = $stableIdentity; runtimeIdentityFingerprint = $identityFingerprint; evidencePath = $call.invocationEvidencePath }
+    return [pscustomobject][ordered]@{
+        payload = $payload[0]; runtimeIdentity = $call.runtimeIdentity
+        stableRuntimeIdentity = $stableIdentity; runtimeIdentityFingerprint = $identityFingerprint
+        evidencePath = $call.invocationEvidencePath; sessionCleanup = $callCleanup
+    }
 }
 
 function Get-ResourcePublicationSnapshot([Parameter(Mandatory)][string]$Phase) {
@@ -241,15 +248,9 @@ function Get-ResourcePublicationSnapshot([Parameter(Mandatory)][string]$Phase) {
         -EvidenceDirectory $runDirectory -EvidenceLabel "renderscale-$Phase" `
         -TimeoutSeconds $remainingSeconds -RequireSuccess `
         -RequirePerformanceNeutral -NoExit -Compact | ConvertFrom-Json -Depth 80
+    $callCleanup = if ($call.PSObject.Properties['sessionCleanup']) { $call.sessionCleanup } else { $null }
     if (-not $call.ok) {
-        return [pscustomobject][ordered]@{
-            phase = $Phase
-            timestampUtc = [DateTime]::UtcNow.ToString('o')
-            telemetry = Invoke-DevBenchNormalizer 'Get-DevBenchResourcePublicationTelemetry' $null
-            preparation = Invoke-DevBenchNormalizer 'Get-DevBenchRenderScalePreparationTelemetry' $null
-            invocationEvidencePath = $call.invocationEvidencePath
-            error = $call.errors -join '; '
-        }
+        throw "DevBench render-scale '$Phase' guard or status call failed: $($call.errors -join '; ')"
     }
 
     $stableIdentity = Get-StableRuntimeIdentity -Identity $call.runtimeIdentity
@@ -265,6 +266,7 @@ function Get-ResourcePublicationSnapshot([Parameter(Mandatory)][string]$Phase) {
             telemetry = Invoke-DevBenchNormalizer 'Get-DevBenchResourcePublicationTelemetry' $null
             preparation = Invoke-DevBenchNormalizer 'Get-DevBenchRenderScalePreparationTelemetry' $null
             invocationEvidencePath = $call.invocationEvidencePath
+            sessionCleanup = $callCleanup
             error = 'Render-scale status returned no structured content.'
         }
     }
@@ -274,6 +276,7 @@ function Get-ResourcePublicationSnapshot([Parameter(Mandatory)][string]$Phase) {
         telemetry = Invoke-DevBenchNormalizer 'Get-DevBenchResourcePublicationTelemetry' $payload[0]
         preparation = Invoke-DevBenchNormalizer 'Get-DevBenchRenderScalePreparationTelemetry' $payload[0]
         invocationEvidencePath = $call.invocationEvidencePath
+        sessionCleanup = $callCleanup
         error = $null
     }
 }
@@ -510,6 +513,16 @@ $timerSummaries = foreach ($group in ($timerRows | Group-Object name | Sort-Obje
         cpuMs = Get-MetricSummary ([double[]]@($group.Group | Where-Object { $_.activeCpu -and $_.hasCpu } | ForEach-Object cpuMs))
     }
 }
+$resourcePublicationSummaryBefore = if ($null -eq $resourcePublicationBefore) {
+    $null
+} else {
+    $resourcePublicationBefore | Select-Object -Property * -ExcludeProperty preparation
+}
+$resourcePublicationSummaryAfter = if ($null -eq $resourcePublicationAfter) {
+    $null
+} else {
+    $resourcePublicationAfter | Select-Object -Property * -ExcludeProperty preparation
+}
 $summary = [pscustomobject][ordered]@{
     schemaVersion = 3; transactionId = $transactionId; label = $Label; startedUtc = $startedUtc.ToString('o'); endedUtc = $endedUtc.ToString('o')
     durationSeconds = ($endedUtc - $startedUtc).TotalSeconds; requestedSamples = $Samples; warmupSamples = $WarmupSamples; collectedSamples = $records.Count
@@ -519,8 +532,8 @@ $summary = [pscustomobject][ordered]@{
     priorProfilerEnabled = $receipt.priorEnabled; profilerStateRestored = $receipt.stateRestored; receiptPath = $receiptPath
     performanceObservations = @($receipt.performanceObservations)
     resourcePublication = [pscustomobject][ordered]@{
-        before = $resourcePublicationBefore
-        after = $resourcePublicationAfter
+        before = $resourcePublicationSummaryBefore
+        after = $resourcePublicationSummaryAfter
     }
     preparation = [pscustomobject][ordered]@{
         before = if ($null -eq $resourcePublicationBefore) { $null } else { $resourcePublicationBefore.preparation }

@@ -86,6 +86,7 @@ foreach ($requiredSkillText in @(
     'coc-stability-control run',
     'capture-hang',
     'VR FPS Stabilizer exclusively owns',
+    'neither requires nor forbids a post-dispatch profile change',
     'Do not inspect graphics adapters',
     'resolve a winning MO2 file',
     'Multiple adapters or Stabilizer INIs are irrelevant',
@@ -289,6 +290,30 @@ Assert-Protocol ($runner.Contains(
     'fixtureAnomalies',
     [StringComparison]::Ordinal
 )) 'Fixture anomalies must be preserved for the measured assay.'
+$watchdogPosition = $runner.IndexOf(
+    '$watchdogJob = Start-ThreadJob',
+    [StringComparison]::Ordinal
+)
+Assert-Protocol ($watchdogPosition -ge 0) (
+    'The independent deadline watchdog is missing.'
+)
+Assert-Protocol (-not $runner.Substring(0, $watchdogPosition).Contains(
+    '$fixtureAnomalies.Count',
+    [StringComparison]::Ordinal
+)) 'Fixture anomalies must not block the deadline watchdog dispatch.'
+$failureWritePosition = $runner.IndexOf(
+    'Write-AtomicJson -Value $stateRecord',
+    [StringComparison]::Ordinal
+)
+$failureThrowPosition = $runner.IndexOf(
+    'if (-not $dispatchAccepted)',
+    [StringComparison]::Ordinal
+)
+Assert-Protocol (
+    $failureWritePosition -ge 0 -and
+    $failureWritePosition -lt $failureThrowPosition -and
+    $runner.Contains('dispatchFailure', [StringComparison]::Ordinal)
+) 'A rejected scenario must publish its evidence before returning the failure.'
 Assert-Protocol (-not $protocol.Contains(
     'Restart Codex after repairing project configuration',
     [StringComparison]::Ordinal

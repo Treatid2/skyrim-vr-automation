@@ -35,7 +35,7 @@ preflight. Render-scale status must expose the live D3D adapter vendor, device,
 and driver identity; those values must agree with the selected vendor matrix
 and fixture manifest.
 
-Protocol revision 4 also requires a Codex CLI installation that can provide
+Protocol revision 5 also requires a Codex CLI installation that can provide
 original image inputs and schema-constrained output with `gpt-5.6-sol`. The
 same invocation runs three batches for each of two blinded, swapped
 presentation passes. Model access, schema, timeout, confidence, disagreement,

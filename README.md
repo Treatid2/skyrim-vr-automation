@@ -40,6 +40,9 @@ optional integration rather than the identity or boundary of the toolkit.
   deterministic evidence, and generated summaries.
 - `tools/profiler-control` — repeatable DevBench profiler capture and
   multi-state comparison reports.
+- `tools/renderscale-tuning-live` and `tools/renderscale-tuning-finalizer` —
+  identity-bound NVIDIA or AMD render-scale assay execution and restartable,
+  lossless evidence finalization.
 - `tools/shader-cache-control` — provider discovery, physical cache
   snapshot/restore transactions, compatibility-ranked known-working cache
   catalogs, task seeding/restoration/promotion, and comparison reports.
@@ -196,9 +199,9 @@ deploys, or launches the game:
 
 The same operation is available conversationally through
 `$render-scale-qualification`: launch the intended DLL and game yourself, enter
-the controlled start scene, then say `start render-scale qualification`. A
-contextual `start` is also sufficient after those conditions have already been
-established in the conversation.
+the controlled start scene, then say `start render-scale qualification`.
+The qualification requires this explicit invocation; a contextual `start`
+does not authorize it.
 
 Explicit runtime, fixture, and output locations remain available:
 
@@ -220,7 +223,7 @@ $baselineBuildId = '<64-character baseline CSX build ID>'
     -ExpectedBaselineBuildId $baselineBuildId
 ```
 
-Protocol revision 4 has a hard 600-second end-to-end pass limit. It runs the
+Protocol revision 5 has a hard 600-second end-to-end pass limit. It runs the
 20-transition load-synchronized COC assay, a 30-second recovery, the ordered
 25-transition menu assay, a second 30-second recovery, and three one-minute
 HMD-submission capture sequences. Dispatch-to-stability time starts at the

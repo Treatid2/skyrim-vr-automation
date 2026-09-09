@@ -64,6 +64,16 @@
       "entryPoint": "tools/profiler-control/Measure-CSXProfiler.ps1"
     },
     {
+      "name": "renderscale-tuning-live",
+      "version": "1.0.0",
+      "entryPoint": "tools/renderscale-tuning-live/runner.js"
+    },
+    {
+      "name": "renderscale-tuning-finalizer",
+      "version": "1.0.0",
+      "entryPoint": "tools/renderscale-tuning-finalizer/finalizer.js"
+    },
+    {
       "name": "shader-cache-control",
       "version": "3.1.0",
       "entryPoint": "tools/shader-cache-control/Invoke-CSXShaderCacheCatalog.ps1"
@@ -74,6 +84,11 @@
       "entryPoint": "tools/capture-interaction-control/Invoke-CaptureInteraction.ps1"
     },
     {
+      "name": "coc-stability-control",
+      "version": "1.0.0",
+      "entryPoint": "tools/coc-stability-control/Invoke-CocStabilityControl.ps1"
+    },
+    {
       "name": "process-control",
       "version": "1.1.0",
       "entryPoint": "tools/process-control/Invoke-BoundedProcess.ps1"
@@ -82,11 +97,6 @@
       "name": "coc-evidence-control",
       "version": "1.1.0",
       "entryPoint": "tools/coc-evidence-control/Invoke-CocEvidenceControl.ps1"
-    },
-    {
-      "name": "coc-stability-control",
-      "version": "1.0.0",
-      "entryPoint": "tools/coc-stability-control/Invoke-CocStabilityControl.ps1"
     },
     {
       "name": "build-test-control",

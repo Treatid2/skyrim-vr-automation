@@ -23,6 +23,7 @@ $modulePath = Join-Path $PSScriptRoot 'CocStabilityControl.psm1'
 Import-Module $modulePath -Force
 $ownedJobs = [Collections.Generic.List[object]]::new()
 $phase = 'initializing'
+$publishedStatePath = $null
 
 function Write-AtomicJson {
     param([Parameter(Mandatory)]$Value, [Parameter(Mandatory)][string]$Path)
@@ -125,37 +126,64 @@ try {
         if ([string]$state.schema -ne 'csx-coc-stability-state-v1') {
             throw 'The state is not owned by COC stability control.'
         }
-        $protocolConfig = Get-Content -LiteralPath ([string]$state.protocolConfigPath) -Raw |
-            ConvertFrom-Json -Depth 30
-        $statusReceipt = Invoke-CocMcpTool -Endpoint ([string]$state.endpoint) `
-            -Tool 'scenario' -Arguments @{
-                action = 'status'
-                runId = [uint64]$state.scenarioRunId
-            } -TimeoutSeconds 20
-        $scenarioDone = [bool]$statusReceipt.value.done
-        $scenarioOk = -not $scenarioDone -or [bool]$statusReceipt.value.ok
-        $analysis = Get-CocQualificationAnalysis -Scenario $statusReceipt.value `
-            -ProtocolConfig $protocolConfig
-        $result = [pscustomobject][ordered]@{
-            schema = 'csx-coc-stability-control-v1'
-            ok = $scenarioOk
-            command = 'status'
-            timestampUtc = [DateTime]::UtcNow.ToString('o')
-            state = if (-not $scenarioDone) {
-                'running'
-            } elseif ($scenarioOk) {
-                'complete'
-            } else {
-                'failed'
+        if ([string]$state.outcome -ceq 'scenario-rejected') {
+            $dispatchFailure = if ($state.PSObject.Properties['dispatchFailure']) {
+                $state.dispatchFailure
+            } else { $null }
+            $dispatchError = if ($null -ne $dispatchFailure -and
+                $dispatchFailure.PSObject.Properties['error']) {
+                [string]$dispatchFailure.error
+            } else { 'Scenario dispatch was rejected without an error detail.' }
+            $result = [pscustomobject][ordered]@{
+                schema = 'csx-coc-stability-control-v1'
+                ok = $false
+                command = 'status'
+                timestampUtc = [DateTime]::UtcNow.ToString('o')
+                state = 'failed'
+                data = [pscustomobject]@{
+                    statePath = $resolvedStatePath
+                    ownerId = [string]$state.ownerId
+                    scenarioRunId = $null
+                    scenario = $null
+                    analysis = $null
+                    dispatchFailure = $dispatchFailure
+                }
+                errors = @($dispatchError)
             }
-            data = [pscustomobject]@{
-                statePath = $resolvedStatePath
-                ownerId = [string]$state.ownerId
-                scenarioRunId = [uint64]$state.scenarioRunId
-                scenario = $statusReceipt.value
-                analysis = $analysis
+        }
+        else {
+            $protocolConfig = Get-Content -LiteralPath ([string]$state.protocolConfigPath) -Raw |
+                ConvertFrom-Json -Depth 30
+            $statusReceipt = Invoke-CocMcpTool -Endpoint ([string]$state.endpoint) `
+                -Tool 'scenario' -Arguments @{
+                    action = 'status'
+                    runId = [uint64]$state.scenarioRunId
+                } -TimeoutSeconds 20
+            $scenarioDone = [bool]$statusReceipt.value.done
+            $scenarioOk = -not $scenarioDone -or [bool]$statusReceipt.value.ok
+            $analysis = Get-CocQualificationAnalysis -Scenario $statusReceipt.value `
+                -ProtocolConfig $protocolConfig
+            $result = [pscustomobject][ordered]@{
+                schema = 'csx-coc-stability-control-v1'
+                ok = $scenarioOk
+                command = 'status'
+                timestampUtc = [DateTime]::UtcNow.ToString('o')
+                state = if (-not $scenarioDone) {
+                    'running'
+                } elseif ($scenarioOk) {
+                    'complete'
+                } else {
+                    'failed'
+                }
+                data = [pscustomobject]@{
+                    statePath = $resolvedStatePath
+                    ownerId = [string]$state.ownerId
+                    scenarioRunId = [uint64]$state.scenarioRunId
+                    scenario = $statusReceipt.value
+                    analysis = $analysis
+                }
+                errors = if ($scenarioOk) { @() } else { @([string]$statusReceipt.value.error) }
             }
-            errors = if ($scenarioOk) { @() } else { @([string]$statusReceipt.value.error) }
         }
     }
     else {
@@ -334,18 +362,35 @@ try {
                 }
             }
         }
-        if (-not [bool]$dispatchResult.ok -or
-            [string]$dispatchResult.state -ne 'scenario-accepted') {
-            throw "The measured scenario was not accepted: $($dispatchResult.error)"
-        }
-        $scenarioRunId = [uint64]$dispatchResult.receipt.value.runId
-        $acceptedElapsedMs = [Math]::Round(
-            ([double]([long]$dispatchResult.acceptedTimestamp - $originTimestamp) *
-                1000.0 / [double]$frequency), 3
-        )
+        $dispatchStateProperty = $dispatchResult.PSObject.Properties['state']
+        $dispatchSourceProperty = $dispatchResult.PSObject.Properties['source']
+        $dispatchErrorProperty = $dispatchResult.PSObject.Properties['error']
+        $dispatchState = if ($dispatchStateProperty) {
+            [string]$dispatchStateProperty.Value
+        } else { 'unknown' }
+        $dispatchSource = if ($dispatchSourceProperty) {
+            [string]$dispatchSourceProperty.Value
+        } else { 'unknown' }
+        $dispatchError = if ($dispatchErrorProperty) {
+            [string]$dispatchErrorProperty.Value
+        } else { 'The dispatch job returned no error detail.' }
+        $dispatchAccepted = [bool]$dispatchResult.ok -and
+            $dispatchState -eq 'scenario-accepted'
+        $scenarioRunId = if ($dispatchAccepted) {
+            [uint64]$dispatchResult.receipt.value.runId
+        } else { $null }
+        $acceptedElapsedMs = if ($dispatchAccepted) {
+            [Math]::Round(
+                ([double]([long]$dispatchResult.acceptedTimestamp -
+                        $originTimestamp) * 1000.0 / [double]$frequency), 3
+            )
+        } else { $null }
         $stateRecord = [pscustomobject][ordered]@{
             schema = 'csx-coc-stability-state-v1'
             createdUtc = [DateTime]::UtcNow.ToString('o')
+            outcome = if ($dispatchAccepted) {
+                'scenario-accepted'
+            } else { 'scenario-rejected' }
             endpoint = $Endpoint
             ownerId = $ownerId
             expectedPid = $ExpectedPid
@@ -353,15 +398,26 @@ try {
             collectorStatePath = [IO.Path]::GetFullPath($CollectorStatePath)
             protocolConfigPath = [IO.Path]::GetFullPath($ProtocolConfigPath)
             baselineDeadlineMs = $BaselineDeadlineMs
-            dispatchSource = [string]$dispatchResult.source
+            dispatchSource = $dispatchSource
+            dispatchState = $dispatchState
             dispatchAcceptedElapsedMs = $acceptedElapsedMs
             scenarioRunId = $scenarioRunId
+            dispatchFailure = if ($dispatchAccepted) { $null } else {
+                [pscustomobject][ordered]@{
+                    error = $dispatchError
+                    detail = $dispatchResult
+                }
+            }
             fixture = $fixture.value
             fixtureAnomalies = @($fixtureAnomalies)
             baseline = $baselineResults
             baselineVerdict = $baselineVerdict
         }
         Write-AtomicJson -Value $stateRecord -Path $resolvedStatePath
+        $publishedStatePath = $resolvedStatePath
+        if (-not $dispatchAccepted) {
+            throw "The measured scenario was not accepted: $dispatchError"
+        }
         $result = [pscustomobject][ordered]@{
             schema = 'csx-coc-stability-control-v1'
             ok = $true
@@ -372,7 +428,7 @@ try {
                 ownerId = $ownerId
                 scenarioRunId = $scenarioRunId
                 statePath = $resolvedStatePath
-                dispatchSource = [string]$dispatchResult.source
+                dispatchSource = $dispatchSource
                 dispatchAcceptedElapsedMs = $acceptedElapsedMs
                 baselineDeadlineMs = $BaselineDeadlineMs
                 fixtureAnomalies = @($fixtureAnomalies)
@@ -393,6 +449,7 @@ catch {
         data = [pscustomobject]@{
             phase = $phase
             nextAction = 'ask_user'
+            statePath = $publishedStatePath
         }
         errors = @($_.Exception.Message)
     }

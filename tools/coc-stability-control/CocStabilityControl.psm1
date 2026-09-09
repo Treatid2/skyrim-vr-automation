@@ -281,12 +281,18 @@ function Test-CocBaseline {
     $scene = $Results.scene.value
     $upscaling = $Results.upscaling.value
     $renderScale = $Results.renderscale.value
-    $actualCell = if ($scene.cell -is [string]) {
-        [string]$scene.cell
+    $cell = Get-CocPropertyValue -Value $scene -Name 'cell'
+    $actualCell = if ($cell -is [string]) {
+        [string]$cell
+    } elseif ($null -ne $cell) {
+        [string](Get-CocPropertyValue -Value $cell -Name 'editorId')
     } else {
-        [string]$scene.cell.editorId
+        ''
     }
-    if (-not [bool]$state.playerLoaded) { $reasons.Add('the player is not loaded') }
+    $playerLoaded = ConvertTo-CocBoolean (
+        Get-CocPropertyValue -Value $state -Name 'playerLoaded'
+    )
+    if ($true -ne $playerLoaded) { $reasons.Add('the player is not loaded') }
     if (-not [string]::Equals(
         $actualCell, $ExpectedCell, [StringComparison]::OrdinalIgnoreCase
     )) { $reasons.Add("the exact cell is '$actualCell'") }
@@ -444,10 +450,11 @@ function Get-CocScenarioRecordPayload {
         [Parameter(Mandatory)][string]$Label
     )
 
-    $record = @($Records | Where-Object {
+    $matches = @($Records | Where-Object {
             [string](Get-CocPropertyValue -Value $_ -Name 'label') -ceq $Label
-        } | Select-Object -First 1)[0]
-    if ($null -eq $record) { return $null }
+        } | Select-Object -First 1)
+    if ($matches.Count -eq 0) { return $null }
+    $record = $matches[0]
     $payload = Get-CocPropertyValue -Value $record -Name 'result'
     if ($null -eq $payload) {
         $payload = Get-CocPropertyValue -Value $record -Name 'value'
@@ -489,6 +496,12 @@ function Get-CocQualificationAnalysis {
                 cleanupElapsedMs = $null; cleanupElapsedFrames = $null
                 strictElapsedMs = $null; strictElapsedFrames = $null
                 cleanupTailMs = $null; cleanupTailFrames = $null
+                presentationStable = $null; cleanupDrained = $null
+                strictSatisfied = $null; retryCount = $null
+                sessionStretchObservations = $null
+                vendorFailures = $null; boundsMismatchFallbacks = $null
+                ooms = $null; deviceLosses = $null
+                fidelityMismatches = $null
                 resourcePublication = Get-DevBenchResourcePublicationTelemetry -Response $null
                 preparation = Get-DevBenchRenderScalePreparationTelemetry -Response $statusReceipt
             })

@@ -154,6 +154,7 @@ function retained(boundary, violation, identity = {}, nonStable = false) {
     const runId = identity.runId || "nvidia-test-run";
     const buildId = identity.buildId || "e".repeat(64);
     return {
+        variant: identity.variant || (runId.startsWith("amd-") ? "amd" : "nvidia"),
         analysisSentinel: {
             falseValue: false,
             zeroValue: 0,
@@ -362,10 +363,20 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
         counts: { transitionsDispatched: 2 },
     });
     writeDeploymentVerification(root, buildId);
+    if (variant === "amd") {
+        writeJson(path.join(root, "raw", "live-result.json"), {
+            ok: true,
+            status: "COMPLETE",
+            variant,
+            runId,
+            traceCapability: { status: "supported" },
+            lanes: [],
+        });
+    }
     writeJson(path.join(root, "raw", "pass-1", "transitions", "01",
-        "retained.json"), retained(false, true, { runId, buildId }));
+        "retained.json"), retained(false, true, { runId, buildId, variant }));
     writeJson(path.join(root, "raw", "pass-1", "transitions", "02",
-        "retained.json"), retained(true, true, { runId, buildId }, nonStable));
+        "retained.json"), retained(true, true, { runId, buildId, variant }, nonStable));
     return root;
 }
 
@@ -479,6 +490,7 @@ function testPartialInterruptedFinalization() {
         });
         writeJson(path.join(root, "raw", "pass-2", "transitions", "01",
             "retained.json"), {
+            variant: "nvidia",
             scenarioReceiptKey: failure.receiptKey,
             scenario: failure,
             waiter: null,
@@ -839,6 +851,92 @@ function testValidationLeavesEvidenceUntouched() {
     }
 }
 
+function testAmdTraceCapabilityOnlyAffectsReporting() {
+    const root = createEvidenceRoot("amd");
+    try {
+        const options = { root, variant: "amd",
+            runId: "amd-test-run", buildId: "e".repeat(64), expectedRows: 2,
+            generatedUtc: "2026-08-30T20:00:00.000Z" };
+        const supported = finalizeEvidence(options);
+        const livePath = path.join(root, "raw", "live-result.json");
+        const live = JSON.parse(fs.readFileSync(livePath, "utf8"));
+        live.traceCapability = { status: "unsupported" };
+        writeJson(livePath, live);
+        const result = finalizeEvidence(options);
+        assert(result.summary.render.verdict === supported.summary.render.verdict &&
+            result.summary.reporting.status === "INCOMPLETE" &&
+            result.summary.traceCapability.status === "unsupported" &&
+            result.summary.reporting.reasons.includes(
+                "amd_trace_capability_evidence_incomplete"),
+        `Missing optional AMD trace evidence changed row results or allowed reporting completion: ${JSON.stringify({ render: result.summary.render, reporting: result.summary.reporting })}`);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testVariantAndSourceProfileValidation() {
+    const root = createEvidenceRoot();
+    try {
+        const retainedPath = path.join(root, "raw", "pass-1", "transitions",
+            "01", "retained.json");
+        let receipt = JSON.parse(fs.readFileSync(retainedPath, "utf8"));
+        receipt.variant = "amd";
+        writeJson(retainedPath, receipt);
+        try {
+            finalizeEvidence({ root, variant: "nvidia", runId: "nvidia-test-run",
+                buildId: "e".repeat(64), expectedRows: 2 });
+            throw new Error("Expected variant mismatch.");
+        } catch (error) {
+            assert(error.message === "terminal_receipt_variant_mismatch",
+                "A mixed-variant receipt was accepted.");
+        }
+        receipt.variant = "nvidia";
+        receipt.waiter.replacementTimeline.dispatch.presentationProof
+            .rightEye.method = "taa";
+        writeJson(retainedPath, receipt);
+        try {
+            finalizeEvidence({ root, variant: "nvidia", runId: "nvidia-test-run",
+                buildId: "e".repeat(64), expectedRows: 2 });
+            throw new Error("Expected source method mismatch.");
+        } catch (error) {
+            assert(error.message === "source_profile_method_mismatch",
+                "Mismatched source-eye methods were accepted.");
+        }
+        receipt.waiter.replacementTimeline.dispatch.presentationProof.leftEye =
+            "none";
+        receipt.waiter.replacementTimeline.dispatch.presentationProof
+            .rightEye.method = "none";
+        writeJson(retainedPath, receipt);
+        try {
+            finalizeEvidence({ root, variant: "nvidia", runId: "nvidia-test-run",
+                buildId: "e".repeat(64), expectedRows: 2 });
+            throw new Error("Expected malformed source proof.");
+        } catch (error) {
+            assert(error.message === "source_profile_method_invalid",
+                "A malformed source-eye proof was accepted.");
+        }
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+
+    const missing = createEvidenceRoot();
+    try {
+        const retainedPath = path.join(missing, "raw", "pass-1", "transitions",
+            "01", "retained.json");
+        const receipt = JSON.parse(fs.readFileSync(retainedPath, "utf8"));
+        delete receipt.waiter.replacementTimeline.dispatch.presentationProof.leftEye;
+        delete receipt.waiter.replacementTimeline.dispatch.presentationProof.rightEye;
+        writeJson(retainedPath, receipt);
+        const result = finalizeEvidence({ root: missing, variant: "nvidia",
+            runId: "nvidia-test-run", buildId: "e".repeat(64), expectedRows: 2,
+            generatedUtc: "2026-08-30T20:00:00.000Z" });
+        assert(result.summary.transitions[0].source.method === "not_exposed",
+            "A genuinely unexposed source method was inferred.");
+    } finally {
+        fs.rmSync(missing, { recursive: true, force: true });
+    }
+}
+
 function testUnsafeEvidenceNumberFailsClosed() {
     const root = createEvidenceRoot();
     try {
@@ -861,16 +959,77 @@ function testUnsafeEvidenceNumberFailsClosed() {
     }
 }
 
+function testActualBackendProjection() {
+    const root = createEvidenceRoot();
+    const firstPath = path.join(root, "raw", "pass-1", "transitions",
+        "01", "retained.json");
+    const secondPath = path.join(root, "raw", "pass-1", "transitions",
+        "02", "retained.json");
+    const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+        buildId: "e".repeat(64), expectedRows: 2,
+        generatedUtc: "2026-08-30T20:00:00.000Z" };
+    try {
+        const scaled = JSON.parse(fs.readFileSync(firstPath, "utf8"));
+        scaled.waiter.target = {
+            method: "dlss", qualityMode: 3, renderScaleMode: true,
+        };
+        scaled.waiter.replacementTimeline.terminal.presentationProof.backend =
+            "dlss";
+        writeJson(firstPath, scaled);
+
+        const native = JSON.parse(fs.readFileSync(secondPath, "utf8"));
+        native.waiter.target = {
+            method: "fsr", qualityMode: 0, renderScaleMode: false,
+        };
+        native.waiter.nativeVendorExecution = {
+            required: true,
+            sameFrameBothEyesValid: true,
+            actualBackend: "fsr_host",
+        };
+        writeJson(secondPath, native);
+
+        let result = finalizeEvidence(options);
+        assert(result.summary.transitions[0].actualBackend === "dlss" &&
+            result.summary.transitions[1].actualBackend === "fsr_host" &&
+            !result.summary.reporting.reasons.includes(
+                "reporting_contract_incomplete"),
+        "Owning backend evidence was not projected into complete reporting.");
+        const csvText = fs.readFileSync(path.join(root, "transitions.csv"),
+            "utf8");
+        const reportText = fs.readFileSync(path.join(root, "report.md"), "utf8");
+        assert(csvText.includes("actual_backend") &&
+            csvText.includes("dlss") && csvText.includes("fsr_host") &&
+            reportText.includes("Actual backend") &&
+            reportText.includes("| fsr_host |"),
+        "Actual backend was omitted from a rendered transition output.");
+
+        delete native.waiter.nativeVendorExecution;
+        writeJson(secondPath, native);
+        result = finalizeEvidence(options);
+        assert(result.summary.transitions[1].renderVerdict === "PASS" &&
+            result.summary.transitions[1].actualBackend === "not_exposed" &&
+            result.summary.reporting.status === "INCOMPLETE" &&
+            result.summary.reporting.reasons.includes(
+                "reporting_contract_incomplete"),
+        "Missing native backend evidence did not preserve PASS and fail reporting.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
 Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testPagingResume).then(testDeploymentVerification)
     .then(testOfflineFinalization)
     .then(testReportingSeparation).then(testUnownedViolationRemainsReported)
     .then(testMatchedViolationSurvivesIncompletePeer)
     .then(testAmdParity)
+    .then(testAmdTraceCapabilityOnlyAffectsReporting)
     .then(testRecoveryIsReportedWithoutRewritingFailure)
     .then(testBaselineOnlyInterruptedFinalization)
     .then(testPartialInterruptedFinalization)
     .then(testValidationLeavesEvidenceUntouched)
+    .then(testVariantAndSourceProfileValidation)
+    .then(testActualBackendProjection)
     .then(testUnsafeEvidenceNumberFailsClosed).then(() => {
         process.stdout.write("Render-scale tuning finalizer tests passed.\n");
     }).catch((error) => {

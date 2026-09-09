@@ -77,8 +77,8 @@ shortcut; the 10-second watchdog still runs the measured assay.
 VR FPS Stabilizer exclusively owns every DLSS/upscaling change. Observe its
 per-cell profiles; never apply an upscaling method, quality, preset, render
 scale, or dynamic policy through CSX. Every measured `qualification_wait`
-omits `target`; it requires a post-dispatch profile change and returns the
-coherent observed profile as evidence.
+omits `target`; it neither requires nor forbids a post-dispatch profile change
+and returns the coherent observed profile as evidence.
 
 That ownership includes profile discovery and policy selection. Do not inspect
 graphics adapters, infer a target from AMD/NVIDIA hardware, read or compare

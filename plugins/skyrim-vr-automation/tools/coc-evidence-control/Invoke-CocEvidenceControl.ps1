@@ -146,6 +146,50 @@ function Test-DumpRootWriteAccess([string]$Root) {
     }
 }
 
+function Assert-StatePathWriteAccess([string]$Path) {
+    $directory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        throw "Evidence state directory does not exist: $directory"
+    }
+
+    $probe = Join-Path $directory (
+        '.coc-evidence-state-probe-' + [Guid]::NewGuid().ToString('N')
+    )
+    try {
+        [IO.File]::WriteAllText($probe, 'coc-evidence-state-probe')
+    }
+    finally {
+        if (Test-Path -LiteralPath $probe -PathType Leaf) {
+            [IO.File]::Delete($probe)
+        }
+    }
+}
+
+function Write-OwnedState {
+    param(
+        [Parameter(Mandatory)]$Value,
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$Replace
+    )
+
+    $temporary = "$Path.$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $Value | ConvertTo-Json -Depth 20 |
+            Set-Content -LiteralPath $temporary -Encoding utf8
+        $move = @{
+            LiteralPath = $temporary
+            Destination = $Path
+        }
+        if ($Replace) { $move.Force = $true }
+        Move-Item @move
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            [IO.File]::Delete($temporary)
+        }
+    }
+}
+
 function Get-ExecutableRecord([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
     $item = Get-Item -LiteralPath $Path
@@ -232,24 +276,43 @@ function Read-OwnedState {
     return [pscustomobject]@{ path = $resolved; data = $state }
 }
 
-function Get-OwnedMonitor($State) {
-    $monitor = Get-Process -Id ([int]$State.monitorPid) -ErrorAction SilentlyContinue
-    if (-not $monitor) { return $null }
-    $expectedValue = $State.monitorStartedUtc
-    $expected = if ($expectedValue -is [DateTime]) {
-        $expectedValue.ToUniversalTime()
-    } elseif ($expectedValue -is [DateTimeOffset]) {
-        $expectedValue.UtcDateTime
-    } else {
-        [DateTimeOffset]::Parse(
-            [string]$expectedValue,
-            [Globalization.CultureInfo]::InvariantCulture,
-            [Globalization.DateTimeStyles]::RoundtripKind
-        ).UtcDateTime
+function Get-OwnedProcess($State, [string]$PidProperty, [string]$StartedProperty) {
+    $pidValue = $State.PSObject.Properties[$PidProperty]
+    $startedValue = $State.PSObject.Properties[$StartedProperty]
+    if (-not $pidValue -or -not $startedValue) { return $null }
+    $process = Get-Process -Id ([int]$pidValue.Value) -ErrorAction SilentlyContinue
+    if (-not $process) { return $null }
+    try {
+        $expectedValue = $startedValue.Value
+        $expected = if ($expectedValue -is [DateTime]) {
+            $expectedValue.ToUniversalTime()
+        } elseif ($expectedValue -is [DateTimeOffset]) {
+            $expectedValue.UtcDateTime
+        } else {
+            [DateTimeOffset]::Parse(
+                [string]$expectedValue,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind
+            ).UtcDateTime
+        }
+        $actual = $process.StartTime.ToUniversalTime()
     }
-    $actual = $monitor.StartTime.ToUniversalTime()
+    catch { return $null }
     if ([math]::Abs(($actual - $expected).TotalSeconds) -gt 2) { return $null }
-    return $monitor
+    return $process
+}
+
+function Get-OwnedMonitor($State) {
+    return Get-OwnedProcess $State 'monitorPid' 'monitorStartedUtc'
+}
+
+function Get-OwnedHangCapture($State) {
+    $captureState = $State.PSObject.Properties['captureState']
+    if (-not $captureState -or
+        [string]$captureState.Value -ne 'capture-running') {
+        return $null
+    }
+    return Get-OwnedProcess $State 'capturePid' 'captureStartedUtc'
 }
 
 function Get-TargetProcesses([string]$Name, [int]$ProcessId) {
@@ -322,6 +385,7 @@ try {
         if (Test-Path -LiteralPath $resolvedStatePath) {
             throw "Refusing to overwrite evidence state: $resolvedStatePath"
         }
+        Assert-StatePathWriteAccess $resolvedStatePath
 
         $arguments = @(
             '-accepteula', '-ma', '-e', '-n', '2', '-r', '1', '-a'
@@ -360,6 +424,7 @@ try {
             armedUtc = [DateTime]::UtcNow.ToString('o')
             monitorPid = $monitor.Id
             monitorStartedUtc = $monitor.StartTime.ToUniversalTime().ToString('o')
+            monitorState = 'armed'
             targetName = $TargetName
             targetPid = $TargetPid
             captureDirectory = $captureDirectory
@@ -370,8 +435,24 @@ try {
             triggerPolicy = 'unhandled-exception'
             manualHangCaptureCommand = 'capture-hang'
         }
-        $stateRecord | ConvertTo-Json -Depth 20 |
-            Set-Content -LiteralPath $resolvedStatePath -Encoding utf8
+        try {
+            Write-OwnedState -Value $stateRecord -Path $resolvedStatePath
+        }
+        catch {
+            $publicationError = $_.Exception.Message
+            try {
+                $rollback = Stop-OwnedProcDumpMonitor -Owned (
+                    [pscustomobject]@{ data = $stateRecord }
+                ) -Monitor $monitor
+            }
+            catch {
+                throw "Evidence state publication failed and ProcDump cancellation failed: $publicationError; $($_.Exception.Message)"
+            }
+            if (-not $rollback.stopped) {
+                throw "Evidence state publication failed and ProcDump did not stop: $publicationError"
+            }
+            throw "Evidence state publication failed; the ProcDump monitor was cancelled: $publicationError"
+        }
         $targets = @(Get-TargetProcesses $TargetName $TargetPid)
         $result = [pscustomobject][ordered]@{
             schema = 'csx-coc-evidence-control-v1'
@@ -391,6 +472,7 @@ try {
     elseif ($Command -eq 'status') {
         $owned = Read-OwnedState
         $monitor = Get-OwnedMonitor $owned.data
+        $capture = Get-OwnedHangCapture $owned.data
         $targets = @(Get-TargetProcesses (
             [string]$owned.data.targetName
         ) ([int]$owned.data.targetPid))
@@ -400,11 +482,17 @@ try {
             Sort-Object LastWriteTimeUtc)
         $result = [pscustomobject][ordered]@{
             schema = 'csx-coc-evidence-control-v1'
-            ok = $null -ne $monitor -or $dumps.Count -gt 0
+            ok = $null -ne $monitor -or $null -ne $capture -or
+                $dumps.Count -gt 0
             command = 'status'
             timestampUtc = [DateTime]::UtcNow.ToString('o')
-            state = if (-not $monitor -and $dumps.Count -gt 0) {
+            state = if ($capture) {
+                'capture-running'
+            } elseif (-not $monitor -and $dumps.Count -gt 0) {
                 'capture-complete'
+            } elseif ($owned.data.PSObject.Properties['captureState'] -and
+                [string]$owned.data.captureState -eq 'capture-running') {
+                'capture-exited'
             } elseif (-not $monitor) {
                 'monitor-exited'
             } elseif ($targets.Count -gt 0) {
@@ -413,17 +501,27 @@ try {
                 'armed-waiting'
             }
             checks = @()
-            errors = if ($monitor -or $dumps.Count -gt 0) {
+            errors = if ($monitor -or $capture -or $dumps.Count -gt 0) {
                 @()
+            } elseif ($owned.data.PSObject.Properties['captureState'] -and
+                [string]$owned.data.captureState -eq 'capture-running') {
+                @('The owned ProcDump hang capture is no longer running and produced no dump.')
             } else {
                 @('The owned ProcDump monitor is no longer running.')
             }
             data = [pscustomobject][ordered]@{
                 statePath = $owned.path
                 monitorPid = [int]$owned.data.monitorPid
+                capturePid = if ($owned.data.PSObject.Properties['capturePid']) {
+                    [int]$owned.data.capturePid
+                } else { $null }
                 targetPids = @($targets | ForEach-Object Id)
                 captureDirectory = [string]$owned.data.captureDirectory
                 coverageActive = $null -ne $monitor
+                captureActive = $null -ne $capture
+                activeProcessKind = if ($capture) {
+                    'hang-capture'
+                } elseif ($monitor) { 'crash-monitor' } else { $null }
                 triggerPolicy = if ($owned.data.PSObject.Properties['triggerPolicy']) {
                     [string]$owned.data.triggerPolicy
                 } else {
@@ -477,6 +575,35 @@ try {
             $null = $startInfo.ArgumentList.Add($argument)
         }
         $capture = [Diagnostics.Process]::Start($startInfo)
+        if (-not $capture) { throw 'ProcDump hang capture did not start.' }
+        $owned.data | Add-Member -NotePropertyName monitorState `
+            -NotePropertyValue 'stopped-for-hang-capture' -Force
+        $owned.data | Add-Member -NotePropertyName capturePid `
+            -NotePropertyValue $capture.Id -Force
+        $owned.data | Add-Member -NotePropertyName captureStartedUtc `
+            -NotePropertyValue $capture.StartTime.ToUniversalTime().ToString('o') -Force
+        $owned.data | Add-Member -NotePropertyName captureState `
+            -NotePropertyValue 'capture-running' -Force
+        $owned.data | Add-Member -NotePropertyName captureDumpPath `
+            -NotePropertyValue $dumpPath -Force
+        $owned.data | Add-Member -NotePropertyName captureTrigger `
+            -NotePropertyValue 'operator-confirmed-hang' -Force
+        try {
+            Write-OwnedState -Value $owned.data -Path $owned.path -Replace
+        }
+        catch {
+            $publicationError = $_.Exception.Message
+            try {
+                $rollback = Stop-OwnedProcDumpMonitor -Owned $owned -Monitor $capture
+            }
+            catch {
+                throw "Hang-capture state publication failed and ProcDump cancellation failed: $publicationError; $($_.Exception.Message)"
+            }
+            if (-not $rollback.stopped) {
+                throw "Hang-capture state publication failed and ProcDump did not stop: $publicationError"
+            }
+            throw "Hang-capture state publication failed; ProcDump was cancelled: $publicationError"
+        }
         $completed = $capture.WaitForExit($CaptureTimeoutSeconds * 1000)
         if (-not $completed) {
             $result = [pscustomobject][ordered]@{
@@ -519,6 +646,11 @@ try {
             }
             $captureReceipt | ConvertTo-Json -Depth 10 |
                 Set-Content -LiteralPath $receiptPath -Encoding utf8
+            $owned.data | Add-Member -NotePropertyName captureState `
+                -NotePropertyValue 'capture-complete' -Force
+            $owned.data | Add-Member -NotePropertyName captureCompletedUtc `
+                -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
+            Write-OwnedState -Value $owned.data -Path $owned.path -Replace
             $result = [pscustomobject][ordered]@{
                 schema = 'csx-coc-evidence-control-v1'
                 ok = $true
@@ -541,8 +673,11 @@ try {
     else {
         $owned = Read-OwnedState
         $monitor = Get-OwnedMonitor $owned.data
-        if (-not $monitor) {
-            throw 'The state does not identify a live owned ProcDump monitor.'
+        $capture = Get-OwnedHangCapture $owned.data
+        $ownedProcess = if ($capture) { $capture } else { $monitor }
+        $processKind = if ($capture) { 'hang-capture' } else { 'crash-monitor' }
+        if (-not $ownedProcess) {
+            throw 'The state does not identify a live owned ProcDump process.'
         }
         $recentDump = @(Get-ChildItem -LiteralPath (
             [string]$owned.data.captureDirectory
@@ -554,8 +689,15 @@ try {
             throw 'A dump was written recently; wait before stopping ProcDump.'
         }
 
-        $cancel = Stop-OwnedProcDumpMonitor -Owned $owned -Monitor $monitor
+        $cancel = Stop-OwnedProcDumpMonitor -Owned $owned -Monitor $ownedProcess
         $stopped = $cancel.stopped
+        if ($stopped -and $capture) {
+            $owned.data | Add-Member -NotePropertyName captureState `
+                -NotePropertyValue 'capture-stopped' -Force
+            $owned.data | Add-Member -NotePropertyName captureStoppedUtc `
+                -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
+            Write-OwnedState -Value $owned.data -Path $owned.path -Replace
+        }
         $result = [pscustomobject][ordered]@{
             schema = 'csx-coc-evidence-control-v1'
             ok = $stopped
@@ -571,6 +713,8 @@ try {
             data = [pscustomobject][ordered]@{
                 statePath = $owned.path
                 monitorPid = [int]$owned.data.monitorPid
+                processKind = $processKind
+                processPid = $ownedProcess.Id
                 target = $cancel.target
                 captureDirectory = [string]$owned.data.captureDirectory
             }

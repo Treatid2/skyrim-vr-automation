@@ -41,6 +41,7 @@ foreach ($required in @(
     '../../tools/render-scale-qualification/protocol.v1.json',
     'one positioning COC to `WhiterunDragonsreach`',
     '25 exact render-scale `apply` mutations',
+    'lifecycle, pacing, or result grouping',
     'Setup must not change upscaling'
 )) {
     if (-not $skill.Contains($required, [StringComparison]::Ordinal)) {
@@ -67,11 +68,18 @@ foreach ($required in @(
     '`actualDispatchBackend`',
     '`fsr_host`, `fsr_runtime`, or',
     'AMD hardware',
+    'pacing, DLSS-trace',
+    '`n/a (unsupported)` for every per-DLSS trace field',
+    'does not make the run incomplete',
+    'transitions, statuses, and stabilization aggregates remain mandatory',
+    'require zero DLSS trace dispatch records',
     'There must be exactly 25 begin, dispatch, apply, waiter, and status',
     'Immediately after transition 25',
     'final scene to remain `WhiterunDragonsreach`',
     'CPU, GPU, lifetime, presentation',
     'resource-publication, preparation-stage',
+    'Record `n/a` for methods absent from the',
+    'present-method and complete-assay values are mandatory',
     'Stop there'
 )) {
     if (-not $protocol.Contains($required, [StringComparison]::Ordinal)) {

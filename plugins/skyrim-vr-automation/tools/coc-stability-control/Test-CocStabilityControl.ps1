@@ -157,6 +157,33 @@ if (-not $analysis.available -or $analysis.transitions.Count -ne 20 -or
     throw 'Strict milestone analysis did not retain the required timing and failure evidence.'
 }
 
+$missingLabelAnalysis = Get-CocQualificationAnalysis -Scenario (
+    [pscustomobject]@{
+        results = @([pscustomobject]@{
+                label = 'unrelated-record'
+                result = [pscustomobject]@{}
+            })
+    }
+) -ProtocolConfig $config
+if (-not $missingLabelAnalysis.available -or
+    $missingLabelAnalysis.transitions.Count -ne 20 -or
+    @($missingLabelAnalysis.transitions | Where-Object receiptPresent).Count -ne 0) {
+    throw 'Missing scenario labels did not remain absent receipt evidence.'
+}
+
+$moduleScript = Get-Content -LiteralPath $modulePath -Raw
+foreach ($required in @(
+    "Get-CocPropertyValue -Value `$scene -Name 'cell'",
+    "Get-CocPropertyValue -Value `$cell -Name 'editorId'",
+    "Get-CocPropertyValue -Value `$state -Name 'playerLoaded'",
+    'ConvertTo-CocBoolean',
+    'if ($matches.Count -eq 0) { return $null }'
+)) {
+    if (-not $moduleScript.Contains($required, [StringComparison]::Ordinal)) {
+        throw "COC stability module is missing safe optional-field handling: $required"
+    }
+}
+
 $script = Get-Content -LiteralPath $scriptPath -Raw
 foreach ($required in @(
     '[Diagnostics.Stopwatch]::GetTimestamp()',
@@ -173,10 +200,42 @@ foreach ($required in @(
     }
 }
 
+$rejectedFixture = Join-Path ([IO.Path]::GetTempPath()) (
+    'coc-stability-rejected-' + [Guid]::NewGuid().ToString('N')
+)
+try {
+    New-Item -ItemType Directory -Path $rejectedFixture | Out-Null
+    $rejectedStatePath = Join-Path $rejectedFixture 'state.json'
+    [pscustomobject][ordered]@{
+        schema = 'csx-coc-stability-state-v1'
+        outcome = 'scenario-rejected'
+        endpoint = 'http://127.0.0.1:1/mcp'
+        ownerId = 'rejected-owner'
+        protocolConfigPath = $configPath
+        scenarioRunId = $null
+        dispatchFailure = [pscustomobject]@{ error = 'fixture dispatch rejection' }
+    } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $rejectedStatePath -Encoding utf8
+    $rejectedStatus = & $scriptPath status -StatePath $rejectedStatePath `
+        -Compact -NoExit | ConvertFrom-Json -Depth 30
+    if ($rejectedStatus.ok -or $rejectedStatus.state -ne 'failed' -or
+        $null -ne $rejectedStatus.data.scenarioRunId -or
+        $rejectedStatus.errors[0] -ne 'fixture dispatch rejection' -or
+        $rejectedStatus.data.dispatchFailure.error -ne 'fixture dispatch rejection') {
+        throw 'Rejected scenario status did not preserve the terminal dispatch failure.'
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $rejectedFixture) {
+        Remove-Item -LiteralPath $rejectedFixture -Recurse -Force
+    }
+}
+
 [pscustomobject][ordered]@{
     ok = $true
     exactTransitions = 20
     atomicPerformanceOrigin = $true
     monotonicIndependentWatchdog = $true
     exactlyOnceDispatchClaim = $true
+    missingBaselineFieldsRemainAnomalies = $true
+    missingScenarioLabelsRemainAbsent = $true
 } | ConvertTo-Json

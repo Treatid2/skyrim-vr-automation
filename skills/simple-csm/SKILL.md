@@ -18,7 +18,7 @@ Before the first live call, read these files completely in order:
 The Simple COC authorization, fixture, fidelity, telemetry, failure, cleanup,
 and CSV contracts apply except where the Simple CSM override explicitly
 replaces the initial cell, measured mutation, transition count, trace
-lifecycle, or result grouping.
+lifecycle, pacing, or result grouping.
 
 The trigger authorizes one positioning COC to `WhiterunDragonsreach` and only
 the 25 exact render-scale `apply` mutations in the selected canonical menu

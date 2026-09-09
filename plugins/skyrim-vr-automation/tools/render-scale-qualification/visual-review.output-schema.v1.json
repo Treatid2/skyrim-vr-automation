@@ -56,6 +56,35 @@
       "type": "array",
       "minItems": 3,
       "maxItems": 3,
+      "allOf": [
+        {
+          "contains": {
+            "type": "object",
+            "required": ["ordinal"],
+            "properties": { "ordinal": { "const": 1 } }
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "type": "object",
+            "required": ["ordinal"],
+            "properties": { "ordinal": { "const": 8 } }
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "type": "object",
+            "required": ["ordinal"],
+            "properties": { "ordinal": { "const": 16 } }
+          },
+          "minContains": 1,
+          "maxContains": 1
+        }
+      ],
       "items": {
         "type": "object",
         "additionalProperties": false,
