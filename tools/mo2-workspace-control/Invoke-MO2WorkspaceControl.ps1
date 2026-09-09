@@ -955,7 +955,6 @@ function Move-OverwriteShaderCachesToStableMod($Config, [string]$SourceName, [st
         $blockingProcessNames = @(
             @($Config.mo2.processNames)
             @($Config.mo2.gameProcessNames)
-            @($Config.mo2.runtimeProcessNames)
         ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique
         if ($blockingProcessNames.Count -eq 0) { $blockingProcessNames = @('ModOrganizer', 'SkyrimVR', 'sksevr_loader') }
         $registration = & $profileTool register -ProfilePath $modListPath -ModName $modName -ModDirectory $modDirectory -Placement End -RegisterEnabled -EvidenceDirectory $profileEvidence -BlockingProcessNames $blockingProcessNames -Confirm:$false | ConvertFrom-Json
