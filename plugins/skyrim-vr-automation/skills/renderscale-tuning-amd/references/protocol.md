@@ -301,7 +301,7 @@ completed bundle.
 This per-transition evidence requirement does not duplicate `prepare_tuning` or
 the positioning scenario. Materialize their stored exact receipts once under
 `raw/startup` during finalization. Missing startup evidence is explicitly
-`startup_evidence_incomplete`, forbids a ledger append, and never replays the
+`startup_evidence_incomplete`, labels unavailable ledger metrics, and never replays the
 startup calls or changes completed row classifications.
 
 A semantic strict timeout, unsatisfied milestone, or native-stability timeout
@@ -623,7 +623,8 @@ transition. It writes `summary.json`, `transitions.csv`,
 `evidence-values.csv`, `report.md`, and `receipt-index.json` atomically only
 after validation. Do not hash or render per
 row. An evidence root containing only `summary.json` and `transitions.csv` is
-incomplete and cannot support a ledger append. Append one uniquely headed
+incomplete; it can still support a clearly labeled partial comparison using
+the measurements actually retained. Append one uniquely headed
 result column per completed two-pass lane.
 
 If the live runner stops at baseline before any measured row, retain
@@ -670,8 +671,8 @@ Compute a ratio only when the pass 1 delta is positive; otherwise report
   no positive pass 2 increase in DXGI usage, live texture count, or live
   texture bytes.
 - Every other complete comparison is `inconclusive`. A missing repeat is
-  `repeat_not_completed`, makes the assay `INTERRUPTED`, and forbids a ledger
-  append.
+  `repeat_not_completed` and makes the assay `INTERRUPTED`. Preserve the
+  available pass in the comparison with unavailable repeat metrics marked `n/a`.
 
 Always emit the memory table and `memoryConfirmation` object, including for an
 interrupted pass. When pass 2 never ran, set `passesCompleted` to the actual
@@ -688,7 +689,7 @@ render verdict separately. Memory growth alone never changes a transition's
 
 Treat each comparison-ledger column append as one transaction. Use exactly
 `docs/development/vr-render-scale-comparison-ledger.csv`; never search for a
-ledger. Read and parse it once after both passes for the comparison finish,
+ledger. Read and parse it once after measurement completes or stops,
 retain its original hash, and compose the
 complete candidate before any ledger write. Reject the candidate unless it has
 the same ordered metric rows and row count, exactly one additional rightmost
@@ -794,3 +795,20 @@ while retaining the exact classifications of completed rows; do not convert it
 to overall `FAIL` merely because later rows were not run. Do not append a
 ledger column for an interrupted lane. Print the complete tables and evidence
 paths, then stop; do not start another protocol.
+
+### Retention and partial comparisons
+
+Retain measurements as they arrive. After positioning, the runner writes each
+scenario envelope and row revision into a new numbered JSON file under the
+run's `raw/journal` directory before the next operation. This is a data save,
+not another rendering admission gate. The first trace page and all continuation
+pages are retained before any reset. Repeated keys create new files; they do
+not overwrite earlier evidence. Startup envelopes and the final live result
+use the same journal. An existing run directory is never reused for a new run.
+
+Offline finalization materializes the latest revision for each key from the
+journal, preserving every original revision. It does not depend on turn-local
+`store()` surviving. Partial runs remain valid comparison inputs. Report the
+measurements that exist, label incomplete execution/evidence and unavailable
+metrics, and preserve prior ledger cells. Missing evidence is not a reason to
+discard available timings or memory samples or to deny a partial comparison.

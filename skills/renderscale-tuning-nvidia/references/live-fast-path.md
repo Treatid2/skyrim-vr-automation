@@ -32,9 +32,14 @@ optional owned DLSS trace stop/read. Transition 1 alone sets
 terminal waiter's authoritative stable profile and state revision plus the
 matrix destination. Store the exact terminal waiter immediately; for a traced
 row, retain its reset, start, stop, and bounded raw-read subreceipts in the same
-stored row record. Emit only a compact projection. Do not pause for model
-reasoning, read files, write evidence, hash, or issue a confirmation read
-between rows.
+stored row record. The first trace read uses the producer default bound.
+The runner drains every `moreAvailable` continuation into `traceReadPages`
+before any later transition or trace reset; these reads add no dwell time or
+profile mutation. Reject foreign, discontinuous, or incomplete windows before
+continuing. Emit only a compact projection. Do not pause for model
+reasoning, read unrelated files, hash, or issue a confirmation read between
+rows. The runner's append-only receipt write is the required exception: save
+each received envelope and revision before starting the next operation.
 
 Continue directly after a semantic baseline or row failure when the terminal
 receipt proves the owner closed, zero active operation, matching PID/Build ID,

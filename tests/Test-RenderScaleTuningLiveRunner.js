@@ -93,7 +93,7 @@ function wrappedProfile(target) {
 }
 
 function createMock(semanticFailureOrdinal, receiptTransform = null,
-    scenarioTransform = null) {
+    scenarioTransform = null, traceRecordCount = 2) {
     let revision = 1;
     let stressSession = 0;
     let stressActive = false;
@@ -115,6 +115,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
             active: traceActive,
             sessionID: traceSession,
             totalRecords: traceRecords.length,
+            droppedRecords: 0, overwrittenRecords: 0,
             setConstantsCalls: traceRecords.length > 0 ? 1 : 0,
             evaluateCalls: traceRecords.length > 0 ? 1 : 0,
         };
@@ -138,30 +139,38 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
         if (args.action === "cpu_performance_stop") cpuActive = false;
         if (args.action === "gpu_performance_stop") gpuActive = false;
         if (args.action === "dlss_trace_status") {
-            return { action: args.action, capture: traceSummary() };
+            return { action: args.action, producer: { buildId }, capture: traceSummary() };
         }
         if (args.action === "dlss_trace_reset") {
             traceSession += 1;
             traceActive = false;
             traceRecords = [];
-            return { action: args.action, capture: traceSummary() };
+            return { action: args.action, producer: { buildId }, capture: traceSummary() };
         }
         if (args.action === "dlss_trace_start") {
             traceActive = true;
-            return { action: args.action, capture: traceSummary() };
+            return { action: args.action, producer: { buildId }, capture: traceSummary() };
         }
         if (args.action === "dlss_trace_stop") {
             traceActive = false;
-            return { action: args.action, capture: traceSummary() };
+            return { action: args.action, producer: { buildId }, capture: traceSummary() };
         }
         if (args.action === "dlss_trace_read") {
             return {
                 action: args.action,
+                producer: { buildId },
                 capture: {
                     summary: traceSummary(),
-                    records: traceRecords,
+                    records: traceRecords.slice(args.afterSequence,
+                        args.afterSequence + (args.limit || 32)),
                     afterSequence: args.afterSequence,
-                    limit: args.limit,
+                    limit: args.limit || 32,
+                    availableFromSequence: 1,
+                    lastReturnedSequence: Math.min(traceRecords.length,
+                        args.afterSequence + (args.limit || 32)),
+                    latestSequence: traceRecords.length,
+                    moreAvailable: args.afterSequence + (args.limit || 32) < traceRecords.length,
+                    requestedSequenceOverwritten: false,
                 },
             };
         }
@@ -251,16 +260,17 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
                 displayWidth: 200,
                 displayHeight: 200,
                 compositorCycleToken: 22,
-                backend: vendorTarget ? target.method : "none",
+                backend: vendorTarget ? (target.method === "fsr" ? "fsr_host" : "dlss") : "none",
                 sharedVendorDispatchRequired: vendorTarget,
                 vendorDispatchProven: vendorTarget,
                 leftEye: {
+                    valid: true,
                     frame: 14,
                     qpcTick: 14,
                     compositorCycleToken: 22,
                     transitionEpoch: 9,
                     method: target.method,
-                    backend: vendorTarget ? target.method : "none",
+                    backend: vendorTarget ? (target.method === "fsr" ? "fsr_host" : "dlss") : "none",
                     generation: vendorTarget ? 9 : 0,
                     deviceIdentity: 100,
                     resourceRevision: 41,
@@ -273,12 +283,13 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
                     vendorRuntimeFallback: false,
                 },
                 rightEye: {
+                    valid: true,
                     frame: 14,
                     qpcTick: 14,
                     compositorCycleToken: 22,
                     transitionEpoch: 9,
                     method: target.method,
-                    backend: vendorTarget ? target.method : "none",
+                    backend: vendorTarget ? (target.method === "fsr" ? "fsr_host" : "dlss") : "none",
                     generation: vendorTarget ? 9 : 0,
                     deviceIdentity: 100,
                     resourceRevision: 41,
@@ -294,15 +305,15 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
             const semanticFailure = !recovery && semanticFailureOrdinal > 0 &&
                 ((transitionOrdinal - 1) % 33) + 1 === semanticFailureOrdinal;
             if (traceActive && target.method === "dlss") {
-                traceRecords = [
-                    { sequence: 1, eye: "left", qualityMode: profile.qualityMode },
-                    { sequence: 2, eye: "right", qualityMode: profile.qualityMode },
-                ];
+                traceRecords = Array.from({ length: traceRecordCount }, (_, index) =>
+                    ({ sequence: index + 1, eye: index % 2 ? "right" : "left",
+                        qualityMode: profile.qualityMode }));
             }
             return {
                 label: step.label,
                 result: {
                     schemaRevision: 14,
+                    producer: { buildId },
                     action: "qualification_wait",
                     status: semanticFailure ? undefined : { adapter: { available: true,
                         vendorId: waitStep.args.ownerId.includes("-amd-") ?
@@ -457,6 +468,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
 
     return {
         context: {
+            receiptJournal: { write: async () => {} },
             tools: {
                 mcp__devbench_vr__scenario: scenario,
                 mcp__devbench_vr__communityshaders_renderscale: async () =>
@@ -579,7 +591,8 @@ async function testNvidia() {
         positioningRoot: positioningRoot(),
         matrix,
     });
-    assert(result.ok === true && result.status === "COMPLETE", "NVIDIA mock run did not complete.");
+    assert(result.ok === true && result.status === "COMPLETE",
+        `NVIDIA mock run did not complete: ${result.lanes[0].passes[0].error}`);
     assertQualificationTimeouts(mock.scenarioCalls, matrix, "NVIDIA");
     assertProviderTargetSeparation(mock.scenarioCalls, "NVIDIA");
     assertFoveationTargetScope(mock.scenarioCalls, "NVIDIA");
@@ -637,7 +650,7 @@ async function testNvidia() {
         const tail = call.steps.slice(-2);
         assert(tail[0].label === "dlss-trace-stop" &&
             tail[1].label === "dlss-trace-read" &&
-            tail[1].args.limit === matrix.traceReadLimit,
+            tail[1].args.limit === undefined,
         "NVIDIA trace stop/read ordering or bound is wrong.");
     }
     for (const [, retained] of retainedTraceRows) {
@@ -702,7 +715,7 @@ async function testAmd() {
     const capabilityRead = capabilityResults.get("amd-dlss-trace-read");
     assert(capabilityRead.action === "dlss_trace_read" &&
         capabilityRead.capture.records.length === 0 &&
-        capabilityRead.capture.limit === matrix.traceReadLimit,
+        capabilityRead.capture.limit === 32,
         "AMD capability trace raw window is not empty.");
     const amdTransitionTrace = mock.scenarioCalls.some((call) =>
         call.steps.some((step) => step.label === "dlss-trace-start"));
@@ -2114,7 +2127,158 @@ async function testEvidenceVerdicts() {
     "A partial eye observation was treated as submitted mixed stereo.");
 }
 
+function nativeReuseReceipt(receipt, context) {
+    if (context.baseline || receipt.upscalingSnapshot.profiles.stable.renderScaleMode) {
+        return receipt;
+    }
+    const timeline = receipt.replacementTimeline;
+    timeline.mutationExpectation = "not_required";
+    timeline.mutationExpectationReason = "native_contract_reuse";
+    receipt.presentationCycleAudit.firstExactNewGenerationCycles = 0;
+    delete timeline.firstPhysicalMutation;
+    delete timeline.firstPostMutation;
+    delete timeline.firstNewGenerationProven;
+    const proof = timeline.terminal.presentationProof;
+    delete proof.sharedVendorDispatchRequired;
+    proof.contractGeneration = 0;
+    proof.providerRuntimeGeneration = 0;
+    for (const eye of [proof.leftEye, proof.rightEye]) {
+        eye.generation = 0;
+        eye.vendorDispatchSerial = 0;
+    }
+    timeline.mutationNotRequiredTerminalProof = {
+        ...timeline.terminal,
+        stressSessionId: receipt.baseline.stressSessionId,
+        qualificationTransitionId: receipt.transitionId,
+        ownershipToken: receipt.presentationCycleAudit.ownerToken,
+        replacementRequestId: proof.requestId,
+        replacementTransitionEpoch: proof.transitionEpoch,
+        replacementContractGeneration: 0,
+        replacementDeviceIdentity: proof.deviceIdentity,
+    };
+    return receipt;
+}
+
+async function testNativeReusePassability() {
+    const valid = await runNvidiaProjectionTransform(nativeReuseReceipt);
+    assert(valid.length === 66 && valid.every(row => row.renderVerdict === "PASS" &&
+        row.task2Verdict === "PASS" && row.missingEvidence.length === 0),
+    `A complete producer-shaped two-pass run cannot pass: ${JSON.stringify(valid.filter(row =>
+        row.task2Verdict !== "PASS").map(row => ({ ordinal: row.ordinal,
+            missing: row.missingEvidence, invalid: row.producerInvalidEvidence })))}`);
+    const cycleFacets = await runNvidiaProjectionTransform((receipt, context) => {
+        if (!context.baseline) {
+            const proof = receipt.replacementTimeline.firstNewGenerationProven.presentationProof;
+            delete proof.leftEye.valid;
+            delete proof.rightEye.valid;
+            proof.leftEye.qpcTick = proof.qpcTick - 1;
+        }
+        return receipt;
+    });
+    assert(cycleFacets.every(row => row.task2Verdict === "PASS"),
+        "Cycle proof wrongly requires snapshot-only validity or identical eye timestamps.");
+    for (const corrupt of [
+        (facet) => { facet.ownershipToken += 1; },
+        (facet) => { facet.presentationProof.rightEye.frame -= 1; },
+        (facet) => { facet.presentationProof.rightEye.qpcTick += 1; },
+        (facet) => { facet.presentationProof.rightEye.backend = "wrong_provider"; },
+        (facet) => { facet.presentationProof.rightEye.deviceIdentity += 1; },
+        (facet) => { facet.presentationProof.rightEye.valid = false; },
+        (facet) => { delete facet.presentationProof.rightEye; },
+        (facet) => { delete facet.presentationProof.vendorDispatchProven; },
+    ]) {
+        const rows = await runNvidiaProjectionTransform((receipt, context) => {
+            nativeReuseReceipt(receipt, context);
+            const facet = receipt.replacementTimeline.mutationNotRequiredTerminalProof;
+            if (facet) corrupt(facet);
+            return receipt;
+        });
+        assert(rows.filter(row => !row.target.renderScaleMode).every(row =>
+            row.task2Verdict === "INCONCLUSIVE" &&
+            row.missingEvidence.includes("mutation_not_required_terminal_proof")),
+        "Incomplete or mismatched native proof was accepted.");
+    }
+    const staleVendor = await runNvidiaProjectionTransform((receipt, context) => {
+        nativeReuseReceipt(receipt, context);
+        const proof = receipt.replacementTimeline.mutationNotRequiredTerminalProof?.presentationProof;
+        if (proof?.kind === "exact_vendor_evaluation") proof.rightEye.vendorDispatchFrame -= 1;
+        return receipt;
+    });
+    assert(staleVendor.filter(row => !row.target.renderScaleMode &&
+        ["dlss", "fsr"].includes(row.target.method)).every(row =>
+        row.task2Verdict === "INCONCLUSIVE"), "Stale native vendor execution was accepted.");
+}
+
+async function testPerRowTracePagination() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(repositoryRoot,
+        "skills/renderscale-tuning-nvidia/references/matrix.v1.json")));
+    for (const corrupt of [false, true]) {
+        const mock = createMock(0, null, (root, args) => {
+            if (corrupt && args.steps[0].label === "dlss-trace-page-2") {
+                root.results[0].result.capture.records[0].sequence -= 1;
+            }
+            return root;
+        }, 70);
+        const result = await runRenderScaleTuningLive({ ...mock.context,
+            variant: "nvidia", runId: "trace-pages", buildId,
+            positioningRoot: positioningRoot(), matrix });
+        const retained = [...mock.stores.values()].filter(value => value.traceRead);
+        if (!corrupt) {
+            assert(result.status === "COMPLETE" && retained.length === 24,
+                "Paged traces did not complete both measured passes.");
+            assert(retained.every(value => value.traceReadPages.length === 3 &&
+                value.traceEvidence.complete && value.traceEvidence.records === 70),
+            "A trace was reset before all pages were retained.");
+        } else {
+            assert(result.status === "INTERRUPTED" && retained.length === 1 &&
+                retained[0].traceReadPages.length === 2,
+            "A malformed page was not preserved before stopping later mutations.");
+        }
+    }
+}
+
+async function testDurableReceiptOrdering() {
+    const mock = createMock(0, null, null, 70);
+    const journal = [];
+    let writing = false;
+    const scenario = mock.context.tools.mcp__devbench_vr__scenario;
+    mock.context.tools.mcp__devbench_vr__scenario = async args => {
+        assert(!writing, "A new operation began before its preceding receipt was saved.");
+        return scenario(args);
+    };
+    mock.context.receiptJournal = {
+        root: "offline-fixture",
+        write: async (key, value) => {
+            writing = true;
+            const snapshot = JSON.stringify(value);
+            await Promise.resolve();
+            journal.push({ key, snapshot });
+            writing = false;
+        },
+    };
+    const matrix = JSON.parse(fs.readFileSync(path.join(repositoryRoot,
+        "skills/renderscale-tuning-nvidia/references/matrix.v1.json")));
+    const result = await runRenderScaleTuningLive({ ...mock.context,
+        variant: "nvidia", runId: "durable-receipts", buildId,
+        positioningRoot: positioningRoot(), matrix,
+        startupReceipts: { prepare: envelope({ ready: true }),
+            positioning: envelope(positioningRoot()) } });
+    assert(result.status === "COMPLETE" && result.evidenceRoot === "offline-fixture",
+        "The completed run did not return its durable evidence location.");
+    assert(journal[0].key.endsWith(":startup-prepare") &&
+        journal[1].key.endsWith(":startup-positioning") &&
+        journal[journal.length - 1].key.endsWith(":live-result"),
+    "Startup or completed-run evidence was not saved.");
+    const revisions = journal.filter(entry =>
+        entry.key === "durable-receipts:nvidia:pass-1:transition-3");
+    assert(revisions.length > 2 && !JSON.parse(revisions[0].snapshot).traceReadPages &&
+        JSON.parse(revisions[revisions.length - 1].snapshot).traceReadPages.length === 3,
+    "A later trace update overwrote the earlier received evidence.");
+}
+
 Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
+    testNativeReusePassability(), testPerRowTracePagination(),
+    testDurableReceiptOrdering(),
     testAmdExposedTraceFailureStops(),
     testAdmissionRejectsMalformedInputs(), testEvidenceVerdicts(),
     testMeasuredVendorMismatchStops(),

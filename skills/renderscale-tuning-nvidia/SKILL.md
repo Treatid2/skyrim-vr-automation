@@ -23,7 +23,7 @@ Scenario first or issue either as a standalone tool.
 Store the exact envelopes under run-unique `startup-prepare` and
 `startup-positioning` keys, but control from the local responses. Do not call
 `load()`, compare object identity, stringify, or create evidence during startup;
-finalization materializes both stored responses.
+the post-positioning runner journals both stored responses before measurement.
 
 Decode each envelope once from `content[0].type: "text"` with `JSON.parse` of
 `content[0].text`. Admit `prepare_tuning` only from these exact paths: top-level
@@ -82,7 +82,9 @@ parsed matrix, a short run-unique ID, and the cell's `tools`, `store`, and
 `notify` functions. Do not extract, normalize, or validate positioning fields
 in the client; the runner exclusively owns positioning admission.
 Use this loader shape, substituting only the current plugin root and the local
-positioning/build variables:
+positioning/build variables. Reuse the run ID assigned to startup receipts;
+`prepareEnvelope` and `positioningEnvelope` below are the exact local startup
+responses:
 
 ```javascript
 const support = await Promise.all([
@@ -90,11 +92,19 @@ const support = await Promise.all([
   tools.exec_command({cmd:"Get-Content -Raw -LiteralPath 'skills\\renderscale-tuning-nvidia\\references\\matrix.v1.json'",workdir:"<plugin-root>",shell:"powershell",login:false})
 ]);
 const runLive = new Function(`${support[0].output}\nreturn runRenderScaleTuningLive;`)();
-const liveResult = await runLive({tools,store,notify,variant:"nvidia",runId:`nvidia-${Date.now().toString(36)}`,buildId,positioningRoot,matrix:JSON.parse(support[1].output)});
-text(JSON.stringify(liveResult));
+const liveResult = await runLive({tools,store,notify,variant:"nvidia",runId,buildId,positioningRoot,startupReceipts:{prepare:prepareEnvelope,positioning:positioningEnvelope},matrix:JSON.parse(support[1].output)});
+text({status:liveResult.status,evidenceRoot:liveResult.evidenceRoot});
 ```
 
-The runner is the executable live contract. Each strict waiter owns a 20-second
+The runner is the executable live contract. After positioning, it creates
+a new run directory under the current workspace's `artifacts/renderscale-tuning`.
+Every received scenario and every row revision is appended to `raw/journal`
+before the next operation; older revisions and run directories are never
+overwritten. Do not pass a custom `receiptJournal` in a live run (that injection
+exists only for offline tests). Print only the final status and evidence path;
+the complete live result is already journaled. Partial runs remain useful for
+comparison: report missing metrics explicitly instead of discarding evidence.
+ Each strict waiter owns a 20-second
 terminal budget. An unsatisfied terminal receipt records a compact non-stable
 note, including its presentation disposition and eye paths. A safely closed
 failure advances directly. A stuck operation or physical mutation gets one

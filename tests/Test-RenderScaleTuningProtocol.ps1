@@ -68,10 +68,7 @@ Assert-True ((Get-FileHash -LiteralPath $finalizerSource -Algorithm SHA256).Hash
     (Get-FileHash -LiteralPath $finalizerPlugin -Algorithm SHA256).Hash) 'Shared tuning finalizer source/package parity failed.'
 $finalizer = Get-Content -LiteralPath $finalizerSource -Raw
 foreach ($token in @(
-    'async function collectTracePages', 'afterSequence', 'moreAvailable',
-    'requestedSequenceOverwritten', 'trace_sequence_gap',
-    'trace_sequence_duplicate', 'trace_session_changed',
-    'trace_build_changed', 'function finalizeEvidence',
+    'function finalizeEvidence',
     'missing_required_mutation_boundary', 'phaseCountersAuthoritative',
     'assayExecution', 'task2Evidence', 'reportingStatus',
     'function evidenceValues', 'evidence-values.csv',
@@ -88,6 +85,9 @@ foreach ($token in @(
 }
 foreach ($token in @(
     'async function runRenderScaleTuningLive',
+    'async function collectTracePages', 'validateRetainedTrace',
+    'traceReadPages', 'trace_pages_incomplete', 'trace_sequence_gap',
+    'trace_sequence_duplicate', 'trace_session_changed',
     'mcp__devbench_vr__scenario',
     'mcp__devbench_vr__communityshaders_renderscale',
     'positioningRoot', 'positioningInputs', 'capabilities',
@@ -138,7 +138,7 @@ foreach ($token in @(
     'without another model handoff',
     'run-unique startup keys', '`raw/startup`',
     '`startup_evidence_incomplete`',
-    'forbid the comparison-ledger append',
+    'label unavailable comparison metrics',
     'Every later mutation and ownership scenario remains synchronous',
     'terminal baseline waiter receipt', '`milestoneTimings`',
     '`replacementTimeline`', 'Fast measured-loop contract',
@@ -152,7 +152,7 @@ foreach ($token in @(
     'complete measured pass in that one live orchestration cell',
     '`notify()`', '`yield_control()`',
     'sole server-owned `wait` of exactly 5,000 ms',
-    "preceding terminal waiter's", 'At pass finalization', '`load()`',
+    "preceding terminal waiter's", 'journal every received terminal response',
     'one cumulative evidence-read batch', 'generate the receipt index',
     '`continueOnError: true`', 'validate each labeled result independently',
     'unsupported optional operation', 'must not suppress',
@@ -314,7 +314,7 @@ foreach ($variant in $variants) {
     Assert-Contains $skill '`load()`, compare object identity' $variant.Name
     Assert-Contains $skill 'never correct, restart, or replay' $variant.Name
     Assert-True (-not $skill.Contains('verify both keys with `load()`', [StringComparison]::Ordinal)) "$($variant.Name) still gates startup on stored-object verification."
-    Assert-Contains $skill 'finalization materializes both stored responses' $variant.Name
+    Assert-Contains $skill 'runner journals both stored responses before measurement' $variant.Name
     Assert-Contains $skill '`content[0].type: "text"`' $variant.Name
     Assert-Contains $skill '`JSON.parse`' $variant.Name
     Assert-Contains $skill '`content[0].text`' $variant.Name
@@ -511,7 +511,7 @@ foreach ($variant in $variants) {
     Assert-True ($matrix.protocol -eq $variant.Name) "$($variant.Name) matrix identity is wrong."
     Assert-True ($matrix.pacingMilliseconds -eq 5000) "$($variant.Name) pacing is wrong."
     Assert-True ($matrix.completionTimeoutMilliseconds -eq 20000) "$($variant.Name) timeout is wrong."
-    Assert-True ([int]$matrix.traceReadLimit -gt 0) "$($variant.Name) trace read limit is invalid."
+    Assert-True ($null -eq $matrix.PSObject.Properties['traceReadLimit']) "$($variant.Name) must use the producer trace page bound."
     Assert-True (@($matrix.transitions).Count -eq $variant.Count) "$($variant.Name) transition count is wrong."
     $ordinals = @($matrix.transitions | ForEach-Object ordinal)
     Assert-True (($ordinals -join ',') -eq ((1..$variant.Count) -join ',')) "$($variant.Name) ordinals are not contiguous."

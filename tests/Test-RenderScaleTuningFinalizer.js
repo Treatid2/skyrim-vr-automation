@@ -1017,7 +1017,93 @@ function testActualBackendProjection() {
     }
 }
 
+function testTraceCompletenessPassability() {
+    const root = createEvidenceRoot();
+    const buildId = "e".repeat(64);
+    try {
+        const file = path.join(root, "raw/pass-1/transitions/02/retained.json");
+        const receipt = JSON.parse(fs.readFileSync(file, "utf8"));
+        receipt.waiter.target = { method: "dlss", qualityMode: 0, renderScaleMode: false };
+        receipt.waiter.nativeVendorExecution = { actualBackend: "dlss" };
+        const summary = { active: false, sessionID: 17, totalRecords: 70,
+            droppedRecords: 0, overwrittenRecords: 0 };
+        receipt.traceReset = { action: "dlss_trace_reset", producer: { buildId },
+            capture: { ...summary, totalRecords: 0 } };
+        receipt.traceStart = { action: "dlss_trace_start", producer: { buildId },
+            capture: { ...summary, active: true, totalRecords: 0 } };
+        receipt.traceStop = { action: "dlss_trace_stop", producer: { buildId }, capture: summary };
+        const pages = [0, 32, 64].map(cursor => {
+            const page = tracePage(buildId, 17, cursor,
+                records(cursor + 1, Math.min(32, 70 - cursor)), cursor < 64, 32);
+            page.capture.latestSequence = 70;
+            page.capture.summary = { ...summary };
+            return page;
+        });
+        receipt.traceRead = pages[0];
+        receipt.traceReadPages = pages;
+        const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+            buildId, expectedRows: 2 };
+        writeJson(file, receipt);
+        let result = finalizeEvidence(options);
+        assert(result.summary.reporting.status === "COMPLETE" &&
+            result.summary.transitions[1].traceEvidence.records === 70,
+        "A complete producer-shaped trace cannot pass offline finalization.");
+        for (const change of [
+            row => { delete row.traceReadPages; },
+            row => { row.traceReadPages[1].capture.summary.sessionID += 1; },
+            row => { row.traceReadPages[1].capture.records[0].current.sequence -= 1; },
+            row => { row.traceReadPages[2].capture.latestSequence += 1; },
+            row => { row.traceStop.capture.active = true; },
+            row => { row.traceStop.capture.droppedRecords = 1; },
+        ]) {
+            const broken = JSON.parse(JSON.stringify(receipt));
+            change(broken);
+            writeJson(file, broken);
+            result = finalizeEvidence(options);
+            assert(result.summary.reporting.status === "INCOMPLETE" &&
+                result.summary.transitions[1].renderVerdict === "PASS" &&
+                result.summary.transitions[1].traceComplete === false,
+            "An incomplete or foreign trace passed reporting or rewrote render truth.");
+        }
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testJournalOnlyPartialFinalization() {
+    const root = createEvidenceRoot();
+    try {
+        const runId = "nvidia-test-run";
+        const journal = path.join(root, "raw/journal");
+        const row = retained(true, false, { runId, buildId: "e".repeat(64) });
+        writeJson(path.join(journal, "000001.json"), {
+            sequence: 1, receiptKey: `${runId}:nvidia:pass-1:transition-1`,
+            value: { ...row, projection: null },
+        });
+        writeJson(path.join(journal, "000002.json"), {
+            sequence: 2, receiptKey: `${runId}:nvidia:pass-1:transition-1`, value: row,
+        });
+        fs.rmSync(path.join(root, "raw/pass-1"), { recursive: true });
+        const before = sha(path.join(journal, "000001.json"));
+        const options = { root, variant: "nvidia", runId,
+            buildId: "e".repeat(64), expectedRows: 66 };
+        let result = finalizeEvidence(options);
+        assert(result.summary.assayExecution.transitionsDispatched === 1 &&
+            result.summary.assayExecution.status === "INCOMPLETE" &&
+            result.summary.transitions[0].renderVerdict === "PASS",
+        "Partial journal evidence was discarded instead of reported.");
+        result = finalizeEvidence(options);
+        assert(sha(path.join(journal, "000001.json")) === before &&
+            result.summary.transitions.length === 1,
+        "Restarting offline finalization changed or duplicated earlier evidence.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
 Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
+    .then(testTraceCompletenessPassability)
+    .then(testJournalOnlyPartialFinalization)
     .then(testPagingResume).then(testDeploymentVerification)
     .then(testOfflineFinalization)
     .then(testReportingSeparation).then(testUnownedViolationRemainsReported)

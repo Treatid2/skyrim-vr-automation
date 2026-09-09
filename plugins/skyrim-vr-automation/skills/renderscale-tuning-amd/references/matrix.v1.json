@@ -5,7 +5,6 @@
   "initialDestination": "fsr_hoshipa",
   "pacingMilliseconds": 5000,
   "completionTimeoutMilliseconds": 20000,
-  "traceReadLimit": 16,
   "lanes": [
     {
       "id": "explicit_fsr4",

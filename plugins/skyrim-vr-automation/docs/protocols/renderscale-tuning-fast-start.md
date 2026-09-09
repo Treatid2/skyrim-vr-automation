@@ -73,7 +73,7 @@ receipt-index/hash batch.
 
 If either stored startup receipt is unexpectedly unavailable, never replay a
 startup call or invalidate completed render rows. Record
-`startup_evidence_incomplete`, forbid the comparison-ledger append, and make the
+`startup_evidence_incomplete`, label unavailable comparison metrics, and make the
 missing receipt explicit in the report. The normal protocol must not produce
 this state because both keys are stored before positioning is reported.
 
@@ -221,9 +221,9 @@ terminal failure rules.
 The terminal `qualification-wait` receipt is the transition boundary. Its
 closed owner, zero active operation, exact PID/Build ID, and unresolved-mutation
 state are the complete safety decision for starting the next row. Do not add a
-post-wait operation read, status read, final snapshot, local evidence write,
-hash, report update, source search, or model pause before starting the next
-row. Do not invent another previous-transition safety gate.
+post-wait operation read, status read, final snapshot, hash, report update,
+source search, or model pause before starting the next row. Save each received
+envelope and row revision to the append-only receipt journal first. Do not invent another previous-transition safety gate.
 
 When the 20,000 ms waiter returns unsatisfied but this safety decision passes,
 record `nonStableNote` with `status: not_stable`, the terminal presentation
@@ -317,8 +317,9 @@ stop without retry. Never retry when DevBench may have accepted the scenario,
 when a new qualification owner exists, or when the response was lost; use the
 owner-correlated recovery rule in those cases.
 
-At pass finalization, use `load()` to materialize every retained terminal
-response and trace lifecycle receipt losslessly without first printing it to
+During measurement, journal every received terminal response and trace
+lifecycle receipt losslessly before the next operation. At finalization,
+materialize the latest revisions from disk without first printing them to
 chat,
 then make one cumulative evidence-read batch for operation/event history,
 render-scale status, preparation/provider traces, telemetry, profiler, stress,
@@ -397,3 +398,25 @@ their exact returned guards, disable the task-owned profiler state, and verify
 all owners inactive. A semantic row failure never skips cleanup. If transport
 is genuinely unavailable, preserve the guards, warn the user that sessions may
 remain active, and make no speculative cleanup call.
+
+### Complete trace windows and native proof compatibility
+
+For NVIDIA, the deterministic runner retains every page of each stopped DLSS
+trace before the next row can reset it. The first read omits `limit`; subsequent
+reads reuse the producer-returned bound and advance `afterSequence` until
+`moreAvailable` is explicitly false. The shared validator checks all pages and
+the complete stopped record count. Offline finalization rejects partial,
+foreign, overwritten, or discontinuous windows independently of render truth.
+The AMD empty capability read also uses the producer default page bound.
+
+Native proof checks accept the producer's snapshot and cycle representations,
+including absent shape-specific flags and separate per-eye timestamps. Native
+vendor execution may have zero scaled-resource generations; it still requires
+matching owner/device/resource/stereo identity and same-frame vendor dispatch.
+No such compatibility rule permits absent required proof or mixed-eye identity.
+
+Partial measurement and reporting status do not prevent comparison. Retain and
+compare available values, explicitly label incomplete rows/passes and missing
+metrics, and use `n/a` instead of invented zeroes. Do not impose a complete-run
+admission rule on the ledger. The ledger preserves historical columns while
+adding the current run's available data and limitations.

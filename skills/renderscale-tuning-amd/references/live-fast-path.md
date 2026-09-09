@@ -36,8 +36,9 @@ history clear, `qualification_dispatch`, public-API `apply`, and strict
 terminal waiter's authoritative stable profile and state revision plus the
 matrix destination and lane runtime. Store the exact terminal waiter
 immediately and emit only a compact projection. Do not pause for model
-reasoning, read files, write evidence, hash, or issue a confirmation read
-between rows.
+reasoning, read unrelated files, hash, or issue a confirmation read between
+rows. The runner's append-only receipt write is the required exception: save
+each received envelope and revision before starting the next operation.
 
 Continue directly after a semantic baseline or row failure when the terminal
 receipt proves the owner closed, zero active operation, matching PID/Build ID,

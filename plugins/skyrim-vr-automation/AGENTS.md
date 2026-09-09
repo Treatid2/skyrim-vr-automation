@@ -32,6 +32,10 @@
 - Require SteamVR to be closed before applying or restoring null-HMD settings.
 - Retain exact backups and receipts until the associated test evidence has been
   classified. Never delete unclassified MO2 overwrite or shader-cache content.
+- Render-scale tuning saves each received measurement and later revision to
+  an append-only run journal before the next operation. Compare available
+  measurements even from partial runs, explicitly labeling missing values and
+  incomplete coverage instead of requiring a complete run for ledger entry.
 - Keep automated waits bounded and report the observed postcondition. A CTD is
   useful evidence, not permission for unbounded retries.
 - Treat the render-scale tuning fixture, immediate positioning, and startup

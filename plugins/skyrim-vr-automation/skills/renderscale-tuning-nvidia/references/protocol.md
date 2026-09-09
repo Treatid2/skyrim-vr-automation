@@ -281,7 +281,7 @@ retained terminal response must be a decoded raw file in the completed bundle.
 This per-transition evidence requirement does not duplicate `prepare_tuning` or
 the positioning scenario. Materialize their stored exact receipts once under
 `raw/startup` during finalization. Missing startup evidence is explicitly
-`startup_evidence_incomplete`, forbids a ledger append, and never replays the
+`startup_evidence_incomplete`, labels unavailable ledger metrics, and never replays the
 startup calls or changes completed row classifications.
 
 A semantic strict timeout, unsatisfied milestone, or native-stability timeout
@@ -574,13 +574,20 @@ fidelity violates this protocol.
 
 For each DLSS or DLAA transition, reset/start exactly one owned bounded DLSS
 trace after the row's five-second wait, then stop and bounded-read it after the
-terminal waiter in the same scenario. Retain the reset, start, stop, and raw
-read receipts together, and materialize them only at pass finalization.
+terminal waiter in the same scenario. Omit the initial read limit so the
+producer selects its supported default. Before another reset or transition,
+drain every continuation with the returned page bound and `afterSequence`.
+Retain the first read as `traceRead` and all ordered pages as `traceReadPages`,
+alongside the reset/start/stop receipts. Preserve each page before validating
+its build, session, cursor, sequence continuity, and stopped-window identity.
+An invalid or incomplete window stops later mutations. Journal these raw
+receipts during measurement before the next operation; finalization derives
+the analysis tables from the saved files.
 A missing trace action is `BLOCKED`; an exposed trace action that fails is a
 control failure. Do not start a DLSS trace for FSR, TAA, or None.
 
 Missing required trace lifecycle or raw-window evidence marks the evidence
-contract incomplete and forbids a ledger append, but it does not change an
+contract incomplete; label unavailable comparison metrics, but do not change an
 already completed row's render classification or authorize a replay.
 
 Unsupported preparation providers are `n/a`, never zero. Preserve raw values
@@ -594,6 +601,16 @@ native-resolution DLSS evaluation. TAA and None must not retain DLSS as the
 active presentation. Every FSR destination must retain configured FSR3 and
 resolve coherently to `fsr_host` or `fsr_runtime`; `fsr4_runtime` is a failure.
 Changing the logical native method must not retain the previous vendor.
+
+Native proof validation follows the producer's two evidence shapes. Snapshot
+proofs may omit `sharedVendorDispatchRequired`; cycle proofs may omit eye
+`valid` flags and record distinct per-eye QPC ticks. Explicit contradictory
+flags still fail. Require matching frame, compositor cycle, method/backend,
+epoch, resource revision, dimensions, device, and owner; the proof timestamp
+must equal the latest of its two eye timestamps. None/TAA require zero
+generations and no vendor dispatch. Native DLAA/vendor AA may use generation
+zero only with coherent same-frame, same-backend vendor execution for both
+eyes. Scaled vendor proofs retain positive generation requirements.
 
 No exact temporal/input tuple may receive duplicate Streamline evaluation. An
 `eErrorDuplicatedConstants` is a transition `FAIL` even if presentation recovers;
@@ -630,19 +647,24 @@ for example:
 This validation is finalization-only and must not insert another read, wait,
 or gate between measured rows or passes. Treat an unsupported optional
 operation or event history action as `not_exposed`; it must not abort the later
-status, telemetry, or cleanup reads. During live finalization,
-its `collectTracePages` helper obtains the maximum page size from the live
-producer schema, pages with `afterSequence` while `moreAvailable` is true, and
-rejects gaps, duplicates, overwritten requests, or build/session changes.
-Never supply an invented client limit. Materialize each raw page before
-validating it. Offline restart uses the retained per-row trace evidence and
+status, telemetry, or cleanup reads. The runner and finalizer share the
+`collectTracePages` helper and trace validation. Never supply an invented client limit.
+It advances `afterSequence` while `moreAvailable` and rejects gaps, duplicates, overwritten requests,
+or changed build/session identity. The live runner drains each stopped row using the producer's
+returned default page bound before any later reset; it never invents a client
+limit. The offline finalizer validates all retained pages through an explicit
+`moreAvailable: false`, including record totals, dropped/overwritten counters,
+and build/session ownership. Merely retaining a read receipt is insufficient.
+Missing pages keep reporting `INCOMPLETE` without changing render truth or
+authorizing a replay. Offline restart uses the retained per-row trace evidence and
 does not issue a live read. The finalizer must be restartable from the exact
 run/build/session-owned retained files and must never replay an in-game
 transition. It writes `summary.json`, `transitions.csv`,
 `evidence-values.csv`, `report.md`, and `receipt-index.json` atomically only
 after validation. Do not hash or render per
 row. An evidence root containing only `summary.json` and `transitions.csv` is
-incomplete and cannot support a ledger append.
+incomplete; it can still support a clearly labeled partial comparison using
+the measurements actually retained.
 
 If the live runner stops at baseline before any measured row, retain
 `raw/live-result.json` and the exact baseline waiter receipt. Run the same
@@ -660,8 +682,11 @@ counts. When a required mutation has no
 Task 2 `INCONCLUSIVE`; preserve its phase counters as non-authoritative raw
 observations. With a valid boundary, all existing post-boundary failure rules
 remain strict.
-Append one uniquely headed result column only after the complete two-pass
-comparison.
+Append one uniquely headed result column for a complete or partial comparison.
+State execution/reporting status, dispatched and retained row counts, and
+missing evidence explicitly. Use `n/a` for unavailable metrics; never replace
+missing measurements with zero or discard usable data because another facet
+is incomplete.
 
 ### Memory confirmation result
 
@@ -690,8 +715,8 @@ Compute a ratio only when the pass 1 delta is positive; otherwise report
   no positive pass 2 increase in DXGI usage, live texture count, or live
   texture bytes.
 - Every other complete comparison is `inconclusive`. A missing repeat is
-  `repeat_not_completed`, makes the assay `INTERRUPTED`, and forbids a ledger
-  append.
+  `repeat_not_completed` and makes the assay `INTERRUPTED`. Preserve the
+  available pass in the comparison with unavailable repeat metrics marked `n/a`.
 
 Always emit the memory table and `memoryConfirmation` object, including for an
 interrupted pass. When pass 2 never ran, set `passesCompleted` to the actual
@@ -708,7 +733,7 @@ render verdict separately. Memory growth alone never changes a transition's
 
 Treat each comparison-ledger column append as one transaction. Use exactly
 `docs/development/vr-render-scale-comparison-ledger.csv`; never search for a
-ledger. Read and parse it once after both passes for the comparison finish,
+ledger. Read and parse it once after measurement completes or stops,
 retain its original hash, and compose the
 complete candidate before any ledger write. Reject the candidate unless it has
 the same ordered metric rows and row count, exactly one additional rightmost
@@ -810,6 +835,23 @@ If the matrix ends early, label every entry that was never dispatched
 `NOT RUN`, never `BLOCKED`. Reserve `BLOCKED` for a row whose required admission
 or precondition failed before its mutation. Report the overall assay as
 `INTERRUPTED` while retaining the exact classifications of completed rows; do
-not convert it to overall `FAIL` merely because later rows were not run. Do not
-append the comparison ledger for an interrupted matrix. Print the complete
+not convert it to overall `FAIL` merely because later rows were not run.
+Include the available measurements in a clearly labeled partial ledger column. Print the complete
 tables and evidence paths, then stop; do not start another protocol.
+
+### Retention and partial comparisons
+
+Retain measurements as they arrive. After positioning, the runner writes each
+scenario envelope and row revision into a new numbered JSON file under the
+run's `raw/journal` directory before the next operation. This is a data save,
+not another rendering admission gate. The first trace page and all continuation
+pages are retained before any reset. Repeated keys create new files; they do
+not overwrite earlier evidence. Startup envelopes and the final live result
+use the same journal. An existing run directory is never reused for a new run.
+
+Offline finalization materializes the latest revision for each key from the
+journal, preserving every original revision. It does not depend on turn-local
+`store()` surviving. Partial runs remain valid comparison inputs. Report the
+measurements that exist, label incomplete execution/evidence and unavailable
+metrics, and preserve prior ledger cells. Missing evidence is not a reason to
+discard available timings or memory samples or to deny a partial comparison.

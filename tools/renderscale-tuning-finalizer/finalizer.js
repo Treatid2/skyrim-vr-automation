@@ -6,132 +6,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 
-function unwrapTraceRead(value) {
-    if (value && Array.isArray(value.content) && value.content[0] &&
-        typeof value.content[0].text === "string") {
-        return unwrapTraceRead(JSON.parse(value.content[0].text));
-    }
-    if (value && Array.isArray(value.results)) {
-        const step = value.results.find((entry) => entry &&
-            entry.result && entry.result.action === "dlss_trace_read");
-        return step && step.result;
-    }
-    return value && value.result && value.result.action === "dlss_trace_read" ?
-        value.result : value;
-}
-
-function recordSequence(record) {
-    const value = record && (record.sequence ??
-        (record.current && record.current.sequence));
-    return Number.isSafeInteger(value) && value > 0 ? value : null;
-}
-
-function traceCapacity(schema) {
-    const maximum = schema && (schema.maximum ?? schema.max ??
-        (schema.limit && schema.limit.maximum));
-    if (!Number.isSafeInteger(maximum) || maximum < 1) {
-        throw new Error("trace_schema_maximum_missing");
-    }
-    return maximum;
-}
-
-function validateTracePage(rawPage, state) {
-    const page = unwrapTraceRead(rawPage);
-    const capture = page && page.capture;
-    const producer = page && page.producer;
-    if (!page || page.action !== "dlss_trace_read" || !capture ||
-        !Array.isArray(capture.records)) {
-        throw new Error("invalid_trace_page");
-    }
-    if (!producer || producer.buildId !== state.buildId) {
-        throw new Error("trace_build_changed");
-    }
-    const sessionId = capture.summary && capture.summary.sessionID;
-    if (!Number.isSafeInteger(sessionId) || sessionId < 1) {
-        throw new Error("trace_session_missing");
-    }
-    if (state.sessionId !== null && sessionId !== state.sessionId) {
-        throw new Error("trace_session_changed");
-    }
-    if (capture.limit > state.maximum || capture.limit < 1) {
-        throw new Error("trace_page_limit_out_of_range");
-    }
-    if (capture.afterSequence !== state.afterSequence) {
-        throw new Error("trace_page_cursor_mismatch");
-    }
-    if (capture.requestedSequenceOverwritten === true ||
-        (Number.isSafeInteger(capture.availableFromSequence) &&
-            capture.availableFromSequence > state.afterSequence + 1)) {
-        throw new Error("trace_requested_sequence_overwritten");
-    }
-
-    let expected = state.afterSequence + 1;
-    for (const record of capture.records) {
-        const sequence = recordSequence(record);
-        if (sequence === null) throw new Error("trace_sequence_missing");
-        if (sequence < expected) throw new Error("trace_sequence_duplicate");
-        if (sequence > expected) throw new Error("trace_sequence_gap");
-        expected += 1;
-    }
-    const lastSequence = capture.records.length > 0 ? expected - 1 :
-        state.afterSequence;
-    if (capture.lastReturnedSequence !== lastSequence) {
-        throw new Error("trace_last_sequence_mismatch");
-    }
-    if (capture.moreAvailable === true && capture.records.length === 0) {
-        throw new Error("trace_empty_continuation_page");
-    }
-    return { page, sessionId, lastSequence };
-}
-
-async function collectTracePages(options) {
-    const {
-        readPage, expectedBuildId, schema, expectedSessionId = null,
-        existingPages = [], preservePage = async () => {},
-    } = options;
-    if (typeof readPage !== "function" || typeof preservePage !== "function" ||
-        typeof expectedBuildId !== "string" || expectedBuildId.length === 0) {
-        throw new Error("invalid_trace_paging_options");
-    }
-    const maximum = traceCapacity(schema);
-    const state = {
-        buildId: expectedBuildId,
-        sessionId: expectedSessionId,
-        afterSequence: 0,
-        maximum,
-    };
-    const pages = [];
-    const records = [];
-
-    for (const rawPage of existingPages) {
-        const checked = validateTracePage(rawPage, state);
-        state.sessionId = checked.sessionId;
-        state.afterSequence = checked.lastSequence;
-        pages.push(checked.page);
-        records.push(...checked.page.capture.records);
-        if (checked.page.capture.moreAvailable !== true) {
-            return { pages, records, sessionId: state.sessionId, maximum };
-        }
-    }
-
-    while (pages.length === 0 ||
-        pages[pages.length - 1].capture.moreAvailable === true) {
-        const rawPage = await readPage({
-            action: "dlss_trace_read",
-            afterSequence: state.afterSequence,
-            limit: maximum,
-            expectedBuildId,
-        });
-        // Preserve the producer receipt even when validation rejects it.
-        await preservePage(rawPage, pages.length + 1);
-        const checked = validateTracePage(rawPage, state);
-        state.sessionId = checked.sessionId;
-        state.afterSequence = checked.lastSequence;
-        pages.push(checked.page);
-        records.push(...checked.page.capture.records);
-    }
-    return { pages, records, sessionId: state.sessionId, maximum };
-}
+const { collectTracePages, traceCapacity, validateTracePage,
+    validateRetainedTrace } = require("../renderscale-tuning-live/runner.js");
 
 function readJson(file) {
     return JSON.parse(fs.readFileSync(file, "utf8"));
@@ -697,8 +573,12 @@ function transitionRow(root, file, retained) {
     const stretch = presentationStretchDetails(waiter, projection, renderVerdict);
     const traceRequired = retained.variant === "nvidia" &&
         target.method === "dlss";
-    const traceComplete = !traceRequired || ["traceReset", "traceStart", "traceStop",
-        "traceRead"].every((name) => retained[name]);
+    let traceEvidence = { complete: true, status: "not_applicable" };
+    if (traceRequired) {
+        try { traceEvidence = validateRetainedTrace(retained); }
+        catch (error) { traceEvidence = { complete: false, reason: error.message }; }
+    }
+    const traceComplete = traceEvidence.complete;
     const recovery = retained.recovery || null;
     return {
         ...identity,
@@ -735,6 +615,7 @@ function transitionRow(root, file, retained) {
         presentationStretchRecoveryElapsedMs: stretch.recoveryElapsedMs,
         traceRequired,
         traceComplete,
+        traceEvidence,
         recoveryStatus: recovery ? recovery.status || "not_exposed" : "not_needed",
         recoveryTarget: recovery ? recovery.target || null : null,
         recoveryReceiptKey: retained.recoveryReceiptKey ||
@@ -774,7 +655,7 @@ function csv(rows) {
         "transition_evidence_complete",
         "physical_mutation_started", "final_method", "final_quality",
         "final_render_scale_mode", "final_state_revision", "trace_required",
-        "trace_complete", "recovery_status", "recovery_target",
+        "trace_complete", "trace_evidence", "recovery_status", "recovery_target",
         "recovery_receipt_key", "source_recovery_receipt_key",
         "presentation_stretch_selected",
         "presentation_stretch_consecutive_frames",
@@ -861,6 +742,9 @@ function report(summary) {
         `| ${row.lane || "default"} | ${row.pass} | ${row.ordinal} | ` +
         `${row.actualBackend} | ${row.renderVerdict} | ${stability} | ` +
         `${row.task2Verdict} | ` +
+        `${row.traceRequired ? (row.traceComplete ?
+            `${row.traceEvidence.records} records / ${row.traceEvidence.pages} pages` :
+            row.traceEvidence.reason) : "not_applicable"} | ` +
         `${row.presentationStretchSelected ?
             row.presentationStretchConsecutiveFrames : "none"} | ` +
         `${row.presentationStretchRecovered ?
@@ -924,9 +808,9 @@ function report(summary) {
         `per-transition evidence. Every raw JSON value is available in ` +
         `\`${summary.evidenceExtraction.path}\`.\n\n` +
         `## Transitions\n\n` +
-        `| Lane | Pass | Row | Actual backend | Render | Stability | Task 2 | Stretch frames | Stretch recovery | Recovery | Authority | Reported violations | ` +
+        `| Lane | Pass | Row | Actual backend | Render | Stability | Task 2 | Trace evidence | Stretch frames | Stretch recovery | Recovery | Authority | Reported violations | ` +
         `Missing evidence | Invalid producer evidence |\n` +
-        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n\n` +
+        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n\n` +
         `## Presentation stretch anomalies\n\n` +
         `| Lane | Pass | Row | From | To | Consecutive frames | Recovered PASS |\n` +
         `| --- | ---: | ---: | --- | --- | ---: | --- |\n` +
@@ -966,12 +850,53 @@ function sha256(file) {
     return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
+function materializeReceiptJournal(root, runId) {
+    const directory = path.join(root, "raw", "journal");
+    if (!fs.existsSync(directory)) return;
+    const latest = new Map();
+    for (const name of fs.readdirSync(directory).sort()) {
+        if (!/^\d{6}\.json$/.test(name)) continue;
+        const entry = readJson(path.join(directory, name));
+        if (!entry.receiptKey.startsWith(`${runId}:`)) {
+            throw new Error("receipt_journal_run_mismatch");
+        }
+        latest.set(entry.receiptKey.slice(runId.length + 1), entry.value);
+    }
+    for (const [key, value] of latest) {
+        let relativePath;
+        if (/^startup-(prepare|positioning)$/.test(key)) {
+            relativePath = `raw/startup/${key.slice(8)}.json`;
+        } else if (key === "live-result") {
+            relativePath = "raw/live-result.json";
+        } else {
+            const row = key.match(/^([^:]+):pass-(\d+):transition-(\d+)(?::(scenario|trace-page-\d+|recovery))?$/);
+            const pass = key.match(/^([^:]+):pass-(\d+):([a-z-]+)$/);
+            if (row) relativePath = `raw/lane-${row[1]}/pass-${row[2]}/transitions/` +
+                `${row[3].padStart(2, "0")}/${row[4] || "retained"}.json`;
+            else if (pass) relativePath = `raw/lane-${pass[1]}/pass-${pass[2]}/` +
+                (pass[3] === "baseline" ? "baseline/baseline" :
+                    pass[3].includes("cleanup") ? `finalization/${pass[3]}` : pass[3]) + ".json";
+            else continue;
+        }
+        const file = path.join(root, relativePath);
+        if (fs.existsSync(file)) {
+            if (JSON.stringify(readJson(file)) !== JSON.stringify(value)) {
+                throw new Error("receipt_projection_already_exists");
+            }
+            continue;
+        }
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        writeAtomic(file, `${JSON.stringify(value)}\n`);
+    }
+}
+
 function finalizeEvidence(options) {
     const root = path.resolve(options.root);
     const variant = options.variant;
     if (!fs.statSync(root).isDirectory() || !["nvidia", "amd"].includes(variant)) {
         throw new Error("invalid_finalization_options");
     }
+    materializeReceiptJournal(root, options.runId);
     const retainedFiles = walk(root).filter((file) =>
         path.basename(file) === "retained.json" && rowIdentity(root, file));
     const allRetained = retainedFiles.map((file) => ({ file, value: readJson(file) }));

@@ -1,5 +1,238 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+function unwrapTraceRead(value) {
+    if (value && Array.isArray(value.content) && value.content[0] &&
+        typeof value.content[0].text === "string") {
+        return unwrapTraceRead(JSON.parse(value.content[0].text));
+    }
+    if (value && Array.isArray(value.results)) {
+        const step = value.results.find((entry) => entry &&
+            entry.result && entry.result.action === "dlss_trace_read");
+        return step && step.result;
+    }
+    return value && value.result && value.result.action === "dlss_trace_read" ?
+        value.result : value;
+}
+
+function recordSequence(record) {
+    const value = record && (record.sequence ??
+        (record.current && record.current.sequence));
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function traceCapacity(schema) {
+    const maximum = schema && (schema.maximum ?? schema.max ??
+        (schema.limit && schema.limit.maximum));
+    if (!Number.isSafeInteger(maximum) || maximum < 1) {
+        throw new Error("trace_schema_maximum_missing");
+    }
+    return maximum;
+}
+
+function validateTracePage(rawPage, state) {
+    const page = unwrapTraceRead(rawPage);
+    const capture = page && page.capture;
+    const producer = page && page.producer;
+    if (!page || page.action !== "dlss_trace_read" || !capture ||
+        !Array.isArray(capture.records)) {
+        throw new Error("invalid_trace_page");
+    }
+    if (!producer || producer.buildId !== state.buildId) {
+        throw new Error("trace_build_changed");
+    }
+    const sessionId = capture.summary && capture.summary.sessionID;
+    if (!Number.isSafeInteger(sessionId) || sessionId < 1) {
+        throw new Error("trace_session_missing");
+    }
+    if (state.sessionId !== null && sessionId !== state.sessionId) {
+        throw new Error("trace_session_changed");
+    }
+    if (!Number.isSafeInteger(capture.limit) ||
+        capture.limit > state.maximum || capture.limit < 1 ||
+        capture.records.length > capture.limit) {
+        throw new Error("trace_page_limit_out_of_range");
+    }
+    if (typeof capture.moreAvailable !== "boolean" ||
+        !Number.isSafeInteger(capture.latestSequence) || capture.latestSequence < 0) {
+        throw new Error("trace_continuation_missing");
+    }
+    if (state.latestSequence !== undefined && state.latestSequence !== capture.latestSequence) {
+        throw new Error("trace_window_changed");
+    }
+    state.latestSequence = capture.latestSequence;
+    if (capture.afterSequence !== state.afterSequence) {
+        throw new Error("trace_page_cursor_mismatch");
+    }
+    if (capture.requestedSequenceOverwritten === true ||
+        (Number.isSafeInteger(capture.availableFromSequence) &&
+            capture.availableFromSequence > state.afterSequence + 1)) {
+        throw new Error("trace_requested_sequence_overwritten");
+    }
+
+    let expected = state.afterSequence + 1;
+    for (const record of capture.records) {
+        const sequence = recordSequence(record);
+        if (sequence === null) throw new Error("trace_sequence_missing");
+        if (sequence < expected) throw new Error("trace_sequence_duplicate");
+        if (sequence > expected) throw new Error("trace_sequence_gap");
+        expected += 1;
+    }
+    const lastSequence = capture.records.length > 0 ? expected - 1 :
+        state.afterSequence;
+    if (capture.lastReturnedSequence !== lastSequence) {
+        throw new Error("trace_last_sequence_mismatch");
+    }
+    if (capture.moreAvailable === true && capture.records.length === 0) {
+        throw new Error("trace_empty_continuation_page");
+    }
+    if (lastSequence > capture.latestSequence ||
+        (capture.moreAvailable && lastSequence === capture.latestSequence)) {
+        throw new Error("trace_continuation_out_of_range");
+    }
+    return { page, sessionId, lastSequence };
+}
+
+async function collectTracePages(options) {
+    const {
+        readPage, expectedBuildId, schema, expectedSessionId = null,
+        existingPages = [], preservePage = async () => {},
+    } = options;
+    if (typeof readPage !== "function" || typeof preservePage !== "function" ||
+        typeof expectedBuildId !== "string" || expectedBuildId.length === 0) {
+        throw new Error("invalid_trace_paging_options");
+    }
+    const maximum = traceCapacity(schema);
+    const state = {
+        buildId: expectedBuildId,
+        sessionId: expectedSessionId,
+        afterSequence: 0,
+        maximum,
+    };
+    const pages = [];
+    const records = [];
+
+    for (const rawPage of existingPages) {
+        const checked = validateTracePage(rawPage, state);
+        state.sessionId = checked.sessionId;
+        state.afterSequence = checked.lastSequence;
+        pages.push(checked.page);
+        records.push(...checked.page.capture.records);
+        if (checked.page.capture.moreAvailable !== true) {
+            return { pages, records, sessionId: state.sessionId, maximum };
+        }
+    }
+
+    while (pages.length === 0 ||
+        pages[pages.length - 1].capture.moreAvailable === true) {
+        const rawPage = await readPage({
+            action: "dlss_trace_read",
+            afterSequence: state.afterSequence,
+            limit: maximum,
+            expectedBuildId,
+        });
+        // Preserve the producer receipt even when validation rejects it.
+        await preservePage(rawPage, pages.length + 1);
+        const checked = validateTracePage(rawPage, state);
+        state.sessionId = checked.sessionId;
+        state.afterSequence = checked.lastSequence;
+        pages.push(checked.page);
+        records.push(...checked.page.capture.records);
+    }
+    return { pages, records, sessionId: state.sessionId, maximum };
+}
+
+function validateRetainedTrace(retained) {
+    if (!["traceReset", "traceStart", "traceStop", "traceRead"]
+        .every(name => retained[name])) throw new Error("trace_lifecycle_missing");
+    const buildId = retained.waiter.producer.buildId;
+    const sessionId = retained.traceStart.capture && retained.traceStart.capture.sessionID;
+    for (const name of ["traceReset", "traceStart", "traceStop"]) {
+        const receipt = retained[name];
+        if (!receipt.producer || receipt.producer.buildId !== buildId) {
+            throw new Error("trace_build_changed");
+        }
+        if (!receipt.capture || receipt.action !== {
+            traceReset: "dlss_trace_reset", traceStart: "dlss_trace_start",
+            traceStop: "dlss_trace_stop",
+        }[name]) throw new Error("trace_lifecycle_invalid");
+    }
+    const stopped = retained.traceStop.capture;
+    if (!Number.isSafeInteger(sessionId) || sessionId < 1 ||
+        stopped.sessionID !== sessionId) throw new Error("trace_session_changed");
+    if (retained.traceReset.capture.active !== false ||
+        retained.traceStart.capture.active !== true || stopped.active !== false) {
+        throw new Error("trace_lifecycle_not_stopped");
+    }
+    const pages = retained.traceReadPages || [retained.traceRead];
+    if (!Array.isArray(pages) || pages.length === 0) throw new Error("trace_pages_missing");
+    const first = unwrapTraceRead(pages[0]);
+    if (JSON.stringify(first) !== JSON.stringify(retained.traceRead)) {
+        throw new Error("trace_first_page_mismatch");
+    }
+    const state = { buildId, sessionId, afterSequence: 0,
+        maximum: traceCapacity({ maximum: first.capture && first.capture.limit }) };
+    let records = 0;
+    for (let index = 0; index < pages.length; index += 1) {
+        const checked = validateTracePage(pages[index], state);
+        const capture = checked.page.capture;
+        if (capture.summary.active !== false ||
+            capture.summary.totalRecords !== stopped.totalRecords) {
+            throw new Error("trace_stopped_window_changed");
+        }
+        if (typeof capture.moreAvailable !== "boolean") throw new Error("trace_continuation_missing");
+        if (!capture.moreAvailable && index !== pages.length - 1) {
+            throw new Error("trace_pages_after_terminal");
+        }
+        if (capture.moreAvailable && index === pages.length - 1) {
+            throw new Error("trace_pages_incomplete");
+        }
+        state.afterSequence = checked.lastSequence;
+        records += capture.records.length;
+        if (!capture.moreAvailable && capture.latestSequence !== checked.lastSequence) {
+            throw new Error("trace_terminal_sequence_mismatch");
+        }
+    }
+    if (!Number.isSafeInteger(stopped.totalRecords) ||
+        records !== stopped.totalRecords || stopped.droppedRecords !== 0 ||
+        stopped.overwrittenRecords !== 0) throw new Error("trace_window_incomplete");
+    return { complete: true, pages: pages.length, records, sessionId };
+}
+
+async function createReceiptJournal(tools, runId) {
+    if (!/^[A-Za-z0-9_-]+$/.test(runId) ||
+        typeof tools.exec_command !== "function" || typeof tools.apply_patch !== "function") {
+        throw new Error("durable_receipt_store_unavailable");
+    }
+    const setup = await tools.exec_command({
+        cmd: `$root = [IO.Path]::GetFullPath((Join-Path (Get-Location).Path 'artifacts/renderscale-tuning/${runId}'))
+` +
+            `if (Test-Path -LiteralPath $root) { throw 'Evidence run already exists; preserve it and use a new run ID.' }
+` +
+            `[IO.Directory]::CreateDirectory($root) | Out-Null
+` +
+            `$owner = [IO.File]::Open((Join-Path $root 'receipt-owner'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+` +
+            `$owner.Dispose()
+[pscustomobject]@{ root = $root } | ConvertTo-Json -Compress`,
+        max_output_tokens: 300,
+    });
+    if (setup.exit_code !== 0) throw new Error("durable_receipt_store_creation_failed");
+    const root = JSON.parse(setup.output).root.replaceAll("\\", "/");
+    let sequence = 0;
+    return {
+        root,
+        write: async (receiptKey, value) => {
+            const number = String(++sequence).padStart(6, "0");
+            const entry = JSON.stringify({ sequence, receiptKey, value });
+            const result = await tools.apply_patch(
+                `*** Begin Patch\n*** Add File: ${root}/raw/journal/${number}.json\n+${entry}\n*** End Patch`);
+            if (result && (result.isError || result.exit_code > 0)) {
+                throw new Error("durable_receipt_write_failed");
+            }
+        },
+    };
+}
+
 async function runRenderScaleTuningLive(context) {
     "use strict";
 
@@ -15,16 +248,18 @@ async function runRenderScaleTuningLive(context) {
     const retainedReceiptKeys = [];
     let verifiedAdapter = null;
 
-    function retain(key, value) {
+    async function retain(key, value) {
         store(key, value);
+        await receiptJournal.write(key, value);
         if (!retainedReceiptKeys.includes(key)) retainedReceiptKeys.push(key);
     }
 
-    function retainLiveResult(summary) {
+    async function retainLiveResult(summary) {
         const key = `${runId}:live-result`;
         if (!retainedReceiptKeys.includes(key)) retainedReceiptKeys.push(key);
         summary.receiptKeys = [...retainedReceiptKeys];
-        store(key, summary);
+        summary.evidenceRoot = receiptJournal.root;
+        await retain(key, summary);
     }
 
     const quality = Object.freeze({
@@ -256,6 +491,11 @@ async function runRenderScaleTuningLive(context) {
     }
 
     const positioning = positioningInputs(positioningRoot);
+    const receiptJournal = context.receiptJournal || await createReceiptJournal(tools, runId);
+    for (const [name, value] of Object.entries(context.startupReceipts || {})) {
+        await retain(`${runId}:startup-${name}`, value);
+    }
+
     const capabilities = positioning.capabilities;
     notify({
         phase: "positioning",
@@ -313,7 +553,7 @@ async function runRenderScaleTuningLive(context) {
                 reportedSteps: [],
             });
         }
-        retain(receiptKey, envelope);
+        await retain(receiptKey, envelope);
         try {
             return { envelope, root: decodeEnvelope(envelope) };
         } catch (error) {
@@ -434,7 +674,7 @@ async function runRenderScaleTuningLive(context) {
             }));
             steps.push(toolStep("dlss-trace-read", "communityshaders.renderscale", {
                 action: "dlss_trace_read", afterSequence: 0,
-                limit: matrix.traceReadLimit, expectedBuildId: buildId,
+                expectedBuildId: buildId,
             }));
         }
         return steps;
@@ -789,9 +1029,9 @@ async function runRenderScaleTuningLive(context) {
     }
 
     function exactNativeStereoProof(proof, target) {
-        const exactEye = (eye) => eye &&
+        const exactEye = (eye) => eye && (eye.valid === undefined || eye.valid === true) &&
             positiveInteger(eye.frame) && eye.frame === proof.frame &&
-            positiveInteger(eye.qpcTick) &&
+            positiveInteger(eye.qpcTick) && eye.qpcTick <= proof.qpcTick &&
             positiveInteger(eye.compositorCycleToken) &&
             eye.compositorCycleToken === proof.compositorCycleToken &&
             positiveInteger(eye.transitionEpoch) &&
@@ -809,9 +1049,41 @@ async function runRenderScaleTuningLive(context) {
             positiveInteger(proof.compositorCycleToken) && proof.backend === "none" &&
             proof.contractGeneration === 0 &&
             proof.providerRuntimeGeneration === 0 &&
-            proof.sharedVendorDispatchRequired === false &&
+            (proof.sharedVendorDispatchRequired === undefined ||
+                proof.sharedVendorDispatchRequired === false) &&
             proof.vendorDispatchProven === false &&
-            exactEye(proof.leftEye) && exactEye(proof.rightEye);
+            exactEye(proof.leftEye) && exactEye(proof.rightEye) &&
+            proof.qpcTick === Math.max(proof.leftEye.qpcTick, proof.rightEye.qpcTick);
+    }
+
+    function exactNativeVendorProof(proof, target) {
+        const backendMatches = target.method === "dlss" ? proof.backend === "dlss" :
+            ["fsr_host", "fsr_runtime", "fsr4_runtime"].includes(proof.backend);
+        const exactEye = eye => eye && (eye.valid === undefined || eye.valid === true) &&
+            eye.frame === proof.frame && positiveInteger(eye.qpcTick) &&
+            eye.qpcTick <= proof.qpcTick &&
+            eye.compositorCycleToken === proof.compositorCycleToken &&
+            eye.transitionEpoch === proof.transitionEpoch &&
+            eye.method === target.method && eye.backend === proof.backend &&
+            eye.generation === proof.contractGeneration &&
+            eye.deviceIdentity === proof.deviceIdentity &&
+            eye.resourceRevision === proof.resourceRevision &&
+            eye.renderWidth === proof.renderWidth && eye.renderHeight === proof.renderHeight &&
+            eye.displayWidth === proof.displayWidth && eye.displayHeight === proof.displayHeight &&
+            eye.vendorDispatchFrame === proof.frame &&
+            nonNegativeInteger(eye.vendorDispatchSerial) &&
+            typeof eye.vendorRuntimeFallback === "boolean";
+        // Native vendor execution has no active scaled-resource generation.
+        return backendMatches && positiveInteger(proof.frame) &&
+            positiveInteger(proof.qpcTick) && positiveInteger(proof.compositorCycleToken) &&
+            nonNegativeInteger(proof.contractGeneration) &&
+            (proof.contractGeneration === 0 ? proof.providerRuntimeGeneration === 0 :
+                positiveInteger(proof.providerRuntimeGeneration)) &&
+            proof.vendorDispatchProven === true &&
+            exactEye(proof.leftEye) && exactEye(proof.rightEye) &&
+            proof.qpcTick === Math.max(proof.leftEye.qpcTick, proof.rightEye.qpcTick) &&
+            proof.leftEye.vendorDispatchSerial === proof.rightEye.vendorDispatchSerial &&
+            proof.leftEye.vendorRuntimeFallback === proof.rightEye.vendorRuntimeFallback;
     }
 
     function exactTargetProof(proof, target) {
@@ -836,8 +1108,11 @@ async function runRenderScaleTuningLive(context) {
             proof.displayHeight,
         ];
         if (!identifiers.every(positiveInteger)) return false;
-        if (vendorTarget && (!positiveInteger(proof.contractGeneration) ||
-            !positiveInteger(proof.providerRuntimeGeneration))) return false;
+        if (vendorTarget && target.renderScaleMode &&
+            (!positiveInteger(proof.contractGeneration) ||
+                !positiveInteger(proof.providerRuntimeGeneration))) return false;
+        if (vendorTarget && !target.renderScaleMode &&
+            !exactNativeVendorProof(proof, target)) return false;
         if (!vendorTarget && !exactNativeStereoProof(proof, target)) return false;
         return target.renderScaleMode ?
             proof.renderWidth < proof.displayWidth &&
@@ -1233,7 +1508,7 @@ async function runRenderScaleTuningLive(context) {
             action: "qualification_status",
             expectedBuildId: buildId,
         });
-        retain(`${runId}:recovery:${identifiers.transitionId}`, status.envelope);
+        await retain(`${runId}:recovery:${identifiers.transitionId}`, status.envelope);
         const qualification = status.root.qualification;
         const waiter = qualification && qualification.lastEvidence;
         if (qualification && qualification.active === false && waiter &&
@@ -1249,7 +1524,7 @@ async function runRenderScaleTuningLive(context) {
             action: "qualification_status",
             expectedBuildId: buildId,
         });
-        retain(`${runId}:recovery:${identifiers.transitionId}:close-status`,
+        await retain(`${runId}:recovery:${identifiers.transitionId}:close-status`,
             status.envelope);
         const qualification = status.root.qualification;
         if (qualification && qualification.active === true &&
@@ -1261,7 +1536,7 @@ async function runRenderScaleTuningLive(context) {
                 ownerId: identifiers.ownerId,
                 expectedBuildId: buildId,
             });
-            retain(`${runId}:recovery:${identifiers.transitionId}:cancel`,
+            await retain(`${runId}:recovery:${identifiers.transitionId}:cancel`,
                 cancel.envelope);
         }
     }
@@ -1286,7 +1561,7 @@ async function runRenderScaleTuningLive(context) {
             steps.push(toolStep("failed-dlss-trace-read",
                 "communityshaders.renderscale", {
                     action: "dlss_trace_read", afterSequence: 0,
-                    limit: matrix.traceReadLimit, expectedBuildId: buildId,
+                    expectedBuildId: buildId,
                 }));
         }
         steps.push(toolStep("recovery-qualification-begin",
@@ -1351,7 +1626,7 @@ async function runRenderScaleTuningLive(context) {
             traceStop: entries.get("failed-dlss-trace-stop") || null,
             traceRead: entries.get("failed-dlss-trace-read") || null,
         };
-        retain(receiptKey, evidence);
+        await retain(receiptKey, evidence);
         if (!recovered) {
             if (!waiter) await closeOpenQualification(identifiers);
             throw diagnosticError("transition_recovery_failed", {
@@ -1509,7 +1784,7 @@ async function runRenderScaleTuningLive(context) {
             try {
                 waiter = await recoverTerminal(identifiers);
             } catch {
-                retain(retainedKey, {
+                await retain(retainedKey, {
                     variant,
                     scenarioReceiptKey: receiptKey,
                     scenario: scenarioFailure && scenarioFailure.diagnostic || null,
@@ -1559,14 +1834,14 @@ async function runRenderScaleTuningLive(context) {
                 traceStop: entries.get("dlss-trace-stop") || null,
                 traceRead: entries.get("dlss-trace-read") || null,
             };
-            retain(retainedKey, retained);
+            await retain(retainedKey, retained);
             if (!waiter || (response.root.ok !== true &&
                 diagnostic.failedStep !== "qualification-wait")) {
                 await closeOpenQualification(identifiers);
                 throw diagnosticError("transition_scenario_failed", diagnostic);
             }
         }
-        retain(retainedKey, retained);
+        await retain(retainedKey, retained);
         let recovery = null;
         let nextBoundary;
         if (safeTerminal(waiter, identifiers)) {
@@ -1587,7 +1862,7 @@ async function runRenderScaleTuningLive(context) {
                     retained.traceStop = restored.evidence.traceStop;
                     retained.traceRead = restored.evidence.traceRead;
                 }
-                retain(retainedKey, retained);
+                await retain(retainedKey, retained);
                 nextBoundary = restored.boundary;
             } catch (error) {
                 const recoveryReceiptKey =
@@ -1600,8 +1875,17 @@ async function runRenderScaleTuningLive(context) {
                         error.diagnostic || null : null,
                 };
                 retained.recoveryReceiptKey = recoveryReceiptKey;
-                retain(retainedKey, retained);
+                await retain(retainedKey, retained);
                 throw error;
+            }
+        }
+        if (variant === "nvidia" && target.method === "dlss") {
+            await drainTransitionTrace(retained, retainedKey);
+            const trace = retained.traceStop.capture;
+            if (trace.duplicatedConstantsFailures > 0 || trace.evaluateFailures > 0) {
+                projection.renderVerdict = "FAIL";
+                retained.traceExecutionFailure = true;
+                await retain(retainedKey, retained);
             }
         }
         notify({
@@ -1617,6 +1901,36 @@ async function runRenderScaleTuningLive(context) {
         });
         return { boundary: nextBoundary, waiter, projection, recovery,
             sourceRecoveryReceiptKey: retained.sourceRecoveryReceiptKey };
+    }
+
+    async function drainTransitionTrace(retained, retainedKey) {
+        retained.traceReadPages = retained.traceRead ? [retained.traceRead] : [];
+        await retain(retainedKey, retained);
+        if (!retained.traceRead || !retained.traceStart || !retained.traceStop) {
+            throw new Error("trace_lifecycle_missing");
+        }
+        const first = retained.traceRead.capture;
+        // The first read uses the producer default; continuation reuses its returned bound.
+        await collectTracePages({
+            expectedBuildId: buildId,
+            expectedSessionId: retained.traceStart.capture.sessionID,
+            schema: { maximum: first.limit },
+            existingPages: retained.traceReadPages,
+            readPage: async args => {
+                const page = retained.traceReadPages.length + 1;
+                const label = `dlss-trace-page-${page}`;
+                const key = `${retainedKey}:trace-page-${page}`;
+                const steps = [toolStep(label, "communityshaders.renderscale", args)];
+                const response = await scenario(steps, key);
+                return requireScenario(response.root, steps, key).get(label);
+            },
+            preservePage: async page => {
+                retained.traceReadPages.push(page);
+                await retain(retainedKey, retained);
+            },
+        });
+        retained.traceEvidence = validateRetainedTrace(retained);
+        await retain(retainedKey, retained);
     }
 
     async function retainAmdTraceCapability() {
@@ -1636,7 +1950,7 @@ async function runRenderScaleTuningLive(context) {
             }),
             toolStep("amd-dlss-trace-read", "communityshaders.renderscale", {
                 action: "dlss_trace_read", afterSequence: 0,
-                limit: matrix.traceReadLimit, expectedBuildId: buildId,
+                expectedBuildId: buildId,
             }),
         ];
         const unavailableTraceAction = (error) => {
@@ -1811,7 +2125,7 @@ async function runRenderScaleTuningLive(context) {
             summary.error = error instanceof Error ? error.message : String(error);
             summary.failure = error && typeof error === "object" &&
                 error.diagnostic ? error.diagnostic : null;
-            retainLiveResult(summary);
+            await retainLiveResult(summary);
             return summary;
         }
     }
@@ -1868,11 +2182,16 @@ async function runRenderScaleTuningLive(context) {
                     error.message : String(error);
                 passSummary.failure = error && typeof error === "object" &&
                     error.diagnostic ? error.diagnostic : null;
-                retainLiveResult(summary);
+                await retainLiveResult(summary);
                 return summary;
             }
         }
     }
-    retainLiveResult(summary);
+    await retainLiveResult(summary);
     return summary;
+}
+
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = { runRenderScaleTuningLive, collectTracePages, traceCapacity,
+        validateTracePage, validateRetainedTrace };
 }
