@@ -668,6 +668,8 @@ function Get-ExternalDriverInventory {
                 name = $null
                 alwaysActivate = $false
                 redirectsDisplay = $false
+                isVirtualDesktop = $false
+                nullDisplayDisposition = 'not-a-display-redirector'
                 conflictsWithNullDisplay = $false
                 error = $null
             }
@@ -678,7 +680,10 @@ function Get-ExternalDriverInventory {
                     $record.name = if ($manifest.ContainsKey('name')) { [string]$manifest['name'] } else { [IO.Path]::GetFileName($root) }
                     $record.alwaysActivate = $manifest.ContainsKey('alwaysActivate') -and [bool]$manifest['alwaysActivate']
                     $record.redirectsDisplay = $manifest.ContainsKey('redirectsDisplay') -and [bool]$manifest['redirectsDisplay']
-                    $record.conflictsWithNullDisplay = [bool]$record.redirectsDisplay
+                    $normalizedName = ([string]$record.name -replace '[^A-Za-z0-9]', '').ToLowerInvariant()
+                    $record.isVirtualDesktop = $normalizedName -eq 'virtualdesktop'
+                    $record.conflictsWithNullDisplay = [bool]$record.redirectsDisplay -and -not [bool]$record.isVirtualDesktop
+                    $record.nullDisplayDisposition = if ($record.isVirtualDesktop) { 'ignored-virtual-desktop' } elseif ($record.conflictsWithNullDisplay) { 'conflict' } else { 'compatible' }
                 }
                 catch { $record.error = $_.Exception.Message }
             }
@@ -1318,14 +1323,26 @@ function Get-MO2NullAdmission {
 
     $mo2Entry = Join-Path (Split-Path -Parent $PSScriptRoot) 'mo2-control\Invoke-MO2Control.ps1'
     if (-not (Test-Path -LiteralPath $mo2Entry -PathType Leaf)) { throw "MO2 route-admission controller is missing: $mo2Entry" }
-    $arguments = @('validate', '-AccessId', $MO2AccessId, '-Profile', $MO2Profile, '-RequireClosed', '-Compact', '-NoExit')
-    if (-not [string]::IsNullOrWhiteSpace($MO2ConfigPath)) { $arguments += @('-ConfigPath', $MO2ConfigPath) }
-    $validationText = & $mo2Entry @arguments
+    $validationParameters = @{
+        AccessId = $MO2AccessId
+        Profile = $MO2Profile
+        RequireClosed = $true
+        Compact = $true
+        NoExit = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($MO2ConfigPath)) { $validationParameters['ConfigPath'] = $MO2ConfigPath }
+    $validationText = & $mo2Entry validate @validationParameters
     $validation = $validationText | ConvertFrom-Json -Depth 20 -ErrorAction Stop
-    $routeChecks = @($validation.checks | Where-Object name -eq 'runtime-route-provider')
+    $validationProperties = @($validation.PSObject.Properties.Name)
+    $validationChecks = if ($validationProperties -contains 'checks') { @($validation.checks) } else { @() }
+    $routeChecks = @($validationChecks | Where-Object name -eq 'runtime-route-provider')
     $routeId = if ($routeChecks.Count -eq 1 -and $routeChecks[0].details.runtimeRoute) { [string]$routeChecks[0].details.runtimeRoute.id } else { $null }
     if (-not $validation.ok -or $routeChecks.Count -ne 1 -or $routeChecks[0].status -ne 'pass' -or $routeId -cne 'SteamVRNull') {
-        $failures = @($validation.checks | Where-Object status -eq 'fail' | ForEach-Object message)
+        $failures = @(
+            if ($validationProperties -contains 'errors') { $validation.errors | ForEach-Object { [string]$_ } }
+            $validationChecks | Where-Object status -eq 'fail' | ForEach-Object message
+        )
+        if ($failures.Count -eq 0) { $failures = @("MO2 validation returned state '$($validation.state)' without an accepted SteamVRNull route check.") }
         throw "MO2 null-HMD admission failed for exact profile '$MO2Profile': $($failures -join '; ')"
     }
     $enabledReplacements = @($validation.data.runtimeProviders.providers | Where-Object { $_.enabled -and $_.markers.rootOpenVrApi })

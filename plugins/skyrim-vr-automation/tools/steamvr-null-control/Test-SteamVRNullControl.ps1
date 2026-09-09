@@ -123,6 +123,10 @@ try {
     Assert-Test (-not $missingAdmission.ok -and $missingAdmission.errors[0] -match 'requires -MO2AccessId and -MO2Profile') 'live null-HMD mutation refuses to bypass MO2 route admission implicitly'
     $standaloneAdmission = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestRequireMO2Admission -Standalone -WhatIf -Compact -NoExit | ConvertFrom-Json
     Assert-Test ($standaloneAdmission.ok -and $standaloneAdmission.state -eq 'dry-run' -and $standaloneAdmission.data.mo2Admission.mode -eq 'standalone') 'explicit standalone mode remains available without authorizing an MO2-backed launch'
+    $missingMO2ConfigPath = Join-Path $fixture 'missing-mo2-config.json'
+    $mo2BinderFailure = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestRequireMO2Admission -MO2AccessId 'fixture-access' -MO2Profile 'Codex' -MO2ConfigPath $missingMO2ConfigPath -WhatIf -Compact -NoExit | ConvertFrom-Json
+    $mo2BinderError = @($mo2BinderFailure.errors) -join '; '
+    Assert-Test (-not $mo2BinderFailure.ok -and $mo2BinderError -notmatch "positional parameter.*-AccessId" -and $mo2BinderError -match 'configuration was not found') 'null-HMD admission passes named parameters through the real MO2 entry-point binder'
     $poseView.Write(48, [double]0.0)
     $poseView.Write(56, [double]1.0)
     $poseView.Write(64, [double]0.0)
@@ -744,8 +748,15 @@ try {
 
     [ordered]@{ name = 'VirtualDesktop'; alwaysActivate = $true; redirectsDisplay = $true } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $externalDriverRoot 'driver.vrdrivermanifest') -Encoding utf8
     [ordered]@{ version = 1; external_drivers = @($headPoseDriverRoot, $externalDriverRoot) } | ConvertTo-Json | Set-Content -LiteralPath $openVrPathsPath -Encoding utf8
+    $virtualDesktopInspect = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json
+    $virtualDesktopRecord = @($virtualDesktopInspect.data.externalDrivers.drivers | Where-Object name -eq 'VirtualDesktop')
+    Assert-Test ($virtualDesktopInspect.ok -and $virtualDesktopInspect.state -eq 'null-configured-runtime-stopped' -and $virtualDesktopInspect.data.externalDrivers.conflicts.Count -eq 0 -and $virtualDesktopRecord.Count -eq 1 -and $virtualDesktopRecord[0].nullDisplayDisposition -eq 'ignored-virtual-desktop') 'Virtual Desktop registration is inventory evidence and never a null-HMD blocker'
+    $virtualDesktopStart = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($virtualDesktopStart.ok -and $virtualDesktopStart.state -eq 'dry-run') 'start admission ignores Virtual Desktop while retaining its inventory record'
+
+    [ordered]@{ name = 'FixtureDisplayRedirector'; alwaysActivate = $true; redirectsDisplay = $true } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $externalDriverRoot 'driver.vrdrivermanifest') -Encoding utf8
     $conflictInspect = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json
-    Assert-Test ($conflictInspect.ok -and $conflictInspect.state -eq 'external-driver-conflict' -and $conflictInspect.data.externalDrivers.conflicts[0].name -eq 'VirtualDesktop') 'inspect reports exact external display-driver conflicts'
+    Assert-Test ($conflictInspect.ok -and $conflictInspect.state -eq 'external-driver-conflict' -and $conflictInspect.data.externalDrivers.conflicts[0].name -eq 'FixtureDisplayRedirector') 'inspect reports exact non-Virtual-Desktop display-driver conflicts'
     $conflictStart = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $conflictStart.ok -and $conflictStart.state -eq 'external-driver-conflict') 'start refuses an external OpenVR display redirector'
     $conflictOverrideStart = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -AllowExternalDisplayRedirector -WhatIf -Compact -NoExit | ConvertFrom-Json
@@ -757,7 +768,7 @@ try {
 
     $openVrTextBeforeIsolation = [IO.File]::ReadAllText($openVrPathsPath)
     $isolationDry = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -IsolateExternalDisplayRedirectors -WhatIf -Compact | ConvertFrom-Json
-    Assert-Test ($isolationDry.ok -and $isolationDry.state -eq 'dry-run' -and $isolationDry.data.externalDriverIsolation.targets[0].name -eq 'VirtualDesktop') 'isolation dry-run identifies the sole exact redirector'
+    Assert-Test ($isolationDry.ok -and $isolationDry.state -eq 'dry-run' -and $isolationDry.data.externalDriverIsolation.targets[0].name -eq 'FixtureDisplayRedirector') 'isolation dry-run identifies the sole exact conflicting redirector'
     Assert-Test (-not (Test-Path -LiteralPath (Join-Path $isolationEvidence 'openvrpaths.vrpath.before'))) 'isolation dry-run creates no OpenVR registration backup'
 
     $isolatedApply = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -IsolateExternalDisplayRedirectors -Compact | ConvertFrom-Json
