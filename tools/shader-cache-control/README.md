@@ -121,6 +121,10 @@ Prepare a closed task cache immediately before launching MO2:
   -ProfilePath 'D:\MO2\profiles\Codex Task - Example\modlist.txt' `
   -ModsPath 'D:\MO2\mods' `
   -BindToOverwrite `
+  -WorkspaceId '<workspace identity>' `
+  -OwnershipId '<ownership identity>' `
+  -OwnerMarkerPath 'D:\MO2\overwrite\.codex-workspace-output-owner.json' `
+  -OwnerMarkerSha256 '<exact owner-marker SHA-256>' `
   -EvidenceDirectory 'D:\Evidence\task-id\shader-cache' `
   -ShaderCacheAbi '<exact ABI>' `
   -ShaderSourceSha256 '<exact source-tree SHA-256>' `
@@ -144,9 +148,11 @@ physical `overwrite\ShaderCache` path. After optional seeding it inventories
 all enabled providers in exact modlist priority order and copies every missing
 provider path into Overwrite. Existing Overwrite or seed files remain
 authoritative. Every copied source is checked for stability and the target is
-SHA-256 verified; complete path coverage is then written to
-`shader-cache-provider-shadow.receipt.json` together with the final prepared
-inventory and `preparedTreeSha256`. This full shadow is required because MO2
+SHA-256 verified; complete path coverage and the final `preparedInventory` are
+then written to `shader-cache-provider-shadow.receipt.json`. The task plan
+records the corresponding `preparedTreeSha256`; consumers must validate both
+artifacts and require their hashes to agree. This full shadow is required
+because MO2
 writes modifications to the original provider of an existing virtual path;
 new paths naturally use Overwrite, but existing mod paths must first be made
 Overwrite winners. `-CacheModName` remains available for older explicitly
@@ -162,7 +168,7 @@ After the game and MO2 are closed, complete the cache transaction:
 
 ```powershell
 .\Invoke-CSXShaderCacheCatalog.ps1 complete `
-  -CachePath 'D:\MO2\mods\Task Cache\ShaderCache' `
+  -CachePath 'D:\MO2\overwrite\ShaderCache' `
   -EvidenceDirectory 'D:\Evidence\task-id\shader-cache' `
   -WorkingSetStatus known-working `
   -Promote -Label 'verified task result' `

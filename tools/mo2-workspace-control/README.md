@@ -16,10 +16,13 @@ rejects reparse points. Exceeding any budget returns a bounded failure before a
 new clone is committed; the limits are configurable through the corresponding
 `-MaxProfile*` and `-TreeOperationTimeoutSeconds` parameters.
 
-`prepare-source` is now a non-mutating compatibility command. It reports
-existing Overwrite cache trees but never moves them or changes the stable
-profile. `create` snapshots the exact Overwrite `backup` tree and later cache
-`prepare` snapshots the exact Overwrite `ShaderCache` tree.
+`prepare-source` performs the one-time legacy-cache migration. With an owned
+lease and all MO2/runtime processes closed, it moves every Overwrite
+`ShaderCache`, `.previous`, and `.swap` tree into a newly enabled mod in the
+stable source profile. The operation is transactional and rejects reparse-point
+sources; `-WhatIf` reports the planned mutation without moving anything.
+`create` snapshots the exact Overwrite `backup` tree and later cache `prepare`
+snapshots the exact Overwrite `ShaderCache` tree.
 
 The task must own an MO2 access lease. MO2, Skyrim, loaders, and active
 RootBuilder deployment must be closed before `create`, `resume`, `register-mod`,
@@ -40,7 +43,10 @@ Workspaces are durably owned by `-TaskId` (or `CODEX_THREAD_ID` /
 `CODEX_TASK_ID`), not by one access lease. `create` makes and selects a fresh
 profile. `list-task` reports retained profiles. `resume` rebinds one exact
 retained workspace to a newly owned lease and selects it without refreshing it
-from the primary profile. See `../../docs/MO2-TASK-WORKSPACES.md`.
+from the primary profile. If the prior lease completed its output transaction,
+resume also publishes a fresh owner marker, snapshots, evidence paths, and
+completion paths before returning ready. See
+`../../docs/MO2-TASK-WORKSPACES.md`.
 
 Creation binds the task to MO2 Overwrite with an exact owner marker. It removes
 both the selected game executable and `Synthesis` entries from the cloned
@@ -82,7 +88,8 @@ literal command-specific `data.approval.reusablePrefix`. `create`,
 `register-mod`, and `ensure-mod-wins` are eligible for narrow reusable approval;
 `refresh-fixture`, `complete-output`, and `retire` remain one-shot because they
 replace shared metadata, restore snapshotted Overwrite state, or recursively
-remove exact owned paths. `prepare-source` is reusable because it is read-only.
+remove exact owned paths. `prepare-source` is also one-shot because it moves
+legacy shader-cache trees out of shared Overwrite state.
 
 `adopt` is also one-shot: it transfers one ready workspace from the exact
 released `-PreviousAccessId` to a distinct active lease only after closed-state,

@@ -41,7 +41,7 @@ param(
     [long]$MaxProfileBytes = 34359738368,
     [ValidateRange(5, 600)]
     [int]$TreeOperationTimeoutSeconds = 120,
-    [ValidateSet('', 'selected-profile-before-cas', 'tree-operation-deadline')]
+    [ValidateSet('', 'selected-profile-before-cas', 'tree-operation-deadline', 'owner-marker-before-claim', 'resume-interrupt-after-output-rearm')]
     [string]$InternalTestFailurePoint = '',
     [switch]$Compact,
     [switch]$NoExit
@@ -120,6 +120,127 @@ function Write-WorkspaceJsonAtomic([string]$Path, $Value) {
         [IO.File]::Move($temporary, $Path, $true)
     }
     finally { if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force } }
+}
+
+function New-WorkspaceOutputOwnerMarkerPayload($Value) {
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Value | ConvertTo-Json -Depth 12))
+    return [pscustomobject]@{ bytes = $bytes; sha256 = (Get-WorkspaceBytesSha256 -Bytes $bytes) }
+}
+
+function New-WorkspaceOutputOwnerMarker([string]$Path, $Value, $Payload = $null) {
+    $parent = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) { throw "MO2 Overwrite root does not exist: $parent" }
+    Assert-NoWorkspaceReparsePoint -Path $parent -Purpose 'MO2 Overwrite root'
+    if ($null -eq $Payload) { $Payload = New-WorkspaceOutputOwnerMarkerPayload -Value $Value }
+    $bytes = [byte[]]$Payload.bytes
+    $expectedHash = [string]$Payload.sha256
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { $stream.Dispose() }
+    if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -cne $expectedHash) {
+        throw 'MO2 Overwrite owner marker did not persist with its exact claimed bytes.'
+    }
+    return $expectedHash
+}
+
+function Assert-WorkspaceOutputOwnerMarker(
+    [string]$Path,
+    [string]$ExpectedSha256,
+    [string]$WorkspaceId,
+    [string]$OwnershipId,
+    [string]$OverwritePath
+) {
+    if ($ExpectedSha256 -notmatch '^[0-9A-Fa-f]{64}$') { throw 'Workspace output ownership lacks an exact owner-marker hash.' }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "The task-owned MO2 Overwrite marker is missing: $Path" }
+    if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -cne $ExpectedSha256) { throw 'MO2 Overwrite owner marker changed after ownership was claimed.' }
+    try { $marker = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -Depth 20 }
+    catch { throw "MO2 Overwrite owner marker is unreadable: $($_.Exception.Message)" }
+    foreach ($required in @('workspaceId', 'ownershipId', 'mode', 'overwritePath')) {
+        if (-not $marker.PSObject.Properties[$required]) { throw "MO2 Overwrite owner marker lacks '$required'." }
+    }
+    if ([string]$marker.workspaceId -cne $WorkspaceId -or
+        [string]$marker.ownershipId -cne $OwnershipId -or
+        [string]$marker.mode -cne 'mo2-overwrite-output' -or
+        -not (Test-WorkspaceSamePath ([string]$marker.overwritePath) $OverwritePath)) {
+        throw 'MO2 Overwrite owner marker belongs to a different workspace transaction.'
+    }
+    return $marker
+}
+
+function Remove-WorkspaceCreatedOutputTree([string]$Path, [string]$OverwritePath, [string]$Purpose) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $resolvedPath = [IO.Path]::GetFullPath($Path)
+    $resolvedRoot = [IO.Path]::GetFullPath($OverwritePath).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    if (-not $resolvedPath.StartsWith($resolvedRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-WorkspaceSamePath (Split-Path -Parent $resolvedPath) $resolvedRoot)) {
+        throw "$Purpose cleanup target is not an exact child of MO2 Overwrite: $resolvedPath"
+    }
+    Assert-NoWorkspaceReparsePoint -Path $resolvedPath -Purpose $Purpose
+    $inventory = Get-BoundedTreeInventory -Path $resolvedPath -Purpose "$Purpose absence restoration"
+    if ($inventory.fileCount -ne 0 -or $inventory.directoryCount -ne 0) {
+        throw "$Purpose was absent before the task but is not empty after baseline restoration."
+    }
+    Remove-Item -LiteralPath $resolvedPath -Recurse -Force
+}
+
+function Resolve-WorkspaceCommunityShadersBuildBinding([string]$ProfilePath, [string]$ModsPath, [string]$TransactionTool) {
+    $relativePluginPath = 'SKSE\Plugins\CommunityShaders.dll'
+    $providers = & $TransactionTool providers -ProfilePath $ProfilePath -ModsPath $ModsPath -RelativeCachePath $relativePluginPath -NoExit -Confirm:$false | ConvertFrom-Json -Depth 40
+    if (-not $providers.ok) { throw "Could not inspect the winning Community Shaders provider: $($providers.errors -join '; ')" }
+    $winner = $providers.data.effectiveWinnerAmongEnabledMods
+    if ($null -eq $winner -or [string]$winner.providerType -cne 'file') { throw 'The task profile has no exact enabled loose-file CommunityShaders.dll winner.' }
+    $pluginPath = [IO.Path]::GetFullPath([string]$winner.providerPath)
+    $manifestPath = Join-Path ([string]$winner.modRoot) 'SKSE\Plugins\CSX.BuildManifest.json'
+    if (-not (Test-Path -LiteralPath $pluginPath -PathType Leaf) -or -not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw 'The winning Community Shaders provider lacks its DLL or CSX.BuildManifest.json.'
+    }
+    try { $buildManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -Depth 40 }
+    catch { throw "The winning Community Shaders build manifest is invalid JSON: $($_.Exception.Message)" }
+    $buildId = if ($buildManifest.PSObject.Properties['buildId']) { [string]$buildManifest.buildId } else { '' }
+    $artifact = if ($buildManifest.PSObject.Properties['artifact']) { $buildManifest.artifact } else { $null }
+    $artifactHash = if ($null -ne $artifact -and $artifact.PSObject.Properties['sha256']) { [string]$artifact.sha256 } else { '' }
+    $artifactBytes = if ($null -ne $artifact -and $artifact.PSObject.Properties['sizeBytes']) { [long]$artifact.sizeBytes } else { -1 }
+    $identity = if ($buildManifest.PSObject.Properties['identity']) { $buildManifest.identity } else { $null }
+    $shaderCache = if ($null -ne $identity -and $identity.PSObject.Properties['shaderCache']) { $identity.shaderCache } else { $null }
+    $shaderCacheAbi = if ($null -ne $shaderCache -and $shaderCache.PSObject.Properties['abiId']) { [string]$shaderCache.abiId } else { '' }
+    if ([string]::IsNullOrWhiteSpace($buildId) -or $artifactHash -notmatch '^[0-9A-Fa-f]{64}$' -or [string]::IsNullOrWhiteSpace($shaderCacheAbi)) {
+        throw 'The winning Community Shaders build manifest lacks an exact build ID, DLL hash, or shader-cache ABI.'
+    }
+    $plugin = Get-Item -LiteralPath $pluginPath
+    $actualHash = (Get-FileHash -LiteralPath $pluginPath -Algorithm SHA256).Hash
+    if ($actualHash -cne $artifactHash -or ($artifactBytes -ge 0 -and [long]$plugin.Length -ne $artifactBytes)) {
+        throw 'The winning Community Shaders DLL does not match its build manifest.'
+    }
+    return [pscustomobject][ordered]@{
+        mode = 'mo2-winning-loose-plugin-provider'; profilePath = [string]$providers.data.profilePath
+        profileSha256 = [string]$providers.data.profileSha256; modsPath = [string]$providers.data.modsPath
+        relativePluginPath = $relativePluginPath; modName = [string]$winner.modName
+        modRoot = [string]$winner.modRoot; pluginPath = $pluginPath; manifestPath = [IO.Path]::GetFullPath($manifestPath)
+        manifestSha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+        buildId = $buildId; artifactSha256 = $actualHash; artifactBytes = [long]$plugin.Length
+        shaderCacheAbi = $shaderCacheAbi
+    }
+}
+
+function Test-WorkspaceCommunityShadersBuildBinding($Expected, $Current) {
+    if ($null -eq $Expected -or $null -eq $Current) { return $false }
+    foreach ($required in @('profilePath', 'profileSha256', 'modsPath', 'modName', 'pluginPath', 'manifestPath', 'manifestSha256', 'buildId', 'artifactSha256', 'artifactBytes', 'shaderCacheAbi')) {
+        if (-not $Expected.PSObject.Properties[$required] -or -not $Current.PSObject.Properties[$required]) { return $false }
+    }
+    return (Test-WorkspaceSamePath ([string]$Expected.profilePath) ([string]$Current.profilePath)) -and
+        [string]$Expected.profileSha256 -ceq [string]$Current.profileSha256 -and
+        (Test-WorkspaceSamePath ([string]$Expected.modsPath) ([string]$Current.modsPath)) -and
+        [string]$Expected.modName -ceq [string]$Current.modName -and
+        (Test-WorkspaceSamePath ([string]$Expected.pluginPath) ([string]$Current.pluginPath)) -and
+        (Test-WorkspaceSamePath ([string]$Expected.manifestPath) ([string]$Current.manifestPath)) -and
+        [string]$Expected.manifestSha256 -ceq [string]$Current.manifestSha256 -and
+        [string]$Expected.buildId -ceq [string]$Current.buildId -and
+        [string]$Expected.artifactSha256 -ceq [string]$Current.artifactSha256 -and
+        [long]$Expected.artifactBytes -eq [long]$Current.artifactBytes -and
+        [string]$Expected.shaderCacheAbi -ceq [string]$Current.shaderCacheAbi
 }
 
 function Get-SafeName([string]$Value) {
@@ -242,12 +363,12 @@ function Get-WorkspaceOutputInventory([string]$Path, [string]$Purpose) {
     $entries = foreach ($file in @($inventory.files)) {
         Assert-TreeOperationBudget -Purpose "$Purpose hashing"
         [pscustomobject][ordered]@{
-            relativePath = [string]$file.path
+            relativePath = ([string]$file.path).Replace('/', '\')
             bytes = [long]$file.bytes
             sha256 = (Get-FileHash -LiteralPath ([string]$file.fullPath) -Algorithm SHA256).Hash
         }
     }
-    $canonical = @($entries) | ConvertTo-Json -Depth 4 -Compress
+    $canonical = (@($entries) | ForEach-Object { '{0}|{1}|{2}' -f $_.relativePath, $_.bytes, $_.sha256 }) -join "`n"
     return [pscustomobject][ordered]@{
         path = [string]$inventory.root
         files = @($entries).Count
@@ -297,15 +418,17 @@ function Copy-WorkspaceProviderTreeShadow($ProviderResult, [string]$TargetPath, 
                 throw "$Purpose source changed during materialization: $source"
             }
             $record = [pscustomobject][ordered]@{
-                relativePath = $relative; sourceModName = [string]$provider.modName
+                relativePath = $relative; winnerClass = 'copied-provider'; sourceModName = [string]$provider.modName
                 source = $source; destination = $target; bytes = [long]$entry.bytes
                 sha256 = $sourceHashBefore
             }
             $selected.Add($relative, $record)
             if (Test-Path -LiteralPath $target -PathType Leaf) {
+                $targetItem = Get-Item -LiteralPath $target
                 $alreadyPresent.Add([pscustomobject][ordered]@{
-                    relativePath = $relative; sourceModName = [string]$provider.modName
-                    destination = $target; sha256 = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+                    relativePath = $relative; winnerClass = 'pre-existing-overwrite'
+                    destination = $target; bytes = [long]$targetItem.Length
+                    sha256 = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
                 })
                 continue
             }
@@ -340,16 +463,53 @@ function Preserve-WorkspaceRuntimeOutput(
 ) {
     $inventory = Get-WorkspaceOutputInventory -Path $Source -Purpose 'Task runtime-output preservation source'
     $target = Join-Path $EvidenceRoot 'runtime-output'
+    $staging = Join-Path $EvidenceRoot ('.runtime-output.incomplete.' + $WorkspaceId)
     $receiptPath = Join-Path $EvidenceRoot 'runtime-output-preservation.receipt.json'
     if ($WhatIf) {
         return [pscustomobject][ordered]@{
-            source = $Source; preservedPath = $target; receiptPath = $receiptPath
+            source = $Source; stagingPath = $staging; preservedPath = $target; receiptPath = $receiptPath
             inventory = $inventory; preserved = $false
         }
     }
-    if (Test-Path -LiteralPath $target) { throw "Refusing to overwrite retained runtime-output evidence: $target" }
     New-Item -ItemType Directory -Path $EvidenceRoot -Force | Out-Null
-    Copy-Item -LiteralPath $Source -Destination $target -Recurse -ErrorAction Stop
+    if (Test-Path -LiteralPath $target -PathType Container) {
+        $preserved = Get-WorkspaceOutputInventory -Path $target -Purpose 'Previously preserved task runtime-output evidence'
+        if ([string]$preserved.treeSha256 -cne [string]$inventory.treeSha256 -or
+            [int]$preserved.files -ne [int]$inventory.files -or [long]$preserved.bytes -ne [long]$inventory.bytes) {
+            throw "Retained runtime-output evidence already exists with different bytes: $target"
+        }
+    }
+    else {
+        if (-not (Test-Path -LiteralPath $staging -PathType Container)) { New-Item -ItemType Directory -Path $staging -ErrorAction Stop | Out-Null }
+        Assert-NoWorkspaceReparsePoint -Path $staging -Purpose 'Incomplete runtime-output evidence staging'
+        $sourceTree = Get-BoundedTreeInventory -Path $Source -Purpose 'Task runtime-output preservation copy'
+        $sourceByPath = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($file in @($sourceTree.files)) { $sourceByPath[[string]$file.path] = $file }
+        $stagedTree = Get-BoundedTreeInventory -Path $staging -Purpose 'Incomplete runtime-output evidence recovery'
+        foreach ($file in @($stagedTree.files)) {
+            $relative = [string]$file.path
+            if (-not $sourceByPath.ContainsKey($relative) -or
+                (Get-FileHash -LiteralPath ([string]$file.fullPath) -Algorithm SHA256).Hash -cne
+                    (Get-FileHash -LiteralPath ([string]$sourceByPath[$relative].fullPath) -Algorithm SHA256).Hash) {
+                throw "Incomplete runtime-output staging contains unverified bytes; retain or remove this exact task-owned path before retry: $staging"
+            }
+        }
+        foreach ($directory in @($sourceTree.directories)) {
+            New-Item -ItemType Directory -Path (Join-Path $staging ([string]$directory.path)) -Force | Out-Null
+        }
+        foreach ($file in @($sourceTree.files)) {
+            $destination = Join-Path $staging ([string]$file.path)
+            if (Test-Path -LiteralPath $destination -PathType Leaf) { continue }
+            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+            Copy-Item -LiteralPath ([string]$file.fullPath) -Destination $destination -ErrorAction Stop
+        }
+        $staged = Get-WorkspaceOutputInventory -Path $staging -Purpose 'Staged task runtime-output evidence'
+        if ([string]$staged.treeSha256 -cne [string]$inventory.treeSha256 -or
+            [int]$staged.files -ne [int]$inventory.files -or [long]$staged.bytes -ne [long]$inventory.bytes) {
+            throw "Incomplete runtime-output staging did not verify; it remains resumable at: $staging"
+        }
+        [IO.Directory]::Move($staging, $target)
+    }
     $preserved = Get-WorkspaceOutputInventory -Path $target -Purpose 'Preserved task runtime-output evidence'
     if ([string]$preserved.treeSha256 -cne [string]$inventory.treeSha256 -or
         [int]$preserved.files -ne [int]$inventory.files -or
@@ -363,7 +523,7 @@ function Preserve-WorkspaceRuntimeOutput(
     }
     Write-WorkspaceJsonAtomic -Path $receiptPath -Value $receipt
     return [pscustomobject][ordered]@{
-        source = $Source; preservedPath = $target; receiptPath = $receiptPath
+        source = $Source; stagingPath = $staging; preservedPath = $target; receiptPath = $receiptPath
         inventory = $inventory; preserved = $true
     }
 }
@@ -379,23 +539,189 @@ function Get-WorkspaceBlockingProcessNames($Config) {
     return $names
 }
 
+function Get-WorkspaceCacheCompletionEvidence($Config, $Workspace, [switch]$RequireOwnerMarker) {
+    $output = $Workspace.data.runtimeOutput
+    if ([string]$output.mode -cne 'mo2-overwrite-output') { throw 'Workspace does not use the MO2 Overwrite output contract.' }
+    if ($RequireOwnerMarker) {
+        $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$output.overwritePath)
+    }
+    foreach ($path in @([string]$output.cachePlanPath, [string]$output.cacheCompletionPath)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required shader-cache evidence is missing: $path" }
+    }
+    $plan = Get-Content -LiteralPath ([string]$output.cachePlanPath) -Raw | ConvertFrom-Json -Depth 40
+    $completion = Get-Content -LiteralPath ([string]$output.cacheCompletionPath) -Raw | ConvertFrom-Json -Depth 40
+    foreach ($property in @('state', 'cachePath', 'beforeTreeSha256', 'cacheBinding', 'workingTreeInventory', 'transactionId')) {
+        if (-not $plan.PSObject.Properties[$property]) { throw "Shader-cache plan lacks required field '$property'." }
+    }
+    foreach ($property in @('state', 'planPath', 'cacheBinding', 'workingTree', 'restoredTreeSha256')) {
+        if (-not $completion.PSObject.Properties[$property]) { throw "Shader-cache completion lacks required field '$property'." }
+    }
+    $binding = $plan.cacheBinding
+    $completionBinding = $completion.cacheBinding
+    foreach ($property in @('mode', 'profilePath', 'profileSha256', 'modsPath', 'overwriteRoot', 'cachePath', 'workspaceId', 'ownershipId', 'ownerMarkerPath', 'ownerMarkerSha256', 'communityShadersPlugin')) {
+        if ($null -eq $binding -or -not $binding.PSObject.Properties[$property] -or
+            $null -eq $completionBinding -or -not $completionBinding.PSObject.Properties[$property]) {
+            throw "Shader-cache ownership binding lacks required field '$property'."
+        }
+    }
+    foreach ($pathProperty in @('profilePath', 'modsPath', 'overwriteRoot', 'cachePath', 'ownerMarkerPath')) {
+        if (-not (Test-WorkspaceSamePath ([string]$binding.$pathProperty) ([string]$completionBinding.$pathProperty))) {
+            throw "Shader-cache completion changed binding path '$pathProperty'."
+        }
+    }
+    foreach ($identityProperty in @('mode', 'profileSha256', 'workspaceId', 'ownershipId', 'ownerMarkerSha256')) {
+        if ([string]$binding.$identityProperty -cne [string]$completionBinding.$identityProperty) {
+            throw "Shader-cache completion changed binding identity '$identityProperty'."
+        }
+    }
+    $modListPath = Join-Path ([string]$Workspace.data.profilePath) 'modlist.txt'
+    if ([string]$plan.state -cne 'restored' -or [string]$completion.state -cne 'complete' -or
+        -not (Test-WorkspaceSamePath ([string]$completion.planPath) ([string]$output.cachePlanPath)) -or
+        -not (Test-WorkspaceSamePath ([string]$plan.cachePath) ([string]$output.cachePath)) -or
+        [string]$completion.restoredTreeSha256 -cne [string]$plan.beforeTreeSha256 -or
+        [string]$binding.mode -cne 'mo2-overwrite-output' -or
+        -not (Test-WorkspaceSamePath ([string]$binding.profilePath) $modListPath) -or
+        -not (Test-WorkspaceSamePath ([string]$binding.modsPath) ([string]$Config.mo2.modsDirectory)) -or
+        -not (Test-WorkspaceSamePath ([string]$binding.overwriteRoot) ([string]$output.overwritePath)) -or
+        -not (Test-WorkspaceSamePath ([string]$binding.cachePath) ([string]$output.cachePath)) -or
+        [string]$binding.workspaceId -cne [string]$Workspace.data.workspaceId -or
+        [string]$binding.ownershipId -cne [string]$Workspace.data.ownershipId -or
+        -not (Test-WorkspaceSamePath ([string]$binding.ownerMarkerPath) ([string]$output.ownerMarkerPath)) -or
+        [string]$binding.ownerMarkerSha256 -cne [string]$output.ownerMarkerSha256) {
+        throw 'Shader-cache completion does not close the exact workspace-owned plan.'
+    }
+    foreach ($property in @('inventory', 'materializedFiles', 'preservedPath')) {
+        if ($null -eq $completion.workingTree -or -not $completion.workingTree.PSObject.Properties[$property]) { throw "Shader-cache working-tree evidence lacks '$property'." }
+    }
+    if ([int]$completion.workingTree.materializedFiles -lt 1 -or -not (Test-Path -LiteralPath ([string]$completion.workingTree.preservedPath) -PathType Container)) {
+        throw 'Shader-cache completion does not retain generated task output.'
+    }
+    $preserved = Get-WorkspaceOutputInventory -Path ([string]$completion.workingTree.preservedPath) -Purpose 'Preserved shader-cache task output'
+    if ([string]$preserved.treeSha256 -cne [string]$completion.workingTree.inventory.treeSha256) {
+        throw 'Preserved shader-cache task output changed after completion.'
+    }
+    $transactionTool = Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'
+    $currentBuild = Resolve-WorkspaceCommunityShadersBuildBinding -ProfilePath $modListPath -ModsPath ([string]$Config.mo2.modsDirectory) -TransactionTool $transactionTool
+    if (-not (Test-WorkspaceCommunityShadersBuildBinding -Expected $output.communityShadersPlugin -Current $currentBuild) -or
+        -not (Test-WorkspaceCommunityShadersBuildBinding -Expected $binding.communityShadersPlugin -Current $currentBuild) -or
+        -not (Test-WorkspaceCommunityShadersBuildBinding -Expected $completionBinding.communityShadersPlugin -Current $currentBuild)) {
+        throw 'Shader-cache completion belongs to a different Community Shaders build identity.'
+    }
+    if (Test-Path -LiteralPath ([string]$output.cachePath) -PathType Container) {
+        $restored = Get-WorkspaceOutputInventory -Path ([string]$output.cachePath) -Purpose 'Restored MO2 Overwrite ShaderCache'
+        if ([string]$restored.treeSha256 -cne [string]$completion.restoredTreeSha256) { throw 'The restored ShaderCache tree changed after completion.' }
+    }
+    elseif ([bool]$output.cachePathExistedBefore) { throw 'The pre-existing MO2 Overwrite ShaderCache is missing after completion.' }
+    return [pscustomobject][ordered]@{ plan = $plan; completion = $completion; build = $currentBuild }
+}
+
 function Complete-WorkspaceBackupOutput($Config, $Workspace, [switch]$WhatIf) {
     $output = $Workspace.data.runtimeOutput
     if ([string]$output.mode -cne 'mo2-overwrite-output') { throw 'Workspace does not use the MO2 Overwrite output contract.' }
+    $markerExists = Test-Path -LiteralPath ([string]$output.ownerMarkerPath) -PathType Leaf
+    $cacheEvidence = Get-WorkspaceCacheCompletionEvidence -Config $Config -Workspace $Workspace -RequireOwnerMarker:$markerExists
     $completionPath = [string]$output.backupCompletionPath
     if (Test-Path -LiteralPath $completionPath -PathType Leaf) {
-        $existing = Get-Content -LiteralPath $completionPath -Raw | ConvertFrom-Json
+        $existing = Get-Content -LiteralPath $completionPath -Raw | ConvertFrom-Json -Depth 40
+        foreach ($property in @('state', 'workspaceId', 'ownershipId', 'ownerMarkerSha256', 'backupPath', 'backupPlanPath', 'cachePlanTransactionId', 'pathExistedBefore', 'workingTree', 'preservedPath', 'restoredTreeSha256', 'communityShadersPlugin')) {
+            if (-not $existing.PSObject.Properties[$property]) { throw "Existing backup completion lacks required field '$property'." }
+        }
         if ([string]$existing.state -cne 'complete' -or
-            -not (Test-WorkspaceSamePath ([string]$existing.backupPath) ([string]$output.backupPath))) {
+            [string]$existing.workspaceId -cne [string]$Workspace.data.workspaceId -or
+            [string]$existing.ownershipId -cne [string]$Workspace.data.ownershipId -or
+            [string]$existing.ownerMarkerSha256 -cne [string]$output.ownerMarkerSha256 -or
+            -not (Test-WorkspaceSamePath ([string]$existing.backupPath) ([string]$output.backupPath)) -or
+            -not (Test-WorkspaceSamePath ([string]$existing.backupPlanPath) ([string]$output.backupPlanPath)) -or
+            [string]$existing.cachePlanTransactionId -cne [string]$cacheEvidence.plan.transactionId -or
+            [bool]$existing.pathExistedBefore -ne [bool]$output.backupPathExistedBefore -or
+            -not (Test-WorkspaceCommunityShadersBuildBinding -Expected $output.communityShadersPlugin -Current $existing.communityShadersPlugin)) {
             throw "Existing backup completion does not close this workspace output transaction: $completionPath"
         }
-        if (-not $WhatIf -and (Test-Path -LiteralPath ([string]$output.ownerMarkerPath) -PathType Leaf)) {
-            if ((Get-FileHash -LiteralPath ([string]$output.ownerMarkerPath) -Algorithm SHA256).Hash -cne [string]$output.ownerMarkerSha256) { throw 'MO2 Overwrite owner marker changed before output completion.' }
+        if (-not (Test-Path -LiteralPath ([string]$existing.preservedPath) -PathType Container)) { throw 'Existing backup completion lost its preserved task output.' }
+        $preserved = Get-WorkspaceOutputInventory -Path ([string]$existing.preservedPath) -Purpose 'Preserved backup task output'
+        if ([string]$preserved.treeSha256 -cne [string]$existing.workingTree.treeSha256) { throw 'Preserved backup task output changed after completion.' }
+        if (Test-Path -LiteralPath ([string]$output.backupPath) -PathType Container) {
+            $liveBackup = Get-WorkspaceOutputInventory -Path ([string]$output.backupPath) -Purpose 'Restored MO2 Overwrite backup'
+            if ([string]$liveBackup.treeSha256 -cne [string]$existing.restoredTreeSha256) { throw 'The restored backup tree changed after completion.' }
+        }
+        elseif ([bool]$output.backupPathExistedBefore) { throw 'The pre-existing MO2 Overwrite backup is missing after completion.' }
+        if (-not $WhatIf -and $markerExists) {
+            if (-not [bool]$output.backupPathExistedBefore) {
+                $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$output.overwritePath)
+                Remove-WorkspaceCreatedOutputTree -Path ([string]$output.backupPath) -OverwritePath ([string]$output.overwritePath) -Purpose 'Task-created backup tree'
+            }
+            if (-not [bool]$output.cachePathExistedBefore) {
+                $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$output.overwritePath)
+                Remove-WorkspaceCreatedOutputTree -Path ([string]$output.cachePath) -OverwritePath ([string]$output.overwritePath) -Purpose 'Task-created ShaderCache tree'
+            }
+            $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$output.overwritePath)
             Remove-Item -LiteralPath ([string]$output.ownerMarkerPath) -Force
         }
         return $existing
     }
+    if (-not $markerExists) { throw 'The task-owned MO2 Overwrite marker is missing before backup completion.' }
+    $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$output.overwritePath)
+    if (-not $output.PSObject.Properties['backupPlanPath'] -or -not (Test-Path -LiteralPath ([string]$output.backupPlanPath) -PathType Leaf)) { throw 'The workspace backup plan is missing.' }
+    $backupPlan = Get-Content -LiteralPath ([string]$output.backupPlanPath) -Raw | ConvertFrom-Json -Depth 40
+    foreach ($property in @('state', 'workspaceId', 'ownershipId', 'ownerMarkerPath', 'ownerMarkerSha256', 'overwritePath', 'backupPath', 'pathExistedBefore', 'profilePath', 'profileSha256', 'modsPath', 'communityShadersPlugin', 'transactionReceiptPath', 'beforeTreeSha256', 'preparedTreeSha256', 'shadowReceipt')) {
+        if (-not $backupPlan.PSObject.Properties[$property]) { throw "Workspace backup plan lacks required field '$property'." }
+    }
+    $modListPath = Join-Path ([string]$Workspace.data.profilePath) 'modlist.txt'
+    if ([string]$backupPlan.state -notin @('prepared', 'completing', 'restored') -or
+        [string]$backupPlan.workspaceId -cne [string]$Workspace.data.workspaceId -or
+        [string]$backupPlan.ownershipId -cne [string]$Workspace.data.ownershipId -or
+        -not (Test-WorkspaceSamePath ([string]$backupPlan.ownerMarkerPath) ([string]$output.ownerMarkerPath)) -or
+        [string]$backupPlan.ownerMarkerSha256 -cne [string]$output.ownerMarkerSha256 -or
+        -not (Test-WorkspaceSamePath ([string]$backupPlan.overwritePath) ([string]$output.overwritePath)) -or
+        -not (Test-WorkspaceSamePath ([string]$backupPlan.backupPath) ([string]$output.backupPath)) -or
+        [bool]$backupPlan.pathExistedBefore -ne [bool]$output.backupPathExistedBefore -or
+        -not (Test-WorkspaceSamePath ([string]$backupPlan.profilePath) $modListPath) -or
+        -not (Test-WorkspaceSamePath ([string]$backupPlan.modsPath) ([string]$Config.mo2.modsDirectory)) -or
+        -not (Test-WorkspaceCommunityShadersBuildBinding -Expected $output.communityShadersPlugin -Current $backupPlan.communityShadersPlugin)) {
+        throw 'Workspace backup plan does not bind the exact current owner, profile, path, and build.'
+    }
+    $planShadow = $backupPlan.shadowReceipt
+    $manifestShadow = if ($output.PSObject.Properties['shadowReceipt']) { $output.shadowReceipt } else { $null }
+    foreach ($property in @('bindingMode', 'profilePath', 'profileSha256', 'targetPath', 'workspaceId', 'ownershipId', 'ownerMarkerPath', 'ownerMarkerSha256', 'transactionReceiptPath', 'beforeTreeSha256', 'preparedInventory', 'communityShadersPlugin')) {
+        if ($null -eq $planShadow -or -not $planShadow.PSObject.Properties[$property] -or
+            $null -eq $manifestShadow -or -not $manifestShadow.PSObject.Properties[$property]) {
+            throw "Workspace backup provider evidence lacks required field '$property'."
+        }
+    }
+    if ($null -eq $planShadow.preparedInventory -or -not $planShadow.preparedInventory.PSObject.Properties['treeSha256']) {
+        throw "Workspace backup provider evidence lacks required field 'preparedInventory.treeSha256'."
+    }
+    if ([string]$planShadow.bindingMode -cne 'mo2-overwrite-output' -or
+        -not (Test-WorkspaceSamePath ([string]$planShadow.profilePath) ([string]$backupPlan.profilePath)) -or
+        [string]$planShadow.profileSha256 -cne [string]$backupPlan.profileSha256 -or
+        -not (Test-WorkspaceSamePath ([string]$planShadow.targetPath) ([string]$backupPlan.backupPath)) -or
+        [string]$planShadow.workspaceId -cne [string]$backupPlan.workspaceId -or
+        [string]$planShadow.ownershipId -cne [string]$backupPlan.ownershipId -or
+        -not (Test-WorkspaceSamePath ([string]$planShadow.ownerMarkerPath) ([string]$backupPlan.ownerMarkerPath)) -or
+        [string]$planShadow.ownerMarkerSha256 -cne [string]$backupPlan.ownerMarkerSha256 -or
+        -not (Test-WorkspaceSamePath ([string]$planShadow.transactionReceiptPath) ([string]$backupPlan.transactionReceiptPath)) -or
+        [string]$planShadow.beforeTreeSha256 -cne [string]$backupPlan.beforeTreeSha256 -or
+        [string]$planShadow.preparedInventory.treeSha256 -cne [string]$backupPlan.preparedTreeSha256 -or
+        ($planShadow | ConvertTo-Json -Depth 40 -Compress) -cne ($manifestShadow | ConvertTo-Json -Depth 40 -Compress) -or
+        -not (Test-WorkspaceCommunityShadersBuildBinding -Expected $backupPlan.communityShadersPlugin -Current $planShadow.communityShadersPlugin)) {
+        throw 'Workspace backup provider evidence changed after the exact owner-bound plan was published.'
+    }
+    if (-not (Test-Path -LiteralPath ([string]$backupPlan.transactionReceiptPath) -PathType Leaf)) { throw 'Workspace backup snapshot receipt is missing.' }
+    $snapshotReceipt = Get-Content -LiteralPath ([string]$backupPlan.transactionReceiptPath) -Raw | ConvertFrom-Json -Depth 20
+    foreach ($property in @('operation', 'transactionId', 'cachePath', 'beforeTreeSha256')) {
+        if (-not $snapshotReceipt.PSObject.Properties[$property]) { throw "Workspace backup snapshot receipt lacks required field '$property'." }
+    }
+    if ([string]$snapshotReceipt.operation -cne 'snapshot' -or [string]::IsNullOrWhiteSpace([string]$snapshotReceipt.transactionId) -or
+        -not (Test-WorkspaceSamePath ([string]$snapshotReceipt.cachePath) ([string]$backupPlan.backupPath)) -or
+        [string]$snapshotReceipt.beforeTreeSha256 -cne [string]$backupPlan.beforeTreeSha256) {
+        throw 'Workspace backup snapshot receipt no longer binds the exact backup plan.'
+    }
     $transactionTool = Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'
+    $currentBuild = Resolve-WorkspaceCommunityShadersBuildBinding -ProfilePath $modListPath -ModsPath ([string]$Config.mo2.modsDirectory) -TransactionTool $transactionTool
+    if ([string]$currentBuild.profileSha256 -cne [string]$backupPlan.profileSha256 -or
+        -not (Test-WorkspaceCommunityShadersBuildBinding -Expected $backupPlan.communityShadersPlugin -Current $currentBuild)) {
+        throw 'Workspace backup plan build or profile identity changed before completion.'
+    }
     $blockingProcessNames = @(Get-WorkspaceBlockingProcessNames -Config $Config)
     $current = & $transactionTool inspect -CachePath ([string]$output.backupPath) -RelativeCachePath 'backup' -NoExit -Confirm:$false | ConvertFrom-Json
     if (-not $current.ok) { throw "Could not inspect current MO2 Overwrite backup: $($current.errors -join '; ')" }
@@ -405,22 +731,265 @@ function Complete-WorkspaceBackupOutput($Config, $Workspace, [switch]$WhatIf) {
             workingTree = $current.data; completionPath = $completionPath
         }
     }
-    $restored = & $transactionTool restore -CachePath ([string]$output.backupPath) -RelativeCachePath 'backup' -EvidenceDirectory ([string]$output.backupEvidenceDirectory) -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
-    if (-not $restored.ok) { throw "Could not restore the exact pre-task MO2 Overwrite backup: $($restored.errors -join '; ')" }
+    if ($null -eq $backupPlan.workingTreeInventory) {
+        $backupPlan.workingTreeInventory = $current.data
+        $backupPlan.state = 'completing'
+        $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$output.overwritePath)
+        Write-WorkspaceJsonAtomic -Path ([string]$output.backupPlanPath) -Value $backupPlan
+    }
+    elseif ([string]$current.data.treeSha256 -cne [string]$backupPlan.workingTreeInventory.treeSha256 -and
+        [string]$current.data.treeSha256 -cne [string]$backupPlan.beforeTreeSha256) {
+        throw 'Live backup matches neither the recorded working tree nor the preserved baseline.'
+    }
+    $restored = $null
+    if ([string]$current.data.treeSha256 -ceq [string]$backupPlan.beforeTreeSha256) {
+        $restoreMatches = @(Get-ChildItem -LiteralPath ([string]$output.backupEvidenceDirectory) -Filter 'shader-cache-restore.*.receipt.json' -File | ForEach-Object {
+            $receipt = Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json -Depth 30
+            if ([string]$receipt.cachePath -ceq [string]$output.backupPath -and
+                [string]$receipt.restoredTreeSha256 -ceq [string]$backupPlan.beforeTreeSha256 -and
+                [string]$receipt.displacedTreeSha256 -ceq [string]$backupPlan.workingTreeInventory.treeSha256) {
+                [pscustomobject]@{ path = $_.FullName; receipt = $receipt }
+            }
+        })
+        if ($restoreMatches.Count -ne 1) { throw 'Restored backup lacks one exact committed restore receipt for its preserved working tree.' }
+        $restored = [pscustomobject]@{ data = [pscustomobject]@{ displacedPath = [string]$restoreMatches[0].receipt.displacedPath; baseline = [pscustomobject]@{ treeSha256 = [string]$restoreMatches[0].receipt.restoredTreeSha256 }; restoreReceiptPath = [string]$restoreMatches[0].path } }
+    }
+    else {
+        $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$output.overwritePath)
+        $restored = & $transactionTool restore -CachePath ([string]$output.backupPath) -RelativeCachePath 'backup' -EvidenceDirectory ([string]$output.backupEvidenceDirectory) -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
+        if (-not $restored.ok) { throw "Could not restore the exact pre-task MO2 Overwrite backup: $($restored.errors -join '; ')" }
+    }
+    $preserved = Get-WorkspaceOutputInventory -Path ([string]$restored.data.displacedPath) -Purpose 'Preserved backup task output'
+    if ([string]$preserved.treeSha256 -cne [string]$backupPlan.workingTreeInventory.treeSha256) { throw 'Preserved backup task output differs from the recorded working tree.' }
+    $backupPlan.state = 'restored'; $backupPlan.restoreReceiptPath = [string]$restored.data.restoreReceiptPath
+    $backupPlan.restoredTreeSha256 = [string]$restored.data.baseline.treeSha256
+    $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$output.overwritePath)
+    Write-WorkspaceJsonAtomic -Path ([string]$output.backupPlanPath) -Value $backupPlan
     $completion = [pscustomobject][ordered]@{
         contractVersion = '1.0.0'; state = 'complete'; completedUtc = [DateTime]::UtcNow.ToString('o')
-        workspaceId = [string]$Workspace.data.workspaceId; backupPath = [string]$output.backupPath
-        workingTree = $current.data; preservedPath = [string]$restored.data.displacedPath
+        workspaceId = [string]$Workspace.data.workspaceId; ownershipId = [string]$Workspace.data.ownershipId
+        ownerMarkerSha256 = [string]$output.ownerMarkerSha256; backupPath = [string]$output.backupPath
+        backupPlanPath = [string]$output.backupPlanPath; cachePlanTransactionId = [string]$cacheEvidence.plan.transactionId
+        pathExistedBefore = [bool]$output.backupPathExistedBefore; communityShadersPlugin = $currentBuild
+        workingTree = $backupPlan.workingTreeInventory; preservedPath = [string]$restored.data.displacedPath
         restoredTreeSha256 = [string]$restored.data.baseline.treeSha256
         restoreReceiptPath = [string]$restored.data.restoreReceiptPath
     }
+    $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$output.overwritePath)
     Write-WorkspaceJsonAtomic -Path $completionPath -Value $completion
-    if (-not (Test-Path -LiteralPath ([string]$output.ownerMarkerPath) -PathType Leaf) -or
-        (Get-FileHash -LiteralPath ([string]$output.ownerMarkerPath) -Algorithm SHA256).Hash -cne [string]$output.ownerMarkerSha256) {
-        throw 'MO2 Overwrite owner marker changed before output completion.'
+    if (-not [bool]$output.backupPathExistedBefore) {
+        $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$output.overwritePath)
+        Remove-WorkspaceCreatedOutputTree -Path ([string]$output.backupPath) -OverwritePath ([string]$output.overwritePath) -Purpose 'Task-created backup tree'
     }
+    if (-not [bool]$output.cachePathExistedBefore) {
+        $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$output.overwritePath)
+        Remove-WorkspaceCreatedOutputTree -Path ([string]$output.cachePath) -OverwritePath ([string]$output.overwritePath) -Purpose 'Task-created ShaderCache tree'
+    }
+    $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$output.overwritePath)
     Remove-Item -LiteralPath ([string]$output.ownerMarkerPath) -Force
     return $completion
+}
+
+function Undo-RearmedWorkspaceRuntimeOutput($Config, $Workspace, $Output) {
+    $errors = [Collections.Generic.List[string]]::new()
+    $transactionTool = Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'
+    $blockingProcessNames = @(Get-WorkspaceBlockingProcessNames -Config $Config)
+    if ($Output -and (Test-Path -LiteralPath ([string]$Output.ownerMarkerPath) -PathType Leaf)) {
+        try {
+            $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$Output.ownerMarkerPath) -ExpectedSha256 ([string]$Output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$Output.overwritePath)
+            $restored = & $transactionTool restore -CachePath ([string]$Output.backupPath) -RelativeCachePath 'backup' -EvidenceDirectory ([string]$Output.backupEvidenceDirectory) -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
+            if (-not $restored.ok) { throw ($restored.errors -join '; ') }
+            if (-not [bool]$Output.backupPathExistedBefore) { Remove-WorkspaceCreatedOutputTree -Path ([string]$Output.backupPath) -OverwritePath ([string]$Output.overwritePath) -Purpose 'Rearmed task-created backup tree' }
+            if (-not [bool]$Output.cachePathExistedBefore) { Remove-WorkspaceCreatedOutputTree -Path ([string]$Output.cachePath) -OverwritePath ([string]$Output.overwritePath) -Purpose 'Rearmed task-created ShaderCache tree' }
+            Remove-Item -LiteralPath ([string]$Output.ownerMarkerPath) -Force
+        }
+        catch { $errors.Add($_.Exception.Message) }
+    }
+    return @($errors)
+}
+
+function Undo-JournaledRuntimeOutputRearm($Config, [string]$WorkspaceId, [string]$OwnershipId, $Rearm) {
+    $overwriteRoot = [IO.Path]::GetFullPath([string]$Config.mo2.overwriteDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $overwritePath = [IO.Path]::GetFullPath([string]$Rearm['overwritePath']).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    if (-not (Test-WorkspaceSamePath $overwritePath $overwriteRoot)) { throw 'Runtime-output rearm targets a different MO2 Overwrite root.' }
+    $cachePath = Assert-WorkspaceRecoveryPath -Path ([string]$Rearm['cachePath']) -Root $overwriteRoot -Purpose 'Runtime-output rearm ShaderCache path'
+    $backupPath = Assert-WorkspaceRecoveryPath -Path ([string]$Rearm['backupPath']) -Root $overwriteRoot -Purpose 'Runtime-output rearm backup path'
+    $markerPath = Assert-WorkspaceRecoveryPath -Path ([string]$Rearm['ownerMarkerPath']) -Root $overwriteRoot -Purpose 'Runtime-output rearm owner marker'
+    $evidenceRoot = Assert-WorkspaceRecoveryPath -Path ([string]$Rearm['backupEvidenceDirectory']) -Root (Get-WorkspaceControlRoot -Config $Config) -Purpose 'Runtime-output rearm backup evidence'
+    $markerExists = Test-Path -LiteralPath $markerPath -PathType Leaf
+    $receiptPath = Join-Path $evidenceRoot 'shader-cache-transaction.receipt.json'
+    $snapshotExists = Test-Path -LiteralPath $receiptPath -PathType Leaf
+    if (-not $markerExists) {
+        if ($snapshotExists -or [string]$Rearm['state'] -cne 'prepared') {
+            throw 'Interrupted runtime-output rearm lost its owner marker after mutation began.'
+        }
+        return
+    }
+    $null = Assert-WorkspaceOutputOwnerMarker -Path $markerPath -ExpectedSha256 ([string]$Rearm['ownerMarkerSha256']) -WorkspaceId $WorkspaceId -OwnershipId $OwnershipId -OverwritePath $overwriteRoot
+    if ($snapshotExists) {
+        $transactionTool = Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'
+        $blockingProcessNames = @(Get-WorkspaceBlockingProcessNames -Config $Config)
+        $restored = & $transactionTool restore -CachePath $backupPath -RelativeCachePath 'backup' -EvidenceDirectory $evidenceRoot -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
+        if (-not $restored.ok) { throw "Interrupted runtime-output rearm backup recovery failed: $($restored.errors -join '; ')" }
+    }
+    if (-not [bool]$Rearm['backupPathExistedBefore'] -and (Test-Path -LiteralPath $backupPath)) {
+        $null = Assert-WorkspaceOutputOwnerMarker -Path $markerPath -ExpectedSha256 ([string]$Rearm['ownerMarkerSha256']) -WorkspaceId $WorkspaceId -OwnershipId $OwnershipId -OverwritePath $overwriteRoot
+        Remove-WorkspaceCreatedOutputTree -Path $backupPath -OverwritePath $overwriteRoot -Purpose 'Interrupted rearmed backup tree'
+    }
+    if (-not [bool]$Rearm['cachePathExistedBefore'] -and (Test-Path -LiteralPath $cachePath)) {
+        $null = Assert-WorkspaceOutputOwnerMarker -Path $markerPath -ExpectedSha256 ([string]$Rearm['ownerMarkerSha256']) -WorkspaceId $WorkspaceId -OwnershipId $OwnershipId -OverwritePath $overwriteRoot
+        Remove-WorkspaceCreatedOutputTree -Path $cachePath -OverwritePath $overwriteRoot -Purpose 'Interrupted rearmed ShaderCache tree'
+    }
+    $null = Assert-WorkspaceOutputOwnerMarker -Path $markerPath -ExpectedSha256 ([string]$Rearm['ownerMarkerSha256']) -WorkspaceId $WorkspaceId -OwnershipId $OwnershipId -OverwritePath $overwriteRoot
+    Remove-Item -LiteralPath $markerPath -Force
+}
+
+function New-RearmedWorkspaceRuntimeOutput($Config, $Workspace, [string]$OperationId, $Journal, [string]$JournalPath) {
+    $old = $Workspace.data.runtimeOutput
+    if ([string]$old.mode -cne 'mo2-overwrite-output') { throw 'Only MO2 Overwrite output transactions can be rearmed.' }
+    if (Test-Path -LiteralPath ([string]$old.ownerMarkerPath) -PathType Leaf) { throw 'A retained workspace still owns an active MO2 Overwrite transaction; complete it before resuming.' }
+    foreach ($completionPath in @([string]$old.cacheCompletionPath, [string]$old.backupCompletionPath)) {
+        if (-not (Test-Path -LiteralPath $completionPath -PathType Leaf)) { throw "Retained workspace output is incomplete and cannot be rearmed: $completionPath" }
+    }
+    $cacheCompletion = Get-Content -LiteralPath ([string]$old.cacheCompletionPath) -Raw | ConvertFrom-Json -Depth 40
+    $backupCompletion = Get-Content -LiteralPath ([string]$old.backupCompletionPath) -Raw | ConvertFrom-Json -Depth 40
+    foreach ($completion in @($cacheCompletion, $backupCompletion)) {
+        if (-not $completion.PSObject.Properties['state'] -or [string]$completion.state -cne 'complete' -or
+            -not $completion.PSObject.Properties['restoredTreeSha256']) {
+            throw 'Retained workspace output completion is not terminal and restorable.'
+        }
+    }
+    if ($null -eq $cacheCompletion.cacheBinding -or
+        [string]$cacheCompletion.cacheBinding.workspaceId -cne [string]$Workspace.data.workspaceId -or
+        [string]$cacheCompletion.cacheBinding.ownershipId -cne [string]$Workspace.data.ownershipId -or
+        [string]$backupCompletion.workspaceId -cne [string]$Workspace.data.workspaceId -or
+        [string]$backupCompletion.ownershipId -cne [string]$Workspace.data.ownershipId) {
+        throw 'Retained workspace output completions belong to a different workspace owner.'
+    }
+
+    $workspaceId = [string]$Workspace.data.workspaceId
+    $ownershipId = [string]$Workspace.data.ownershipId
+    $ownerTaskId = [string]$Workspace.data.ownerTaskId
+    $profilePath = [IO.Path]::GetFullPath([string]$Workspace.data.profilePath)
+    $modListPath = Join-Path $profilePath 'modlist.txt'
+    $modsRoot = [IO.Path]::GetFullPath([string]$Config.mo2.modsDirectory)
+    $overwritePath = [IO.Path]::GetFullPath([string]$old.overwritePath)
+    $cachePath = Join-Path $overwritePath 'ShaderCache'
+    $backupPath = Join-Path $overwritePath 'backup'
+    $markerPath = Join-Path $overwritePath '.codex-workspace-output-owner.json'
+    $evidenceRoot = Join-Path (Split-Path -Parent $Workspace.path) ($workspaceId + '-output-' + $OperationId)
+    $cacheEvidence = Join-Path $evidenceRoot 'shader-cache'
+    $backupEvidence = Join-Path $evidenceRoot 'backup'
+    $transactionTool = Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'
+    $blockingProcessNames = @(Get-WorkspaceBlockingProcessNames -Config $Config)
+    $cacheExisted = Test-Path -LiteralPath $cachePath -PathType Container
+    $backupExisted = Test-Path -LiteralPath $backupPath -PathType Container
+    $markerCreated = $false
+    $backupSnapshotted = $false
+    $output = $null
+    try {
+        foreach ($path in @($cachePath, $backupPath)) {
+            if ((Test-Path -LiteralPath $path) -and -not (Test-Path -LiteralPath $path -PathType Container)) { throw "MO2 Overwrite output path is not a directory: $path" }
+        }
+        $build = Resolve-WorkspaceCommunityShadersBuildBinding -ProfilePath $modListPath -ModsPath $modsRoot -TransactionTool $transactionTool
+        $marker = [pscustomobject][ordered]@{
+            contractVersion = '1.2.0'; workspaceId = $workspaceId; ownershipId = $ownershipId
+            ownerTaskId = $ownerTaskId; transactionId = $OperationId; mode = 'mo2-overwrite-output'
+            overwritePath = $overwritePath; createdUtc = [DateTime]::UtcNow.ToString('o')
+        }
+        $markerPayload = New-WorkspaceOutputOwnerMarkerPayload -Value $marker
+        $Journal.runtimeOutputRearm = [pscustomobject][ordered]@{
+            state = 'prepared'; overwritePath = $overwritePath; cachePath = $cachePath; backupPath = $backupPath
+            ownerMarkerPath = $markerPath; ownerMarkerSha256 = [string]$markerPayload.sha256
+            cachePathExistedBefore = $cacheExisted; backupPathExistedBefore = $backupExisted
+            backupEvidenceDirectory = $backupEvidence
+        }
+        $Journal.phase = 'runtime-output-rearm-prepared'
+        Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
+        $markerHash = New-WorkspaceOutputOwnerMarker -Path $markerPath -Value $marker -Payload $markerPayload
+        $markerCreated = $true
+        $Journal.runtimeOutputRearm.state = 'owner-marker-created'
+        Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
+        if (-not $cacheExisted) { New-Item -ItemType Directory -Path $cachePath -ErrorAction Stop | Out-Null }
+        if (-not $backupExisted) { New-Item -ItemType Directory -Path $backupPath -ErrorAction Stop | Out-Null }
+        $Journal.runtimeOutputRearm.state = 'output-paths-ready'
+        Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
+
+        $backupSnapshot = & $transactionTool snapshot -CachePath $backupPath -RelativeCachePath 'backup' -EvidenceDirectory $backupEvidence -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
+        if (-not $backupSnapshot.ok) { throw "Could not snapshot MO2 Overwrite backup: $($backupSnapshot.errors -join '; ')" }
+        $backupSnapshotted = $true
+        $Journal.runtimeOutputRearm.state = 'backup-snapshotted'
+        Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
+        $backupProviders = & $transactionTool providers -ProfilePath $modListPath -ModsPath $modsRoot -RelativeCachePath 'backup' -DeepInventory -IncludeInventoryEntries -NoExit -Confirm:$false | ConvertFrom-Json
+        if (-not $backupProviders.ok) { throw "Could not inspect the task profile's backup providers: $($backupProviders.errors -join '; ')" }
+        $backupShadow = Copy-WorkspaceProviderTreeShadow -ProviderResult $backupProviders -TargetPath $backupPath -RelativePath 'backup' -Purpose 'MO2 Overwrite backup provider union'
+        $preparedBackup = & $transactionTool inspect -CachePath $backupPath -RelativeCachePath 'backup' -NoExit -Confirm:$false | ConvertFrom-Json
+        if (-not $preparedBackup.ok) { throw "Could not verify prepared MO2 Overwrite backup: $($preparedBackup.errors -join '; ')" }
+        $shadowReceipt = [pscustomobject][ordered]@{
+            contractVersion = '3.0.0'; relativePath = 'backup'; state = 'materialized'; bindingMode = 'mo2-overwrite-output'
+            profilePath = [string]$backupProviders.data.profilePath; profileSha256 = [string]$backupProviders.data.profileSha256
+            modsPath = [string]$backupProviders.data.modsPath; targetPath = $backupPath; workspaceId = $workspaceId; ownershipId = $ownershipId
+            ownerMarkerPath = $markerPath; ownerMarkerSha256 = $markerHash; pathExistedBefore = $backupExisted
+            communityShadersPlugin = $build; transactionReceiptPath = [string]$backupSnapshot.data.receiptPath
+            beforeTreeSha256 = [string]$backupSnapshot.data.inventory.treeSha256
+            requiredProviderFiles = [int]$backupShadow.requiredProviderFiles; copiedFiles = [int]$backupShadow.copiedFiles
+            alreadyPresentFiles = [int]$backupShadow.alreadyPresentFiles; copied = @($backupShadow.copied); alreadyPresent = @($backupShadow.alreadyPresent)
+            preparedInventory = $preparedBackup.data; workspaceInventory = $backupShadow.targetInventory; completedUtc = [DateTime]::UtcNow.ToString('o')
+        }
+        $backupPlanPath = Join-Path $backupEvidence 'backup-task.plan.json'
+        $backupPlan = [pscustomobject][ordered]@{
+            contractVersion = '1.0.0'; state = 'prepared'; workspaceId = $workspaceId; ownershipId = $ownershipId
+            ownerMarkerPath = $markerPath; ownerMarkerSha256 = $markerHash; overwritePath = $overwritePath; backupPath = $backupPath
+            pathExistedBefore = $backupExisted; profilePath = [string]$backupProviders.data.profilePath
+            profileSha256 = [string]$backupProviders.data.profileSha256; modsPath = [string]$backupProviders.data.modsPath
+            communityShadersPlugin = $build; transactionReceiptPath = [string]$backupSnapshot.data.receiptPath
+            beforeTreeSha256 = [string]$backupSnapshot.data.inventory.treeSha256; preparedTreeSha256 = [string]$preparedBackup.data.treeSha256
+            shadowReceipt = $shadowReceipt; workingTreeInventory = $null; restoreReceiptPath = $null; restoredTreeSha256 = $null
+        }
+        Write-WorkspaceJsonAtomic -Path $backupPlanPath -Value $backupPlan
+        $output = [pscustomobject][ordered]@{
+            state = 'ready'; transactionId = $OperationId; mode = 'mo2-overwrite-output'; executable = [string]$old.executable
+            overwritePath = $overwritePath; cachePath = $cachePath; backupPath = $backupPath; ownerMarkerPath = $markerPath; ownerMarkerSha256 = $markerHash
+            cachePathExistedBefore = $cacheExisted; backupPathExistedBefore = $backupExisted; communityShadersPlugin = $build
+            cacheEvidenceDirectory = $cacheEvidence; cachePlanPath = (Join-Path $cacheEvidence 'shader-cache-task.plan.json')
+            cacheCompletionPath = (Join-Path $cacheEvidence 'shader-cache-task.completion.json')
+            cachePrepareArguments = [pscustomobject][ordered]@{
+                CachePath = $cachePath; ProfilePath = $modListPath; ModsPath = $modsRoot; BindToOverwrite = $true
+                EvidenceDirectory = $cacheEvidence; RequireMaterializedOutput = $true; BuildId = [string]$build.buildId
+                ShaderCacheAbi = [string]$build.shaderCacheAbi; WorkspaceId = $workspaceId; OwnershipId = $ownershipId
+                OwnerMarkerPath = $markerPath; OwnerMarkerSha256 = $markerHash
+            }
+            backupEvidenceDirectory = $backupEvidence; backupPlanPath = $backupPlanPath
+            backupTransactionReceiptPath = [string]$backupSnapshot.data.receiptPath
+            backupCompletionPath = (Join-Path $backupEvidence 'backup-task.completion.json')
+            shadowedLoosePaths = @('ShaderCache', 'backup'); shadowReceipt = $shadowReceipt
+        }
+        $Journal.runtimeOutputRearm.state = 'ready'
+        $Journal.runtimeOutputTransactionId = [string]$output.transactionId
+        Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
+        return $output
+    }
+    catch {
+        $failure = $_.Exception.Message
+        $rollbackErrors = [Collections.Generic.List[string]]::new()
+        if ($backupSnapshotted) {
+            try {
+                $restored = & $transactionTool restore -CachePath $backupPath -RelativeCachePath 'backup' -EvidenceDirectory $backupEvidence -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
+                if (-not $restored.ok) { throw ($restored.errors -join '; ') }
+            }
+            catch { $rollbackErrors.Add("backup: $($_.Exception.Message)") }
+        }
+        if ($markerCreated) {
+            try {
+                if (-not $backupExisted) { Remove-WorkspaceCreatedOutputTree -Path $backupPath -OverwritePath $overwritePath -Purpose 'Failed rearmed backup tree' }
+                if (-not $cacheExisted) { Remove-WorkspaceCreatedOutputTree -Path $cachePath -OverwritePath $overwritePath -Purpose 'Failed rearmed ShaderCache tree' }
+                Remove-Item -LiteralPath $markerPath -Force
+            }
+            catch { $rollbackErrors.Add("owner output: $($_.Exception.Message)") }
+        }
+        if ($rollbackErrors.Count -gt 0) { throw "Runtime-output rearm failed and rollback requires recovery. $failure Rollback: $($rollbackErrors -join '; ')" }
+        throw "Runtime-output rearm failed and was rolled back. $failure"
+    }
 }
 
 function Assert-WorkspaceRuntimeOutputReadyForRetirement($Config, $Workspace, [string]$AccessId) {
@@ -878,12 +1447,22 @@ function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
         $backupEvidenceDirectory = if ($journal.ContainsKey('backupEvidenceDirectory') -and -not [string]::IsNullOrWhiteSpace([string]$journal['backupEvidenceDirectory'])) {
             Assert-WorkspaceRecoveryPath -Path ([string]$journal['backupEvidenceDirectory']) -Root $controlRoot -Purpose 'Workspace Overwrite backup evidence'
         } else { $null }
+        $cachePath = if ($journal.ContainsKey('cachePath') -and -not [string]::IsNullOrWhiteSpace([string]$journal['cachePath'])) {
+            Assert-WorkspaceRecoveryPath -Path ([string]$journal['cachePath']) -Root ([string]$Config.mo2.overwriteDirectory) -Purpose 'Workspace Overwrite ShaderCache recovery target'
+        } else { Join-Path ([string]$Config.mo2.overwriteDirectory) 'ShaderCache' }
+        $backupPath = if ($journal.ContainsKey('backupPath') -and -not [string]::IsNullOrWhiteSpace([string]$journal['backupPath'])) {
+            Assert-WorkspaceRecoveryPath -Path ([string]$journal['backupPath']) -Root ([string]$Config.mo2.overwriteDirectory) -Purpose 'Workspace Overwrite backup recovery target'
+        } else { Join-Path ([string]$Config.mo2.overwriteDirectory) 'backup' }
+        $cacheExistedBefore = if ($journal.ContainsKey('cachePathExistedBefore')) { [bool]$journal['cachePathExistedBefore'] } else { $true }
+        $backupExistedBefore = if ($journal.ContainsKey('backupPathExistedBefore')) { [bool]$journal['backupPathExistedBefore'] } else { $true }
+        $markerSha256 = if ($journal.ContainsKey('overwriteOwnerMarkerSha256')) { [string]$journal['overwriteOwnerMarkerSha256'] } else { '' }
         $committable = $false
         if ((Test-Path -LiteralPath $manifestPath -PathType Leaf) -and (Test-Path -LiteralPath $profilePath -PathType Container)) {
             try {
                 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
                 $runtimeReady = if ([string]$manifest.runtimeOutput.mode -ceq 'mo2-overwrite-output') {
-                    $null -ne $overwriteMarkerPath -and (Test-Path -LiteralPath $overwriteMarkerPath -PathType Leaf)
+                    $null -ne $overwriteMarkerPath -and
+                    $null -ne (Assert-WorkspaceOutputOwnerMarker -Path $overwriteMarkerPath -ExpectedSha256 $markerSha256 -WorkspaceId ([string]$journal['workspaceId']) -OwnershipId ([string]$journal['ownershipId']) -OverwritePath ([string]$Config.mo2.overwriteDirectory))
                 } else {
                     $null -ne $runtimeOutputPath -and (Test-Path -LiteralPath $runtimeOutputPath -PathType Container)
                 }
@@ -900,17 +1479,23 @@ function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
         if (Test-Path -LiteralPath $profilePath -PathType Container) { Assert-NoWorkspaceReparsePoint -Path $profilePath -Purpose 'Interrupted workspace profile'; Remove-Item -LiteralPath $profilePath -Recurse -Force }
         if ($null -ne $runtimeOutputPath -and (Test-Path -LiteralPath $runtimeOutputPath -PathType Container)) { Assert-NoWorkspaceReparsePoint -Path $runtimeOutputPath -Purpose 'Interrupted workspace runtime-output mod'; Remove-Item -LiteralPath $runtimeOutputPath -Recurse -Force }
         if ($null -ne $backupEvidenceDirectory -and (Test-Path -LiteralPath (Join-Path $backupEvidenceDirectory 'shader-cache-transaction.receipt.json') -PathType Leaf)) {
+            if ($null -eq $overwriteMarkerPath) { throw 'Interrupted workspace backup recovery lacks its exact owner-marker path.' }
+            $null = Assert-WorkspaceOutputOwnerMarker -Path $overwriteMarkerPath -ExpectedSha256 $markerSha256 -WorkspaceId ([string]$journal['workspaceId']) -OwnershipId ([string]$journal['ownershipId']) -OverwritePath ([string]$Config.mo2.overwriteDirectory)
             $transactionTool = Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'
-            $backupPath = Join-Path ([string]$Config.mo2.overwriteDirectory) 'backup'
             $blockingProcessNames = @(Get-WorkspaceBlockingProcessNames -Config $Config)
             $restored = & $transactionTool restore -CachePath $backupPath -RelativeCachePath 'backup' -EvidenceDirectory $backupEvidenceDirectory -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
             if (-not $restored.ok) { throw "Interrupted workspace backup recovery failed: $($restored.errors -join '; ')" }
         }
+        if ($null -ne $overwriteMarkerPath -and -not $backupExistedBefore -and (Test-Path -LiteralPath $backupPath)) {
+            $null = Assert-WorkspaceOutputOwnerMarker -Path $overwriteMarkerPath -ExpectedSha256 $markerSha256 -WorkspaceId ([string]$journal['workspaceId']) -OwnershipId ([string]$journal['ownershipId']) -OverwritePath ([string]$Config.mo2.overwriteDirectory)
+            Remove-WorkspaceCreatedOutputTree -Path $backupPath -OverwritePath ([string]$Config.mo2.overwriteDirectory) -Purpose 'Interrupted task-created backup tree'
+        }
+        if ($null -ne $overwriteMarkerPath -and -not $cacheExistedBefore -and (Test-Path -LiteralPath $cachePath)) {
+            $null = Assert-WorkspaceOutputOwnerMarker -Path $overwriteMarkerPath -ExpectedSha256 $markerSha256 -WorkspaceId ([string]$journal['workspaceId']) -OwnershipId ([string]$journal['ownershipId']) -OverwritePath ([string]$Config.mo2.overwriteDirectory)
+            Remove-WorkspaceCreatedOutputTree -Path $cachePath -OverwritePath ([string]$Config.mo2.overwriteDirectory) -Purpose 'Interrupted task-created ShaderCache tree'
+        }
         if ($null -ne $overwriteMarkerPath -and (Test-Path -LiteralPath $overwriteMarkerPath -PathType Leaf)) {
-            $marker = Get-Content -LiteralPath $overwriteMarkerPath -Raw | ConvertFrom-Json
-            if ([string]$marker.workspaceId -cne [string]$journal['workspaceId'] -or [string]$marker.ownershipId -cne [string]$journal['ownershipId']) {
-                throw 'Interrupted workspace recovery refused a foreign MO2 Overwrite owner marker.'
-            }
+            $null = Assert-WorkspaceOutputOwnerMarker -Path $overwriteMarkerPath -ExpectedSha256 $markerSha256 -WorkspaceId ([string]$journal['workspaceId']) -OwnershipId ([string]$journal['ownershipId']) -OverwritePath ([string]$Config.mo2.overwriteDirectory)
             Remove-Item -LiteralPath $overwriteMarkerPath -Force
         }
         if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { Remove-Item -LiteralPath $manifestPath -Force }
@@ -924,6 +1509,10 @@ function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
     } else { $null }
     if ([string]::IsNullOrWhiteSpace($preimagePath) -or -not (Test-Path -LiteralPath $preimagePath -PathType Leaf) -or (Get-FileHash -LiteralPath $preimagePath -Algorithm SHA256).Hash -cne [string]$journal['manifestPreimageSha256']) {
         throw "Workspace $operation recovery cannot verify its exact manifest preimage: $JournalPath"
+    }
+
+    if ($operation -eq 'resume' -and $journal.ContainsKey('runtimeOutputRearm') -and $null -ne $journal['runtimeOutputRearm']) {
+        Undo-JournaledRuntimeOutputRearm -Config $Config -WorkspaceId ([string]$journal['workspaceId']) -OwnershipId ([string]$journal['ownershipId']) -Rearm $journal['runtimeOutputRearm']
     }
 
     if ($operation -eq 'retire') {
@@ -1257,13 +1846,29 @@ function Assert-AccessAndClosed($Config, [string]$OwnedAccessId, [string]$Profil
 function Get-OverwriteShaderCacheDirectories($Config) {
     $overwriteRoot = [IO.Path]::GetFullPath([string]$Config.mo2.overwriteDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar)
     if (-not (Test-Path -LiteralPath $overwriteRoot -PathType Container)) { return @() }
-    $matches = @(Get-ChildItem -LiteralPath $overwriteRoot -Directory -Recurse -Force | Where-Object { $_.Name -match '^(?i:ShaderCache)(?:[.]|$)' } | Sort-Object FullName)
-    $roots = @()
-    foreach ($match in $matches) {
-        $nested = @($roots | Where-Object { $match.FullName.StartsWith($_.FullName + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
-        if (-not $nested) { $roots += $match }
+    Assert-NoWorkspaceReparsePoint -Path $overwriteRoot -Purpose 'MO2 Overwrite cache discovery'
+    $queue = [Collections.Generic.Queue[object]]::new()
+    $queue.Enqueue([pscustomobject]@{ path = $overwriteRoot; depth = 0 })
+    $cacheRoots = @()
+    while ($queue.Count -gt 0) {
+        Assert-TreeOperationBudget -Purpose 'MO2 Overwrite cache discovery'
+        $current = $queue.Dequeue()
+        foreach ($directory in @(Get-ChildItem -LiteralPath ([string]$current.path) -Directory -Force | Sort-Object FullName)) {
+            if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "MO2 Overwrite cache discovery contains a reparse point: $($directory.FullName)"
+            }
+            $depth = [int]$current.depth + 1
+            if ($depth -gt $MaxProfileDepth) {
+                throw "MO2 Overwrite cache discovery exceeds maximum depth $MaxProfileDepth at '$($directory.FullName)'."
+            }
+            if ($directory.Name -match '^(?i:ShaderCache)(?:[.]|$)') {
+                $cacheRoots += $directory
+                continue
+            }
+            $queue.Enqueue([pscustomobject]@{ path = $directory.FullName; depth = $depth })
+        }
     }
-    return @($roots)
+    return @($cacheRoots)
 }
 
 $resolvedConfig = $null
@@ -1472,15 +2077,20 @@ try {
                 state = 'planned'; mode = 'mo2-overwrite-output'; executable = $runtimeExecutable
                 overwritePath = $runtimeOutputPath; cachePath = $runtimeCachePath; backupPath = $runtimeBackupPath
                 ownerMarkerPath = $runtimeMarkerPath; ownerMarkerSha256 = $null
+                cachePathExistedBefore = $null; backupPathExistedBefore = $null
+                communityShadersPlugin = $null
                 cacheEvidenceDirectory = $cacheEvidenceDirectory
                 cachePlanPath = (Join-Path $cacheEvidenceDirectory 'shader-cache-task.plan.json')
                 cacheCompletionPath = (Join-Path $cacheEvidenceDirectory 'shader-cache-task.completion.json')
                 cachePrepareArguments = [pscustomobject][ordered]@{
                     CachePath = $runtimeCachePath; ProfilePath = (Join-Path $profilePath 'modlist.txt')
                     ModsPath = $modsRoot; BindToOverwrite = $true; EvidenceDirectory = $cacheEvidenceDirectory
-                    RequireMaterializedOutput = $true
+                    RequireMaterializedOutput = $true; BuildId = $null; ShaderCacheAbi = $null
+                    WorkspaceId = $workspaceId; OwnershipId = $ownershipId
+                    OwnerMarkerPath = $runtimeMarkerPath; OwnerMarkerSha256 = $null
                 }
                 backupEvidenceDirectory = $backupEvidenceDirectory
+                backupPlanPath = (Join-Path $backupEvidenceDirectory 'backup-task.plan.json')
                 backupTransactionReceiptPath = (Join-Path $backupEvidenceDirectory 'shader-cache-transaction.receipt.json')
                 backupCompletionPath = (Join-Path $backupEvidenceDirectory 'backup-task.completion.json')
                 shadowedLoosePaths = @('ShaderCache', 'backup'); shadowReceipt = $null
@@ -1500,11 +2110,15 @@ try {
                     ownerTaskId = $resolvedTaskId; sourceProfile = $sourceName; sourceProfilePath = $sourcePath; sourceSnapshotSha256 = [string]$sourceSnapshot.sha256
                     profileName = $profileName; profilePath = $profilePath; manifestPath = $manifestPath
                     overwriteOwnerMarkerPath = $runtimeMarkerPath; backupEvidenceDirectory = $backupEvidenceDirectory
+                    cachePath = $runtimeCachePath; backupPath = $runtimeBackupPath
+                    cachePathExistedBefore = $null; backupPathExistedBefore = $null
+                    overwriteOwnerMarkerSha256 = $null; communityShadersPlugin = $null
                     preparedUtc = [DateTime]::UtcNow.ToString('o')
                     selectedProfileJournalPath = $selectedProfileJournalPath; selectedProfileTransaction = $null; rollback = $null; committedUtc = $null
                 }
                 Write-WorkspaceJsonAtomic -Path $creationJournalPath -Value $journal
                 $profileCreated = $false; $runtimeMarkerCreated = $false; $backupSnapshotCreated = $false; $selection = $null
+                $cachePathExistedBefore = $false; $backupPathExistedBefore = $false
                 try {
                     New-Item -ItemType Directory -Path $profilePath -ErrorAction Stop | Out-Null
                     $profileCreated = $true
@@ -1555,35 +2169,76 @@ try {
                     $manifest | Add-Member -NotePropertyName copiedWorldEntrySave -NotePropertyValue $true -Force
                     if ($fixture) { $manifest | Add-Member -NotePropertyName copiedVerifiedSaves -NotePropertyValue $true -Force }
 
-                    New-Item -ItemType Directory -Path $runtimeCachePath -Force | Out-Null
-                    New-Item -ItemType Directory -Path $runtimeBackupPath -Force | Out-Null
+                    foreach ($outputPath in @($runtimeCachePath, $runtimeBackupPath)) {
+                        if ((Test-Path -LiteralPath $outputPath) -and -not (Test-Path -LiteralPath $outputPath -PathType Container)) {
+                            throw "MO2 Overwrite output path is not a directory: $outputPath"
+                        }
+                    }
+                    $cachePathExistedBefore = Test-Path -LiteralPath $runtimeCachePath -PathType Container
+                    $backupPathExistedBefore = Test-Path -LiteralPath $runtimeBackupPath -PathType Container
+                    $runtimeMarker = [pscustomobject][ordered]@{
+                        contractVersion = '1.1.0'; workspaceId = $workspaceId; ownershipId = $ownershipId
+                        ownerTaskId = $resolvedTaskId; mode = 'mo2-overwrite-output'; overwritePath = $runtimeOutputPath
+                        createdUtc = [DateTime]::UtcNow.ToString('o')
+                    }
+                    $runtimeMarkerPayload = New-WorkspaceOutputOwnerMarkerPayload -Value $runtimeMarker
+                    $runtimeMarkerHash = [string]$runtimeMarkerPayload.sha256
+                    $journal.overwriteOwnerMarkerSha256 = $runtimeMarkerHash
+                    $journal.cachePathExistedBefore = $cachePathExistedBefore
+                    $journal.backupPathExistedBefore = $backupPathExistedBefore
+                    $journal.phase = 'output-owner-planned'
+                    Write-WorkspaceJsonAtomic -Path $creationJournalPath -Value $journal
+                    if ($InternalTestFailurePoint -eq 'owner-marker-before-claim') {
+                        $null = New-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -Value ([pscustomobject][ordered]@{
+                            contractVersion = '1.1.0'; workspaceId = 'competing-workspace'; ownershipId = 'competing-owner'
+                            ownerTaskId = 'competing-task'; mode = 'mo2-overwrite-output'; overwritePath = $runtimeOutputPath
+                            createdUtc = [DateTime]::UtcNow.ToString('o')
+                        })
+                    }
+                    $runtimeMarkerHash = New-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -Value $runtimeMarker -Payload $runtimeMarkerPayload
+                    $runtimeMarkerCreated = $true
+                    $manifest.runtimeOutput.ownerMarkerSha256 = $runtimeMarkerHash
+                    $manifest.runtimeOutput.cachePrepareArguments.OwnerMarkerSha256 = $runtimeMarkerHash
+                    $manifest.runtimeOutput.cachePathExistedBefore = $cachePathExistedBefore
+                    $manifest.runtimeOutput.backupPathExistedBefore = $backupPathExistedBefore
+                    $journal.phase = 'output-owner-claimed'
+                    Write-WorkspaceJsonAtomic -Path $creationJournalPath -Value $journal
+
+                    if (-not $cachePathExistedBefore) { New-Item -ItemType Directory -Path $runtimeCachePath -ErrorAction Stop | Out-Null }
+                    if (-not $backupPathExistedBefore) { New-Item -ItemType Directory -Path $runtimeBackupPath -ErrorAction Stop | Out-Null }
                     Remove-WorkspaceCustomOverwrite -SettingsPath (Join-Path $profilePath 'settings.ini') -Executable $runtimeExecutable
                     Remove-WorkspaceCustomOverwrite -SettingsPath (Join-Path $profilePath 'settings.ini') -Executable 'Synthesis'
 
                     $transactionTool = Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'
                     $blockingProcessNames = @(Get-WorkspaceBlockingProcessNames -Config $config)
+                    $communityShadersPlugin = Resolve-WorkspaceCommunityShadersBuildBinding -ProfilePath (Join-Path $profilePath 'modlist.txt') -ModsPath $modsRoot -TransactionTool $transactionTool
+                    $manifest.runtimeOutput.communityShadersPlugin = $communityShadersPlugin
+                    $manifest.runtimeOutput.cachePrepareArguments.BuildId = [string]$communityShadersPlugin.buildId
+                    $manifest.runtimeOutput.cachePrepareArguments.ShaderCacheAbi = [string]$communityShadersPlugin.shaderCacheAbi
+                    $journal.communityShadersPlugin = $communityShadersPlugin
+                    Write-WorkspaceJsonAtomic -Path $creationJournalPath -Value $journal
+                    $null = Assert-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -ExpectedSha256 $runtimeMarkerHash -WorkspaceId $workspaceId -OwnershipId $ownershipId -OverwritePath $runtimeOutputPath
                     $backupSnapshot = & $transactionTool snapshot -CachePath $runtimeBackupPath -RelativeCachePath 'backup' -EvidenceDirectory $backupEvidenceDirectory -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
                     if (-not $backupSnapshot.ok) { throw "Could not snapshot MO2 Overwrite backup: $($backupSnapshot.errors -join '; ')" }
                     $backupSnapshotCreated = $true
+                    $null = Assert-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -ExpectedSha256 $runtimeMarkerHash -WorkspaceId $workspaceId -OwnershipId $ownershipId -OverwritePath $runtimeOutputPath
                     $backupProviders = & $transactionTool providers -ProfilePath (Join-Path $profilePath 'modlist.txt') -ModsPath $modsRoot -RelativeCachePath 'backup' -DeepInventory -IncludeInventoryEntries -NoExit -Confirm:$false | ConvertFrom-Json
                     if (-not $backupProviders.ok) { throw "Could not inspect the task profile's backup providers: $($backupProviders.errors -join '; ')" }
+                    $null = Assert-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -ExpectedSha256 $runtimeMarkerHash -WorkspaceId $workspaceId -OwnershipId $ownershipId -OverwritePath $runtimeOutputPath
                     $backupShadow = Copy-WorkspaceProviderTreeShadow -ProviderResult $backupProviders -TargetPath $runtimeBackupPath -RelativePath 'backup' -Purpose 'MO2 Overwrite backup provider union'
+                    $null = Assert-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -ExpectedSha256 $runtimeMarkerHash -WorkspaceId $workspaceId -OwnershipId $ownershipId -OverwritePath $runtimeOutputPath
                     $preparedBackup = & $transactionTool inspect -CachePath $runtimeBackupPath -RelativeCachePath 'backup' -NoExit -Confirm:$false | ConvertFrom-Json
                     if (-not $preparedBackup.ok) { throw "Could not verify prepared MO2 Overwrite backup: $($preparedBackup.errors -join '; ')" }
 
-                    $runtimeMarker = [pscustomobject][ordered]@{
-                        contractVersion = '1.0.0'; workspaceId = $workspaceId; ownershipId = $ownershipId
-                        ownerTaskId = $resolvedTaskId; mode = 'mo2-overwrite-output'; overwritePath = $runtimeOutputPath
-                        createdUtc = [DateTime]::UtcNow.ToString('o')
-                    }
-                    Write-WorkspaceJsonAtomic -Path $runtimeMarkerPath -Value $runtimeMarker
-                    $runtimeMarkerCreated = $true
-                    $runtimeMarkerHash = (Get-FileHash -LiteralPath $runtimeMarkerPath -Algorithm SHA256).Hash
+                    $null = Assert-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -ExpectedSha256 $runtimeMarkerHash -WorkspaceId $workspaceId -OwnershipId $ownershipId -OverwritePath $runtimeOutputPath
                     $shadowReceipt = [pscustomobject][ordered]@{
                         contractVersion = '3.0.0'; relativePath = 'backup'; state = 'materialized'
                         bindingMode = 'mo2-overwrite-output'; profilePath = [string]$backupProviders.data.profilePath
                         profileSha256 = [string]$backupProviders.data.profileSha256
                         modsPath = [string]$backupProviders.data.modsPath; targetPath = $runtimeBackupPath
+                        workspaceId = $workspaceId; ownershipId = $ownershipId
+                        ownerMarkerPath = $runtimeMarkerPath; ownerMarkerSha256 = $runtimeMarkerHash
+                        pathExistedBefore = $backupPathExistedBefore; communityShadersPlugin = $communityShadersPlugin
                         transactionReceiptPath = [string]$backupSnapshot.data.receiptPath
                         beforeTreeSha256 = [string]$backupSnapshot.data.inventory.treeSha256
                         requiredProviderFiles = [int]$backupShadow.requiredProviderFiles
@@ -1593,6 +2248,19 @@ try {
                         preparedInventory = $preparedBackup.data; workspaceInventory = $backupShadow.targetInventory
                         completedUtc = [DateTime]::UtcNow.ToString('o')
                     }
+                    $backupPlan = [pscustomobject][ordered]@{
+                        contractVersion = '1.0.0'; state = 'prepared'; workspaceId = $workspaceId; ownershipId = $ownershipId
+                        ownerMarkerPath = $runtimeMarkerPath; ownerMarkerSha256 = $runtimeMarkerHash
+                        overwritePath = $runtimeOutputPath; backupPath = $runtimeBackupPath
+                        pathExistedBefore = $backupPathExistedBefore; profilePath = [string]$backupProviders.data.profilePath
+                        profileSha256 = [string]$backupProviders.data.profileSha256; modsPath = [string]$backupProviders.data.modsPath
+                        communityShadersPlugin = $communityShadersPlugin; transactionReceiptPath = [string]$backupSnapshot.data.receiptPath
+                        beforeTreeSha256 = [string]$backupSnapshot.data.inventory.treeSha256
+                        preparedTreeSha256 = [string]$preparedBackup.data.treeSha256; shadowReceipt = $shadowReceipt
+                        workingTreeInventory = $null; restoreReceiptPath = $null; restoredTreeSha256 = $null
+                    }
+                    $null = Assert-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -ExpectedSha256 $runtimeMarkerHash -WorkspaceId $workspaceId -OwnershipId $ownershipId -OverwritePath $runtimeOutputPath
+                    Write-WorkspaceJsonAtomic -Path ([string]$manifest.runtimeOutput.backupPlanPath) -Value $backupPlan
                     $manifest.runtimeOutput.state = 'ready'
                     $manifest.runtimeOutput.ownerMarkerSha256 = $runtimeMarkerHash
                     $manifest.runtimeOutput.shadowReceipt = $shadowReceipt
@@ -1614,16 +2282,36 @@ try {
                     if ($profileCreated -and (Test-Path -LiteralPath $profilePath -PathType Container)) {
                         try { Assert-NoWorkspaceReparsePoint -Path $profilePath -Purpose 'Failed task profile'; Remove-Item -LiteralPath $profilePath -Recurse -Force } catch { $rollbackErrors += "profile: $($_.Exception.Message)" }
                     }
+                    if ($runtimeMarkerCreated) {
+                        try { $null = Assert-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -ExpectedSha256 $runtimeMarkerHash -WorkspaceId $workspaceId -OwnershipId $ownershipId -OverwritePath $runtimeOutputPath }
+                        catch { $rollbackErrors += "overwrite-owner-marker: $($_.Exception.Message)" }
+                    }
                     if ($backupSnapshotCreated) {
                         try {
+                            $null = Assert-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -ExpectedSha256 $runtimeMarkerHash -WorkspaceId $workspaceId -OwnershipId $ownershipId -OverwritePath $runtimeOutputPath
                             $restoredBackup = & $transactionTool restore -CachePath $runtimeBackupPath -RelativeCachePath 'backup' -EvidenceDirectory $backupEvidenceDirectory -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
                             if (-not $restoredBackup.ok) { throw ($restoredBackup.errors -join '; ') }
+                            if (-not $backupPathExistedBefore) { Remove-WorkspaceCreatedOutputTree -Path $runtimeBackupPath -OverwritePath $runtimeOutputPath -Purpose 'Task-created backup tree' }
                         }
                         catch { $rollbackErrors += "overwrite-backup: $($_.Exception.Message)" }
                     }
+                    elseif ($runtimeMarkerCreated -and -not $backupPathExistedBefore) {
+                        try {
+                            $null = Assert-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -ExpectedSha256 $runtimeMarkerHash -WorkspaceId $workspaceId -OwnershipId $ownershipId -OverwritePath $runtimeOutputPath
+                            Remove-WorkspaceCreatedOutputTree -Path $runtimeBackupPath -OverwritePath $runtimeOutputPath -Purpose 'Task-created backup tree'
+                        }
+                        catch { $rollbackErrors += "overwrite-backup: $($_.Exception.Message)" }
+                    }
+                    if ($runtimeMarkerCreated -and -not $cachePathExistedBefore) {
+                        try {
+                            $null = Assert-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -ExpectedSha256 $runtimeMarkerHash -WorkspaceId $workspaceId -OwnershipId $ownershipId -OverwritePath $runtimeOutputPath
+                            Remove-WorkspaceCreatedOutputTree -Path $runtimeCachePath -OverwritePath $runtimeOutputPath -Purpose 'Task-created ShaderCache tree'
+                        }
+                        catch { $rollbackErrors += "overwrite-shader-cache: $($_.Exception.Message)" }
+                    }
                     if ($runtimeMarkerCreated -and (Test-Path -LiteralPath $runtimeMarkerPath -PathType Leaf)) {
                         try {
-                            if ((Get-FileHash -LiteralPath $runtimeMarkerPath -Algorithm SHA256).Hash -cne $runtimeMarkerHash) { throw 'owner marker changed' }
+                            $null = Assert-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -ExpectedSha256 $runtimeMarkerHash -WorkspaceId $workspaceId -OwnershipId $ownershipId -OverwritePath $runtimeOutputPath
                             Remove-Item -LiteralPath $runtimeMarkerPath -Force
                         }
                         catch { $rollbackErrors += "overwrite-owner-marker: $($_.Exception.Message)" }
@@ -1649,16 +2337,20 @@ try {
         $owned = Read-OwnedWorkspace -Config $config -Id $WorkspaceId -OwnedAccessId $AccessId -ResolvedTaskId $resolvedTaskId
         $null = Assert-AccessAndClosed -Config $config -OwnedAccessId $AccessId -Profile ([string]$owned.data.profile) -AllowOverwriteShaderCaches
         if ([string]$owned.data.runtimeOutput.mode -cne 'mo2-overwrite-output') { throw 'Workspace does not use the MO2 Overwrite output contract.' }
-        $cacheCompletionPath = [string]$owned.data.runtimeOutput.cacheCompletionPath
-        if (-not (Test-Path -LiteralPath $cacheCompletionPath -PathType Leaf)) { throw "Complete the shader-cache catalog transaction before completing workspace output: $cacheCompletionPath" }
-        $cacheCompletion = Get-Content -LiteralPath $cacheCompletionPath -Raw | ConvertFrom-Json -Depth 40
-        if ([string]$cacheCompletion.state -cne 'complete' -or [string]$cacheCompletion.cacheBinding.mode -cne 'mo2-overwrite-output') {
-            throw 'Shader-cache completion does not close the exact MO2 Overwrite transaction.'
-        }
         $approved = $PSCmdlet.ShouldProcess([string]$owned.data.runtimeOutput.backupPath, 'preserve task output and restore the exact pre-task MO2 Overwrite backup')
         $completion = if ($approved) {
             Invoke-WithWorkspaceTransactionLock -Config $config -Action {
                 $current = Read-OwnedWorkspace -Config $config -Id $WorkspaceId -OwnedAccessId $AccessId -ResolvedTaskId $resolvedTaskId
+                $markerExists = Test-Path -LiteralPath ([string]$current.data.runtimeOutput.ownerMarkerPath) -PathType Leaf
+                if ($markerExists) {
+                    $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$current.data.runtimeOutput.ownerMarkerPath) -ExpectedSha256 ([string]$current.data.runtimeOutput.ownerMarkerSha256) -WorkspaceId ([string]$current.data.workspaceId) -OwnershipId ([string]$current.data.ownershipId) -OverwritePath ([string]$current.data.runtimeOutput.overwritePath)
+                }
+                elseif (-not (Test-Path -LiteralPath ([string]$current.data.runtimeOutput.backupCompletionPath) -PathType Leaf)) {
+                    throw 'The task-owned MO2 Overwrite marker is missing before output completion.'
+                }
+                $isolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile ([string]$current.data.profile) -Executable ([string]$current.data.runtimeOutput.executable) -AccessId $AccessId -AllowPreparedCacheGrowth
+                if (-not $isolation.ok) { throw "Task runtime-output isolation changed before completion: $($isolation.errors -join '; ')" }
+                $null = Get-WorkspaceCacheCompletionEvidence -Config $config -Workspace $current -RequireOwnerMarker:$markerExists
                 Complete-WorkspaceBackupOutput -Config $config -Workspace $current
             }
         }
@@ -1701,15 +2393,33 @@ try {
                     manifestPreimagePath = $manifestPreimagePath; manifestPreimageSha256 = $manifestPreimageSha256
                     profilePath = [string]$current.data.profilePath; selectedProfileJournalPath = $selectedProfileJournalPath
                     targetAccessId = $AccessId; targetProfile = [string]$current.data.profile; preparedUtc = [DateTime]::UtcNow.ToString('o')
-                    selectedProfileTransaction = $null; rollback = $null; committedUtc = $null
+                    selectedProfileTransaction = $null; runtimeOutputTransactionId = $null; runtimeOutputRearm = $null
+                    rollback = $null; committedUtc = $null
                 }
                 Write-WorkspaceJsonAtomic -Path $journalPath -Value $journal
-                $selection = $null
+                $selection = $null; $rearmedOutput = $null
                 try {
+                    $priorAccessId = [string]$current.data.accessId
+                    if ($priorAccessId -cne $AccessId) {
+                        $activeMarkerPath = [string]$current.data.runtimeOutput.ownerMarkerPath
+                        $activeMarker = if (Test-Path -LiteralPath $activeMarkerPath -PathType Leaf) { Get-Content -LiteralPath $activeMarkerPath -Raw | ConvertFrom-Json -Depth 20 } else { $null }
+                        if ($activeMarker -and [string]$activeMarker.workspaceId -cne [string]$current.data.workspaceId) {
+                            throw "Cannot resume while workspace '$($activeMarker.workspaceId)' owns MO2 Overwrite."
+                        }
+                    }
                     $selection = Set-MO2SelectedProfile -Config $config -TargetProfile ([string]$current.data.profile) -Operation 'resume-retained-task-workspace' -EvidenceRoot $resumeEvidence
                     $journal.phase = 'selection-applied-uncommitted'; $journal.selectedProfileTransaction = $selection
                     Write-WorkspaceJsonAtomic -Path $journalPath -Value $journal
-                    $priorAccessId = [string]$current.data.accessId
+                    if ($priorAccessId -cne $AccessId) {
+                        $priorRuntimeOutput = $current.data.runtimeOutput | ConvertTo-Json -Depth 80 | ConvertFrom-Json -Depth 80
+                        $rearmedOutput = New-RearmedWorkspaceRuntimeOutput -Config $config -Workspace $current -OperationId $operationId -Journal $journal -JournalPath $journalPath
+                        $journal.phase = 'runtime-output-rearmed-uncommitted'
+                        Write-WorkspaceJsonAtomic -Path $journalPath -Value $journal
+                        if ($InternalTestFailurePoint -eq 'resume-interrupt-after-output-rearm') { exit 91 }
+                        $outputHistory = if ($current.data.PSObject.Properties['runtimeOutputHistory']) { @($current.data.runtimeOutputHistory) } else { @() }
+                        $current.data | Add-Member -NotePropertyName runtimeOutputHistory -NotePropertyValue (@($outputHistory) + ,$priorRuntimeOutput) -Force
+                        $current.data.runtimeOutput = $rearmedOutput
+                    }
                     $createdNames = @($current.data.createdMods | ForEach-Object { [string]$_.name })
                     $protectedNames = if ($current.data.PSObject.Properties['protectedSharedModNames']) { @($current.data.protectedSharedModNames) } else { @($current.data.initialModNames) }
                     $currentSharedNames = @(Get-ChildItem -LiteralPath $modsRoot -Directory -Force | Select-Object -ExpandProperty Name | Where-Object { $_ -notin $createdNames })
@@ -1730,6 +2440,11 @@ try {
                 }
                 catch {
                     $failure = $_.Exception.Message; $rollbackErrors = @()
+                    if ($rearmedOutput) {
+                        foreach ($outputRollbackError in @(Undo-RearmedWorkspaceRuntimeOutput -Config $config -Workspace $current -Output $rearmedOutput)) {
+                            $rollbackErrors += "runtime-output: $outputRollbackError"
+                        }
+                    }
                     try { Write-WorkspaceBytesAtomic -Path $current.path -Bytes $manifestPreimage } catch { $rollbackErrors += "manifest: $($_.Exception.Message)" }
                     if ($selection) {
                         try { Restore-MO2SelectedProfileTransaction -Transaction $selection } catch { $rollbackErrors += "selected-profile: $($_.Exception.Message)" }
@@ -1913,7 +2628,8 @@ try {
                 $manifestPreimageSha256 = Get-WorkspaceBytesSha256 -Bytes $manifestPreimage
                 if ((Get-FileHash -LiteralPath $manifestPreimagePath -Algorithm SHA256).Hash -cne $manifestPreimageSha256) { throw 'Workspace retirement manifest preimage did not persist exactly.' }
                 $overwriteMarkerPath = $null; $overwriteMarkerPreimagePath = $null; $overwriteMarkerPreimageSha256 = $null
-                if ([string]$current.data.runtimeOutput.mode -ceq 'mo2-overwrite-output' -and (Test-Path -LiteralPath ([string]$current.data.runtimeOutput.ownerMarkerPath) -PathType Leaf)) {
+                if ([string]$current.data.runtimeOutput.mode -ceq 'mo2-overwrite-output' -and
+                    (Test-Path -LiteralPath ([string]$current.data.runtimeOutput.ownerMarkerPath) -PathType Leaf)) {
                     $overwriteMarkerPath = [string]$current.data.runtimeOutput.ownerMarkerPath
                     $overwriteMarkerPreimagePath = Join-Path (Get-WorkspaceControlRoot -Config $config) ($WorkspaceId + '.retire.' + $operationId + '.overwrite-owner-preimage.bin')
                     $overwriteMarkerBytes = [IO.File]::ReadAllBytes($overwriteMarkerPath)
@@ -1964,7 +2680,8 @@ try {
                         $move.moved = $true
                         Write-WorkspaceJsonAtomic -Path $journalPath -Value $journal
                     }
-                    if ([string]$current.data.runtimeOutput.mode -ceq 'mo2-overwrite-output' -and (Test-Path -LiteralPath ([string]$current.data.runtimeOutput.ownerMarkerPath) -PathType Leaf)) {
+                    if ([string]$current.data.runtimeOutput.mode -ceq 'mo2-overwrite-output' -and
+                        (Test-Path -LiteralPath ([string]$current.data.runtimeOutput.ownerMarkerPath) -PathType Leaf)) {
                         $markerPath = [string]$current.data.runtimeOutput.ownerMarkerPath
                         if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf) -or
                             (Get-FileHash -LiteralPath $markerPath -Algorithm SHA256).Hash -cne [string]$current.data.runtimeOutput.ownerMarkerSha256) {
