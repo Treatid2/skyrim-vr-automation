@@ -21,6 +21,9 @@ param(
 
     [string]$Label = 'automation',
 
+    [ValidateSet('OCU', 'SteamVR', 'SteamVRNull')]
+    [string]$RuntimeRoute,
+
     [ValidateRange(1, 600)]
     [int]$TimeoutSeconds = 90,
 
@@ -121,7 +124,20 @@ try {
             data = [pscustomobject]@{ requiredParameter = 'SessionId'; supplied = $false }
         }
     }
-    elseif ($Command -in @('renew-access', 'release-access', 'recover-access', 'configure-steamvr-exclusions') -and [string]::IsNullOrWhiteSpace($AccessId)) {
+    elseif ($Command -eq 'request-access' -and [string]::IsNullOrWhiteSpace($RuntimeRoute)) {
+        $result = [pscustomobject][ordered]@{
+            contractVersion = '1.1.0'
+            command = $Command
+            ok = $false
+            state = 'missing-runtime-route'
+            timestampUtc = [DateTime]::UtcNow.ToString('o')
+            checks = @()
+            warnings = @()
+            errors = @("Command '$Command' requires exactly one -RuntimeRoute: OCU, SteamVR, or SteamVRNull.")
+            data = [pscustomobject]@{ requiredParameter = 'RuntimeRoute'; allowedValues = @('OCU', 'SteamVR', 'SteamVRNull'); supplied = $false }
+        }
+    }
+    elseif ($Command -in @('renew-access', 'release-access', 'recover-access', 'prepare', 'configure-steamvr-exclusions') -and [string]::IsNullOrWhiteSpace($AccessId)) {
         $result = [pscustomobject][ordered]@{
             contractVersion = '1.1.0'
             command = $Command
@@ -139,15 +155,15 @@ try {
             Invoke-MO2Inspect -Config $config -Profile $Profile -Executable $Executable
         }
         'validate' {
-            Invoke-MO2Validate -Config $config -Profile $Profile -Executable $Executable -RequireSKSE:$RequireSKSE -RequireClosed:$RequireClosed -OwnedAccessId $AccessId
+            Invoke-MO2Validate -Config $config -Profile $Profile -Executable $Executable -RequireSKSE:$RequireSKSE -RequireClosed:$RequireClosed -RequireRuntimeRoute:([bool]$AccessId) -OwnedAccessId $AccessId
         }
         'validate-closed' {
-            $validated = Invoke-MO2Validate -Config $config -Profile $Profile -Executable $Executable -RequireClosed -OwnedAccessId $AccessId
+            $validated = Invoke-MO2Validate -Config $config -Profile $Profile -Executable $Executable -RequireClosed -RequireRuntimeRoute:([bool]$AccessId) -OwnedAccessId $AccessId
             $validated.command = 'validate-closed'
             $validated
         }
         'request-access' {
-            Invoke-MO2RequestAccess -Config $config -Label $Label -TaskId $TaskId -EstimatedMinutes $EstimatedMinutes -WaitSeconds $WaitSeconds -WhatIf:$WhatIf
+            Invoke-MO2RequestAccess -Config $config -Label $Label -TaskId $TaskId -RuntimeRoute $RuntimeRoute -EstimatedMinutes $EstimatedMinutes -WaitSeconds $WaitSeconds -WhatIf:$WhatIf
         }
         'access-status' {
             Invoke-MO2AccessStatus -Config $config -AccessId $AccessId

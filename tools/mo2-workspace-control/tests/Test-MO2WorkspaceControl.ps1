@@ -25,14 +25,23 @@ try {
     $mo2 = Join-Path $fixture 'MO2'; $profiles = Join-Path $mo2 'profiles'; $mods = Join-Path $mo2 'mods'
     $source = Join-Path $profiles 'Mad God Stable'; $loaderMod = Join-Path $mods 'Loader'; $sessions = Join-Path $fixture 'sessions'
     $synthesisMod = Join-Path $mods 'Synthesis Patch (SFW)'
-    foreach ($p in @($source, (Join-Path $source 'saves'), $loaderMod, (Join-Path $loaderMod 'SKSE\Plugins'), (Join-Path $synthesisMod 'ShaderCache\Lighting'), (Join-Path $synthesisMod 'backup\previous'), (Join-Path $mo2 'overwrite'), (Join-Path $mo2 'rb'), $sessions, (Join-Path $fixture 'archive'))) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
-    @('+Loader', '+Synthesis Patch (SFW)') | Set-Content -LiteralPath (Join-Path $source 'modlist.txt') -Encoding utf8
+    $ocuMod = Join-Path $mods 'OpenComposite Runtime Provider'
+    $csxReleaseMod = Join-Path $mods '[NoDelete] CSX AIO Local Release'
+    $csxDevBenchMod = Join-Path $mods '[NoDelete] CSX AIO Local DevBench'
+    foreach ($p in @($source, (Join-Path $source 'saves'), $loaderMod, (Join-Path $loaderMod 'SKSE\Plugins'), (Join-Path $ocuMod 'root'), (Join-Path $ocuMod 'SKSE\Plugins'), $csxReleaseMod, $csxDevBenchMod, (Join-Path $synthesisMod 'ShaderCache\Lighting'), (Join-Path $synthesisMod 'backup\previous'), (Join-Path $mo2 'overwrite'), (Join-Path $mo2 'rb'), $sessions, (Join-Path $fixture 'archive'))) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
+    $sourceModListPath = Join-Path $source 'modlist.txt'
+    $sourceModListText = "+[NoDelete] CSX AIO Local Release`r`n+Loader`r`n+Synthesis Patch (SFW)`r`n+OpenComposite Runtime Provider`r`n-[NoDelete] CSX AIO Local DevBench`r`n"
+    $sourceModListBytes = [Text.UTF8Encoding]::new($true).GetPreamble() + [Text.UTF8Encoding]::new($false).GetBytes($sourceModListText)
+    [IO.File]::WriteAllBytes($sourceModListPath, $sourceModListBytes)
     '*Skyrim.esm' | Set-Content -LiteralPath (Join-Path $source 'plugins.txt') -Encoding utf8
     "[custom_overwrites]`r`nsYnThEsIs=Synthesis Patch (SFW)`r`n" | Set-Content -LiteralPath (Join-Path $source 'settings.ini') -Encoding utf8 -NoNewline
     'ordinary-base-save' | Set-Content -LiteralPath (Join-Path $source 'saves\ordinary.ess') -Encoding utf8
     'known-good-save' | Set-Content -LiteralPath (Join-Path $source 'saves\Save2_KnownGood.ess') -Encoding utf8
     'known-good-cosave' | Set-Content -LiteralPath (Join-Path $source 'saves\Save2_KnownGood.skse') -Encoding utf8
     'existing-provider' | Set-Content -LiteralPath (Join-Path $loaderMod 'SKSE\Plugins\Example.dll') -Encoding utf8
+    New-Item -ItemType File -Path (Join-Path $ocuMod 'root\openvr_api.dll') -Force | Out-Null
+    New-Item -ItemType File -Path (Join-Path $ocuMod 'root\opencomposite.ini') -Force | Out-Null
+    New-Item -ItemType File -Path (Join-Path $ocuMod 'SKSE\Plugins\OpenCompositeInput.dll') -Force | Out-Null
     'lower-provider-cache' | Set-Content -LiteralPath (Join-Path $synthesisMod 'ShaderCache\Lighting\later-area.pso') -Encoding utf8
     '{}' | Set-Content -LiteralPath (Join-Path $synthesisMod 'backup\hashes') -Encoding utf8 -NoNewline
     'older-generated-backup' | Set-Content -LiteralPath (Join-Path $synthesisMod 'backup\previous\shader.bin') -Encoding utf8
@@ -50,19 +59,28 @@ try {
         "[General]`r`nselected_profile=@ByteArray(Codex)`r`n[customExecutables]`r`n1\title=@ByteArray(Test)`r`n1\binary=@ByteArray($loader)`r`n1\workingDirectory=@ByteArray($fixture)`r`n",
         [Text.UTF8Encoding]::new($false))
     $configPath = Join-Path $fixture 'config.json'; $lock = Join-Path $sessions 'lock.json'
+    $runtimeSentinelName = (Get-Process -Id $PID -ErrorAction Stop).ProcessName
     $fixtureManifestPath = Join-Path $fixture 'known-good-saves.json'
+    $localWorkCatalogPath = Join-Path $fixture 'local-work-mods.json'
+    [ordered]@{
+        contractVersion = '1.0.0'
+        candidates = @(
+            [ordered]@{ id='csx-aio-local-release'; label='CSX AIO local (DevBench off)'; description='Release-equivalent local CSX build without development bridges.'; modName='[NoDelete] CSX AIO Local Release'; exclusionGroup='csx-aio'; variant='devbench-off'; capabilities=@('csx-aio'); metadata=[ordered]@{devBenchBridgeEnabled=$false;releaseEquivalent=$true} },
+            [ordered]@{ id='csx-aio-local-devbench'; label='CSX AIO local (DevBench on)'; description='Local CSX build with DevBench bridges for automation.'; modName='[NoDelete] CSX AIO Local DevBench'; exclusionGroup='csx-aio'; variant='devbench-on'; capabilities=@('csx-aio','devbench-api'); metadata=[ordered]@{devBenchBridgeEnabled=$true;releaseEquivalent=$false} }
+        )
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $localWorkCatalogPath -Encoding utf8
     $saveFiles = @('Save2_KnownGood.ess', 'Save2_KnownGood.skse') | ForEach-Object {
         $path = Join-Path $source (Join-Path 'saves' $_)
         [ordered]@{ relativePath = $_; bytes = [long](Get-Item -LiteralPath $path).Length; sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
     }
     [ordered]@{ contractVersion='1.0.0'; sourceProfile='Mad God Stable'; profileFingerprintSha256=(Get-TestProfileFingerprint $source); defaultFixtureId='interior'; fixtures=@([ordered]@{id='interior';label='Known-good interior';location='TestCell';loadName='Save2_KnownGood';files=$saveFiles}) } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $fixtureManifestPath -Encoding utf8
     [ordered]@{
-        contractVersion='0.4.0'; machine='fixture'; mo2=[ordered]@{root=$mo2;executable=$mo2Exe;ini=$ini;profilesDirectory=$profiles;modsDirectory=$mods;overwriteDirectory=(Join-Path $mo2 'overwrite');logsDirectory=(Join-Path $mo2 'logs');rootBuilderDefinitions=@();rootBuilderDataDirectory=(Join-Path $mo2 'rb');processNames=@('WorkspaceImpossibleMO2');gameProcessNames=@('WorkspaceImpossibleGame');runtimeProcessNames=@()};
-        defaults=[ordered]@{profile='Mad God Stable';testProfileSource='Mad God Stable';newGameFixtureManifest=$fixtureManifestPath;executable='Test'};storage=[ordered]@{sessionStaging=$sessions;archive=(Join-Path $fixture 'archive')};limits=[ordered]@{maxEnumeratedFiles=100;overwriteWarningFiles=10;overwriteBlockFiles=50;overwriteWarningBytes=1024;overwriteBlockBytes=4096;launchPendingGraceSeconds=30};session=[ordered]@{lockFile=$lock}
+        contractVersion='0.4.0'; machine='fixture'; mo2=[ordered]@{root=$mo2;executable=$mo2Exe;ini=$ini;profilesDirectory=$profiles;modsDirectory=$mods;overwriteDirectory=(Join-Path $mo2 'overwrite');logsDirectory=(Join-Path $mo2 'logs');rootBuilderDefinitions=@();rootBuilderDataDirectory=(Join-Path $mo2 'rb');processNames=@('WorkspaceImpossibleMO2');gameProcessNames=@('WorkspaceImpossibleGame');runtimeProcessNames=@('VirtualDesktop.Streamer', $runtimeSentinelName)};
+        defaults=[ordered]@{profile='Mad God Stable';testProfileSource='Mad God Stable';newGameFixtureManifest=$fixtureManifestPath;localWorkModCatalog=$localWorkCatalogPath;executable='Test'};storage=[ordered]@{sessionStaging=$sessions;archive=(Join-Path $fixture 'archive')};limits=[ordered]@{maxEnumeratedFiles=100;overwriteWarningFiles=10;overwriteBlockFiles=50;overwriteWarningBytes=1024;overwriteBlockBytes=4096;launchPendingGraceSeconds=30};session=[ordered]@{lockFile=$lock}
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding utf8
     Import-Module (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'mo2-control\MO2Control.psm1') -Force
     $config = Read-MO2ControlConfig -ConfigPath $configPath
-    $access = Invoke-MO2RequestAccess -Config $config -Label fixture; $accessId = [string]$access.data.access.accessId
+    $access = Invoke-MO2RequestAccess -Config $config -Label fixture -RuntimeRoute SteamVRNull; $accessId = [string]$access.data.access.accessId
     $escapedSource = Join-Path $mo2 'outside'
     New-Item -ItemType Directory -Path $escapedSource -Force | Out-Null
     '+Loader' | Set-Content -LiteralPath (Join-Path $escapedSource 'modlist.txt') -Encoding utf8
@@ -72,6 +90,19 @@ try {
     if ($fixtureStatusRaw -match "`r|`n") { throw 'Compact workspace output was not one line.' }
     $fixtureStatus = $fixtureStatusRaw | ConvertFrom-Json
     if (-not $fixtureStatus.ok -or $fixtureStatus.state -ne 'fixture-valid') { throw 'Fixture status did not validate the original manifest.' }
+    $localWorkMods = & $entry list-local-work-mods -ConfigPath $configPath -Compact | ConvertFrom-Json
+    if (-not $localWorkMods.ok -or $localWorkMods.state -ne 'local-work-mods-found' -or $localWorkMods.data.availableCount -ne 2) { throw 'Local-work mod discovery did not expose both CSX AIO variants.' }
+    if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($sourceModListPath)) -cne [Convert]::ToBase64String($sourceModListBytes)) { throw 'BOM-aware local-work discovery changed the stable source modlist bytes.' }
+    $releaseCandidate = @($localWorkMods.data.catalog.candidates | Where-Object id -eq 'csx-aio-local-release')[0]
+    $devBenchCandidate = @($localWorkMods.data.catalog.candidates | Where-Object id -eq 'csx-aio-local-devbench')[0]
+    if (-not $releaseCandidate.available -or $releaseCandidate.metadata.devBenchBridgeEnabled -or -not $releaseCandidate.metadata.releaseEquivalent -or -not $devBenchCandidate.available -or -not $devBenchCandidate.metadata.devBenchBridgeEnabled) { throw 'CSX AIO candidate metadata did not distinguish release and DevBench builds.' }
+    if ($localWorkMods.data.approval.escalationUsuallyRequired -or -not $localWorkMods.data.approval.reusableApprovalEligible) { throw 'Local-work mod discovery was not classified as read-only and reusable.' }
+    $noLocalWorkPath = Join-Path $fixture 'config-no-local-work.json'
+    $noLocalWork = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    $noLocalWork.defaults.PSObject.Properties.Remove('localWorkModCatalog')
+    $noLocalWork | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $noLocalWorkPath -Encoding utf8
+    $noLocalWorkStatus = & $entry list-local-work-mods -ConfigPath $noLocalWorkPath -Compact | ConvertFrom-Json
+    if (-not $noLocalWorkStatus.ok -or $noLocalWorkStatus.state -ne 'catalog-not-configured' -or $noLocalWorkStatus.data.availableCount -ne 0) { throw 'A missing optional catalog did not preserve the modlist-only discovery contract.' }
     $boundedStatus = & $entry fixture-status -ConfigPath $configPath -MaxProfileFiles 2 -Compact -NoExit | ConvertFrom-Json
     if ($boundedStatus.ok -or $boundedStatus.errors[0] -notmatch 'maximum file count') { throw 'Profile traversal did not enforce its declared file-count bound.' }
     $deadlineStatus = & $entry fixture-status -ConfigPath $configPath -InternalTestFailurePoint tree-operation-deadline -Compact -NoExit | ConvertFrom-Json
@@ -94,12 +125,15 @@ try {
         [pscustomobject]@{ ok = $true; assertions = 2; mode = 'discovery-only' } | ConvertTo-Json
         return
     }
+    $profileCountBeforeMissingContent = @(Get-ChildItem -LiteralPath $profiles -Directory -Force).Count
+    $missingContentCreate = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label missing-content -SavePolicy FreshGame -Confirm:$false -NoExit | ConvertFrom-Json
+    if ($missingContentCreate.ok -or $missingContentCreate.state -ne 'missing-workspace-content' -or $missingContentCreate.data.requiredParameter -ne 'WorkspaceContent' -or @(Get-ChildItem -LiteralPath $profiles -Directory -Force).Count -ne $profileCountBeforeMissingContent) { throw 'Workspace creation did not reject omitted content selection without profile side effects.' }
     $prepared = & $entry prepare-source -ConfigPath $configPath -AccessId $accessId -Confirm:$false -Compact | ConvertFrom-Json
     if (-not $prepared.ok -or $prepared.state -ne 'overwrite-preserved' -or -not (Test-Path -LiteralPath (Join-Path $mo2 'overwrite\ShaderCache\fixture.bin') -PathType Leaf)) { throw "Source preparation did not preserve MO2 Overwrite: $($prepared | ConvertTo-Json -Depth 8 -Compress)" }
     if (-not $prepared.data.approval.reusableApprovalEligible -or $prepared.data.approval.escalationUsuallyRequired -or $null -ne $prepared.data.approval.oneShotReason) { throw 'Non-mutating source preparation was incorrectly classified as elevated or one-shot.' }
-    $unqualifiedCreate = & $entry create -ConfigPath $unconfiguredPath -AccessId $accessId -TaskId $taskId -Label unqualified -SavePolicy MainMenuOnly -Confirm:$false -NoExit | ConvertFrom-Json
+    $unqualifiedCreate = & $entry create -ConfigPath $unconfiguredPath -AccessId $accessId -TaskId $taskId -Label unqualified -SavePolicy MainMenuOnly -WorkspaceContent Modlist -Confirm:$false -NoExit | ConvertFrom-Json
     if ($unqualifiedCreate.ok -or $unqualifiedCreate.errors[0] -notmatch 'valid default world-entry save') { throw 'Fresh creation did not reject an unqualified maintained source profile.' }
-    $missingFixtureCreate = & $entry create -ConfigPath $missingPath -AccessId $accessId -TaskId $taskId -Label missing-fixture -SavePolicy FreshGame -Confirm:$false -NoExit | ConvertFrom-Json
+    $missingFixtureCreate = & $entry create -ConfigPath $missingPath -AccessId $accessId -TaskId $taskId -Label missing-fixture -SavePolicy FreshGame -WorkspaceContent Modlist -Confirm:$false -NoExit | ConvertFrom-Json
     if ($missingFixtureCreate.ok -or $missingFixtureCreate.errors[0] -notmatch 'valid default world-entry save') { throw 'Fresh creation did not reject a missing maintained world-entry fixture.' }
     'stable-profile-drift' | Set-Content -LiteralPath (Join-Path $source 'fixture-drift.txt') -Encoding utf8
     $staleStatus = & $entry fixture-status -ConfigPath $configPath -Compact | ConvertFrom-Json
@@ -108,15 +142,19 @@ try {
     if (-not $refreshedFixture.ok -or -not $refreshedFixture.data.valid -or -not (Test-Path -LiteralPath $refreshedFixture.data.backupPath -PathType Leaf)) { throw 'Guarded fixture refresh did not preserve and verify the manifest.' }
     if ($refreshedFixture.data.approval.reusableApprovalEligible -or [string]::IsNullOrWhiteSpace([string]$refreshedFixture.data.approval.oneShotReason)) { throw 'Shared fixture replacement was not explicitly classified as a one-shot approval.' }
     $iniBeforeCas = [IO.File]::ReadAllBytes($ini)
-    $casRejected = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label cas-race -SavePolicy FreshGame -InternalTestFailurePoint selected-profile-before-cas -Confirm:$false -NoExit | ConvertFrom-Json
+    $casRejected = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label cas-race -SavePolicy FreshGame -WorkspaceContent Modlist -InternalTestFailurePoint selected-profile-before-cas -Confirm:$false -NoExit | ConvertFrom-Json
     $iniAfterCas = [IO.File]::ReadAllBytes($ini)
     if ($casRejected.ok -or $casRejected.errors[0] -notmatch 'changed after planning and before replacement' -or [Convert]::ToBase64String($iniAfterCas) -ceq [Convert]::ToBase64String($iniBeforeCas) -or [Text.Encoding]::UTF8.GetString($iniAfterCas) -notmatch 'injected concurrent drift') { throw "Selected-profile mutation did not reject immediate preimage drift while preserving the live external bytes: $($casRejected | ConvertTo-Json -Depth 12 -Compress)" }
     [IO.File]::WriteAllBytes($ini, $iniBeforeCas)
-    $created = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label weather -SavePolicy FreshGame -Confirm:$false | ConvertFrom-Json
+    $conflictingSelection = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label conflicting -SavePolicy FreshGame -WorkspaceContent ModlistPlusLocalWorkMods -LocalWorkModId @('csx-aio-local-release','csx-aio-local-devbench') -Confirm:$false -NoExit | ConvertFrom-Json
+    if ($conflictingSelection.ok -or $conflictingSelection.errors[0] -notmatch 'Mutually exclusive') { throw 'Workspace creation accepted mutually exclusive CSX AIO variants.' }
+    $created = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label weather -SavePolicy FreshGame -WorkspaceContent Modlist -Confirm:$false | ConvertFrom-Json
     if (-not $created.ok -or $created.state -ne 'workspace-ready') { throw "Workspace creation failed: $($created | ConvertTo-Json -Depth 12 -Compress)" }
     if ($created.data.configuration.source -ne 'explicit' -or [IO.Path]::GetFullPath([string]$created.data.configuration.path) -ne [IO.Path]::GetFullPath($configPath)) { throw 'Workspace result did not expose exact configuration resolution provenance.' }
     if ($created.data.ownerTaskId -ne $taskId -or (Get-Content -LiteralPath $ini -Raw) -notmatch ('selected_profile=@ByteArray\(' + [regex]::Escape([string]$created.data.profileName) + '\)')) { throw 'Creation did not bind and select the task-owned workspace.' }
     if ($created.data.profileName -ne $created.data.profile -or $created.data.profileDirectory -ne $created.data.profilePath -or $created.data.modListPath -ne (Join-Path $created.data.profilePath 'modlist.txt')) { throw 'Workspace profile identity fields are not explicit and canonical.' }
+    $createdModList = Get-Content -LiteralPath $created.data.modListPath -Raw
+    if ($created.data.runtimeRoute.id -ne 'SteamVRNull' -or $created.data.runtimeRouteApplication.state -ne 'incompatible-providers-disabled' -or $created.data.runtimeRouteAdmission.state -ne 'qualified' -or $createdModList -notmatch '(?m)^-OpenComposite Runtime Provider\r?$') { throw 'Fresh SteamVRNull workspace did not disable and qualify the inherited OCU provider.' }
     if ($created.data.runtimeOutput.mode -ne 'mo2-overwrite-output' -or -not (Test-Path -LiteralPath $created.data.runtimeOutput.ownerMarkerPath -PathType Leaf)) { throw 'Workspace did not bind its exact MO2 Overwrite owner marker.' }
     $runtimeBackupRoot = [string]$created.data.runtimeOutput.backupPath
     foreach ($relativeBackup in @('hashes', 'previous\shader.bin')) {
@@ -193,6 +231,8 @@ try {
     if (-not (Test-Path -LiteralPath $ordinaryCopied -PathType Leaf) -or (Get-FileHash -LiteralPath $ordinaryCopied -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath (Join-Path $source 'saves\ordinary.ess') -Algorithm SHA256).Hash) { throw 'Workspace did not copy the complete stable-source saves tree.' }
     if (-not $created.data.inheritedSaves -or $created.data.sourceSaveSnapshot.sha256 -ne $created.data.profileSaveSnapshot.sha256 -or $created.data.sourceSaveSnapshot.fileCount -ne 3) { throw 'Workspace did not report a verified inherited-save snapshot.' }
     if (-not $created.data.copiedWorldEntrySave -or -not $created.data.sourceIntegrity.integrityVerified -or $created.data.sourceIntegrity.runtimeQualified -or [string]::IsNullOrWhiteSpace([string]$created.data.sourceIntegrity.cloneVerifiedUtc) -or $null -ne $created.data.sourceIntegrity.runtimeQualificationEvidence -or $created.data.worldEntryFixture.id -ne 'interior' -or $null -ne $created.data.saveFixture) { throw 'Ordinary fresh creation did not preserve the integrity-verified world-entry baseline independently of SavePolicy.' }
+    $createdModList = Get-Content -LiteralPath $created.data.modListPath -Raw
+    if ($created.data.localWorkMods.workspaceContent -ne 'Modlist' -or @($created.data.localWorkMods.requestedIds).Count -ne 0 -or $createdModList -notmatch '(?m)^-\[NoDelete\] CSX AIO Local Release\r?$' -or $createdModList -notmatch '(?m)^-\[NoDelete\] CSX AIO Local DevBench\r?$') { throw 'Modlist workspace did not disable every optional CSX AIO candidate.' }
     $workspaceControlRoot = Join-Path $sessions 'workspaces'
     $partialProfile = Join-Path $profiles 'Codex interrupted create fixture'
     New-Item -ItemType Directory -Path $partialProfile -Force | Out-Null
@@ -209,8 +249,12 @@ try {
     $interruptedSelection.phase = 'selection-applied-uncommitted'
     $interruptedSelection | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $selectionJournalPath -Encoding utf8
     Remove-Item -LiteralPath $selectionReceiptPath -Force
-    $verified = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label verified -SavePolicy VerifiedFixture -Confirm:$false | ConvertFrom-Json
+    $localWorkIdsPath = Join-Path $fixture 'requested-local-work-mods.json'
+    '["csx-aio-local-devbench"]' | Set-Content -LiteralPath $localWorkIdsPath -Encoding utf8
+    $verified = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label verified -SavePolicy VerifiedFixture -WorkspaceContent ModlistPlusLocalWorkMods -LocalWorkModIdsFile $localWorkIdsPath -Confirm:$false | ConvertFrom-Json
     if (-not $verified.ok -or -not $verified.data.copiedVerifiedSaves -or $verified.data.saveFixture.id -ne 'interior') { throw 'Verified fixture workspace was not created from the configured default.' }
+    $verifiedModList = Get-Content -LiteralPath $verified.data.modListPath -Raw
+    if ($verified.data.localWorkMods.workspaceContent -ne 'ModlistPlusLocalWorkMods' -or @($verified.data.localWorkMods.requestedIds).Count -ne 1 -or $verified.data.localWorkMods.requestedIds[0] -ne 'csx-aio-local-devbench' -or $verifiedModList -notmatch '(?m)^-\[NoDelete\] CSX AIO Local Release\r?$' -or $verifiedModList -notmatch '(?m)^\+\[NoDelete\] CSX AIO Local DevBench\r?$') { throw 'Requested DevBench-enabled CSX AIO variant was not selected exclusively.' }
     $recoveredSelection = Get-Content -LiteralPath $selectionJournalPath -Raw | ConvertFrom-Json
     if ($recoveredSelection.phase -ne 'recovered-committed' -or -not (Test-Path -LiteralPath $selectionReceiptPath -PathType Leaf)) { throw 'A subsequent transaction did not discover and finalize the interrupted selected-profile journal.' }
     foreach ($name in @('Save2_KnownGood.ess', 'Save2_KnownGood.skse')) {
@@ -248,18 +292,28 @@ try {
     if ($preexisting.ok) { throw 'Workspace claimed a pre-existing mod.' }
     'retained-profile-state' | Set-Content -LiteralPath (Join-Path $created.data.profilePath 'task-state.txt') -Encoding utf8
     $unsafeRelease = & $entry release -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -NoExit -Confirm:$false | ConvertFrom-Json
-    if ($unsafeRelease.ok -or $unsafeRelease.errors[0] -notmatch 'intentionally unavailable' -or -not (Test-Path -LiteralPath $created.data.profilePath) -or -not (Test-Path -LiteralPath (Join-Path $created.data.profilePath 'task-state.txt'))) { throw 'Deprecated workspace release did not fail closed while preserving retained task state.' }
+    if ($unsafeRelease.ok -or $unsafeRelease.errors[0] -notmatch 'explicit retire only after direction to discard or replace' -or $unsafeRelease.errors[0] -match 'finished workspace' -or -not (Test-Path -LiteralPath $created.data.profilePath) -or -not (Test-Path -LiteralPath (Join-Path $created.data.profilePath 'task-state.txt'))) { throw 'Deprecated workspace release did not fail closed with explicit-discard guidance while preserving retained task state.' }
     $listed = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
     if (-not $listed.ok -or $listed.data.count -ne 2) { throw 'Task workspace discovery did not list both retained profiles.' }
+    $listedModlist = @($listed.data.workspaces | Where-Object workspaceId -eq $created.data.workspaceId)[0]
+    $listedDevBench = @($listed.data.workspaces | Where-Object workspaceId -eq $verified.data.workspaceId)[0]
+    if ($listedModlist.workspaceContent -ne 'Modlist' -or @($listedModlist.selectedLocalWorkModIds).Count -ne 0 -or $listedDevBench.workspaceContent -ne 'ModlistPlusLocalWorkMods' -or @($listedDevBench.selectedLocalWorkModIds)[0] -ne 'csx-aio-local-devbench') { throw 'Retained workspace discovery did not expose each original local-work selection.' }
     $releasedAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
     if (-not $releasedAccess.ok -or -not (Test-Path -LiteralPath $created.data.profilePath)) { throw 'Yielding MO2 access did not preserve the retained task profile.' }
     $laterSharedMod = Join-Path $mods 'Later Shared Mod'; New-Item -ItemType Directory -Path $laterSharedMod -Force | Out-Null
-    $nextAccess = Invoke-MO2RequestAccess -Config $config -Label fixture-resume; $nextAccessId = [string]$nextAccess.data.access.accessId
+    $nextAccess = Invoke-MO2RequestAccess -Config $config -Label fixture-resume -RuntimeRoute SteamVRNull; $nextAccessId = [string]$nextAccess.data.access.accessId
     $wrongOwner = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId 'different-task' -WorkspaceId $created.data.workspaceId -NoExit -Confirm:$false | ConvertFrom-Json
     if ($wrongOwner.ok -or $wrongOwner.errors[0] -notmatch 'different task') { throw 'A different task identity was allowed to resume the retained workspace.' }
     $resumed = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -Confirm:$false | ConvertFrom-Json
     if (-not $resumed.ok -or $resumed.state -ne 'workspace-resumed' -or $resumed.data.accessId -ne $nextAccessId -or -not (Test-Path -LiteralPath (Join-Path $created.data.profilePath 'task-state.txt'))) { throw "Retained workspace was not rebound without losing task state: $($resumed | ConvertTo-Json -Depth 12 -Compress)" }
     if ((Get-Content -LiteralPath $ini -Raw) -notmatch ('selected_profile=@ByteArray\(' + [regex]::Escape([string]$created.data.profileName) + '\)')) { throw 'Resume did not select the retained task profile.' }
+    $selectedText = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($ini))
+    $selectedWithBom = [Text.UTF8Encoding]::new($true).GetPreamble() + [Text.UTF8Encoding]::new($false).GetBytes($selectedText)
+    [IO.File]::WriteAllBytes($ini, $selectedWithBom)
+    $alreadySelectedBefore = [IO.File]::ReadAllBytes($ini)
+    $alreadySelectedResume = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -Confirm:$false | ConvertFrom-Json
+    $alreadySelectedAfter = [IO.File]::ReadAllBytes($ini)
+    if (-not $alreadySelectedResume.ok -or [Convert]::ToBase64String($alreadySelectedAfter) -cne [Convert]::ToBase64String($alreadySelectedBefore)) { throw 'Resuming an already-selected profile did not preserve exact MO2 INI bytes.' }
     $resumeJournal = Get-ChildItem -LiteralPath $workspaceControlRoot -Filter ($created.data.workspaceId + '.resume.*.journal.json') -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     $resumeJournalData = Get-Content -LiteralPath $resumeJournal.FullName -Raw | ConvertFrom-Json
     if ($resumeJournalData.phase -ne 'committed' -or -not (Test-Path -LiteralPath $resumeJournalData.manifestPreimagePath -PathType Leaf) -or [string]::IsNullOrWhiteSpace([string]$resumeJournalData.selectedProfileJournalPath)) { throw 'Committed resume did not retain a durable manifest preimage and selected-profile journal link.' }

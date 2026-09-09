@@ -3,7 +3,7 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [ValidateSet('create', 'resume', 'list-task', 'inspect', 'fixture-status', 'refresh-fixture', 'prepare-source', 'complete-output', 'create-mod', 'register-mod', 'ensure-mod-wins', 'retire', 'release')]
+    [ValidateSet('create', 'resume', 'list-task', 'list-local-work-mods', 'inspect', 'fixture-status', 'refresh-fixture', 'prepare-source', 'complete-output', 'create-mod', 'register-mod', 'ensure-mod-wins', 'retire', 'release')]
     [string]$Command,
 
     [string]$ConfigPath,
@@ -16,6 +16,10 @@ param(
     [string]$SavePolicy = 'MainMenuOnly',
     [string]$FixtureManifestPath,
     [string]$FixtureId,
+    [ValidateSet('Modlist', 'ModlistPlusLocalWorkMods')]
+    [string]$WorkspaceContent,
+    [string[]]$LocalWorkModId,
+    [string]$LocalWorkModIdsFile,
     [string]$ModName,
     [string]$ModDirectory,
     [ValidateSet('End', 'Before', 'After')]
@@ -43,6 +47,7 @@ param(
     [switch]$NoExit
 )
 
+$workspaceContentSupplied = $PSBoundParameters.ContainsKey('WorkspaceContent')
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $toolRoot = Split-Path -Parent $PSScriptRoot
@@ -70,6 +75,27 @@ function Resolve-WorkspaceWinningPaths([string[]]$Inline, [string]$File) {
 
 $resolvedWinningPaths = @(Resolve-WorkspaceWinningPaths -Inline $WinningPaths -File $WinningPathsFile)
 
+function Resolve-WorkspaceStringList([string[]]$Inline, [string]$File, [string]$Purpose) {
+    $values = [Collections.Generic.List[string]]::new()
+    foreach ($value in @($Inline)) {
+        if (-not [string]::IsNullOrWhiteSpace($value)) { $values.Add($value.Trim()) }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($File)) {
+        $resolved = [IO.Path]::GetFullPath($File)
+        if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) { throw "$Purpose file does not exist: $resolved" }
+        $raw = Get-Content -LiteralPath $resolved -Raw
+        try { $parsed = $raw | ConvertFrom-Json -Depth 5 -ErrorAction Stop }
+        catch { throw "$Purpose file must be a valid JSON string array. $($_.Exception.Message)" }
+        foreach ($entry in @($parsed)) {
+            if ($entry -isnot [string] -or [string]::IsNullOrWhiteSpace($entry)) { throw "$Purpose file must contain only non-empty strings." }
+            $values.Add($entry.Trim())
+        }
+    }
+    return @($values | Select-Object -Unique)
+}
+
+$resolvedLocalWorkModIds = @(Resolve-WorkspaceStringList -Inline $LocalWorkModId -File $LocalWorkModIdsFile -Purpose 'LocalWorkModIds')
+
 function New-WorkspaceApprovalMetadata([string]$Subcommand) {
     $hostExecutable = [string][Environment]::ProcessPath
     if ([string]::IsNullOrWhiteSpace($hostExecutable)) { $hostExecutable = [string](Get-Process -Id $PID -ErrorAction Stop).Path }
@@ -79,9 +105,9 @@ function New-WorkspaceApprovalMetadata([string]$Subcommand) {
         hostExecutable = $hostExecutable; entryPoint = $entryPoint; subcommand = $Subcommand
         reusablePrefix = @($hostExecutable, '-NoProfile', '-NonInteractive', '-File', $entryPoint, $Subcommand)
         reusableApprovalEligible = $Subcommand -notin $oneShotCommands
-        escalationUsuallyRequired = $Subcommand -notin @('inspect', 'fixture-status', 'list-task', 'prepare-source')
+        escalationUsuallyRequired = $Subcommand -notin @('inspect', 'fixture-status', 'list-task', 'list-local-work-mods', 'prepare-source')
         oneShotReason = if ($Subcommand -eq 'refresh-fixture') { 'Shared fixture replacement must remain a one-shot approval.' } elseif ($Subcommand -eq 'complete-output') { 'Restoring the exact pre-task MO2 Overwrite backup tree must remain a one-shot approval.' } elseif ($Subcommand -in @('retire', 'release')) { 'Recursive owned-workspace removal must remain a one-shot approval.' } else { $null }
-        invocationRule = 'Use this literal prefix directly. Put changing access, workspace, mod, and evidence arguments afterward; do not hide the prefix in variables, -Command, pipelines, or a command string.'
+        invocationRule = 'Use this literal prefix directly. Put only supported command arguments afterward; do not hide the prefix in variables, -Command, pipelines, or a command string.'
     }
 }
 
@@ -345,8 +371,7 @@ function Preserve-WorkspaceRuntimeOutput(
 function Get-WorkspaceBlockingProcessNames($Config) {
     $names = @(
         @($Config.mo2.processNames) +
-        @($Config.mo2.gameProcessNames) +
-        @($Config.mo2.runtimeProcessNames) |
+        @($Config.mo2.gameProcessNames) |
             Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
             Select-Object -Unique
     )
@@ -499,6 +524,182 @@ function Resolve-DirectProfilePath([string]$ProfilesRoot, [string]$ProfileName) 
         throw 'SourceProfile must resolve to a direct child of the configured profiles directory.'
     }
     return $resolvedPath
+}
+
+function Get-LocalWorkModCatalog($Config, [string]$SourcePath, [string]$ModsRoot) {
+    $configured = if ($Config.defaults.PSObject.Properties['localWorkModCatalog']) { [string]$Config.defaults.localWorkModCatalog } else { '' }
+    if ([string]::IsNullOrWhiteSpace($configured)) {
+        return [pscustomobject][ordered]@{
+            configured = $false; path = $null; sha256 = $null; contractVersion = $null
+            candidates = @(); guidance = @(
+                'No local-work mod catalog is configured. Modlist workspaces remain available.',
+                'Set defaults.localWorkModCatalog to an exact local JSON catalog to offer optional local builds.'
+            )
+        }
+    }
+    $catalogPath = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($configured))
+    if (-not (Test-Path -LiteralPath $catalogPath -PathType Leaf)) { throw "Configured local-work mod catalog does not exist: $catalogPath" }
+    try { $catalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json -Depth 20 -ErrorAction Stop }
+    catch { throw "Local-work mod catalog is not valid JSON: $catalogPath. $($_.Exception.Message)" }
+    if ([string]$catalog.contractVersion -cne '1.0.0') { throw "Unsupported local-work mod catalog contractVersion '$($catalog.contractVersion)'; expected '1.0.0'." }
+    if (-not $catalog.PSObject.Properties['candidates']) { throw 'Local-work mod catalog is missing candidates.' }
+
+    $modListPath = Join-Path $SourcePath 'modlist.txt'
+    if (-not (Test-Path -LiteralPath $modListPath -PathType Leaf)) { throw "Stable source modlist does not exist: $modListPath" }
+    $modListBytes = [IO.File]::ReadAllBytes($modListPath)
+    $hasBom = $modListBytes.Length -ge 3 -and $modListBytes[0] -eq 0xEF -and $modListBytes[1] -eq 0xBB -and $modListBytes[2] -eq 0xBF
+    $offset = if ($hasBom) { 3 } else { 0 }
+    try {
+        $modListText = [Text.UTF8Encoding]::new($false, $true).GetString($modListBytes, $offset, $modListBytes.Length - $offset)
+    }
+    catch {
+        throw "Stable source modlist is not valid UTF-8: $modListPath. $($_.Exception.Message)"
+    }
+    $ids = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $modNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $resolved = [Collections.Generic.List[object]]::new()
+    foreach ($candidate in @($catalog.candidates)) {
+        foreach ($required in @('id', 'label', 'modName')) {
+            if (-not $candidate.PSObject.Properties[$required] -or [string]::IsNullOrWhiteSpace([string]$candidate.$required)) { throw "Local-work mod candidate is missing required property '$required'." }
+        }
+        $id = [string]$candidate.id
+        $label = [string]$candidate.label
+        $modName = [string]$candidate.modName
+        if ($id -cnotmatch '^[a-z0-9][a-z0-9._-]{0,63}$') { throw "Local-work mod candidate id is malformed: $id" }
+        if (-not $ids.Add($id)) { throw "Local-work mod candidate id is duplicated: $id" }
+        if (-not $modNames.Add($modName)) { throw "Local-work mod name is duplicated in the catalog: $modName" }
+        if ($modName -in @('.', '..') -or $modName.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or $modName.Contains([IO.Path]::DirectorySeparatorChar) -or $modName.Contains([IO.Path]::AltDirectorySeparatorChar)) { throw "Local-work mod candidate has an invalid direct mod name: $modName" }
+        $modDirectory = [IO.Path]::GetFullPath((Join-Path $ModsRoot $modName))
+        $markerMatches = @([regex]::Matches($modListText, "(?m)^(?<marker>[+-])$([regex]::Escape($modName))`r?$"))
+        $reasons = [Collections.Generic.List[string]]::new()
+        if (-not (Test-Path -LiteralPath $modDirectory -PathType Container)) { $reasons.Add('mod-directory-missing') }
+        if ($markerMatches.Count -eq 0) { $reasons.Add('source-marker-missing') }
+        elseif ($markerMatches.Count -gt 1) { $reasons.Add('source-marker-ambiguous') }
+        $resolved.Add([pscustomobject][ordered]@{
+            id = $id; label = $label; description = if ($candidate.PSObject.Properties['description']) { [string]$candidate.description } else { '' }
+            modName = $modName; modDirectory = $modDirectory
+            exclusionGroup = if ($candidate.PSObject.Properties['exclusionGroup']) { [string]$candidate.exclusionGroup } else { '' }
+            variant = if ($candidate.PSObject.Properties['variant']) { [string]$candidate.variant } else { '' }
+            capabilities = if ($candidate.PSObject.Properties['capabilities']) { @($candidate.capabilities | ForEach-Object { [string]$_ }) } else { @() }
+            metadata = if ($candidate.PSObject.Properties['metadata']) { $candidate.metadata } else { $null }
+            available = $reasons.Count -eq 0; unavailableReasons = @($reasons)
+            sourceMarker = if ($markerMatches.Count -eq 1) { [string]$markerMatches[0].Groups['marker'].Value } else { $null }
+        })
+    }
+    return [pscustomobject][ordered]@{
+        configured = $true; path = $catalogPath; sha256 = (Get-FileHash -LiteralPath $catalogPath -Algorithm SHA256).Hash
+        contractVersion = [string]$catalog.contractVersion; candidates = @($resolved)
+        guidance = @(
+            'Request WorkspaceContent=Modlist for the original modlist baseline.',
+            'Request WorkspaceContent=ModlistPlusLocalWorkMods with one or more exact available candidate IDs for local work.'
+        )
+    }
+}
+
+function Resolve-LocalWorkModSelection($Catalog, [string]$Content, [string[]]$RequestedIds) {
+    $requested = @($RequestedIds | Select-Object -Unique)
+    if ($Content -eq 'Modlist' -and $requested.Count -gt 0) { throw 'WorkspaceContent Modlist cannot include LocalWorkModId values.' }
+    if ($Content -eq 'ModlistPlusLocalWorkMods' -and $requested.Count -eq 0) { throw 'WorkspaceContent ModlistPlusLocalWorkMods requires at least one LocalWorkModId.' }
+    if ($requested.Count -gt 0 -and -not $Catalog.configured) { throw 'Local-work mods were requested, but defaults.localWorkModCatalog is not configured.' }
+    $selected = [Collections.Generic.List[object]]::new()
+    foreach ($id in $requested) {
+        $matches = @($Catalog.candidates | Where-Object { [string]$_.id -ceq $id })
+        if ($matches.Count -ne 1) { throw "Unknown local-work mod candidate id '$id'. Run list-local-work-mods and choose an exact available id." }
+        if (-not $matches[0].available) { throw "Local-work mod candidate '$id' is unavailable: $(@($matches[0].unavailableReasons) -join ', ')." }
+        $selected.Add($matches[0])
+    }
+    $conflicts = @($selected | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.exclusionGroup) } | Group-Object exclusionGroup | Where-Object Count -gt 1)
+    if ($conflicts.Count -gt 0) { throw "Mutually exclusive local-work mod candidates were requested together: $(@($conflicts.Name) -join ', ')." }
+    return [pscustomobject][ordered]@{
+        workspaceContent = $Content; requestedIds = $requested; selected = @($selected)
+        disabledCandidateIds = @($Catalog.candidates | Where-Object { [string]$_.id -notin $requested } | ForEach-Object { [string]$_.id })
+    }
+}
+
+function Set-LocalWorkModSelection([string]$ModListPath, $Catalog, $Selection) {
+    $bytes = [IO.File]::ReadAllBytes($ModListPath)
+    $hasBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+    $offset = if ($hasBom) { 3 } else { 0 }
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes, $offset, $bytes.Length - $offset)
+    $selectedIds = @($Selection.requestedIds)
+    $applied = [Collections.Generic.List[object]]::new()
+    foreach ($candidate in @($Catalog.candidates)) {
+        $pattern = "(?m)^(?<marker>[+-])(?<name>$([regex]::Escape([string]$candidate.modName)))`r?$"
+        $matches = @([regex]::Matches($text, $pattern))
+        if ($matches.Count -eq 0) {
+            $applied.Add([pscustomobject][ordered]@{ id = [string]$candidate.id; modName = [string]$candidate.modName; markerBefore = $null; markerAfter = $null; status = 'marker-absent' })
+            continue
+        }
+        if ($matches.Count -gt 1) { throw "Expected at most one task-profile marker for local-work mod '$($candidate.modName)'; found $($matches.Count)." }
+        $target = if ([string]$candidate.id -cin $selectedIds) { '+' } else { '-' }
+        $before = [string]$matches[0].Groups['marker'].Value
+        $expression = [regex]::new($pattern)
+        $text = $expression.Replace($text, { param($match) $target + $match.Groups['name'].Value + $(if ($match.Value.EndsWith("`r")) { "`r" } else { '' }) }, 1)
+        $applied.Add([pscustomobject][ordered]@{ id = [string]$candidate.id; modName = [string]$candidate.modName; markerBefore = $before; markerAfter = $target; status = 'applied' })
+    }
+    $payload = [Text.UTF8Encoding]::new($false).GetBytes($text)
+    $resultBytes = if ($hasBom) { [byte[]](0xEF, 0xBB, 0xBF) + $payload } else { $payload }
+    Write-WorkspaceBytesAtomic -Path $ModListPath -Bytes $resultBytes
+    return [pscustomobject][ordered]@{
+        modListPath = $ModListPath; workspaceContent = [string]$Selection.workspaceContent
+        requestedIds = @($Selection.requestedIds); applied = @($applied)
+        resultSha256 = (Get-FileHash -LiteralPath $ModListPath -Algorithm SHA256).Hash
+    }
+}
+
+function Set-WorkspaceRuntimeRouteSelection([string]$ModListPath, $Config, $RuntimeRoute) {
+    $routeId = [string]$RuntimeRoute.id
+    if ($routeId -notin @('OCU', 'SteamVR', 'SteamVRNull')) {
+        throw "Workspace runtime route is unsupported: '$routeId'."
+    }
+    if ($routeId -eq 'OCU') {
+        return [pscustomobject][ordered]@{
+            state = 'deferred-to-route-validation'; runtimeRoute = $RuntimeRoute
+            modListPath = $ModListPath; changed = $false; disabledProviders = @()
+            resultSha256 = (Get-FileHash -LiteralPath $ModListPath -Algorithm SHA256).Hash
+        }
+    }
+
+    $profileName = Split-Path -Leaf (Split-Path -Parent $ModListPath)
+    $inventory = (Invoke-MO2Inspect -Config $Config -Profile $profileName).data.runtimeProviders
+    if (@($inventory.errors).Count -gt 0) {
+        throw "Runtime-provider discovery could not prove the cloned profile state: $(@($inventory.errors) -join '; ')"
+    }
+    $targets = @($inventory.providers | Where-Object { $_.enabled -and $_.markers.rootOpenVrApi })
+    if ($targets.Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            state = 'already-compatible'; runtimeRoute = $RuntimeRoute
+            modListPath = $ModListPath; changed = $false; disabledProviders = @()
+            resultSha256 = (Get-FileHash -LiteralPath $ModListPath -Algorithm SHA256).Hash
+        }
+    }
+
+    $bytes = [IO.File]::ReadAllBytes($ModListPath)
+    $hasBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+    $offset = if ($hasBom) { 3 } else { 0 }
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes, $offset, $bytes.Length - $offset)
+    $disabled = [Collections.Generic.List[object]]::new()
+    foreach ($provider in $targets) {
+        $pattern = "(?m)^\+(?<name>$([regex]::Escape([string]$provider.modName)))`r?$"
+        $matches = @([regex]::Matches($text, $pattern))
+        if ($matches.Count -ne 1) {
+            throw "Expected exactly one enabled marker for inherited runtime provider '$($provider.modName)'; found $($matches.Count)."
+        }
+        $expression = [regex]::new($pattern)
+        $text = $expression.Replace($text, { param($match) '-' + $match.Groups['name'].Value + $(if ($match.Value.EndsWith("`r")) { "`r" } else { '' }) }, 1)
+        $disabled.Add([pscustomobject][ordered]@{
+            classification = [string]$provider.classification; modName = [string]$provider.modName
+            lineNumber = [int]$provider.lineNumber; markerBefore = '+'; markerAfter = '-'
+        })
+    }
+    $payload = [Text.UTF8Encoding]::new($false).GetBytes($text)
+    $resultBytes = if ($hasBom) { [byte[]](0xEF, 0xBB, 0xBF) + $payload } else { $payload }
+    Write-WorkspaceBytesAtomic -Path $ModListPath -Bytes $resultBytes
+    return [pscustomobject][ordered]@{
+        state = 'incompatible-providers-disabled'; runtimeRoute = $RuntimeRoute
+        modListPath = $ModListPath; changed = $true; disabledProviders = @($disabled)
+        resultSha256 = (Get-FileHash -LiteralPath $ModListPath -Algorithm SHA256).Hash
+    }
 }
 
 function Get-ProfileSnapshot([string]$Path) {
@@ -776,7 +977,9 @@ function Set-MO2SelectedProfile($Config, [string]$TargetProfile, [string]$Operat
     $beforeValue = [string]$selection.value
     $replacement = $selection.match.Groups['prefix'].Value + '@ByteArray(' + $TargetProfile + ')'
     $afterText = $selection.text.Remove($selection.match.Index, $selection.match.Length).Insert($selection.match.Index, $replacement)
-    $afterBytes = [Text.Encoding]::UTF8.GetBytes($afterText)
+    # An already-selected profile is an exact-byte no-op; MO2 may preserve an
+    # encoding or BOM that a reconstructed UTF-8 representation would erase.
+    $afterBytes = if ($beforeValue -ceq $TargetProfile) { $beforeBytes } else { [Text.Encoding]::UTF8.GetBytes($afterText) }
     $beforeHash = Get-WorkspaceBytesSha256 -Bytes $beforeBytes
     $resultHash = Get-WorkspaceBytesSha256 -Bytes $afterBytes
     $backupPath = Join-Path $EvidenceRoot 'ModOrganizer.before.ini'
@@ -1015,12 +1218,18 @@ function Get-TaskWorkspaces($Config, [string]$ResolvedTaskId) {
             $manifest = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
             if ($manifest.PSObject.Properties['ownerTaskId'] -and [string]$manifest.ownerTaskId -ceq $ResolvedTaskId) {
                 $profilePath = [IO.Path]::GetFullPath([string]$manifest.profilePath)
+                [string[]]$selectedLocalWorkModIds = @()
+                if ($manifest.PSObject.Properties['localWorkMods'] -and @($manifest.localWorkMods.requestedIds).Count -gt 0) {
+                    $selectedLocalWorkModIds = @($manifest.localWorkMods.requestedIds | ForEach-Object { [string]$_ })
+                }
                 $items += [pscustomobject][ordered]@{
                     workspaceId = [string]$manifest.workspaceId; status = [string]$manifest.status
                     profileName = [string]$manifest.profileName; profileDirectory = $profilePath
                     profileExists = Test-Path -LiteralPath $profilePath -PathType Container
                     resumable = ([string]$manifest.status -in @('ready', 'retained')) -and (Test-Path -LiteralPath $profilePath -PathType Container)
                     sourceProfile = [string]$manifest.sourceProfile; accessId = [string]$manifest.accessId
+                    workspaceContent = if ($manifest.PSObject.Properties['localWorkMods']) { [string]$manifest.localWorkMods.workspaceContent } else { 'legacy-unspecified' }
+                    selectedLocalWorkModIds = $selectedLocalWorkModIds
                     createdUtc = [string]$manifest.createdUtc; lastResumedUtc = if ($manifest.PSObject.Properties['lastResumedUtc']) { [string]$manifest.lastResumedUtc } else { $null }
                     manifestPath = $file.FullName
                 }
@@ -1031,12 +1240,12 @@ function Get-TaskWorkspaces($Config, [string]$ResolvedTaskId) {
     return @($items)
 }
 
-function Assert-AccessAndClosed($Config, [string]$OwnedAccessId, [string]$Profile, [switch]$AllowOverwriteShaderCaches) {
+function Assert-AccessAndClosed($Config, [string]$OwnedAccessId, [string]$Profile, [switch]$AllowOverwriteShaderCaches, [switch]$RequireRuntimeRoute) {
     if ([string]::IsNullOrWhiteSpace($OwnedAccessId)) { throw '-AccessId is required for workspace mutation.' }
     $access = Invoke-MO2AccessStatus -Config $Config -AccessId $OwnedAccessId
     if (-not $access.ok -or -not $access.data.owned) { throw 'The exact MO2 access lease is not owned by this task.' }
     if (-not [string]::IsNullOrWhiteSpace([string]$access.data.access.sessionId)) { throw 'Release the active MO2 evidence session before mutating a test workspace.' }
-    $validation = Invoke-MO2Validate -Config $Config -Profile $Profile -RequireClosed -OwnedAccessId $OwnedAccessId
+    $validation = Invoke-MO2Validate -Config $Config -Profile $Profile -RequireClosed -RequireRuntimeRoute:$RequireRuntimeRoute -OwnedAccessId $OwnedAccessId
     if (-not $validation.ok) {
         $failedChecks = @($validation.checks | Where-Object status -eq 'fail')
         $onlyExpectedCaches = $AllowOverwriteShaderCaches -and $failedChecks.Count -eq 1 -and $failedChecks[0].name -eq 'overwrite' -and @($validation.data.overwrite.shaderCaches).Count -gt 0
@@ -1073,7 +1282,7 @@ try {
     }
 
     if ($Command -eq 'release') {
-        throw 'Workspace release is intentionally unavailable because it previously deleted retained task state. Yield scarce MO2 access with Invoke-MO2Control.ps1 release-access; destroy a finished workspace only with the explicit retire command.'
+        throw 'Workspace release is intentionally unavailable because it previously deleted retained task state. Yield scarce MO2 access with Invoke-MO2Control.ps1 release-access. Use explicit retire only after direction to discard or replace that exact environment, or when a separately stated retention policy proves it obsolete.'
     }
 
     if ($Command -eq 'list-task') {
@@ -1086,6 +1295,25 @@ try {
                 ownerTaskId = $resolvedTaskId; count = $workspaces.Count; workspaces = $workspaces
                 unavailableWorkspaces = @($allWorkspaces | Where-Object { -not $_.resumable })
                 guidance = if ($workspaces.Count -eq 0) { 'This task has no retained workspace. After acquiring MO2 access, explicitly create a fresh workspace.' } else { 'After acquiring MO2 access, explicitly resume one listed WorkspaceId or explicitly create a fresh workspace.' }
+            }
+        }
+    }
+    elseif ($Command -eq 'list-local-work-mods') {
+        $sourceName = if (-not [string]::IsNullOrWhiteSpace($SourceProfile)) { $SourceProfile } elseif ($config.defaults.PSObject.Properties['testProfileSource']) { [string]$config.defaults.testProfileSource } else { throw 'defaults.testProfileSource is required for local-work mod discovery.' }
+        $sourcePath = Resolve-DirectProfilePath -ProfilesRoot $profilesRoot -ProfileName $sourceName
+        if (-not (Test-Path -LiteralPath $sourcePath -PathType Container)) { throw "Stable source profile does not exist: $sourceName" }
+        $catalog = Get-LocalWorkModCatalog -Config $config -SourcePath $sourcePath -ModsRoot $modsRoot
+        $result = [pscustomobject][ordered]@{
+            ok = $true; command = $Command; state = $(if (-not $catalog.configured) { 'catalog-not-configured' } elseif (@($catalog.candidates | Where-Object available).Count -eq 0) { 'no-local-work-mods-available' } else { 'local-work-mods-found' })
+            data = [pscustomobject][ordered]@{
+                sourceProfile = $sourceName; sourceProfileDirectory = $sourcePath
+                catalog = $catalog; availableCount = @($catalog.candidates | Where-Object available).Count
+                requestContract = [pscustomobject][ordered]@{
+                    modlist = '-WorkspaceContent Modlist'
+                    modlistPlusLocalWorkMods = '-WorkspaceContent ModlistPlusLocalWorkMods -LocalWorkModId <exact-id>'
+                    multipleIdsFile = '-WorkspaceContent ModlistPlusLocalWorkMods -LocalWorkModIdsFile <json-string-array-path>'
+                    retainedWorkspace = 'Resume preserves the original selection; request a fresh create to change local-work mods.'
+                }
             }
         }
     }
@@ -1155,12 +1383,30 @@ try {
         }
         $result = [pscustomobject][ordered]@{ ok = $true; command = $Command; state = [string]$preparation.state; data = $preparation }
     }
+    elseif ($Command -eq 'create' -and -not $workspaceContentSupplied) {
+        $result = [pscustomobject][ordered]@{
+            ok = $false
+            command = $Command
+            state = 'missing-workspace-content'
+            errors = @("Command 'create' requires explicit -WorkspaceContent Modlist or ModlistPlusLocalWorkMods.")
+            data = [pscustomobject][ordered]@{
+                requiredParameter = 'WorkspaceContent'
+                allowedValues = @('Modlist', 'ModlistPlusLocalWorkMods')
+                supplied = $false
+            }
+        }
+    }
     elseif ($Command -eq 'create') {
         $resolvedTaskId = Resolve-TaskId -RequestedTaskId $TaskId -Required
         $sourceName = if (-not [string]::IsNullOrWhiteSpace($SourceProfile)) { $SourceProfile } elseif ($config.defaults.PSObject.Properties['testProfileSource']) { [string]$config.defaults.testProfileSource } else { throw 'defaults.testProfileSource is required; test workspaces never infer a stable source from the ordinary session default.' }
         $sourcePath = Resolve-DirectProfilePath -ProfilesRoot $profilesRoot -ProfileName $sourceName
         $validation = Assert-AccessAndClosed -Config $config -OwnedAccessId $AccessId -Profile $sourceName -AllowOverwriteShaderCaches
+        $accessStatus = Invoke-MO2AccessStatus -Config $config -AccessId $AccessId
+        if (-not $accessStatus.ok -or -not $accessStatus.data.owned) { throw 'The exact MO2 access lease is not owned by this task.' }
+        $runtimeRoute = $accessStatus.data.access.runtimeRoute
         if (-not (Test-Path -LiteralPath $sourcePath -PathType Container)) { throw "Stable source profile does not exist: $sourceName" }
+        $localWorkCatalog = Get-LocalWorkModCatalog -Config $config -SourcePath $sourcePath -ModsRoot $modsRoot
+        $localWorkSelection = Resolve-LocalWorkModSelection -Catalog $localWorkCatalog -Content $WorkspaceContent -RequestedIds $resolvedLocalWorkModIds
         $workspaceId = '{0}-{1}-{2}' -f ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ').ToLowerInvariant()), (Get-SafeName $Label), ([guid]::NewGuid().ToString('N').Substring(0, 8))
         $ownershipId = [guid]::NewGuid().ToString('N')
         $profileName = 'Codex Task - ' + $workspaceId
@@ -1214,6 +1460,13 @@ try {
                 warranty = 'Exact source and save bytes were verified at clone creation. This does not assert a live game load. Resumed task profiles are preserved as-is and are not reverified after task edits.'
             }
             saveFixture = $fixture; sourceSaveSnapshot = $sourceSaveSnapshot; initialModNames = $initialMods; protectedSharedModNames = $initialMods; createdMods = @(); registeredMods = @(); inheritedSaves = $true
+            localWorkMods = [pscustomobject][ordered]@{
+                workspaceContent = [string]$localWorkSelection.workspaceContent; requestedIds = @($localWorkSelection.requestedIds)
+                selected = @($localWorkSelection.selected); disabledCandidateIds = @($localWorkSelection.disabledCandidateIds)
+                catalog = [pscustomobject][ordered]@{ configured = [bool]$localWorkCatalog.configured; path = $localWorkCatalog.path; sha256 = $localWorkCatalog.sha256; contractVersion = $localWorkCatalog.contractVersion }
+                application = $null
+            }
+            runtimeRoute = $runtimeRoute; runtimeRouteApplication = $null; runtimeRouteAdmission = $null
             creationJournalPath = $creationJournalPath
             runtimeOutput = [pscustomobject][ordered]@{
                 state = 'planned'; mode = 'mo2-overwrite-output'; executable = $runtimeExecutable
@@ -1267,6 +1520,21 @@ try {
                         Copy-Item -LiteralPath ([string]$file.fullPath) -Destination $target
                         Assert-TreeOperationBudget -Purpose 'Stable source profile copy'
                     }
+                    $localWorkApplication = Set-LocalWorkModSelection -ModListPath (Join-Path $profilePath 'modlist.txt') -Catalog $localWorkCatalog -Selection $localWorkSelection
+                    $manifest.localWorkMods.application = $localWorkApplication
+                    $runtimeRouteApplication = Set-WorkspaceRuntimeRouteSelection -ModListPath (Join-Path $profilePath 'modlist.txt') -Config $config -RuntimeRoute $runtimeRoute
+                    $manifest.runtimeRouteApplication = $runtimeRouteApplication
+                    if ([string]$runtimeRoute.id -in @('SteamVR', 'SteamVRNull')) {
+                        $routeValidation = Invoke-MO2Validate -Config $config -Profile $profileName -RequireClosed -RequireRuntimeRoute -OwnedAccessId $AccessId
+                        $routeCheck = @($routeValidation.checks | Where-Object name -eq 'runtime-route-provider')
+                        if ($routeCheck.Count -ne 1 -or $routeCheck[0].status -ne 'pass') {
+                            throw "Fresh workspace did not establish the leased $($runtimeRoute.id) runtime route: $($routeValidation.errors -join '; ')"
+                        }
+                        $manifest.runtimeRouteAdmission = [pscustomobject][ordered]@{
+                            state = 'qualified'; validatedUtc = [DateTime]::UtcNow.ToString('o')
+                            check = $routeCheck[0]; profile = $profileName
+                        }
+                    }
                     New-Item -ItemType Directory -Path (Join-Path $profilePath 'saves') -Force | Out-Null
                     $profileSaveSnapshot = Get-SaveTreeSnapshot -ProfilePath $profilePath
                     if ([string]$profileSaveSnapshot.sha256 -cne [string]$sourceSaveSnapshot.sha256 -or [int]$profileSaveSnapshot.fileCount -ne [int]$sourceSaveSnapshot.fileCount) { throw 'Complete source save-tree copy verification failed.' }
@@ -1297,7 +1565,7 @@ try {
                     $backupSnapshot = & $transactionTool snapshot -CachePath $runtimeBackupPath -RelativeCachePath 'backup' -EvidenceDirectory $backupEvidenceDirectory -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
                     if (-not $backupSnapshot.ok) { throw "Could not snapshot MO2 Overwrite backup: $($backupSnapshot.errors -join '; ')" }
                     $backupSnapshotCreated = $true
-                    $backupProviders = & $transactionTool providers -ProfilePath (Join-Path $profilePath 'modlist.txt') -ModsPath $modsRoot -RelativeCachePath 'backup' -DeepInventory -NoExit -Confirm:$false | ConvertFrom-Json
+                    $backupProviders = & $transactionTool providers -ProfilePath (Join-Path $profilePath 'modlist.txt') -ModsPath $modsRoot -RelativeCachePath 'backup' -DeepInventory -IncludeInventoryEntries -NoExit -Confirm:$false | ConvertFrom-Json
                     if (-not $backupProviders.ok) { throw "Could not inspect the task profile's backup providers: $($backupProviders.errors -join '; ')" }
                     $backupShadow = Copy-WorkspaceProviderTreeShadow -ProviderResult $backupProviders -TargetPath $runtimeBackupPath -RelativePath 'backup' -Purpose 'MO2 Overwrite backup provider union'
                     $preparedBackup = & $transactionTool inspect -CachePath $runtimeBackupPath -RelativeCachePath 'backup' -NoExit -Confirm:$false | ConvertFrom-Json
@@ -1371,6 +1639,7 @@ try {
         }
         elseif ($WhatIfPreference) {
             $selectionEvidence = Join-Path (Split-Path -Parent $manifestPath) ($workspaceId + '-create-select')
+            $manifest.localWorkMods.application = [pscustomobject][ordered]@{ state = 'planned'; requestedIds = @($localWorkSelection.requestedIds); candidateCount = @($localWorkCatalog.candidates).Count }
             $manifest | Add-Member -NotePropertyName selectedProfileTransaction -NotePropertyValue (Set-MO2SelectedProfile -Config $config -TargetProfile $profileName -Operation 'select-created-task-workspace' -EvidenceRoot $selectionEvidence -WhatIf)
         }
         $result = [pscustomobject][ordered]@{ ok = $true; command = $Command; state = $(if ($WhatIfPreference) { 'dry-run' } else { 'workspace-ready' }); data = $manifest }
@@ -1410,7 +1679,7 @@ try {
             $available = @(Get-TaskWorkspaces -Config $config -ResolvedTaskId $resolvedTaskId | Where-Object profileExists)
             throw "Retained workspace '$WorkspaceId' has no profile directory at '$profilePath'. Valid retained workspaces: $((@($available.workspaceId) -join ', ') ?? '<none>'). Request a fresh workspace if none remain."
         }
-        $null = Assert-AccessAndClosed -Config $config -OwnedAccessId $AccessId -Profile ([string]$workspace.data.profile) -AllowOverwriteShaderCaches
+        $null = Assert-AccessAndClosed -Config $config -OwnedAccessId $AccessId -Profile ([string]$workspace.data.profile) -AllowOverwriteShaderCaches -RequireRuntimeRoute
         $approved = $PSCmdlet.ShouldProcess($profilePath, "bind retained workspace to access '$AccessId' and select profile '$($workspace.data.profile)'")
         if ($approved) {
             $resume = Invoke-WithWorkspaceTransactionLock -Config $config -Action {

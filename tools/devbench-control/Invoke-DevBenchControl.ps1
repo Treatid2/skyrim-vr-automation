@@ -41,7 +41,7 @@ param(
     [int]$MaxMenuDismissals = 1,
     [ValidateRange(0, 60)]
     [int]$MinimumMenuStableSeconds = 0,
-    [string[]]$AllowedMainMenuMenus = @('HUD Menu', 'Main Menu'),
+    [string[]]$AllowedMainMenuMenus = @('HUD Menu', 'Main Menu', 'Mist Menu', 'Fader Menu'),
     [switch]$AcceptAlreadyLoaded,
     [switch]$AllowUnsafeTfc1,
     [switch]$AllowUnprovenGameMutation,
@@ -58,6 +58,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $argumentsJsonSupplied = $PSBoundParameters.ContainsKey('ArgumentsJson')
+$readOnlyCall = $false
 $endpoint = $null
 $headers = $null
 $runtimeIdentity = $null
@@ -121,6 +122,7 @@ function Initialize-InvocationEvidence {
         runtimeSha256 = if (-not [string]::IsNullOrWhiteSpace($RuntimePath) -and (Test-Path -LiteralPath $RuntimePath -PathType Leaf)) { (Get-FileHash -LiteralPath $RuntimePath -Algorithm SHA256).Hash } else { $null }
         requestedArguments = if ($Command -eq 'call') { $ArgumentsJson } else { $null }
         requestedArgumentsSha256 = if ($Command -eq 'call') { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.UTF8Encoding]::new($false).GetBytes($ArgumentsJson))) } else { $null }
+        requestMode = if ($Command -eq 'call') { 'unclassified' } else { $null }
         commandId = $null
         workspaceManifestPath = if ([string]::IsNullOrWhiteSpace($WorkspaceManifestPath)) { $null } else { [IO.Path]::GetFullPath($WorkspaceManifestPath) }
         workspaceManifestSha256 = if (-not [string]::IsNullOrWhiteSpace($WorkspaceManifestPath) -and (Test-Path -LiteralPath $WorkspaceManifestPath -PathType Leaf)) { (Get-FileHash -LiteralPath $WorkspaceManifestPath -Algorithm SHA256).Hash } else { $null }
@@ -592,6 +594,9 @@ try {
     if ($Command -eq 'call') {
         if ([string]::IsNullOrWhiteSpace($Tool)) { throw 'Tool is required for call.' }
         try { $arguments = $ArgumentsJson | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { throw "ArgumentsJson is invalid: $($_.Exception.Message)" }
+        $readOnlyCall = Test-DevBenchReadOnlyRequest -ToolName $Tool -Arguments $arguments
+        $script:invocationRecord.requestMode = if ($readOnlyCall) { 'read-only' } else { 'mutation-capable' }
+        Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord
         if ($arguments.Contains('commandId')) { $script:invocationRecord.commandId = [string]$arguments['commandId']; Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord }
         $unsafeTfc1Path = Find-UnsafeTfc1 -Value $arguments
         if ($unsafeTfc1Path -and -not $AllowUnsafeTfc1) {
@@ -627,7 +632,7 @@ try {
         $tools = @($session.tools)
         $runtimeIdentity = $session.runtimeIdentity
         if (-not $SkipRuntimeIdentityVerification) {
-            if ($Command -eq 'call' -and -not $runtimeIdentity.complete) {
+            if ($Command -eq 'call' -and -not $readOnlyCall -and -not $runtimeIdentity.complete) {
                 throw "Mutation-capable DevBench calls require complete runtime identity. Missing: $($runtimeIdentity.missing -join ', ')."
             }
         }
@@ -664,11 +669,11 @@ try {
         }
         else {
             Update-InvocationEvidence -State 'dispatching'
-            $data = Invoke-ToolRpc -Name $Tool -Arguments $arguments -Headers $headers -Mutation
+            $data = Invoke-ToolRpc -Name $Tool -Arguments $arguments -Headers $headers -Mutation:(-not $readOnlyCall)
             if ($performanceGuard) {
                 $data | Add-Member -NotePropertyName performanceGuard -NotePropertyValue $performanceGuard -Force
             }
-            $semantic = Get-DevBenchSemanticStatus -Content @($data.content)
+            $semantic = Get-DevBenchCallSemanticStatus -ToolName $Tool -Arguments $arguments -Content @($data.content)
             if ($Tool -eq 'communityshaders.profiler' -and -not $semantic.known) {
                 $profilerPayload = @($data.content | Select-Object -First 1)
                 if ($profilerPayload.Count -eq 1 -and -not $profilerPayload[0].PSObject.Properties['error']) {

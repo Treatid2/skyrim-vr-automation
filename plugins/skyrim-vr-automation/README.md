@@ -22,7 +22,9 @@ optional integration rather than the identity or boundary of the toolkit.
 - `tools/mo2-workspace-control` — stable-source ShaderCache evacuation plus
   unique task profiles cloned from that explicit source, with a verified copy
   of its complete saves tree, a mandatory integrity-verified world-entry save, and
-  strict ownership of newly created mods.
+  strict ownership of newly created mods. Its local-work catalog offers an
+  explicit modlist-only baseline or selected local builds without changing the
+  maintained source profile.
 - `tools/steamvr-null-control` — transactional null-HMD apply/restore and
   bounded SteamVR shutdown, with a required application-observed standing
   head-pose qualification and opt-in exact-driver isolation for conflicting
@@ -156,6 +158,12 @@ declare it through `defaults.newGameFixtureManifest`, and require both
 `fixture-status` and the doctor's `prime-profile-world-entry-integrity` check
 to pass. See `docs/INSTALL-CODEX.md` and `docs/BREEZEHOME-SAVE.md`.
 
+Optional local builds are declared through
+`defaults.localWorkModCatalog`. Copy
+`tools/mo2-workspace-control/local-work-mods.example.json` to an ignored local
+path, replace its exact mod names, then use `list-local-work-mods` before fresh
+workspace creation.
+
 DevBench runtime discovery is supplied explicitly, through an environment
 variable, or by `devBenchRuntimePath` in the stable per-user
 `%LOCALAPPDATA%\SkyrimVRAutomation\machine.local.json`:
@@ -254,10 +262,16 @@ legacy `ShaderCache*` trees from overwrite into an enabled stable-source mod,
 then uses its own cloned workspace profile and may remove only mods that its
 workspace proved were new;
 tasks release MO2 access whenever
-they can continue without it. Null-HMD apply takes an exact backup and
+they can continue without it while retaining the workspace and its profile-local
+changes for exact later resume. Ending a run, turn, or task does not authorize
+workspace retirement; destructive retirement requires explicit discard or
+replacement intent, or a separately stated policy that proves the environment
+obsolete. Null-HMD apply takes an exact backup and
 restore verifies its receipt; optional display-driver isolation also preserves
 and hash-verifies the exact OpenVR registration file and refuses drift before
-restoration. Profile edits are exact-marker transactions;
+restoration. Virtual Desktop and `VirtualDesktop.Streamer` are not null-HMD or
+profile-mutation blockers; an enabled profile-local OCU/OpenComposite provider
+conflicts with the SteamVR null-HMD route. Profile edits are exact-marker transactions;
 cache restoration retains the displaced tree and verifies both sides before
 cleanup. Nothing here deletes unclassified MO2 overwrite content or shader
 caches.

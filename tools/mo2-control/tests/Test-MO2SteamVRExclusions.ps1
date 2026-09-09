@@ -70,7 +70,7 @@ function New-ExclusionFixture {
     [IO.File]::WriteAllText((Join-Path $mo2Root 'ModOrganizer.ini'), '[Settings]' + "`n" + 'executable_blacklist=leave-this-decoy-alone.exe', [Text.UTF8Encoding]::new($false))
     $configPath = Join-Path $root 'machine.fixture.json'
     [IO.File]::WriteAllText($configPath, ($config | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
-    $access = Invoke-MO2RequestAccess -Config $config -Label $Name -TaskId ('fixture-' + $Name) -EstimatedMinutes 5
+    $access = Invoke-MO2RequestAccess -Config $config -Label $Name -TaskId ('fixture-' + $Name) -RuntimeRoute SteamVR -EstimatedMinutes 5
     if (-not $access.ok) { throw "Unable to acquire isolated fixture lease: $Name" }
     return [pscustomobject]@{
         root = $root; config = $config; configPath = $configPath; ini = $iniPath
