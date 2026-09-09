@@ -55,7 +55,8 @@ function Test-GhidraArtifactReceipt($Receipt, [string]$Path, [string]$Sha256) {
 }
 
 function Test-GhidraStartingReceipt($Receipt, [string]$Path, [string]$Sha256) {
-    return [string]$Receipt.state -ceq 'starting' -and
+    return [bool]$Receipt.ok -and
+        [string]$Receipt.state -ceq 'starting' -and
         [bool]$Receipt.managed -and
         (Test-SamePath ([string]$Receipt.project.programPath) $Path) -and
         ([string]$Receipt.project.programSha256).Equals(
@@ -85,7 +86,8 @@ try {
         ProfilePath = $ProfilePath
         ModsPath = $ModsPath
         RelativeCachePath = 'SKSE\Plugins\CommunityShaders.dll'
-        DeepInventory = $false
+        DeepInventory = $true
+        IncludeInventoryEntries = $true
         NoExit = $true
         Compact = $true
     }

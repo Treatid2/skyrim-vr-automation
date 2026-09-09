@@ -292,7 +292,7 @@ Review the full image, center, boundary, periphery, both eyes, and 12-frame
 loop. Run two blinded passes with the displayed A/B order swapped. If an
 objective's sign reverses between passes, record it as indeterminate unless a
 new, independently randomized repetition resolves the disagreement. Frames
-are evidence within one sequence; they are not sixteen independent votes.
+are evidence within one sequence; they are not twelve independent votes.
 
 Use the following paired scale, always expressed as candidate minus reference:
 

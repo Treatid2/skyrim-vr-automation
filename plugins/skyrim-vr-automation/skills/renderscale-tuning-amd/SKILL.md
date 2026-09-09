@@ -63,6 +63,12 @@ required, but no nested `result` or adapter field is required.
 
 ## Uninterrupted measurement
 
+The runner verifies AMD vendor ID `0x1002`/4098 from existing stress-start
+receipts and terminal waiters. A safe non-stable waiter without status retains
+the verified identity of its exact stress session. Missing or mismatched
+identity stops measurement with diagnostics, without a positioning gate or
+extra tool call.
+
 Do not end the positioning `functions.exec` after the scenario response. In
 that same cell, load `tools/renderscale-tuning-live/runner.js` and
 `skills/renderscale-tuning-amd/references/matrix.v1.json` from the current

@@ -2,8 +2,8 @@
 
 Apply the complete Simple COC protocol without omission, with only the
 replacements below. Where the base protocol conflicts, this file wins only for
-the initial cell, measured mutation, transition count, DLSS-trace lifecycle,
-and result grouping.
+the initial cell, measured mutation, transition count, pacing, DLSS-trace
+lifecycle, and result grouping.
 
 ## Fixed assay
 
@@ -83,8 +83,13 @@ Replace only the base protocol's session-wide DLSS trace ownership:
 - On AMD, perform one bounded status/reset/start/stop/read capability lifecycle
   before the matrix and require zero DLSS dispatch records.
 
-A missing optional trace action is `unsupported`; an exposed action that fails
-is a required-lane failure. Do not allow two simultaneous trace owners.
+A missing optional trace action is `unsupported`. On NVIDIA, one capability
+receipt plus `n/a (unsupported)` for every per-DLSS trace field satisfies only
+the trace-lane requirement and does not make the run incomplete; all DLSS
+transitions, statuses, and stabilization aggregates remain mandatory. An
+exposed trace action that fails is a required-lane failure. On AMD, retain the
+capability receipt and require zero DLSS trace dispatch records. Do not allow
+two simultaneous trace owners.
 
 ## 4. Run the 25 measured menu transitions
 
@@ -142,13 +147,15 @@ substitutions:
    armed telemetry statuses; then stop only task-owned captures and restore
    only profiler state changed by this run.
 3. Retain the complete stress record, all 25 qualification/status receipts,
-   all per-DLSS traces, and every CPU, GPU, lifetime, presentation,
+   all per-DLSS traces or their explicit `n/a (unsupported)` entries, and every
+   CPU, GPU, lifetime, presentation,
    resource-publication, preparation-stage, retry, failure, memory, queue,
    profiler, fidelity, and lifecycle field required by Simple COC.
 4. Calculate strict stabilization mean and worst frames plus retry totals for
-   DLSS, FSR, every method/quality combination present in the matrix, and the
-   complete 25-transition assay. These values are mandatory for a completed
-   result.
+   each method and method/quality combination present in the matrix, plus the
+   complete 25-transition assay. Record `n/a` for methods absent from the
+   selected matrix. The present-method and complete-assay values are mandatory
+   for a completed result.
 5. Append one uniquely headed rightmost column to the Simple COC comparison
    ledger. Populate shared identity, timing, telemetry, preparation, fidelity,
    and verdict rows; add menu-specific rows for the matrix and aggregates.

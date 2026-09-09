@@ -31,9 +31,32 @@ try {
         session = [ordered]@{ lockFile = 'C:\sessions\active.lock.json' }
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $source -Encoding utf8
 
-    $main = & $entry register -Name main -ConfigPath $source -UserRoot $fixture -NoExit | ConvertFrom-Json
+    $incompleteSource = Join-Path $fixture 'incomplete-source.json'
+    [ordered]@{
+        mo2 = [ordered]@{ root = 'C:\MO2' }
+        defaults = [ordered]@{ profile = 'Stable' }
+        storage = [ordered]@{ sessionStaging = 'C:\sessions' }
+        limits = [ordered]@{ maxEnumeratedFiles = 100 }
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $incompleteSource -Encoding utf8
+    $incompleteRegister = & $entry register -Name incomplete -ConfigPath $incompleteSource -UserRoot $fixture -NoExit | ConvertFrom-Json
+    Assert-ModlistTest (-not $incompleteRegister.ok -and $incompleteRegister.errors[0] -match "missing required object 'session'") 'register rejects a configuration missing any shared required object'
+
+    $scalarSource = Join-Path $fixture 'scalar-source.json'
+    $scalarConfiguration = Get-Content -LiteralPath $source -Raw | ConvertFrom-Json
+    $scalarConfiguration.storage = 'not-an-object'
+    $scalarConfiguration | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $scalarSource -Encoding utf8
+    $scalarRegister = & $entry register -Name scalar -ConfigPath $scalarSource -UserRoot $fixture -NoExit | ConvertFrom-Json
+    Assert-ModlistTest (-not $scalarRegister.ok -and $scalarRegister.errors[0] -match "field 'storage' must be a JSON object") 'register rejects scalar values for required configuration objects'
+
+    $bomSource = Join-Path $fixture 'bom-source.json'
+    [IO.File]::WriteAllText($bomSource, [IO.File]::ReadAllText($source), [Text.UTF8Encoding]::new($true))
+    $bomHash = (Get-FileHash -LiteralPath $bomSource -Algorithm SHA256).Hash
+    $main = & $entry register -Name main -ConfigPath $bomSource -UserRoot $fixture -NoExit | ConvertFrom-Json
     $synergy = & $entry register -Name synergy -ConfigPath $source -UserRoot $fixture -NoExit | ConvertFrom-Json
     Assert-ModlistTest ($main.ok -and $synergy.ok) 'register creates two exact named configs'
+    Assert-ModlistTest ($main.ok -and $main.data.sha256 -ceq $bomHash -and
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($main.data.path)) -ceq
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($bomSource))) 'register preserves the exact UTF-8 BOM source bytes and hash'
 
     $stablePath = Join-Path $fixture 'machine.local.json'
     $unselected = Resolve-MO2ControlConfigPath -PackageRoot (Join-Path $toolRoot 'mo2-control') -UserConfigPath $stablePath
@@ -42,6 +65,33 @@ try {
     $selected = & $entry select -Name main -UserRoot $fixture -NoExit | ConvertFrom-Json
     $resolved = Resolve-MO2ControlConfigPath -PackageRoot (Join-Path $toolRoot 'mo2-control') -UserConfigPath $stablePath
     Assert-ModlistTest ($selected.ok -and $resolved.exists -and $resolved.source -eq 'active-modlist' -and $resolved.modlist -eq 'main') 'persisted selection resolves one exact config'
+
+    $activePath = Get-MO2ControlActiveModlistPath -UserRoot $fixture
+    $activeBytes = [IO.File]::ReadAllBytes($activePath)
+    [ordered]@{ schemaVersion = 1; name = 'Not Safe'; selectedAtUtc = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json | Set-Content -LiteralPath $activePath -Encoding utf8
+    $invalidActive = & $entry resolve -UserRoot $fixture -NoExit | ConvertFrom-Json
+    Assert-ModlistTest (-not $invalidActive.ok -and -not $invalidActive.data.exists -and $invalidActive.data.source -eq 'active-modlist-invalid') 'resolve preserves an invalid active-selection failure even when a fallback path exists'
+    '{ malformed' | Set-Content -LiteralPath $activePath -Encoding utf8
+    $malformedList = & $entry list -UserRoot $fixture -NoExit | ConvertFrom-Json
+    Assert-ModlistTest (-not $malformedList.ok -and $malformedList.state -eq 'active-selection-invalid' -and
+        @($malformedList.data.modlists).Count -eq 2 -and $malformedList.errors[0] -match 'JSON') 'list reports named configurations even when the active-selection JSON is malformed'
+    [IO.File]::WriteAllBytes($activePath, $activeBytes)
+
+    $synergyPath = Get-MO2ControlNamedConfigPath -Name synergy -UserRoot $fixture
+    $synergyBytes = [IO.File]::ReadAllBytes($synergyPath)
+    $incompleteSelection = Get-Content -LiteralPath $synergyPath -Raw | ConvertFrom-Json
+    $incompleteSelection.PSObject.Properties.Remove('storage')
+    $incompleteSelection | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $synergyPath -Encoding utf8
+    $rejectedSelection = & $entry select -Name synergy -UserRoot $fixture -NoExit | ConvertFrom-Json
+    Assert-ModlistTest (-not $rejectedSelection.ok -and $rejectedSelection.errors[0] -match "missing required object 'storage'") 'select applies the same complete-configuration validator as register'
+    [IO.File]::WriteAllBytes($synergyPath, $synergyBytes)
+
+    $scalarSelection = Get-Content -LiteralPath $synergyPath -Raw | ConvertFrom-Json
+    $scalarSelection.storage = 'not-an-object'
+    $scalarSelection | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $synergyPath -Encoding utf8
+    $rejectedScalarSelection = & $entry select -Name synergy -UserRoot $fixture -NoExit | ConvertFrom-Json
+    Assert-ModlistTest (-not $rejectedScalarSelection.ok -and $rejectedScalarSelection.errors[0] -match "field 'storage' must be a JSON object") 'select rejects scalar values for required configuration objects'
+    [IO.File]::WriteAllBytes($synergyPath, $synergyBytes)
 
     $env:SKYRIM_VR_AUTOMATION_MODLIST = 'synergy'
     $environment = Resolve-MO2ControlConfigPath -PackageRoot (Join-Path $toolRoot 'mo2-control') -UserConfigPath $stablePath

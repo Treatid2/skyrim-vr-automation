@@ -105,6 +105,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
     let traceSession = 0;
     let traceActive = false;
     let traceRecords = [];
+    let adapterVendorId = 0x10de;
     const scenarioCalls = [];
     const stores = new Map();
     const notifications = [];
@@ -191,6 +192,8 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
             step.label === "recovery-profile-apply");
         const recovery = Boolean(recoveryApplyStep);
         const waitStep = args.steps.find((step) => step.label === "qualification-wait");
+        if (waitStep) adapterVendorId = waitStep.args.ownerId.includes("-amd-") ?
+            0x1002 : 0x10de;
         const firstMeasured = args.steps.some((step) =>
             step.label === "qualification-dispatch" && step.args.startPerformanceTelemetry === true);
         if (firstMeasured) {
@@ -203,7 +206,13 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
         const results = args.steps.map((step) => {
             if (step.wait !== undefined) return { kind: "wait", ms: step.wait };
             if (step.label !== "qualification-wait") {
-                return { label: step.label, result: toolResult(step) };
+                const result = toolResult(step);
+                if (step.label === "baseline-stress-start" ||
+                    step.label === "measured-stress-start") {
+                    result.status.adapter = { available: true,
+                        vendorId: adapterVendorId };
+                }
+                return { label: step.label, result };
             }
             revision += 1;
             const waiterProfile = waitStep.args.target;
@@ -295,6 +304,9 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
                 result: {
                     schemaRevision: 14,
                     action: "qualification_wait",
+                    status: semanticFailure ? undefined : { adapter: { available: true,
+                        vendorId: waitStep.args.ownerId.includes("-amd-") ?
+                            0x1002 : 0x10de } },
                     transitionId: waitStep.args.transitionId,
                     ownerId: waitStep.args.ownerId,
                     satisfied: !semanticFailure,
@@ -695,6 +707,158 @@ async function testAmd() {
     const amdTransitionTrace = mock.scenarioCalls.some((call) =>
         call.steps.some((step) => step.label === "dlss-trace-start"));
     assert(amdTransitionTrace === false, "AMD matrix started a per-row DLSS trace.");
+    assert(result.traceCapability.status === "supported",
+        "AMD trace capability was not classified as supported.");
+    const retainedKeys = [...mock.stores.keys()];
+    const cooldownStart = retainedKeys.indexOf(
+        "amd-test:explicit_fsr3:pass-1:cooldown-start");
+    const cooldownWait = retainedKeys.indexOf(
+        "amd-test:explicit_fsr3:pass-1:cooldown");
+    const cooldownEnd = retainedKeys.indexOf(
+        "amd-test:explicit_fsr3:pass-1:cooldown-end");
+    assert(cooldownStart >= 0 && cooldownWait > cooldownStart &&
+        cooldownEnd > cooldownWait,
+    "AMD cooldown boundary evidence was not retained around the wait.");
+}
+
+async function testAmdUnsupportedTraceContinues() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-amd", "references",
+        "matrix.v1.json")));
+    const mock = createMock(0, null, (root, args) => {
+        if (!args.steps.some((step) => step.label === "amd-dlss-trace-status")) {
+            return root;
+        }
+        return {
+            ok: false,
+            aborted: true,
+            stepsRun: 1,
+            results: [{
+                label: "amd-dlss-trace-status",
+                ok: false,
+                error: "unsupported action dlss_trace_status",
+                result: { ok: false, error: "unsupported action" },
+            }],
+        };
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "amd",
+        runId: "amd-unsupported-trace",
+        buildId,
+        positioningRoot: positioningRoot({
+            supportedFSRRuntimeMask: 1,
+            fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }],
+        }),
+        matrix,
+    });
+    assert(result.ok === true && result.status === "COMPLETE" &&
+        result.traceCapability.status === "unsupported",
+    "An unavailable optional AMD trace action aborted runnable FSR lanes.");
+    assert(result.lanes.filter((lane) => lane.status === "COMPLETE")
+        .every((lane) => lane.passes.length === 2),
+    "AMD lanes did not finish after optional trace classification.");
+}
+
+async function testAmdExposedTraceFailureStops() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-amd", "references",
+        "matrix.v1.json")));
+    const mock = createMock(0, null, (root, args) => {
+        if (!args.steps.some((step) => step.label === "amd-dlss-trace-status")) {
+            return root;
+        }
+        return {
+            ok: false,
+            aborted: true,
+            stepsRun: 2,
+            results: [root.results[0], {
+                label: "amd-dlss-trace-reset",
+                ok: false,
+                error: "trace lifecycle reset failed",
+                result: { ok: false, error: "trace lifecycle reset failed" },
+            }],
+        };
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "amd",
+        runId: "amd-failed-trace",
+        buildId,
+        positioningRoot: positioningRoot({
+            supportedFSRRuntimeMask: 1,
+            fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }],
+        }),
+        matrix,
+    });
+    assert(result.ok === false && result.status === "INTERRUPTED" &&
+        result.error === "scenario_failed",
+    "A failing exposed AMD trace action was treated as unsupported.");
+}
+
+async function testAdmissionRejectsMalformedInputs() {
+    const nvidiaMatrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    for (const [name, expected, mutate] of [
+        ["missing-profile", "effective_profile_missing", (receipt) => {
+            delete receipt.upscalingSnapshot.effective;
+            if (receipt.upscalingSnapshot.profiles) {
+                delete receipt.upscalingSnapshot.profiles.effective;
+            }
+        }],
+        ["invalid-profile", "effective_profile_invalid", (receipt) => {
+            const snapshot = receipt.upscalingSnapshot;
+            (snapshot.effective || snapshot.profiles.effective).method = named("");
+        }],
+        ["unavailable-adapter", "terminal_adapter_unavailable", (receipt) => {
+            receipt.status.adapter.available = false;
+        }],
+        ["wrong-vendor", "terminal_adapter_vendor_mismatch", (receipt) => {
+            receipt.status.adapter.vendorId = 0x1002;
+        }],
+    ]) {
+        const mock = createMock(0, (receipt) => {
+            mutate(receipt);
+            return receipt;
+        });
+        const result = await runRenderScaleTuningLive({
+            ...mock.context, variant: "nvidia", runId: `invalid-${name}`,
+            buildId, positioningRoot: positioningRoot(), matrix: nvidiaMatrix,
+        });
+        const failedPass = result.lanes[0].passes[0];
+        assert(result.status === "INTERRUPTED" && failedPass.error === expected &&
+            failedPass.failure && failedPass.failure.reason,
+        `Terminal ${name} was not rejected with retained diagnostics.`);
+        assert(mock.scenarioCalls.length === 1 &&
+            mock.scenarioCalls[0].steps.some((step) =>
+                step.label === "baseline-stress-start"),
+        "A malformed terminal baseline altered positioning or began measurement.");
+    }
+
+    const amdMatrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-amd", "references",
+        "matrix.v1.json")));
+    for (const capabilities of [
+        { supportedFSRRuntimeMask: 4,
+            fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 0 }] },
+        { supportedFSRRuntimeMask: 1,
+            fsrRuntimeUnavailableConditions: [{ mask: 0 }] },
+        { supportedFSRRuntimeMask: 1,
+            fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: -1 }] },
+    ]) {
+        try {
+            await runRenderScaleTuningLive({
+                ...createMock(0).context, variant: "amd",
+                runId: "invalid-amd-capabilities", buildId,
+                positioningRoot: positioningRoot(capabilities), matrix: amdMatrix,
+            });
+            throw new Error("Expected invalid AMD capabilities.");
+        } catch (error) {
+            assert(error.message === "amd_capabilities_invalid",
+                `Unexpected AMD capability error: ${error.message}`);
+        }
+    }
 }
 
 async function testScenarioFailureRetention() {
@@ -756,6 +920,37 @@ async function testScenarioFailureRetention() {
             "scenario-failure:nvidia:pass-2:transition-1") &&
         result.receiptKeys.includes("scenario-failure:live-result"),
     "The interruption result omitted receipt keys needed for materialization.");
+}
+
+async function testMeasuredVendorMismatchStops() {
+    for (const variant of ["nvidia", "amd"]) {
+        const matrix = JSON.parse(fs.readFileSync(path.join(repositoryRoot,
+            "skills", `renderscale-tuning-${variant}`, "references", "matrix.v1.json")));
+        const mock = createMock(0, (receipt, state) => {
+            if (!state.baseline) {
+                receipt.status.adapter.vendorId = variant === "amd" ? 0x10de : 0x1002;
+            }
+            return receipt;
+        });
+        const result = await runRenderScaleTuningLive({
+            ...mock.context, variant, runId: `changed-vendor-${variant}`, buildId,
+            positioningRoot: positioningRoot(variant === "amd" ? {
+                supportedFSRRuntimeMask: 1,
+                fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }],
+            } : {}), matrix,
+        });
+        const failed = result.lanes.flatMap((lane) => lane.passes || [])
+            .find((pass) => pass.status === "INTERRUPTED");
+        const measuredCalls = mock.scenarioCalls.filter((call) =>
+            call.steps.some((step) => step.label === "profile-apply") &&
+            !call.steps.some((step) => step.label === "baseline-stress-start"));
+        const retained = [...mock.stores.values()].find((value) =>
+            value && value.variant === variant && value.waiter);
+        assert(result.status === "INTERRUPTED" && failed &&
+            failed.error === "terminal_adapter_vendor_mismatch" &&
+            measuredCalls.length === 1 && retained && retained.waiter.status.adapter,
+        `${variant} continued measuring after a retained terminal vendor mismatch.`);
+    }
 }
 
 async function testInformationalReasonIsNotFailure() {
@@ -836,6 +1031,45 @@ async function testPositionRenderScalePayloadIsOpaque() {
     "A missing outer position-renderscale result was not rejected.");
     assert(rejected.scenarioCalls.length === 0,
         "The runner mutated the game after invalid positioning evidence.");
+
+
+}
+
+async function testMalformedMeasuredStressOwnershipIsRetained() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    let malformed = false;
+    const mock = createMock(0, null, (root, args) => {
+        if (malformed) return root;
+        const entry = root.results.find((candidate) =>
+            candidate.label === "measured-stress-start");
+        if (entry) {
+            malformed = true;
+            delete entry.result.status.session.id;
+        }
+        return root;
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "nvidia",
+        runId: "malformed-measured-stress-owner",
+        buildId,
+        positioningRoot: positioningRoot(),
+        matrix,
+    });
+    const failure = result.lanes[0].passes[0].failure;
+    assert(result.ok === false && result.status === "INTERRUPTED" &&
+        result.lanes[0].passes[0].error ===
+            "measured_stress_session_identity_missing" &&
+        failure && failure.phase === "ownership" &&
+        failure.ownership.status === "uncertain" &&
+        failure.ownership.cleanupAttempted === false &&
+        failure.receiptKey.endsWith(":handoff"),
+    "Malformed measured-stress ownership did not fail closed with attribution.");
+    const retained = mock.stores.get("malformed-measured-stress-owner:live-result");
+    assert(retained && retained.lanes[0].passes[0].failure === failure,
+        "Malformed measured-stress ownership evidence was not retained.");
 }
 
 async function testUnsafeTransitionRestoresBaselineAndContinues() {
@@ -1209,6 +1443,7 @@ async function testSafeUnstableBaselineContinues() {
         "matrix.v1.json")));
     const mock = createMock(0, (receipt, context) => {
         if (context.baseline) {
+            delete receipt.status;
             receipt.satisfied = false;
             receipt.outcome = "timeout";
             receipt.timedOutMilestone = "strict";
@@ -1879,10 +2114,14 @@ async function testEvidenceVerdicts() {
     "A partial eye observation was treated as submitted mixed stereo.");
 }
 
-Promise.all([testNvidia(), testAmd(), testEvidenceVerdicts(),
+Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
+    testAmdExposedTraceFailureStops(),
+    testAdmissionRejectsMalformedInputs(), testEvidenceVerdicts(),
+    testMeasuredVendorMismatchStops(),
     testScenarioFailureRetention(), testInformationalReasonIsNotFailure(),
     testOptionalTerminalFacts(), testSafeUnstableBaselineContinues(),
     testFlatTerminalBoundary(), testPositionRenderScalePayloadIsOpaque(),
+    testMalformedMeasuredStressOwnershipIsRetained(),
     testUnsafeTransitionRestoresBaselineAndContinues(),
     testAmdUnsafeTransitionUsesLaneBaseline(),
     testFailedRecoveryStopsLaterTransitions(),

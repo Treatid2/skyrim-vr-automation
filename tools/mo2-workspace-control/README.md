@@ -16,10 +16,13 @@ rejects reparse points. Exceeding any budget returns a bounded failure before a
 new clone is committed; the limits are configurable through the corresponding
 `-MaxProfile*` and `-TreeOperationTimeoutSeconds` parameters.
 
-`prepare-source` is now a non-mutating compatibility command. It reports
-existing Overwrite cache trees but never moves them or changes the stable
-profile. `create` snapshots the exact Overwrite `backup` tree and later cache
-`prepare` snapshots the exact Overwrite `ShaderCache` tree.
+`prepare-source` performs the one-time legacy-cache migration. With an owned
+lease and all MO2/runtime processes closed, it moves every Overwrite
+`ShaderCache`, `.previous`, and `.swap` tree into a newly enabled mod in the
+stable source profile. The operation is transactional and rejects reparse-point
+sources; `-WhatIf` reports the planned mutation without moving anything.
+`create` snapshots the exact Overwrite `backup` tree and later cache `prepare`
+snapshots the exact Overwrite `ShaderCache` tree.
 
 The task must own an MO2 access lease. MO2, Skyrim, loaders, and active
 RootBuilder deployment must be closed before `create`, `resume`, `register-mod`,
@@ -40,7 +43,10 @@ Workspaces are durably owned by `-TaskId` (or `CODEX_THREAD_ID` /
 `CODEX_TASK_ID`), not by one access lease. `create` makes and selects a fresh
 profile. `list-task` reports retained profiles. `resume` rebinds one exact
 retained workspace to a newly owned lease and selects it without refreshing it
-from the primary profile. See `../../docs/MO2-TASK-WORKSPACES.md`.
+from the primary profile. If the prior lease completed its output transaction,
+resume also publishes a fresh owner marker, snapshots, evidence paths, and
+completion paths before returning ready. See
+`../../docs/MO2-TASK-WORKSPACES.md`.
 
 Creation binds the task to MO2 Overwrite with an exact owner marker. It removes
 both the selected game executable and `Synthesis` entries from the cloned
@@ -53,12 +59,37 @@ ordinary Overwrite route, while paths that already existed in a mod also have
 an Overwrite winner. First launch requires exact prepared hashes; retained game
 cycles may grow both trees while preserving complete provider coverage.
 
+## Modlist and local-work choices
+
+Fresh workspace requests distinguish the original maintained modlist from
+optional local builds. Run `list-local-work-mods` first. It reads the exact
+catalog named by `defaults.localWorkModCatalog`, validates every configured mod
+directory and source-profile marker, and reports stable candidate IDs plus
+availability reasons. It never infers a candidate from a directory-name glob.
+
+Use `-WorkspaceContent Modlist` for no local-work candidates. Use
+`-WorkspaceContent ModlistPlusLocalWorkMods -LocalWorkModId <id>` for one or
+more exact available candidates; a JSON string array may instead be passed via
+`-LocalWorkModIdsFile`. Creation disables every other catalogued candidate in
+the cloned profile. Candidates sharing an `exclusionGroup` cannot be selected
+together. This permits two CSX AIO candidates from the same local head: a
+release-equivalent build with `DEVBENCH_BRIDGE` off and an automation build
+with it on. Public release behavior is represented by the former.
+
+The source profile and shared mod directories remain unchanged. The resolved
+catalog path/hash, requested IDs, candidate metadata, and applied profile
+markers are retained in the workspace manifest. `resume` preserves them; a
+different selection requires a fresh workspace. `list-task` reports each
+retained workspace's content mode and selected candidate IDs so a caller can
+choose the right preserved profile without reopening it.
+
 For elevated use, follow `../mo2-control/APPROVALS.md`. Every result reports a
 literal command-specific `data.approval.reusablePrefix`. `create`,
 `register-mod`, and `ensure-mod-wins` are eligible for narrow reusable approval;
 `refresh-fixture`, `complete-output`, and `retire` remain one-shot because they
 replace shared metadata, restore snapshotted Overwrite state, or recursively
-remove exact owned paths. `prepare-source` is reusable because it is read-only.
+remove exact owned paths. `prepare-source` is also one-shot because it moves
+legacy shader-cache trees out of shared Overwrite state.
 
 `adopt` is also one-shot: it transfers one ready workspace from the exact
 released `-PreviousAccessId` to a distinct active lease only after closed-state,
@@ -67,14 +98,35 @@ when an otherwise valid workspace outlives its transient access lease.
 
 ```text
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> prepare-source -AccessId <literal-access-id> -Confirm:$false -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> list-local-work-mods -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> list-task -TaskId <stable-task-id> -Compact
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> create -AccessId <literal-access-id> -TaskId <stable-task-id> -Label weather-api -SavePolicy MainMenuOnly -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> create -AccessId <literal-access-id> -TaskId <stable-task-id> -Label modlist-test -WorkspaceContent Modlist -SavePolicy MainMenuOnly -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> create -AccessId <literal-access-id> -TaskId <stable-task-id> -Label csx-api -WorkspaceContent ModlistPlusLocalWorkMods -LocalWorkModId csx-aio-local-devbench -SavePolicy MainMenuOnly -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> resume -AccessId <new-literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -Compact
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> complete-output -AccessId <literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -Confirm:$false -Compact
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> register-mod -AccessId <literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -ModName "Codex Weather API Test 20260822" -ModDirectory "<exact-mod-directory>" -WinningPaths "SKSE\Plugins\CommunityShaders.dll" -Confirm:$false -Compact
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> release-access -AccessId <literal-access-id> -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> create-mod -AccessId <new-literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -ModName "Codex Weather API Test 20260822" -Confirm:$false -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> register-mod -AccessId <new-literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -ModName "Codex Weather API Test 20260822" -ModDirectory "<exact-mod-directory>" -WinningPaths "SKSE\Plugins\CommunityShaders.dll" -Confirm:$false -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> complete-output -AccessId <new-literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -Confirm:$false -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> release-access -AccessId <new-literal-access-id> -Compact
+```
+
+The normal end state is the retained workspace plus a released access lease.
+Run, turn, or task completion does not authorize resetting the cloned profile,
+removing its task-local changes, or retiring it. Reacquire access and use
+`resume` with the exact workspace ID when work continues.
+
+`retire` is an explicit-discard operation, not part of the normal workflow. Use
+it only after direction to discard or replace that exact environment, or when a
+separately stated retention policy proves it obsolete:
+
+```text
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> retire -AccessId <literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -CleanupOwnedMods -Confirm:$false -Compact
 ```
+
+`create-mod` must precede `register-mod`. It creates the exact empty directory
+and ownership marker that authorize the workspace to populate and later
+register that mod. Deploy files only inside the returned `data.modDirectory`,
+then pass that exact path back to `register-mod`; pre-existing mods cannot be
+claimed by this route.
 
 `SavePolicy` describes what the test is authorized or expected to do; it no
 longer controls which source saves are copied. `MainMenuOnly` never authorizes
@@ -126,9 +178,10 @@ profile; retained task profiles are not rewritten. On every resume the tool
 adds newly observed, non-owned mod directories to the workspace's protected
 shared-mod inventory. Cleanup is restricted to
 the exact generated profile and registered task-owned mods; the stable source
-may have advanced since the clone. Before deleting a task profile, `retire`
-atomically selects and verifies its stable source in `ModOrganizer.ini`, keeps
-the exact prior INI bytes and receipt, and only then removes the task profile.
+may have advanced since the clone. Only after explicit discard, replacement, or
+policy-proven obsolescence may `retire`
+atomically select and verify its stable source in `ModOrganizer.ini`, keep
+the exact prior INI bytes and receipt, and only then remove the task profile.
 Workspace manifests and results expose `profileName`, `profileDirectory`, and
 `modListPath` while retaining the legacy `profile` and `profilePath` fields.
 Calling MO2 `release-access` alone preserves the workspace for later `resume`.
@@ -137,6 +190,11 @@ After the game and MO2 close, catalog `complete` preserves generated
 `complete-output` preserves the generated `backup` tree, restores its pre-task
 tree, and releases the Overwrite owner marker. `retire` requires both exact
 completion receipts and never deletes the Overwrite directory.
+
+Restoring shared runtime state is independent and must not rewrite or retire
+the retained workspace. Virtual Desktop and `VirtualDesktop.Streamer` never
+block profile mutation or SteamVR null-HMD; an enabled profile-local
+OCU/OpenComposite provider is the conflicting `SteamVRNull` route.
 The deprecated workspace `release` command is retained only to return safe
 recovery guidance; it fails before mutation and never deletes a profile.
 

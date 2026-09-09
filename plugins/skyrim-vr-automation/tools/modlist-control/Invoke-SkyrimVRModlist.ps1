@@ -65,11 +65,71 @@ function New-ModlistResult([bool]$Ok, [string]$State, $Data, [string[]]$Errors =
     }
 }
 
+function Assert-ModlistConfigurationComplete($Config, [string]$Path) {
+    foreach ($required in @('mo2', 'defaults', 'storage', 'limits', 'session')) {
+        if ($null -eq $Config -or -not $Config.PSObject.Properties[$required] -or $null -eq $Config.$required) {
+            throw "Configuration is missing required object '$required': $Path"
+        }
+        if ($Config.$required -isnot [pscustomobject]) {
+            throw "Configuration field '$required' must be a JSON object: $Path"
+        }
+    }
+}
+
+function Read-ModlistConfiguration([string]$Path) {
+    $resolved = [IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) { throw "Configuration source does not exist: $resolved" }
+    $stream = [IO.File]::Open($resolved, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -lt 1 -or $stream.Length -gt 4194304) {
+            throw "Configuration must contain between 1 and 4194304 bytes: $resolved"
+        }
+        $bytes = [byte[]]::new([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) { throw "Configuration ended before its retained byte length: $resolved" }
+            $offset += $read
+        }
+    }
+    finally { $stream.Dispose() }
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+    if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+    $config = $text | ConvertFrom-Json
+    Assert-ModlistConfigurationComplete -Config $config -Path $resolved
+    return [pscustomobject][ordered]@{
+        path = $resolved
+        bytes = $bytes
+        config = $config
+        sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+    }
+}
+
+function New-ModlistFileExclusive([string]$Path, [byte[]]$Bytes) {
+    $parent = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $temporary = Join-Path $parent ('.' + [IO.Path]::GetFileName($Path) + '.' + [guid]::NewGuid().ToString('N') + '.incomplete')
+    $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $stream.Write($Bytes, 0, $Bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { $stream.Dispose() }
+    try { [IO.File]::Move($temporary, $Path, $false) }
+    finally { if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force } }
+}
+
 try {
     $resolvedUserRoot = if ([string]::IsNullOrWhiteSpace($UserRoot)) { Get-MO2ControlUserRoot } else { [IO.Path]::GetFullPath($UserRoot) }
     $modlistsDirectory = Get-MO2ControlModlistsDirectory -UserRoot $resolvedUserRoot
     $activePath = Get-MO2ControlActiveModlistPath -UserRoot $resolvedUserRoot
-    $active = Read-ActiveModlist -Path $activePath
+    $active = $null
+    $activeError = $null
+    try { $active = Read-ActiveModlist -Path $activePath }
+    catch {
+        if ($Command -ne 'list') { throw }
+        $activeError = $_.Exception.Message
+    }
     $activeName = if ($null -eq $active) { $null } else { [string]$active.name }
 
     switch ($Command) {
@@ -79,14 +139,15 @@ try {
             }
             else { @() }
             $items = @($files | ForEach-Object { Read-ModlistSummary -File $_ -SelectedName $activeName })
-            $selectionValid = [string]::IsNullOrWhiteSpace($activeName) -or @($items | Where-Object { $_.name -ceq $activeName -and $_.validJson }).Count -eq 1
+            $selectionValid = [string]::IsNullOrWhiteSpace($activeError) -and
+                ([string]::IsNullOrWhiteSpace($activeName) -or @($items | Where-Object { $_.name -ceq $activeName -and $_.validJson }).Count -eq 1)
             $result = New-ModlistResult -Ok $selectionValid -State $(if (-not $selectionValid) { 'active-selection-invalid' } elseif ($items.Count -eq 0) { 'empty' } elseif ([string]::IsNullOrWhiteSpace($activeName)) { 'selection-required' } else { 'ready' }) -Data ([pscustomobject][ordered]@{
                 userRoot = $resolvedUserRoot
                 modlistsDirectory = $modlistsDirectory
                 activeModlistPath = $activePath
                 active = $active
                 modlists = $items
-            }) -Errors $(if ($selectionValid) { @() } else { @("Active modlist '$activeName' does not resolve to exactly one valid named configuration.") })
+            }) -Errors $(if ($selectionValid) { @() } elseif (-not [string]::IsNullOrWhiteSpace($activeError)) { @($activeError) } else { @("Active modlist '$activeName' does not resolve to exactly one valid named configuration.") })
         }
         'resolve' {
             if (-not [string]::IsNullOrWhiteSpace($Name)) {
@@ -101,40 +162,38 @@ try {
                 $source = $resolution.source
                 $resolvedName = $resolution.modlist
             }
-            $exists = Test-Path -LiteralPath $path -PathType Leaf
+            $exists = if (-not [string]::IsNullOrWhiteSpace($Name)) { Test-Path -LiteralPath $path -PathType Leaf } else { [bool]$resolution.exists }
             $result = New-ModlistResult -Ok $exists -State $(if ($exists) { 'resolved' } else { 'not-found' }) -Data ([pscustomobject][ordered]@{ name = $resolvedName; path = $path; source = $source; exists = $exists }) -Errors $(if ($exists) { @() } else { @("Modlist configuration was not found: $path") })
         }
         'register' {
             if ([string]::IsNullOrWhiteSpace($Name)) { throw '-Name is required for register.' }
             if ([string]::IsNullOrWhiteSpace($ConfigPath)) { throw '-ConfigPath is required for register.' }
-            $source = [IO.Path]::GetFullPath($ConfigPath)
-            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Configuration source does not exist: $source" }
-            $config = Get-Content -LiteralPath $source -Raw | ConvertFrom-Json
-            foreach ($required in @('mo2', 'defaults', 'storage', 'limits', 'session')) {
-                if (-not $config.PSObject.Properties[$required]) { throw "Configuration is missing required object '$required': $source" }
-            }
+            $retained = Read-ModlistConfiguration -Path $ConfigPath
+            $source = [string]$retained.path
             $destination = Get-MO2ControlNamedConfigPath -Name $Name -UserRoot $resolvedUserRoot
             if (Test-Path -LiteralPath $destination -PathType Leaf) { throw "Named modlist already exists and was not overwritten: $destination" }
             if (-not $WhatIf) {
-                New-Item -ItemType Directory -Path $modlistsDirectory -Force | Out-Null
-                Copy-Item -LiteralPath $source -Destination $destination
+                New-ModlistFileExclusive -Path $destination -Bytes $retained.bytes
+                $installedHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
+                if ($installedHash -cne [string]$retained.sha256) {
+                    throw "Installed named modlist bytes do not match the validated source: $destination"
+                }
             }
             $result = New-ModlistResult -Ok $true -State $(if ($WhatIf) { 'dry-run' } else { 'registered' }) -Data ([pscustomobject][ordered]@{
                 name = $Name; source = $source; path = $destination; created = -not $WhatIf
-                sha256 = if ($WhatIf) { (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash } else { (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash }
+                sha256 = [string]$retained.sha256
             })
         }
         'select' {
             if ([string]::IsNullOrWhiteSpace($Name)) { throw '-Name is required for select.' }
             $path = Get-MO2ControlNamedConfigPath -Name $Name -UserRoot $resolvedUserRoot
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Named modlist does not exist: $path" }
-            $config = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-            if (-not $config.PSObject.Properties['mo2'] -or -not $config.PSObject.Properties['defaults']) { throw "Named modlist configuration is incomplete: $path" }
+            $retained = Read-ModlistConfiguration -Path $path
             $selection = [pscustomobject][ordered]@{
                 schemaVersion = 1
                 name = $Name
                 selectedAtUtc = [DateTime]::UtcNow.ToString('o')
-                configSha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+                configSha256 = [string]$retained.sha256
             }
             if (-not $WhatIf) {
                 New-Item -ItemType Directory -Path $resolvedUserRoot -Force | Out-Null

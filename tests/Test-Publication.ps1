@@ -15,6 +15,7 @@ $requiredFiles = @(
     'PRIVACY.md',
     'SUPPORT.md',
     'TERMS.md',
+    '.mcp.json',
     '.agents/plugins/marketplace.json',
     '.codex-plugin/plugin.json',
     'skills/feedback-control/SKILL.md',
@@ -56,6 +57,9 @@ $requiredFiles = @(
     'skills/render-scale-qualification/agents/openai.yaml',
     'skills/profiler-control/SKILL.md',
     'skills/profiler-control/agents/openai.yaml',
+    'tools/renderscale-tuning-live/runner.js',
+    'tools/renderscale-tuning-finalizer/finalizer.js',
+    'tools/fork-reciprocal-search/validate-campaign.js',
     'skills/shader-cache-control/SKILL.md',
     'skills/shader-cache-control/agents/openai.yaml',
     'skills/perftune-upscaling/SKILL.md',
@@ -73,7 +77,8 @@ $requiredFiles = @(
     'tools/render-scale-qualification/visual-review.prompt.v1.md',
     'tools/render-scale-qualification/visual-review.output-schema.v1.json',
     'scripts/Install-CodexMarketplacePlugin.ps1',
-    'plugins/skyrim-vr-automation/.codex-plugin/plugin.json'
+    'plugins/skyrim-vr-automation/.codex-plugin/plugin.json',
+    'plugins/skyrim-vr-automation/.mcp.json'
 )
 $forbidden = @(
     ('L:' + '\Codex'),
@@ -124,12 +129,39 @@ elseif ($qualificationTool[0].version -ne '2.0.0') {
     $violations.Add([pscustomobject]@{ file = 'toolset.manifest.json'; issue = 'render-scale qualification version is incorrect' })
 }
 
-$pluginManifest = Get-Content -LiteralPath (Join-Path $repositoryRoot '.codex-plugin/plugin.json') -Raw | ConvertFrom-Json
-if ($pluginManifest.name -ne 'skyrim-vr-automation') {
-    $violations.Add([pscustomobject]@{ file = '.codex-plugin/plugin.json'; issue = 'plugin name does not match the public package' })
+foreach ($manifestRelative in @(
+    '.codex-plugin/plugin.json',
+    'plugins/skyrim-vr-automation/.codex-plugin/plugin.json'
+)) {
+    $manifestPath = Join-Path $repositoryRoot $manifestRelative
+    $pluginManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if ($pluginManifest.name -ne 'skyrim-vr-automation') {
+        $violations.Add([pscustomobject]@{ file = $manifestRelative; issue = 'plugin name does not match the public package' })
+    }
+    if ($pluginManifest.license -ne 'GPL-3.0-or-later') {
+        $violations.Add([pscustomobject]@{ file = $manifestRelative; issue = 'license is not GPL-3.0-or-later' })
+    }
+    $pluginRoot = Split-Path -Parent (Split-Path -Parent $manifestPath)
+    $mcpPath = Join-Path -Path $pluginRoot -ChildPath ([string]$pluginManifest.mcpServers)
+    if ($pluginManifest.mcpServers -ne './.mcp.json' -or
+        -not (Test-Path -LiteralPath $mcpPath -PathType Leaf)) {
+        $violations.Add([pscustomobject]@{ file = $manifestRelative; issue = 'mcpServers does not resolve to the packaged MCP configuration' })
+    }
 }
-if ($pluginManifest.license -ne 'GPL-3.0-or-later') {
-    $violations.Add([pscustomobject]@{ file = '.codex-plugin/plugin.json'; issue = 'license is not GPL-3.0-or-later' })
+
+$pluginToolsetManifest = Get-Content -LiteralPath (Join-Path $repositoryRoot 'plugins/skyrim-vr-automation/toolset.manifest.json') -Raw | ConvertFrom-Json
+$packagedPluginManifest = Get-Content -LiteralPath (Join-Path $repositoryRoot 'plugins/skyrim-vr-automation/.codex-plugin/plugin.json') -Raw | ConvertFrom-Json
+$publishedVersions = @(
+    [string]$manifest.version,
+    [string]$pluginManifest.version,
+    [string]$pluginToolsetManifest.version,
+    [string]$packagedPluginManifest.version
+)
+if (@($publishedVersions | Sort-Object -Unique).Count -ne 1) {
+    $violations.Add([pscustomobject]@{
+        file = 'toolset.manifest.json'
+        issue = "root and packaged publication versions differ: $($publishedVersions -join ', ')"
+    })
 }
 
 foreach ($relativePath in @('skills/feedback-control/SKILL.md', 'skills/mo2-control/SKILL.md', 'skills/steamvr-null-hmd/SKILL.md', 'skills/devbench-control/SKILL.md', 'skills/coc-stability/SKILL.md', 'skills/simple-coc/SKILL.md', 'skills/simple-coc-5/SKILL.md', 'skills/simple-csm/SKILL.md', 'skills/renderscale-tuning-nvidia/SKILL.md', 'skills/renderscale-tuning-amd/SKILL.md', 'skills/render-scale-qualification/SKILL.md', 'skills/profiler-control/SKILL.md', 'skills/shader-cache-control/SKILL.md', 'skills/perftune-upscaling/SKILL.md')) {
@@ -186,6 +218,34 @@ foreach ($pair in @(
     $packagedContent = (Get-Content -LiteralPath (Join-Path $repositoryRoot $pair[1]) -Raw) -replace "`r`n", "`n"
     if ($sourceContent -cne $packagedContent) {
         $violations.Add([pscustomobject]@{ file = $pair[1]; issue = "packaged copy differs from $($pair[0])" })
+    }
+}
+
+foreach ($relativePath in @('skills/steamvr-null-hmd/SKILL.md', 'plugins/skyrim-vr-automation/skills/steamvr-null-hmd/SKILL.md')) {
+    $nullHmdSkill = Get-Content -LiteralPath (Join-Path $repositoryRoot $relativePath) -Raw
+    $nullMutation = $nullHmdSkill.IndexOf('Before `apply` or `restore`', [StringComparison]::Ordinal)
+    $admissionPrefix = if ($nullMutation -ge 0) { $nullHmdSkill.Substring(0, $nullMutation) } else { '' }
+    foreach ($requiredMarker in @('complete MO2 route admission before any', 'runtime-route-provider', '-RuntimeRoute SteamVRNull')) {
+        if (-not $admissionPrefix.Contains($requiredMarker, [StringComparison]::Ordinal)) {
+            $violations.Add([pscustomobject]@{
+                file = $relativePath
+                issue = "missing pre-mutation null-HMD admission marker: $requiredMarker"
+            })
+        }
+    }
+    foreach ($requiredMarker in @('-MO2AccessId', '-MO2Profile', 'Never use `-Standalone` for Skyrim through MO2')) {
+        if (-not $nullHmdSkill.Contains($requiredMarker, [StringComparison]::Ordinal)) {
+            $violations.Add([pscustomobject]@{
+                file = $relativePath
+                issue = "missing executable null-HMD admission marker: $requiredMarker"
+            })
+        }
+    }
+    if ($nullMutation -lt 0) {
+        $violations.Add([pscustomobject]@{
+            file = $relativePath
+            issue = 'null-HMD mutation marker is missing'
+        })
     }
 }
 

@@ -44,6 +44,8 @@ are:
 1. State in commentary that this skill is governing the MO2 operation.
 2. Start with `inspect`. Before any planned MO2 operation, call
    `request-access`, retain its exact `accessId`, and respect `access-busy`.
+   Pass exactly one `-RuntimeRoute`: `OCU`, `SteamVR`, or `SteamVRNull`.
+   Changing routes requires ending the session and requesting a new lease.
    An estimated duration is advisory only and never permits lease stealing.
    Use workspace `list-task -TaskId` to discover retained state. On the first
    request, require `fixture-status` to report
@@ -52,8 +54,21 @@ are:
    verified, and selected. On later requests, require an explicit
    `resume -TaskId -WorkspaceId` or fresh `create -TaskId`. Never silently
    replace, refresh, or requalify a retained profile after task-local edits.
+   Before fresh creation, run `list-local-work-mods`; pass
+   `-WorkspaceContent Modlist` for no local build, or
+   `ModlistPlusLocalWorkMods` plus exact available candidate IDs. Resume
+   preserves the original selection.
    Before any closed-state mutation, run `validate -AccessId <literal-access-id>
    -RequireClosed` and account for every warning or block.
+   For `SteamVRNull`, this validation is the admission gate for the runtime
+   transition: require the `runtime-route-provider` check to pass before the
+   null-HMD controller may apply or start. An enabled OCU or unclassified root
+   OpenVR provider is a hard failure, not a warning to carry into the run. A
+   fresh `SteamVR` or `SteamVRNull` clone automatically disables inherited root
+   OpenVR providers in that task profile, verifies the resulting route, and
+   leaves the maintained source profile untouched. Resuming a retained profile
+   never makes that correction silently; an incompatible retained profile is
+   blocked until its owner explicitly repairs it or requests a fresh clone.
 3. Use `-WhatIf` when the command supports it and the requested change has not
    already been proven in an isolated fixture.
 4. For a live run, call `prepare -AccessId` with the owned lease, retain its
@@ -110,10 +125,14 @@ are:
    If the game main thread is deadlocked, `terminate-game` is the only forced
    game recovery: it targets launch-recorded identities, retains MO2, invokes
    exact Unlock, and requires RootBuilder cleanup. `release-access` is the
-   normal yield path and preserves the task workspace. Use workspace `retire`
-   only when that exact profile is no longer wanted. Retirement requires the
-   exact cache and backup completion receipts and never deletes MO2 Overwrite;
-   workspace `release` is a deprecated destructive alias.
+   normal yield path and preserves the task workspace. Reacquire access and
+   `resume` that exact workspace on later work. Never infer discard intent from
+   the end of a run, turn, or task, and do not revert profile-local changes.
+   Use workspace `retire` only after explicit direction to discard or replace
+   that exact environment, or when a separately stated policy proves it
+   obsolete. Retirement requires exact cache and backup completion receipts
+   and never deletes MO2 Overwrite. The deprecated workspace `release` command
+   fails closed without mutation.
 9. Preserve session identifiers, receipts, hashes, logs, screenshots, dumps,
    and the pre/post inspection results with the test record.
 
@@ -167,6 +186,14 @@ are:
   variables. If configuration is absent, use the bundled doctor to initialize
   the stable path and ask only for values that cannot be discovered read-only.
 
-When SteamVR null-HMD state is also involved, apply the
-`$steamvr-null-hmd` skill before launching MO2. Restore the prior runtime state
-only when the user's requested workflow includes restoration.
+When SteamVR null-HMD state is also involved, split the MO2 lifecycle. First
+request the `SteamVRNull` lease, select the exact task workspace, and pass the
+closed-state runtime-route validation. Then apply `$steamvr-null-hmd`; only
+after that transition succeeds may this controller prepare or launch MO2.
+Restore the prior runtime state only when the user's requested workflow
+includes restoration. That shared
+runtime restoration is independent of the retained task workspace and must not
+rewrite or retire its profile. Virtual Desktop and `VirtualDesktop.Streamer`
+are not blockers for profile mutation or null-HMD. The conflicting null-HMD
+route is an enabled profile-local OCU/OpenComposite provider, which the exact
+runtime-route admission check must reject.

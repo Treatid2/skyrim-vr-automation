@@ -81,11 +81,12 @@ foreach ($requiredSkillText in @(
     'waits exactly 10 seconds',
     'During that server wait',
     '"action":"prepare_coc"',
-    'one monotonic 10-second watchdog',
-    'atomic dispatch claim',
+    'monotonic 10-second admission',
+    'fails closed before the',
     'coc-stability-control run',
     'capture-hang',
     'VR FPS Stabilizer exclusively owns',
+    'neither requires nor forbids a post-dispatch profile change',
     'Do not inspect graphics adapters',
     'resolve a winning MO2 file',
     'Multiple adapters or Stabilizer INIs are irrelevant',
@@ -147,13 +148,13 @@ foreach ($requiredProtocolText in @(
     '"action": "prepare_coc"',
     'raises an `info` or less-verbose CSX log level to `debug`',
     'A returned semantic fixture defect',
-    'full error history',
+    'prevents the measured assay',
     '## Bounded parallel baseline',
-    'independent monotonic watchdog job',
-    'at 10 seconds the watchdog starts it',
+    'monotonic 10-second',
+    'fails closed without calling',
     'coc-stability-control run',
     'capture-hang',
-    'not permission to delay or cancel',
+    'foreign-owned baseline fails closed',
     '## Atomic diagnostics and measured assay',
     'startPerformanceTelemetry: true',
     '`milestone: "strict"`',
@@ -187,7 +188,7 @@ foreach ($requiredProtocolText in @(
     'Do not enumerate graphics adapters',
     'inspect or compare Stabilizer INIs',
     'running public CSX profile is the sole observation source',
-    'must not delay the watchdog or measured scenario'
+    'authorize a target'
 )) {
     Assert-Protocol $protocol.Contains(
         $requiredProtocolText,
@@ -289,6 +290,33 @@ Assert-Protocol ($runner.Contains(
     'fixtureAnomalies',
     [StringComparison]::Ordinal
 )) 'Fixture anomalies must be preserved for the measured assay.'
+Assert-Protocol (-not $runner.Contains(
+    '$watchdogJob',
+    [StringComparison]::Ordinal
+)) 'The controller retains an unsafe deadline dispatch path.'
+Assert-Protocol ($runner.Contains(
+    'Every baseline ownership and readiness check must complete before scenario mutation.',
+    [StringComparison]::Ordinal
+) -and $runner.IndexOf(
+    "-Tool 'communityshaders.menu'",
+    [StringComparison]::Ordinal
+) -gt $runner.IndexOf(
+    'Test-CocBaseline',
+    [StringComparison]::Ordinal
+)) 'Fixture/scenario mutation is not gated by complete baseline admission.'
+$failureWritePosition = $runner.IndexOf(
+    'Write-AtomicJson -Value $stateRecord',
+    [StringComparison]::Ordinal
+)
+$failureThrowPosition = $runner.IndexOf(
+    'if (-not $dispatchAccepted)',
+    [StringComparison]::Ordinal
+)
+Assert-Protocol (
+    $failureWritePosition -ge 0 -and
+    $failureWritePosition -lt $failureThrowPosition -and
+    $runner.Contains('dispatchFailure', [StringComparison]::Ordinal)
+) 'A rejected scenario must publish its evidence before returning the failure.'
 Assert-Protocol (-not $protocol.Contains(
     'Restart Codex after repairing project configuration',
     [StringComparison]::Ordinal
@@ -336,7 +364,7 @@ Assert-Protocol (
     mainMenuReadinessBeforeLiveStart = $true
     timedStartQueuedFirst = $true
     boundedParallelBaseline = $true
-    independentBaselineWatchdog = $true
+    failClosedBaselineAdmission = $true
     firstCocOwnsPerformanceOrigin = $true
     semanticAnomaliesContinue = $true
     hardControlFailuresAbort = $true

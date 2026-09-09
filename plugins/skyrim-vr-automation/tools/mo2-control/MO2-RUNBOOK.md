@@ -7,7 +7,8 @@ the Skyrim VR installation. The local machine configuration is
 the resolved machine configuration; do not rediscover paths or guess profile and
 executable names when the package can report them.
 
-Version 0.8.0 provides cooperative cross-task access leases, read-only
+Version 1.0.0 requires a route-qualified explicit access lease for preparation
+and launch, and provides cooperative cross-task access leases, read-only
 inspection, single-owner `prepare`, exact
 `open` and `launch`, bounded `status`, graceful `stop-game`, MO2-only
 cooperative `close`, stranded-instance `recover-close`, and graceful full
@@ -104,9 +105,16 @@ overwrite means “classify and relocate safely,” not “delete until green.�
 Before any planned MO2 use, request the shared resource:
 
 ```text
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -Label short-task-name -EstimatedMinutes 20 -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -Label short-task-name -RuntimeRoute OCU -EstimatedMinutes 20 -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate -AccessId <literal-access-id> -RequireClosed -Compact
 ```
+
+Choose exactly one route for the complete lease: `OCU`, physical `SteamVR`, or
+`SteamVRNull`. OCU cannot coexist with SteamVR. The null-HMD route is a SteamVR
+mode, not an OCU mode, and cannot coexist with the physical SteamVR route. To
+change routes, end the session, release the access lease, perform the relevant
+runtime restore/apply transaction, and request a new lease for the new route.
+The lease and prepared session both record the route.
 
 If another task owns it, `state` is `access-busy`. The response includes its
 label, whether a session is bound, and any estimated release time. The estimate
@@ -124,6 +132,8 @@ analysis, report writing, or any other phase that does not require MO2:
 
 This yields only the scarce access lease. It deliberately preserves the task's
 workspace profile, saves, options, and task-owned mods for a later `resume`.
+That retained environment is the normal end state for a run, turn, or task;
+completion never implies reverting its changes or retiring it.
 
 The task remains responsible for its lease even when the estimate is overdue.
 Use `renew-access` to update coordination metadata. Use `recover-access` only
@@ -138,8 +148,9 @@ or resume one while holding access. On the first request, prepare the configured
 stable source and create a task workspace. On later requests, select an exact
 retained WorkspaceId or explicitly request a fresh clone. Pass the returned
 task profile explicitly to `prepare`.
-`prepare-source` now reports existing cache trees without moving them. Creation
-binds the workspace to snapshotted MO2 Overwrite output, removes the cloned
+Except under `-WhatIf`, `prepare-source` transactionally moves legacy cache
+trees from Overwrite into a newly enabled stable-profile mod. Creation binds
+the workspace to snapshotted MO2 Overwrite output, removes the cloned
 profile's game and `Synthesis` custom-overwrite mappings, and materializes the
 enabled `backup` provider union there. Cache catalog preparation does the same
 for `ShaderCache`. Fresh creation also requires `fixture-status` to be
@@ -148,17 +159,31 @@ for `ShaderCache`. Fresh creation also requires `fixture-status` to be
 ```text
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> prepare-source -AccessId <literal-access-id> -Confirm:$false -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> fixture-status -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> list-local-work-mods -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> list-task -TaskId <stable-task-id> -Compact
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> create -AccessId <literal-access-id> -TaskId <stable-task-id> -Label short-test-name -SavePolicy MainMenuOnly -Confirm:$false -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> create -AccessId <literal-access-id> -TaskId <stable-task-id> -Label short-test-name -WorkspaceContent Modlist -SavePolicy MainMenuOnly -Confirm:$false -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> resume -AccessId <literal-access-id> -TaskId <stable-task-id> -WorkspaceId <exact-retained-workspace-id> -Confirm:$false -Compact
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> complete-output -AccessId <literal-access-id> -TaskId <stable-task-id> -WorkspaceId <exact-workspace-id> -Confirm:$false -Compact
 ```
 
+`list-local-work-mods` is read-only. A fresh request must name either
+`-WorkspaceContent Modlist` or `ModlistPlusLocalWorkMods`; the latter also
+passes exact candidate IDs. Creation changes only the cloned profile, disables
+unselected catalog candidates, and records the catalog hash and applied
+selection. Resume never changes that selection.
+
 After each live use, release the evidence session and access lease but retain
-the workspace. Use workspace `retire` only when its profile is no longer
-wanted. A task must never edit, replace, or delete a pre-existing shared mod;
+the workspace. Later, reacquire access and resume that exact environment. Use
+workspace `retire` only after explicit direction to discard or replace it, or
+when a separately stated retention policy proves it obsolete. A task must never
+edit, replace, or delete a pre-existing shared mod;
 it may change existing mod markers only in its own cloned profile. Primary-list
 updates install a new mod name and change primary-profile markers additively.
+
+Virtual Desktop and `VirtualDesktop.Streamer` do not block MO2 profile mutation
+or SteamVR null-HMD. The `SteamVRNull` route instead fails admission when the
+exact profile has an enabled OCU/OpenComposite provider. Shared runtime
+restoration is separate from workspace retention and must not rewrite or retire
+the task-owned profile.
 
 Preview first, then bind a session to the owned access lease:
 
@@ -173,8 +198,8 @@ machine configuration under the session, and binds it to the exact access
 lease. Use the returned `controllerPath` for every command that owns that
 session; it remains valid if a plugin update replaces the versioned cache from
 which `prepare` was called. `prepare` does not change MO2's selected profile or
-mod list. Legacy callers may omit AccessId;
-that creates an implicit one-session lease which `release` removes.
+mod list. `AccessId` is mandatory; callers must first acquire exactly one
+explicit OCU, SteamVR, or SteamVRNull route.
 When `-RequireSKSE` is supplied, that requirement is durable session state and
 `launch` revalidates it before starting MO2.
 
@@ -255,8 +280,12 @@ the actual route independently.
    use the same durable controller for the bounded escalation `stop-game`,
    `terminate`, then `release`; the
    latter two commands prove game/RootBuilder absence and exact lock ownership.
-   `release -SessionId` ends the evidence session. For an explicitly requested
-   lease it deliberately retains access, so call `release-access -AccessId`
+   `release -SessionId` ends the evidence session. After the game, MO2, and
+   evidence session are closed, complete the shader-cache catalog transaction,
+   then run workspace `complete-output -AccessId <literal-access-id> -TaskId
+   <stable-task-id> -WorkspaceId <exact-workspace-id> -Confirm:$false`. This
+   preserves generated output, restores the exact pre-task Overwrite trees, and
+   releases the owner marker. Finally call `release-access -AccessId`
    immediately unless another MO2 session is about to begin.
 2. Collect only files attributable to the session. Common sources include:
    - CSX/SKSE/MO2 logs;

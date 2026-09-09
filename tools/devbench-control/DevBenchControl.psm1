@@ -149,6 +149,96 @@ function Get-DevBenchSemanticStatus {
     }
 }
 
+function Test-DevBenchReadOnlyRequest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ToolName,
+        [Parameter(Mandatory)][Collections.IDictionary]$Arguments
+    )
+
+    $action = if ($Arguments.Contains('action')) { [string]$Arguments['action'] } else { '' }
+    $kind = if ($Arguments.Contains('kind')) { [string]$Arguments['kind'] } else { '' }
+    if ($ToolName -eq 'inspect') {
+        return $kind -in @('state', 'health', 'vm', 'scene', 'mods', 'player', 'inventory', 'quests', 'effects', 'refs', 'registrants', 'screenshots', 'extensions')
+    }
+    if ($ToolName -eq 'menu') { return $action -eq 'list' }
+    if ($ToolName -eq 'record') { return $action -eq 'status' }
+    if ($ToolName -eq 'input') { return $action -in @('observe', 'status') }
+    return $false
+}
+
+function Get-DevBenchCallSemanticStatus {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ToolName,
+        [Parameter(Mandatory)][Collections.IDictionary]$Arguments,
+        [AllowEmptyCollection()][object[]]$Content
+    )
+
+    $semantic = Get-DevBenchSemanticStatus -Content $Content
+    if ($semantic.known) { return $semantic }
+    $payloads = @($Content)
+    if ($payloads.Count -ne 1 -or $null -eq $payloads[0] -or $payloads[0] -is [string] -or $payloads[0] -is [ValueType]) {
+        return $semantic
+    }
+    $payload = $payloads[0]
+
+    if ($ToolName -eq 'record' -and $Arguments.Contains('action') -and [string]$Arguments['action'] -eq 'start') {
+        $actionProperty = $payload.PSObject.Properties['action']
+        $recordingProperty = $payload.PSObject.Properties['recording']
+        if ($actionProperty -and $recordingProperty) {
+            $reasons = [Collections.Generic.List[string]]::new()
+            if ([string]$actionProperty.Value -ne 'start') { $reasons.Add("content.action is '$($actionProperty.Value)', expected 'start'") }
+            if (-not [bool]$recordingProperty.Value) { $reasons.Add('content.recording is false after record start') }
+            if ($Arguments.Contains('correlationId')) {
+                $correlationProperty = $payload.PSObject.Properties['correlationId']
+                if (-not $correlationProperty -or [string]$correlationProperty.Value -cne [string]$Arguments['correlationId']) {
+                    $reasons.Add('content.correlationId does not match the requested recording correlation')
+                }
+            }
+            return [pscustomobject][ordered]@{
+                known = $true
+                ok = $reasons.Count -eq 0
+                outcome = if ($reasons.Count -eq 0) { 'record-start-contract-satisfied' } else { 'record-start-contract-failed' }
+                guarded = $false
+                transient = $false
+                codes = @()
+                states = @()
+                reasons = @($reasons)
+                schedulerOnly = $false
+                schedulerReceiptPaths = @()
+                explicitOutcomeEvidence = @('content.action', 'content.recording', 'content.correlationId')
+            }
+        }
+    }
+
+    if (Test-DevBenchReadOnlyRequest -ToolName $ToolName -Arguments $Arguments) {
+        $properties = @($payload.PSObject.Properties)
+        $errorProperty = $payload.PSObject.Properties['error']
+        if ($errorProperty -and $null -ne $errorProperty.Value) {
+            $semantic.known = $true
+            $semantic.ok = $false
+            $semantic.outcome = 'read-contract-failed'
+            $semantic.reasons = @("content.error is '$($errorProperty.Value)'")
+            return $semantic
+        }
+        $action = if ($Arguments.Contains('action')) { [string]$Arguments['action'] } else { '' }
+        $contractSatisfied =
+            ($ToolName -eq 'inspect' -and $properties.Count -gt 0) -or
+            ($ToolName -eq 'menu' -and $payload.PSObject.Properties['openMenus'] -and $payload.PSObject.Properties['messageBoxOpen']) -or
+            ($ToolName -eq 'record' -and $payload.PSObject.Properties['recording'] -and $payload.PSObject.Properties['state']) -or
+            ($ToolName -eq 'input' -and $action -eq 'observe' -and $payload.PSObject.Properties['frame']) -or
+            ($ToolName -eq 'input' -and $action -eq 'status' -and $payload.PSObject.Properties['device'])
+        if ($contractSatisfied) {
+            $semantic.known = $true
+            $semantic.ok = $true
+            $semantic.outcome = 'read-contract-satisfied'
+            $semantic.explicitOutcomeEvidence = @($semantic.explicitOutcomeEvidence) + "tool:$ToolName"
+        }
+    }
+    return $semantic
+}
+
 function Get-DevBenchServiceState {
     [CmdletBinding()]
     param([AllowEmptyCollection()][object[]]$Content)
@@ -534,6 +624,25 @@ function Get-DevBenchRenderScalePreparationTelemetry {
     }
 }
 
+function Test-DevBenchUpscalingProfileShape {
+    [CmdletBinding()]
+    param($Profile)
+
+    if ($null -eq $Profile -or $Profile -is [string] -or
+        $Profile -is [ValueType]) {
+        return $false
+    }
+    foreach ($name in @('method', 'qualityMode', 'dlssProfile', 'fsrRuntime')) {
+        $property = $Profile.PSObject.Properties[$name]
+        if (-not $property -or $null -eq $property.Value -or
+            [string]::IsNullOrWhiteSpace([string](Get-DevBenchNamedValue $property.Value))) {
+            return $false
+        }
+    }
+    $renderScaleMode = $Profile.PSObject.Properties['renderScaleMode']
+    return $null -ne $renderScaleMode -and $renderScaleMode.Value -is [bool]
+}
+
 function Test-DevBenchUpscalingProfilesEqual {
     [CmdletBinding()]
     param(
@@ -541,6 +650,10 @@ function Test-DevBenchUpscalingProfilesEqual {
         [Parameter(Mandatory)]$Right
     )
 
+    if (-not (Test-DevBenchUpscalingProfileShape $Left) -or
+        -not (Test-DevBenchUpscalingProfileShape $Right)) {
+        return $false
+    }
     foreach ($name in @('method', 'qualityMode', 'renderScaleMode', 'dlssProfile', 'fsrRuntime')) {
         $leftProperty = $Left.PSObject.Properties[$name]
         $rightProperty = $Right.PSObject.Properties[$name]
@@ -566,6 +679,11 @@ function Test-DevBenchUpscalingStable {
     function Require-StableValue([bool]$Condition, [string]$Reason) {
         if (-not $Condition) { $reasons.Add($Reason) }
     }
+    function Get-RequiredStableTelemetry($Source, [string]$Name, [string]$Reason) {
+        $value = Get-DevBenchTelemetryMember $Source $Name
+        Require-StableValue ($null -ne $value) $Reason
+        return $value
+    }
 
     $profilePresence = if ($snapshot.PSObject.Properties['profilePresence']) { [uint32]$snapshot.profilePresence } else { [uint32]0 }
     $flags = if ($snapshot.PSObject.Properties['flags']) { [uint64]$snapshot.flags } else { [uint64]0 }
@@ -579,9 +697,11 @@ function Test-DevBenchUpscalingStable {
     $hasRequested = ($profilePresence -band [uint32]0x2) -ne 0 -and $null -ne $requestedProfile
     $hasEffective = ($profilePresence -band [uint32]0x8) -ne 0 -and $null -ne $effectiveProfile
     $hasStable = ($profilePresence -band [uint32]0x10) -ne 0 -and $null -ne $stableProfile
+    $expectedProfileValid = $null -eq $ExpectedProfile -or
+        (Test-DevBenchUpscalingProfileShape $ExpectedProfile)
+    Require-StableValue $expectedProfileValid 'the expected upscaling profile has invalid field types'
     $expectsNativeProfile = $null -ne $ExpectedProfile -and
-        $ExpectedProfile.PSObject.Properties['renderScaleMode'] -and
-        -not [bool]$ExpectedProfile.renderScaleMode
+        $expectedProfileValid -and -not $ExpectedProfile.renderScaleMode
     $criticalConditions = @(
         'loading_transition', 'relatch_pending', 'transition_pending',
         'first_world_frame_pending', 'post_load_recovery',
@@ -614,6 +734,9 @@ function Test-DevBenchUpscalingStable {
         if ($hasStable -and $hasEffective) {
             Require-StableValue (Test-DevBenchUpscalingProfilesEqual $stableProfile $effectiveProfile) 'stable and effective profiles differ'
         }
+        if ($null -ne $ExpectedProfile -and $expectedProfileValid -and $hasEffective) {
+            Require-StableValue (Test-DevBenchUpscalingProfilesEqual $effectiveProfile $ExpectedProfile) 'effective scaled profile does not match the expected target'
+        }
     }
     $dimensions = Get-DevBenchTelemetryMember $snapshot 'dimensions'
     $displayEyeWidth = Get-DevBenchTelemetryMember $dimensions 'displayEyeWidth'
@@ -627,12 +750,25 @@ function Test-DevBenchUpscalingStable {
         $null -ne $renderEyeHeight -and [uint32]$renderEyeHeight -gt 0
     ) 'upscaling dimensions are not materialized'
 
-    $method = if ($hasEffective) { Get-DevBenchNamedValue $effectiveProfile.method } else { $null }
-    $qualityMode = if ($hasEffective) { Get-DevBenchNamedValue $effectiveProfile.qualityMode } else { $null }
-    $effectiveRenderScaleMode = if ($hasEffective) { [bool]$effectiveProfile.renderScaleMode } else { $false }
-    $dlssProfile = if ($hasEffective) { Get-DevBenchNamedValue $effectiveProfile.dlssProfile } else { $null }
-    $fsrRuntime = if ($hasEffective) { Get-DevBenchNamedValue $effectiveProfile.fsrRuntime } else { $null }
+    $effectiveProfileValid = $hasEffective -and
+        (Test-DevBenchUpscalingProfileShape $effectiveProfile)
+    Require-StableValue (-not $hasEffective -or $effectiveProfileValid) 'the effective upscaling profile has invalid field types'
+    $method = if ($effectiveProfileValid) { Get-DevBenchNamedValue $effectiveProfile.method } else { $null }
+    $qualityMode = if ($effectiveProfileValid) { Get-DevBenchNamedValue $effectiveProfile.qualityMode } else { $null }
+    $effectiveRenderScaleMode = if ($effectiveProfileValid) { $effectiveProfile.renderScaleMode } else { $false }
+    $dlssProfile = if ($effectiveProfileValid) { Get-DevBenchNamedValue $effectiveProfile.dlssProfile } else { $null }
+    $fsrRuntime = if ($effectiveProfileValid) { Get-DevBenchNamedValue $effectiveProfile.fsrRuntime } else { $null }
     $frame = Get-DevBenchTelemetryMember $renderStatus 'frame'
+    $snapshotRevision = Get-DevBenchTelemetryMember $snapshot 'stateRevision'
+    $correlatedSnapshot = Get-DevBenchTelemetryMember $renderStatus 'upscalingSnapshot'
+    $correlatedRevision = Get-DevBenchTelemetryMember $correlatedSnapshot 'stateRevision'
+    Require-StableValue (
+        $null -ne $snapshotRevision -and $null -ne $correlatedRevision -and
+        [uint64]$snapshotRevision -eq [uint64]$correlatedRevision
+    ) 'upscaling and render-scale observations are not revision-correlated'
+    if ($effectiveProfileValid) {
+        Require-StableValue ($renderScaleActive -eq $effectiveRenderScaleMode) 'render-scale status disagrees with the effective profile'
+    }
     $controller = Get-DevBenchTelemetryMember $renderStatus 'controller'
     $gate = Get-DevBenchTelemetryMember $renderStatus 'vendorWorkGate'
     if ($null -eq $controller -or $null -eq $gate) {
@@ -646,7 +782,7 @@ function Test-DevBenchUpscalingStable {
             qualityMode = $qualityMode
             effectiveRenderScaleMode = $effectiveRenderScaleMode
             expectedProfile = $ExpectedProfile
-            expectedProfileMatches = if ($null -ne $ExpectedProfile -and $hasEffective) { Test-DevBenchUpscalingProfilesEqual $effectiveProfile $ExpectedProfile } else { $null }
+            expectedProfileMatches = if ($null -ne $ExpectedProfile -and $effectiveProfileValid) { Test-DevBenchUpscalingProfilesEqual $effectiveProfile $ExpectedProfile } else { $null }
             dlssProfile = $dlssProfile
             fsrRuntime = $fsrRuntime
             frame = if ($null -ne $frame) { [uint32]$frame } else { [uint32]0 }
@@ -655,30 +791,50 @@ function Test-DevBenchUpscalingStable {
             reasons = @($reasons | Select-Object -Unique)
         }
     }
-    Require-StableValue (-not [bool]$controller.terminalFailureSignaled) 'render-scale terminal failure is signaled'
-    Require-StableValue (-not [bool]$controller.terminalDeviceLossSignaled) 'render-scale device loss is signaled'
-    Require-StableValue ([uint64]$controller.unresolvedPhysicalMutationEpoch -eq 0) 'a physical render-scale mutation remains unresolved'
-    Require-StableValue (-not [bool]$gate.active) 'the vendor work gate is active'
-    Require-StableValue ([bool]$gate.completedWorldFrame) 'no completed destination world frame is available'
+    $terminalFailureSignaled = Get-DevBenchTelemetryMember $controller 'terminalFailureSignaled'
+    $terminalDeviceLossSignaled = Get-DevBenchTelemetryMember $controller 'terminalDeviceLossSignaled'
+    $unresolvedPhysicalMutationEpoch = Get-DevBenchTelemetryMember $controller 'unresolvedPhysicalMutationEpoch'
+    $gateActive = Get-DevBenchTelemetryMember $gate 'active'
+    $completedWorldFrame = Get-DevBenchTelemetryMember $gate 'completedWorldFrame'
+    Require-StableValue ($null -ne $terminalFailureSignaled) 'render-scale terminal failure telemetry is missing'
+    Require-StableValue ($null -eq $terminalFailureSignaled -or -not [bool]$terminalFailureSignaled) 'render-scale terminal failure is signaled'
+    Require-StableValue ($null -ne $terminalDeviceLossSignaled) 'render-scale device-loss telemetry is missing'
+    Require-StableValue ($null -eq $terminalDeviceLossSignaled -or -not [bool]$terminalDeviceLossSignaled) 'render-scale device loss is signaled'
+    Require-StableValue ($null -ne $unresolvedPhysicalMutationEpoch) 'physical render-scale mutation telemetry is missing'
+    Require-StableValue ($null -ne $unresolvedPhysicalMutationEpoch -and [uint64]$unresolvedPhysicalMutationEpoch -eq 0) 'a physical render-scale mutation remains unresolved'
+    Require-StableValue ($null -ne $gateActive) 'vendor work gate active telemetry is missing'
+    Require-StableValue ($null -eq $gateActive -or -not [bool]$gateActive) 'the vendor work gate is active'
+    Require-StableValue ($null -ne $completedWorldFrame) 'completed world-frame telemetry is missing'
+    Require-StableValue ($null -ne $completedWorldFrame -and [bool]$completedWorldFrame) 'no completed destination world frame is available'
     foreach ($name in @('loadingMenu', 'loadingPresentationActive', 'postLoadResetPending', 'relatchQueued', 'relatchInProgress', 'relatchFramePending', 'relatchPostLoadSettle', 'recoveryPending', 'relatchPending', 'profileTransitionPending')) {
         $property = $gate.PSObject.Properties[$name]
         if ($property) { Require-StableValue (-not [bool]$property.Value) "vendor work gate '$name' remains active" }
     }
-    if ($controller.postLoadRecovery) {
-        Require-StableValue (-not [bool]$controller.postLoadRecovery.active) 'post-load render-scale recovery is active'
+    $postLoadRecovery = Get-RequiredStableTelemetry $controller 'postLoadRecovery' 'post-load render-scale recovery telemetry is missing'
+    if ($null -ne $postLoadRecovery) {
+        $postLoadRecoveryActive = Get-RequiredStableTelemetry $postLoadRecovery 'active' 'post-load render-scale recovery active telemetry is missing'
+        Require-StableValue ($null -eq $postLoadRecoveryActive -or -not [bool]$postLoadRecoveryActive) 'post-load render-scale recovery is active'
     }
-    if ($controller.memoryTrim) {
-        Require-StableValue (-not [bool]$controller.memoryTrim.pending) 'render-scale memory trim is pending'
+    $memoryTrim = Get-RequiredStableTelemetry $controller 'memoryTrim' 'render-scale memory trim telemetry is missing'
+    if ($null -ne $memoryTrim) {
+        $memoryTrimPending = Get-RequiredStableTelemetry $memoryTrim 'pending' 'render-scale memory trim pending telemetry is missing'
+        Require-StableValue ($null -eq $memoryTrimPending -or -not [bool]$memoryTrimPending) 'render-scale memory trim is pending'
     }
-    if ($controller.retirement) {
+    $retirement = Get-RequiredStableTelemetry $controller 'retirement' 'render-scale resource retirement telemetry is missing'
+    if ($null -ne $retirement) {
+        $pendingSets = Get-RequiredStableTelemetry $retirement 'pendingSets' 'render-scale retirement pending-set telemetry is missing'
+        $fencePending = Get-RequiredStableTelemetry $retirement 'fencePending' 'render-scale retirement fence telemetry is missing'
+        $capacityBlocked = Get-RequiredStableTelemetry $retirement 'capacityBlocked' 'render-scale retirement capacity telemetry is missing'
         Require-StableValue (
-            [uint32]$controller.retirement.pendingSets -eq 0 -and
-            -not [bool]$controller.retirement.fencePending -and
-            -not [bool]$controller.retirement.capacityBlocked
+            $null -ne $pendingSets -and [uint32]$pendingSets -eq 0 -and
+            $null -ne $fencePending -and -not [bool]$fencePending -and
+            $null -ne $capacityBlocked -and -not [bool]$capacityBlocked
         ) 'render-scale resource retirement is pending'
     }
-    if ($controller.engineTargetRetirement) {
-        Require-StableValue (-not [bool]$controller.engineTargetRetirement.pending) 'engine render-target retirement is pending'
+    $engineTargetRetirement = Get-RequiredStableTelemetry $controller 'engineTargetRetirement' 'engine render-target retirement telemetry is missing'
+    if ($null -ne $engineTargetRetirement) {
+        $engineTargetPending = Get-RequiredStableTelemetry $engineTargetRetirement 'pending' 'engine render-target retirement pending telemetry is missing'
+        Require-StableValue ($null -eq $engineTargetPending -or -not [bool]$engineTargetPending) 'engine render-target retirement is pending'
     }
 
     $stereoEvidence = 'native_pipeline_frames'
@@ -687,25 +843,39 @@ function Test-DevBenchUpscalingStable {
         Require-StableValue (($flags -band [uint64]0x10) -ne 0 -and ($flags -band [uint64]0x20) -ne 0) 'render-scale is not both latched and active'
         Require-StableValue ($hasStable) 'the stable render-scale profile is not authoritative'
         Require-StableValue ($transitionState -eq 'active') "render-scale transition state is '$transitionState'"
-        Require-StableValue ((Get-DevBenchNamedValue $renderStatus.modeStatus) -eq 'active') 'render-scale mode status is not active'
-        Require-StableValue ((Get-DevBenchNamedValue $controller.state) -eq 'active') 'render-scale controller is not active'
-        Require-StableValue ((Get-DevBenchNamedValue $controller.presentationPhase) -in @('stereo_proven', 'released')) 'stereo presentation has not been proven or released'
-        Require-StableValue ([bool]$controller.stable.valid -and [bool]$controller.stable.active) 'stable render-scale contract is invalid or inactive'
+        Require-StableValue ((Get-DevBenchNamedValue (Get-DevBenchTelemetryMember $renderStatus 'modeStatus')) -eq 'active') 'render-scale mode status is not active'
+        Require-StableValue ((Get-DevBenchNamedValue (Get-DevBenchTelemetryMember $controller 'state')) -eq 'active') 'render-scale controller is not active'
+        Require-StableValue ((Get-DevBenchNamedValue (Get-DevBenchTelemetryMember $controller 'presentationPhase')) -in @('stereo_proven', 'released')) 'stereo presentation has not been proven or released'
+        $stableContract = Get-DevBenchTelemetryMember $controller 'stable'
+        Require-StableValue ($null -ne $stableContract) 'stable render-scale contract telemetry is missing'
+        if ($null -ne $stableContract) {
+            Require-StableValue ([bool](Get-DevBenchTelemetryMember $stableContract 'valid') -and [bool](Get-DevBenchTelemetryMember $stableContract 'active')) 'stable render-scale contract is invalid or inactive'
+        }
 
-        $fidelity = $controller.fidelity
-        Require-StableValue ([bool]$fidelity.active -and [bool]$fidelity.bothEyesValid) 'both render-scale eyes are not valid'
-        Require-StableValue ([uint32]$fidelity.evaluationEyeMask -eq 3 -and [uint32]$fidelity.invariantEyeMask -eq 3) 'both-eye evaluation or invariant mask is incomplete'
-        Require-StableValue ([uint32]$fidelity.lastMismatchMask -eq 0) 'the latest render-scale fidelity observation mismatched'
-        $fidelityEyes = @($fidelity.eyes)
+        $fidelity = Get-DevBenchTelemetryMember $controller 'fidelity'
+        Require-StableValue ($null -ne $fidelity) 'render-scale fidelity telemetry is missing'
+        if ($null -ne $fidelity) {
+            Require-StableValue ([bool](Get-DevBenchTelemetryMember $fidelity 'active') -and [bool](Get-DevBenchTelemetryMember $fidelity 'bothEyesValid')) 'both render-scale eyes are not valid'
+            Require-StableValue ([uint32](Get-DevBenchTelemetryMember $fidelity 'evaluationEyeMask') -eq 3 -and [uint32](Get-DevBenchTelemetryMember $fidelity 'invariantEyeMask') -eq 3) 'both-eye evaluation or invariant mask is incomplete'
+            Require-StableValue ([uint32](Get-DevBenchTelemetryMember $fidelity 'lastMismatchMask') -eq 0) 'the latest render-scale fidelity observation mismatched'
+        }
+        $fidelityEyesValue = Get-DevBenchTelemetryMember $fidelity 'eyes'
+        Require-StableValue ($null -ne $fidelityEyesValue) 'render-scale fidelity eye telemetry is missing'
+        [object[]]$fidelityEyes = @()
+        if ($null -ne $fidelityEyesValue) { $fidelityEyes = @($fidelityEyesValue) }
         Require-StableValue ($fidelityEyes.Count -eq 2) 'render-scale fidelity did not expose two eyes'
         if ($fidelityEyes.Count -eq 2) {
             Require-StableValue (@($fidelityEyes | Where-Object { -not [bool]$_.valid -or -not [bool]$_.evaluated }).Count -eq 0) 'one or more render-scale eyes are invalid or unevaluated'
             Require-StableValue ([Math]::Abs([int64]$fidelityEyes[0].frame - [int64]$fidelityEyes[1].frame) -le 1) 'render-scale eye observations are not frame-coherent'
         }
 
-        $presentation = $controller.presentation
-        $presentationEyes = @($presentation.eyes)
-        Require-StableValue ([uint32]$presentation.consecutiveBothEyesVendorFrames -ge 2) 'fewer than two consecutive stereo vendor frames are proven'
+        $presentation = Get-DevBenchTelemetryMember $controller 'presentation'
+        Require-StableValue ($null -ne $presentation) 'render-scale presentation telemetry is missing'
+        $presentationEyesValue = Get-DevBenchTelemetryMember $presentation 'eyes'
+        Require-StableValue ($null -ne $presentationEyesValue) 'render-scale presentation eye telemetry is missing'
+        [object[]]$presentationEyes = @()
+        if ($null -ne $presentationEyesValue) { $presentationEyes = @($presentationEyesValue) }
+        Require-StableValue ([uint32](Get-DevBenchTelemetryMember $presentation 'consecutiveBothEyesVendorFrames') -ge 2) 'fewer than two consecutive stereo vendor frames are proven'
         Require-StableValue ($presentationEyes.Count -eq 2) 'render-scale presentation did not expose two eyes'
         if ($presentationEyes.Count -eq 2) {
             $paths = @($presentationEyes | ForEach-Object { Get-DevBenchNamedValue $_.path } | Select-Object -Unique)
@@ -714,28 +884,45 @@ function Test-DevBenchUpscalingStable {
         }
 
         if ($method -eq 'fsr') {
-            $fsr = $renderStatus.fsrDispatch
-            Require-StableValue ([bool]$fsr.actualDispatchBothEyesValid -and [bool]$fsr.actualDispatchBackendConverged) 'FSR did not prove a converged two-eye dispatch'
-            Require-StableValue (-not [bool]$fsr.actualRuntimeFallbackObserved) 'FSR runtime fallback is active'
-            Require-StableValue (-not [bool]$fsr.shaderCompilationActive) 'shader compilation is active'
-            Require-StableValue ([bool]$fsr.contractReady -and (Get-DevBenchNamedValue $fsr.contractLifecyclePhase) -eq 'ready') 'FSR runtime contract is not ready'
+            $fsr = Get-DevBenchTelemetryMember $renderStatus 'fsrDispatch'
+            Require-StableValue ($null -ne $fsr) 'FSR dispatch telemetry is missing'
+            if ($null -ne $fsr) {
+                Require-StableValue ([bool](Get-DevBenchTelemetryMember $fsr 'actualDispatchBothEyesValid') -and [bool](Get-DevBenchTelemetryMember $fsr 'actualDispatchBackendConverged')) 'FSR did not prove a converged two-eye dispatch'
+                Require-StableValue (-not [bool](Get-DevBenchTelemetryMember $fsr 'actualRuntimeFallbackObserved')) 'FSR runtime fallback is active'
+                Require-StableValue (-not [bool](Get-DevBenchTelemetryMember $fsr 'shaderCompilationActive')) 'shader compilation is active'
+                Require-StableValue ([bool](Get-DevBenchTelemetryMember $fsr 'contractReady') -and (Get-DevBenchNamedValue (Get-DevBenchTelemetryMember $fsr 'contractLifecyclePhase')) -eq 'ready') 'FSR runtime contract is not ready'
+            }
         }
         elseif ($method -eq 'dlss') {
-            $lifecycle = $controller.dlssLifecycle
-            Require-StableValue ([bool]$lifecycle.resourcesPresent -and [bool]$lifecycle.readyForContract) 'DLSS runtime resources are not ready'
-            Require-StableValue ((Get-DevBenchNamedValue $lifecycle.phase) -eq 'ready' -and [uint32]$lifecycle.failures -eq 0) 'DLSS runtime lifecycle is not cleanly ready'
+            $lifecycle = Get-DevBenchTelemetryMember $controller 'dlssLifecycle'
+            Require-StableValue ($null -ne $lifecycle) 'DLSS lifecycle telemetry is missing'
+            if ($null -ne $lifecycle) {
+                Require-StableValue ([bool](Get-DevBenchTelemetryMember $lifecycle 'resourcesPresent') -and [bool](Get-DevBenchTelemetryMember $lifecycle 'readyForContract')) 'DLSS runtime resources are not ready'
+                Require-StableValue ((Get-DevBenchNamedValue (Get-DevBenchTelemetryMember $lifecycle 'phase')) -eq 'ready' -and [uint32](Get-DevBenchTelemetryMember $lifecycle 'failures') -eq 0) 'DLSS runtime lifecycle is not cleanly ready'
+            }
         }
     }
     else {
-        $controllerState = Get-DevBenchNamedValue $controller.state
+        $controllerState = Get-DevBenchNamedValue (Get-DevBenchTelemetryMember $controller 'state')
         $nativeControllerSettled =
             ($transitionState -eq 'idle' -and $controllerState -eq 'idle') -or
             ($transitionState -eq 'active' -and $controllerState -eq 'active')
         Require-StableValue ($nativeControllerSettled) "native-resolution controller state is '$transitionState/$controllerState'"
         Require-StableValue (($flags -band [uint64]0x10) -eq 0 -and ($flags -band [uint64]0x20) -eq 0) 'render-scale remains latched or active for a native-resolution profile'
+        $nativeStableContract = Get-DevBenchTelemetryMember $controller 'stable'
+        $nativeFidelity = Get-DevBenchTelemetryMember $controller 'fidelity'
+        Require-StableValue ($null -ne $nativeStableContract -and -not [bool](Get-DevBenchTelemetryMember $nativeStableContract 'active')) 'an active physical render-scale contract remains for a native-resolution profile'
+        Require-StableValue ($null -ne $nativeFidelity -and -not [bool](Get-DevBenchTelemetryMember $nativeFidelity 'active')) 'active render-scale fidelity remains for a native-resolution profile'
     }
 
-    $signature = if ($hasEffective) {
+    $stableForSignature = Get-DevBenchTelemetryMember $controller 'stable'
+    $targetEpoch = Get-DevBenchTelemetryMember $controller 'targetEpoch'
+    $contractGeneration = Get-DevBenchTelemetryMember $stableForSignature 'contractGeneration'
+    if ($effectiveProfileValid) {
+        Require-StableValue ($null -ne $targetEpoch) 'render-scale target epoch telemetry is missing'
+        Require-StableValue ($null -ne $contractGeneration) 'stable contract generation telemetry is missing'
+    }
+    $signature = if ($effectiveProfileValid -and $null -ne $targetEpoch -and $null -ne $contractGeneration) {
         @(
             $method,
             (Get-DevBenchNamedValue $effectiveProfile.qualityMode),
@@ -746,8 +933,8 @@ function Test-DevBenchUpscalingStable {
             [uint32]$displayEyeHeight,
             [uint32]$renderEyeWidth,
             [uint32]$renderEyeHeight,
-            [uint64]$controller.targetEpoch,
-            [uint32]$controller.stable.contractGeneration
+            [uint64]$targetEpoch,
+            [uint32]$contractGeneration
         ) -join '|'
     } else { $null }
 
@@ -759,7 +946,7 @@ function Test-DevBenchUpscalingStable {
         qualityMode = $qualityMode
         effectiveRenderScaleMode = $effectiveRenderScaleMode
         expectedProfile = $ExpectedProfile
-        expectedProfileMatches = if ($null -ne $ExpectedProfile -and $hasEffective) { Test-DevBenchUpscalingProfilesEqual $effectiveProfile $ExpectedProfile } else { $null }
+        expectedProfileMatches = if ($null -ne $ExpectedProfile -and $effectiveProfileValid) { Test-DevBenchUpscalingProfilesEqual $effectiveProfile $ExpectedProfile } else { $null }
         dlssProfile = $dlssProfile
         fsrRuntime = $fsrRuntime
         frame = if ($null -ne $frame) { [uint32]$frame } else { [uint32]0 }
@@ -792,7 +979,7 @@ function Test-DevBenchMainMenuReady {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$MenuState,
-        [string[]]$AllowedMenus = @('HUD Menu', 'Main Menu')
+        [string[]]$AllowedMenus = @('HUD Menu', 'Main Menu', 'Mist Menu', 'Fader Menu')
     )
     $openMenus = if ($MenuState.PSObject.Properties['openMenus']) { @($MenuState.openMenus) } else { @() }
     $unexpected = @($openMenus | Where-Object { $_ -notin $AllowedMenus })
@@ -984,4 +1171,4 @@ function Test-DevBenchPerformanceWindow {
     }
 }
 
-Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow
+Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow

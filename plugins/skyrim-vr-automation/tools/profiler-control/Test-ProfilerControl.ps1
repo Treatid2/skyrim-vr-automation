@@ -135,17 +135,31 @@ try {
     [IO.File]::WriteAllText($runtimePath, '{}', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0}', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText($fakeControl, @'
-param([string]$Command,[string]$Tool,[string]$ArgumentsJson,[string]$RuntimePath,[string]$EvidenceDirectory,[string]$EvidenceLabel,[int]$TimeoutSeconds,[switch]$RequireSuccess,[switch]$RequirePerformanceNeutral,[switch]$NoExit,[switch]$Compact)
+param([string]$Command,[string]$Tool,[string]$ArgumentsJson,[string]$RuntimePath,[string]$EvidenceDirectory,[string]$EvidenceLabel,[int]$TimeoutSeconds,[switch]$RequireSuccess,[switch]$RequirePerformanceNeutral,[switch]$NoExit,[switch]$Compact,[string]$ExpectedRuntimeIdentityJson)
 $state = Get-Content -LiteralPath $env:CSX_PROFILER_TEST_STATE -Raw | ConvertFrom-Json -AsHashtable
 $state.calls = [int]$state.calls + 1
 $action = ($ArgumentsJson | ConvertFrom-Json).action
+$listenerPid = if (-not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DRIFT_AT_CALL) -and [int]$env:CSX_PROFILER_TEST_DRIFT_AT_CALL -eq [int]$state.calls) { 456 } else { 123 }
+if (-not [string]::IsNullOrWhiteSpace($ExpectedRuntimeIdentityJson)) {
+    $expected = $ExpectedRuntimeIdentityJson | ConvertFrom-Json
+    if ([int]$expected.listenerPid -ne $listenerPid) {
+        $state.rejectedBeforeMutation = $true
+        $state | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:CSX_PROFILER_TEST_STATE -Encoding utf8
+        [pscustomobject]@{ok=$false;errors=@('Expected runtime identity changed before dispatch.')} | ConvertTo-Json -Compress
+        return
+    }
+}
 if ($action -eq 'enable') { $state.enabled = $true }
 elseif ($action -eq 'disable') { $state.enabled = $false }
 elseif ($action -eq 'status') { $state.frame = [int]$state.frame + 1 }
 $state | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:CSX_PROFILER_TEST_STATE -Encoding utf8
+$mirrorPath = Join-Path $EvidenceDirectory 'transaction.journal.json'
+if ($action -eq 'enable' -and $env:CSX_PROFILER_TEST_BREAK_MIRROR -eq '1') {
+    if (Test-Path -LiteralPath $EvidenceDirectory -PathType Container) { Remove-Item -LiteralPath $EvidenceDirectory -Recurse -Force }
+    'blocked-evidence-directory' | Set-Content -LiteralPath $EvidenceDirectory -Encoding utf8
+}
 $timer = [pscustomobject]@{name='Synthetic';activeGpu=$true;activeCpu=$true;hasGpu=$true;hasCpu=$true;gpuMs=1.0;topLevelMs=1.0;cpuMs=0.1}
 $status = [pscustomobject]@{enabled=[bool]$state.enabled;frame_count=[long]$state.frame;capturedFrameCount=[long]$state.frame;resolvedTotalMs=1.0;resolvedCpuTotalMs=0.1;acquiredSlots=1;slotRefusals=0;timers=@($timer)}
-$listenerPid = if (-not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DRIFT_AT_CALL) -and [int]$env:CSX_PROFILER_TEST_DRIFT_AT_CALL -eq [int]$state.calls) { 456 } else { 123 }
 $data = [ordered]@{content=@([pscustomobject]@{ok=$true;status=$status})}
 if ($RequirePerformanceNeutral) {
     $distorted = -not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DISTORT_ACTION) -and $env:CSX_PROFILER_TEST_DISTORT_ACTION -eq $action
@@ -153,7 +167,7 @@ if ($RequirePerformanceNeutral) {
     $data.performanceGuard = $guard
     $data.performanceWindow = [pscustomobject]@{valid=(-not $distorted);applicable=$true;sameEpoch=$true;before=$guard;after=$guard;reason=$(if ($distorted) {'performance-probe-distorted'} else {'performance-window-neutral'})}
 }
-[pscustomobject]@{ok=$true;runtimeIdentity=[pscustomobject]@{complete=$true;verified=$true;listenerPid=$listenerPid;process=[pscustomobject]@{path='C:\Fixture\SkyrimVR.exe';startTimeUtc='2026-08-28T00:00:00Z'};build=[pscustomobject]@{buildId='fixture'};artifact=[pscustomobject]@{path='C:\Fixture\CommunityShaders.dll';sha256='AA'}};invocationEvidencePath=(Join-Path $EvidenceDirectory "$EvidenceLabel.json");data=[pscustomobject]$data;errors=@()} | ConvertTo-Json -Depth 20 -Compress
+[pscustomobject]@{ok=$true;runtimeIdentity=[pscustomobject]@{complete=$true;verified=$true;listenerPid=$listenerPid;process=[pscustomobject]@{path='C:\Fixture\SkyrimVR.exe';startTimeUtc='2026-08-28T00:00:00Z'};build=[pscustomobject]@{buildId='fixture'};artifact=[pscustomobject]@{path='C:\Fixture\CommunityShaders.dll';sha256='AA'}};invocationEvidencePath=(Join-Path $EvidenceDirectory "$EvidenceLabel.json");sessionCleanup=[pscustomobject]@{attempted=$true;ok=$true;state='all_closed'};data=[pscustomobject]$data;errors=@()} | ConvertTo-Json -Depth 20 -Compress
 '@, [Text.UTF8Encoding]::new($false))
     $env:CSX_PROFILER_TEST_STATE = $statePath
     $env:CSX_PROFILER_CONTROL_ROOT = Join-Path $resolvedTestRoot 'profiler-control'
@@ -168,6 +182,7 @@ if ($RequirePerformanceNeutral) {
     Assert-Test (@($measuredRecords.runtimeIdentityFingerprint | Sort-Object -Unique).Count -eq 1 -and @($measurementReceipt.runtimeIdentityObservations).Count -ge 7) 'measurement binds every accepted response and sample to one verified runtime identity'
     Assert-Test ($measurement.summary.schemaVersion -eq 3 -and @($measurement.summary.performanceObservations).Count -ge 5) 'measurement preserves performance-neutrality evidence in summary schema 3'
     Assert-Test (@($measurement.summary.performanceObservations | Where-Object { -not $_.window.valid -or $_.guard.performanceEpoch -ne 7 }).Count -eq 0) 'measurement retains one valid performance epoch across the capture'
+    Assert-Test (@($measurement.summary.performanceObservations | Where-Object { -not $_.sessionCleanup.ok }).Count -eq 0) 'measurement preserves final MCP cleanup evidence for every guarded profiler call'
 
     $recoveryMirror = Join-Path $resolvedTestRoot 'interrupted-profiler.journal.json'
     $authoritativeJournal = Join-Path $env:CSX_PROFILER_CONTROL_ROOT 'transaction.journal.json'
@@ -179,13 +194,24 @@ if ($RequirePerformanceNeutral) {
     Assert-Test ($recoveredMeasurement.ok -and $recoveredPriorJournal.phase -eq 'recovered-preimage' -and $recoveredPriorJournal.recovery.stateRestored -and -not $recoveredFinalState.enabled) 'next capture discovers a dead capture journal and restores the same runtime exact prior state'
 
     [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0}', [Text.UTF8Encoding]::new($false))
-    $env:CSX_PROFILER_TEST_DRIFT_AT_CALL = '3'
+    $env:CSX_PROFILER_TEST_DRIFT_AT_CALL = '2'
     $driftError = $null
     try { & $measure -Label identity-drift -EvidenceDirectory (Join-Path $resolvedTestRoot 'drift') -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | Out-Null }
     catch { $driftError = $_.Exception.Message }
     Remove-Item Env:CSX_PROFILER_TEST_DRIFT_AT_CALL -ErrorAction SilentlyContinue
     $driftFinalState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
-    Assert-Test ($driftError -match 'runtime identity changed' -and -not $driftFinalState.enabled) 'measurement rejects a replacement runtime and restores state only through the original identity'
+    Assert-Test ($driftError -match 'Expected runtime identity changed before dispatch' -and $driftFinalState.rejectedBeforeMutation -and -not $driftFinalState.enabled) 'measurement rejects a replacement runtime before dispatching a profiler mutation'
+
+    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0}', [Text.UTF8Encoding]::new($false))
+    $env:CSX_PROFILER_TEST_BREAK_MIRROR = '1'
+    $mirrorFailure = $null
+    try { & $measure -Label mirror-failure -EvidenceDirectory (Join-Path $resolvedTestRoot 'mirror-failure') -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | Out-Null }
+    catch { $mirrorFailure = $_.Exception.Message }
+    Remove-Item Env:CSX_PROFILER_TEST_BREAK_MIRROR -ErrorAction SilentlyContinue
+    $mirrorFailureState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $leaseProbe = [IO.File]::Open((Join-Path $env:CSX_PROFILER_CONTROL_ROOT 'capture.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $leaseProbe.Dispose()
+    Assert-Test ($mirrorFailure -match 'evidence is incomplete after state restoration' -and -not $mirrorFailureState.enabled) 'journal mirror failure cannot prevent exact profiler restoration or lease release'
 
     [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0}', [Text.UTF8Encoding]::new($false))
     $env:CSX_PROFILER_TEST_DISTORT_ACTION = 'status'
@@ -226,6 +252,8 @@ if ($RequirePerformanceNeutral) {
     ) -ge 0) 'profiler capture retains render-scale preparation telemetry'
     Assert-Test ($null -ne $measurement.summary.preparation.before -and
         $null -ne $measurement.summary.preparation.after) 'profiler summary exposes before and after preparation traces'
+    Assert-Test (-not $measurement.summary.resourcePublication.before.PSObject.Properties['preparation'] -and
+        -not $measurement.summary.resourcePublication.after.PSObject.Properties['preparation']) 'profiler summary serializes each preparation trace only once'
 
     $profilerSkill = Get-Content -LiteralPath (Join-Path $PSScriptRoot `
         '..\..\skills\profiler-control\SKILL.md') -Raw
@@ -245,6 +273,7 @@ if ($RequirePerformanceNeutral) {
 finally {
     Remove-Item Env:CSX_PROFILER_TEST_STATE -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_DRIFT_AT_CALL -ErrorAction SilentlyContinue
+    Remove-Item Env:CSX_PROFILER_TEST_BREAK_MIRROR -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_CONTROL_ROOT -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $resolvedTestRoot -PathType Container) {
         Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force

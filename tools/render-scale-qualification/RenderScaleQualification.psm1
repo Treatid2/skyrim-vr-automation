@@ -78,8 +78,8 @@ function Get-CSXObjectSha256 {
 
 function Assert-CSXProtocol {
     param([Parameter(Mandatory)]$Protocol)
-    if ([string]$Protocol.schema -ne 'csx-render-scale-pr-v1' -or [int]$Protocol.protocolRevision -ne 4) {
-        throw 'The protocol must be csx-render-scale-pr-v1 revision 4.'
+    if ([string]$Protocol.schema -ne 'csx-render-scale-pr-v1' -or [int]$Protocol.protocolRevision -ne 5) {
+        throw 'The protocol must be csx-render-scale-pr-v1 revision 5.'
     }
     if ([string]$Protocol.requiredMethodsCommit -ne 'b46edeaed14c41ad41225641c3a4943f1db25db6') {
         throw 'The protocol does not bind the required DLSS trace methods commit.'
@@ -182,7 +182,7 @@ function Assert-CSXProtocol {
         [int]$evaluation.promptRevision -ne 1 -or [string]$evaluation.promptFile -ne 'visual-review.prompt.v1.md' -or
         [string]$evaluation.promptSha256 -ne '1d0926fc81e2b4b3dc7f51eee2b30ef08ce40fd9715aeeeda674b71aed46ac04' -or
         [string]$evaluation.outputSchemaFile -ne 'visual-review.output-schema.v1.json' -or
-        [string]$evaluation.outputSchemaSha256 -ne 'bab27931bd21dfe86c7675d4e37f37061031adbf124576952e03ddfb16d54470' -or
+        [string]$evaluation.outputSchemaSha256 -ne '5dd5e20421174a1b0a9e41ef8f5c393fe1b2dcfc9039fd0c01497751e57c8c11' -or
         [int]$evaluation.presentationPasses -ne 2 -or [string]$evaluation.presentationOrder -ne 'blinded_swapped_ab' -or
         [int]$evaluation.parallelReplicates -ne 3 -or [string]$evaluation.minimumConfidence -ne 'medium' -or
         [int]$evaluation.timeoutMs -ne 90000 -or [string]$evaluation.failurePolicy -ne 'fail_closed') {
@@ -204,9 +204,9 @@ function Assert-CSXProtocol {
         [int]$Protocol.timeBudget.orchestrationMs + [int]$Protocol.timeBudget.evidenceFinalizationMs -ne [int]$Protocol.timeBudget.endToEndMs) {
         throw 'Capture, vision, and finalization allocations do not exactly fit the unattended cap.'
     }
-    $canonicalProtocolSha256 = 'b0842394300f5c9e87f08afcd1b09d64aa551d1c1fc157d432710df046865074'
+    $canonicalProtocolSha256 = '745aa3a0a9d5e2a7f9769d11676d13b5ea77fd6bf59b50d6c3b87bcca507c4bd'
     if ((Get-CSXObjectSha256 -Value $Protocol) -ne $canonicalProtocolSha256) {
-        throw 'The revision-4 protocol definition changed; publish a new protocol revision instead.'
+        throw 'The revision-5 protocol definition changed; publish a new protocol revision instead.'
     }
 }
 
@@ -2796,8 +2796,8 @@ function Test-CSXAutomatedVisualReviewEvidence {
     $automated = Get-CSXPathValue $RunRaw 'assays.visual.automatedReview'
     $latestCompletedUtc = [DateTimeOffset]::MinValue
     try {
-        if ([int](Get-CSXPathValue $RunRaw 'protocol.revision' 0) -ne 4) {
-            throw 'Automated visual review evidence requires protocol revision 4.'
+        if ([int](Get-CSXPathValue $RunRaw 'protocol.revision' 0) -ne 5) {
+            throw 'Automated visual review evidence requires protocol revision 5.'
         }
         if ($runId -notmatch '^rsq-[A-Za-z0-9_-]{8,80}$') {
             throw 'Automated visual review run identity is outside the response-schema contract.'
@@ -3495,7 +3495,7 @@ function Test-CSXAutomatedVisualReview {
     if (-not $evidence.integrityOk) { $reviewIntegrityOk = $false }
     if ([string](Get-CSXPropertyValue $Review 'schema') -ne 'csx-render-scale-visual-review-v2' -or
         [string](Get-CSXPathValue $Review 'reviewer.kind') -ne 'image_model') {
-        $errors.Add('Protocol revision 4 requires visual-review-v2 from an image_model; human review is forbidden.')
+        $errors.Add('Protocol revision 5 requires visual-review-v2 from an image_model; human review is forbidden.')
         $reviewIntegrityOk = $false
     }
     if ($evidence.integrityOk) {
@@ -3527,10 +3527,10 @@ function Test-CSXVisualReview {
         [Parameter(Mandatory)]$Review,
         $BaselineVisualIndex = $null
     )
-    if ([int](Get-CSXPathValue $RunRaw 'protocol.revision' 0) -ne 4) {
+    if ([int](Get-CSXPathValue $RunRaw 'protocol.revision' 0) -ne 5) {
         return [pscustomobject][ordered]@{
             ok = $false; integrityOk = $false; qualityPassed = $false
-            errors = @('Only protocol revision 4 automated image-model visual review evidence is accepted.')
+            errors = @('Only protocol revision 5 automated image-model visual review evidence is accepted.')
             reviewer = Get-CSXPropertyValue $Review 'reviewer'; reviewedUtc = Get-CSXPropertyValue $Review 'reviewedUtc'
         }
     }
@@ -3544,17 +3544,17 @@ function Test-CSXFlattenedBaselineVisualReview {
         [Parameter(Mandatory)]$VisualIndex,
         [Parameter(Mandatory)]$Review
     )
-    if ([int](Get-CSXPathValue $RunRaw 'protocol.revision' 0) -ne 4) {
+    if ([int](Get-CSXPathValue $RunRaw 'protocol.revision' 0) -ne 5) {
         return [pscustomobject][ordered]@{
             ok = $false; integrityOk = $false; qualityPassed = $false
-            errors = @('Only protocol revision 4 automated image-model baseline review evidence is accepted.')
+            errors = @('Only protocol revision 5 automated image-model baseline review evidence is accepted.')
             reviewer = Get-CSXPropertyValue $Review 'reviewer'; reviewedUtc = Get-CSXPropertyValue $Review 'reviewedUtc'
         }
     }
     if ([bool](Get-CSXPropertyValue $RunRaw 'prMode' $false)) {
         return [pscustomobject][ordered]@{
             ok = $false; integrityOk = $false; qualityPassed = $false
-            errors = @('A flattened PR baseline requires its automated comparison index; recursive visual baselines are not accepted by revision 4.')
+            errors = @('A flattened PR baseline requires its automated comparison index; recursive visual baselines are not accepted by revision 5.')
             reviewer = Get-CSXPropertyValue $Review 'reviewer'; reviewedUtc = Get-CSXPropertyValue $Review 'reviewedUtc'
         }
     }
@@ -4587,7 +4587,7 @@ function Update-CSXQualificationReport {
         catch { $infrastructureErrors.Add("Visual review validation failed: $($_.Exception.Message)"); $reviewState = 'FAIL' }
     }
     else {
-        $infrastructureErrors.Add('Protocol revision 4 requires the same-run automated image-model visual review; no review file was produced.')
+        $infrastructureErrors.Add('Protocol revision 5 requires the same-run automated image-model visual review; no review file was produced.')
     }
     $status = if ($infrastructureErrors.Count -gt 0) {
         'INFRASTRUCTURE_ERROR'
@@ -4697,7 +4697,7 @@ function Update-CSXQualificationReport {
         $markdown += "`nThis is a passing local qualification, not a PR qualification. PR use requires -PrMode and an explicitly identified baseline build.`n"
     }
     elseif ($status -ne 'PASS') {
-        $markdown += "`nThis is not a passing PR qualification. See run.json errors; protocol revision 4 has no manual review or pending state.`n"
+        $markdown += "`nThis is not a passing PR qualification. See run.json errors; protocol revision 5 has no manual review or pending state.`n"
     }
     $summaryName = if ($prMode) { 'pr-summary.md' } else { 'qualification-summary.md' }
     $summaryPath = Write-CSXTextFile -Path (Join-Path $root $summaryName) -Value $markdown
