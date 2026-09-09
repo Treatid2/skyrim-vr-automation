@@ -12,6 +12,45 @@ $configPath = Join-Path $PSScriptRoot 'protocol.v1.json'
 Import-Module $modulePath -Force
 
 $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json -Depth 30
+$protocolRaw = [IO.File]::ReadAllText($configPath)
+$protocolSnapshot = New-CocProtocolSnapshot -ProtocolJson $protocolRaw
+$snapshotConfig = Get-CocProtocolFromSnapshot `
+    -Encoding $protocolSnapshot.encoding -Sha256 $protocolSnapshot.sha256 `
+    -Bytes $protocolSnapshot.bytes
+if ([string]$snapshotConfig.schema -ne 'csx-coc-stability-protocol-v1') {
+    throw 'The immutable protocol snapshot did not round-trip.'
+}
+$tamperedBytes = [Convert]::ToBase64String(
+    [Text.Encoding]::UTF8.GetBytes($protocolRaw + ' ')
+)
+try {
+    Get-CocProtocolFromSnapshot -Encoding $protocolSnapshot.encoding `
+        -Sha256 $protocolSnapshot.sha256 -Bytes $tamperedBytes | Out-Null
+    throw 'Tampered protocol bytes retained the admitted digest.'
+} catch {
+    if ($_.Exception.Message -notlike '*digest does not match*') { throw }
+}
+foreach ($badEndpoint in @(
+        'http://127.0.0.1:8922/mcp',
+        'http://127.0.0.1:8921/other',
+        'http://localhost:8921/mcp',
+        'http://192.0.2.1:8921/mcp'
+    )) {
+    try {
+        Assert-CocCanonicalEndpoint -Endpoint $badEndpoint | Out-Null
+        throw "Noncanonical endpoint was accepted: $badEndpoint"
+    } catch {
+        if ($_.Exception.Message -notlike '*only accepts the registered*') { throw }
+    }
+}
+$exactStart = (Get-Process -Id $PID).StartTime.ToUniversalTime()
+try {
+    Assert-CocProcessLifetime -ProcessId $PID `
+        -ExpectedStartTimeUtc $exactStart.AddMilliseconds(1).ToString('o')
+    throw 'A near-time replacement process was accepted.'
+} catch {
+    if ($_.Exception.Message -notlike '*no longer denotes*') { throw }
+}
 $requiredPreparationEvents = @(
     'request_queued', 'admission_check', 'early_exit',
     'shader_cache_busy_wait', 'sss_raymarch_prewarm', 'ssgi_prewarm',
@@ -59,10 +98,13 @@ for ($index = 0; $index -lt 20; $index++) {
     } else {
         'WindhelmExterior01'
     }
-    $offset = 2 + ($index * 5)
-    if ([string]$steps[$offset + 2].label -ne [string]$dispatches[$index].label -or
-        [string]$steps[$offset + 3].label -ne [string]$waiters[$index].label -or
-        [string]$steps[$offset + 4].label -ne [string]$statuses[$index].label) {
+    $dispatchIndex = [Array]::IndexOf(
+        @($steps | ForEach-Object { [string]$_.label }),
+        [string]$dispatches[$index].label
+    )
+    if ($dispatchIndex -lt 0 -or
+        [string]$steps[$dispatchIndex + 1].label -ne [string]$waiters[$index].label -or
+        [string]$steps[$dispatchIndex + 2].label -ne [string]$statuses[$index].label) {
         throw "Transition $($index + 1) does not execute its COC immediately before the bounded waiter."
     }
     if ([string]$dispatches[$index].args.action -ne 'qualification_dispatch' -or
@@ -142,7 +184,8 @@ for ($ordinal = 1; $ordinal -le 20; $ordinal++) {
 }
 $analysis = Get-CocQualificationAnalysis -Scenario ([pscustomobject]@{
         results = @($results)
-    }) -ProtocolConfig $config -ExpectedOwnerId 'test-owner'
+    }) -ProtocolConfig $config -ExpectedOwnerId 'test-owner' `
+    -ExpectedBuildId ('a' * 64)
 if (-not $analysis.available -or -not $analysis.complete -or
     $analysis.transitions.Count -ne 20 -or
     $analysis.timings.strictFrames.p95 -ne 24 -or
@@ -156,6 +199,31 @@ if (-not $analysis.available -or -not $analysis.complete -or
     $analysis.preparation.eventCount -ne 20 -or
     -not $analysis.transitions[0].preparation.stages.total_preparation.observed) {
     throw 'Strict milestone analysis did not retain the required timing and failure evidence.'
+}
+
+foreach ($requiredField in @($config.qualification.receiptFields)) {
+    $fieldFixture = @($results | ConvertTo-Json -Depth 50 |
+        ConvertFrom-Json -Depth 50)
+    $fieldWait = $fieldFixture | Where-Object label -eq 'coc-01-wait' |
+        Select-Object -First 1
+    $fieldWait.result.PSObject.Properties.Remove([string]$requiredField)
+    $fieldAnalysis = Get-CocQualificationAnalysis -Scenario (
+        [pscustomobject]@{ results = $fieldFixture }
+    ) -ProtocolConfig $config -ExpectedOwnerId 'test-owner' `
+        -ExpectedBuildId ('a' * 64)
+    if ($fieldAnalysis.complete -or
+        "coc-01-wait.$requiredField" -notin @($fieldAnalysis.missingEvidence)) {
+        throw "Missing mandatory receipt field was accepted: $requiredField"
+    }
+}
+
+$duplicateAnalysis = Get-CocQualificationAnalysis -Scenario ([pscustomobject]@{
+        results = @($results) + @($results[0])
+    }) -ProtocolConfig $config -ExpectedOwnerId 'test-owner' `
+    -ExpectedBuildId ('a' * 64)
+if ($duplicateAnalysis.complete -or
+    'coc-01-wait.duplicate' -notin @($duplicateAnalysis.missingEvidence)) {
+    throw 'A duplicate scenario label was accepted as unambiguous evidence.'
 }
 
 $missingLabelAnalysis = Get-CocQualificationAnalysis -Scenario (
@@ -172,6 +240,14 @@ if (-not $missingLabelAnalysis.available -or
     $missingLabelAnalysis.transitions.Count -ne 20 -or
     @($missingLabelAnalysis.transitions | Where-Object receiptPresent).Count -ne 0) {
     throw 'Missing scenario labels did not remain absent receipt evidence.'
+}
+if ([string]$steps[0].label -ne 'coc-01-qualification-status' -or
+    [string]$steps[1].label -ne 'coc-01-begin' -or
+    [string]$steps[2].label -ne 'stress-reset' -or
+    [string]$steps[3].label -ne 'stress-start' -or
+    [string]$steps[2].args.ownerId -ne 'test-owner' -or
+    [string]$steps[3].args.ownerId -ne 'test-owner') {
+    throw 'Server-side qualification ownership is not established before diagnostic mutation.'
 }
 $partialDisposition = Get-CocScenarioDisposition -Scenario ([pscustomobject]@{
         done = $true
@@ -264,6 +340,14 @@ $runningDisposition = Get-CocScenarioDisposition -Scenario ([pscustomobject]@{
 if (-not $runningDisposition.ok -or $runningDisposition.state -ne 'running') {
     throw 'A running partial transcript was not preserved as provisional evidence.'
 }
+$missingDoneDisposition = Get-CocScenarioDisposition -Scenario ([pscustomobject]@{
+        ok = $true
+        results = @($results)
+    }) -Analysis $analysis
+if ($missingDoneDisposition.ok -or
+    $missingDoneDisposition.state -ne 'evidence-partial') {
+    throw 'A scenario without an explicit Boolean done field was accepted.'
+}
 
 $ownershipConflict = Test-CocBaseline -Results @{
     state = [pscustomobject]@{ value = [pscustomobject]@{ playerLoaded = $true } }
@@ -306,7 +390,9 @@ foreach ($required in @(
     '[Diagnostics.Stopwatch]::GetTimestamp()',
     'New-CocDispatchClaim',
     "'baseline-complete'",
-    "'deadline'",
+    'baseline admission deadline expired',
+    'protocolSha256',
+    'Assert-CocCanonicalEndpoint',
     "-Tool 'communityshaders.menu'",
     "-Tool 'scenario'",
     'Start-ThreadJob',
@@ -316,6 +402,11 @@ foreach ($required in @(
 )) {
     if (-not $script.Contains($required, [StringComparison]::Ordinal)) {
         throw "COC stability controller is missing: $required"
+    }
+}
+foreach ($forbidden in @('$watchdogJob', '$earlyJob', "'deadline'")) {
+    if ($script.Contains($forbidden, [StringComparison]::Ordinal)) {
+        throw "COC stability controller retains unsafe deadline dispatch: $forbidden"
     }
 }
 
@@ -424,14 +515,22 @@ try {
         Set-Content -LiteralPath $invalidProtocolPath -Encoding utf8
     $invalidProtocolStatePath = Join-Path $invalidProtocolFixture 'state.json'
     $currentStart = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+    $invalidProtocolRaw = '{"schema":"unrelated-protocol"}'
+    $invalidProtocolBytes = [Text.Encoding]::UTF8.GetBytes($invalidProtocolRaw)
     [pscustomobject][ordered]@{
         schema = 'csx-coc-stability-state-v1'
         outcome = 'scenario-accepted'
-        endpoint = 'http://127.0.0.1:1/mcp'
+        endpoint = 'http://127.0.0.1:8921/mcp'
         ownerId = 'invalid-protocol-owner'
         expectedPid = $PID
         expectedProcessStartTimeUtc = $currentStart
+        expectedBuildId = ('a' * 64)
         protocolConfigPath = $invalidProtocolPath
+        protocolEncoding = 'utf8-base64'
+        protocolSha256 = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($invalidProtocolBytes)
+        ).ToLowerInvariant()
+        protocolBytes = [Convert]::ToBase64String($invalidProtocolBytes)
         scenarioRunId = 1
     } | ConvertTo-Json -Depth 10 |
         Set-Content -LiteralPath $invalidProtocolStatePath -Encoding utf8
@@ -483,7 +582,7 @@ finally {
     ok = $true
     exactTransitions = 20
     atomicPerformanceOrigin = $true
-    monotonicIndependentWatchdog = $true
+    failClosedBaselineDeadline = $true
     exactlyOnceDispatchClaim = $true
     missingBaselineFieldsRemainAnomalies = $true
     missingScenarioLabelsRemainAbsent = $true

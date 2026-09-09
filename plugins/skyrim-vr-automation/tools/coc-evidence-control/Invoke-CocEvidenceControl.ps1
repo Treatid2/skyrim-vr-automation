@@ -299,7 +299,7 @@ function Get-OwnedProcess($State, [string]$PidProperty, [string]$StartedProperty
         $actual = $process.StartTime.ToUniversalTime()
     }
     catch { return $null }
-    if ([math]::Abs(($actual - $expected).TotalSeconds) -gt 2) { return $null }
+    if ($actual.ToFileTimeUtc() -ne $expected.ToFileTimeUtc()) { return $null }
     return $process
 }
 
@@ -310,18 +310,24 @@ function Get-OwnedMonitor($State) {
 function Get-OwnedHangCapture($State) {
     $captureState = $State.PSObject.Properties['captureState']
     if (-not $captureState -or
-        [string]$captureState.Value -ne 'capture-running') {
+        [string]$captureState.Value -notin @('capture-running', 'hash-pending')) {
         return $null
     }
     return Get-OwnedProcess $State 'capturePid' 'captureStartedUtc'
 }
 
 function Get-TargetProcesses([string]$Name, [int]$ProcessId) {
-    if ($ProcessId -gt 0) {
-        return @(Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
+    if ($ProcessId -le 0) { return @() }
+    return @(Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
+}
+
+function Get-OwnedProcDumpCapture($State) {
+    if (-not $State.PSObject.Properties['captureState'] -or
+        [string]$State.captureState -notin @('capture-running', 'hash-pending')) {
+        return $null
     }
-    $processName = [IO.Path]::GetFileNameWithoutExtension($Name)
-    return @(Get-Process -Name $processName -ErrorAction SilentlyContinue)
+    return Get-OwnedProcess $State 'captureProcDumpPid' `
+        'captureProcDumpStartedUtc'
 }
 
 function Get-OwnedCancellation($State) {
@@ -342,11 +348,11 @@ function Get-OwnedTarget($State) {
 }
 
 function Stop-OwnedProcDumpMonitor($Owned, $Monitor) {
-    $target = if ([int]$Owned.data.targetPid -gt 0) {
-        [string]$Owned.data.targetPid
-    } else {
-        [string]$Owned.data.targetName
+    $ownedTarget = Get-OwnedTarget $Owned.data
+    if (-not $ownedTarget) {
+        throw 'The exact target lifetime is unavailable; cancellation is not authorized.'
     }
+    $target = [string]$ownedTarget.Id
     $cancelInfo = [Diagnostics.ProcessStartInfo]::new()
     $cancelInfo.FileName = [string]$Owned.data.procDump.path
     $cancelInfo.UseShellExecute = $false
@@ -358,13 +364,24 @@ function Stop-OwnedProcDumpMonitor($Owned, $Monitor) {
     if (-not $cancel) { throw 'ProcDump cancellation helper did not start.' }
     $cancelStartedUtc = try {
         $cancel.StartTime.ToUniversalTime().ToString('o')
-    } catch { $null }
+    } catch {
+        try { if (-not $cancel.HasExited) { $cancel.Kill() } } catch {}
+        try { $cancel.WaitForExit(5000) | Out-Null } catch {}
+        return [pscustomobject]@{
+            stopped = $false; cleanupComplete = $false; target = $target
+            cancelPid = $cancel.Id; cancelStartedUtc = $null
+            cancelExited = [bool]$cancel.HasExited; cancelExitCode = $null
+            monitorPid = $Monitor.Id; monitorExited = [bool]$Monitor.HasExited
+            error = 'The ProcDump cancellation helper start time is inaccessible.'
+        }
+    }
     $cancelExited = $cancel.WaitForExit(5000)
     $monitorExited = $Monitor.WaitForExit(5000)
     return [pscustomobject]@{
         stopped = [bool]$monitorExited -and [bool]$Monitor.HasExited
         cleanupComplete = [bool]$cancelExited -and [bool]$cancel.HasExited -and
-            [bool]$monitorExited -and [bool]$Monitor.HasExited
+            [bool]$monitorExited -and [bool]$Monitor.HasExited -and
+            $null -ne (Get-OwnedTarget $Owned.data)
         target = $target
         cancelPid = $cancel.Id
         cancelStartedUtc = $cancelStartedUtc
@@ -404,11 +421,13 @@ function Stop-HangCaptureWorker([Diagnostics.Process]$Capture) {
 
 function Get-ValidatedCaptureCompletion($State) {
     if (-not $State.PSObject.Properties['captureState'] -or
-        [string]$State.captureState -notin @('capture-running', 'capture-complete') -or
+        [string]$State.captureState -cne 'capture-complete' -or
         -not $State.PSObject.Properties['captureDumpPath'] -or
         -not $State.PSObject.Properties['captureReceiptPath'] -or
         -not $State.PSObject.Properties['capturePid'] -or
         -not $State.PSObject.Properties['captureStartedUtc'] -or
+        -not $State.PSObject.Properties['captureProcDumpPid'] -or
+        -not $State.PSObject.Properties['captureProcDumpStartedUtc'] -or
         -not $State.PSObject.Properties['targetPid'] -or
         -not $State.PSObject.Properties['targetStartedUtc']) {
         return $null
@@ -429,17 +448,23 @@ function Get-ValidatedCaptureCompletion($State) {
     foreach ($required in @(
             'schema', 'dumpPath', 'length', 'captureWorkerPid',
             'captureWorkerStartedUtc', 'targetPid', 'targetStartedUtc',
-            'procDumpExitCode'
+            'procDumpPid', 'procDumpStartedUtc', 'procDumpExitCode', 'sha256'
         )) {
         if (-not $receipt.PSObject.Properties[$required]) { return $null }
     }
+    $actualHash = try {
+        (Get-FileHash -LiteralPath $dump.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    } catch { return $null }
     if ([string]$receipt.schema -ne 'csx-coc-hang-capture-v1' -or
         [string]$receipt.dumpPath -cne $dump.FullName -or
         [long]$receipt.length -ne [long]$dump.Length -or
         [int]$receipt.captureWorkerPid -ne [int]$State.capturePid -or
         [string]$receipt.captureWorkerStartedUtc -cne [string]$State.captureStartedUtc -or
+        [int]$receipt.procDumpPid -ne [int]$State.captureProcDumpPid -or
+        [string]$receipt.procDumpStartedUtc -cne [string]$State.captureProcDumpStartedUtc -or
         [int]$receipt.targetPid -ne [int]$State.targetPid -or
         [string]$receipt.targetStartedUtc -cne [string]$State.targetStartedUtc -or
+        [string]$receipt.sha256 -cne $actualHash -or
         [int]$receipt.procDumpExitCode -ne 0) {
         return $null
     }
@@ -474,6 +499,9 @@ try {
         $result = New-InspectionResult (Get-LocalReadiness)
     }
     elseif ($Command -eq 'arm') {
+        if ($TargetPid -le 0) {
+            throw 'TargetPid is required; name-only crash-monitor ownership is not permitted.'
+        }
         $readiness = Get-LocalReadiness
         if (-not $readiness.ok) { throw ($readiness.errors -join '; ') }
         $runId = '{0}-{1}' -f [DateTime]::UtcNow.ToString(
@@ -491,21 +519,13 @@ try {
         }
         Assert-StatePathWriteAccess $resolvedStatePath
 
-        $admittedTarget = $null
-        $targetStartedUtc = $null
-        if ($TargetPid -gt 0) {
-            $admittedTarget = Get-Process -Id $TargetPid -ErrorAction Stop
-            $targetStartedUtc = $admittedTarget.StartTime.ToUniversalTime().ToString('o')
-        }
+        $admittedTarget = Get-Process -Id $TargetPid -ErrorAction Stop
+        $targetStartedUtc = $admittedTarget.StartTime.ToUniversalTime().ToString('o')
 
         $arguments = @(
             '-accepteula', '-ma', '-e', '-n', '2', '-r', '1', '-a'
         )
-        if ($TargetPid -gt 0) {
-            $arguments += [string]$TargetPid
-        } else {
-            $arguments += @('-w', $TargetName)
-        }
+        $arguments += [string]$TargetPid
         $arguments += $captureDirectory
 
         $startInfo = [Diagnostics.ProcessStartInfo]::new()
@@ -566,6 +586,7 @@ try {
                     data = [pscustomobject]@{
                         targetPid = $TargetPid
                         targetName = $TargetName
+                        targetStartedUtc = $targetStartedUtc
                         procDump = [pscustomobject]@{ path = $readiness.paths.procDump }
                     }
                 }
@@ -586,9 +607,7 @@ try {
             throw "Evidence state publication failed; the ProcDump monitor was cancelled: $publicationError"
         }
         $failureData = $null
-        $targets = if ($TargetPid -gt 0) {
-            @(Get-OwnedTarget $stateRecord | Where-Object { $null -ne $_ })
-        } else { @(Get-TargetProcesses $TargetName $TargetPid) }
+        $targets = @(Get-OwnedTarget $stateRecord | Where-Object { $null -ne $_ })
         $result = [pscustomobject][ordered]@{
             schema = 'csx-coc-evidence-control-v1'
             ok = $true
@@ -608,13 +627,10 @@ try {
         $owned = Read-OwnedState
         $monitor = Get-OwnedMonitor $owned.data
         $capture = Get-OwnedHangCapture $owned.data
+        $procDumpCapture = Get-OwnedProcDumpCapture $owned.data
         $cancellation = Get-OwnedCancellation $owned.data
         $ownedTarget = Get-OwnedTarget $owned.data
-        $targets = if ([int]$owned.data.targetPid -gt 0) {
-            if ($ownedTarget) { @($ownedTarget) } else { @() }
-        } else {
-            @(Get-TargetProcesses ([string]$owned.data.targetName) 0)
-        }
+        $targets = if ($ownedTarget) { @($ownedTarget) } else { @() }
         $dumps = @(Get-ChildItem -LiteralPath (
             [string]$owned.data.captureDirectory
         ) -Filter '*.dmp' -File -ErrorAction SilentlyContinue |
@@ -624,17 +640,22 @@ try {
             [string]$owned.data.captureState
         } else { $null }
         $captureEvidencePartial = $persistedCaptureState -in @(
-            'capture-running', 'capture-complete', 'capture-failed'
-        ) -and -not $capture -and -not $validatedCompletion
+            'capture-running', 'hash-pending', 'capture-complete',
+            'capture-failed', 'capture-cleanup-incomplete'
+        ) -and -not $capture -and -not $procDumpCapture -and
+            -not $validatedCompletion
         $result = [pscustomobject][ordered]@{
             schema = 'csx-coc-evidence-control-v1'
             ok = ($null -ne $monitor -or $null -ne $capture -or
+                $null -ne $procDumpCapture -or
                 $null -ne $validatedCompletion
             ) -and $null -eq $cancellation
             command = 'status'
             timestampUtc = [DateTime]::UtcNow.ToString('o')
-            state = if ($capture) {
-                'capture-running'
+            state = if ($capture -or $procDumpCapture) {
+                if ($persistedCaptureState -eq 'hash-pending') {
+                    'hash-pending'
+                } else { 'capture-running' }
             } elseif ($cancellation) {
                 'cleanup-incomplete'
             } elseif ($validatedCompletion) {
@@ -651,7 +672,8 @@ try {
             checks = @()
             errors = if ($cancellation) {
                 @('The owned ProcDump cancellation helper is still running.')
-            } elseif ($monitor -or $capture -or $validatedCompletion) {
+            } elseif ($monitor -or $capture -or $procDumpCapture -or
+                $validatedCompletion) {
                 @()
             } elseif ($captureEvidencePartial) {
                 @($(if ($persistedCaptureState -eq 'capture-failed' -and
@@ -669,6 +691,9 @@ try {
                 capturePid = if ($owned.data.PSObject.Properties['capturePid']) {
                     [int]$owned.data.capturePid
                 } else { $null }
+                procDumpPid = if ($owned.data.PSObject.Properties['captureProcDumpPid']) {
+                    [int]$owned.data.captureProcDumpPid
+                } else { $null }
                 targetPids = @($targets | ForEach-Object Id)
                 targetStartedUtc = if ($ownedTarget) {
                     $ownedTarget.StartTime.ToUniversalTime().ToString('o')
@@ -676,9 +701,11 @@ try {
                 cancelPid = if ($cancellation) { $cancellation.Id } else { $null }
                 captureDirectory = [string]$owned.data.captureDirectory
                 coverageActive = $null -ne $monitor
-                captureActive = $null -ne $capture
+                captureActive = $null -ne $capture -or $null -ne $procDumpCapture
                 activeProcessKind = if ($capture) {
-                    'hang-capture'
+                    'hang-capture-worker'
+                } elseif ($procDumpCapture) {
+                    'hang-capture-procdump'
                 } elseif ($monitor) { 'crash-monitor' } else { $null }
                 triggerPolicy = if ($owned.data.PSObject.Properties['triggerPolicy']) {
                     [string]$owned.data.triggerPolicy
@@ -771,7 +798,8 @@ try {
             '-TargetPid', [string]$targetPid,
             '-TargetStartedUtc', [string]$owned.data.targetStartedUtc,
             '-DumpPath', $dumpPath,
-            '-ReceiptPath', $receiptPath
+            '-ReceiptPath', $receiptPath,
+            '-CaptureTimeoutSeconds', [string]$CaptureTimeoutSeconds
         )
         $startInfo = [Diagnostics.ProcessStartInfo]::new()
         $startInfo.FileName = (Get-Process -Id $PID -ErrorAction Stop).Path
@@ -871,8 +899,13 @@ try {
         $owned = Read-OwnedState
         $monitor = Get-OwnedMonitor $owned.data
         $capture = Get-OwnedHangCapture $owned.data
-        $ownedProcess = if ($capture) { $capture } else { $monitor }
-        $processKind = if ($capture) { 'hang-capture' } else { 'crash-monitor' }
+        $procDumpCapture = Get-OwnedProcDumpCapture $owned.data
+        $ownedProcess = if ($capture) {
+            $capture
+        } elseif ($procDumpCapture) { $procDumpCapture } else { $monitor }
+        $processKind = if ($capture) {
+            'hang-capture-worker'
+        } elseif ($procDumpCapture) { 'hang-capture-procdump' } else { 'crash-monitor' }
         if (-not $ownedProcess) {
             throw 'The state does not identify a live owned ProcDump process.'
         }
@@ -886,17 +919,27 @@ try {
             throw 'A dump was written recently; wait before stopping ProcDump.'
         }
 
-        $cancel = Stop-OwnedProcDumpMonitor -Owned $owned -Monitor $ownedProcess
+        $cancel = if ($processKind -eq 'crash-monitor') {
+            Stop-OwnedProcDumpMonitor -Owned $owned -Monitor $ownedProcess
+        } else {
+            Stop-HangCaptureWorker -Capture $ownedProcess
+        }
         $stopped = [bool]$cancel.cleanupComplete
         $owned.data | Add-Member -NotePropertyName cancelPid `
-            -NotePropertyValue $cancel.cancelPid -Force
+            -NotePropertyValue $(if ($cancel.PSObject.Properties['cancelPid']) {
+                $cancel.cancelPid
+            } else { $null }) -Force
         $owned.data | Add-Member -NotePropertyName cancelStartedUtc `
-            -NotePropertyValue $cancel.cancelStartedUtc -Force
+            -NotePropertyValue $(if ($cancel.PSObject.Properties['cancelStartedUtc']) {
+                $cancel.cancelStartedUtc
+            } else { $null }) -Force
         $owned.data | Add-Member -NotePropertyName cancelState `
-            -NotePropertyValue $(if ($cancel.cancelExited) {
+            -NotePropertyValue $(if (-not $cancel.PSObject.Properties['cancelExited'] -or
+                $cancel.cancelExited) {
                 'exited'
             } else { 'cleanup-incomplete' }) -Force
-        if ($cancel.monitorExited -and $capture) {
+        if (($cancel.PSObject.Properties['monitorExited'] -and $cancel.monitorExited) -or
+            $processKind -ne 'crash-monitor') {
             $owned.data | Add-Member -NotePropertyName captureState `
                 -NotePropertyValue $(if ($stopped) {
                     'capture-stopped'

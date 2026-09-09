@@ -10,6 +10,20 @@ $scriptPath = Join-Path $PSScriptRoot 'Invoke-CocEvidenceControl.ps1'
 $script = Get-Content -LiteralPath $scriptPath -Raw
 $completionWorkerPath = Join-Path $PSScriptRoot 'Complete-CocHangCapture.ps1'
 $completionWorkerScript = Get-Content -LiteralPath $completionWorkerPath -Raw
+$ownedProcessSourcePath = Join-Path $PSScriptRoot 'CocOwnedProcess.cs'
+if (-not ('CocOwnedProcess' -as [type])) {
+    Add-Type -Path $ownedProcessSourcePath
+}
+$ownedProcessFixture = [CocOwnedProcess]::Start(
+    (Get-Process -Id $PID).Path,
+    @('-NoProfile', '-Command', 'Start-Sleep -Seconds 30')
+)
+$ownedProcessFixturePid = $ownedProcessFixture.Process.Id
+$ownedProcessFixture.Dispose()
+Start-Sleep -Milliseconds 100
+if (Get-Process -Id $ownedProcessFixturePid -ErrorAction SilentlyContinue) {
+    throw 'Closing the capture job did not terminate its exact child process.'
+}
 $workerTokens = $null
 $workerParseErrors = $null
 [System.Management.Automation.Language.Parser]::ParseFile(
@@ -23,8 +37,13 @@ foreach ($requiredText in @(
         'captureWorkerPid',
         'captureWorkerStartedUtc',
         'targetStartedUtc',
+        'procDumpPid',
+        'procDumpStartedUtc',
         'procDumpExitCode',
-        'ReadToEndAsync',
+        'sha256',
+        'hash-pending',
+        'CocOwnedProcess',
+        'WaitForExit($CaptureTimeoutSeconds * 1000)',
         "'capture-complete'",
         "'capture-failed'"
     )) {
@@ -74,6 +93,14 @@ $replacementState = [pscustomobject]@{
 if ($null -ne (Get-OwnedProcess $replacementState 'monitorPid' 'monitorStartedUtc')) {
     throw 'A reused PID with a different start time was accepted as owned.'
 }
+$nearReplacementState = [pscustomobject]@{
+    monitorPid = $PID
+    monitorStartedUtc = (Get-Process -Id $PID).StartTime.ToUniversalTime().
+        AddMilliseconds(1).ToString('o')
+}
+if ($null -ne (Get-OwnedProcess $nearReplacementState 'monitorPid' 'monitorStartedUtc')) {
+    throw 'A near-time process mismatch was accepted as the same lifetime.'
+}
 
 foreach ($requiredText in @(
     "[ValidateSet('inspect', 'arm', 'status', 'capture-hang', 'stop')]",
@@ -82,7 +109,6 @@ foreach ($requiredText in @(
     "'-n', '2'",
     "'-r', '1'",
     "'-a'",
-    '@(''-w'', $TargetName)',
     "'-cancel'",
     'csx-coc-evidence-state-v1',
     'MinimumFreeGiB = 100',
@@ -102,6 +128,7 @@ foreach ($requiredText in @(
     'Stop-HangCaptureWorker',
     '$Capture.Kill()',
     'Get-OwnedHangCapture',
+    'Get-OwnedProcDumpCapture',
     'Get-OwnedCancellation',
     'Get-OwnedTarget',
     'targetStartedUtc',
@@ -135,7 +162,9 @@ foreach ($forbiddenText in @(
     'Stop-Process',
     'GhidraMcpUrl',
     'GhidraInstallRoot',
-    'PyGhidraPath'
+    'PyGhidraPath',
+    "@('-w', `$TargetName)",
+    'hashDeferred'
 )) {
     if ($script.Contains($forbiddenText, [StringComparison]::Ordinal)) {
         throw "COC evidence controller contains unsafe behavior: $forbiddenText"
@@ -196,6 +225,12 @@ try {
         @($preflight.errors)[0] -notlike '*state directory does not exist*') {
         throw 'Arm did not reject an invalid state destination before launch.'
     }
+    $nameOnly = & $scriptPath arm -ProcDumpPath $pwsh -CdbPath $pwsh `
+        -DumpRoot $fixture -StatePath (Join-Path $fixture 'name-only.json') `
+        -MinimumFreeGiB 1 -Compact -NoExit | ConvertFrom-Json -Depth 20
+    if ($nameOnly.ok -or @($nameOnly.errors)[0] -notlike '*TargetPid is required*') {
+        throw 'Name-only crash-monitor ownership was not rejected.'
+    }
 
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $pwsh
@@ -228,7 +263,7 @@ try {
         ConvertFrom-Json -Depth 20
     if (-not $running.ok -or $running.state -ne 'capture-running' -or
         $running.data.coverageActive -or -not $running.data.captureActive -or
-        $running.data.activeProcessKind -ne 'hang-capture' -or
+        $running.data.activeProcessKind -ne 'hang-capture-worker' -or
         $running.data.capturePid -ne $capture.Id) {
         throw 'Status did not recognize the persisted live hang capture.'
     }
@@ -254,6 +289,8 @@ try {
     $currentDump = Join-Path $fixture 'current.dmp'
     [IO.File]::WriteAllBytes($currentDump, [byte[]](4, 5, 6, 7))
     $receiptPath = Join-Path $fixture 'current.json'
+    $currentHash = (Get-FileHash -LiteralPath $currentDump -Algorithm SHA256).
+        Hash.ToLowerInvariant()
     [pscustomobject]@{
         schema = 'csx-coc-hang-capture-v1'
         dumpPath = $currentDump
@@ -262,13 +299,21 @@ try {
         targetStartedUtc = $targetStartedUtc
         captureWorkerPid = $capture.Id
         captureWorkerStartedUtc = $captureStartedUtc
+        procDumpPid = $capture.Id
+        procDumpStartedUtc = $captureStartedUtc
         procDumpExitCode = 0
+        sha256 = $currentHash
     } | ConvertTo-Json | Set-Content -LiteralPath $receiptPath -Encoding utf8
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
     $state | Add-Member -NotePropertyName captureDumpPath `
         -NotePropertyValue $currentDump -Force
     $state | Add-Member -NotePropertyName captureReceiptPath `
         -NotePropertyValue $receiptPath -Force
+    $state | Add-Member -NotePropertyName captureProcDumpPid `
+        -NotePropertyValue $capture.Id -Force
+    $state | Add-Member -NotePropertyName captureProcDumpStartedUtc `
+        -NotePropertyValue $captureStartedUtc -Force
+    $state.captureState = 'capture-complete'
     $state | ConvertTo-Json -Depth 10 |
         Set-Content -LiteralPath $statePath -Encoding utf8
     $complete = & $scriptPath status -StatePath $statePath -Compact -NoExit |
@@ -276,6 +321,12 @@ try {
     if (-not $complete.ok -or $complete.state -ne 'capture-complete' -or
         [string]$complete.data.completionReceiptPath -cne $receiptPath) {
         throw 'Exact nonempty dump and matching receipt were not accepted as completion.'
+    }
+    [IO.File]::WriteAllBytes($currentDump, [byte[]](7, 6, 5, 4))
+    $substituted = & $scriptPath status -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if ($substituted.ok -or $substituted.state -ne 'capture-evidence-partial') {
+        throw 'A same-length replacement dump retained completed-evidence status.'
     }
 }
 finally {

@@ -13,7 +13,8 @@ It verifies:
 `dump-write` check is a configuration block: preserve that receipt, do not arm
 or retry ProcDump, and ask the operator to repair the configured output path.
 
-The arm command starts one hidden ProcDump monitor for SkyrimVR.exe. It records
+The arm command requires the exact Skyrim PID and starts one hidden ProcDump
+monitor for that lifetime. It records
 full dumps for unhandled exceptions, caps the run at two dumps, and does not
 create a normal-process-exit dump. It deliberately does not use ProcDump's
 five-second window-hang trigger because a healthy Skyrim COC load can satisfy
@@ -21,8 +22,9 @@ that heuristic twice and exhaust evidence coverage before the assay.
 
 For a visually confirmed freeze, `capture-hang` officially cancels the owned
 crash monitor and immediately takes one classified full dump of the exact PID.
-The returned receipt records `operator-confirmed-hang` and dump length, while
-deferring the multi-gigabyte hash so analysis can begin immediately.
+The returned receipt records `operator-confirmed-hang`, exact child-process
+identity, dump length, and SHA-256. Until hashing completes, status remains
+`hash-pending`; it never presents unfinalized bytes as complete evidence.
 The returned state path owns status, hang-capture, and stop operations.
 Exact targets are bound by PID and process start time. A replacement process is
 never accepted merely because Windows reused its numeric PID. Monitor, capture,
@@ -34,10 +36,12 @@ receipt and successful ProcDump exit record. Empty, unrelated, or unfinalized
 files remain preserved as `capture-evidence-partial` and never imply that it is
 safe to disturb the game.
 
-Hang capture runs through an exact, journal-admitted completion worker. If the
-foreground command reaches its bounded wait, that worker retains ProcDump,
-publishes the exit-backed receipt, and advances the same state journal. A later
-`status` can therefore prove completion without guessing from a dump filename.
+Hang capture runs through an exact, journal-admitted completion worker. The
+actual ProcDump child is started suspended inside a kill-on-close Windows job,
+assigned before it can run, and journaled by exact PID/start time. Wrapper loss
+therefore terminates the child; after journaling, `status` and `stop` can also
+recover it directly. Both the child wait and foreground wait are bounded. A
+later `status` recomputes the dump digest before proving completion.
 
 The controller discovers the sibling `codex-ghidra-live` GitHub folder.
 Portable overrides are `CSX_COC_EVIDENCE_ROOT`, `CSX_PROCDUMP_PATH`,
