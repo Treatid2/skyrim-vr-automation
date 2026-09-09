@@ -18,7 +18,7 @@ create evidence, enumerate tools, or inspect fallbacks.
 
 After the required skill announcement, use one `functions.exec` with nested
 direct tools: first `mcp__devbench_vr__communityshaders_menu` with exactly
-`{"action":"prepare_coc"}`, then `mcp__devbench_vr__scenario`. Never call
+`{"action":"prepare_tuning"}`, then `mcp__devbench_vr__scenario`. Never call
 Scenario first or issue either as a standalone tool.
 Store the exact envelopes under run-unique `startup-prepare` and
 `startup-positioning` keys, but control from the local responses. Do not call
@@ -26,10 +26,10 @@ Store the exact envelopes under run-unique `startup-prepare` and
 finalization materializes both stored responses.
 
 Decode each envelope once from `content[0].type: "text"` with `JSON.parse` of
-`content[0].text`. Admit `prepare_coc` only from these exact paths: top-level
+`content[0].text`. Admit `prepare_tuning` only from these exact paths: top-level
 `ready: true`, `persisted: false`, 64-character `producer.buildId`;
 `after.ready`, `after.vr`, `after.inGame`,
-`after.vrFpsStabilizer.activeForSession`, `after.developerMode.active`,
+`after.developerMode.active`,
 `after.foveation.ready`, `after.foveation.foveatedVendorDispatch`, and
 `after.foveation.peripheryTAAEnable` all `true`; and
 `after.developerMode.logLevel: "debug"`. Require `after.foveation` values

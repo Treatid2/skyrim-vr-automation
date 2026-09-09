@@ -54,7 +54,7 @@ Simple COC/CSM, enumerate tools, inspect schemas, or run another
 admission/reset scenario. Vendor live-path, protocol, and this detailed
 contract are finalization-only reads.
 
-The vendor `SKILL.md` stores the exact `prepare_coc` and positioning responses
+The vendor `SKILL.md` stores the exact `prepare_tuning` and positioning responses
 under run-unique startup keys before this contract is read. They are startup
 identity/admission evidence, not measurement timing evidence. The live path
 keeps the returned envelopes in local variables and must not call `load()` or

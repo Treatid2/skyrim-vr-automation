@@ -6,7 +6,7 @@ profile through `communityshaders.renderscale`.
 
 ## 1. Bind and prepare
 
-The AMD `SKILL.md` owns runtime-only `prepare_coc`, positioning, lane baseline,
+The AMD `SKILL.md` owns runtime-only `prepare_tuning`, positioning, lane baseline,
 handoff, and the measured live loop before this file is read. Read this file
 only after a pass completes or is interrupted, for cumulative evidence,
 guarded finalization, and reporting. Do not repeat live reads or add another
@@ -298,7 +298,7 @@ it by transition ID/QPC/frame, and write and hash the complete evidence bundle
 in one local batch. A response-store handle is permitted during the live loop
 but every retained terminal response must be a decoded raw file in the
 completed bundle.
-This per-transition evidence requirement does not duplicate `prepare_coc` or
+This per-transition evidence requirement does not duplicate `prepare_tuning` or
 the positioning scenario. Materialize their stored exact receipts once under
 `raw/startup` during finalization. Missing startup evidence is explicitly
 `startup_evidence_incomplete`, forbids a ledger append, and never replays the

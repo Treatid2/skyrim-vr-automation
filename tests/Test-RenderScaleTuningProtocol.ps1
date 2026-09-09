@@ -202,7 +202,7 @@ foreach ($forbidden in @(
     'Require the runtime-only FOV/TAA `0.3/0.3/0.7` fixture,',
     'render-scale tool description to advertise independent',
     'generic process inventory, adapter description string, or upscaling API receipt is authoritative',
-    'one local evidence action before `prepare_coc`',
+    'one local evidence action before `prepare_tuning`',
     '`startupReadElapsedMs`',
     '`positioningDispatchElapsedMs`',
     '`slow_startup_reads`',
@@ -295,7 +295,9 @@ foreach ($variant in $variants) {
     Assert-True (-not $skill.Contains('evidence-values.csv', [StringComparison]::Ordinal)) "$($variant.Name) moved finalization into startup instructions."
     Assert-Contains $live '../../../docs/protocols/renderscale-tuning-fast-start.md' $variant.Name
     Assert-Contains $skill 'first `mcp__devbench_vr__communityshaders_menu`' $variant.Name
-    Assert-Contains $skill '`{"action":"prepare_coc"}`' $variant.Name
+    Assert-Contains $skill '`{"action":"prepare_tuning"}`' $variant.Name
+    Assert-True (-not $protocolContract.Contains('prepare_coc', [StringComparison]::Ordinal)) "$($variant.Name) still selects Stabilizer-dependent preparation."
+    Assert-True (-not $skill.Contains('after.vrFpsStabilizer.activeForSession', [StringComparison]::Ordinal)) "$($variant.Name) still requires Stabilizer startup sync."
     Assert-Contains $skill '"async":false' $variant.Name
     Assert-Contains $skill '"command":"coc WhiterunDragonsreach"' $variant.Name
     Assert-Contains $skill '"label":"position-renderscale"' $variant.Name
@@ -335,7 +337,6 @@ foreach ($variant in $variants) {
     foreach ($fixtureToken in @(
         '`ready: true`', '`persisted: false`', '`producer.buildId`',
         '`after.ready`', '`after.vr`', '`after.inGame`',
-        '`after.vrFpsStabilizer.activeForSession`',
         '`after.developerMode.active`',
         '`after.developerMode.logLevel: "debug"`',
         '`after.foveation.ready`',
@@ -380,8 +381,8 @@ foreach ($variant in $variants) {
     Assert-True (-not $skill.Contains('"args": { "action": "scene" }', [StringComparison]::Ordinal)) "$($variant.Name) uses action instead of kind for inspect scene."
 
     foreach ($token in @(
-        '`prepare_coc`', '`0.3/0.3/0.7` fixture',
-        '`SKILL.md` owns runtime-only `prepare_coc`, positioning',
+        '`prepare_tuning`', '`0.3/0.3/0.7` fixture',
+        '`SKILL.md` owns runtime-only `prepare_tuning`, positioning',
         'one synchronous', 'Do not repeat live reads',
         'Do not enumerate', 'audit schemas', '`plugin_direct_unavailable`',
         'no fallback transport',
