@@ -1010,7 +1010,6 @@ function Move-OverwriteShaderCachesToStableMod($Config, [string]$SourceName, [st
         $blockingProcessNames = @(
             @($Config.mo2.processNames)
             @($Config.mo2.gameProcessNames)
-            @($Config.mo2.runtimeProcessNames)
         ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique
         if ($blockingProcessNames.Count -eq 0) { $blockingProcessNames = @('ModOrganizer', 'SkyrimVR', 'sksevr_loader') }
         $registration = & $profileTool register -ProfilePath $modListPath -ModName $modName -ModDirectory $modDirectory -Placement End -RegisterEnabled -EvidenceDirectory $profileEvidence -BlockingProcessNames $blockingProcessNames -Confirm:$false | ConvertFrom-Json
@@ -1074,7 +1073,7 @@ try {
     }
 
     if ($Command -eq 'release') {
-        throw 'Workspace release is intentionally unavailable because it previously deleted retained task state. Yield scarce MO2 access with Invoke-MO2Control.ps1 release-access; destroy a finished workspace only with the explicit retire command.'
+        throw 'Workspace release is intentionally unavailable because it previously deleted retained task state. Yield scarce MO2 access with Invoke-MO2Control.ps1 release-access. Use explicit retire only after direction to discard or replace that exact environment, or when a separately stated retention policy proves it obsolete.'
     }
 
     if ($Command -eq 'list-task') {

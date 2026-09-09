@@ -31,12 +31,15 @@ remains fail-closed until its other runtime conflicts are separately qualified.
 
 Before `start`, the controller reads the OpenVR registration file (normally
 `%LOCALAPPDATA%\openvr\openvrpaths.vrpath`) and inventories every external
-driver manifest with exact paths and hashes. An external driver declaring
-`redirectsDisplay=true` conflicts with the forced null display path: `inspect`
-returns `external-driver-conflict`, and `start` refuses with the exact driver
-inventory. Use `-OpenVRPathsPath` for a nonstandard registration file. This
-preflight also refuses startup when a registered driver cannot be classified;
-it does not silently mutate or unregister third-party drivers.
+driver manifest with exact paths and hashes. A non-Virtual-Desktop external
+driver declaring `redirectsDisplay=true` conflicts with the forced null display
+path: `inspect` returns `external-driver-conflict`, and `start` refuses with the
+exact driver inventory. A Virtual Desktop registration remains visible in the
+inventory with disposition `ignored-virtual-desktop`; it is not a null-HMD
+blocker and is never selected for isolation. Use `-OpenVRPathsPath` for a
+nonstandard registration file. This preflight also refuses startup when a
+registered driver cannot be classified; it does not silently mutate or
+unregister third-party drivers.
 
 For a measurement-qualified transaction with one classified redirector, pass
 `-IsolateExternalDisplayRedirectors` to `apply`. The controller backs up and

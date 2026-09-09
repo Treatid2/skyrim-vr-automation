@@ -8,6 +8,16 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   the exact lease, profile, and provider inventory into the transaction
   receipt, and route-shape fresh SteamVR task clones so inherited OCU providers
   cannot survive into the SteamVR route.
+- Bind null-HMD admission to the MO2 entry point with actual named parameters,
+  preserve its structured validation errors, and treat a Virtual Desktop driver
+  registration as inventory evidence rather than a null-HMD conflict.
+- Stop treating configured runtime processes such as
+  `VirtualDesktop.Streamer` as profile-mutation blockers. MO2 and game processes
+  still gate mutations, while exact runtime-route admission continues to reject
+  an enabled OCU/OpenComposite provider for SteamVR null-HMD.
+- Make task-owned MO2 workspace retention the default lifecycle: end live
+  sessions, release scarce access, and later resume the exact environment.
+  Run, turn, or task completion no longer implies destructive retirement.
 - Require every cooperative MO2 access request to select exactly one mutually
   exclusive OCU, physical SteamVR, or SteamVR null-HMD route, and propagate the
   selected route into access status and prepared session evidence.

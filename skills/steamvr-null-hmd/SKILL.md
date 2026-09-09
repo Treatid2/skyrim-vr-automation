@@ -29,7 +29,9 @@ particular drive letter for the plugin itself.
    exact redirecting driver inventory. For an authorized measurement run,
    preview and apply `-IsolateExternalDisplayRedirectors`; when more than one
    redirector exists, specify every exact root in the
-   `-ExternalDisplayRedirectorRoot` array.
+   `-ExternalDisplayRedirectorRoot` array. A Virtual Desktop driver registration
+   is retained as inventory evidence but is never classified as a null-HMD
+   conflict and must not be isolated for null-HMD admission.
 3. When the test also uses MO2, complete MO2 route admission before any
    null-HMD mutation. Apply `$mo2-control`, request access with
    `-RuntimeRoute SteamVRNull`, select or create the exact task workspace, and
