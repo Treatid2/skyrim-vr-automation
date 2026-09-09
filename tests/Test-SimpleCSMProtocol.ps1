@@ -12,10 +12,12 @@ $sourceProtocol = Join-Path $repositoryRoot 'skills\simple-csm\references\protoc
 $pluginSkill = Join-Path $repositoryRoot 'plugins\skyrim-vr-automation\skills\simple-csm\SKILL.md'
 $pluginProtocol = Join-Path $repositoryRoot 'plugins\skyrim-vr-automation\skills\simple-csm\references\protocol.md'
 $matrixPath = Join-Path $repositoryRoot 'tools\render-scale-qualification\protocol.v1.json'
+$pluginMatrixPath = Join-Path $repositoryRoot 'plugins\skyrim-vr-automation\tools\render-scale-qualification\protocol.v1.json'
 
 foreach ($pair in @(
     @($sourceSkill, $pluginSkill),
-    @($sourceProtocol, $pluginProtocol)
+    @($sourceProtocol, $pluginProtocol),
+    @($matrixPath, $pluginMatrixPath)
 )) {
     foreach ($path in $pair) {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
