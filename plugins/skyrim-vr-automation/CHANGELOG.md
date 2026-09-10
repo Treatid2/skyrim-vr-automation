@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Verify owned baseline capture cleanup after NVIDIA tuning failures, including
+  timed-out and recovered responses, and preserve the original failure result.
+- Refresh the local plugin cache identity and align all publication manifests
+  so the installed snapshot includes the baseline cleanup correction.
 - Run NVIDIA render-scale measurement in a persistent worker so chat progress
   requests cannot terminate its orchestration. Queue complete receipts and
   transition timings to one append-only document, let saving overlap later
