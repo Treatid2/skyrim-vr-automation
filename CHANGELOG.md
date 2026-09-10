@@ -4,6 +4,14 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Run NVIDIA render-scale measurement in a persistent worker so chat progress
+  requests cannot terminate its orchestration. Queue complete receipts and
+  transition timings to one append-only document, let saving overlap later
+  transitions and passes, and flush after measurement and cleanup. Report
+  progress every five transitions and preserve all evidence for offline review.
+- Refresh the local plugin cache identity and align toolset/package versions
+  so the installed snapshot includes the persistent NVIDIA worker.
+
 - Add modlist-agnostic SteamVR VFS blacklist inspection and explicit,
   lease-gated `configure-steamvr-exclusions` maintenance with preview,
   idempotence, preserved INI bytes, exact backups, and verified writes.

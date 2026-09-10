@@ -16,8 +16,10 @@ Restart Codex after a new installation. Run the doctor before a live workflow:
 ```
 
 The plugin registers the loopback `devbench_vr` MCP server from its own
-`.mcp.json`. Render-scale tuning requires those plugin-provided direct tools
-and never uses the bundled HTTP controller. A separate global
+`.mcp.json`. Render-scale tuning starts with those plugin-provided direct tools.
+After positioning, NVIDIA transfers measurement to a persistent worker using
+the same selected MCP endpoint; AMD retains its direct-tool execution path.
+Neither path uses the bundled HTTP controller. A separate global
 `mcp_servers.devbench_vr` entry is not required. Remove a legacy global entry
 after installing the plugin, then restart Codex:
 
@@ -108,6 +110,12 @@ host or VS Code before starting another protocol. A new chat in the existing
 host can retain the old catalog path and is not a sufficient reload boundary.
 Source/package generation and commits may continue while a run is active;
 defer only the installed-cache rotation.
+
+The persistent NVIDIA worker requires Node.js 22 or newer. Its launcher finds
+Node on PATH or through Visual Studio's `vswhere`; alternatively set
+`CSX_TUNING_NODE_PATH` to the intended executable. Once the plugin is installed
+and the host has fully reloaded, the NVIDIA skill launches this worker
+automatically and reports every five transitions without pausing measurement.
 
 For a Git marketplace installation without a checkout, refresh the marketplace
 registration before reinstalling the plugin:
