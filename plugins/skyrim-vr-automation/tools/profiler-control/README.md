@@ -18,6 +18,32 @@ pre-state: it restores the exact profiler state when the same runtime survives,
 or terminally records that the old process was replaced without toggling the
 new process.
 
+Every non-restoration profiler call uses the central controller's
+`-RequirePerformanceNeutral` guard. If the standalone temporal probe is
+registered, each call requires a proven neutral physical state and unchanged
+ownership epoch before and after dispatch. The capture also pins that epoch
+across all warm-up and measured samples. Registration or epoch drift invalidates
+the run, while the reserved restoration path remains available to restore the
+profiler's prior state. Guard observations are retained in receipt and summary
+schema 3; the collector never disarms the probe.
+
+The collector also retains central-controller, read-only resource-publication
+snapshots immediately before and after the measured interval: current,
+current/completed/published generations,
+expected/published dimensions, `complete`, deferred-setup acknowledgement, and
+D3D device/context matches. An unavailable snapshot is explicit evidence and
+does not invalidate the CPU/GPU capture only when the render-scale tool is
+explicitly absent or unsupported. Both snapshot calls still prove the same
+performance-probe registration and ownership epoch as every measured sample;
+guard, identity, or epoch uncertainty remains a failed capture.
+
+Those same existing status calls retain bounded render-scale preparation
+telemetry: raw events and ring/session/QPC metadata plus summaries for queued
+requests, admission/early exits, shader-cache deferral, SSS/SSGI prewarming,
+DLSS/FSR/FSR4 preparation, D3D object creation, total preparation,
+request-to-prepared latency, and prepared-to-creator latency. The collector
+does not poll or alter the render-scale profile to obtain this evidence.
+
 ```powershell
 .\Measure-CSXProfiler.ps1 `
   -Label 'breezehome-enabled' `
