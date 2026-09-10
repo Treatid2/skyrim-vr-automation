@@ -181,3 +181,8 @@ capture owners, stop only those captures, and verify them inactive. Never
 resume measurement or replay a mutation through the cleanup connection. A
 failed cleanup retains explicit ownership and its lock independently of the
 flushed evidence journal.
+
+After measurement, follow the [completion and retry-reporting rules](references/protocol.md#4-completion-and-evidence-rules).
+The finalizer reads retry causes, viewport-wait intervals and stabilization
+milestones from the retained terminal receipts. Missing telemetry remains a
+reporting gap and never authorizes another live call or measurement replay.

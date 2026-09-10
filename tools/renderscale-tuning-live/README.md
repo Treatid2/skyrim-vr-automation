@@ -6,6 +6,25 @@ plugin's loopback DevBench MCP endpoint. The worker pins the positioned PID and
 Build ID, owns both passes, and keeps running after its launcher or chat tool
 cell exits. Progress messages do not control it. AMD retains its existing path.
 
+The runner retains `status.retryTelemetry` within each existing terminal waiter,
+without duplicating the full ring in another field of the same row.
+The offline finalizer correlates schema-v1 events with the exact stress
+session, request, epoch and dispatch-to-terminal QPC window. Its transition
+columns distinguish retry causes, observed per-role viewport waits and
+remaining stereo/settling qualification. Overlapping waits are not summed.
+Missing or incomplete diagnostics are reported explicitly without changing
+render verdicts or adding live calls. Collection requires a DLL built with
+`DEVBENCH_BRIDGE=ON`; updating this plugin cannot add telemetry to an older DLL.
+
+Retry analysis validates the complete ring sequence and QPC ordering before
+publishing timings. Overwrites matter when they leave the transition window
+uncovered; older overwritten events do not invalidate a fully retained window.
+Malformed clocks/owners/retention never produce authoritative counts or numeric
+durations. Missing or duplicate wait endpoints leave that interval unavailable
+while preserving independently verified retry counts. Immediate viewport-ready
+observations participate in stabilization timing, and cleared/replaced guards
+cannot borrow another guard's promotion.
+
 The worker drains a persistent notification stream on that same MCP session.
 This keeps session activity current during long POST requests and server waits.
 It never adds a heartbeat tool call or another measurement session. HTTP errors

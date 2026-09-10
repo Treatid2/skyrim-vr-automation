@@ -369,6 +369,52 @@ solely by pre-mutation replacement admission is a transition `FAIL`.
 
 ## 4. Completion and evidence rules
 
+Read retry diagnostics from the existing terminal waiter's
+`status.retryTelemetry` (schema version 1), retaining the complete object.
+`observation.status.retryTelemetry` is the equivalent fallback. Do not add a
+live read, polling loop, wait or admission gate to obtain these diagnostics.
+The finalizer owns interpretation through
+`tools/renderscale-tuning-finalizer/retry-telemetry.js`.
+
+Correlate the producer Build ID, stress session, request ID and transition epoch
+with that exact transition and its dispatch-to-terminal QPC window. Preserve
+every non-coalesced `Retry` reason/category and source file/line. Correlate each
+`ViewportWaitEnd` with its `ViewportWaitBegin` sequence, role and generation;
+report the observed pending-to-ready milliseconds, cache/slot/victim details,
+initial/final fence result and pending-observation count. Failed, cancelled,
+superseded, stopped and unresolved waits remain explicit unavailable durations.
+Never sum overlapping full-eye and foveated-center waits as transition cost.
+Retain the full ring inside the waiter once. Validate its unbroken sequence,
+sample ownership and QPC ordering before deriving counts or durations. An
+overwrite before a fully retained transition window is not a gap in that
+transition. Invalid global evidence leaves counts and timings unavailable;
+an invalid individual wait leaves its duration unavailable while an
+independently verified retry count remains usable.
+
+Keep `GuardArmed`, `ProofRevoked`, `SettleGuardSatisfied`, `PromotionCandidate`, `Promoted`, and
+`GuardCleared` events. Report ready-to-candidate and candidate-to-promotion
+intervals separately from viewport waits. The six-frame guard overlaps stereo
+qualification; neither retry-to-stable nor ready-to-candidate is isolated retry
+overhead. Preserve the applicable guard deadline, first observed satisfied
+guard age, and requeue-to-admission as observed scheduler backoff. A guard
+already satisfied before readiness does not imply a negative wait duration.
+Include immediate `ViewportReady` observations when finding the final ready
+role. Require the same uninterrupted guard segment for its candidate and
+promotion, with valid stereo counts and any required minimum guard age.
+Cleared or replaced guards cannot supply another segment's missing milestone.
+
+Put diagnostic status, retry count/reasons, per-role wait milliseconds and
+ready-to-candidate milliseconds directly after the transition identity in CSV
+and report columns. Keep all events and intervals in `summary.json` and retain
+the raw receipts. Missing telemetry is `not_exposed`, never zero retries.
+Unsupported schemas, invalid clocks or ownership, overwrites within the window and
+unmatched intervals make retry reporting incomplete. They do not change the
+render verdict, stop the worker, trigger recovery or authorize replay.
+Display unavailable measurements as `n.d.` and the affected reporting outcome
+as `n/a`, retaining the detailed reason. Keep every retrieved value in its raw
+receipt and the full `evidence-values.csv` export even when provenance cannot
+support a derived result. These checks run only during offline reporting.
+
 For scaled DLSS and FSR, require requested, effective, stable, and physical
 profiles to agree; scaled dimensions; coherent both-eye presentation; exact
 provider generation and resource ownership; and strict completion. For

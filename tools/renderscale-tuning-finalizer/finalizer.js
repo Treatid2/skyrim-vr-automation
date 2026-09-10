@@ -5,6 +5,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { retryTelemetry } = require("./retry-telemetry.js");
 
 const { collectTracePages, traceCapacity, validateTracePage,
     validateRetainedTrace } = require("../renderscale-tuning-live/runner.js");
@@ -609,6 +610,7 @@ function transitionRow(root, file, retained) {
         target,
         source: sourceProfile(waiter),
         actualBackend: actualBackend(waiter, target),
+        retryTelemetry: retryTelemetry(retained),
         renderVerdict,
         task2Verdict: task2.verdict,
         task2MissingEvidence: task2.missingEvidence,
@@ -665,7 +667,9 @@ function csvCell(value) {
 
 function csv(rows) {
     const columns = [
-        "lane", "pass", "ordinal", "method", "quality_mode", "render_scale_mode",
+        "lane", "pass", "ordinal", "retry_telemetry_status", "retry_outcome", "retry_count",
+        "retry_reasons", "viewport_waits", "retry_stabilization",
+        "method", "quality_mode", "render_scale_mode",
         "actual_backend", "render_verdict", "stability_status",
         "stability_presentation_disposition",
         "stability_left_eye_path", "stability_right_eye_path",
@@ -702,7 +706,10 @@ function csv(rows) {
     for (const row of rows) {
         const diagnostics = row.diagnostics;
         const note = row.nonStableNote;
-        const values = [row.lane, row.pass, row.ordinal, row.target.method,
+        const values = [row.lane, row.pass, row.ordinal,
+            row.retryTelemetry.status, row.retryTelemetry.outcome, row.retryTelemetry.retryCount ?? "n.d.",
+            row.retryTelemetry.retryReasons, JSON.stringify(row.retryTelemetry.waits),
+            JSON.stringify(row.retryTelemetry.stabilization), row.target.method,
             row.target.qualityMode, row.target.renderScaleMode, row.actualBackend,
             row.renderVerdict,
             note ? note.status : "stable",
@@ -722,6 +729,7 @@ function csv(rows) {
             row.physicalMutationStarted,
             row.finalMethod, row.finalQuality, row.finalRenderScaleMode,
             row.finalStateRevision, row.traceRequired, row.traceComplete,
+            row.traceEvidence,
             row.recoveryStatus, row.recoveryTarget, row.recoveryReceiptKey,
             row.sourceRecoveryReceiptKey,
             row.presentationStretchSelected,
@@ -755,6 +763,16 @@ function csv(rows) {
 function report(summary) {
     const rows = summary.transitions.map((row) => {
         const note = row.nonStableNote;
+        const retry = row.retryTelemetry;
+        const waits = retry.waits.map(wait => `${wait.role}: ` +
+            (wait.observedWaitMs === null ? `n.d. (${wait.status}` +
+                (wait.observedUntilClosureMs === null ? "" :
+                    `; observed until closure: ${wait.observedUntilClosureMs.toFixed(3)} ms`) + ")" :
+                `${wait.observedWaitMs.toFixed(3)} ms`)).join("; ") ||
+            (retry.status === "complete" ? "none observed" : `n.d. (${retry.status})`);
+        const settle = retry.stabilization.map(entry => entry.status !== "complete" ? "n.d. (incomplete)" :
+            entry.readyToCandidateMs === null ? "n.d. (no viewport observation)" :
+                `${entry.readyToCandidateMs.toFixed(3)} ms`).join("; ") || "n.d.";
         const stability = note ?
             `not stable: ${note.presentationDisposition}; ` +
                 `${note.leftEyePath}/${note.rightEyePath}; ` +
@@ -764,6 +782,9 @@ function report(summary) {
                 "started after reset" : row.recoveryStatus;
         return (
         `| ${row.lane || "default"} | ${row.pass} | ${row.ordinal} | ` +
+        `${retry.outcome} (${retry.status}) | ` +
+        `${retry.retryCount === null ? "n.d." : retry.retryCount} | ` +
+        `${retry.retryReasons.join("; ") || retry.status} | ${waits} | ${settle} | ` +
         `${row.actualBackend} | ${row.renderVerdict} | ${stability} | ` +
         `${row.task2Verdict} | ` +
         `${row.traceRequired ? (row.traceComplete ?
@@ -832,9 +853,15 @@ function report(summary) {
         `per-transition evidence. Every raw JSON value is available in ` +
         `\`${summary.evidenceExtraction.path}\`.\n\n` +
         `## Transitions\n\n` +
-        `| Lane | Pass | Row | Actual backend | Render | Stability | Task 2 | Trace evidence | Stretch frames | Stretch recovery | Recovery | Authority | Reported violations | ` +
+        `Retry waits end at the first observed preparation-ready result. ` +
+        `Ready-to-candidate includes stereo qualification and the settling guard; ` +
+        `it is not isolated retry overhead. Overlapping viewport waits are not added. ` +
+        `Unavailable results are n.d. and the affected reporting outcome is n/a. ` +
+        `All retrieved values remain in raw evidence and evidence-values.csv; ` +
+        `reporting provenance never aborts or replays measurements.\n\n` +
+        `| Lane | Pass | Row | Retry telemetry | Retries | Retry reasons | Viewport wait | Ready-to-candidate | Actual backend | Render | Stability | Task 2 | Trace evidence | Stretch frames | Stretch recovery | Recovery | Authority | Reported violations | ` +
         `Missing evidence | Invalid producer evidence |\n` +
-        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n\n` +
+        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n\n` +
         `## Presentation stretch anomalies\n\n` +
         `| Lane | Pass | Row | From | To | Consecutive frames | Recovered PASS |\n` +
         `| --- | ---: | ---: | --- | --- | ---: | --- |\n` +
@@ -1067,6 +1094,9 @@ function finalizeEvidence(options) {
     }
     if (rows.some((row) => !row.traceComplete)) {
         reportingReasons.push("required_trace_evidence_incomplete");
+    }
+    if (rows.some(row => row.retryTelemetry.status !== "complete")) {
+        reportingReasons.push("retry_telemetry_incomplete");
     }
     if (rows.some((row) => row.renderVerdict === "PASS" &&
         row.actualBackend === "not_exposed")) {

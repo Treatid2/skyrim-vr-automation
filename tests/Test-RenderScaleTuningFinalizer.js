@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { fixture: retryFixture, testRetryTelemetry } = require("./Test-RenderScaleRetryTelemetry.js");
 const {
     collectTracePages,
     deploymentVerification,
@@ -566,8 +567,9 @@ function testOfflineFinalization() {
             !Object.hasOwn(result.summary, "task2Verdict") &&
             !Object.hasOwn(result.summary, "overallVerdict"),
         "Legacy aggregate verdict fields were retained.");
-        assert(result.summary.reporting.status === "COMPLETE",
-            "Complete preserved receipts did not finalize.");
+        assert(result.summary.reporting.status === "INCOMPLETE" &&
+            result.summary.reporting.reasons.includes("retry_telemetry_incomplete"),
+        "An older receipt without retry telemetry did not leave an explicit reporting gap.");
         assert(result.summary.stabilityNotes.count === 1 &&
             result.summary.stabilityNotes.transitions[0]
                 .presentationDisposition === "PresentationStretch",
@@ -1185,8 +1187,9 @@ function testTraceCompletenessPassability() {
             buildId, expectedRows: 2 };
         writeJson(file, receipt);
         let result = finalizeEvidence(options);
-        assert(result.summary.reporting.status === "COMPLETE" &&
-            result.summary.transitions[1].traceEvidence.records === 70,
+        assert(result.summary.transitions[1].traceComplete === true &&
+            result.summary.transitions[1].traceEvidence.records === 70 &&
+            result.summary.reporting.reasons.includes("retry_telemetry_incomplete"),
         "A complete producer-shaped trace cannot pass offline finalization.");
         for (const change of [
             row => { delete row.traceReadPages; },
@@ -1260,7 +1263,36 @@ function testJournalOnlyPartialFinalization(document = false) {
     }
 }
 
+function testRetryReportingGaps() {
+    const root = createEvidenceRoot();
+    try {
+        const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+            buildId: "e".repeat(64), expectedRows: 2 };
+        const before = finalizeEvidence(options).summary;
+        const file = path.join(root, "raw/pass-1/transitions/01/retained.json");
+        const receipt = JSON.parse(fs.readFileSync(file, "utf8"));
+        const diagnostic = retryFixture().waiter;
+        receipt.waiter.status = diagnostic.status;
+        receipt.waiter.timing = diagnostic.timing;
+        receipt.waiter.baseline = diagnostic.baseline;
+        receipt.waiter.status.retryTelemetry.qpcFrequency = 0;
+        receipt.waiter.status.retryTelemetry.measuredRetrySentinel = 123.456;
+        writeJson(file, receipt);
+        const { summary } = finalizeEvidence(options);
+        assert(summary.assayExecution.status === before.assayExecution.status &&
+            summary.renderVerdict === before.renderVerdict &&
+            summary.transitions[0].retryTelemetry.outcome === "n/a",
+        "Retry provenance changed the measured assay result or prevented reporting.");
+        assert(fs.readFileSync(path.join(root, "evidence-values.csv"), "utf8")
+            .includes("123.456"), "An unverified retry measurement was discarded.");
+        assert(fs.readFileSync(path.join(root, "transitions.csv"), "utf8")
+            .includes("clock_unavailable,n/a,n.d."), "Retry gap labels were lost in CSV.");
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+}
+
 Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
+    .then(testRetryReportingGaps)
+    .then(testRetryTelemetry)
     .then(testTraceCompletenessPassability)
     .then(testJournalOnlyPartialFinalization)
     .then(() => testJournalOnlyPartialFinalization(true))
