@@ -566,7 +566,9 @@ async function runRenderScaleTuningLive(context) {
             const root = decodeEnvelope(envelope);
             for (const entry of root.results || []) {
                 const value = entry.result;
-                if (entry.label === "measured-stress-start" && value?.status?.session?.active) {
+                if ((entry.label === "baseline-stress-start" || entry.label === "measured-stress-start") &&
+                    value?.status?.session?.active === true &&
+                    Number.isSafeInteger(value.status.session.id) && value.status.session.id > 0) {
                     ownedCaptures = { stressSessionId: value.status.session.id };
                 }
                 if (entry.label === "texture-lifetime-start") ownedCaptures.textureSessionId = value?.capture?.sessionID;
@@ -1693,6 +1695,11 @@ async function runRenderScaleTuningLive(context) {
                     scenarioFailure && scenarioFailure.diagnostic || null);
             }
             const stressSessionId = waiter.baseline && waiter.baseline.stressSessionId;
+            if (waiter.producer?.buildId === buildId &&
+                Number.isSafeInteger(stressSessionId) && stressSessionId > 0) {
+                ownedCaptures = { stressSessionId };
+                if (context.observeOwnership) context.observeOwnership({ ...ownedCaptures });
+            }
             if (!safeTerminal(waiter, identifiers) || !waiter.milestoneTimings ||
                 !waiter.replacementTimeline) {
                 throw diagnosticError("baseline_failed",
@@ -1709,12 +1716,6 @@ async function runRenderScaleTuningLive(context) {
             !waiter.milestoneTimings ||
             !waiter.replacementTimeline) {
             await closeOpenQualification(identifiers);
-            if (stressSessionId) {
-                await renderScale({
-                    action: "stop", expectedSessionId: stressSessionId,
-                    expectedBuildId: buildId,
-                });
-            }
             throw diagnosticError("baseline_failed",
                 scenarioDiagnostic(response.root, steps, receiptKey));
         }
@@ -2275,8 +2276,9 @@ async function runRenderScaleTuningLive(context) {
                 notify({ lane: lane.id, pass, phase: "pass_complete", status: "COMPLETE" });
                 if (pass === 1) await cooldown(lane, pass);
             } catch (error) {
-                if (stressSessionId && !cleanupAttempted) {
-                    try { await cleanup(lane, pass, stressSessionId); }
+                const cleanupSessionId = ownedCaptures.stressSessionId || stressSessionId;
+                if (cleanupSessionId && !cleanupAttempted) {
+                    try { await cleanup(lane, pass, cleanupSessionId); }
                     catch (cleanupError) {
                         passSummary.cleanupError = String(cleanupError.message || cleanupError);
                         passSummary.cleanupFailure = cleanupError.diagnostic || null;

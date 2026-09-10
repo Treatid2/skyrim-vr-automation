@@ -341,6 +341,72 @@ async function testCleanupRecovery() {
         }
     }
 }
+async function testBaselineFailureCleanup() {
+    for (const mode of ["timeout", "recovered-timeout", "foreign-stress", "stop-refused"]) {
+        const req = request(`baseline-${mode}`);
+        const mock = createMock(0, (receipt, context) => {
+            if (context.baseline) {
+                receipt.satisfied = false;
+                receipt.outcome = "timeout";
+                receipt.upscalingSnapshot.activeOperationId = 1;
+                receipt.failureReasons = [{ category: "api", code: "api_operation_active" }];
+            }
+            return receipt;
+        });
+        const client = clientFor(mock), originalCall = client.call;
+        let stopBatches = 0, recoveredWaiter;
+        client.call = async (name, args) => {
+            if (mode === "recovered-timeout" && args.action === "qualification_status") {
+                return envelope({ qualification: { active: false, lastEvidence: recoveredWaiter } });
+            }
+            const stopping = args.steps?.some(step => step.label === "measured-stress-stop");
+            if (stopping) {
+                stopBatches++;
+                const stop = args.steps.find(step => step.label === "measured-stress-stop");
+                assert.equal(stop.args.expectedSessionId, 1);
+                assert.equal(stop.args.expectedBuildId, buildId);
+                if (mode === "stop-refused") {
+                    return envelope({ ok: false, aborted: true, stepsRun: 1,
+                        results: [{ label: "measured-stress-stop", ok: false, error: "stop refused" }] });
+                }
+            }
+            const result = await originalCall(name, args);
+            if (mode === "recovered-timeout" && args.steps?.some(step => step.label === "baseline-stress-start")) {
+                recoveredWaiter = JSON.parse(result.content[0].text).results
+                    .find(step => step.label === "qualification-wait").result;
+                throw new Error("baseline response lost");
+            }
+            if (mode === "foreign-stress" && args.steps?.some(step => step.label === "render-status")) {
+                const root = JSON.parse(result.content[0].text);
+                root.results.find(step => step.label === "render-status").result.status.session.id = 999;
+                return envelope(root);
+            }
+            return result;
+        };
+        client.reconnectForCleanup = async () => ({ session: "baseline-cleanup-session" });
+        const result = await runWorker(req, { client });
+        assert.equal(result.state, "INTERRUPTED");
+        assert.equal(result.completedTransitions, 0);
+        assert.equal(result.result.lanes[0].passes[0].error, "baseline_failed");
+        assert.equal(result.ownership.stressSessionId, 1, "baseline capture ownership was not published");
+        assert.equal(result.cleanupVerified, ["timeout", "recovered-timeout"].includes(mode),
+            "baseline capture cleanup was not verified");
+        assert.equal(stopBatches, mode === "foreign-stress" ? 0 : 1, "baseline stop was missing or replayed");
+        assert.equal(mock.scenarioCalls.filter(call => call.steps.some(step => step.label === "profile-apply")).length, 1,
+            "baseline failure replayed a profile mutation");
+        assert.equal(JSON.parse(fs.readFileSync(path.join(req.root, "worker-status.json"))).evidencePending, 0);
+        const journal = fs.readFileSync(path.join(req.root, "raw/journal.ndjson"), "utf8")
+            .trim().split("\n").map(line => JSON.parse(line));
+        assert.ok(journal.some(record => mode === "recovered-timeout" ?
+            record.receiptKey.includes(":recovery:") : record.receiptKey.endsWith(":baseline")));
+        assert.ok(journal.some(record => record.receiptKey.endsWith(":final-status-before-cleanup")));
+        if (mode !== "foreign-stress") {
+            assert.ok(journal.some(record => record.receiptKey.endsWith(":cleanup")), "baseline stop receipt was not retained");
+            assert.ok(journal.some(record => record.receiptKey.endsWith(":final-status-after-cleanup")));
+        }
+    }
+}
+
 async function testCleanupStopFailure() {
     const req = request("stop-failure"), mock = createMock(0);
     const client = clientFor(mock), originalCall = client.call;
@@ -378,10 +444,15 @@ async function testCleanupStopFailure() {
         console.log(`Detached tool-boundary test passed; fixtures: ${temporary}`);
         return;
     }
+    if (process.argv.includes("--baseline-only")) {
+        await testBaselineFailureCleanup();
+        console.log(`Baseline failure cleanup tests passed; fixtures: ${temporary}`);
+        return;
+    }
     await testQueue(); await testFullMatrix(); await testSlowSavingAndFailure();
     await testPacing(); await testStreamingResponse(); await testNotificationShutdown();
     await testTransportShutdownFailure(); await testCleanupRecovery();
-    await testCleanupStopFailure(); await testDetachedAndMcp();
+    await testBaselineFailureCleanup(); await testCleanupStopFailure(); await testDetachedAndMcp();
     await testDetachedAndMcp("delete-timeout");
     console.log(`Durable tuning worker tests passed; fixtures: ${temporary}`);
 })().catch(error => { console.error(error.stack || error); process.exitCode = 1; });

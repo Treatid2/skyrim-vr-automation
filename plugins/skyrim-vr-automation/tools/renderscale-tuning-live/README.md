@@ -39,6 +39,12 @@ response leads to a status check, never a replay. A blocked cleanup preserves
 the exact known owners and failure in worker status and retains the endpoint
 lock. Journal completion never substitutes for verified inactive captures.
 
+Baseline captures retain their stress-session ownership as soon as the start
+receipt arrives, including a matching recovered terminal receipt. A failed
+baseline uses the same guarded cleanup as a measured pass: retain the stop
+receipt, verify every capture inactive, then publish cleanup completion.
+The baseline failure remains interrupted and never replays the profile apply.
+
 The launcher requires Node 22 or newer. It uses `CSX_TUNING_NODE_PATH`, `node`
 on PATH, or the Node bundled with Visual Studio found through `vswhere`.
 An explicit `-NodePath` is also supported. Start only through the skill's

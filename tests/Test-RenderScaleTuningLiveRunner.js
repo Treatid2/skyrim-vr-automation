@@ -859,10 +859,14 @@ async function testAdmissionRejectsMalformedInputs() {
         assert(result.status === "INTERRUPTED" && failedPass.error === expected &&
             failedPass.failure && failedPass.failure.reason,
         `Terminal ${name} was not rejected with retained diagnostics.`);
-        assert(mock.scenarioCalls.length === 1 &&
-            mock.scenarioCalls[0].steps.some((step) =>
-                step.label === "baseline-stress-start"),
+        assert(mock.scenarioCalls.filter(call => call.steps.some(step =>
+            step.label === "profile-apply")).length === 1 &&
+            mock.scenarioCalls[0].steps.some(step => step.label === "baseline-stress-start") &&
+            !mock.scenarioCalls.some(call => call.steps.some(step =>
+                step.label === "measured-stress-start" || step.label === "transition-pace")),
         "A malformed terminal baseline altered positioning or began measurement.");
+        assert(mock.stores.has(`invalid-${name}:nvidia:pass-1:final-status-after-cleanup`),
+            "A rejected baseline did not verify capture cleanup.");
     }
 
     const amdMatrix = JSON.parse(fs.readFileSync(path.join(
