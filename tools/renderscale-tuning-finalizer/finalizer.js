@@ -8,10 +8,10 @@ const crypto = require("node:crypto");
 const { retryTelemetry } = require("./retry-telemetry.js");
 const { memoryConfirmation, memoryReport } = require("./memory-confirmation.js");
 const { transitionHealth, transitionTimings, switchHealthSummary,
-    healthReport } = require("./switch-health.js");
+    healthReport, envelope } = require("./switch-health.js");
 
 const { collectTracePages, traceCapacity, validateTracePage,
-    validateRetainedTrace } = require("../renderscale-tuning-live/runner.js");
+    validateRetainedTrace, actualBackend, qualifyLaneBackend } = require("../renderscale-tuning-live/runner.js");
 
 function readJson(file) {
     return JSON.parse(fs.readFileSync(file, "utf8"));
@@ -542,36 +542,24 @@ function sourceProfile(waiter) {
     };
 }
 
-function exposedBackend(value) {
-    return typeof value === "string" && value.length > 0 ? value : null;
+function readLaneContext(root) {
+    const position = envelope(path.join(root, "raw/startup/positioning.json"));
+    const entries = position?.results?.filter(step => step.label === "position-capabilities" && step.ok !== false) || [];
+    return {
+        matrix: readJson(path.join(__dirname, "../../skills/renderscale-tuning-amd/references/matrix.v1.json")),
+        capabilities: entries.length === 1 ? entries[0].result?.capabilities : null,
+    };
 }
 
-function actualBackend(waiter, target) {
-    if (target.method === "none" || target.method === "taa") return "none";
-    if (target.method !== "dlss" && target.method !== "fsr") {
-        return "not_exposed";
-    }
-    if (target.renderScaleMode === false) {
-        const execution = waiter.nativeVendorExecution ||
-            waiter.observation && waiter.observation.nativeVendorExecution;
-        return exposedBackend(execution && execution.actualBackend) ||
-            "not_exposed";
-    }
-    if (target.renderScaleMode !== true) return "not_exposed";
-    const timeline = waiter.replacementTimeline || {};
-    const proof = timeline.terminal &&
-        timeline.terminal.presentationProof || {};
-    const direct = exposedBackend(proof.backend);
-    if (direct) return direct;
-    const left = exposedBackend(proof.leftEye && proof.leftEye.backend);
-    const right = exposedBackend(proof.rightEye && proof.rightEye.backend);
-    if (left && left === right) return left;
-    const dispatch = waiter.status && waiter.status.fsrDispatch;
-    return exposedBackend(dispatch && dispatch.actualDispatchBackend) ||
-        "not_exposed";
+function laneQualification(root, laneId, waiter, target, context) {
+    if (!laneId || laneId === "nvidia") return { verdict: "NOT_APPLICABLE", reasons: [] };
+    const { matrix, capabilities } = context || readLaneContext(root);
+    const lane = matrix.lanes.find(value => value.id === laneId);
+    if (!lane) return { verdict: "FAIL", reasons: ["unknown_amd_lane"] };
+    return qualifyLaneBackend(waiter, target, lane, capabilities);
 }
 
-function transitionRow(root, file, retained) {
+function transitionRow(root, file, retained, laneContext) {
     const identity = rowIdentity(root, file);
     const waiter = retained.waiter || {};
     const projection = retained.projection || {};
@@ -598,6 +586,7 @@ function transitionRow(root, file, retained) {
         target,
         source: sourceProfile(waiter),
         actualBackend: actualBackend(waiter, target),
+        laneQualification: laneQualification(root, identity.lane, waiter, target, laneContext),
         retryTelemetry: retryTelemetry(retained),
         switchHealth: transitionHealth(waiter),
         switchTimings: transitionTimings(waiter),
@@ -661,7 +650,7 @@ function csv(rows) {
         "cleanup_tail_ms", "switch_health", "switch_timings", "retry_telemetry_status", "retry_outcome", "retry_count",
         "retry_reasons", "viewport_waits", "retry_stabilization",
         "method", "quality_mode", "render_scale_mode",
-        "actual_backend", "render_verdict", "stability_status",
+        "actual_backend", "lane_qualification", "render_verdict", "stability_status",
         "stability_presentation_disposition",
         "stability_left_eye_path", "stability_right_eye_path",
         "stability_controller_state", "stability_presentation_phase",
@@ -704,7 +693,7 @@ function csv(rows) {
             row.retryTelemetry.status, row.retryTelemetry.outcome, row.retryTelemetry.retryCount ?? "n.d.",
             row.retryTelemetry.retryReasons, JSON.stringify(row.retryTelemetry.waits),
             JSON.stringify(row.retryTelemetry.stabilization), row.target.method,
-            row.target.qualityMode, row.target.renderScaleMode, row.actualBackend,
+            row.target.qualityMode, row.target.renderScaleMode, row.actualBackend, JSON.stringify(row.laneQualification),
             row.renderVerdict,
             note ? note.status : "stable",
             note ? note.presentationDisposition : "n/a",
@@ -779,7 +768,7 @@ function report(summary) {
         `${retry.outcome} (${retry.status}) | ` +
         `${retry.retryCount === null ? "n.d." : retry.retryCount} | ` +
         `${retry.retryReasons.join("; ") || retry.status} | ${waits} | ${settle} | ` +
-        `${row.actualBackend} | ${row.renderVerdict} | ${stability} | ` +
+        `${row.actualBackend} | ${row.laneQualification.verdict}: ${row.laneQualification.reasons.join("; ") || "qualified/inapplicable"} | ${row.renderVerdict} | ${stability} | ` +
         `${row.task2Verdict} | ` +
         `${row.traceRequired ? (row.traceComplete ?
             `${row.traceEvidence.records} records / ${row.traceEvidence.pages} pages` :
@@ -812,6 +801,7 @@ function report(summary) {
         `- Transitions dispatched: **${summary.assayExecution.transitionsDispatched}/` +
         `${summary.assayExecution.expectedTransitions}**\n` +
         `- Terminal render verdict: **${summary.render.verdict}** (terminal condition only)\n` +
+        `- Lane qualification: **${summary.laneQualification.verdict}**\n` +
         `- Full-history switch health: **${summary.switchHealth.status}**\n` +
         `- Change assessment: **${summary.changeAssessment.status}**\n` +
         `- Non-stable terminal notes: **${summary.stabilityNotes.count}**\n` +
@@ -856,9 +846,9 @@ function report(summary) {
         `Unavailable results are n.d. and the affected reporting outcome is n/a. ` +
         `All retrieved values remain in raw evidence and evidence-values.csv; ` +
         `reporting provenance never aborts or replays measurements.\n\n` +
-        `| Lane | Pass | Row | Retry telemetry | Retries | Retry reasons | Viewport wait | Ready-to-candidate | Actual backend | Render | Stability | Task 2 | Trace evidence | Stretch frames | Stretch recovery | Recovery | Authority | Reported violations | ` +
+        `| Lane | Pass | Row | Retry telemetry | Retries | Retry reasons | Viewport wait | Ready-to-candidate | Actual backend | Lane qualification | Render | Stability | Task 2 | Trace evidence | Stretch frames | Stretch recovery | Recovery | Authority | Reported violations | ` +
         `Missing evidence | Invalid producer evidence |\n` +
-        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n\n` +
+        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n\n` +
         `## Presentation stretch anomalies\n\n` +
         `| Lane | Pass | Row | From | To | Consecutive frames | Recovered PASS |\n` +
         `| --- | ---: | ---: | --- | --- | ---: | --- |\n` +
@@ -1036,7 +1026,8 @@ function finalizeEvidence(options) {
             throw new Error("terminal_receipt_variant_mismatch");
         }
     }
-    const rows = retained.map(({ file, value }) => transitionRow(root, file, value))
+    const laneContext = readLaneContext(root);
+    const rows = retained.map(({ file, value }) => transitionRow(root, file, value, laneContext))
         .sort((left, right) => (left.lane || "").localeCompare(right.lane || "") ||
             left.pass - right.pass || left.ordinal - right.ordinal);
     const liveResult = readLiveResult(root, variant, runIds[0]);
@@ -1145,6 +1136,14 @@ function finalizeEvidence(options) {
                     relative(root, entry.file)),
             } : null },
         render: { verdict: renderVerdict, scope: "terminal_condition_only" },
+        laneQualification: { verdict: rows.some(row => row.laneQualification.verdict === "FAIL") ? "FAIL" :
+            variant === "amd" ? (assayStatus === "COMPLETE" ? "PASS" : "INCONCLUSIVE") : "NOT_APPLICABLE",
+            counts: rows.reduce((counts, row) => {
+                const verdict = row.laneQualification.verdict;
+                counts[verdict] = (counts[verdict] || 0) + 1;
+                return counts;
+            }, {}),
+            scope: "lane_capability_and_physical_backend" },
         switchHealth: health,
         changeAssessment: { status: health.passes.some(pass => pass.healthStandard === "NOT_MET") ?
             "DOES_NOT_MEET_STANDARD" : "INCONCLUSIVE", scope: "improvement_or_neutral",
@@ -1247,6 +1246,8 @@ if (require.main === module) {
 module.exports = {
     sourceProfile,
     actualBackend,
+    laneQualification,
+    readLaneContext,
     collectTracePages,
     deploymentVerification,
     finalizeEvidence,

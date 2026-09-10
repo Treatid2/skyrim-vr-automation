@@ -326,6 +326,9 @@ async function runWorker(request, dependencies = {}) {
         mcp__devbench_vr__scenario: async args => {
             const measured = args.steps?.[0]?.label === "transition-pace";
             const containsApply = args.steps?.some(step => step.label === "profile-apply" || step.label === "recovery-profile-apply");
+            const containsCaptureStart = args.steps?.some(step =>
+                ["start", "dlss_trace_start", "texture_lifetime_start", "load_presentation_start",
+                    "cpu_performance_start", "gpu_performance_start"].includes(step.args?.action));
             // Storage failures must leave ownership-guarded cleanup callable.
             if (containsApply) journal.check();
             if (measured && lastRowResponse !== null) {
@@ -341,7 +344,7 @@ async function runWorker(request, dependencies = {}) {
             const invocationKey = `${request.runId}:invocation:${++invocation}`;
             if (containsApply) await journal.write(invocationKey, {
                 state: "DISPATCHING", args, utc: new Date().toISOString() });
-            if (containsApply) {
+            if (containsApply || containsCaptureStart) {
                 cleanupVerified = false; status.mutationDispatched = true;
                 const owner = args.steps.find(step => step.label === "qualification-begin")?.args;
                 status.qualification = owner ? { ownerId: owner.ownerId, transitionId: owner.transitionId } : null;

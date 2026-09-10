@@ -233,6 +233,84 @@ async function createReceiptJournal(tools, runId) {
     };
 }
 
+function exposedBackend(value) {
+    return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function actualBackend(waiter, target) {
+    if (target.method === "none" || target.method === "taa") return "none";
+    if (target.method !== "dlss" && target.method !== "fsr") {
+        return "not_exposed";
+    }
+    if (target.renderScaleMode === false) {
+        const execution = waiter.nativeVendorExecution ||
+            waiter.observation && waiter.observation.nativeVendorExecution;
+        return exposedBackend(execution && execution.actualBackend) ||
+            "not_exposed";
+    }
+    if (target.renderScaleMode !== true) return "not_exposed";
+    const timeline = waiter.replacementTimeline || {};
+    const proof = timeline.terminal &&
+        timeline.terminal.presentationProof || {};
+    const direct = exposedBackend(proof.backend);
+    if (direct) return direct;
+    const left = exposedBackend(proof.leftEye && proof.leftEye.backend);
+    const right = exposedBackend(proof.rightEye && proof.rightEye.backend);
+    if (left && left === right) return left;
+    const dispatch = waiter.status && waiter.status.fsrDispatch;
+    return exposedBackend(dispatch && dispatch.actualDispatchBackend) ||
+        "not_exposed";
+}
+
+function amdLaneAvailability(lane, capabilities) {
+    const supported = capabilities?.supportedFSRRuntimeMask;
+    const unavailable = capabilities?.fsrRuntimeUnavailableConditions;
+    if (!Number.isSafeInteger(supported) || supported < 0 || supported > 3 ||
+        !Array.isArray(unavailable) || unavailable.length !== 2 ||
+        unavailable.some(entry => !Number.isSafeInteger(entry?.mask) || entry.mask < 0)) {
+        return { runnable: null, reason: "fsr_runtime_capability_shape_invalid" };
+    }
+    const fsr3 = (supported & 1) !== 0 && unavailable[0].mask === 0;
+    const runnable = lane.id === "explicit_fsr4" ?
+        (supported & 2) !== 0 && unavailable[1].mask === 0 :
+        lane.id === "explicit_fsr3" ? fsr3 :
+        lane.id === "fsr4_to_fsr3_fallback" ? fsr3 && unavailable[1].mask !== 0 : null;
+    return { runnable, reason: runnable === true ? null : "lane_capability_requirements_not_met",
+        supportedFSRRuntimeMask: supported, fsrRuntimeUnavailableConditions: unavailable };
+}
+
+function qualifyLaneBackend(waiter, target, lane, capabilities) {
+    if (!lane?.expectedBackends) return { verdict: "NOT_APPLICABLE", reasons: [] };
+    const eligibility = amdLaneAvailability(lane, capabilities);
+    const result = { verdict: "PASS", reasons: [], eligibility,
+        expectedBackends: lane.expectedBackends, actualBackend: actualBackend(waiter, target),
+        configuredFsrRuntime: target.fsrRuntime ?? null, runtimeFallbackObserved: null };
+    if (eligibility.runnable !== true) result.reasons.push("lane_not_eligible");
+    if (target.method === "fsr") {
+        if (target.fsrRuntime !== lane.configuredFsrRuntime) result.reasons.push("configured_runtime_mismatch");
+        if (!lane.expectedBackends.includes(result.actualBackend)) result.reasons.push("physical_backend_mismatch_or_missing");
+        const execution = waiter.nativeVendorExecution || waiter.observation?.nativeVendorExecution;
+        const proof = waiter.replacementTimeline?.terminal?.presentationProof;
+        const eyes = [proof?.leftEye, proof?.rightEye];
+        const fallback = target.renderScaleMode === false ? execution?.actualRuntimeFallbackObserved :
+            eyes.every(eye => typeof eye?.vendorRuntimeFallback === "boolean") ?
+                eyes.some(eye => eye.vendorRuntimeFallback) : null;
+        result.runtimeFallbackObserved = typeof fallback === "boolean" ? fallback : null;
+        if (target.renderScaleMode === true && typeof eyes[0]?.vendorRuntimeFallback === "boolean" &&
+            typeof eyes[1]?.vendorRuntimeFallback === "boolean" &&
+            eyes[0].vendorRuntimeFallback !== eyes[1].vendorRuntimeFallback)
+            result.reasons.push("eye_fallback_mismatch");
+        if (target.renderScaleMode === true && eyes.some(eye => eye?.backend &&
+            !lane.expectedBackends.includes(eye.backend))) result.reasons.push("eye_backend_mismatch");
+        if (lane.requiresDocumentedFsr4UnavailableCondition && result.runtimeFallbackObserved !== true)
+            result.reasons.push("runtime_fallback_not_proven");
+        if (lane.requiresFsr4Available && result.runtimeFallbackObserved !== false)
+            result.reasons.push("explicit_fsr4_without_fallback_not_proven");
+    } else if (!["none", "taa"].includes(target.method)) result.reasons.push("lane_method_invalid");
+    if (result.reasons.length) result.verdict = "FAIL";
+    return result;
+}
+
 async function runRenderScaleTuningLive(context) {
     "use strict";
 
@@ -249,6 +327,7 @@ async function runRenderScaleTuningLive(context) {
     let verifiedAdapter = null;
     let cleanupMode = false;
     let ownedCaptures = {};
+    let amdTraceMayBeActive = false;
     const cleanupEvidenceErrors = [];
 
     async function retain(key, value) {
@@ -573,7 +652,7 @@ async function runRenderScaleTuningLive(context) {
                 }
                 if (entry.label === "texture-lifetime-start") ownedCaptures.textureSessionId = value?.capture?.sessionID;
                 if (entry.label === "load-presentation-start") ownedCaptures.probeSessionId = value?.status?.sessionID;
-                if (entry.label === "dlss-trace-start") ownedCaptures.traceSessionId = value?.capture?.sessionID;
+                if (["dlss-trace-start", "amd-dlss-trace-start"].includes(entry.label)) ownedCaptures.traceSessionId = value?.capture?.sessionID;
                 if (entry.label === "profiler-enable") ownedCaptures.profilerEnabled = value?.ok === true;
                 if (entry.label === "qualification-dispatch" && value?.performanceTelemetry?.started) {
                     ownedCaptures.cpuSessionId = value.performanceTelemetry.cpuPerformance?.sessionId;
@@ -1820,7 +1899,8 @@ async function runRenderScaleTuningLive(context) {
                 throw diagnosticError("transition_receipt_unavailable",
                     scenarioFailure && scenarioFailure.diagnostic || null);
             }
-            projection = transitionProjection(waiter, target);
+            projection = { ...transitionProjection(waiter, target),
+                laneQualification: qualifyLaneBackend(waiter, target, lane, capabilities) };
             diagnostic = scenarioFailure && scenarioFailure.diagnostic || null;
             retained = {
                 variant,
@@ -1837,7 +1917,8 @@ async function runRenderScaleTuningLive(context) {
         if (response) {
             entries = resultMap(response.root);
             waiter = entries.get("qualification-wait");
-            projection = waiter ? transitionProjection(waiter, target) : null;
+            projection = waiter ? { ...transitionProjection(waiter, target),
+                laneQualification: qualifyLaneBackend(waiter, target, lane, capabilities) } : null;
             diagnostic = scenarioDiagnostic(response.root, steps, receiptKey);
             retained = {
                 variant,
@@ -1995,26 +2076,35 @@ async function runRenderScaleTuningLive(context) {
                     .test(reported || "");
             return traceStep && unavailable ? diagnostic : null;
         };
-        let response;
-        try {
-            response = await scenario(steps, receiptKey);
-        } catch (error) {
+        const combined = [];
+        async function part(selected, suffix) {
+            const key = `${receiptKey}:${suffix}`;
+            const response = await scenario(selected, key);
+            combined.push(...(response.root.results || []));
+            return requireScenario(response.root, selected, key);
+        }
+        let initial;
+        try { initial = await part(steps.slice(0, 1), "inspect"); }
+        catch (error) {
             const diagnostic = unavailableTraceAction(error);
-            if (diagnostic) {
-                return { status: "unsupported", receiptKey, diagnostic };
-            }
+            if (diagnostic) return { status: "unsupported", receiptKey, diagnostic };
             throw error;
         }
-        let entries;
-        try {
-            entries = requireScenario(response.root, steps, receiptKey);
-        } catch (error) {
-            const diagnostic = unavailableTraceAction(error);
-            if (diagnostic) {
-                return { status: "unsupported", receiptKey, diagnostic };
-            }
-            throw error;
-        }
+        const prior = initial.get("amd-dlss-trace-status")?.capture;
+        if (prior?.active !== false) throw new Error("amd_trace_not_inactive_before_start");
+        amdTraceMayBeActive = true;
+        await part(steps.slice(1, 3), "start");
+        const owner = ownedCaptures.traceSessionId;
+        if (!Number.isSafeInteger(owner) || owner <= 0) throw new Error("amd_trace_start_owner_missing");
+        for (const step of steps.slice(3)) step.args.expectedSessionId = owner;
+        const entries = await part(steps.slice(3), "stop-read");
+        if (entries.get("amd-dlss-trace-stop")?.capture?.active !== false ||
+            entries.get("amd-dlss-trace-read")?.capture?.summary?.active !== false)
+            throw new Error("amd_trace_stop_not_verified");
+        amdTraceMayBeActive = false;
+        await retain(receiptKey, { content: [{ type: "text", text: JSON.stringify({
+            ok: true, aborted: false, stepsRun: steps.length, results: combined,
+        }) }] });
         const read = entries.get("amd-dlss-trace-read");
         const capture = read && read.capture;
         const summary = capture && capture.summary;
@@ -2049,7 +2139,7 @@ async function runRenderScaleTuningLive(context) {
                 clientId: `${runId}-cleanup`, commandId: `${runId}-${pass}-${suffix}`,
             }),
         ];
-        if (variant === "nvidia") steps.push(toolStep("trace-status", "communityshaders.renderscale", {
+        if (variant === "nvidia" || amdTraceMayBeActive) steps.push(toolStep("trace-status", "communityshaders.renderscale", {
             action: "dlss_trace_status", expectedBuildId: buildId,
         }));
         const response = await scenario(steps, receiptKey);
@@ -2084,7 +2174,7 @@ async function runRenderScaleTuningLive(context) {
         const profiler = before.get("profiler-status")?.result;
         const activeStates = [render?.session?.active, render?.loadPresentationProbe?.active,
             cpu?.active, gpu?.active, texture?.active, qualification?.active, profiler?.enabled];
-        if (variant === "nvidia") activeStates.push(trace?.active);
+        if (variant === "nvidia" || amdTraceMayBeActive) activeStates.push(trace?.active);
         if (activeStates.some(value => typeof value !== "boolean")) {
             throw new Error("cleanup_status_incomplete");
         }
@@ -2158,7 +2248,7 @@ async function runRenderScaleTuningLive(context) {
             after.get("texture-status")?.capture?.active !== false ||
             after.get("qualification-status")?.qualification?.active !== false ||
             after.get("profiler-status")?.result?.enabled !== false ||
-            (variant === "nvidia" && after.get("trace-status")?.capture?.active !== false)) {
+            ((variant === "nvidia" || amdTraceMayBeActive) && after.get("trace-status")?.capture?.active !== false)) {
             throw new Error("cleanup_verification_failed");
         }
         const mayContinueMeasurement = context.cleanupComplete ? context.cleanupComplete() : true;
@@ -2226,13 +2316,17 @@ async function runRenderScaleTuningLive(context) {
             summary.error = error instanceof Error ? error.message : String(error);
             summary.failure = error && typeof error === "object" &&
                 error.diagnostic ? error.diagnostic : null;
+            if (amdTraceMayBeActive) {
+                try { await cleanup({ id: "amd-capability" }, 0, 0); }
+                catch (cleanupError) { summary.cleanupError = String(cleanupError.message || cleanupError); }
+            }
             await retainLiveResult(summary);
             return summary;
         }
     }
     for (let laneIndex = 0; laneIndex < selectedLanes.length; laneIndex += 1) {
         const lane = selectedLanes[laneIndex];
-        const laneSummary = { id: lane.id, status: lane.runnable ? "COMPLETE" : "BLOCKED", passes: [] };
+        const laneSummary = { id: lane.id, eligibility: variant === "amd" ? amdLaneAvailability(lane, capabilities) : null, status: lane.runnable ? "COMPLETE" : "BLOCKED", passes: [] };
         summary.lanes.push(laneSummary);
         if (!lane.runnable) continue;
         for (let pass = 1; pass <= 2; pass += 1) {
@@ -2248,6 +2342,8 @@ async function runRenderScaleTuningLive(context) {
                     satisfied: base.waiter.satisfied === true,
                     outcome: base.waiter.outcome || null,
                     nonStableNote: base.nonStableNote,
+                    laneQualification: qualifyLaneBackend(base.waiter,
+                        targetFor(boundary, matrix.destinations[matrix.initialDestination], lane.configuredFsrRuntime), lane, capabilities),
                 };
                 if (base.nonStableNote) {
                     notify({ lane: lane.id, pass, phase: "baseline",
@@ -2303,5 +2399,5 @@ async function runRenderScaleTuningLive(context) {
 
 if (typeof module !== "undefined" && module.exports) {
     module.exports = { runRenderScaleTuningLive, collectTracePages, traceCapacity,
-        validateTracePage, validateRetainedTrace };
+        validateTracePage, validateRetainedTrace, actualBackend, qualifyLaneBackend, amdLaneAvailability };
 }

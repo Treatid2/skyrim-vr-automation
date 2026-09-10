@@ -4,6 +4,8 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const { amdLaneAvailability } = require("../renderscale-tuning-live/runner.js");
+const { envelope, step } = require("./switch-health.js");
 
 const boundarySources = {
     pass1_start: "pass-1/handoff.json",
@@ -259,9 +261,30 @@ function memoryConfirmation(options) {
     const matrix = JSON.parse(fs.readFileSync(path.join(__dirname, "../../skills",
         `renderscale-tuning-${options.variant}/references/matrix.v1.json`), "utf8"));
     if (options.variant === "nvidia") return confirmLane(options, "nvidia", matrix);
-    const lanes = Object.fromEntries(matrix.lanes.map(lane => [lane.id, confirmLane(options, lane.id, matrix)]));
+    const position = envelope(path.join(options.root, "raw/startup/positioning.json"));
+    const capabilities = step(position, "position-capabilities")?.capabilities;
+    const lanes = Object.fromEntries(matrix.lanes.map(lane => {
+        const result = confirmLane(options, lane.id, matrix);
+        const live = options.liveResult?.lanes?.filter(value => value.id === lane.id) || [];
+        const entry = live.length === 1 ? live[0] : null;
+        const eligibility = amdLaneAvailability(lane, capabilities);
+        const blocked = entry?.status === "BLOCKED" && eligibility.runnable === false &&
+            Array.isArray(entry.passes) && entry.passes.length === 0 &&
+            result.coverage.every(pass => pass.retainedTransitions === 0) &&
+            result.unavailableBoundaries.length === Object.keys(boundarySources).length;
+        result.applicability = { status: blocked ? "NOT_APPLICABLE" : "APPLICABLE", eligibility,
+            reason: blocked ? eligibility.reason : null };
+        if (blocked) {
+            result.status = "not_applicable";
+            result.verdict = "lane_blocked";
+            result.predicateInputs.reason = "lane_blocked_by_retained_capabilities";
+            result.unavailableEvidence = result.issues;
+            result.issues = [];
+        }
+        return [lane.id, result];
+    }));
     return { mode: "per_lane", verdict: "per_lane",
-        status: Object.values(lanes).every(lane => lane.status === "complete") ? "complete" : "incomplete", lanes };
+        status: Object.values(lanes).every(lane => ["complete", "not_applicable"].includes(lane.status)) ? "complete" : "incomplete", lanes };
 }
 
 function memoryReport(confirmation) {

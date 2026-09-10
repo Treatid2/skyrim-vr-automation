@@ -617,8 +617,9 @@ status, reset, start, stop, and read. Require zero DLSS dispatch records. A
 missing trace action is `unsupported`; an exposed action that fails is a
 control failure. Retain the complete lifecycle envelope so its action receipts
 and empty raw read can be materialized during finalization. Do not start a DLSS
-trace during AMD matrix transitions. Missing lifecycle evidence forbids a
-ledger append but does not change completed AMD row classifications.
+trace during AMD matrix transitions. Missing lifecycle evidence makes reporting incomplete; append all available
+measurements and comparisons with that explicit gap. It does not change
+completed AMD row classifications.
 
 Unsupported preparation providers are `n/a`, never zero. Preserve raw values
 before summarizing. Archive any log before reading it under the repository's
@@ -674,7 +675,11 @@ after validation. Do not hash or render per
 row. An evidence root containing only `summary.json` and `transitions.csv` is
 incomplete; it can still support a clearly labeled partial comparison using
 the measurements actually retained. Append one uniquely headed
-result column per completed two-pass lane.
+result column per run ID, including interrupted runs. Put every lane and
+pass in explicitly lane-qualified metric rows within that column. Preserve
+blocked lanes with their capability reasons and unavailable measurements.
+Keep historical columns and cells intact; do not repeat the same run ID in
+separate lane columns.
 
 If the live runner stops at baseline before any measured row, retain
 `raw/live-result.json` and the exact baseline waiter receipt. Run the same
@@ -907,3 +912,24 @@ an explicit user order to close the identified stale menu and continue may
 authorize one replacement. Require verified cleanup and unchanged PID/Build
 ID ownership, preserve all interrupted evidence, and run the complete AMD
 assay with a fresh run ID. Never resume a partial pass or replay automatically.
+
+### Physical lane qualification and ownership
+
+Preserve terminal render and Task 2 results separately from lane
+qualification. Qualify retained native/scaled FSR execution against the
+matrix's expected physical backends. Explicit FSR4 requires FSR4 execution
+without fallback; the fallback lane requires documented FSR4 unavailability
+and observed runtime fallback. Missing or contradictory proof fails lane
+qualification and prevents a supported improvement/neutral assessment.
+This uses existing receipts and adds no per-transition calls or waits.
+
+Inspect capability-trace inactivity before reset/start, retain its returned
+owner, and use that owner for stop/read. An interrupted capability capture
+uses the shared guarded cleanup; retain endpoint ownership if inactivity
+cannot be verified. Never reset or stop a foreign active trace.
+
+Memory completeness applies to runnable lanes. A retained BLOCKED lane
+with valid capability evidence, no passes and no boundary/transition
+receipts is explicitly inapplicable, with unavailable values preserved.
+Missing or contradictory evidence in runnable/unknown lanes remains
+incomplete. Do not add passes to satisfy an inapplicable lane.

@@ -81,3 +81,19 @@ cannot support GPU milliseconds or FPS claims.
 Validate with `node tests/Test-RenderScaleTuningFinalizer.js` and
 `node tests/Test-RenderScaleSwitchComparison.js`. All tests use temporary
 fixtures; comparison generation does not contact DevBench or replay a run.
+
+The toolkit also ships `compare-ledger.py`, the portable implementation of
+the shader repository's `tools/compare-render-scale-ledger.py` entry point.
+Supply `--ledger <canonical-ledger.csv>` when invoking it from the toolkit;
+the other arguments and content-verified reuse rules are identical. Use one
+column per run ID and explicit lane/pass/ordinal metric rows, including
+partial AMD runs. Legacy unprefixed NVIDIA rows remain supported, and
+duplicate matching metrics fail closed. Keep the shader entry point and
+this distributed copy synchronized when updating this workflow.
+
+AMD output includes `laneQualification` separately from raw render and
+Task 2 results. It checks the configured lane, retained capability evidence,
+physical native/scaled backend and required fallback proof. Failed or
+missing qualification prevents a supported comparison assessment; it does
+not rewrite terminal render results. Blocked-lane memory is inapplicable
+only with retained capability proof and no contradictory execution evidence.

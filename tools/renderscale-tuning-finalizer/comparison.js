@@ -6,7 +6,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { envelope, step, transitionHealth, transitionTimings, switchHealthSummary,
     markdownTable } = require("./switch-health.js");
-const { sourceProfile, actualBackend } = require("./finalizer.js");
+const { sourceProfile, actualBackend, laneQualification, readLaneContext } = require("./finalizer.js");
 const hash = file => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 const canonical = value => JSON.stringify(value, (_, item) => item && typeof item === "object" &&
     !Array.isArray(item) ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
@@ -38,6 +38,7 @@ function loadRun(root, provenance = {}) {
     const index = envelope(path.join(root, "receipt-index.json"));
     const indexed = new Map((index?.files ?? []).map(item => [item.path, item]));
     const seen = new Set(), evidence = [];
+    const laneContext = readLaneContext(root);
     const rows = summary.transitions.map(original => {
         if (seen.has(key(original))) throw new Error("comparison_duplicate_transition_identity");
         seen.add(key(original));
@@ -64,7 +65,8 @@ function loadRun(root, provenance = {}) {
         if (index && (!expected || expected.sha256 !== digest || expected.bytes !== fs.statSync(raw).size))
             throw new Error("comparison_receipt_index_mismatch");
         evidence.push({ path: original.rawRetained, sha256: digest, indexVerified: Boolean(expected) });
-        return { ...original, switchHealth: transitionHealth(waiter),
+        return { ...original, laneQualification: laneQualification(root, original.lane, waiter, waiter.target, laneContext),
+            switchHealth: transitionHealth(waiter),
             switchTimings: transitionTimings(waiter), retainedRetry: retained.retryTelemetry ?? null };
     });
     const health = switchHealthSummary(root, rows, summary.build.buildId);
@@ -153,6 +155,9 @@ function compareData(baseline, candidate, policy = null) {
         reasons.push("incomplete_reporting");
     if (candidate.health.evidenceStatus !== "COMPLETE" || baseline.health.evidenceStatus !== "COMPLETE")
         reasons.push("incomplete_health_evidence");
+    if ([baseline, candidate].some(run => run.rows.some(row =>
+        row.lane && row.lane !== "nvidia" && row.laneQualification?.verdict !== "PASS")))
+        reasons.push("amd_lane_qualification_failed_or_missing");
     const validPolicy = policy && typeof policy.id === "string" && policy.id.length > 0 &&
         Number.isFinite(policy.absoluteToleranceMs) && policy.absoluteToleranceMs >= 0 &&
         Number.isFinite(policy.relativeTolerancePercent) && policy.relativeTolerancePercent >= 0 &&

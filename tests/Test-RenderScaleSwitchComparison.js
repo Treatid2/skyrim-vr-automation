@@ -97,6 +97,22 @@ try {
     assert.deepEqual(adverse.passes[0].newFailureRows, [1]);
     assert.equal(adverse.candidate.health.passes[0].counters.fidelityMismatches, 2);
     assert.equal(compareData(b, c, policy).changeAssessment.status, "IMPROVEMENT_SUPPORTED");
+    const amdBase = structuredClone(b), amdCandidate = structuredClone(c);
+    for (const run of [amdBase, amdCandidate]) {
+        for (const row of run.rows) {
+            row.lane = "explicit_fsr4";
+            row.laneQualification = { verdict: "PASS", reasons: [] };
+        }
+        for (const pass of run.health.passes) pass.lane = "explicit_fsr4";
+    }
+    assert.equal(compareData(amdBase, amdCandidate, policy).changeAssessment.status, "IMPROVEMENT_SUPPORTED");
+    for (const qualification of [{ verdict: "FAIL" }, null]) {
+        amdCandidate.rows[0].laneQualification = qualification;
+        const invalid = compareData(amdBase, amdCandidate, policy);
+        assert.equal(invalid.changeAssessment.status, "INCONCLUSIVE");
+        assert(invalid.changeAssessment.reasons.includes("amd_lane_qualification_failed_or_missing"));
+        assert.equal(invalid.candidate.rows[0].renderVerdict, "PASS");
+    }
     assert.equal(compareData(b, c).changeAssessment.status, "INCONCLUSIVE");
     assert.equal(compareData(b, load(fixture("neutral", 101)), policy).changeAssessment.status, "NEUTRAL_SUPPORTED");
     assert.equal(compareData(b, load(fixture("slow", 103)), policy).changeAssessment.status, "DOES_NOT_MEET_STANDARD");

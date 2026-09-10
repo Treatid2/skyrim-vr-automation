@@ -716,6 +716,7 @@ Assert-True (-not $simpleCsmProtocol.Contains('renderscale-tuning-amd', [StringC
 foreach ($script in @(
     'tests\Test-RenderScaleTuningLiveRunner.js',
     'tests\Test-RenderScaleTuningWorker.js',
+    'tests\Test-AmdParityReview.js',
     'tests\Test-RenderScaleTuningFinalizer.js'
 )) {
     $output = & node (Join-Path $repositoryRoot $script) 2>&1

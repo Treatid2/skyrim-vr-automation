@@ -42,6 +42,12 @@
   Both variants follow identical pacing, deadlines, cleanup/replay rules,
   evidence schemas, complete-ledger reporting, and comparison requirements.
   Only adapter verification, backend capabilities, and vendor matrices differ.
+  Keep physical lane qualification separate from raw terminal verdicts.
+  Record one ledger column per run ID with explicit lane/pass metric rows;
+  retain blocked and interrupted lanes and their evidence gaps. Correctly
+  evidenced blocked lanes are inapplicable to memory completeness; missing
+  runnable-lane evidence is incomplete. Guard capability-capture ownership
+  before the first profile apply as well as during measured passes.
   Compare available measurements even from partial runs, explicitly labeling
   missing values and incomplete coverage instead of requiring a complete run
   for ledger entry.

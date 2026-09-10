@@ -29,6 +29,8 @@ foreach ($tree in @('.codex-plugin', 'skills', 'tools', 'profiles', 'docs', 'nat
     foreach ($file in Get-ChildItem -LiteralPath $sourceRoot -Recurse -File) {
         $relative = [IO.Path]::GetRelativePath($sourceRoot, $file.FullName)
         if ($file.Name -like '*.local.json' -or
+            $file.Extension -in @('.pyc', '.pyo') -or
+            $relative -match '(^|[\\/])__pycache__([\\/]|$)' -or
             $relative -match '(^|[\\/])sessions([\\/]|$)' -or
             ($tree -eq 'native' -and $relative -match '(^|[\\/])build(?:-[^\\/]+)?([\\/]|$)') -or
             $relative -match '(^|[\\/])[.]fixture-refresh-[^\\/]+([\\/]|$)') { continue }
