@@ -7,6 +7,8 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { retryTelemetry } = require("./retry-telemetry.js");
 const { memoryConfirmation, memoryReport } = require("./memory-confirmation.js");
+const { transitionHealth, transitionTimings, switchHealthSummary,
+    healthReport } = require("./switch-health.js");
 
 const { collectTracePages, traceCapacity, validateTracePage,
     validateRetainedTrace } = require("../renderscale-tuning-live/runner.js");
@@ -597,6 +599,8 @@ function transitionRow(root, file, retained) {
         source: sourceProfile(waiter),
         actualBackend: actualBackend(waiter, target),
         retryTelemetry: retryTelemetry(retained),
+        switchHealth: transitionHealth(waiter),
+        switchTimings: transitionTimings(waiter),
         renderVerdict,
         task2Verdict: task2.verdict,
         task2MissingEvidence: task2.missingEvidence,
@@ -653,7 +657,8 @@ function csvCell(value) {
 
 function csv(rows) {
     const columns = [
-        "lane", "pass", "ordinal", "retry_telemetry_status", "retry_outcome", "retry_count",
+        "lane", "pass", "ordinal", "strict_ms", "presentation_ms", "cleanup_ms",
+        "cleanup_tail_ms", "switch_health", "switch_timings", "retry_telemetry_status", "retry_outcome", "retry_count",
         "retry_reasons", "viewport_waits", "retry_stabilization",
         "method", "quality_mode", "render_scale_mode",
         "actual_backend", "render_verdict", "stability_status",
@@ -693,6 +698,9 @@ function csv(rows) {
         const diagnostics = row.diagnostics;
         const note = row.nonStableNote;
         const values = [row.lane, row.pass, row.ordinal,
+            row.switchTimings.strictMs, row.switchTimings.presentationMs,
+            row.switchTimings.cleanupMs, row.switchTimings.cleanupTailMs,
+            row.switchHealth, row.switchTimings,
             row.retryTelemetry.status, row.retryTelemetry.outcome, row.retryTelemetry.retryCount ?? "n.d.",
             row.retryTelemetry.retryReasons, JSON.stringify(row.retryTelemetry.waits),
             JSON.stringify(row.retryTelemetry.stabilization), row.target.method,
@@ -803,7 +811,9 @@ function report(summary) {
         `- Assay execution: **${summary.assayExecution.status}**\n` +
         `- Transitions dispatched: **${summary.assayExecution.transitionsDispatched}/` +
         `${summary.assayExecution.expectedTransitions}**\n` +
-        `- Render verdict: **${summary.render.verdict}**\n` +
+        `- Terminal render verdict: **${summary.render.verdict}** (terminal condition only)\n` +
+        `- Full-history switch health: **${summary.switchHealth.status}**\n` +
+        `- Change assessment: **${summary.changeAssessment.status}**\n` +
         `- Non-stable terminal notes: **${summary.stabilityNotes.count}**\n` +
         `- Task 2/evidence: **per transition** ` +
         `(${summary.task2Evidence.counts.PASS} PASS, ` +
@@ -837,6 +847,7 @@ function report(summary) {
         `rewrite the render result, and a render pass does not hide missing ` +
         `per-transition evidence. Every raw JSON value is available in ` +
         `\`${summary.evidenceExtraction.path}\`.\n\n` +
+        healthReport(summary.switchHealth) +
         memoryReport(summary.memoryConfirmation) +
         `## Transitions\n\n` +
         `Retry waits end at the first observed preparation-ready result. ` +
@@ -1099,13 +1110,17 @@ function finalizeEvidence(options) {
             ...rowIdentity(root, file), stressSessionId: value.waiter.baseline.stressSessionId,
         })) });
     if (memory.status !== "complete") reportingReasons.push("memory_evidence_incomplete");
+    const health = switchHealthSummary(root, rows, buildIds[0]);
+    if (health.evidenceStatus !== "COMPLETE") reportingReasons.push("switch_health_evidence_incomplete");
     const reportingStatus = reportingReasons.length === 0 ? "COMPLETE" : "INCOMPLETE";
     const extraction = evidenceValues(root);
     const generatedUtc = options.generatedUtc || existing.generatedUtc ||
         "not_exposed";
     const summary = {
         ...existing,
-        schemaVersion: `renderscale-tuning-${variant}-summary-v5`,
+        build: { ...(existing.build || {}), ...(retained[0]?.value.waiter.producer || {}),
+            buildId: buildIds[0] },
+        schemaVersion: `renderscale-tuning-${variant}-summary-v6`,
         protocol: `renderscale-tuning-${variant}`,
         runId: runIds[0],
         generatedUtc,
@@ -1129,7 +1144,13 @@ function finalizeEvidence(options) {
                 undispatchedTransitionReceipts: undispatchedFailures.map((entry) =>
                     relative(root, entry.file)),
             } : null },
-        render: { verdict: renderVerdict },
+        render: { verdict: renderVerdict, scope: "terminal_condition_only" },
+        switchHealth: health,
+        changeAssessment: { status: health.passes.some(pass => pass.healthStandard === "NOT_MET") ?
+            "DOES_NOT_MEET_STANDARD" : "INCONCLUSIVE", scope: "improvement_or_neutral",
+            reasons: health.passes.some(pass => pass.healthStandard === "NOT_MET") ?
+                ["observed_health_findings_or_unmet_cumulative_gates"] : ["paired_comparison_required"],
+            changesTestResult: false },
         stabilityNotes: { count: nonStableTransitions.length,
             transitions: nonStableTransitions },
         presentationStretchAnomalies: presentationStretchAnomalies(rows),
@@ -1174,6 +1195,8 @@ function finalizeEvidence(options) {
         task2Evidence: { mode: "per_transition", counts: task2Counts,
             aggregateVerdict: "NOT_COMPUTED" },
         reportingStatus,
+        switchHealthStatus: health.status,
+        changeAssessment: summary.changeAssessment,
         files: files.map((file) => ({ path: relative(root, file),
             bytes: fs.statSync(file).size, sha256: sha256(file) })),
     };
@@ -1212,7 +1235,9 @@ if (require.main === module) {
             renderVerdict: result.summary.render.verdict,
             task2EvidenceMode: result.summary.task2Evidence.mode,
             task2RowCounts: result.summary.task2Evidence.counts,
-            reportingStatus: result.summary.reporting.status })}\n`);
+            reportingStatus: result.summary.reporting.status,
+            switchHealthStatus: result.summary.switchHealth.status,
+            changeAssessment: result.summary.changeAssessment })}\n`);
     } catch (error) {
         process.stderr.write(`${error.stack || error}\n`);
         process.exitCode = 1;
@@ -1220,6 +1245,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+    sourceProfile,
+    actualBackend,
     collectTracePages,
     deploymentVerification,
     finalizeEvidence,

@@ -818,7 +818,7 @@ function testRecoveryIsReportedWithoutRewritingFailure() {
             generatedUtc: "2026-08-30T20:00:00.000Z" });
         const row = result.summary.transitions[1];
         assert(result.summary.schemaVersion ===
-            "renderscale-tuning-nvidia-summary-v5" &&
+            "renderscale-tuning-nvidia-summary-v6" &&
             row.renderVerdict === "FAIL" &&
             row.recoveryStatus === "RECOVERED" &&
             row.recoveryTarget.method === "dlss" &&
@@ -1343,9 +1343,37 @@ function testMemoryFinalizationWithoutExistingSummary() {
     }
 }
 
+function testRecoveredHealthKeepsCompletedTest() {
+    const root = createEvidenceRoot();
+    try {
+        const file = path.join(root, "raw/pass-1/transitions/01/retained.json");
+        const value = JSON.parse(fs.readFileSync(file, "utf8"));
+        value.waiter.strictSatisfied = true;
+        value.waiter.diagnostics.delta.failures = { fidelityMismatches: 2 };
+        value.waiter.diagnostics.delta.presentation.vendorFailureStretchEyeObservations = 1;
+        writeJson(file, value);
+        const original = sha(file);
+        const { summary } = finalizeEvidence({ root, variant: "nvidia",
+            runId: "nvidia-test-run", buildId: "e".repeat(64), expectedRows: 2 });
+        assert(summary.assayExecution.status === "COMPLETE" && summary.render.verdict === "PASS",
+            "Recovered health findings rewrote the completed test or terminal verdict.");
+        assert(summary.render.scope === "terminal_condition_only" &&
+            summary.changeAssessment.status === "DOES_NOT_MEET_STANDARD" &&
+            summary.changeAssessment.changesTestResult === false,
+            "Finalization did not separate change assessment from terminal completion.");
+        assert(summary.switchHealth.passes[0].affectedTransitions[0].counters.fidelityMismatches === 2 &&
+            summary.transitions[0].switchHealth.counters.vendorFailureStretchEyeObservations === 1,
+            "Recovered failure observations were omitted from pass or transition summaries.");
+        assert(fs.readFileSync(path.join(root, "report.md"), "utf8").includes("fidelityMismatches=2"),
+            "Rendered summary hid recovered failure observations.");
+        assert(sha(file) === original, "Health reporting changed the retained receipt.");
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+}
+
 Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testRetryReportingGaps)
     .then(testRetryTelemetry)
+    .then(testRecoveredHealthKeepsCompletedTest)
     .then(testMemoryConfirmation).then(testMemoryFinalizationWithoutExistingSummary)
     .then(testTraceCompletenessPassability)
     .then(testJournalOnlyPartialFinalization)

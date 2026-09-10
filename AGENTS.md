@@ -42,6 +42,14 @@
   Compare available
   measurements even from partial runs, explicitly labeling missing values and
   incomplete coverage instead of requiring a complete run for ledger entry.
+- Every tuning ledger update includes the detailed side-by-side analysis in
+  `tools/renderscale-tuning-finalizer/README.md`. Preserve completion and
+  terminal results separately from full-history health and the
+  improvement-or-neutral assessment. Show actual relatch/strict frames and
+  milliseconds, stretch counts/frames/duration, retries and recovered failures
+  in the per-pass and per-transition comparison tables. The imposed-stretch
+  cutoff is diagnostic only. PR inclusion is solely the user's decision;
+  this analysis is not a PR requirement or merge gate.
 - Keep automated waits bounded and report the observed postcondition. A CTD is
   useful evidence, not permission for unbounded retries.
 - Treat the render-scale tuning fixture, immediate positioning, and startup
