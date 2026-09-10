@@ -761,12 +761,19 @@ function Test-DevBenchUpscalingStable {
     $displayEyeHeight = Get-DevBenchTelemetryMember $dimensions 'displayEyeHeight'
     $renderEyeWidth = Get-DevBenchTelemetryMember $dimensions 'renderEyeWidth'
     $renderEyeHeight = Get-DevBenchTelemetryMember $dimensions 'renderEyeHeight'
-    Require-StableValue (
-        $null -ne $displayEyeWidth -and [uint32]$displayEyeWidth -gt 0 -and
-        $null -ne $displayEyeHeight -and [uint32]$displayEyeHeight -gt 0 -and
-        $null -ne $renderEyeWidth -and [uint32]$renderEyeWidth -gt 0 -and
-        $null -ne $renderEyeHeight -and [uint32]$renderEyeHeight -gt 0
-    ) 'upscaling dimensions are not materialized'
+    $dimensionsValid = $true
+    foreach ($dimension in @($displayEyeWidth, $displayEyeHeight, $renderEyeWidth, $renderEyeHeight)) {
+        if (-not (Test-StableUnsignedIntegerTelemetry $dimension)) {
+            $dimensionsValid = $false
+            break
+        }
+        $dimensionValue = [uint64]$dimension
+        if ($dimensionValue -eq 0 -or $dimensionValue -gt [uint32]::MaxValue) {
+            $dimensionsValid = $false
+            break
+        }
+    }
+    Require-StableValue $dimensionsValid 'upscaling dimensions are not materialized'
 
     $effectiveProfileValid = $hasEffective -and
         (Test-DevBenchUpscalingProfileShape $effectiveProfile)
@@ -939,7 +946,7 @@ function Test-DevBenchUpscalingStable {
         Require-StableValue ($null -ne $targetEpoch) 'render-scale target epoch telemetry is missing'
         Require-StableValue ($null -ne $contractGeneration) 'stable contract generation telemetry is missing'
     }
-    $signature = if ($effectiveProfileValid -and $null -ne $targetEpoch -and $null -ne $contractGeneration) {
+    $signature = if ($effectiveProfileValid -and $dimensionsValid -and $null -ne $targetEpoch -and $null -ne $contractGeneration) {
         @(
             $method,
             (Get-DevBenchNamedValue $effectiveProfile.qualityMode),

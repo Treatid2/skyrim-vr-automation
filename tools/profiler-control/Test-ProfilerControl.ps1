@@ -196,6 +196,17 @@ $semantic = if ($optionalUnavailable) { [pscustomobject]@{known=$true;ok=$false;
     Remove-Item Env:CSX_PROFILER_TEST_RENDER_SCALE_OPTIONAL_MODE -ErrorAction SilentlyContinue
 
     [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
+    $env:CSX_PROFILER_TEST_RENDER_SCALE_OPTIONAL_MODE = 'unsupported'
+    $env:CSX_PROFILER_TEST_DRIFT_AT_CALL = '3'
+    $optionalIdentityError = $null
+    try { & $measure -Label render-scale-optional-identity-drift -EvidenceDirectory (Join-Path $resolvedTestRoot 'render-scale-optional-identity-drift') -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | Out-Null }
+    catch { $optionalIdentityError = $_.Exception.Message }
+    Remove-Item Env:CSX_PROFILER_TEST_RENDER_SCALE_OPTIONAL_MODE -ErrorAction SilentlyContinue
+    Remove-Item Env:CSX_PROFILER_TEST_DRIFT_AT_CALL -ErrorAction SilentlyContinue
+    $optionalIdentityFinalState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    Assert-Test ($optionalIdentityError -match 'runtime identity changed' -and -not $optionalIdentityFinalState.enabled) 'optional render-scale unavailability never bypasses runtime identity validation'
+
+    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
     $env:CSX_PROFILER_TEST_DISTORT_LABEL = 'renderscale-before'
     $renderScaleGuardError = $null
     try { & $measure -Label render-scale-guard-failure -EvidenceDirectory (Join-Path $resolvedTestRoot 'render-scale-guard-failure') -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | Out-Null }
@@ -213,7 +224,7 @@ $semantic = if ($optionalUnavailable) { [pscustomobject]@{known=$true;ok=$false;
     Assert-Test ($recoveredMeasurement.ok -and $recoveredPriorJournal.phase -eq 'recovered-preimage' -and $recoveredPriorJournal.recovery.stateRestored -and -not $recoveredFinalState.enabled) 'next capture discovers a dead capture journal and restores the same runtime exact prior state'
 
     [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
-    $env:CSX_PROFILER_TEST_DRIFT_AT_CALL = '3'
+    $env:CSX_PROFILER_TEST_DRIFT_AT_CALL = '4'
     $driftError = $null
     try { & $measure -Label identity-drift -EvidenceDirectory (Join-Path $resolvedTestRoot 'drift') -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | Out-Null }
     catch { $driftError = $_.Exception.Message }

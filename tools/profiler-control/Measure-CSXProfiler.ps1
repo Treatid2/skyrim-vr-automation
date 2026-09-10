@@ -254,6 +254,11 @@ function Get-ResourcePublicationSnapshot([Parameter(Mandatory)][string]$Phase) {
         -RequirePerformanceNeutral -NoExit -Compact | ConvertFrom-Json -Depth 80
     $callCleanup = if ($call.PSObject.Properties['sessionCleanup']) { $call.sessionCleanup } else { $null }
     Assert-CapturePerformanceObservation -Call $call -Action "renderscale-$Phase" -SessionCleanup $callCleanup
+    $stableIdentity = Get-StableRuntimeIdentity -Identity $call.runtimeIdentity
+    $identityFingerprint = Get-CanonicalHash $stableIdentity
+    if ($identityFingerprint -cne $script:expectedRuntimeIdentityFingerprint) {
+        throw "DevBench runtime identity changed during profiler capture; refusing render-scale telemetry from the replacement runtime. Expected $($script:expectedRuntimeIdentityFingerprint), observed $identityFingerprint."
+    }
     if (-not $call.ok) {
         if (Test-OptionalRenderScaleUnavailable $call) {
             return [pscustomobject][ordered]@{
@@ -270,11 +275,6 @@ function Get-ResourcePublicationSnapshot([Parameter(Mandatory)][string]$Phase) {
         throw "DevBench render-scale '$Phase' guard or status call failed: $($call.errors -join '; ')"
     }
 
-    $stableIdentity = Get-StableRuntimeIdentity -Identity $call.runtimeIdentity
-    $identityFingerprint = Get-CanonicalHash $stableIdentity
-    if ($identityFingerprint -cne $script:expectedRuntimeIdentityFingerprint) {
-        throw "DevBench runtime identity changed during profiler capture; refusing render-scale telemetry from the replacement runtime. Expected $($script:expectedRuntimeIdentityFingerprint), observed $identityFingerprint."
-    }
     $payload = @($call.data.content | Where-Object { $null -ne $_ } | Select-Object -First 1)
     if ($payload.Count -ne 1) {
         return [pscustomobject][ordered]@{

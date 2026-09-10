@@ -323,6 +323,41 @@ function Test-GameMutationPolicy {
     return [pscustomobject]@{ allowed = $true; override = $false; error = $null; policy = $policy; manifestPath = $resolvedManifest; loadName = $expectedName }
 }
 
+function Get-McpSessionHeaderValue {
+    param($Response)
+
+    if ($null -eq $Response -or -not $Response.PSObject.Properties['Headers'] -or $null -eq $Response.Headers) {
+        return $null
+    }
+    $headers = $Response.Headers
+    $value = $null
+    if ($headers.PSObject.Methods['ContainsKey']) {
+        if (-not $headers.ContainsKey('Mcp-Session-Id')) { return $null }
+        $value = $headers['Mcp-Session-Id']
+    }
+    elseif ($headers -is [Collections.IDictionary]) {
+        if (-not $headers.Contains('Mcp-Session-Id')) { return $null }
+        $value = $headers['Mcp-Session-Id']
+    }
+    elseif ($headers.PSObject.Methods['TryGetValues']) {
+        $values = $null
+        if (-not $headers.TryGetValues('Mcp-Session-Id', [ref]$values)) { return $null }
+        $value = $values
+    }
+    elseif ($headers.PSObject.Methods['GetValues']) {
+        try { $value = $headers.GetValues('Mcp-Session-Id') } catch { return $null }
+    }
+    else {
+        $property = $headers.PSObject.Properties['Mcp-Session-Id']
+        if (-not $property) { return $null }
+        $value = $property.Value
+    }
+    if ($value -is [array] -or ($value -is [Collections.IEnumerable] -and $value -isnot [string])) {
+        return [string](@($value) | Select-Object -First 1)
+    }
+    return [string]$value
+}
+
 function Invoke-McpRequest {
     param([string]$Endpoint, [hashtable]$Headers, $Payload, [switch]$Mutation)
     $body = $Payload | ConvertTo-Json -Depth 30 -Compress
@@ -339,8 +374,7 @@ function Invoke-McpRequest {
                 $parseFailure = [IO.InvalidDataException]::new(
                     "DevBench returned malformed JSON: $($_.Exception.Message)",
                     $_.Exception)
-                $returnedSession = $response.Headers['Mcp-Session-Id']
-                $returnedSessionId = if ($returnedSession -is [array]) { [string]$returnedSession[0] } else { [string]$returnedSession }
+                $returnedSessionId = Get-McpSessionHeaderValue -Response $response
                 if (-not [string]::IsNullOrWhiteSpace($returnedSessionId)) {
                     $parseFailure.Data['DevBenchMcpSessionId'] = $returnedSessionId
                 }
@@ -540,8 +574,7 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
                 protocolVersion = '2025-03-26'; capabilities = @{}; clientInfo = @{ name = 'DevBenchControl'; version = '1.5' }
             }
         }
-        $sessionHeader = $initialize.response.Headers['Mcp-Session-Id']
-        $sessionId = if ($sessionHeader -is [array]) { [string]$sessionHeader[0] } else { [string]$sessionHeader }
+        $sessionId = Get-McpSessionHeaderValue -Response $initialize.response
         if ([string]::IsNullOrWhiteSpace($sessionId)) { throw 'DevBench did not return an MCP session ID.' }
         $sessionHeaders = @{ Accept = 'application/json, text/event-stream'; 'Content-Type' = 'application/json'; 'Mcp-Session-Id' = $sessionId }
         $ownedMcpSessions.Add([pscustomobject][ordered]@{
@@ -1136,6 +1169,8 @@ try {
                 }
                 catch {
                     if (-not (Test-WaitRetryableException -Exception $_.Exception)) { throw }
+                    Close-McpSessionForRebind -Headers $headers | Out-Null
+                    $headers = $null
                     $stableCandidateCount = 0
                     $stableFirstFrame = 0u
                     $stableLastFrame = 0u
