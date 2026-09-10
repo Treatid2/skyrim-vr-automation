@@ -9,17 +9,24 @@ const { EventEmitter } = require("node:events");
 const { spawn } = require("node:child_process");
 const { ReceiptQueue, runWorker, McpClient } =
     require("../tools/renderscale-tuning-live/durable-worker.js");
+const { startRenderScaleTuningWorker } = require("../tools/renderscale-tuning-live/handoff.js");
+const { finalizeEvidence } = require("../tools/renderscale-tuning-finalizer/finalizer.js");
 const { createMock, positioningRoot, envelope, buildId } = require("./Test-RenderScaleTuningLiveRunner.js");
 const source = path.resolve(__dirname, "..");
 const matrix = JSON.parse(fs.readFileSync(path.join(source,
     "skills/renderscale-tuning-nvidia/references/matrix.v1.json")));
+const amdMatrix = JSON.parse(fs.readFileSync(path.join(source,
+    "skills/renderscale-tuning-amd/references/matrix.v1.json")));
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "tuning-worker-test-"));
-function request(name) {
+function request(name, variant = "nvidia", fsr4Available = false) {
     const root = path.join(temporary, name);
     fs.mkdirSync(path.join(root, "raw", "journal"), { recursive: true });
-    const positioning = positioningRoot();
+    const positioning = positioningRoot(variant === "amd" ? {
+        supportedFSRRuntimeMask: fsr4Available ? 3 : 1,
+        fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: fsr4Available ? 0 : 1 }],
+    } : {});
     positioning.results.find(step => step.label === "position-health").result = { pid: 7, exe: "SkyrimVR.exe", vr: true };
-    return { root, runId: name, variant: "nvidia", buildId, matrix, positioningRoot: positioning,
+    return { root, runId: name, variant, buildId, matrix: variant === "amd" ? amdMatrix : matrix, positioningRoot: positioning,
         startupReceipts: { prepare: envelope({ ready: true }), positioning: envelope(positioning) } };
 }
 function clientFor(mock) {
@@ -54,30 +61,71 @@ async function testQueue() {
     await assert.rejects(broken.write("queue:failed", {}), /disk full/);
     await assert.rejects(broken.close(), /disk full/);
 }
-async function testFullMatrix() {
-    const req = request("complete");
+async function testHandoff() {
+    for (const variant of [undefined, "nvidia", "amd"]) {
+        const req = request(`handoff-${variant}`, variant);
+        const calls = [];
+        let saved;
+        const tools = {
+            exec_command: async args => {
+                calls.push(args);
+                return { exit_code: 0, output: calls.length === 1 ? temporary : '{"ok":true}' };
+            },
+            apply_patch: async patch => { saved = JSON.parse(patch.split("\n")[2].slice(1)); return {}; },
+        };
+        assert.deepEqual(await startRenderScaleTuningWorker({ ...req, tools, variant, pluginRoot: source }), { ok: true });
+        assert.equal(saved.variant, variant ?? "nvidia");
+        assert.deepEqual(saved.positioningRoot, req.positioningRoot);
+        assert.deepEqual(saved.startupReceipts, req.startupReceipts);
+        assert.equal(calls.length, 2, "handoff added a live call or extra startup work");
+    }
+    for (const variant of ["intel", "../nvidia", "", null]) {
+        await assert.rejects(startRenderScaleTuningWorker({ tools: {}, runId: "invalid", variant, pluginRoot: source }),
+            /invalid_worker_handoff/);
+    }
+}
+async function testFullMatrix(variant = "nvidia", fsr4Available = false) {
+    const req = request(`complete-${variant}-${fsr4Available}`, variant, fsr4Available);
+    const expectedRows = variant === "amd" ? 124 : 66;
     const mock = createMock(0);
     const result = await runWorker(req, { client: clientFor(mock) });
     assert.equal(result.state, "COMPLETE", JSON.stringify(result));
-    assert.equal(result.completedTransitions, 66);
+    assert.equal(result.completedTransitions, expectedRows);
+    assert.equal(result.variant, variant);
     assert.equal(result.cleanupVerified, true);
     const journal = fs.readFileSync(path.join(req.root, "raw", "journal.ndjson"), "utf8").trim().split("\n");
     const last = JSON.parse(journal.at(-1));
-    assert.equal(last.receiptKey, "complete:live-result");
+    assert.equal(last.receiptKey, `${req.runId}:live-result`);
     assert.equal(last.value.status, "COMPLETE");
     const records = journal.map(line => JSON.parse(line));
     const rows = new Map(records.filter(entry => /:pass-\d+:transition-\d+$/.test(entry.receiptKey))
         .map(entry => [entry.receiptKey, entry.value]));
-    assert.equal(rows.size, 66, "The document omitted measured transitions");
+    assert.equal(rows.size, expectedRows, "The document omitted measured transitions");
     for (const row of rows.values()) {
         assert.equal(row.waiter.timing.elapsedMs, 1);
         assert.equal(row.waiter.timing.dispatchTick, 10);
         assert.equal(row.waiter.timing.stableTick, 11);
     }
     assert.ok(fs.statSync(path.join(req.root, "worker-status.json")).size < 6000);
+    if (variant === "amd") {
+        assert.deepEqual(result.result.lanes.map(lane => lane.status),
+            fsr4Available ? ["COMPLETE", "COMPLETE", "BLOCKED"] : ["BLOCKED", "COMPLETE", "COMPLETE"]);
+    }
+    for (const lane of last.value.lanes.filter(lane => lane.status === "COMPLETE")) {
+        assert.equal(lane.passes.length, 2);
+        for (const pass of lane.passes) assert.equal(pass.rows.length, req.matrix.transitions.length);
+    }
+    const measured = mock.scenarioCalls.filter(call => call.steps[0]?.label === "transition-pace");
+    assert.equal(measured.length, expectedRows);
+    assert.ok(measured.every(call => call.steps[0].wait === 5000));
+    assert.ok(measured.every(call => call.steps.find(step => step.label === "qualification-wait").args.timeoutMs === 20000));
+    const finalized = finalizeEvidence({ root: req.root, runId: req.runId, variant, buildId, expectedRows });
+    assert.equal(finalized.summary.assayExecution.status, "COMPLETE");
+    const columns = fs.readFileSync(path.join(req.root, "transitions.csv"), "utf8").split("\n")[0];
+    return { summaryKeys: Object.keys(finalized.summary).sort(), columns };
 }
-async function testSlowSavingAndFailure() {
-    const req = request("slow");
+async function testSlowSavingAndFailure(variant = "nvidia") {
+    const req = request(`slow-${variant}`, variant);
     const mock = createMock(0);
     let pending = 0, overlapped = false;
     const client = clientFor(mock), call = client.call;
@@ -92,7 +140,7 @@ async function testSlowSavingAndFailure() {
     const result = await runWorker(req, { client, journal });
     assert.equal(result.state, "COMPLETE"); assert.equal(overlapped, true); assert.equal(pending, 0);
 
-    const failed = request("write-failure"), failureMock = createMock(0);
+    const failed = request(`write-failure-${variant}`, variant), failureMock = createMock(0);
     let writes = 0;
     const failingJournal = { root: failed.root, check() {}, write: async () => {
         if (++writes >= 8) throw new Error("disk full");
@@ -115,12 +163,14 @@ async function testPacing() {
     assert.equal(result.state, "COMPLETE"); assert.equal(result.pacing.status, "EXCEEDED");
     assert.equal(result.completedTransitions, 66); assert.equal(result.cleanupVerified, true);
 }
-async function testDetachedAndMcp(mode = "normal") {
-    const fixture = path.join(temporary, `plugin-${mode}`);
+async function testDetachedAndMcp(mode = "normal", variant = "nvidia") {
+    const fixture = path.join(temporary, `plugin-${mode}-${variant}`);
     fs.mkdirSync(path.join(fixture, "tools"), { recursive: true });
     fs.cpSync(path.join(source, "tools", "renderscale-tuning-live"), path.join(fixture, "tools", "renderscale-tuning-live"), { recursive: true });
     fs.mkdirSync(path.join(fixture, "skills/renderscale-tuning-nvidia/references"), { recursive: true });
     fs.writeFileSync(path.join(fixture, "skills/renderscale-tuning-nvidia/references/matrix.v1.json"), JSON.stringify(matrix));
+    fs.mkdirSync(path.join(fixture, "skills/renderscale-tuning-amd/references"), { recursive: true });
+    fs.writeFileSync(path.join(fixture, "skills/renderscale-tuning-amd/references/matrix.v1.json"), JSON.stringify(amdMatrix));
     const mock = createMock(0), mockClient = clientFor(mock);
     const sessions = new Map();
     let sessionSerial = 0;
@@ -159,9 +209,9 @@ async function testDetachedAndMcp(mode = "normal") {
     try {
     const endpoint = `http://127.0.0.1:${server.address().port}/mcp`;
     fs.writeFileSync(path.join(fixture, ".mcp.json"), JSON.stringify({ mcpServers: { devbench_vr: { type: "http", url: endpoint } } }));
-    const req = request(`detached-startup-${mode}`);
-    req.runId = `detached-${mode}`; req.workspace = temporary;
-    const file = path.join(temporary, `request-${mode}.json`); fs.writeFileSync(file, JSON.stringify(req));
+    const req = request(`detached-startup-${mode}-${variant}`, variant);
+    req.runId = `detached-${mode}-${variant}`; req.workspace = temporary;
+    const file = path.join(temporary, `request-${mode}-${variant}.json`); fs.writeFileSync(file, JSON.stringify(req));
     const entrypoint = path.join(fixture, "tools/renderscale-tuning-live/durable-worker.js");
     const child = spawn(process.execPath, [entrypoint, "start", file], {
         env: { ...process.env, LOCALAPPDATA: path.join(temporary, "state") }, windowsHide: true,
@@ -172,13 +222,29 @@ async function testDetachedAndMcp(mode = "normal") {
     await new Promise((resolve, reject) => child.on("exit", code => code === 0 ? resolve() : reject(new Error(errors))));
     const launched = JSON.parse(output);
     assert.ok(launched.pid > 0);
+    for (const competingVariant of [variant === "amd" ? "nvidia" : "amd", "../nvidia"]) {
+        const competingRun = `${req.runId}-competing`;
+        const competingFile = path.join(temporary, `${competingRun}.json`);
+        fs.writeFileSync(competingFile, JSON.stringify({ ...req, runId: competingRun, variant: competingVariant }));
+        const competing = spawn(process.execPath, [entrypoint, "start", competingFile], {
+            env: { ...process.env, LOCALAPPDATA: path.join(temporary, "state") }, windowsHide: true,
+            stdio: ["ignore", "ignore", "pipe"],
+        });
+        let rejected = "";
+        competing.stderr.on("data", data => { rejected += data; });
+        const code = await new Promise(resolve => competing.on("exit", resolve));
+        assert.equal(code, 1, "another variant bypassed endpoint ownership or request validation");
+        assert.match(rejected, competingVariant === "../nvidia" ? /invalid_worker_request/ : /EEXIST/);
+        assert.equal(fs.existsSync(path.join(temporary, "artifacts/renderscale-tuning", competingRun)), false);
+    }
     const started = Date.now(); let state;
     do {
         await new Promise(resolve => setTimeout(resolve, 50));
         if (fs.existsSync(launched.statusPath)) state = JSON.parse(fs.readFileSync(launched.statusPath));
     } while ((!state || state.state === "RUNNING") && Date.now() - started < 20000);
     assert.equal(state?.state, "COMPLETE", JSON.stringify(state));
-    assert.equal(state.completedTransitions, 66, "worker stopped after launcher exited");
+    assert.equal(state.completedTransitions, variant === "amd" ? 124 : 66, "worker stopped after launcher exited");
+    assert.equal(state.variant, variant);
     assert.equal(state.cleanupVerified, true);
     if (mode === "delete-timeout") assert.equal(state.transportCleanupError, "mcp_close_timeout");
     else assert.equal(state.transportCleanupError, undefined);
@@ -274,9 +340,9 @@ async function testTransportShutdownFailure() {
         }
     } finally { global.fetch = originalFetch; }
 }
-async function testCleanupRecovery() {
+async function testCleanupRecovery(variant = "nvidia") {
     for (const mode of ["expired", "lost-stop-response", "changed-process", "foreign-capture", "incomplete-status", "unavailable"]) {
-        const req = request(`cleanup-${mode}`), mock = createMock(0);
+        const req = request(`cleanup-${mode}-${variant}`, variant), mock = createMock(0);
         const client = clientFor(mock), originalCall = client.call;
         let failed = false, reconnected = 0, stopBatches = 0, measuredCalls = 0;
         client.reconnectForCleanup = async () => {
@@ -329,7 +395,7 @@ async function testCleanupRecovery() {
             assert.equal(result.state, "INTERRUPTED", JSON.stringify(result));
             assert.equal(result.cleanupVerified, true);
             assert.equal(stopBatches, 1, "a stop batch was replayed instead of verified");
-            assert.equal(measuredCalls, 33, "measurement resumed on a cleanup connection");
+            assert.equal(measuredCalls, req.matrix.transitions.length, "measurement resumed on a cleanup connection");
         } else {
             assert.equal(result.state, "INTERRUPTED");
             assert.equal(result.cleanupVerified, false);
@@ -341,9 +407,9 @@ async function testCleanupRecovery() {
         }
     }
 }
-async function testBaselineFailureCleanup() {
+async function testBaselineFailureCleanup(variant = "nvidia") {
     for (const mode of ["timeout", "recovered-timeout", "foreign-stress", "stop-refused"]) {
-        const req = request(`baseline-${mode}`);
+        const req = request(`baseline-${mode}-${variant}`, variant);
         const mock = createMock(0, (receipt, context) => {
             if (context.baseline) {
                 receipt.satisfied = false;
@@ -387,7 +453,7 @@ async function testBaselineFailureCleanup() {
         const result = await runWorker(req, { client });
         assert.equal(result.state, "INTERRUPTED");
         assert.equal(result.completedTransitions, 0);
-        assert.equal(result.result.lanes[0].passes[0].error, "baseline_failed");
+        assert.equal(result.result.lanes.flatMap(lane => lane.passes)[0].error, "baseline_failed");
         assert.equal(result.ownership.stressSessionId, 1, "baseline capture ownership was not published");
         assert.equal(result.cleanupVerified, ["timeout", "recovered-timeout"].includes(mode),
             "baseline capture cleanup was not verified");
@@ -449,10 +515,19 @@ async function testCleanupStopFailure() {
         console.log(`Baseline failure cleanup tests passed; fixtures: ${temporary}`);
         return;
     }
-    await testQueue(); await testFullMatrix(); await testSlowSavingAndFailure();
+    await testQueue(); await testHandoff();
+    const nvidiaOutput = await testFullMatrix();
+    for (const fsr4Available of [false, true]) {
+        assert.deepEqual(await testFullMatrix("amd", fsr4Available), nvidiaOutput,
+            "AMD finalization changed the shared summary fields or transition CSV columns");
+    }
+    await testSlowSavingAndFailure(); await testSlowSavingAndFailure("amd");
     await testPacing(); await testStreamingResponse(); await testNotificationShutdown();
     await testTransportShutdownFailure(); await testCleanupRecovery();
-    await testBaselineFailureCleanup(); await testCleanupStopFailure(); await testDetachedAndMcp();
+    await testCleanupRecovery("amd");
+    await testBaselineFailureCleanup(); await testBaselineFailureCleanup("amd");
+    await testCleanupStopFailure(); await testDetachedAndMcp();
     await testDetachedAndMcp("delete-timeout");
+    await testDetachedAndMcp("normal", "amd");
     console.log(`Durable tuning worker tests passed; fixtures: ${temporary}`);
 })().catch(error => { console.error(error.stack || error); process.exitCode = 1; });

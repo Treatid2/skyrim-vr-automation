@@ -33,15 +33,18 @@
 - Retain exact backups and receipts until the associated test evidence has been
   classified. Never delete unclassified MO2 overwrite or shader-cache content.
 - Render-scale tuning queues an immutable copy of each received measurement
-  and later revision before the next operation. NVIDIA uses a detached worker
-  and one append-only journal; disk writes and flushes never gate the next
-  transition or pass. Drain and flush all queued evidence after measurement
-  and ownership cleanup, before reporting evidence completion. Never discard
+  and later revision before the next operation. AMD and NVIDIA use the same
+  detached worker and one append-only journal; disk writes and flushes never
+  gate the next transition or pass. Drain and flush all queued evidence after
+  measurement and ownership cleanup, before reporting evidence completion. Never discard
   receipts, reduce telemetry, or stop measurement because saving falls behind.
   Report progress every five transitions without controlling worker execution.
-  Compare available
-  measurements even from partial runs, explicitly labeling missing values and
-  incomplete coverage instead of requiring a complete run for ledger entry.
+  Both variants follow identical pacing, deadlines, cleanup/replay rules,
+  evidence schemas, complete-ledger reporting, and comparison requirements.
+  Only adapter verification, backend capabilities, and vendor matrices differ.
+  Compare available measurements even from partial runs, explicitly labeling
+  missing values and incomplete coverage instead of requiring a complete run
+  for ledger entry.
 - Every tuning ledger update includes the detailed side-by-side analysis in
   `tools/renderscale-tuning-finalizer/README.md`. Preserve completion and
   terminal results separately from full-history health and the

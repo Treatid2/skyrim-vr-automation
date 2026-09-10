@@ -14,17 +14,20 @@ preflight phase.
 Sections 2 through 4 audit actions already executed by the live skill; never
 replay them when this file is loaded for finalization.
 
-Use the installed plugin's direct DevBench MCP tools exclusively for every AMD
-lane baseline, transition, evidence read, and guarded cleanup. Do not enumerate
-tools, audit schemas, use a controller, switch lanes, or generate a local
-orchestration script. If one of the named direct calls is unavailable, stop
-with `plugin_direct_unavailable`; there is no fallback transport.
+Startup uses the installed plugin's direct DevBench MCP tools. After
+positioning, the packaged detached worker uses the same selected endpoint
+from `.mcp.json`, one persistent session, and the positioned PID and bound
+Build ID. Do not enumerate tools, audit schemas, use a controller, select an
+alternate endpoint, or generate another orchestration script. A lost session
+permits one replacement on that exact endpoint solely for ownership-guarded
+cleanup, never resumed measurement or mutation replay.
 
-Require `status.adapter.available: true` and AMD vendor ID `0x1002`/4098 in the
-positioning `communityshaders.renderscale status` result. This is the bound
-active D3D adapter; do not substitute generic process inventory or a
-description string. Retain the fixture receipt and the single positioning
-scenario response.
+Require `status.adapter.available: true` and AMD vendor ID `0x1002`/4098
+in existing stress-start receipts and terminal waiters. A safe non-stable
+waiter without status retains the verified identity of its exact stress
+session. Missing or mismatched identity stops measurement with diagnostics.
+Do not add an adapter gate to positioning: its render-scale result is opaque.
+Retain the fixture receipt and the single positioning scenario response.
 
 Require public capabilities to expose FSR and every matrix quality mode before
 any baseline. A missing method or quality is `BLOCKED`; do not substitute a
@@ -43,7 +46,7 @@ At native resolution they remain inactive with backend `none`, but retain the
 exact logical method and never replace a public profile.
 
 The live skill passes packaged `matrix.v1.json` unchanged to the deterministic
-runner in the positioning orchestration cell. Do not reopen, revalidate, or
+runner in the detached worker launched after positioning. Do not reopen, revalidate, or
 summarize the matrix while reading this protocol.
 
 ## 2. Select and isolate the three lanes
@@ -366,6 +369,52 @@ stale old-provider dispatch after mutation, or ordinary-world fallback caused
 solely by pre-mutation replacement admission is a transition `FAIL`.
 
 ## 5. Completion and evidence rules
+
+Read retry diagnostics from the existing terminal waiter's
+`status.retryTelemetry` (schema version 1), retaining the complete object.
+`observation.status.retryTelemetry` is the equivalent fallback. Do not add a
+live read, polling loop, wait or admission gate to obtain these diagnostics.
+The finalizer owns interpretation through
+`tools/renderscale-tuning-finalizer/retry-telemetry.js`.
+
+Correlate the producer Build ID, stress session, request ID and transition epoch
+with that exact transition and its dispatch-to-terminal QPC window. Preserve
+every non-coalesced `Retry` reason/category and source file/line. Correlate each
+`ViewportWaitEnd` with its `ViewportWaitBegin` sequence, role and generation;
+report the observed pending-to-ready milliseconds, cache/slot/victim details,
+initial/final fence result and pending-observation count. Failed, cancelled,
+superseded, stopped and unresolved waits remain explicit unavailable durations.
+Never sum overlapping full-eye and foveated-center waits as transition cost.
+Retain the full ring inside the waiter once. Validate its unbroken sequence,
+sample ownership and QPC ordering before deriving counts or durations. An
+overwrite before a fully retained transition window is not a gap in that
+transition. Invalid global evidence leaves counts and timings unavailable;
+an invalid individual wait leaves its duration unavailable while an
+independently verified retry count remains usable.
+
+Keep `GuardArmed`, `ProofRevoked`, `SettleGuardSatisfied`, `PromotionCandidate`, `Promoted`, and
+`GuardCleared` events. Report ready-to-candidate and candidate-to-promotion
+intervals separately from viewport waits. The six-frame guard overlaps stereo
+qualification; neither retry-to-stable nor ready-to-candidate is isolated retry
+overhead. Preserve the applicable guard deadline, first observed satisfied
+guard age, and requeue-to-admission as observed scheduler backoff. A guard
+already satisfied before readiness does not imply a negative wait duration.
+Include immediate `ViewportReady` observations when finding the final ready
+role. Require the same uninterrupted guard segment for its candidate and
+promotion, with valid stereo counts and any required minimum guard age.
+Cleared or replaced guards cannot supply another segment's missing milestone.
+
+Put diagnostic status, retry count/reasons, per-role wait milliseconds and
+ready-to-candidate milliseconds directly after the transition identity in CSV
+and report columns. Keep all events and intervals in `summary.json` and retain
+the raw receipts. Missing telemetry is `not_exposed`, never zero retries.
+Unsupported schemas, invalid clocks or ownership, overwrites within the window and
+unmatched intervals make retry reporting incomplete. They do not change the
+render verdict, stop the worker, trigger recovery or authorize replay.
+Display unavailable measurements as `n.d.` and the affected reporting outcome
+as `n/a`, retaining the detailed reason. Keep every retrieved value in its raw
+receipt and the full `evidence-values.csv` export even when provenance cannot
+support a derived result. These checks run only during offline reporting.
 
 For scaled FSR, require requested, effective, stable, and physical profiles to
 agree; scaled dimensions; coherent both-eye FSR presentation; exact provider
@@ -833,13 +882,15 @@ paths, then stop; do not start another protocol.
 
 ### Retention and partial comparisons
 
-Retain measurements as they arrive. After positioning, the runner writes each
-scenario envelope and row revision into a new numbered JSON file under the
-run's `raw/journal` directory before the next operation. This is a data save,
-not another rendering admission gate. The first trace page and all continuation
-pages are retained before any reset. Repeated keys create new files; they do
-not overwrite earlier evidence. Startup envelopes and the final live result
-use the same journal. An existing run directory is never reused for a new run.
+Retain measurements as they arrive. After positioning, the worker queues an
+immutable copy of each scenario envelope and row revision before the next
+operation. A dedicated writer appends one `raw/journal.ndjson` document;
+disk acknowledgements and flushes never gate a transition or pass. Preserve
+the first trace page and all continuation pages before any reset. Repeated
+keys append new revisions without overwriting earlier evidence. Startup
+envelopes and the final live result use the same journal. An existing run
+directory is never reused for a new run. Drain and flush after all runnable
+lanes and ownership cleanup before reporting evidence complete.
 
 Offline finalization materializes the latest revision for each key from the
 journal, preserving every original revision. It does not depend on turn-local
@@ -847,3 +898,12 @@ journal, preserving every original revision. It does not depend on turn-local
 measurements that exist, label incomplete execution/evidence and unavailable
 metrics, and preserve prior ledger cells. Missing evidence is not a reason to
 discard available timings or memory samples or to deny a partial comparison.
+
+### Explicit failed-recovery replay
+
+Follow the [skill's explicit failed-recovery replay rule](../SKILL.md#explicit-failed-recovery-replay).
+Only the immediately preceding attempt's `transition_recovery_failed` and
+an explicit user order to close the identified stale menu and continue may
+authorize one replacement. Require verified cleanup and unchanged PID/Build
+ID ownership, preserve all interrupted evidence, and run the complete AMD
+assay with a fresh run ID. Never resume a partial pass or replay automatically.

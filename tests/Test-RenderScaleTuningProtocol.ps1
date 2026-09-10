@@ -151,11 +151,11 @@ foreach ($token in @(
     'Do not invent another previous-transition safety gate',
     '60,000 ms `position-settle`', '20,000 ms strict waiter',
     'record `nonStableNote`', 'not permission to overlap mutations',
-    '`store()` that exact terminal receipt', 'return only a compact', '`text()`',
+    '`store()` that exact terminal receipt', 'publish only a compact', 'projection through worker status',
     'Store the complete scenario envelope', '`failedStep`',
     '`firstUnreportedStep`', 'never invent that it failed',
-    'complete measured pass in that one live orchestration cell',
-    '`notify()`', '`yield_control()`',
+    'every measured pass and runnable lane in the same detached worker',
+    '`notify()`', 'Status reads never cancel, restart, or replay the worker',
     'sole server-owned `wait` of exactly 5,000 ms',
     "preceding terminal waiter's", 'journal every received terminal response',
     'one cumulative evidence-read batch', 'generate the receipt index',
@@ -293,17 +293,11 @@ foreach ($variant in $variants) {
     Assert-Contains $skill 'does not authorize' $variant.Name
     Assert-Contains $skill 'VR FPS Stabilizer' $variant.Name
     Assert-Contains $skill 'outside this assay' $variant.Name
-    if ($variant.Name -eq 'renderscale-tuning-nvidia') {
-        foreach ($token in @('hidden detached Node worker', 'raw/journal.ndjson',
-            'A save backlog never aborts or slows measurement', 'every five completed transitions',
-            'same selected DevBench MCP', 'one persistent session', 'Startup uses direct')) {
-            Assert-Contains $skill $token $variant.Name
-        }
-    } else {
-        Assert-Contains $skill 'Direct `mcp__devbench_vr__*` tools are the only' $variant.Name
-        Assert-Contains $skill 'Do not enumerate tools or inspect fallbacks' $variant.Name
-        Assert-Contains $skill 'if a named tool is not callable' $variant.Name
-        Assert-Contains $skill 'never use the bundled controller' $variant.Name
+    foreach ($token in @('hidden detached Node worker', 'raw/journal.ndjson',
+        'A save backlog never aborts or slows measurement', 'every five completed transitions',
+        'same selected DevBench MCP', 'one persistent session', 'Startup uses direct',
+        '## Explicit failed-recovery replay', 'transition_recovery_failed')) {
+        Assert-Contains $skill $token $variant.Name
     }
     Assert-True (-not $skill.Contains('evidence-values.csv', [StringComparison]::Ordinal)) "$($variant.Name) moved finalization into startup instructions."
     Assert-Contains $live '../../../docs/protocols/renderscale-tuning-fast-start.md' $variant.Name
@@ -397,10 +391,10 @@ foreach ($variant in $variants) {
         '`prepare_tuning`', '`0.3/0.3/0.7` fixture',
         '`SKILL.md` owns runtime-only `prepare_tuning`, positioning',
         'one synchronous', 'Do not repeat live reads',
-        'Do not enumerate', 'audit schemas', '`plugin_direct_unavailable`',
-        'no fallback transport',
+        'Do not enumerate', 'audit schemas', 'select an alternate endpoint',
+        'never resumed measurement or mutation replay',
         'measured live loop before this file is read',
-        'deterministic runner in the positioning orchestration cell',
+        'deterministic runner in the detached worker launched after positioning',
         'Do not reopen, revalidate, or summarize the matrix',
         'reset then start the short', 'six baseline scenario steps',
         'one synchronous fail-closed handoff scenario',
@@ -446,7 +440,7 @@ foreach ($variant in $variants) {
         'Scenario steps cannot interpolate earlier',
         'short ownership sequence', 'Do not issue a separate',
         'atomically resets/starts', '`clear_history`',
-        'positioning `communityshaders.renderscale status` result',
+        'existing stress-start receipts and terminal waiters',
         'they are output evidence',
         'Native-generation evidence is optional',
         'do not relabel a core `PASS`',
@@ -616,11 +610,11 @@ foreach ($protocol in @(
 )) {
     $sharedProtocolText = "$($protocol.Text)`n$fastStart"
     foreach ($token in @(
-        "installed plugin's direct DevBench MCP tools exclusively",
+        "Startup uses the installed plugin's direct DevBench MCP tools",
         'Do not enumerate',
         'audit schemas',
-        '`plugin_direct_unavailable`',
-        'no fallback transport',
+        'same selected endpoint',
+        'never resumed measurement or mutation replay',
         'without changing the shared 20-second measurement deadline',
         '`qualification_status`',
         'Never replay the',

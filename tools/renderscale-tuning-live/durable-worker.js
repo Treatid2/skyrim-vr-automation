@@ -51,7 +51,7 @@ function envelopeRoot(envelope) {
 
 function readRequest(file) {
     const request = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (request.variant !== "nvidia" || !/^[a-zA-Z0-9_-]+$/.test(request.runId) ||
+    if (!["nvidia", "amd"].includes(request.variant) || !/^[a-zA-Z0-9_-]+$/.test(request.runId) ||
         !/^[a-fA-F0-9]{64}$/.test(request.buildId) || !path.isAbsolute(request.workspace)) {
         throw new Error("invalid_worker_request");
     }
@@ -67,7 +67,7 @@ function readRequest(file) {
     request.ownerRoot = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), ".local", "state"),
         "SkyrimVRAutomation", "renderscale-tuning");
     request.matrix = JSON.parse(fs.readFileSync(path.join(__dirname,
-        "../../skills/renderscale-tuning-nvidia/references/matrix.v1.json"), "utf8"));
+        `../../skills/renderscale-tuning-${request.variant}/references/matrix.v1.json`), "utf8"));
     return request;
 }
 
@@ -282,7 +282,7 @@ async function runWorker(request, dependencies = {}) {
     const journal = dependencies.journal || new ReceiptQueue(request.root);
     const runner = dependencies.runner || runRenderScaleTuningLive;
     const statusPath = path.join(request.root, "worker-status.json");
-    const status = { runId: request.runId, buildId: request.buildId, pid: process.pid,
+    const status = { runId: request.runId, variant: request.variant, buildId: request.buildId, pid: process.pid,
         state: "RUNNING", completedTransitions: 0, startedUtc: new Date().toISOString(),
         pacing: { status: "VALID", maximumClientDispatchGapMs: 0, budgetMs: MAX_DISPATCH_GAP_MS } };
     const publisher = statusPublisher(statusPath);
@@ -408,7 +408,7 @@ async function runWorker(request, dependencies = {}) {
         } });
         status.state = result.status;
         status.result = { ok: result.ok, status: result.status, lanes: result.lanes?.map(lane => ({
-            id: lane.id, passes: lane.passes.map(pass => ({ pass: pass.pass, status: pass.status,
+            id: lane.id, status: lane.status, passes: lane.passes.map(pass => ({ pass: pass.pass, status: pass.status,
                 rows: pass.rows.length, error: pass.error, cleanupError: pass.cleanupError })) })) };
     } catch (error) {
         status.state = "INTERRUPTED";

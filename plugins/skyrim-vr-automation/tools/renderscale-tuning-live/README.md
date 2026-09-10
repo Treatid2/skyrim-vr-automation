@@ -1,10 +1,16 @@
-# Persistent NVIDIA tuning worker
+# Persistent render-scale tuning worker
 
-The NVIDIA skill transfers the unchanged admitted startup and fixed matrix to
+Both AMD and NVIDIA skills transfer the unchanged admitted startup and fixed matrix to
 a hidden detached Node process. One persistent connection uses the selected
 plugin's loopback DevBench MCP endpoint. The worker pins the positioned PID and
 Build ID, owns both passes, and keeps running after its launcher or chat tool
-cell exits. Progress messages do not control it. AMD retains its existing path.
+cell exits. Progress messages do not control it. The request selects `variant: "nvidia"`
+or `variant: "amd"`; the handoff defaults to NVIDIA for existing callers. The
+worker validates the variant before loading its unchanged vendor matrix.
+Both variants share pacing, deadlines, receipt storage, cleanup, and output
+contracts. AMD retains its capability-selected FSR4, FSR3, and fallback lanes;
+only runnable lanes execute, each with two 31-transition passes. Its overall
+run length follows that lane count; no extra per-transition delay is added.
 
 The runner retains `status.retryTelemetry` within each existing terminal waiter,
 without duplicating the full ring in another field of the same row.

@@ -1,7 +1,7 @@
 # AMD live fast path
 
-`tools/renderscale-tuning-live/runner.js` executes this path in the positioning
-cell. This file is its post-run audit contract; it is not read or translated
+`tools/renderscale-tuning-live/runner.js` executes this path in the detached
+worker launched after positioning. This file is its post-run audit contract; it is not read or translated
 during live measurement.
 
 Decode the admitted positioning receipt inside the runner, select runnable
@@ -28,7 +28,7 @@ On a safe terminal baseline, immediately record a compact non-stable note when
 the strict milestone was not satisfied, then run one handoff scenario: stop the
 exact baseline stress session, start measured stress, reset/start texture
 lifetime, reset/start load presentation, and enable the profiler. Execute the
-lane matrix twice in this same orchestration cell. Each row scenario starts
+lane matrix twice in this same worker process. Each row scenario starts
 with the sole 5,000 ms wait, then `qualification_begin`, transition-1 profiler
 history clear, `qualification_dispatch`, public-API `apply`, and strict
 `qualification_wait`. Transition 1 alone sets
@@ -37,8 +37,10 @@ terminal waiter's authoritative stable profile and state revision plus the
 matrix destination and lane runtime. Store the exact terminal waiter
 immediately and emit only a compact projection. Do not pause for model
 reasoning, read unrelated files, hash, or issue a confirmation read between
-rows. The runner's append-only receipt write is the required exception: save
-each received envelope and revision before starting the next operation.
+rows. Queue an immutable copy of each received envelope and revision before
+starting the next operation. The writer appends one `raw/journal.ndjson`
+document asynchronously. Queue backlog cannot delay or stop measurement;
+flush after all runnable lanes and cleanup, then generate offline evidence reports.
 
 Continue directly after a semantic baseline or row failure when the terminal
 receipt proves the owner closed, zero active operation, matching PID/Build ID,
@@ -49,7 +51,10 @@ profile. Use the render-scale iteration action only for that recovery, qualify
 the reset strictly under a fresh owner, do not retry the failed destination,
 and continue with the next row only after the reset is safe and stable. Device
 loss, OOM, lost scene/ownership/transport, or failed recovery stops future
-mutations and triggers ownership-guarded cleanup. After pass 1,
+mutations in the current attempt and triggers ownership-guarded cleanup. After
+the worker ends, only the AMD protocol's explicit failed-recovery replay
+may authorize a fresh, fully re-admitted replacement attempt; never resume the
+interrupted cell or reuse its run ID. After pass 1,
 finalize its owned sessions, take the memory boundary, run the one server-owned
 10,000 ms cooldown, establish the fresh pass-2 baseline and owners, and repeat
 the unchanged lane matrix. Finalize a lane before selecting the next one.
