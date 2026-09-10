@@ -5,6 +5,13 @@ description: Run or explicitly replay the NVIDIA Skyrim VR public-upscaling-API 
 
 # NVIDIA render-scale tuning
 
+After measurement, use the shared
+[summary and comparison contract](../../tools/renderscale-tuning-finalizer/README.md).
+Every ledger update includes detailed per-pass and per-transition comparisons,
+including relatch/strict frames and milliseconds, stretch duration and counts,
+retries and recovered failures. Keep terminal results separate from the
+improvement-or-neutral assessment. PR inclusion is the user's decision.
+
 Use only for exact command `renderscale-tuning nvidia`,
 `renderscale-tuning-nvidia`, or an explicit continuation directive for the
 immediately preceding NVIDIA attempt's failed recovery. Never infer this lane
