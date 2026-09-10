@@ -172,3 +172,12 @@ HTTP endpoint from this plugin's `.mcp.json`, with one persistent session and
 the positioned PID and bound Build ID. This post-position handoff is the sole
 transport exception; do not enumerate tools, select an alternate endpoint,
 retry failed mutations, or use the bundled controller.
+
+The worker drains the notification stream on its existing HTTP session to
+maintain session activity during server waits. After measurement transport
+loss, it may replace that session once on the exact same endpoint solely for
+cleanup. It must recheck the positioned PID and bound Build ID, match retained
+capture owners, stop only those captures, and verify them inactive. Never
+resume measurement or replay a mutation through the cleanup connection. A
+failed cleanup retains explicit ownership and its lock independently of the
+flushed evidence journal.

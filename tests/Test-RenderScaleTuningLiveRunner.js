@@ -101,6 +101,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
     let gpuActive = false;
     let textureActive = false;
     let probeActive = false;
+    let profilerEnabled = false;
     let transitionOrdinal = 0;
     let traceSession = 0;
     let traceActive = false;
@@ -132,12 +133,27 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
             stressActive = false;
             return { status: { session: { id: stressSession, active: false } } };
         }
-        if (args.action === "texture_lifetime_start") textureActive = true;
+        if (args.action === "texture_lifetime_start") {
+            textureActive = true;
+            return { capture: { active: true, sessionID: 12 } };
+        }
         if (args.action === "texture_lifetime_stop") textureActive = false;
-        if (args.action === "probe_start") probeActive = true;
+        if (args.action === "probe_start") {
+            probeActive = true;
+            return { status: { active: true, sessionID: 13 } };
+        }
         if (args.action === "probe_stop") probeActive = false;
         if (args.action === "cpu_performance_stop") cpuActive = false;
         if (args.action === "gpu_performance_stop") gpuActive = false;
+        if (args.action === "qualification_dispatch" && args.startPerformanceTelemetry) {
+            return { performanceTelemetry: { started: true,
+                cpuPerformance: { sessionId: 11 }, gpuPerformance: { startFrame: 10 } } };
+        }
+        if (step.tool === "communityshaders.profiler_api") {
+            if (args.action === "set_enabled") profilerEnabled = args.enabled;
+            return { ok: true, result: { enabled: profilerEnabled } };
+        }
+        if (args.action === "qualification_status") return { qualification: { active: false } };
         if (args.action === "dlss_trace_status") {
             return { action: args.action, producer: { buildId }, capture: traceSummary() };
         }
@@ -178,15 +194,15 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
             return {
                 status: {
                     session: { id: stressSession, active: stressActive },
-                    loadPresentationProbe: { active: probeActive },
+                    loadPresentationProbe: { active: probeActive, sessionID: 13 },
                 },
             };
         }
         if (args.action === "cpu_performance_status") {
             return { cpuPerformance: { active: cpuActive, sessionId: cpuActive ? 11 : 0 } };
         }
-        if (args.action === "gpu_performance_status") return { capture: { active: gpuActive } };
-        if (args.action === "texture_lifetime_status") return { capture: { active: textureActive } };
+        if (args.action === "gpu_performance_status") return { capture: { active: gpuActive, startFrame: 10 } };
+        if (args.action === "texture_lifetime_status") return { capture: { active: textureActive, sessionID: 12 } };
         if (step.label === "profile-apply") return { apply: { disposition: { name: "queued" } } };
         if (step.label === "recovery-profile-apply") {
             return { action: "apply", accepted: true, disposition: "queued" };

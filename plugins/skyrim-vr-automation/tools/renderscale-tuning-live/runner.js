@@ -248,6 +248,7 @@ async function runRenderScaleTuningLive(context) {
     const retainedReceiptKeys = [];
     let verifiedAdapter = null;
     let cleanupMode = false;
+    let ownedCaptures = {};
     const cleanupEvidenceErrors = [];
 
     async function retain(key, value) {
@@ -543,7 +544,7 @@ async function runRenderScaleTuningLive(context) {
             envelope = await scenarioTool({
                 action: "run",
                 async: false,
-                continueOnError: false,
+                continueOnError: cleanupMode,
                 steps,
             });
         } catch (error) {
@@ -561,9 +562,25 @@ async function runRenderScaleTuningLive(context) {
                 reportedSteps: [],
             });
         }
-        await retain(receiptKey, envelope);
         try {
-            return { envelope, root: decodeEnvelope(envelope) };
+            const root = decodeEnvelope(envelope);
+            for (const entry of root.results || []) {
+                const value = entry.result;
+                if (entry.label === "measured-stress-start" && value?.status?.session?.active) {
+                    ownedCaptures = { stressSessionId: value.status.session.id };
+                }
+                if (entry.label === "texture-lifetime-start") ownedCaptures.textureSessionId = value?.capture?.sessionID;
+                if (entry.label === "load-presentation-start") ownedCaptures.probeSessionId = value?.status?.sessionID;
+                if (entry.label === "dlss-trace-start") ownedCaptures.traceSessionId = value?.capture?.sessionID;
+                if (entry.label === "profiler-enable") ownedCaptures.profilerEnabled = value?.ok === true;
+                if (entry.label === "qualification-dispatch" && value?.performanceTelemetry?.started) {
+                    ownedCaptures.cpuSessionId = value.performanceTelemetry.cpuPerformance?.sessionId;
+                    ownedCaptures.gpuStartFrame = value.performanceTelemetry.gpuPerformance?.startFrame;
+                }
+            }
+            if (context.observeOwnership) context.observeOwnership({ ...ownedCaptures });
+            await retain(receiptKey, envelope);
+            return { envelope, root };
         } catch (error) {
             throw diagnosticError("scenario_decode_failed", {
                 phase: "decode",
@@ -2023,7 +2040,17 @@ async function runRenderScaleTuningLive(context) {
             toolStep("texture-status", "communityshaders.renderscale", {
                 action: "texture_lifetime_status", expectedBuildId: buildId,
             }),
+            toolStep("qualification-status", "communityshaders.renderscale", {
+                action: "qualification_status", expectedBuildId: buildId,
+            }),
+            toolStep("profiler-status", "communityshaders.profiler_api", {
+                contractMajor: 1, action: "snapshot", expectedBuildId: buildId,
+                clientId: `${runId}-cleanup`, commandId: `${runId}-${pass}-${suffix}`,
+            }),
         ];
+        if (variant === "nvidia") steps.push(toolStep("trace-status", "communityshaders.renderscale", {
+            action: "dlss_trace_status", expectedBuildId: buildId,
+        }));
         const response = await scenario(steps, receiptKey);
         const entries = requireScenario(response.root, steps, receiptKey);
         return entries;
@@ -2031,26 +2058,67 @@ async function runRenderScaleTuningLive(context) {
 
     async function cleanup(lane, pass, stressSessionId) {
         cleanupMode = true;
-        try {
-        const before = await status(lane, pass, "final-status-before-cleanup");
+        try { return await cleanupCaptures(lane, pass, stressSessionId); }
+        catch (error) {
+            if (context.cleanupFailed) context.cleanupFailed(error);
+            throw error;
+        } finally { cleanupMode = false; }
+    }
+
+    async function cleanupCaptures(lane, pass, stressSessionId) {
+        if (context.prepareCleanup) await context.prepareCleanup();
+        let before;
+        try { before = await status(lane, pass, "final-status-before-cleanup"); }
+        catch (error) {
+            if (!context.recoverCleanupTransport) throw error;
+            await context.recoverCleanupTransport(error);
+            before = await status(lane, pass, "final-status-before-cleanup");
+        }
         const render = before.get("render-status").status;
         const cpu = before.get("cpu-status").cpuPerformance;
         const gpu = before.get("gpu-status").capture;
         const texture = before.get("texture-status").capture;
+        const trace = before.get("trace-status")?.capture;
+        const qualification = before.get("qualification-status")?.qualification;
+        const profiler = before.get("profiler-status")?.result;
+        const activeStates = [render?.session?.active, render?.loadPresentationProbe?.active,
+            cpu?.active, gpu?.active, texture?.active, qualification?.active, profiler?.enabled];
+        if (variant === "nvidia") activeStates.push(trace?.active);
+        if (activeStates.some(value => typeof value !== "boolean")) {
+            throw new Error("cleanup_status_incomplete");
+        }
+        const requireOwner = (active, actual, expected, name) => {
+            if (active && (!Number.isSafeInteger(expected) || actual !== expected)) {
+                throw new Error(`cleanup_${name}_owner_mismatch`);
+            }
+        };
+        requireOwner(render.session.active, render.session.id, stressSessionId, "stress");
+        requireOwner(cpu.active, cpu.sessionId, ownedCaptures.cpuSessionId, "cpu");
+        requireOwner(gpu.active, gpu.startFrame, ownedCaptures.gpuStartFrame, "gpu");
+        requireOwner(texture.active, texture.sessionID, ownedCaptures.textureSessionId, "texture");
+        requireOwner(render.loadPresentationProbe.active, render.loadPresentationProbe.sessionID,
+            ownedCaptures.probeSessionId, "probe");
+        requireOwner(trace?.active, trace?.sessionID, ownedCaptures.traceSessionId, "trace");
+        if (qualification?.active !== false) throw new Error("cleanup_qualification_still_active");
+        if (profiler?.enabled && !ownedCaptures.profilerEnabled) throw new Error("cleanup_profiler_owner_missing");
         const steps = [];
+        if (trace?.active) steps.push(toolStep("dlss-trace-stop", "communityshaders.renderscale", {
+            action: "dlss_trace_stop", expectedSessionId: ownedCaptures.traceSessionId, expectedBuildId: buildId,
+        }));
         if (render.session.active) {
             steps.push(toolStep("measured-stress-stop", "communityshaders.renderscale", {
                 action: "stop", expectedSessionId: stressSessionId, expectedBuildId: buildId,
             }));
         }
         if (cpu.active) {
-            const args = { action: "cpu_performance_stop", expectedBuildId: buildId };
-            if (cpu.sessionId) args.expectedSessionId = cpu.sessionId;
+            const args = { action: "cpu_performance_stop", expectedBuildId: buildId,
+                expectedSessionId: ownedCaptures.cpuSessionId };
             steps.push(toolStep("cpu-performance-stop", "communityshaders.renderscale", args));
         }
         if (gpu.active) {
             steps.push(toolStep("gpu-performance-stop", "communityshaders.renderscale", {
                 action: "gpu_performance_stop", expectedBuildId: buildId,
+                expectedStartFrame: ownedCaptures.gpuStartFrame,
             }));
         }
         if (texture.active) {
@@ -2063,7 +2131,7 @@ async function runRenderScaleTuningLive(context) {
                 action: "probe_stop", expectedBuildId: buildId,
             }));
         }
-        steps.push(toolStep("profiler-disable", "communityshaders.profiler_api", {
+        if (profiler?.enabled) steps.push(toolStep("profiler-disable", "communityshaders.profiler_api", {
             contractMajor: 1,
             clientId: `${runId}-${lane.id}-${pass}-cleanup-client`,
             commandId: `${runId}-${lane.id}-${pass}-cleanup-disable`,
@@ -2072,10 +2140,31 @@ async function runRenderScaleTuningLive(context) {
             expectedBuildId: buildId,
         }));
         const receiptKey = `${runId}:${lane.id}:pass-${pass}:cleanup`;
-        const response = await scenario(steps, receiptKey);
-        requireScenario(response.root, steps, receiptKey);
-        await status(lane, pass, "final-status-after-cleanup");
-        } finally { cleanupMode = false; }
+        let stopError;
+        try {
+            if (steps.length) {
+                const response = await scenario(steps, receiptKey);
+                requireScenario(response.root, steps, receiptKey);
+            }
+        } catch (error) { stopError = error; }
+        // A lost stop response permits verification, never replay of the stop batch.
+        if (stopError && context.recoverCleanupTransport) await context.recoverCleanupTransport(stopError);
+        const after = await status(lane, pass, "final-status-after-cleanup");
+        if (after.get("render-status")?.status?.session?.active !== false ||
+            after.get("render-status")?.status?.loadPresentationProbe?.active !== false ||
+            after.get("cpu-status")?.cpuPerformance?.active !== false ||
+            after.get("gpu-status")?.capture?.active !== false ||
+            after.get("texture-status")?.capture?.active !== false ||
+            after.get("qualification-status")?.qualification?.active !== false ||
+            after.get("profiler-status")?.result?.enabled !== false ||
+            (variant === "nvidia" && after.get("trace-status")?.capture?.active !== false)) {
+            throw new Error("cleanup_verification_failed");
+        }
+        const mayContinueMeasurement = context.cleanupComplete ? context.cleanupComplete() : true;
+        if (stopError) await retain(`${receiptKey}:response-error`, {
+            error: String(stopError.message || stopError), verifiedInactive: true,
+        });
+        return mayContinueMeasurement;
     }
 
     async function cooldown(lane, pass) {
@@ -2148,6 +2237,7 @@ async function runRenderScaleTuningLive(context) {
         for (let pass = 1; pass <= 2; pass += 1) {
             passSequence += 1;
             let stressSessionId = 0;
+            let cleanupAttempted = false;
             const passSummary = { pass, status: "RUNNING", rows: [] };
             laneSummary.passes.push(passSummary);
             try {
@@ -2177,16 +2267,19 @@ async function runRenderScaleTuningLive(context) {
                             completed.sourceRecoveryReceiptKey,
                     });
                 }
-                await cleanup(lane, pass, stressSessionId);
+                cleanupAttempted = true;
+                const mayContinueMeasurement = await cleanup(lane, pass, stressSessionId);
                 stressSessionId = 0;
+                if (mayContinueMeasurement === false) throw new Error("cleanup_recovered_assay_interrupted");
                 passSummary.status = "COMPLETE";
                 notify({ lane: lane.id, pass, phase: "pass_complete", status: "COMPLETE" });
                 if (pass === 1) await cooldown(lane, pass);
             } catch (error) {
-                if (stressSessionId) {
+                if (stressSessionId && !cleanupAttempted) {
                     try { await cleanup(lane, pass, stressSessionId); }
                     catch (cleanupError) {
                         passSummary.cleanupError = String(cleanupError.message || cleanupError);
+                        passSummary.cleanupFailure = cleanupError.diagnostic || null;
                     }
                 }
                 summary.ok = false;

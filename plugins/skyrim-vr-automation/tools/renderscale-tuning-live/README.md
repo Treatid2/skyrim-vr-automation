@@ -6,6 +6,20 @@ plugin's loopback DevBench MCP endpoint. The worker pins the positioned PID and
 Build ID, owns both passes, and keeps running after its launcher or chat tool
 cell exits. Progress messages do not control it. AMD retains its existing path.
 
+The worker drains a persistent notification stream on that same MCP session.
+This keeps session activity current during long POST requests and server waits.
+It never adds a heartbeat tool call or another measurement session. HTTP errors
+retain their status and bounded response detail.
+
+After transport loss, measurement remains interrupted. Cleanup may reconnect
+once to the exact selected endpoint, verify the positioned PID and Build ID,
+and compare the current captures with their retained start/dispatch ownership.
+CPU and GPU stops include their session/start-frame guards. Cleanup checks the
+qualification owner, trace, profiler and every telemetry capture; a lost stop
+response leads to a status check, never a replay. A blocked cleanup preserves
+the exact known owners and failure in worker status and retains the endpoint
+lock. Journal completion never substitutes for verified inactive captures.
+
 The launcher requires Node 22 or newer. It uses `CSX_TUNING_NODE_PATH`, `node`
 on PATH, or the Node bundled with Visual Studio found through `vswhere`.
 An explicit `-NodePath` is also supported. Start only through the skill's

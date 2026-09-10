@@ -122,11 +122,29 @@ async function testDetachedAndMcp() {
     fs.mkdirSync(path.join(fixture, "skills/renderscale-tuning-nvidia/references"), { recursive: true });
     fs.writeFileSync(path.join(fixture, "skills/renderscale-tuning-nvidia/references/matrix.v1.json"), JSON.stringify(matrix));
     const mock = createMock(0), mockClient = clientFor(mock);
+    const sessions = new Map();
+    let sessionSerial = 0;
     const server = http.createServer(async (req, res) => {
-        if (req.method === "DELETE") { res.writeHead(200).end(); return; }
+        const sessionId = req.headers["mcp-session-id"];
+        if (req.method === "DELETE") { sessions.delete(sessionId); res.writeHead(200).end(); return; }
+        if (req.method === "GET") {
+            assert.ok(sessions.has(sessionId));
+            res.writeHead(200, { "Content-Type": "text/event-stream" });
+            const beat = () => { sessions.set(sessionId, Date.now()); res.write(": heartbeat\r\n\r\n"); };
+            beat();
+            const timer = setInterval(beat, 10);
+            res.on("close", () => clearInterval(timer));
+            return;
+        }
         let text = ""; for await (const chunk of req) text += chunk;
         const rpc = JSON.parse(text);
-        res.setHeader("Content-Type", "application/json"); res.setHeader("Mcp-Session-Id", "test-session");
+        res.setHeader("Content-Type", "application/json");
+        if (rpc.method === "initialize") {
+            const created = `test-session-${++sessionSerial}`;
+            sessions.set(created, Date.now()); res.setHeader("Mcp-Session-Id", created);
+        } else if (!sessions.has(sessionId) || Date.now() - sessions.get(sessionId) > 100) {
+            res.writeHead(404).end('{"error":"Session not found"}'); return;
+        }
         if (rpc.method === "notifications/initialized") { res.writeHead(202).end(); return; }
         const result = rpc.method === "initialize" ? {} : await mockClient.call(rpc.params.name, rpc.params.arguments);
         // Simulates server-owned work continuing while the launching client exits.
@@ -177,6 +195,104 @@ async function testStreamingResponse() {
         new Response(stream), 9);
     assert.equal(response.id, 9); assert.equal(cancelled, true);
 }
+async function testCleanupRecovery() {
+    for (const mode of ["expired", "lost-stop-response", "changed-process", "foreign-capture", "incomplete-status", "unavailable"]) {
+        const req = request(`cleanup-${mode}`), mock = createMock(0);
+        const client = clientFor(mock), originalCall = client.call;
+        let failed = false, reconnected = 0, stopBatches = 0, measuredCalls = 0;
+        client.reconnectForCleanup = async () => {
+            reconnected++;
+            if (mode === "unavailable") throw new Error("connection refused");
+            return {};
+        };
+        client.call = async (name, args) => {
+            if (name === "inspect" && reconnected && mode === "changed-process") {
+                return envelope({ pid: 8, exe: "SkyrimVR.exe", vr: true });
+            }
+            const measured = args.steps?.[0]?.label === "transition-pace";
+            if (measured) measuredCalls++;
+            const stopBatch = args.steps?.some(step => step.label === "measured-stress-stop");
+            if (stopBatch) {
+                stopBatches++;
+                assert.equal(args.continueOnError, true);
+                assert.equal(args.steps.find(step => step.label === "cpu-performance-stop").args.expectedSessionId, 11);
+                assert.equal(args.steps.find(step => step.label === "gpu-performance-stop").args.expectedStartFrame, 10);
+            }
+            if (mode !== "lost-stop-response" && measured && measuredCalls === 2) {
+                failed = true;
+                throw new Error("mcp_http_404: Session not found");
+            }
+            if (failed && !reconnected) throw new Error("mcp_http_404: Session not found");
+            const result = await originalCall(name, args);
+            if (mode === "lost-stop-response" && stopBatch && !failed) {
+                failed = true;
+                throw new Error("response connection reset after stops executed");
+            }
+            if (["foreign-capture", "incomplete-status"].includes(mode) && reconnected &&
+                args.steps?.some(step => step.label === "cpu-status")) {
+                const root = JSON.parse(result.content[0].text);
+                const cpu = root.results.find(step => step.label === "cpu-status").result.cpuPerformance;
+                if (mode === "foreign-capture") cpu.sessionId = 999;
+                else delete cpu.active;
+                return envelope(root);
+            }
+            return result;
+        };
+        const result = await runWorker(req, { client });
+        assert.equal(reconnected, 1, mode);
+        if (mode === "expired") {
+            assert.equal(result.state, "INTERRUPTED");
+            assert.equal(result.cleanupVerified, true);
+            assert.equal(result.cleanup.state, "VERIFIED_INACTIVE");
+            assert.equal(measuredCalls, 2, "failed transition was replayed");
+            assert.equal(stopBatches, 1);
+        } else if (mode === "lost-stop-response") {
+            assert.equal(result.state, "INTERRUPTED", JSON.stringify(result));
+            assert.equal(result.cleanupVerified, true);
+            assert.equal(stopBatches, 1, "a stop batch was replayed instead of verified");
+            assert.equal(measuredCalls, 33, "measurement resumed on a cleanup connection");
+        } else {
+            assert.equal(result.state, "INTERRUPTED");
+            assert.equal(result.cleanupVerified, false);
+            assert.equal(stopBatches, 0, "unproven ownership was mutated");
+            assert.equal(result.cleanup.state, "BLOCKED");
+            assert.equal(result.ownership.cpuSessionId, 11);
+            assert.equal(result.ownership.gpuStartFrame, 10);
+            assert.equal(result.ownership.pid, 7);
+        }
+    }
+}
+async function testCleanupStopFailure() {
+    const req = request("stop-failure"), mock = createMock(0);
+    const client = clientFor(mock), originalCall = client.call;
+    let stopBatches = 0, finalStatus;
+    client.call = async (name, args) => {
+        if (args.steps?.some(step => step.label === "measured-stress-stop")) {
+            stopBatches++;
+            assert.equal(args.continueOnError, true);
+            const result = await originalCall(name, { ...args,
+                steps: args.steps.filter(step => step.label !== "cpu-performance-stop") });
+            const root = JSON.parse(result.content[0].text);
+            root.ok = false;
+            root.results.push({ label: "cpu-performance-stop", ok: false, error: "stop refused" });
+            return envelope(root);
+        }
+        const result = await originalCall(name, args);
+        if (stopBatches && args.steps?.some(step => step.label === "cpu-status")) {
+            finalStatus = JSON.parse(result.content[0].text);
+        }
+        return result;
+    };
+    const result = await runWorker(req, { client });
+    assert.equal(stopBatches, 1, "failed stop batch was replayed");
+    assert.equal(result.cleanupVerified, false);
+    assert.equal(result.cleanup.error, "cleanup_verification_failed");
+    const by = Object.fromEntries(finalStatus.results.map(step => [step.label, step.result]));
+    assert.equal(by["cpu-status"].cpuPerformance.active, true);
+    assert.equal(by["gpu-status"].capture.active, false);
+    assert.equal(by["texture-status"].capture.active, false);
+    assert.equal(by["profiler-status"].result.enabled, false);
+}
 (async () => {
     if (process.argv.includes("--detached-only")) {
         await testDetachedAndMcp();
@@ -184,6 +300,7 @@ async function testStreamingResponse() {
         return;
     }
     await testQueue(); await testFullMatrix(); await testSlowSavingAndFailure();
-    await testPacing(); await testStreamingResponse(); await testDetachedAndMcp();
+    await testPacing(); await testStreamingResponse(); await testCleanupRecovery();
+    await testCleanupStopFailure(); await testDetachedAndMcp();
     console.log(`Durable tuning worker tests passed; fixtures: ${temporary}`);
 })().catch(error => { console.error(error.stack || error); process.exitCode = 1; });

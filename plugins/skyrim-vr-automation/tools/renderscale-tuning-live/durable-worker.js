@@ -134,7 +134,37 @@ class ReceiptQueue {
 }
 
 class McpClient {
-    constructor(endpoint) { this.endpoint = endpoint; this.id = 0; this.session = null; this.protocol = "2025-03-26"; }
+    constructor(endpoint) {
+        this.endpoint = endpoint; this.id = 0; this.session = null; this.protocol = "2025-03-26";
+        this.streamAbort = null; this.streamTask = null; this.transportError = null;
+        this.requestTimeoutMs = 90000;
+    }
+    async openNotifications() {
+        const controller = new AbortController();
+        this.streamAbort = controller;
+        const timeout = setTimeout(() => controller.abort(new Error("mcp_stream_connect_timeout")), 5000);
+        let response;
+        try {
+            response = await fetch(this.endpoint, { method: "GET", redirect: "error",
+                headers: { Accept: "text/event-stream", "Mcp-Session-Id": this.session,
+                    "MCP-Protocol-Version": this.protocol }, signal: controller.signal });
+            if (!response.ok) throw new Error(`mcp_stream_http_${response.status}`);
+            if (!(response.headers.get("content-type") || "").includes("text/event-stream")) {
+                throw new Error("mcp_stream_content_type_invalid");
+            }
+        } catch (error) { controller.abort(); throw error; }
+        finally { clearTimeout(timeout); }
+        // Drain notifications on this session while POST owns every tool response.
+        this.streamTask = (async () => {
+            const reader = response.body.getReader();
+            try {
+                while (!(await reader.read()).done) { /* The runner consumes correlated POST receipts. */ }
+                if (!controller.signal.aborted) throw new Error("mcp_notification_stream_closed");
+            } finally { reader.releaseLock(); }
+        })().catch(error => {
+            if (!controller.signal.aborted) this.transportError = error;
+        });
+    }
     async eventResponse(response, id) {
         const reader = response.body.getReader(), decoder = new TextDecoder();
         let buffered = "";
@@ -157,6 +187,11 @@ class McpClient {
         } finally { await reader.cancel(); }
     }
     async rpc(method, params, notification = false) {
+        if (this.transportError) throw this.transportError;
+        try { return await this.request(method, params, notification); }
+        catch (error) { this.transportError = error; throw error; }
+    }
+    async request(method, params, notification) {
         const id = ++this.id;
         const headers = { "Content-Type": "application/json", Accept: "application/json, text/event-stream" };
         if (this.session) headers["Mcp-Session-Id"] = this.session;
@@ -164,9 +199,12 @@ class McpClient {
         const response = await fetch(this.endpoint, {
             method: "POST", headers,
             body: JSON.stringify({ jsonrpc: "2.0", ...(notification ? {} : { id }), method, params }),
-            signal: AbortSignal.timeout(90000), redirect: "error",
+            signal: AbortSignal.timeout(this.requestTimeoutMs), redirect: "error",
         });
-        if (!response.ok) throw new Error(`mcp_http_${response.status}`);
+        if (!response.ok) {
+            const detail = (await response.text()).slice(0, 1024);
+            throw new Error(`mcp_http_${response.status}: ${detail}`);
+        }
         if (method === "initialize") this.session = response.headers.get("Mcp-Session-Id");
         if (notification) { await response.arrayBuffer(); return; }
         let payload;
@@ -184,13 +222,27 @@ class McpClient {
         if (initialized?.protocolVersion) this.protocol = initialized.protocolVersion;
         if (!this.session) throw new Error("mcp_session_missing");
         await this.rpc("notifications/initialized", {}, true);
+        await this.openNotifications();
     }
     call(name, args) { return this.rpc("tools/call", { name, arguments: args }); }
     async close() {
+        this.streamAbort?.abort();
+        await this.streamTask;
         if (!this.session) return;
         const response = await fetch(this.endpoint, { method: "DELETE",
             headers: { "Mcp-Session-Id": this.session }, signal: AbortSignal.timeout(5000) });
         if (!response.ok && response.status !== 404) throw new Error(`mcp_close_${response.status}`);
+        this.session = null;
+    }
+    async reconnectForCleanup() {
+        // Reconnection is restricted to cleanup; no failed measurement is replayed.
+        this.requestTimeoutMs = 10000;
+        let closeError = null;
+        try { await this.close(); } catch (error) { closeError = String(error.message || error); }
+        this.session = null;
+        this.transportError = null;
+        await this.initialize();
+        return { closeError };
     }
 }
 
@@ -214,9 +266,38 @@ async function runWorker(request, dependencies = {}) {
     let lastRowResponse = null;
     let previousWaiter = null;
     let cleanupVerified = false;
+    let cleanupReconnects = 0;
+    let transportFailed = false;
     let invocation = 0;
+    const expected = request.positioningRoot?.results?.find(step => step.label === "position-health")?.result;
+    const verifyProcess = async () => {
+        const health = envelopeRoot(await client.call("inspect", { kind: "health" }));
+        if (!Number.isSafeInteger(expected?.pid) || health.pid !== expected.pid ||
+            health.exe !== expected.exe || health.vr !== true) throw new Error("positioned_process_changed");
+    };
+    const recoverCleanupTransport = async error => {
+        if (!transportFailed && !client.transportError) return;
+        if (++cleanupReconnects > 1 || typeof client.reconnectForCleanup !== "function") {
+            throw new Error("cleanup_transport_recovery_unavailable");
+        }
+        status.cleanup = { state: "RECONNECTING", reason: String(error?.message || client.transportError || "transport_failure") };
+        publish();
+        const recovery = await client.reconnectForCleanup();
+        await verifyProcess();
+        transportFailed = false;
+        status.cleanup = { state: "VERIFYING_OWNERS", reconnected: true, ...recovery };
+        publish();
+    };
+    const call = async (name, args) => {
+        try { return await client.call(name, args); }
+        catch (error) {
+            transportFailed = true;
+            status.transportError = String(error.message || error);
+            throw error;
+        }
+    };
     const tools = {
-        mcp__devbench_vr__communityshaders_renderscale: args => client.call("communityshaders.renderscale", args),
+        mcp__devbench_vr__communityshaders_renderscale: args => call("communityshaders.renderscale", args),
         mcp__devbench_vr__scenario: async args => {
             const measured = args.steps?.[0]?.label === "transition-pace";
             const containsApply = args.steps?.some(step => step.label === "profile-apply" || step.label === "recovery-profile-apply");
@@ -235,18 +316,14 @@ async function runWorker(request, dependencies = {}) {
             const invocationKey = `${request.runId}:invocation:${++invocation}`;
             if (containsApply) await journal.write(invocationKey, {
                 state: "DISPATCHING", args, utc: new Date().toISOString() });
-            if (containsApply) { cleanupVerified = false; status.mutationDispatched = true; }
-            const result = await client.call("scenario", args);
+            if (containsApply) {
+                cleanupVerified = false; status.mutationDispatched = true;
+                const owner = args.steps.find(step => step.label === "qualification-begin")?.args;
+                status.qualification = owner ? { ownerId: owner.ownerId, transitionId: owner.transitionId } : null;
+            }
+            const result = await call("scenario", args);
             if (measured) lastRowResponse = performance.now();
             const root = envelopeRoot(result);
-            const cleanupStatus = root.results?.find(step => step.label === "render-status")?.result?.status;
-            if (cleanupStatus?.session?.active === false) {
-                const cpu = root.results.find(step => step.label === "cpu-status")?.result?.cpuPerformance;
-                const gpu = root.results.find(step => step.label === "gpu-status")?.result?.capture;
-                const texture = root.results.find(step => step.label === "texture-status")?.result?.capture;
-                cleanupVerified = cpu?.active === false && gpu?.active === false &&
-                    texture?.active === false && cleanupStatus.loadPresentationProbe?.active === false;
-            }
             const waiter = root.results?.find(step => step.label === "qualification-wait")?.result;
             if (measured && waiter) {
                 if (previousWaiter) {
@@ -273,10 +350,7 @@ async function runWorker(request, dependencies = {}) {
     let result;
     try {
         await client.initialize();
-        const expected = request.positioningRoot?.results?.find(step => step.label === "position-health")?.result;
-        const health = envelopeRoot(await client.call("inspect", { kind: "health" }));
-        if (!Number.isSafeInteger(expected?.pid) || health.pid !== expected.pid ||
-            health.exe !== expected.exe || health.vr !== true) throw new Error("positioned_process_changed");
+        await verifyProcess();
         result = await runner({ tools, store: () => {}, notify: value => {
             status.progress = compactProgress(value);
             if (value.ordinal) status.completedTransitions += 1;
@@ -287,7 +361,26 @@ async function runWorker(request, dependencies = {}) {
             publish();
         }, receiptJournal: journal, variant: request.variant, runId: request.runId,
         buildId: request.buildId, positioningRoot: request.positioningRoot,
-        startupReceipts: request.startupReceipts, matrix: request.matrix });
+        startupReceipts: request.startupReceipts, matrix: request.matrix,
+        observeOwnership: owners => { status.ownership = { pid: expected.pid, buildId: request.buildId, ...owners }; },
+        prepareCleanup: async () => {
+            client.requestTimeoutMs = 10000;
+            status.cleanup = { state: "VERIFYING_OWNERS" }; publish();
+            await recoverCleanupTransport();
+            await verifyProcess();
+        },
+        recoverCleanupTransport,
+        cleanupComplete: () => {
+            cleanupVerified = true;
+            client.requestTimeoutMs = 90000;
+            status.cleanup = { state: "VERIFIED_INACTIVE", reconnected: cleanupReconnects > 0 };
+            publish();
+            return cleanupReconnects === 0;
+        },
+        cleanupFailed: error => {
+            status.cleanup = { ...status.cleanup, state: "BLOCKED", error: String(error.message || error) };
+            publish();
+        } });
         status.state = result.status;
         status.result = { ok: result.ok, status: result.status, lanes: result.lanes?.map(lane => ({
             id: lane.id, passes: lane.passes.map(pass => ({ pass: pass.pass, status: pass.status,
@@ -302,6 +395,11 @@ async function runWorker(request, dependencies = {}) {
         try { await client.close(); } catch (error) { status.transportCleanupError = String(error.message || error); }
         status.finishedUtc = new Date().toISOString();
         status.cleanupVerified = cleanupVerified;
+        if (status.mutationDispatched && !cleanupVerified) {
+            status.cleanup = { ...status.cleanup, state: "BLOCKED",
+                error: status.cleanup?.error || status.result?.lanes?.flatMap(lane => lane.passes).find(pass => pass.cleanupError)?.cleanupError ||
+                    status.error || "cleanup_not_verified", ownership: status.ownership };
+        }
         publish();
         try { await publisher.drain(); }
         catch (error) {
