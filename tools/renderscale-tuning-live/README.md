@@ -69,6 +69,15 @@ between scheduled updates. Never wait on the launcher's exec cell to determine
 whether the worker is alive. If terminal status publication fails, the worker
 writes `worker-terminal.json` and includes the error.
 
+Transport shutdown explicitly cancels the notification reader as well as its
+fetch signal. Reader shutdown and session deletion share a five-second deadline;
+either may fail without preventing terminal status publication after the journal
+is flushed. A transport cleanup failure remains in `transportCleanupError`,
+separate from the measurement result and capture ownership verification. Once
+terminal status is saved and the guarded lock decision is complete, the detached
+worker exits even if an abandoned transport handle remains. Transport cleanup
+errors produce a nonzero worker exit code without changing completed measurements.
+
 An exclusive endpoint lock under local application data prevents competing
 workers. Release it only after verified telemetry cleanup or proof that no
 mutation was dispatched. Missing status, process loss, or an unresolved owner
@@ -78,4 +87,6 @@ the request, journal, status, and worker log for manual guarded recovery.
 
 Validation: `node tests/Test-RenderScaleTuningWorker.js` uses a local mock MCP
 server, complete matrices, delayed writes, storage failures, and launcher exit.
+It also exercises a notification read that ignores fetch abort, cancellation and
+DELETE timeouts, terminal evidence preservation, process exit, and lock release.
 `node tests/Test-RenderScaleTuningFinalizer.js` validates journal reconstruction.

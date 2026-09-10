@@ -115,8 +115,8 @@ async function testPacing() {
     assert.equal(result.state, "COMPLETE"); assert.equal(result.pacing.status, "EXCEEDED");
     assert.equal(result.completedTransitions, 66); assert.equal(result.cleanupVerified, true);
 }
-async function testDetachedAndMcp() {
-    const fixture = path.join(temporary, "plugin");
+async function testDetachedAndMcp(mode = "normal") {
+    const fixture = path.join(temporary, `plugin-${mode}`);
     fs.mkdirSync(path.join(fixture, "tools"), { recursive: true });
     fs.cpSync(path.join(source, "tools", "renderscale-tuning-live"), path.join(fixture, "tools", "renderscale-tuning-live"), { recursive: true });
     fs.mkdirSync(path.join(fixture, "skills/renderscale-tuning-nvidia/references"), { recursive: true });
@@ -126,7 +126,10 @@ async function testDetachedAndMcp() {
     let sessionSerial = 0;
     const server = http.createServer(async (req, res) => {
         const sessionId = req.headers["mcp-session-id"];
-        if (req.method === "DELETE") { sessions.delete(sessionId); res.writeHead(200).end(); return; }
+        if (req.method === "DELETE") {
+            if (mode === "delete-timeout") return;
+            sessions.delete(sessionId); res.writeHead(200).end(); return;
+        }
         if (req.method === "GET") {
             assert.ok(sessions.has(sessionId));
             res.writeHead(200, { "Content-Type": "text/event-stream" });
@@ -156,9 +159,9 @@ async function testDetachedAndMcp() {
     try {
     const endpoint = `http://127.0.0.1:${server.address().port}/mcp`;
     fs.writeFileSync(path.join(fixture, ".mcp.json"), JSON.stringify({ mcpServers: { devbench_vr: { type: "http", url: endpoint } } }));
-    const req = request("detached-startup");
-    req.runId = "detached"; req.workspace = temporary;
-    const file = path.join(temporary, "request.json"); fs.writeFileSync(file, JSON.stringify(req));
+    const req = request(`detached-startup-${mode}`);
+    req.runId = `detached-${mode}`; req.workspace = temporary;
+    const file = path.join(temporary, `request-${mode}.json`); fs.writeFileSync(file, JSON.stringify(req));
     const entrypoint = path.join(fixture, "tools/renderscale-tuning-live/durable-worker.js");
     const child = spawn(process.execPath, [entrypoint, "start", file], {
         env: { ...process.env, LOCALAPPDATA: path.join(temporary, "state") }, windowsHide: true,
@@ -177,7 +180,20 @@ async function testDetachedAndMcp() {
     assert.equal(state?.state, "COMPLETE", JSON.stringify(state));
     assert.equal(state.completedTransitions, 66, "worker stopped after launcher exited");
     assert.equal(state.cleanupVerified, true);
-    const rpc = new McpClient(endpoint); await rpc.initialize(); await rpc.close();
+    if (mode === "delete-timeout") assert.equal(state.transportCleanupError, "mcp_close_timeout");
+    else assert.equal(state.transportCleanupError, undefined);
+    const exited = () => {
+        try { process.kill(launched.pid, 0); return false; }
+        catch (error) { if (error.code === "ESRCH") return true; throw error; }
+    };
+    const exitDeadline = Date.now() + 2000;
+    while (!exited() && Date.now() < exitDeadline) await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(exited(), true, "terminal worker retained a transport handle");
+    assert.deepEqual(fs.readdirSync(path.join(temporary, "state/SkyrimVRAutomation/renderscale-tuning")), [],
+        "verified inactive captures retained an endpoint lock");
+    if (mode === "normal") {
+        const rpc = new McpClient(endpoint); await rpc.initialize(); await rpc.close();
+    }
     } finally {
         server.closeAllConnections();
         await new Promise(resolve => server.close(resolve));
@@ -194,6 +210,69 @@ async function testStreamingResponse() {
     const response = await new McpClient("http://127.0.0.1/mcp").eventResponse(
         new Response(stream), 9);
     assert.equal(response.id, 9); assert.equal(cancelled, true);
+}
+async function testNotificationShutdown() {
+    const originalFetch = global.fetch;
+    let cancels = 0, deletes = 0, closeTimedOut;
+    global.fetch = async (_url, options) => {
+        if (options.method === "GET") return new Response(new ReadableStream({
+            start(controller) { controller.enqueue(new TextEncoder().encode(": heartbeat\n\n")); },
+            cancel() { cancels++; },
+        }), { headers: { "Content-Type": "text/event-stream" } });
+        assert.equal(options.method, "DELETE"); deletes++;
+        return new Response(null, { status: 204 });
+    };
+    const client = new McpClient("http://127.0.0.1/mcp"); client.session = "shutdown-test";
+    try {
+        await client.openNotifications();
+        // Reproduce a body read that remains pending after the fetch signal aborts.
+        await Promise.race([client.close(), new Promise((_resolve, reject) => {
+            closeTimedOut = setTimeout(() => reject(new Error("notification_shutdown_stalled")), 500);
+        })]);
+        assert.equal(cancels, 1); assert.equal(deletes, 1); assert.equal(client.session, null);
+    } finally { clearTimeout(closeTimedOut); global.fetch = originalFetch; }
+}
+async function testTransportShutdownFailure() {
+    const originalFetch = global.fetch;
+    try {
+        for (const mode of ["stream-timeout", "delete-timeout", "delete-error"]) {
+            let deletes = 0, finishDelete;
+            global.fetch = async (_url, options) => {
+                if (options.method === "GET") return new Response(new ReadableStream({
+                    cancel() { if (mode === "stream-timeout") return new Promise(() => {}); },
+                }), { headers: { "Content-Type": "text/event-stream" } });
+                assert.equal(options.method, "DELETE"); deletes++;
+                if (mode === "delete-timeout") return new Promise(resolve => { finishDelete = resolve; });
+                return new Response(null, { status: mode === "delete-error" ? 503 : 204 });
+            };
+            const transport = new McpClient("http://127.0.0.1/mcp");
+            transport.session = mode; transport.closeTimeoutMs = 30;
+            await transport.openNotifications();
+            const req = request(mode), client = clientFor(createMock(0));
+            client.close = () => transport.close();
+            let result, timeout;
+            try {
+                result = await Promise.race([runWorker(req, { client }), new Promise((_resolve, reject) => {
+                    timeout = setTimeout(() => reject(new Error(`unbounded_worker_close: ${mode}`)), 1000);
+                })]);
+            } finally { clearTimeout(timeout); }
+            assert.equal(result.state, "COMPLETE", mode);
+            assert.equal(result.completedTransitions, 66); assert.equal(result.cleanupVerified, true);
+            assert.equal(result.transportCleanupError, mode === "delete-error" ? "mcp_close_503" : "mcp_close_timeout");
+            assert.equal(deletes, 1, "stream shutdown prevented session deletion");
+            const saved = JSON.parse(fs.readFileSync(path.join(req.root, "worker-status.json")));
+            assert.equal(saved.state, "COMPLETE"); assert.equal(saved.evidencePending, 0);
+            assert.ok(saved.finishedUtc); assert.equal(saved.transportCleanupError, result.transportCleanupError);
+            const last = fs.readFileSync(path.join(req.root, "raw/journal.ndjson"), "utf8").trim().split("\n").at(-1);
+            assert.equal(JSON.parse(last).value.status, "COMPLETE", "transport failure lost the final result");
+            if (finishDelete) {
+                transport.session = "replacement-cleanup-session";
+                finishDelete(new Response(null, { status: 204 }));
+                await new Promise(resolve => setImmediate(resolve));
+                assert.equal(transport.session, "replacement-cleanup-session", "late deletion cleared a replacement session");
+            }
+        }
+    } finally { global.fetch = originalFetch; }
 }
 async function testCleanupRecovery() {
     for (const mode of ["expired", "lost-stop-response", "changed-process", "foreign-capture", "incomplete-status", "unavailable"]) {
@@ -300,7 +379,9 @@ async function testCleanupStopFailure() {
         return;
     }
     await testQueue(); await testFullMatrix(); await testSlowSavingAndFailure();
-    await testPacing(); await testStreamingResponse(); await testCleanupRecovery();
+    await testPacing(); await testStreamingResponse(); await testNotificationShutdown();
+    await testTransportShutdownFailure(); await testCleanupRecovery();
     await testCleanupStopFailure(); await testDetachedAndMcp();
+    await testDetachedAndMcp("delete-timeout");
     console.log(`Durable tuning worker tests passed; fixtures: ${temporary}`);
 })().catch(error => { console.error(error.stack || error); process.exitCode = 1; });

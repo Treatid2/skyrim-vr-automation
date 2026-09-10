@@ -137,6 +137,7 @@ class McpClient {
     constructor(endpoint) {
         this.endpoint = endpoint; this.id = 0; this.session = null; this.protocol = "2025-03-26";
         this.streamAbort = null; this.streamTask = null; this.transportError = null;
+        this.streamReader = null; this.closeTimeoutMs = 5000;
         this.requestTimeoutMs = 90000;
     }
     async openNotifications() {
@@ -157,10 +158,14 @@ class McpClient {
         // Drain notifications on this session while POST owns every tool response.
         this.streamTask = (async () => {
             const reader = response.body.getReader();
+            this.streamReader = reader;
             try {
                 while (!(await reader.read()).done) { /* The runner consumes correlated POST receipts. */ }
                 if (!controller.signal.aborted) throw new Error("mcp_notification_stream_closed");
-            } finally { reader.releaseLock(); }
+            } finally {
+                reader.releaseLock();
+                if (this.streamReader === reader) this.streamReader = null;
+            }
         })().catch(error => {
             if (!controller.signal.aborted) this.transportError = error;
         });
@@ -226,13 +231,33 @@ class McpClient {
     }
     call(name, args) { return this.rpc("tools/call", { name, arguments: args }); }
     async close() {
-        this.streamAbort?.abort();
-        await this.streamTask;
-        if (!this.session) return;
-        const response = await fetch(this.endpoint, { method: "DELETE",
-            headers: { "Mcp-Session-Id": this.session }, signal: AbortSignal.timeout(5000) });
-        if (!response.ok && response.status !== 404) throw new Error(`mcp_close_${response.status}`);
-        this.session = null;
+        const reader = this.streamReader, streamTask = this.streamTask, session = this.session;
+        const controller = new AbortController();
+        let timeout;
+        const deadline = new Promise((_resolve, reject) => {
+            timeout = setTimeout(() => {
+                const error = new Error("mcp_close_timeout");
+                controller.abort(error); reject(error);
+            }, this.closeTimeoutMs);
+        });
+        try {
+            this.streamAbort?.abort();
+            const stopStream = (async () => {
+                // Fetch abort can leave a body read pending; cancel its reader explicitly.
+                try { await reader?.cancel(); }
+                catch (error) { if (error.name !== "AbortError") throw error; }
+                await streamTask;
+            })();
+            const deleteSession = (async () => {
+                if (!session) return;
+                const response = await fetch(this.endpoint, { method: "DELETE", redirect: "error",
+                    headers: { "Mcp-Session-Id": session }, signal: controller.signal });
+                if (!response.ok && response.status !== 404) throw new Error(`mcp_close_${response.status}`);
+                if (this.session === session) this.session = null;
+                await response.body?.cancel();
+            })();
+            await Promise.race([Promise.all([stopStream, deleteSession]), deadline]);
+        } finally { clearTimeout(timeout); controller.abort(); }
     }
     async reconnectForCleanup() {
         // Reconnection is restricted to cleanup; no failed measurement is replayed.
@@ -454,6 +479,8 @@ if (require.main === module) {
                 if (owner.runId !== request.runId || owner.root !== request.root) throw new Error("worker_lock_owner_changed");
                 fs.unlinkSync(lock);
             }
+            // Evidence and terminal status are saved before abandoned transport handles exit.
+            process.exit(result.state === "COMPLETE" && !result.transportCleanupError ? 0 : 1);
         } else throw new Error("usage: durable-worker.js start REQUEST | status STATUS");
     })().catch(error => { console.error(error.stack || error); process.exitCode = 1; });
 }
