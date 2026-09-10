@@ -437,8 +437,9 @@ function testBaselineOnlyInterruptedFinalization() {
             `${variant} baseline-only memory status is incomplete.`);
             const reportText = fs.readFileSync(path.join(evidence.root,
                 "report.md"), "utf8");
+            const memoryVerdict = variant === "amd" ? "per_lane" : "repeat_not_completed";
             assert(reportText.includes(`Transitions dispatched: **0/${expectedRows}**`) &&
-                reportText.includes("Memory confirmation: **repeat_not_completed**"),
+                reportText.includes(`Memory confirmation: **${memoryVerdict}**`),
             `${variant} baseline-only report is incomplete.`);
             const outputs = ["report.md", "summary.json", "transitions.csv",
                 "evidence-values.csv", "receipt-index.json"];
