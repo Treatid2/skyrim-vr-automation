@@ -684,6 +684,24 @@ function Test-DevBenchUpscalingStable {
         Require-StableValue ($null -ne $value) $Reason
         return $value
     }
+    function Require-StableBooleanTelemetry($Source, [string]$Name, [bool]$Expected, [string]$MissingReason, [string]$TypeReason, [string]$StateReason) {
+        $value = Get-DevBenchTelemetryMember $Source $Name
+        if ($null -eq $value) {
+            Require-StableValue $false $MissingReason
+        }
+        elseif ($value -isnot [bool]) {
+            Require-StableValue $false $TypeReason
+        }
+        else {
+            Require-StableValue ($value -eq $Expected) $StateReason
+        }
+        return $value
+    }
+    function Test-StableUnsignedIntegerTelemetry($Value) {
+        if ($null -eq $Value) { return $false }
+        return $Value -is [byte] -or $Value -is [uint16] -or $Value -is [uint32] -or $Value -is [uint64] -or
+            (($Value -is [sbyte] -or $Value -is [int16] -or $Value -is [int32] -or $Value -is [int64]) -and [int64]$Value -ge 0)
+    }
 
     $profilePresence = if ($snapshot.PSObject.Properties['profilePresence']) { [uint32]$snapshot.profilePresence } else { [uint32]0 }
     $flags = if ($snapshot.PSObject.Properties['flags']) { [uint64]$snapshot.flags } else { [uint64]0 }
@@ -791,50 +809,41 @@ function Test-DevBenchUpscalingStable {
             reasons = @($reasons | Select-Object -Unique)
         }
     }
-    $terminalFailureSignaled = Get-DevBenchTelemetryMember $controller 'terminalFailureSignaled'
-    $terminalDeviceLossSignaled = Get-DevBenchTelemetryMember $controller 'terminalDeviceLossSignaled'
+    $terminalFailureSignaled = Require-StableBooleanTelemetry $controller 'terminalFailureSignaled' $false 'render-scale terminal failure telemetry is missing' 'render-scale terminal failure telemetry has invalid type' 'render-scale terminal failure is signaled'
+    $terminalDeviceLossSignaled = Require-StableBooleanTelemetry $controller 'terminalDeviceLossSignaled' $false 'render-scale device-loss telemetry is missing' 'render-scale device-loss telemetry has invalid type' 'render-scale device loss is signaled'
     $unresolvedPhysicalMutationEpoch = Get-DevBenchTelemetryMember $controller 'unresolvedPhysicalMutationEpoch'
-    $gateActive = Get-DevBenchTelemetryMember $gate 'active'
-    $completedWorldFrame = Get-DevBenchTelemetryMember $gate 'completedWorldFrame'
-    Require-StableValue ($null -ne $terminalFailureSignaled) 'render-scale terminal failure telemetry is missing'
-    Require-StableValue ($null -eq $terminalFailureSignaled -or -not [bool]$terminalFailureSignaled) 'render-scale terminal failure is signaled'
-    Require-StableValue ($null -ne $terminalDeviceLossSignaled) 'render-scale device-loss telemetry is missing'
-    Require-StableValue ($null -eq $terminalDeviceLossSignaled -or -not [bool]$terminalDeviceLossSignaled) 'render-scale device loss is signaled'
-    Require-StableValue ($null -ne $unresolvedPhysicalMutationEpoch) 'physical render-scale mutation telemetry is missing'
-    Require-StableValue ($null -ne $unresolvedPhysicalMutationEpoch -and [uint64]$unresolvedPhysicalMutationEpoch -eq 0) 'a physical render-scale mutation remains unresolved'
-    Require-StableValue ($null -ne $gateActive) 'vendor work gate active telemetry is missing'
-    Require-StableValue ($null -eq $gateActive -or -not [bool]$gateActive) 'the vendor work gate is active'
-    Require-StableValue ($null -ne $completedWorldFrame) 'completed world-frame telemetry is missing'
-    Require-StableValue ($null -ne $completedWorldFrame -and [bool]$completedWorldFrame) 'no completed destination world frame is available'
+    $gateActive = Require-StableBooleanTelemetry $gate 'active' $false 'vendor work gate active telemetry is missing' 'vendor work gate active telemetry has invalid type' 'the vendor work gate is active'
+    $completedWorldFrame = Require-StableBooleanTelemetry $gate 'completedWorldFrame' $true 'completed world-frame telemetry is missing' 'completed world-frame telemetry has invalid type' 'no completed destination world frame is available'
+    Require-StableValue (Test-StableUnsignedIntegerTelemetry $unresolvedPhysicalMutationEpoch) 'physical render-scale mutation telemetry is missing or has invalid type'
+    if (Test-StableUnsignedIntegerTelemetry $unresolvedPhysicalMutationEpoch) {
+        Require-StableValue ([uint64]$unresolvedPhysicalMutationEpoch -eq 0) 'a physical render-scale mutation remains unresolved'
+    }
     foreach ($name in @('loadingMenu', 'loadingPresentationActive', 'postLoadResetPending', 'relatchQueued', 'relatchInProgress', 'relatchFramePending', 'relatchPostLoadSettle', 'recoveryPending', 'relatchPending', 'profileTransitionPending')) {
         $property = $gate.PSObject.Properties[$name]
-        if ($property) { Require-StableValue (-not [bool]$property.Value) "vendor work gate '$name' remains active" }
+        if ($property) {
+            Require-StableValue ($property.Value -is [bool]) "vendor work gate '$name' telemetry has invalid type"
+            if ($property.Value -is [bool]) { Require-StableValue (-not $property.Value) "vendor work gate '$name' remains active" }
+        }
     }
     $postLoadRecovery = Get-RequiredStableTelemetry $controller 'postLoadRecovery' 'post-load render-scale recovery telemetry is missing'
     if ($null -ne $postLoadRecovery) {
-        $postLoadRecoveryActive = Get-RequiredStableTelemetry $postLoadRecovery 'active' 'post-load render-scale recovery active telemetry is missing'
-        Require-StableValue ($null -eq $postLoadRecoveryActive -or -not [bool]$postLoadRecoveryActive) 'post-load render-scale recovery is active'
+        $null = Require-StableBooleanTelemetry $postLoadRecovery 'active' $false 'post-load render-scale recovery active telemetry is missing' 'post-load render-scale recovery active telemetry has invalid type' 'post-load render-scale recovery is active'
     }
     $memoryTrim = Get-RequiredStableTelemetry $controller 'memoryTrim' 'render-scale memory trim telemetry is missing'
     if ($null -ne $memoryTrim) {
-        $memoryTrimPending = Get-RequiredStableTelemetry $memoryTrim 'pending' 'render-scale memory trim pending telemetry is missing'
-        Require-StableValue ($null -eq $memoryTrimPending -or -not [bool]$memoryTrimPending) 'render-scale memory trim is pending'
+        $null = Require-StableBooleanTelemetry $memoryTrim 'pending' $false 'render-scale memory trim pending telemetry is missing' 'render-scale memory trim pending telemetry has invalid type' 'render-scale memory trim is pending'
     }
     $retirement = Get-RequiredStableTelemetry $controller 'retirement' 'render-scale resource retirement telemetry is missing'
     if ($null -ne $retirement) {
         $pendingSets = Get-RequiredStableTelemetry $retirement 'pendingSets' 'render-scale retirement pending-set telemetry is missing'
-        $fencePending = Get-RequiredStableTelemetry $retirement 'fencePending' 'render-scale retirement fence telemetry is missing'
-        $capacityBlocked = Get-RequiredStableTelemetry $retirement 'capacityBlocked' 'render-scale retirement capacity telemetry is missing'
-        Require-StableValue (
-            $null -ne $pendingSets -and [uint32]$pendingSets -eq 0 -and
-            $null -ne $fencePending -and -not [bool]$fencePending -and
-            $null -ne $capacityBlocked -and -not [bool]$capacityBlocked
-        ) 'render-scale resource retirement is pending'
+        Require-StableValue (Test-StableUnsignedIntegerTelemetry $pendingSets) 'render-scale retirement pending-set telemetry has invalid type'
+        if (Test-StableUnsignedIntegerTelemetry $pendingSets) { Require-StableValue ([uint64]$pendingSets -eq 0) 'render-scale resource retirement is pending' }
+        $null = Require-StableBooleanTelemetry $retirement 'fencePending' $false 'render-scale retirement fence telemetry is missing' 'render-scale retirement fence telemetry has invalid type' 'render-scale resource retirement is pending'
+        $null = Require-StableBooleanTelemetry $retirement 'capacityBlocked' $false 'render-scale retirement capacity telemetry is missing' 'render-scale retirement capacity telemetry has invalid type' 'render-scale resource retirement is pending'
     }
     $engineTargetRetirement = Get-RequiredStableTelemetry $controller 'engineTargetRetirement' 'engine render-target retirement telemetry is missing'
     if ($null -ne $engineTargetRetirement) {
-        $engineTargetPending = Get-RequiredStableTelemetry $engineTargetRetirement 'pending' 'engine render-target retirement pending telemetry is missing'
-        Require-StableValue ($null -eq $engineTargetPending -or -not [bool]$engineTargetPending) 'engine render-target retirement is pending'
+        $null = Require-StableBooleanTelemetry $engineTargetRetirement 'pending' $false 'engine render-target retirement pending telemetry is missing' 'engine render-target retirement pending telemetry has invalid type' 'engine render-target retirement is pending'
     }
 
     $stereoEvidence = 'native_pipeline_frames'
@@ -849,13 +858,15 @@ function Test-DevBenchUpscalingStable {
         $stableContract = Get-DevBenchTelemetryMember $controller 'stable'
         Require-StableValue ($null -ne $stableContract) 'stable render-scale contract telemetry is missing'
         if ($null -ne $stableContract) {
-            Require-StableValue ([bool](Get-DevBenchTelemetryMember $stableContract 'valid') -and [bool](Get-DevBenchTelemetryMember $stableContract 'active')) 'stable render-scale contract is invalid or inactive'
+            $stableValid = Require-StableBooleanTelemetry $stableContract 'valid' $true 'stable render-scale validity telemetry is missing' 'stable render-scale validity telemetry has invalid type' 'stable render-scale contract is invalid or inactive'
+            $stableActive = Require-StableBooleanTelemetry $stableContract 'active' $true 'stable render-scale activity telemetry is missing' 'stable render-scale activity telemetry has invalid type' 'stable render-scale contract is invalid or inactive'
         }
 
         $fidelity = Get-DevBenchTelemetryMember $controller 'fidelity'
         Require-StableValue ($null -ne $fidelity) 'render-scale fidelity telemetry is missing'
         if ($null -ne $fidelity) {
-            Require-StableValue ([bool](Get-DevBenchTelemetryMember $fidelity 'active') -and [bool](Get-DevBenchTelemetryMember $fidelity 'bothEyesValid')) 'both render-scale eyes are not valid'
+            $null = Require-StableBooleanTelemetry $fidelity 'active' $true 'render-scale fidelity activity telemetry is missing' 'render-scale fidelity activity telemetry has invalid type' 'both render-scale eyes are not valid'
+            $null = Require-StableBooleanTelemetry $fidelity 'bothEyesValid' $true 'render-scale both-eye validity telemetry is missing' 'render-scale both-eye validity telemetry has invalid type' 'both render-scale eyes are not valid'
             Require-StableValue ([uint32](Get-DevBenchTelemetryMember $fidelity 'evaluationEyeMask') -eq 3 -and [uint32](Get-DevBenchTelemetryMember $fidelity 'invariantEyeMask') -eq 3) 'both-eye evaluation or invariant mask is incomplete'
             Require-StableValue ([uint32](Get-DevBenchTelemetryMember $fidelity 'lastMismatchMask') -eq 0) 'the latest render-scale fidelity observation mismatched'
         }
@@ -911,8 +922,14 @@ function Test-DevBenchUpscalingStable {
         Require-StableValue (($flags -band [uint64]0x10) -eq 0 -and ($flags -band [uint64]0x20) -eq 0) 'render-scale remains latched or active for a native-resolution profile'
         $nativeStableContract = Get-DevBenchTelemetryMember $controller 'stable'
         $nativeFidelity = Get-DevBenchTelemetryMember $controller 'fidelity'
-        Require-StableValue ($null -ne $nativeStableContract -and -not [bool](Get-DevBenchTelemetryMember $nativeStableContract 'active')) 'an active physical render-scale contract remains for a native-resolution profile'
-        Require-StableValue ($null -ne $nativeFidelity -and -not [bool](Get-DevBenchTelemetryMember $nativeFidelity 'active')) 'active render-scale fidelity remains for a native-resolution profile'
+        Require-StableValue ($null -ne $nativeStableContract) 'stable render-scale contract telemetry is missing for a native-resolution profile'
+        if ($null -ne $nativeStableContract) {
+            $null = Require-StableBooleanTelemetry $nativeStableContract 'active' $false 'stable render-scale activity telemetry is missing for a native-resolution profile' 'stable render-scale activity telemetry has invalid type for a native-resolution profile' 'an active physical render-scale contract remains for a native-resolution profile'
+        }
+        Require-StableValue ($null -ne $nativeFidelity) 'render-scale fidelity telemetry is missing for a native-resolution profile'
+        if ($null -ne $nativeFidelity) {
+            $null = Require-StableBooleanTelemetry $nativeFidelity 'active' $false 'render-scale fidelity activity telemetry is missing for a native-resolution profile' 'render-scale fidelity activity telemetry has invalid type for a native-resolution profile' 'active render-scale fidelity remains for a native-resolution profile'
+        }
     }
 
     $stableForSignature = Get-DevBenchTelemetryMember $controller 'stable'

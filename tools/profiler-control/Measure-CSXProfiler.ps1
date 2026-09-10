@@ -179,37 +179,49 @@ function Start-ProfilerDelay([int]$RequestedMilliseconds) {
     Start-Sleep -Milliseconds ([int][Math]::Min($RequestedMilliseconds, $remaining))
 }
 
+function Assert-CapturePerformanceObservation($Call, [string]$Action, $SessionCleanup) {
+    $performanceGuard = if ($Call.data -and $Call.data.PSObject.Properties['performanceGuard']) { $Call.data.performanceGuard } else { $null }
+    $performanceWindow = if ($Call.data -and $Call.data.PSObject.Properties['performanceWindow']) { $Call.data.performanceWindow } else { $null }
+    $script:receipt.performanceObservations = @($script:receipt.performanceObservations) + @([pscustomobject][ordered]@{
+        action = $Action
+        observedUtc = [DateTime]::UtcNow.ToString('o')
+        guard = $performanceGuard
+        window = $performanceWindow
+        evidencePath = $Call.invocationEvidencePath
+        sessionCleanup = $SessionCleanup
+    })
+    if ($null -eq $performanceGuard -or $null -eq $performanceWindow -or -not $performanceWindow.valid) {
+        throw "DevBench '$Action' did not preserve a valid performance-neutrality window."
+    }
+    $applicable = [bool]$performanceGuard.applicable
+    $epoch = if ($applicable) { $performanceGuard.performanceEpoch } else { $null }
+    if (-not $script:performanceGuardInitialized) {
+        $script:performanceGuardInitialized = $true
+        $script:expectedPerformanceApplicable = $applicable
+        $script:expectedPerformanceEpoch = $epoch
+    }
+    elseif ($applicable -ne $script:expectedPerformanceApplicable -or
+        ($applicable -and [uint64]$epoch -ne [uint64]$script:expectedPerformanceEpoch)) {
+        throw "DevBench '$Action' observed a changed performance-probe registration or ownership epoch."
+    }
+}
+
+function Test-OptionalRenderScaleUnavailable($Call) {
+    $state = if ($Call.PSObject.Properties['state']) { [string]$Call.state } else { $null }
+    if ($state -eq 'tool-unavailable') { return $true }
+    $semantic = if ($Call.PSObject.Properties['semantic']) { $Call.semantic } else { $null }
+    if ($null -eq $semantic -or [bool]$semantic.ok) { return $false }
+    $accepted = @('tool_unavailable', 'unsupported', 'not_supported', 'not-supported')
+    $signals = @($semantic.codes) + @($semantic.states) + @($semantic.outcome)
+    return @($signals | Where-Object { ([string]$_).ToLowerInvariant() -in $accepted }).Count -gt 0
+}
+
 function Invoke-ProfilerAction([string]$Action, [switch]$ForRestore) {
     $arguments = @{ action = $Action } | ConvertTo-Json -Compress
     $remainingSeconds = Get-RemainingProfilerSeconds -ForRestore:$ForRestore
     $call = & $control call -Tool 'communityshaders.profiler' -ArgumentsJson $arguments -RuntimePath $RuntimePath -EvidenceDirectory $runDirectory -EvidenceLabel "profiler-$Action" -TimeoutSeconds $remainingSeconds -RequireSuccess -RequirePerformanceNeutral:(-not $ForRestore) -NoExit -Compact | ConvertFrom-Json -Depth 80
     $callCleanup = if ($call.PSObject.Properties['sessionCleanup']) { $call.sessionCleanup } else { $null }
-    if (-not $ForRestore -and $call.data) {
-        $performanceGuard = if ($call.data.PSObject.Properties['performanceGuard']) { $call.data.performanceGuard } else { $null }
-        $performanceWindow = if ($call.data.PSObject.Properties['performanceWindow']) { $call.data.performanceWindow } else { $null }
-        $script:receipt.performanceObservations = @($script:receipt.performanceObservations) + @([pscustomobject][ordered]@{
-            action = $Action
-            observedUtc = [DateTime]::UtcNow.ToString('o')
-            guard = $performanceGuard
-            window = $performanceWindow
-            evidencePath = $call.invocationEvidencePath
-            sessionCleanup = $callCleanup
-        })
-        if ($null -eq $performanceGuard -or $null -eq $performanceWindow -or -not $performanceWindow.valid) {
-            throw "DevBench profiler '$Action' did not preserve a valid performance-neutrality window."
-        }
-        $applicable = [bool]$performanceGuard.applicable
-        $epoch = if ($applicable) { $performanceGuard.performanceEpoch } else { $null }
-        if (-not $script:performanceGuardInitialized) {
-            $script:performanceGuardInitialized = $true
-            $script:expectedPerformanceApplicable = $applicable
-            $script:expectedPerformanceEpoch = $epoch
-        }
-        elseif ($applicable -ne $script:expectedPerformanceApplicable -or
-            ($applicable -and [uint64]$epoch -ne [uint64]$script:expectedPerformanceEpoch)) {
-            throw "DevBench profiler '$Action' observed a changed performance-probe registration or ownership epoch."
-        }
-    }
+    if (-not $ForRestore) { Assert-CapturePerformanceObservation -Call $call -Action "profiler-$Action" -SessionCleanup $callCleanup }
     if (-not $call.ok) { throw "DevBench profiler '$Action' failed: $($call.errors -join '; ')" }
     $payload = @($call.data.content | Where-Object { $null -ne $_ } | Select-Object -First 1)
     if ($payload.Count -ne 1) { throw "DevBench profiler '$Action' returned no structured content." }
@@ -241,7 +253,20 @@ function Get-ResourcePublicationSnapshot([Parameter(Mandatory)][string]$Phase) {
         -TimeoutSeconds $remainingSeconds -RequireSuccess `
         -RequirePerformanceNeutral -NoExit -Compact | ConvertFrom-Json -Depth 80
     $callCleanup = if ($call.PSObject.Properties['sessionCleanup']) { $call.sessionCleanup } else { $null }
+    Assert-CapturePerformanceObservation -Call $call -Action "renderscale-$Phase" -SessionCleanup $callCleanup
     if (-not $call.ok) {
+        if (Test-OptionalRenderScaleUnavailable $call) {
+            return [pscustomobject][ordered]@{
+                phase = $Phase
+                timestampUtc = [DateTime]::UtcNow.ToString('o')
+                availability = 'unavailable'
+                telemetry = Invoke-DevBenchNormalizer 'Get-DevBenchResourcePublicationTelemetry' $null
+                preparation = Invoke-DevBenchNormalizer 'Get-DevBenchRenderScalePreparationTelemetry' $null
+                invocationEvidencePath = $call.invocationEvidencePath
+                sessionCleanup = $callCleanup
+                error = $call.errors -join '; '
+            }
+        }
         throw "DevBench render-scale '$Phase' guard or status call failed: $($call.errors -join '; ')"
     }
 
@@ -255,6 +280,7 @@ function Get-ResourcePublicationSnapshot([Parameter(Mandatory)][string]$Phase) {
         return [pscustomobject][ordered]@{
             phase = $Phase
             timestampUtc = [DateTime]::UtcNow.ToString('o')
+            availability = 'payload-unavailable'
             telemetry = Invoke-DevBenchNormalizer 'Get-DevBenchResourcePublicationTelemetry' $null
             preparation = Invoke-DevBenchNormalizer 'Get-DevBenchRenderScalePreparationTelemetry' $null
             invocationEvidencePath = $call.invocationEvidencePath
@@ -265,6 +291,7 @@ function Get-ResourcePublicationSnapshot([Parameter(Mandatory)][string]$Phase) {
     return [pscustomobject][ordered]@{
         phase = $Phase
         timestampUtc = [DateTime]::UtcNow.ToString('o')
+        availability = 'available'
         telemetry = Invoke-DevBenchNormalizer 'Get-DevBenchResourcePublicationTelemetry' $payload[0]
         preparation = Invoke-DevBenchNormalizer 'Get-DevBenchRenderScalePreparationTelemetry' $payload[0]
         invocationEvidencePath = $call.invocationEvidencePath

@@ -189,6 +189,26 @@ function Update-InvocationEvidence {
     Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord
 }
 
+function Write-TerminalInvocationEvidence {
+    param(
+        [Parameter(Mandatory)]$Result,
+        [Parameter(Mandatory)][string]$FailurePrefix,
+        [Parameter(Mandatory)][scriptblock]$WriteAction
+    )
+
+    try {
+        & $WriteAction | Out-Null
+        return $true
+    }
+    catch {
+        $journalError = "$FailurePrefix`: $($_.Exception.Message)"
+        $existingWarnings = if ($Result.PSObject.Properties['evidenceWarnings']) { @($Result.evidenceWarnings) } else { @() }
+        $Result | Add-Member -NotePropertyName evidenceWarnings -NotePropertyValue @($existingWarnings + $journalError) -Force
+        $Result | Add-Member -NotePropertyName evidenceJournalFinalized -NotePropertyValue $false -Force
+        return $false
+    }
+}
+
 function Find-UnsafeTfc1 {
     param($Value, [string]$Path = '$')
     if ($Value -is [string]) {
@@ -769,7 +789,7 @@ try {
         $data = if ($NamesOnly) { [pscustomobject][ordered]@{ names = @($tools | ForEach-Object name); count = $tools.Count } } else { [pscustomobject][ordered]@{ tools = $tools } }
     }
     elseif ($Command -eq 'call') {
-        if (@($tools | Where-Object name -eq $Tool).Count -ne 1) { throw "Tool '$Tool' is not present in the authoritative tools/list response." }
+        $toolAvailable = @($tools | Where-Object name -eq $Tool).Count -eq 1
         $performanceGuard = if ($RequirePerformanceNeutral) {
             Get-PerformanceMeasurementGuard -Tools $tools -Headers $headers
         }
@@ -789,6 +809,41 @@ try {
                 codes = @('performance_measurement_distorted')
                 states = @()
                 reasons = @("Performance measurement rejected: $($performanceGuard.reason).")
+            }
+        }
+        elseif (-not $toolAvailable) {
+            $data = [pscustomobject][ordered]@{
+                tool = $Tool
+                toolAvailable = $false
+                toolCallSkipped = $true
+                performanceGuard = $performanceGuard
+            }
+            $semantic = [pscustomobject][ordered]@{
+                known = $true
+                ok = $false
+                outcome = 'tool-unavailable'
+                guarded = $false
+                transient = $false
+                codes = @('tool_unavailable')
+                states = @('tool_unavailable')
+                reasons = @("Tool '$Tool' is not present in the authoritative tools/list response.")
+            }
+            if ($performanceGuard) {
+                $performanceGuardAfter = Get-PerformanceMeasurementGuard -Tools $tools -Headers $headers
+                $performanceWindow = Test-DevBenchPerformanceWindow -Before $performanceGuard -After $performanceGuardAfter
+                $data | Add-Member -NotePropertyName performanceWindow -NotePropertyValue $performanceWindow -Force
+                if (-not $performanceWindow.valid) {
+                    $semantic = [pscustomobject][ordered]@{
+                        known = $true
+                        ok = $false
+                        outcome = 'guard-invalidated'
+                        guarded = $true
+                        transient = $false
+                        codes = @('performance_measurement_invalidated')
+                        states = @()
+                        reasons = @("Performance measurement rejected: $($performanceWindow.reason).")
+                    }
+                }
             }
         }
         else {
@@ -1223,7 +1278,9 @@ try {
     }
     $guardedProperty = $semantic.PSObject.Properties['guarded']
     $completionState = if ($guardedProperty -and [bool]$guardedProperty.Value -and -not $semantic.ok) { 'guard-rejected' } else { 'completed' }
-    Update-InvocationEvidence -State $completionState -Semantic $semantic -Data $data -Errors @($result.errors)
+    $null = Write-TerminalInvocationEvidence -Result $result -FailurePrefix 'Completed invocation evidence could not be journaled' -WriteAction {
+        Update-InvocationEvidence -State $completionState -Semantic $semantic -Data $data -Errors @($result.errors)
+    }
 }
 catch {
     $failureMessage = $_.Exception.Message
@@ -1255,14 +1312,12 @@ catch {
 $sessionCleanup = Close-AllMcpSessions
 $result | Add-Member -NotePropertyName sessionCleanup -NotePropertyValue $sessionCleanup
 if ($invocationRecord -and -not [string]::IsNullOrWhiteSpace($invocationEvidencePath)) {
-    try {
+    $finalEvidenceWritten = Write-TerminalInvocationEvidence -Result $result -FailurePrefix 'Session cleanup evidence could not be journaled' -WriteAction {
         $invocationRecord['sessionCleanup'] = $sessionCleanup
         Write-JsonAtomic -Path $invocationEvidencePath -Value $invocationRecord
     }
-    catch {
-        $journalError = "Session cleanup evidence could not be journaled: $($_.Exception.Message)"
-        $result.errors = @($result.errors) + $journalError
-        $result | Add-Member -NotePropertyName evidenceJournalFinalized -NotePropertyValue $false -Force
+    if ($finalEvidenceWritten) {
+        $result | Add-Member -NotePropertyName evidenceJournalFinalized -NotePropertyValue $true -Force
     }
 }
 

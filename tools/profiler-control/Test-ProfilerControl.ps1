@@ -133,27 +133,33 @@ try {
     $runtimePath = Join-Path $resolvedTestRoot 'runtime.json'
     $statePath = Join-Path $resolvedTestRoot 'profiler-state.json'
     [IO.File]::WriteAllText($runtimePath, '{}', [Text.UTF8Encoding]::new($false))
-    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0}', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText($fakeControl, @'
 param([string]$Command,[string]$Tool,[string]$ArgumentsJson,[string]$RuntimePath,[string]$EvidenceDirectory,[string]$EvidenceLabel,[int]$TimeoutSeconds,[switch]$RequireSuccess,[switch]$RequirePerformanceNeutral,[switch]$NoExit,[switch]$Compact)
 $state = Get-Content -LiteralPath $env:CSX_PROFILER_TEST_STATE -Raw | ConvertFrom-Json -AsHashtable
 $state.calls = [int]$state.calls + 1
+$isRenderScale = $Tool -eq 'communityshaders.renderscale'
+if ($isRenderScale) { $state.renderScaleCalls = [int]$state.renderScaleCalls + 1 }
 $action = ($ArgumentsJson | ConvertFrom-Json).action
 if ($action -eq 'enable') { $state.enabled = $true }
 elseif ($action -eq 'disable') { $state.enabled = $false }
-elseif ($action -eq 'status') { $state.frame = [int]$state.frame + 1 }
+elseif ($action -eq 'status' -and -not $isRenderScale) { $state.frame = [int]$state.frame + 1 }
 $state | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:CSX_PROFILER_TEST_STATE -Encoding utf8
 $timer = [pscustomobject]@{name='Synthetic';activeGpu=$true;activeCpu=$true;hasGpu=$true;hasCpu=$true;gpuMs=1.0;topLevelMs=1.0;cpuMs=0.1}
 $status = [pscustomobject]@{enabled=[bool]$state.enabled;frame_count=[long]$state.frame;capturedFrameCount=[long]$state.frame;resolvedTotalMs=1.0;resolvedCpuTotalMs=0.1;acquiredSlots=1;slotRefusals=0;timers=@($timer)}
 $listenerPid = if (-not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DRIFT_AT_CALL) -and [int]$env:CSX_PROFILER_TEST_DRIFT_AT_CALL -eq [int]$state.calls) { 456 } else { 123 }
 $data = [ordered]@{content=@([pscustomobject]@{ok=$true;status=$status})}
 if ($RequirePerformanceNeutral) {
-    $distorted = -not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DISTORT_ACTION) -and $env:CSX_PROFILER_TEST_DISTORT_ACTION -eq $action
-    $guard = [pscustomobject]@{applicable=$true;neutral=(-not $distorted);performanceDistorted=$distorted;performanceEpoch=7;physicalStateKnown=$true;reason=$(if ($distorted) {'intrusive-temporal-probe-active'} else {'intrusive-temporal-probe-disarmed'})}
+    $distorted = (-not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DISTORT_ACTION) -and $env:CSX_PROFILER_TEST_DISTORT_ACTION -eq $action) -or (-not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DISTORT_LABEL) -and $env:CSX_PROFILER_TEST_DISTORT_LABEL -eq $EvidenceLabel)
+    $epoch = if ($isRenderScale -and [int]$state.renderScaleCalls -eq 2 -and $env:CSX_PROFILER_TEST_RENDER_SCALE_EPOCH_AFTER -eq '1') { 8 } else { 7 }
+    $guard = [pscustomobject]@{applicable=$true;neutral=(-not $distorted);performanceDistorted=$distorted;performanceEpoch=$epoch;physicalStateKnown=$true;reason=$(if ($distorted) {'intrusive-temporal-probe-active'} else {'intrusive-temporal-probe-disarmed'})}
     $data.performanceGuard = $guard
     $data.performanceWindow = [pscustomobject]@{valid=(-not $distorted);applicable=$true;sameEpoch=$true;before=$guard;after=$guard;reason=$(if ($distorted) {'performance-probe-distorted'} else {'performance-window-neutral'})}
 }
-[pscustomobject]@{ok=$true;runtimeIdentity=[pscustomobject]@{complete=$true;verified=$true;listenerPid=$listenerPid;process=[pscustomobject]@{path='C:\Fixture\SkyrimVR.exe';startTimeUtc='2026-08-28T00:00:00Z'};build=[pscustomobject]@{buildId='fixture'};artifact=[pscustomobject]@{path='C:\Fixture\CommunityShaders.dll';sha256='AA'}};invocationEvidencePath=(Join-Path $EvidenceDirectory "$EvidenceLabel.json");sessionCleanup=[pscustomobject]@{attempted=$true;ok=$true;state='all_closed'};data=[pscustomobject]$data;errors=@()} | ConvertTo-Json -Depth 20 -Compress
+$optionalMode = [string]$env:CSX_PROFILER_TEST_RENDER_SCALE_OPTIONAL_MODE
+$optionalUnavailable = $isRenderScale -and $optionalMode -in @('absent', 'unsupported')
+$semantic = if ($optionalUnavailable) { [pscustomobject]@{known=$true;ok=$false;outcome=$(if ($optionalMode -eq 'absent') {'tool-unavailable'} else {'unsupported'});codes=@($(if ($optionalMode -eq 'absent') {'tool_unavailable'} else {'unsupported'}));states=@()} } else { $null }
+[pscustomobject]@{ok=(-not $optionalUnavailable);state=$(if ($optionalUnavailable -and $optionalMode -eq 'absent') {'tool-unavailable'} else {'completed'});semantic=$semantic;runtimeIdentity=[pscustomobject]@{complete=$true;verified=$true;listenerPid=$listenerPid;process=[pscustomobject]@{path='C:\Fixture\SkyrimVR.exe';startTimeUtc='2026-08-28T00:00:00Z'};build=[pscustomobject]@{buildId='fixture'};artifact=[pscustomobject]@{path='C:\Fixture\CommunityShaders.dll';sha256='AA'}};invocationEvidencePath=(Join-Path $EvidenceDirectory "$EvidenceLabel.json");sessionCleanup=[pscustomobject]@{attempted=$true;ok=$true;state='all_closed'};data=[pscustomobject]$data;errors=$(if ($optionalUnavailable) {@("render-scale $optionalMode")} else {@()})} | ConvertTo-Json -Depth 20 -Compress
 '@, [Text.UTF8Encoding]::new($false))
     $env:CSX_PROFILER_TEST_STATE = $statePath
     $env:CSX_PROFILER_CONTROL_ROOT = Join-Path $resolvedTestRoot 'profiler-control'
@@ -166,20 +172,47 @@ if ($RequirePerformanceNeutral) {
     $measuredRecords = @(Get-Content -LiteralPath $measurement.rawPath -Raw | ConvertFrom-Json)
     $measurementReceipt = Get-Content -LiteralPath $measurement.receiptPath -Raw | ConvertFrom-Json
     Assert-Test (@($measuredRecords.runtimeIdentityFingerprint | Sort-Object -Unique).Count -eq 1 -and @($measurementReceipt.runtimeIdentityObservations).Count -ge 7) 'measurement binds every accepted response and sample to one verified runtime identity'
-    Assert-Test ($measurement.summary.schemaVersion -eq 3 -and @($measurement.summary.performanceObservations).Count -ge 5) 'measurement preserves performance-neutrality evidence in summary schema 3'
+    Assert-Test ($measurement.summary.schemaVersion -eq 3 -and @($measurement.summary.performanceObservations).Count -ge 7) 'measurement preserves performance-neutrality evidence in summary schema 3'
     Assert-Test (@($measurement.summary.performanceObservations | Where-Object { -not $_.window.valid -or $_.guard.performanceEpoch -ne 7 }).Count -eq 0) 'measurement retains one valid performance epoch across the capture'
+    Assert-Test (@($measurement.summary.performanceObservations | Where-Object { $_.action -in @('renderscale-before', 'renderscale-after') }).Count -eq 2) 'capture-wide performance evidence includes both render-scale snapshots'
     Assert-Test (@($measurement.summary.performanceObservations | Where-Object { -not $_.sessionCleanup.ok }).Count -eq 0) 'measurement preserves final MCP cleanup evidence for every guarded profiler call'
+
+    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
+    $env:CSX_PROFILER_TEST_RENDER_SCALE_EPOCH_AFTER = '1'
+    $renderScaleEpochError = $null
+    try { & $measure -Label render-scale-epoch-drift -EvidenceDirectory (Join-Path $resolvedTestRoot 'render-scale-epoch-drift') -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | Out-Null }
+    catch { $renderScaleEpochError = $_.Exception.Message }
+    Remove-Item Env:CSX_PROFILER_TEST_RENDER_SCALE_EPOCH_AFTER -ErrorAction SilentlyContinue
+    $renderScaleEpochFinalState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    Assert-Test ($renderScaleEpochError -match 'renderscale-after.*changed performance-probe registration or ownership epoch' -and -not $renderScaleEpochFinalState.enabled) 'final render-scale snapshot rejects capture-wide performance epoch drift and restores state'
+
+    foreach ($optionalMode in @('absent', 'unsupported')) {
+        [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
+        $env:CSX_PROFILER_TEST_RENDER_SCALE_OPTIONAL_MODE = $optionalMode
+        $optionalMeasurement = & $measure -Label "render-scale-$optionalMode" -EvidenceDirectory (Join-Path $resolvedTestRoot "render-scale-$optionalMode") -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | ConvertFrom-Json
+        $optionalFinalState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+        Assert-Test ($optionalMeasurement.ok -and $optionalMeasurement.summary.resourcePublication.before.availability -eq 'unavailable' -and $optionalMeasurement.summary.resourcePublication.after.availability -eq 'unavailable' -and -not $optionalFinalState.enabled) "optional render-scale $optionalMode preserves a qualified capture and exact restoration"
+    }
+    Remove-Item Env:CSX_PROFILER_TEST_RENDER_SCALE_OPTIONAL_MODE -ErrorAction SilentlyContinue
+
+    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
+    $env:CSX_PROFILER_TEST_DISTORT_LABEL = 'renderscale-before'
+    $renderScaleGuardError = $null
+    try { & $measure -Label render-scale-guard-failure -EvidenceDirectory (Join-Path $resolvedTestRoot 'render-scale-guard-failure') -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | Out-Null }
+    catch { $renderScaleGuardError = $_.Exception.Message }
+    Remove-Item Env:CSX_PROFILER_TEST_DISTORT_LABEL -ErrorAction SilentlyContinue
+    Assert-Test ($renderScaleGuardError -match 'renderscale-before.*performance-neutrality window') 'optional render-scale telemetry never downgrades a mandatory performance guard failure'
 
     $recoveryMirror = Join-Path $resolvedTestRoot 'interrupted-profiler.journal.json'
     $authoritativeJournal = Join-Path $env:CSX_PROFILER_CONTROL_ROOT 'transaction.journal.json'
     [ordered]@{contractVersion='1.0.0';operation='measure-profiler';transactionId='interrupted-fixture';phase='sampling';runtimePath=$runtimePath;runtimeIdentityFingerprint=$measurement.summary.runtimeIdentityFingerprint;priorEnabled=$false;evidenceMirrorPath=$recoveryMirror;preparedUtc=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $authoritativeJournal -Encoding utf8
-    [IO.File]::WriteAllText($statePath, '{"enabled":true,"frame":0,"calls":0}', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($statePath, '{"enabled":true,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
     $recoveredMeasurement = & $measure -Label restart-recovery -EvidenceDirectory (Join-Path $resolvedTestRoot 'recovery') -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | ConvertFrom-Json
     $recoveredPriorJournal = Get-Content -LiteralPath $recoveryMirror -Raw | ConvertFrom-Json
     $recoveredFinalState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
     Assert-Test ($recoveredMeasurement.ok -and $recoveredPriorJournal.phase -eq 'recovered-preimage' -and $recoveredPriorJournal.recovery.stateRestored -and -not $recoveredFinalState.enabled) 'next capture discovers a dead capture journal and restores the same runtime exact prior state'
 
-    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0}', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
     $env:CSX_PROFILER_TEST_DRIFT_AT_CALL = '3'
     $driftError = $null
     try { & $measure -Label identity-drift -EvidenceDirectory (Join-Path $resolvedTestRoot 'drift') -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | Out-Null }
@@ -188,7 +221,7 @@ if ($RequirePerformanceNeutral) {
     $driftFinalState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
     Assert-Test ($driftError -match 'runtime identity changed' -and -not $driftFinalState.enabled) 'measurement rejects a replacement runtime and restores state only through the original identity'
 
-    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0}', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
     $env:CSX_PROFILER_TEST_DISTORT_ACTION = 'status'
     $distortionError = $null
     try { & $measure -Label performance-distortion -EvidenceDirectory (Join-Path $resolvedTestRoot 'distortion') -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | Out-Null }
@@ -197,7 +230,7 @@ if ($RequirePerformanceNeutral) {
     $distortionFinalState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
     Assert-Test ($distortionError -match 'performance-neutrality window' -and -not $distortionFinalState.enabled) 'measurement fails closed on a distorted performance probe and restores profiler state'
 
-    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0}', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
     $deadlineWatch = [Diagnostics.Stopwatch]::StartNew()
     $deadlineError = $null
     try { & $measure -Label deadline -EvidenceDirectory (Join-Path $resolvedTestRoot 'deadline') -ContextJson $contextJson -Samples 3 -WarmupSamples 100 -IntervalMs 50 -TotalTimeoutSeconds 5 -RestoreReserveSeconds 2 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | Out-Null }
@@ -248,6 +281,9 @@ if ($RequirePerformanceNeutral) {
 finally {
     Remove-Item Env:CSX_PROFILER_TEST_STATE -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_DRIFT_AT_CALL -ErrorAction SilentlyContinue
+    Remove-Item Env:CSX_PROFILER_TEST_RENDER_SCALE_EPOCH_AFTER -ErrorAction SilentlyContinue
+    Remove-Item Env:CSX_PROFILER_TEST_RENDER_SCALE_OPTIONAL_MODE -ErrorAction SilentlyContinue
+    Remove-Item Env:CSX_PROFILER_TEST_DISTORT_LABEL -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_CONTROL_ROOT -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $resolvedTestRoot -PathType Container) {
         Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force
