@@ -51,6 +51,8 @@ by the host environment.
 Do not propose reusable approval for:
 
 - `recover-access`, because it transfers an abandoned lease;
+- `configure-steamvr-exclusions`, because it rewrites the selected installation's
+  MO2 INI under an exact backup transaction;
 - workspace `recover-legacy-selection`, because it changes the shared MO2
   selected profile after exact legacy-workspace classification;
 - `terminate-game` or `terminate`, because they force process termination;
@@ -61,11 +63,12 @@ Do not propose reusable approval for:
 - any profile-control mutation, because it overwrites `modlist.txt` under its
   exact backup transaction.
 
-Workspace `prepare-source`, `create`, `resume`, `register-mod`, and
-`ensure-mod-wins` are eligible only through the exact workspace entry point and
-literal subcommand. Their access and ownership proofs remain mandatory.
-`prepare-source` is a non-mutating compatibility inspection. Profile `inspect`
-is read-only; all other profile commands remain one-shot.
+Workspace `create`, `resume`, `register-mod`, and `ensure-mod-wins` are eligible
+only through the exact workspace entry point and literal subcommand. Their
+access and ownership proofs remain mandatory. `prepare-source` is a one-shot
+mutation: except under `-WhatIf`, it moves legacy shader-cache trees from
+Overwrite into a newly enabled stable-profile mod. Profile `inspect` is
+read-only; all other profile commands remain one-shot.
 
 ## Approval request construction
 

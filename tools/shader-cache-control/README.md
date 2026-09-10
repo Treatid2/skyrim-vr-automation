@@ -48,7 +48,8 @@ than evidence copies.
 ```powershell
 .\Invoke-CSXShaderCacheTransaction.ps1 providers `
   -ProfilePath 'D:\MO2\profiles\Profile\modlist.txt' `
-  -ModsPath 'D:\MO2\mods' -DeepInventory
+  -ModsPath 'D:\MO2\mods' -DeepInventory `
+  -EvidenceDirectory 'D:\Evidence\provider-inventory'
 
 .\Invoke-CSXShaderCacheTransaction.ps1 snapshot `
   -CachePath 'D:\MO2\mods\Cache Mod\ShaderCache' `
@@ -86,8 +87,9 @@ tags, and—by default—exact shader-source SHA-256. Supply
 `-FeatureSetSha256` whenever an effective feature-set fingerprint is available;
 then an absent or different fingerprint is a hard exclusion. Among compatible
 candidates, exact source, feature-set, build, preset, and observed render-path
-matches rank first, followed by broader verified coverage and
-recency. `select` returns both the ranking and explicit exclusion reasons.
+matches rank first. Within one render family, the request's provenance class
+(`vr-steamvr-*` or legacy `steamvr-*`) ranks ahead of broader verified coverage
+and recency. `select` returns both the ranking and explicit exclusion reasons.
 
 The exact render path remains immutable provenance and an exact-match ranking
 signal. The default `skyrimvr-d3d11` class deliberately permits reuse across
@@ -120,6 +122,10 @@ Prepare a closed task cache immediately before launching MO2:
   -ProfilePath 'D:\MO2\profiles\Codex Task - Example\modlist.txt' `
   -ModsPath 'D:\MO2\mods' `
   -BindToOverwrite `
+  -WorkspaceId '<workspace identity>' `
+  -OwnershipId '<ownership identity>' `
+  -OwnerMarkerPath 'D:\MO2\overwrite\.codex-workspace-output-owner.json' `
+  -OwnerMarkerSha256 '<exact owner-marker SHA-256>' `
   -EvidenceDirectory 'D:\Evidence\task-id\shader-cache' `
   -ShaderCacheAbi '<exact ABI>' `
   -ShaderSourceSha256 '<exact source-tree SHA-256>' `
@@ -143,9 +149,11 @@ physical `overwrite\ShaderCache` path. After optional seeding it inventories
 all enabled providers in exact modlist priority order and copies every missing
 provider path into Overwrite. Existing Overwrite or seed files remain
 authoritative. Every copied source is checked for stability and the target is
-SHA-256 verified; complete path coverage is then written to
-`shader-cache-provider-shadow.receipt.json` together with the final prepared
-inventory and `preparedTreeSha256`. This full shadow is required because MO2
+SHA-256 verified; complete path coverage and the final `preparedInventory` are
+then written to `shader-cache-provider-shadow.receipt.json`. The task plan
+records the corresponding `preparedTreeSha256`; consumers must validate both
+artifacts and require their hashes to agree. This full shadow is required
+because MO2
 writes modifications to the original provider of an existing virtual path;
 new paths naturally use Overwrite, but existing mod paths must first be made
 Overwrite winners. `-CacheModName` remains available for older explicitly
@@ -161,7 +169,7 @@ After the game and MO2 are closed, complete the cache transaction:
 
 ```powershell
 .\Invoke-CSXShaderCacheCatalog.ps1 complete `
-  -CachePath 'D:\MO2\mods\Task Cache\ShaderCache' `
+  -CachePath 'D:\MO2\overwrite\ShaderCache' `
   -EvidenceDirectory 'D:\Evidence\task-id\shader-cache' `
   -WorkingSetStatus known-working `
   -Promote -Label 'verified task result' `
@@ -197,7 +205,11 @@ silence an unknown ABI mismatch.
 `SKSE\Plugins\CommunityShaders.dll`). It enumerates every physical provider,
 marks the earliest enabled mod provider as the winner among enabled loose mods,
 and explicitly leaves overwrite, unmanaged-file, archive, and runtime
-deployment resolution to separate VFS evidence.
+deployment resolution to separate VFS evidence. `-DeepInventory` returns only
+the bounded file count, byte count, and tree hash inline. When
+`-EvidenceDirectory` is supplied, the complete entry list is written to
+`providers.inventory.json`; use `-IncludeInventoryEntries` only when a caller
+explicitly needs that potentially large list in the command response.
 
 Restore never silently discards the current tree: it copies the displaced
 contents into the evidence directory, verifies that copy, and only then removes

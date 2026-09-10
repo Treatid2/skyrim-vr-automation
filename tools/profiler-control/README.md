@@ -32,7 +32,10 @@ snapshots immediately before and after the measured interval: current,
 current/completed/published generations,
 expected/published dimensions, `complete`, deferred-setup acknowledgement, and
 D3D device/context matches. An unavailable snapshot is explicit evidence and
-does not invalidate the CPU/GPU capture.
+does not invalidate the CPU/GPU capture only when the render-scale tool is
+explicitly absent or unsupported. Both snapshot calls still prove the same
+performance-probe registration and ownership epoch as every measured sample;
+guard, identity, or epoch uncertainty remains a failed capture.
 
 Those same existing status calls retain bounded render-scale preparation
 telemetry: raw events and ring/session/QPC metadata plus summaries for queued

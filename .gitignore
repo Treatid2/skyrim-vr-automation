@@ -17,3 +17,5 @@ native/**/build-*/
 # Common platform/editor debris
 .DS_Store
 Thumbs.db
+__pycache__/
+*.py[cod]

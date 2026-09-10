@@ -1,5 +1,316 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+function unwrapTraceRead(value) {
+    if (value && Array.isArray(value.content) && value.content[0] &&
+        typeof value.content[0].text === "string") {
+        return unwrapTraceRead(JSON.parse(value.content[0].text));
+    }
+    if (value && Array.isArray(value.results)) {
+        const step = value.results.find((entry) => entry &&
+            entry.result && entry.result.action === "dlss_trace_read");
+        return step && step.result;
+    }
+    return value && value.result && value.result.action === "dlss_trace_read" ?
+        value.result : value;
+}
+
+function recordSequence(record) {
+    const value = record && (record.sequence ??
+        (record.current && record.current.sequence));
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function traceCapacity(schema) {
+    const maximum = schema && (schema.maximum ?? schema.max ??
+        (schema.limit && schema.limit.maximum));
+    if (!Number.isSafeInteger(maximum) || maximum < 1) {
+        throw new Error("trace_schema_maximum_missing");
+    }
+    return maximum;
+}
+
+function validateTracePage(rawPage, state) {
+    const page = unwrapTraceRead(rawPage);
+    const capture = page && page.capture;
+    const producer = page && page.producer;
+    if (!page || page.action !== "dlss_trace_read" || !capture ||
+        !Array.isArray(capture.records)) {
+        throw new Error("invalid_trace_page");
+    }
+    if (!producer || producer.buildId !== state.buildId) {
+        throw new Error("trace_build_changed");
+    }
+    const sessionId = capture.summary && capture.summary.sessionID;
+    if (!Number.isSafeInteger(sessionId) || sessionId < 1) {
+        throw new Error("trace_session_missing");
+    }
+    if (state.sessionId !== null && sessionId !== state.sessionId) {
+        throw new Error("trace_session_changed");
+    }
+    if (!Number.isSafeInteger(capture.limit) ||
+        capture.limit > state.maximum || capture.limit < 1 ||
+        capture.records.length > capture.limit) {
+        throw new Error("trace_page_limit_out_of_range");
+    }
+    if (typeof capture.moreAvailable !== "boolean" ||
+        !Number.isSafeInteger(capture.latestSequence) || capture.latestSequence < 0) {
+        throw new Error("trace_continuation_missing");
+    }
+    if (state.latestSequence !== undefined && state.latestSequence !== capture.latestSequence) {
+        throw new Error("trace_window_changed");
+    }
+    state.latestSequence = capture.latestSequence;
+    if (capture.afterSequence !== state.afterSequence) {
+        throw new Error("trace_page_cursor_mismatch");
+    }
+    if (capture.requestedSequenceOverwritten === true ||
+        (Number.isSafeInteger(capture.availableFromSequence) &&
+            capture.availableFromSequence > state.afterSequence + 1)) {
+        throw new Error("trace_requested_sequence_overwritten");
+    }
+
+    let expected = state.afterSequence + 1;
+    for (const record of capture.records) {
+        const sequence = recordSequence(record);
+        if (sequence === null) throw new Error("trace_sequence_missing");
+        if (sequence < expected) throw new Error("trace_sequence_duplicate");
+        if (sequence > expected) throw new Error("trace_sequence_gap");
+        expected += 1;
+    }
+    const lastSequence = capture.records.length > 0 ? expected - 1 :
+        state.afterSequence;
+    if (capture.lastReturnedSequence !== lastSequence) {
+        throw new Error("trace_last_sequence_mismatch");
+    }
+    if (capture.moreAvailable === true && capture.records.length === 0) {
+        throw new Error("trace_empty_continuation_page");
+    }
+    if (lastSequence > capture.latestSequence ||
+        (capture.moreAvailable && lastSequence === capture.latestSequence)) {
+        throw new Error("trace_continuation_out_of_range");
+    }
+    return { page, sessionId, lastSequence };
+}
+
+async function collectTracePages(options) {
+    const {
+        readPage, expectedBuildId, schema, expectedSessionId = null,
+        existingPages = [], preservePage = async () => {},
+    } = options;
+    if (typeof readPage !== "function" || typeof preservePage !== "function" ||
+        typeof expectedBuildId !== "string" || expectedBuildId.length === 0) {
+        throw new Error("invalid_trace_paging_options");
+    }
+    const maximum = traceCapacity(schema);
+    const state = {
+        buildId: expectedBuildId,
+        sessionId: expectedSessionId,
+        afterSequence: 0,
+        maximum,
+    };
+    const pages = [];
+    const records = [];
+
+    for (const rawPage of existingPages) {
+        const checked = validateTracePage(rawPage, state);
+        state.sessionId = checked.sessionId;
+        state.afterSequence = checked.lastSequence;
+        pages.push(checked.page);
+        records.push(...checked.page.capture.records);
+        if (checked.page.capture.moreAvailable !== true) {
+            return { pages, records, sessionId: state.sessionId, maximum };
+        }
+    }
+
+    while (pages.length === 0 ||
+        pages[pages.length - 1].capture.moreAvailable === true) {
+        const rawPage = await readPage({
+            action: "dlss_trace_read",
+            afterSequence: state.afterSequence,
+            limit: maximum,
+            expectedBuildId,
+        });
+        // Preserve the producer receipt even when validation rejects it.
+        await preservePage(rawPage, pages.length + 1);
+        const checked = validateTracePage(rawPage, state);
+        state.sessionId = checked.sessionId;
+        state.afterSequence = checked.lastSequence;
+        pages.push(checked.page);
+        records.push(...checked.page.capture.records);
+    }
+    return { pages, records, sessionId: state.sessionId, maximum };
+}
+
+function validateRetainedTrace(retained) {
+    if (!["traceReset", "traceStart", "traceStop", "traceRead"]
+        .every(name => retained[name])) throw new Error("trace_lifecycle_missing");
+    const buildId = retained.waiter.producer.buildId;
+    const sessionId = retained.traceStart.capture && retained.traceStart.capture.sessionID;
+    for (const name of ["traceReset", "traceStart", "traceStop"]) {
+        const receipt = retained[name];
+        if (!receipt.producer || receipt.producer.buildId !== buildId) {
+            throw new Error("trace_build_changed");
+        }
+        if (!receipt.capture || receipt.action !== {
+            traceReset: "dlss_trace_reset", traceStart: "dlss_trace_start",
+            traceStop: "dlss_trace_stop",
+        }[name]) throw new Error("trace_lifecycle_invalid");
+    }
+    const stopped = retained.traceStop.capture;
+    if (!Number.isSafeInteger(sessionId) || sessionId < 1 ||
+        stopped.sessionID !== sessionId) throw new Error("trace_session_changed");
+    if (retained.traceReset.capture.active !== false ||
+        retained.traceStart.capture.active !== true || stopped.active !== false) {
+        throw new Error("trace_lifecycle_not_stopped");
+    }
+    const pages = retained.traceReadPages || [retained.traceRead];
+    if (!Array.isArray(pages) || pages.length === 0) throw new Error("trace_pages_missing");
+    const first = unwrapTraceRead(pages[0]);
+    if (JSON.stringify(first) !== JSON.stringify(retained.traceRead)) {
+        throw new Error("trace_first_page_mismatch");
+    }
+    const state = { buildId, sessionId, afterSequence: 0,
+        maximum: traceCapacity({ maximum: first.capture && first.capture.limit }) };
+    let records = 0;
+    for (let index = 0; index < pages.length; index += 1) {
+        const checked = validateTracePage(pages[index], state);
+        const capture = checked.page.capture;
+        if (capture.summary.active !== false ||
+            capture.summary.totalRecords !== stopped.totalRecords) {
+            throw new Error("trace_stopped_window_changed");
+        }
+        if (typeof capture.moreAvailable !== "boolean") throw new Error("trace_continuation_missing");
+        if (!capture.moreAvailable && index !== pages.length - 1) {
+            throw new Error("trace_pages_after_terminal");
+        }
+        if (capture.moreAvailable && index === pages.length - 1) {
+            throw new Error("trace_pages_incomplete");
+        }
+        state.afterSequence = checked.lastSequence;
+        records += capture.records.length;
+        if (!capture.moreAvailable && capture.latestSequence !== checked.lastSequence) {
+            throw new Error("trace_terminal_sequence_mismatch");
+        }
+    }
+    if (!Number.isSafeInteger(stopped.totalRecords) ||
+        records !== stopped.totalRecords || stopped.droppedRecords !== 0 ||
+        stopped.overwrittenRecords !== 0) throw new Error("trace_window_incomplete");
+    return { complete: true, pages: pages.length, records, sessionId };
+}
+
+async function createReceiptJournal(tools, runId) {
+    if (!/^[A-Za-z0-9_-]+$/.test(runId) ||
+        typeof tools.exec_command !== "function" || typeof tools.apply_patch !== "function") {
+        throw new Error("durable_receipt_store_unavailable");
+    }
+    const setup = await tools.exec_command({
+        cmd: `$root = [IO.Path]::GetFullPath((Join-Path (Get-Location).Path 'artifacts/renderscale-tuning/${runId}'))
+` +
+            `if (Test-Path -LiteralPath $root) { throw 'Evidence run already exists; preserve it and use a new run ID.' }
+` +
+            `[IO.Directory]::CreateDirectory($root) | Out-Null
+` +
+            `$owner = [IO.File]::Open((Join-Path $root 'receipt-owner'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+` +
+            `$owner.Dispose()
+[pscustomobject]@{ root = $root } | ConvertTo-Json -Compress`,
+        max_output_tokens: 300,
+    });
+    if (setup.exit_code !== 0) throw new Error("durable_receipt_store_creation_failed");
+    const root = JSON.parse(setup.output).root.replaceAll("\\", "/");
+    let sequence = 0;
+    return {
+        root,
+        write: async (receiptKey, value) => {
+            const number = String(++sequence).padStart(6, "0");
+            const entry = JSON.stringify({ sequence, receiptKey, value });
+            const result = await tools.apply_patch(
+                `*** Begin Patch\n*** Add File: ${root}/raw/journal/${number}.json\n+${entry}\n*** End Patch`);
+            if (result && (result.isError || result.exit_code > 0)) {
+                throw new Error("durable_receipt_write_failed");
+            }
+        },
+    };
+}
+
+function exposedBackend(value) {
+    return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function actualBackend(waiter, target) {
+    if (target.method === "none" || target.method === "taa") return "none";
+    if (target.method !== "dlss" && target.method !== "fsr") {
+        return "not_exposed";
+    }
+    if (target.renderScaleMode === false) {
+        const execution = waiter.nativeVendorExecution ||
+            waiter.observation && waiter.observation.nativeVendorExecution;
+        return exposedBackend(execution && execution.actualBackend) ||
+            "not_exposed";
+    }
+    if (target.renderScaleMode !== true) return "not_exposed";
+    const timeline = waiter.replacementTimeline || {};
+    const proof = timeline.terminal &&
+        timeline.terminal.presentationProof || {};
+    const direct = exposedBackend(proof.backend);
+    if (direct) return direct;
+    const left = exposedBackend(proof.leftEye && proof.leftEye.backend);
+    const right = exposedBackend(proof.rightEye && proof.rightEye.backend);
+    if (left && left === right) return left;
+    const dispatch = waiter.status && waiter.status.fsrDispatch;
+    return exposedBackend(dispatch && dispatch.actualDispatchBackend) ||
+        "not_exposed";
+}
+
+function amdLaneAvailability(lane, capabilities) {
+    const supported = capabilities?.supportedFSRRuntimeMask;
+    const unavailable = capabilities?.fsrRuntimeUnavailableConditions;
+    if (!Number.isSafeInteger(supported) || supported < 0 || supported > 3 ||
+        !Array.isArray(unavailable) || unavailable.length !== 2 ||
+        unavailable.some(entry => !Number.isSafeInteger(entry?.mask) || entry.mask < 0)) {
+        return { runnable: null, reason: "fsr_runtime_capability_shape_invalid" };
+    }
+    const fsr3 = (supported & 1) !== 0 && unavailable[0].mask === 0;
+    const runnable = lane.id === "explicit_fsr4" ?
+        (supported & 2) !== 0 && unavailable[1].mask === 0 :
+        lane.id === "explicit_fsr3" ? fsr3 :
+        lane.id === "fsr4_to_fsr3_fallback" ? fsr3 && unavailable[1].mask !== 0 : null;
+    return { runnable, reason: runnable === true ? null : "lane_capability_requirements_not_met",
+        supportedFSRRuntimeMask: supported, fsrRuntimeUnavailableConditions: unavailable };
+}
+
+function qualifyLaneBackend(waiter, target, lane, capabilities) {
+    if (!lane?.expectedBackends) return { verdict: "NOT_APPLICABLE", reasons: [] };
+    const eligibility = amdLaneAvailability(lane, capabilities);
+    const result = { verdict: "PASS", reasons: [], eligibility,
+        expectedBackends: lane.expectedBackends, actualBackend: actualBackend(waiter, target),
+        configuredFsrRuntime: target.fsrRuntime ?? null, runtimeFallbackObserved: null };
+    if (eligibility.runnable !== true) result.reasons.push("lane_not_eligible");
+    if (target.method === "fsr") {
+        if (target.fsrRuntime !== lane.configuredFsrRuntime) result.reasons.push("configured_runtime_mismatch");
+        if (!lane.expectedBackends.includes(result.actualBackend)) result.reasons.push("physical_backend_mismatch_or_missing");
+        const execution = waiter.nativeVendorExecution || waiter.observation?.nativeVendorExecution;
+        const proof = waiter.replacementTimeline?.terminal?.presentationProof;
+        const eyes = [proof?.leftEye, proof?.rightEye];
+        const fallback = target.renderScaleMode === false ? execution?.actualRuntimeFallbackObserved :
+            eyes.every(eye => typeof eye?.vendorRuntimeFallback === "boolean") ?
+                eyes.some(eye => eye.vendorRuntimeFallback) : null;
+        result.runtimeFallbackObserved = typeof fallback === "boolean" ? fallback : null;
+        if (target.renderScaleMode === true && typeof eyes[0]?.vendorRuntimeFallback === "boolean" &&
+            typeof eyes[1]?.vendorRuntimeFallback === "boolean" &&
+            eyes[0].vendorRuntimeFallback !== eyes[1].vendorRuntimeFallback)
+            result.reasons.push("eye_fallback_mismatch");
+        if (target.renderScaleMode === true && eyes.some(eye => eye?.backend &&
+            !lane.expectedBackends.includes(eye.backend))) result.reasons.push("eye_backend_mismatch");
+        if (lane.requiresDocumentedFsr4UnavailableCondition && result.runtimeFallbackObserved !== true)
+            result.reasons.push("runtime_fallback_not_proven");
+        if (lane.requiresFsr4Available && result.runtimeFallbackObserved !== false)
+            result.reasons.push("explicit_fsr4_without_fallback_not_proven");
+    } else if (!["none", "taa"].includes(target.method)) result.reasons.push("lane_method_invalid");
+    if (result.reasons.length) result.verdict = "FAIL";
+    return result;
+}
+
 async function runRenderScaleTuningLive(context) {
     "use strict";
 
@@ -13,17 +324,30 @@ async function runRenderScaleTuningLive(context) {
         throw new Error("plugin_direct_unavailable");
     }
     const retainedReceiptKeys = [];
+    let verifiedAdapter = null;
+    let cleanupMode = false;
+    let ownedCaptures = {};
+    let amdTraceMayBeActive = false;
+    const cleanupEvidenceErrors = [];
 
-    function retain(key, value) {
+    async function retain(key, value) {
         store(key, value);
+        try { await receiptJournal.write(key, value); }
+        catch (error) {
+            if (!cleanupMode) throw error;
+            cleanupEvidenceErrors.push({ receiptKey: key, error: String(error.message || error) });
+        }
         if (!retainedReceiptKeys.includes(key)) retainedReceiptKeys.push(key);
     }
 
-    function retainLiveResult(summary) {
+    async function retainLiveResult(summary) {
         const key = `${runId}:live-result`;
         if (!retainedReceiptKeys.includes(key)) retainedReceiptKeys.push(key);
         summary.receiptKeys = [...retainedReceiptKeys];
-        store(key, summary);
+        summary.evidenceRoot = receiptJournal.root;
+        summary.cleanupEvidenceErrors = cleanupEvidenceErrors;
+        await retain(key, summary);
+        if (receiptJournal.drain) await receiptJournal.drain();
     }
 
     const quality = Object.freeze({
@@ -126,23 +450,80 @@ async function runRenderScaleTuningLive(context) {
 
     // Qualification producers have used flat profiles and wrapped public
     // snapshots. Decode either shape without changing the measured sequence.
-    function terminalBoundary(waiter) {
-        const snapshot = waiter.upscalingSnapshot;
+    function terminalBoundary(waiter, validateTerminal = true) {
+        const snapshot = waiter && waiter.upscalingSnapshot;
+        if (validateTerminal && (!snapshot || typeof snapshot !== "object")) {
+            throw diagnosticError("effective_profile_missing", {
+                reason: "upscaling_snapshot_missing",
+            });
+        }
         const profile = snapshot.effective ||
             (snapshot.profiles && snapshot.profiles.effective);
         const enumName = (value, names = null) =>
             value && typeof value === "object" ? value.name :
                 names && Number.isSafeInteger(value) ? names[value] : value;
+        if (validateTerminal && (!profile || typeof profile !== "object")) {
+            throw diagnosticError("effective_profile_missing", {
+                reason: "effective_profile_missing",
+            });
+        }
+        const decoded = {
+            method: enumName(profile.method),
+            qualityMode: enumName(profile.qualityMode, qualityName),
+            renderScaleMode: profile.renderScaleMode,
+            dlssProfile: enumName(profile.dlssProfile),
+            fsrRuntime: enumName(profile.fsrRuntime),
+        };
+        const validName = (value) =>
+            typeof value === "string" && value.length > 0;
+        if (validateTerminal && (!Number.isSafeInteger(snapshot.stateRevision) ||
+            snapshot.stateRevision < 0 || !validName(decoded.method) ||
+            !validName(decoded.qualityMode) ||
+            typeof decoded.renderScaleMode !== "boolean" ||
+            !validName(decoded.dlssProfile) || !validName(decoded.fsrRuntime))) {
+            throw diagnosticError("effective_profile_invalid", {
+                reason: "effective_profile_shape_invalid",
+                stateRevision: snapshot.stateRevision ?? null,
+                fields: {
+                    method: decoded.method ?? null,
+                    qualityMode: decoded.qualityMode ?? null,
+                    renderScaleMode: decoded.renderScaleMode ?? null,
+                    dlssProfile: decoded.dlssProfile ?? null,
+                    fsrRuntime: decoded.fsrRuntime ?? null,
+                },
+            });
+        }
+        if (validateTerminal) requireTerminalAdapter(waiter);
         return {
             revision: snapshot.stateRevision,
-            profile: {
-                method: enumName(profile.method),
-                qualityMode: enumName(profile.qualityMode, qualityName),
-                renderScaleMode: profile.renderScaleMode,
-                dlssProfile: enumName(profile.dlssProfile),
-                fsrRuntime: enumName(profile.fsrRuntime),
-            },
+            profile: decoded,
         };
+    }
+
+    function requireTerminalAdapter(waiter) {
+        const stressSessionId = waiter.baseline && waiter.baseline.stressSessionId ||
+            waiter.status && waiter.status.session && waiter.status.session.id;
+        const adapter = waiter.status ? waiter.status.adapter :
+            verifiedAdapter && verifiedAdapter.stressSessionId === stressSessionId ?
+                verifiedAdapter.adapter : null;
+        if (!adapter || adapter.available !== true) {
+            throw diagnosticError("terminal_adapter_unavailable", {
+                reason: "adapter_identity_not_available", variant,
+                adapter: adapter || null,
+            });
+        }
+        const vendorId = typeof adapter.vendorId === "string" &&
+            /^(?:0x[0-9a-f]+|[0-9]+)$/i.test(adapter.vendorId) ?
+            Number(adapter.vendorId) : adapter.vendorId;
+        const expectedVendorId = variant === "amd" ? 0x1002 : 0x10de;
+        if (!Number.isSafeInteger(vendorId) || vendorId !== expectedVendorId) {
+            throw diagnosticError("terminal_adapter_vendor_mismatch", {
+                reason: "adapter_vendor_mismatch", variant, expectedVendorId,
+                actualVendorId: Number.isSafeInteger(vendorId) ? vendorId : null,
+                adapter,
+            });
+        }
+        verifiedAdapter = { stressSessionId, adapter: { ...adapter, vendorId } };
     }
 
     // Keep positioning admission inside the runner so callers cannot add
@@ -191,13 +572,18 @@ async function runRenderScaleTuningLive(context) {
             cellEditorId: sceneResult.cell.editorId,
             boundary: terminalBoundary({
                 upscalingSnapshot: snapshotResult.snapshot,
-            }),
+            }, false),
             capabilities: capabilitiesResult &&
                 capabilitiesResult.capabilities || {},
         };
     }
 
     const positioning = positioningInputs(positioningRoot);
+    const receiptJournal = context.receiptJournal || await createReceiptJournal(tools, runId);
+    for (const [name, value] of Object.entries(context.startupReceipts || {})) {
+        await retain(`${runId}:startup-${name}`, value);
+    }
+
     const capabilities = positioning.capabilities;
     notify({
         phase: "positioning",
@@ -237,7 +623,7 @@ async function runRenderScaleTuningLive(context) {
             envelope = await scenarioTool({
                 action: "run",
                 async: false,
-                continueOnError: false,
+                continueOnError: cleanupMode,
                 steps,
             });
         } catch (error) {
@@ -255,9 +641,27 @@ async function runRenderScaleTuningLive(context) {
                 reportedSteps: [],
             });
         }
-        retain(receiptKey, envelope);
         try {
-            return { envelope, root: decodeEnvelope(envelope) };
+            const root = decodeEnvelope(envelope);
+            for (const entry of root.results || []) {
+                const value = entry.result;
+                if ((entry.label === "baseline-stress-start" || entry.label === "measured-stress-start") &&
+                    value?.status?.session?.active === true &&
+                    Number.isSafeInteger(value.status.session.id) && value.status.session.id > 0) {
+                    ownedCaptures = { stressSessionId: value.status.session.id };
+                }
+                if (entry.label === "texture-lifetime-start") ownedCaptures.textureSessionId = value?.capture?.sessionID;
+                if (entry.label === "load-presentation-start") ownedCaptures.probeSessionId = value?.status?.sessionID;
+                if (["dlss-trace-start", "amd-dlss-trace-start"].includes(entry.label)) ownedCaptures.traceSessionId = value?.capture?.sessionID;
+                if (entry.label === "profiler-enable") ownedCaptures.profilerEnabled = value?.ok === true;
+                if (entry.label === "qualification-dispatch" && value?.performanceTelemetry?.started) {
+                    ownedCaptures.cpuSessionId = value.performanceTelemetry.cpuPerformance?.sessionId;
+                    ownedCaptures.gpuStartFrame = value.performanceTelemetry.gpuPerformance?.startFrame;
+                }
+            }
+            if (context.observeOwnership) context.observeOwnership({ ...ownedCaptures });
+            await retain(receiptKey, envelope);
+            return { envelope, root };
         } catch (error) {
             throw diagnosticError("scenario_decode_failed", {
                 phase: "decode",
@@ -376,7 +780,7 @@ async function runRenderScaleTuningLive(context) {
             }));
             steps.push(toolStep("dlss-trace-read", "communityshaders.renderscale", {
                 action: "dlss_trace_read", afterSequence: 0,
-                limit: matrix.traceReadLimit, expectedBuildId: buildId,
+                expectedBuildId: buildId,
             }));
         }
         return steps;
@@ -731,9 +1135,9 @@ async function runRenderScaleTuningLive(context) {
     }
 
     function exactNativeStereoProof(proof, target) {
-        const exactEye = (eye) => eye &&
+        const exactEye = (eye) => eye && (eye.valid === undefined || eye.valid === true) &&
             positiveInteger(eye.frame) && eye.frame === proof.frame &&
-            positiveInteger(eye.qpcTick) &&
+            positiveInteger(eye.qpcTick) && eye.qpcTick <= proof.qpcTick &&
             positiveInteger(eye.compositorCycleToken) &&
             eye.compositorCycleToken === proof.compositorCycleToken &&
             positiveInteger(eye.transitionEpoch) &&
@@ -751,9 +1155,41 @@ async function runRenderScaleTuningLive(context) {
             positiveInteger(proof.compositorCycleToken) && proof.backend === "none" &&
             proof.contractGeneration === 0 &&
             proof.providerRuntimeGeneration === 0 &&
-            proof.sharedVendorDispatchRequired === false &&
+            (proof.sharedVendorDispatchRequired === undefined ||
+                proof.sharedVendorDispatchRequired === false) &&
             proof.vendorDispatchProven === false &&
-            exactEye(proof.leftEye) && exactEye(proof.rightEye);
+            exactEye(proof.leftEye) && exactEye(proof.rightEye) &&
+            proof.qpcTick === Math.max(proof.leftEye.qpcTick, proof.rightEye.qpcTick);
+    }
+
+    function exactNativeVendorProof(proof, target) {
+        const backendMatches = target.method === "dlss" ? proof.backend === "dlss" :
+            ["fsr_host", "fsr_runtime", "fsr4_runtime"].includes(proof.backend);
+        const exactEye = eye => eye && (eye.valid === undefined || eye.valid === true) &&
+            eye.frame === proof.frame && positiveInteger(eye.qpcTick) &&
+            eye.qpcTick <= proof.qpcTick &&
+            eye.compositorCycleToken === proof.compositorCycleToken &&
+            eye.transitionEpoch === proof.transitionEpoch &&
+            eye.method === target.method && eye.backend === proof.backend &&
+            eye.generation === proof.contractGeneration &&
+            eye.deviceIdentity === proof.deviceIdentity &&
+            eye.resourceRevision === proof.resourceRevision &&
+            eye.renderWidth === proof.renderWidth && eye.renderHeight === proof.renderHeight &&
+            eye.displayWidth === proof.displayWidth && eye.displayHeight === proof.displayHeight &&
+            eye.vendorDispatchFrame === proof.frame &&
+            nonNegativeInteger(eye.vendorDispatchSerial) &&
+            typeof eye.vendorRuntimeFallback === "boolean";
+        // Native vendor execution has no active scaled-resource generation.
+        return backendMatches && positiveInteger(proof.frame) &&
+            positiveInteger(proof.qpcTick) && positiveInteger(proof.compositorCycleToken) &&
+            nonNegativeInteger(proof.contractGeneration) &&
+            (proof.contractGeneration === 0 ? proof.providerRuntimeGeneration === 0 :
+                positiveInteger(proof.providerRuntimeGeneration)) &&
+            proof.vendorDispatchProven === true &&
+            exactEye(proof.leftEye) && exactEye(proof.rightEye) &&
+            proof.qpcTick === Math.max(proof.leftEye.qpcTick, proof.rightEye.qpcTick) &&
+            proof.leftEye.vendorDispatchSerial === proof.rightEye.vendorDispatchSerial &&
+            proof.leftEye.vendorRuntimeFallback === proof.rightEye.vendorRuntimeFallback;
     }
 
     function exactTargetProof(proof, target) {
@@ -778,8 +1214,11 @@ async function runRenderScaleTuningLive(context) {
             proof.displayHeight,
         ];
         if (!identifiers.every(positiveInteger)) return false;
-        if (vendorTarget && (!positiveInteger(proof.contractGeneration) ||
-            !positiveInteger(proof.providerRuntimeGeneration))) return false;
+        if (vendorTarget && target.renderScaleMode &&
+            (!positiveInteger(proof.contractGeneration) ||
+                !positiveInteger(proof.providerRuntimeGeneration))) return false;
+        if (vendorTarget && !target.renderScaleMode &&
+            !exactNativeVendorProof(proof, target)) return false;
         if (!vendorTarget && !exactNativeStereoProof(proof, target)) return false;
         return target.renderScaleMode ?
             proof.renderWidth < proof.displayWidth &&
@@ -1175,7 +1614,7 @@ async function runRenderScaleTuningLive(context) {
             action: "qualification_status",
             expectedBuildId: buildId,
         });
-        retain(`${runId}:recovery:${identifiers.transitionId}`, status.envelope);
+        await retain(`${runId}:recovery:${identifiers.transitionId}`, status.envelope);
         const qualification = status.root.qualification;
         const waiter = qualification && qualification.lastEvidence;
         if (qualification && qualification.active === false && waiter &&
@@ -1191,7 +1630,7 @@ async function runRenderScaleTuningLive(context) {
             action: "qualification_status",
             expectedBuildId: buildId,
         });
-        retain(`${runId}:recovery:${identifiers.transitionId}:close-status`,
+        await retain(`${runId}:recovery:${identifiers.transitionId}:close-status`,
             status.envelope);
         const qualification = status.root.qualification;
         if (qualification && qualification.active === true &&
@@ -1203,7 +1642,7 @@ async function runRenderScaleTuningLive(context) {
                 ownerId: identifiers.ownerId,
                 expectedBuildId: buildId,
             });
-            retain(`${runId}:recovery:${identifiers.transitionId}:cancel`,
+            await retain(`${runId}:recovery:${identifiers.transitionId}:cancel`,
                 cancel.envelope);
         }
     }
@@ -1228,7 +1667,7 @@ async function runRenderScaleTuningLive(context) {
             steps.push(toolStep("failed-dlss-trace-read",
                 "communityshaders.renderscale", {
                     action: "dlss_trace_read", afterSequence: 0,
-                    limit: matrix.traceReadLimit, expectedBuildId: buildId,
+                    expectedBuildId: buildId,
                 }));
         }
         steps.push(toolStep("recovery-qualification-begin",
@@ -1293,7 +1732,7 @@ async function runRenderScaleTuningLive(context) {
             traceStop: entries.get("failed-dlss-trace-stop") || null,
             traceRead: entries.get("failed-dlss-trace-read") || null,
         };
-        retain(receiptKey, evidence);
+        await retain(receiptKey, evidence);
         if (!recovered) {
             if (!waiter) await closeOpenQualification(identifiers);
             throw diagnosticError("transition_recovery_failed", {
@@ -1335,6 +1774,11 @@ async function runRenderScaleTuningLive(context) {
                     scenarioFailure && scenarioFailure.diagnostic || null);
             }
             const stressSessionId = waiter.baseline && waiter.baseline.stressSessionId;
+            if (waiter.producer?.buildId === buildId &&
+                Number.isSafeInteger(stressSessionId) && stressSessionId > 0) {
+                ownedCaptures = { stressSessionId };
+                if (context.observeOwnership) context.observeOwnership({ ...ownedCaptures });
+            }
             if (!safeTerminal(waiter, identifiers) || !waiter.milestoneTimings ||
                 !waiter.replacementTimeline) {
                 throw diagnosticError("baseline_failed",
@@ -1351,15 +1795,10 @@ async function runRenderScaleTuningLive(context) {
             !waiter.milestoneTimings ||
             !waiter.replacementTimeline) {
             await closeOpenQualification(identifiers);
-            if (stressSessionId) {
-                await renderScale({
-                    action: "stop", expectedSessionId: stressSessionId,
-                    expectedBuildId: buildId,
-                });
-            }
             throw diagnosticError("baseline_failed",
                 scenarioDiagnostic(response.root, steps, receiptKey));
         }
+        requireTerminalAdapter(start);
         return { boundary: terminalBoundary(waiter), stressSessionId, waiter,
             nonStableNote: nonStableNote(waiter) };
     }
@@ -1407,7 +1846,24 @@ async function runRenderScaleTuningLive(context) {
         const response = await scenario(steps, receiptKey);
         const entries = requireScenario(response.root, steps, receiptKey);
         const start = entries.get("measured-stress-start");
-        const sessionId = start.status.session.id;
+        const session = start && start.status && start.status.session;
+        if (!session || session.active !== true ||
+            !Number.isSafeInteger(session.id) || session.id < 1) {
+            const diagnostic = scenarioDiagnostic(
+                response.root, steps, receiptKey, "ownership");
+            diagnostic.ownership = {
+                status: "uncertain",
+                reason: "measured_stress_session_identity_missing",
+                cleanupAttempted: false,
+                baselineSessionId: baselineResult.stressSessionId,
+                reportedSessionId: session && session.id !== undefined ?
+                    session.id : null,
+            };
+            throw diagnosticError(
+                "measured_stress_session_identity_missing", diagnostic);
+        }
+        const sessionId = session.id;
+        requireTerminalAdapter(start);
         return sessionId;
     }
 
@@ -1433,7 +1889,8 @@ async function runRenderScaleTuningLive(context) {
             try {
                 waiter = await recoverTerminal(identifiers);
             } catch {
-                retain(retainedKey, {
+                await retain(retainedKey, {
+                    variant,
                     scenarioReceiptKey: receiptKey,
                     scenario: scenarioFailure && scenarioFailure.diagnostic || null,
                     waiter: null,
@@ -1442,9 +1899,11 @@ async function runRenderScaleTuningLive(context) {
                 throw diagnosticError("transition_receipt_unavailable",
                     scenarioFailure && scenarioFailure.diagnostic || null);
             }
-            projection = transitionProjection(waiter, target);
+            projection = { ...transitionProjection(waiter, target),
+                laneQualification: qualifyLaneBackend(waiter, target, lane, capabilities) };
             diagnostic = scenarioFailure && scenarioFailure.diagnostic || null;
             retained = {
+                variant,
                 scenarioReceiptKey: receiptKey,
                 scenario: diagnostic,
                 sourceRecoveryReceiptKey: boundary.recoveryReceiptKey || null,
@@ -1458,9 +1917,11 @@ async function runRenderScaleTuningLive(context) {
         if (response) {
             entries = resultMap(response.root);
             waiter = entries.get("qualification-wait");
-            projection = waiter ? transitionProjection(waiter, target) : null;
+            projection = waiter ? { ...transitionProjection(waiter, target),
+                laneQualification: qualifyLaneBackend(waiter, target, lane, capabilities) } : null;
             diagnostic = scenarioDiagnostic(response.root, steps, receiptKey);
             retained = {
+                variant,
                 scenarioReceiptKey: receiptKey,
                 scenario: diagnostic,
                 sourceRecoveryReceiptKey: boundary.recoveryReceiptKey || null,
@@ -1480,14 +1941,14 @@ async function runRenderScaleTuningLive(context) {
                 traceStop: entries.get("dlss-trace-stop") || null,
                 traceRead: entries.get("dlss-trace-read") || null,
             };
-            retain(retainedKey, retained);
+            await retain(retainedKey, retained);
             if (!waiter || (response.root.ok !== true &&
                 diagnostic.failedStep !== "qualification-wait")) {
                 await closeOpenQualification(identifiers);
                 throw diagnosticError("transition_scenario_failed", diagnostic);
             }
         }
-        retain(retainedKey, retained);
+        await retain(retainedKey, retained);
         let recovery = null;
         let nextBoundary;
         if (safeTerminal(waiter, identifiers)) {
@@ -1508,7 +1969,7 @@ async function runRenderScaleTuningLive(context) {
                     retained.traceStop = restored.evidence.traceStop;
                     retained.traceRead = restored.evidence.traceRead;
                 }
-                retain(retainedKey, retained);
+                await retain(retainedKey, retained);
                 nextBoundary = restored.boundary;
             } catch (error) {
                 const recoveryReceiptKey =
@@ -1521,8 +1982,17 @@ async function runRenderScaleTuningLive(context) {
                         error.diagnostic || null : null,
                 };
                 retained.recoveryReceiptKey = recoveryReceiptKey;
-                retain(retainedKey, retained);
+                await retain(retainedKey, retained);
                 throw error;
+            }
+        }
+        if (variant === "nvidia" && target.method === "dlss") {
+            await drainTransitionTrace(retained, retainedKey);
+            const trace = retained.traceStop.capture;
+            if (trace.duplicatedConstantsFailures > 0 || trace.evaluateFailures > 0) {
+                projection.renderVerdict = "FAIL";
+                retained.traceExecutionFailure = true;
+                await retain(retainedKey, retained);
             }
         }
         notify({
@@ -1538,6 +2008,36 @@ async function runRenderScaleTuningLive(context) {
         });
         return { boundary: nextBoundary, waiter, projection, recovery,
             sourceRecoveryReceiptKey: retained.sourceRecoveryReceiptKey };
+    }
+
+    async function drainTransitionTrace(retained, retainedKey) {
+        retained.traceReadPages = retained.traceRead ? [retained.traceRead] : [];
+        await retain(retainedKey, retained);
+        if (!retained.traceRead || !retained.traceStart || !retained.traceStop) {
+            throw new Error("trace_lifecycle_missing");
+        }
+        const first = retained.traceRead.capture;
+        // The first read uses the producer default; continuation reuses its returned bound.
+        await collectTracePages({
+            expectedBuildId: buildId,
+            expectedSessionId: retained.traceStart.capture.sessionID,
+            schema: { maximum: first.limit },
+            existingPages: retained.traceReadPages,
+            readPage: async args => {
+                const page = retained.traceReadPages.length + 1;
+                const label = `dlss-trace-page-${page}`;
+                const key = `${retainedKey}:trace-page-${page}`;
+                const steps = [toolStep(label, "communityshaders.renderscale", args)];
+                const response = await scenario(steps, key);
+                return requireScenario(response.root, steps, key).get(label);
+            },
+            preservePage: async page => {
+                retained.traceReadPages.push(page);
+                await retain(retainedKey, retained);
+            },
+        });
+        retained.traceEvidence = validateRetainedTrace(retained);
+        await retain(retainedKey, retained);
     }
 
     async function retainAmdTraceCapability() {
@@ -1557,11 +2057,54 @@ async function runRenderScaleTuningLive(context) {
             }),
             toolStep("amd-dlss-trace-read", "communityshaders.renderscale", {
                 action: "dlss_trace_read", afterSequence: 0,
-                limit: matrix.traceReadLimit, expectedBuildId: buildId,
+                expectedBuildId: buildId,
             }),
         ];
-        const response = await scenario(steps, receiptKey);
-        const entries = requireScenario(response.root, steps, receiptKey);
+        const unavailableTraceAction = (error) => {
+            const diagnostic = error && error.diagnostic;
+            const traceStep = diagnostic && [
+                diagnostic.failedStep,
+                diagnostic.firstUnreportedStep,
+            ].some((label) => typeof label === "string" &&
+                label.startsWith("amd-dlss-trace-"));
+            const reported = diagnostic && [
+                diagnostic.reportedError,
+                ...(diagnostic.reportedSteps || []).map((step) => step.error),
+            ].filter((value) => typeof value === "string").join(" ");
+            const unavailable =
+                /(?:unsupported|unknown|unrecognized|not[ _-](?:available|exposed|implemented)|missing)[\s\S]*(?:action|operation)|(?:action|operation)[\s\S]*(?:unsupported|unknown|unrecognized|not[ _-](?:available|exposed|implemented)|missing)/i
+                    .test(reported || "");
+            return traceStep && unavailable ? diagnostic : null;
+        };
+        const combined = [];
+        async function part(selected, suffix) {
+            const key = `${receiptKey}:${suffix}`;
+            const response = await scenario(selected, key);
+            combined.push(...(response.root.results || []));
+            return requireScenario(response.root, selected, key);
+        }
+        let initial;
+        try { initial = await part(steps.slice(0, 1), "inspect"); }
+        catch (error) {
+            const diagnostic = unavailableTraceAction(error);
+            if (diagnostic) return { status: "unsupported", receiptKey, diagnostic };
+            throw error;
+        }
+        const prior = initial.get("amd-dlss-trace-status")?.capture;
+        if (prior?.active !== false) throw new Error("amd_trace_not_inactive_before_start");
+        amdTraceMayBeActive = true;
+        await part(steps.slice(1, 3), "start");
+        const owner = ownedCaptures.traceSessionId;
+        if (!Number.isSafeInteger(owner) || owner <= 0) throw new Error("amd_trace_start_owner_missing");
+        for (const step of steps.slice(3)) step.args.expectedSessionId = owner;
+        const entries = await part(steps.slice(3), "stop-read");
+        if (entries.get("amd-dlss-trace-stop")?.capture?.active !== false ||
+            entries.get("amd-dlss-trace-read")?.capture?.summary?.active !== false)
+            throw new Error("amd_trace_stop_not_verified");
+        amdTraceMayBeActive = false;
+        await retain(receiptKey, { content: [{ type: "text", text: JSON.stringify({
+            ok: true, aborted: false, stepsRun: steps.length, results: combined,
+        }) }] });
         const read = entries.get("amd-dlss-trace-read");
         const capture = read && read.capture;
         const summary = capture && capture.summary;
@@ -1570,6 +2113,7 @@ async function runRenderScaleTuningLive(context) {
             summary.setConstantsCalls !== 0 || summary.evaluateCalls !== 0) {
             throw new Error("amd_dlss_trace_not_empty");
         }
+        return { status: "supported", receiptKey };
     }
 
     async function status(lane, pass, suffix) {
@@ -1587,32 +2131,85 @@ async function runRenderScaleTuningLive(context) {
             toolStep("texture-status", "communityshaders.renderscale", {
                 action: "texture_lifetime_status", expectedBuildId: buildId,
             }),
+            toolStep("qualification-status", "communityshaders.renderscale", {
+                action: "qualification_status", expectedBuildId: buildId,
+            }),
+            toolStep("profiler-status", "communityshaders.profiler_api", {
+                contractMajor: 1, action: "snapshot", expectedBuildId: buildId,
+                clientId: `${runId}-cleanup`, commandId: `${runId}-${pass}-${suffix}`,
+            }),
         ];
+        if (variant === "nvidia" || amdTraceMayBeActive) steps.push(toolStep("trace-status", "communityshaders.renderscale", {
+            action: "dlss_trace_status", expectedBuildId: buildId,
+        }));
         const response = await scenario(steps, receiptKey);
         const entries = requireScenario(response.root, steps, receiptKey);
         return entries;
     }
 
     async function cleanup(lane, pass, stressSessionId) {
-        const before = await status(lane, pass, "final-status-before-cleanup");
+        cleanupMode = true;
+        try { return await cleanupCaptures(lane, pass, stressSessionId); }
+        catch (error) {
+            if (context.cleanupFailed) context.cleanupFailed(error);
+            throw error;
+        } finally { cleanupMode = false; }
+    }
+
+    async function cleanupCaptures(lane, pass, stressSessionId) {
+        if (context.prepareCleanup) await context.prepareCleanup();
+        let before;
+        try { before = await status(lane, pass, "final-status-before-cleanup"); }
+        catch (error) {
+            if (!context.recoverCleanupTransport) throw error;
+            await context.recoverCleanupTransport(error);
+            before = await status(lane, pass, "final-status-before-cleanup");
+        }
         const render = before.get("render-status").status;
         const cpu = before.get("cpu-status").cpuPerformance;
         const gpu = before.get("gpu-status").capture;
         const texture = before.get("texture-status").capture;
+        const trace = before.get("trace-status")?.capture;
+        const qualification = before.get("qualification-status")?.qualification;
+        const profiler = before.get("profiler-status")?.result;
+        const activeStates = [render?.session?.active, render?.loadPresentationProbe?.active,
+            cpu?.active, gpu?.active, texture?.active, qualification?.active, profiler?.enabled];
+        if (variant === "nvidia" || amdTraceMayBeActive) activeStates.push(trace?.active);
+        if (activeStates.some(value => typeof value !== "boolean")) {
+            throw new Error("cleanup_status_incomplete");
+        }
+        const requireOwner = (active, actual, expected, name) => {
+            if (active && (!Number.isSafeInteger(expected) || actual !== expected)) {
+                throw new Error(`cleanup_${name}_owner_mismatch`);
+            }
+        };
+        requireOwner(render.session.active, render.session.id, stressSessionId, "stress");
+        requireOwner(cpu.active, cpu.sessionId, ownedCaptures.cpuSessionId, "cpu");
+        requireOwner(gpu.active, gpu.startFrame, ownedCaptures.gpuStartFrame, "gpu");
+        requireOwner(texture.active, texture.sessionID, ownedCaptures.textureSessionId, "texture");
+        requireOwner(render.loadPresentationProbe.active, render.loadPresentationProbe.sessionID,
+            ownedCaptures.probeSessionId, "probe");
+        requireOwner(trace?.active, trace?.sessionID, ownedCaptures.traceSessionId, "trace");
+        if (qualification?.active !== false) throw new Error("cleanup_qualification_still_active");
+        if (profiler?.enabled && !ownedCaptures.profilerEnabled) throw new Error("cleanup_profiler_owner_missing");
         const steps = [];
+        if (trace?.active) steps.push(toolStep("dlss-trace-stop", "communityshaders.renderscale", {
+            action: "dlss_trace_stop", expectedSessionId: ownedCaptures.traceSessionId, expectedBuildId: buildId,
+        }));
         if (render.session.active) {
             steps.push(toolStep("measured-stress-stop", "communityshaders.renderscale", {
                 action: "stop", expectedSessionId: stressSessionId, expectedBuildId: buildId,
             }));
         }
         if (cpu.active) {
-            const args = { action: "cpu_performance_stop", expectedBuildId: buildId };
-            if (cpu.sessionId) args.expectedSessionId = cpu.sessionId;
+            const args = { action: "cpu_performance_stop", expectedBuildId: buildId,
+                expectedSessionId: ownedCaptures.cpuSessionId };
             steps.push(toolStep("cpu-performance-stop", "communityshaders.renderscale", args));
         }
         if (gpu.active) {
             steps.push(toolStep("gpu-performance-stop", "communityshaders.renderscale", {
                 action: "gpu_performance_stop", expectedBuildId: buildId,
+                expectedStartFrame: ownedCaptures.gpuStartFrame,
             }));
         }
         if (texture.active) {
@@ -1625,7 +2222,7 @@ async function runRenderScaleTuningLive(context) {
                 action: "probe_stop", expectedBuildId: buildId,
             }));
         }
-        steps.push(toolStep("profiler-disable", "communityshaders.profiler_api", {
+        if (profiler?.enabled) steps.push(toolStep("profiler-disable", "communityshaders.profiler_api", {
             contractMajor: 1,
             clientId: `${runId}-${lane.id}-${pass}-cleanup-client`,
             commandId: `${runId}-${lane.id}-${pass}-cleanup-disable`,
@@ -1634,12 +2231,35 @@ async function runRenderScaleTuningLive(context) {
             expectedBuildId: buildId,
         }));
         const receiptKey = `${runId}:${lane.id}:pass-${pass}:cleanup`;
-        const response = await scenario(steps, receiptKey);
-        requireScenario(response.root, steps, receiptKey);
-        await status(lane, pass, "final-status-after-cleanup");
+        let stopError;
+        try {
+            if (steps.length) {
+                const response = await scenario(steps, receiptKey);
+                requireScenario(response.root, steps, receiptKey);
+            }
+        } catch (error) { stopError = error; }
+        // A lost stop response permits verification, never replay of the stop batch.
+        if (stopError && context.recoverCleanupTransport) await context.recoverCleanupTransport(stopError);
+        const after = await status(lane, pass, "final-status-after-cleanup");
+        if (after.get("render-status")?.status?.session?.active !== false ||
+            after.get("render-status")?.status?.loadPresentationProbe?.active !== false ||
+            after.get("cpu-status")?.cpuPerformance?.active !== false ||
+            after.get("gpu-status")?.capture?.active !== false ||
+            after.get("texture-status")?.capture?.active !== false ||
+            after.get("qualification-status")?.qualification?.active !== false ||
+            after.get("profiler-status")?.result?.enabled !== false ||
+            ((variant === "nvidia" || amdTraceMayBeActive) && after.get("trace-status")?.capture?.active !== false)) {
+            throw new Error("cleanup_verification_failed");
+        }
+        const mayContinueMeasurement = context.cleanupComplete ? context.cleanupComplete() : true;
+        if (stopError) await retain(`${receiptKey}:response-error`, {
+            error: String(stopError.message || stopError), verifiedInactive: true,
+        });
+        return mayContinueMeasurement;
     }
 
     async function cooldown(lane, pass) {
+        await status(lane, pass, "cooldown-start");
         const receiptKey = `${runId}:${lane.id}:pass-${pass}:cooldown`;
         const steps = [{ label: "memory-cooldown", wait: 10000 }];
         const response = await scenario(steps, receiptKey);
@@ -1655,10 +2275,24 @@ async function runRenderScaleTuningLive(context) {
                 runnable: true,
             }];
         }
+        const supported = capabilities.supportedFSRRuntimeMask;
         const unavailable = capabilities.fsrRuntimeUnavailableConditions;
-        const fsr3 = (capabilities.supportedFSRRuntimeMask & 1) !== 0 &&
+        const validUnavailable = Array.isArray(unavailable) &&
+            unavailable.length === 2 && unavailable.every((entry) =>
+                entry && typeof entry === "object" &&
+                Number.isSafeInteger(entry.mask) && entry.mask >= 0);
+        if (!Number.isSafeInteger(supported) || supported < 0 || supported > 3 ||
+            !validUnavailable) {
+            throw diagnosticError("amd_capabilities_invalid", {
+                reason: "fsr_runtime_capability_shape_invalid",
+                supportedFSRRuntimeMask: supported ?? null,
+                unavailableConditionCount: Array.isArray(unavailable) ?
+                    unavailable.length : null,
+            });
+        }
+        const fsr3 = (supported & 1) !== 0 &&
             unavailable[0].mask === 0;
-        const fsr4 = (capabilities.supportedFSRRuntimeMask & 2) !== 0;
+        const fsr4 = (supported & 2) !== 0;
         const fsr4Unavailable = unavailable[1].mask !== 0;
         return matrix.lanes.map((lane) => ({
             ...lane,
@@ -1668,30 +2302,37 @@ async function runRenderScaleTuningLive(context) {
     }
 
     let boundary = positioning.boundary;
-    const summary = { ok: true, status: "COMPLETE", variant, runId, lanes: [] };
+    const summary = { ok: true, status: "COMPLETE", variant, runId,
+        traceCapability: variant === "amd" ? null : { status: "not_applicable" },
+        lanes: [] };
     let passSequence = 0;
     const selectedLanes = lanes();
     if (variant === "amd" && selectedLanes.some((lane) => lane.runnable)) {
         try {
-            await retainAmdTraceCapability();
+            summary.traceCapability = await retainAmdTraceCapability();
         } catch (error) {
             summary.ok = false;
             summary.status = "INTERRUPTED";
             summary.error = error instanceof Error ? error.message : String(error);
             summary.failure = error && typeof error === "object" &&
                 error.diagnostic ? error.diagnostic : null;
-            retainLiveResult(summary);
+            if (amdTraceMayBeActive) {
+                try { await cleanup({ id: "amd-capability" }, 0, 0); }
+                catch (cleanupError) { summary.cleanupError = String(cleanupError.message || cleanupError); }
+            }
+            await retainLiveResult(summary);
             return summary;
         }
     }
     for (let laneIndex = 0; laneIndex < selectedLanes.length; laneIndex += 1) {
         const lane = selectedLanes[laneIndex];
-        const laneSummary = { id: lane.id, status: lane.runnable ? "COMPLETE" : "BLOCKED", passes: [] };
+        const laneSummary = { id: lane.id, eligibility: variant === "amd" ? amdLaneAvailability(lane, capabilities) : null, status: lane.runnable ? "COMPLETE" : "BLOCKED", passes: [] };
         summary.lanes.push(laneSummary);
         if (!lane.runnable) continue;
         for (let pass = 1; pass <= 2; pass += 1) {
             passSequence += 1;
             let stressSessionId = 0;
+            let cleanupAttempted = false;
             const passSummary = { pass, status: "RUNNING", rows: [] };
             laneSummary.passes.push(passSummary);
             try {
@@ -1701,6 +2342,8 @@ async function runRenderScaleTuningLive(context) {
                     satisfied: base.waiter.satisfied === true,
                     outcome: base.waiter.outcome || null,
                     nonStableNote: base.nonStableNote,
+                    laneQualification: qualifyLaneBackend(base.waiter,
+                        targetFor(boundary, matrix.destinations[matrix.initialDestination], lane.configuredFsrRuntime), lane, capabilities),
                 };
                 if (base.nonStableNote) {
                     notify({ lane: lane.id, pass, phase: "baseline",
@@ -1721,13 +2364,21 @@ async function runRenderScaleTuningLive(context) {
                             completed.sourceRecoveryReceiptKey,
                     });
                 }
-                await cleanup(lane, pass, stressSessionId);
+                cleanupAttempted = true;
+                const mayContinueMeasurement = await cleanup(lane, pass, stressSessionId);
                 stressSessionId = 0;
+                if (mayContinueMeasurement === false) throw new Error("cleanup_recovered_assay_interrupted");
                 passSummary.status = "COMPLETE";
+                notify({ lane: lane.id, pass, phase: "pass_complete", status: "COMPLETE" });
                 if (pass === 1) await cooldown(lane, pass);
             } catch (error) {
-                if (stressSessionId) {
-                    try { await cleanup(lane, pass, stressSessionId); } catch { }
+                const cleanupSessionId = ownedCaptures.stressSessionId || stressSessionId;
+                if (cleanupSessionId && !cleanupAttempted) {
+                    try { await cleanup(lane, pass, cleanupSessionId); }
+                    catch (cleanupError) {
+                        passSummary.cleanupError = String(cleanupError.message || cleanupError);
+                        passSummary.cleanupFailure = cleanupError.diagnostic || null;
+                    }
                 }
                 summary.ok = false;
                 summary.status = "INTERRUPTED";
@@ -1737,11 +2388,16 @@ async function runRenderScaleTuningLive(context) {
                     error.message : String(error);
                 passSummary.failure = error && typeof error === "object" &&
                     error.diagnostic ? error.diagnostic : null;
-                retainLiveResult(summary);
+                await retainLiveResult(summary);
                 return summary;
             }
         }
     }
-    retainLiveResult(summary);
+    await retainLiveResult(summary);
     return summary;
+}
+
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = { runRenderScaleTuningLive, collectTracePages, traceCapacity,
+        validateTracePage, validateRetainedTrace, actualBackend, qualifyLaneBackend, amdLaneAvailability };
 }

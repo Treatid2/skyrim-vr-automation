@@ -1,25 +1,25 @@
 ---
 name: render-scale-qualification
-description: Run the fully unattended CSX VR render-scale qualification when the user invokes $render-scale-qualification, asks to start render-scale qualification, or contextually says start after confirming the intended DLL is running in game at the controlled start scene. Attach to that exact session and return its final verdict without building, deploying, or launching.
+description: Run the fully unattended CSX VR render-scale qualification only when the user invokes $render-scale-qualification or explicitly asks to start render-scale qualification. Attach to that exact session and return its final verdict without building, deploying, or launching.
 ---
 
 # Render-scale qualification
 
-Run the packaged revision-4 qualification once and return its final result.
+Run the packaged revision-5 qualification once and return its final result.
 The package owns capture, image-model evaluation, telemetry validation,
 evidence finalization, and verdict generation.
 
-Before live work, read the sibling `devbench-control` skill and
-`../coc-stability/references/protocol.md`. Use the packaged entrypoint for all
-test mutations; use direct DevBench tools only for read-only diagnosis when the
-package reports an infrastructure problem.
+Before live work, read the sibling `devbench-control` skill. Use the packaged
+entrypoint for all test mutations; use direct DevBench tools only for read-only
+diagnosis when the package reports an infrastructure problem.
 
 ## Invocation boundary
 
 - Require the intended CSX DLL and Skyrim VR session to be running already at
   the controlled start scene.
-- When that context is established, treat `start render-scale qualification`
-  or a contextual `start` as authorization to run this package once.
+- When that context is established, require `start render-scale qualification`
+  or an equivalent explicit request to run this package once. A bare or
+  contextual `start` is not sufficient authorization.
 - Never build, configure, deploy, redeploy, launch, restart, reload, switch an
   MO2 profile, or edit game or mod configuration in this workflow.
 - Never substitute a runtime, fixture, GPU matrix, baseline, capture source,
@@ -55,7 +55,8 @@ create a unique directory below
 `%LOCALAPPDATA%\SkyrimVRAutomation\evidence\render-scale-qualification`.
 Never reuse, empty, or delete an existing directory. Use local mode unless the
 task already supplies both a baseline evidence path and its exact Build ID. If
-only one baseline input is present, stop before mutation.
+either baseline input is supplied without explicit PR mode, or only one is
+present, stop before mutation. The entrypoint enforces the same boundary.
 
 ## Run once
 
@@ -77,7 +78,9 @@ retains raw events, transition-epoch stage views, and CSV evidence for
 admission/early exits, shader-cache deferral, SSS/SSGI prewarm,
 DLSS/FSR/FSR4 preparation, D3D creation, total preparation,
 request-to-prepared, and prepared-to-creator without adding transition polls.
-It then runs `gpt-5.6-sol` through the Codex CLI in six blinded batches: three
+Before any qualification mutation, it proves the selected `gpt-5.6-sol`
+model with a bounded read-only Codex capability call. It then runs that model
+through the Codex CLI in six blinded batches: three
 replicates in each of two independently swapped presentation passes. The model
 evaluates sharpness, blur, shimmer, stereo alignment, equal eye scale, and
 geometry correspondence. Render-scale latch is decided only from owner-bound

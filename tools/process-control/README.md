@@ -22,8 +22,13 @@ Use `-NoExit` when composing several tools in one PowerShell host.
 `Invoke-WindowsThreadContext.ps1` captures bounded AMD64 register and stack
 samples from one exact live process/thread identity. It requires the expected
 executable path and process start time, verifies that the thread belongs to the
-process, suspends it only around `GetThreadContext`, and always resumes it in a
-`finally` block.
+process, rejects the sampler's own thread, and rechecks the owning process plus
+thread start identity after every `OpenThread`. It suspends the verified handle
+only around `GetThreadContext` and always resumes it in a `finally` block.
+Every owned process and thread handle also has a structured close outcome under
+`cleanup.handles`. A failed or thrown `CloseHandle` leaves captured samples
+available as evidence but returns `cleanup-uncertain` rather than claiming a
+fully restored capture.
 
 ```powershell
 .\Invoke-WindowsThreadContext.ps1 `

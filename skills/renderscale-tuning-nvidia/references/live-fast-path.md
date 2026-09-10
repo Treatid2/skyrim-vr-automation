@@ -1,7 +1,7 @@
 # NVIDIA live fast path
 
-`tools/renderscale-tuning-live/runner.js` executes this path in the positioning
-cell. This file is its post-run audit contract; it is not read or translated
+`tools/renderscale-tuning-live/runner.js` executes this path in the detached
+worker launched after positioning. This file is its post-run audit contract; it is not read or translated
 during live measurement.
 
 Decode the admitted positioning receipt inside the runner and use its snapshot
@@ -23,7 +23,7 @@ On a safe terminal baseline, immediately record a compact non-stable note when
 the strict milestone was not satisfied, then run one handoff scenario: stop the
 exact baseline stress session, start measured stress, reset/start texture
 lifetime, reset/start load presentation, and enable the profiler. Then execute
-the matrix twice in this same orchestration cell. Each row scenario starts
+the matrix twice in this same worker process. Each row scenario starts
 with the sole 5,000 ms wait, then optional owned DLSS trace reset/start,
 `qualification_begin`, transition-1 profiler history clear,
 `qualification_dispatch`, public-API `apply`, strict `qualification_wait`, and
@@ -32,9 +32,16 @@ optional owned DLSS trace stop/read. Transition 1 alone sets
 terminal waiter's authoritative stable profile and state revision plus the
 matrix destination. Store the exact terminal waiter immediately; for a traced
 row, retain its reset, start, stop, and bounded raw-read subreceipts in the same
-stored row record. Emit only a compact projection. Do not pause for model
-reasoning, read files, write evidence, hash, or issue a confirmation read
-between rows.
+stored row record. The first trace read uses the producer default bound.
+The runner drains every `moreAvailable` continuation into `traceReadPages`
+before any later transition or trace reset; these reads add no dwell time or
+profile mutation. Reject foreign, discontinuous, or incomplete windows before
+continuing. Emit only a compact projection. Do not pause for model
+reasoning, read unrelated files, hash, or issue a confirmation read between
+rows. Queue an immutable copy of each received envelope and revision before
+starting the next operation. The writer appends one `raw/journal.ndjson`
+document asynchronously. Queue backlog cannot delay or stop measurement;
+flush after both passes and cleanup, then generate offline evidence reports.
 
 Continue directly after a semantic baseline or row failure when the terminal
 receipt proves the owner closed, zero active operation, matching PID/Build ID,
@@ -46,7 +53,7 @@ the reset strictly under a fresh owner, do not retry the failed destination,
 and continue with the next row only after the reset is safe and stable. Device
 loss, OOM, lost scene/ownership/transport, or failed recovery stops future
 mutations in the current attempt and triggers ownership-guarded cleanup. After
-the cell returns, only the NVIDIA protocol's explicit failed-recovery replay
+the worker ends, only the NVIDIA protocol's explicit failed-recovery replay
 may authorize a fresh, fully re-admitted replacement attempt; never resume the
 interrupted cell or reuse its run ID. After pass 1,
 finalize its owned sessions, take the memory boundary, run the one server-owned

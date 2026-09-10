@@ -1,7 +1,58 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 Set-StrictMode -Version Latest
-$script:MO2ControlContractVersion = '1.0.0'
+$script:MO2ControlContractVersion = '1.1.0'
+
+if (-not ('SkyrimVRAutomation.Native.DirectoryIdentity' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace SkyrimVRAutomation.Native {
+    public static class DirectoryIdentity {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FILE_ID_INFO {
+            public ulong VolumeSerialNumber;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+            public byte[] FileId;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(
+            string path, uint access, uint share, IntPtr security,
+            uint creation, uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandleEx(
+            SafeFileHandle handle, int infoClass, out FILE_ID_INFO info,
+            uint size);
+
+        public static string Get(string path) {
+            const uint FILE_READ_ATTRIBUTES = 0x80;
+            const uint FILE_SHARE_READ = 1, FILE_SHARE_WRITE = 2, FILE_SHARE_DELETE = 4;
+            const uint OPEN_EXISTING = 3, FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+            using (SafeFileHandle handle = CreateFileW(
+                path, FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
+                IntPtr.Zero)) {
+                if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+                FILE_ID_INFO info;
+                if (!GetFileInformationByHandleEx(
+                    handle, 18, out info,
+                    (uint)Marshal.SizeOf(typeof(FILE_ID_INFO)))) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                return info.VolumeSerialNumber.ToString("X16") + ":" +
+                    BitConverter.ToString(info.FileId).Replace("-", "");
+            }
+        }
+    }
+}
+'@
+}
 
 function Resolve-MO2ControlPath {
     param([Parameter(Mandatory)][string]$Path)
@@ -314,6 +365,193 @@ function Get-MO2PreparedBackupShadowVerification {
     }
 }
 
+function Resolve-MO2CommunityShadersBuildBinding {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$TransactionTool,
+        [Parameter(Mandatory)][string]$ProfilePath,
+        [Parameter(Mandatory)][string]$ModsPath
+    )
+
+    $relativePluginPath = 'SKSE\Plugins\CommunityShaders.dll'
+    $providers = ConvertFrom-MO2JsonText ([string](& $TransactionTool providers -ProfilePath $ProfilePath -ModsPath $ModsPath -RelativeCachePath $relativePluginPath -NoExit -Confirm:$false))
+    if (-not $providers.ok) { throw "Could not inspect the winning Community Shaders provider: $(@($providers.errors) -join '; ')" }
+    $winner = $providers.data.effectiveWinnerAmongEnabledMods
+    if ($null -eq $winner -or [string]$winner.providerType -cne 'file') { throw 'The task profile has no exact enabled loose-file CommunityShaders.dll winner.' }
+    $pluginPath = [IO.Path]::GetFullPath([string]$winner.providerPath)
+    $manifestPath = [IO.Path]::GetFullPath((Join-Path ([string]$winner.modRoot) 'SKSE\Plugins\CSX.BuildManifest.json'))
+    if (-not (Test-Path -LiteralPath $pluginPath -PathType Leaf) -or -not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw 'The winning Community Shaders provider lacks its DLL or CSX.BuildManifest.json.'
+    }
+    $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw)
+    $artifact = if ($manifest.PSObject.Properties['artifact']) { $manifest.artifact } else { $null }
+    $identity = if ($manifest.PSObject.Properties['identity']) { $manifest.identity } else { $null }
+    $cacheIdentity = if ($null -ne $identity -and $identity.PSObject.Properties['shaderCache']) { $identity.shaderCache } else { $null }
+    $buildId = if ($manifest.PSObject.Properties['buildId']) { [string]$manifest.buildId } else { '' }
+    $declaredHash = if ($null -ne $artifact -and $artifact.PSObject.Properties['sha256']) { [string]$artifact.sha256 } else { '' }
+    $declaredBytes = if ($null -ne $artifact -and $artifact.PSObject.Properties['sizeBytes']) { [long]$artifact.sizeBytes } else { -1 }
+    $cacheAbi = if ($null -ne $cacheIdentity -and $cacheIdentity.PSObject.Properties['abiId']) { [string]$cacheIdentity.abiId } else { '' }
+    if ([string]::IsNullOrWhiteSpace($buildId) -or $declaredHash -notmatch '^[0-9A-Fa-f]{64}$' -or [string]::IsNullOrWhiteSpace($cacheAbi)) {
+        throw 'The winning Community Shaders build manifest lacks an exact build ID, DLL hash, or shader-cache ABI.'
+    }
+    $plugin = Get-Item -LiteralPath $pluginPath
+    $actualHash = (Get-FileHash -LiteralPath $pluginPath -Algorithm SHA256).Hash
+    if ($actualHash -cne $declaredHash -or ($declaredBytes -ge 0 -and [long]$plugin.Length -ne $declaredBytes)) {
+        throw 'The winning Community Shaders DLL does not match its build manifest.'
+    }
+    return [pscustomobject][ordered]@{
+        profilePath = [string]$providers.data.profilePath; profileSha256 = [string]$providers.data.profileSha256
+        modsPath = [string]$providers.data.modsPath; relativePluginPath = $relativePluginPath
+        modName = [string]$winner.modName; pluginPath = $pluginPath; manifestPath = $manifestPath
+        manifestSha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+        buildId = $buildId; artifactSha256 = $actualHash; artifactBytes = [long]$plugin.Length
+        shaderCacheAbi = $cacheAbi
+    }
+}
+
+function Test-MO2CommunityShadersBuildBinding($Expected, $Current) {
+    if ($null -eq $Expected -or $null -eq $Current) { return $false }
+    foreach ($required in @('profilePath', 'profileSha256', 'modsPath', 'modName', 'pluginPath', 'manifestPath', 'manifestSha256', 'buildId', 'artifactSha256', 'artifactBytes', 'shaderCacheAbi')) {
+        if (-not $Expected.PSObject.Properties[$required] -or -not $Current.PSObject.Properties[$required]) { return $false }
+    }
+    return (Test-MO2SamePath ([string]$Expected.profilePath) ([string]$Current.profilePath)) -and
+        [string]$Expected.profileSha256 -ceq [string]$Current.profileSha256 -and
+        (Test-MO2SamePath ([string]$Expected.modsPath) ([string]$Current.modsPath)) -and
+        [string]$Expected.modName -ceq [string]$Current.modName -and
+        (Test-MO2SamePath ([string]$Expected.pluginPath) ([string]$Current.pluginPath)) -and
+        (Test-MO2SamePath ([string]$Expected.manifestPath) ([string]$Current.manifestPath)) -and
+        [string]$Expected.manifestSha256 -ceq [string]$Current.manifestSha256 -and
+        [string]$Expected.buildId -ceq [string]$Current.buildId -and
+        [string]$Expected.artifactSha256 -ceq [string]$Current.artifactSha256 -and
+        [long]$Expected.artifactBytes -eq [long]$Current.artifactBytes -and
+        [string]$Expected.shaderCacheAbi -ceq [string]$Current.shaderCacheAbi
+}
+
+function Get-MO2OverwriteProviderShadowVerification {
+    [CmdletBinding()]
+    param(
+        $Receipt,
+        $ProviderResult,
+        $Inventory,
+        [Parameter(Mandatory)][string]$RelativePath,
+        [Parameter(Mandatory)][string]$RequiredCountProperty
+    )
+
+    $errors = [Collections.Generic.List[string]]::new()
+    $required = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+    if ($null -eq $ProviderResult -or -not [bool]$ProviderResult.ok) {
+        $errors.Add("The current $RelativePath provider union is unavailable.")
+    }
+    else {
+        foreach ($provider in @($ProviderResult.data.providers | Where-Object enabled | Sort-Object lineNumber)) {
+            if ([string]$provider.providerType -cne 'directory' -or $null -eq $provider.inventory) {
+                $errors.Add("An enabled $RelativePath provider is not an inventoried directory: $($provider.modName).")
+                continue
+            }
+            foreach ($entry in @($provider.inventory.entries)) {
+                $relative = ([string]$entry.relativePath).Replace('/', '\')
+                if ([string]::IsNullOrWhiteSpace($relative) -or [IO.Path]::IsPathRooted($relative) -or $relative -match '(^|[\\/])\.\.([\\/]|$)') {
+                    $errors.Add("An enabled $RelativePath provider returned an unsafe relative path: '$relative'.")
+                    continue
+                }
+                if (-not $required.ContainsKey($relative)) {
+                    $required.Add($relative, [pscustomobject][ordered]@{
+                        relativePath = $relative; sourceModName = [string]$provider.modName
+                        bytes = [long]$entry.bytes; sha256 = [string]$entry.sha256
+                    })
+                }
+            }
+        }
+    }
+
+    $live = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+    if ($null -ne $Inventory -and $Inventory.PSObject.Properties['entries']) {
+        foreach ($entry in @($Inventory.entries)) { $live[([string]$entry.relativePath).Replace('/', '\')] = $entry }
+    }
+    $copied = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+    $preExisting = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+    $receiptShapeValid = $null -ne $Receipt -and $Receipt.PSObject.Properties['copied'] -and
+        $Receipt.PSObject.Properties['alreadyPresent'] -and $Receipt.PSObject.Properties[$RequiredCountProperty]
+    if (-not $receiptShapeValid) {
+        $errors.Add("The $RelativePath provider-shadow receipt is missing required ownership records.")
+    }
+    else {
+        foreach ($entry in @($Receipt.copied)) {
+            if ($null -eq $entry -or -not $entry.PSObject.Properties['relativePath']) {
+                $errors.Add("The $RelativePath copied-provider receipt contains a malformed record.")
+                continue
+            }
+            $relative = ([string]$entry.relativePath).Replace('/', '\')
+            if ([string]::IsNullOrWhiteSpace($relative)) {
+                $errors.Add("The $RelativePath copied-provider receipt contains an empty path.")
+                continue
+            }
+            if ($copied.ContainsKey($relative)) { $errors.Add("The $RelativePath copied-provider receipt repeats '$relative'.") }
+            else { $copied.Add($relative, $entry) }
+        }
+        foreach ($entry in @($Receipt.alreadyPresent)) {
+            if ($null -eq $entry -or -not $entry.PSObject.Properties['relativePath']) {
+                $errors.Add("The $RelativePath pre-existing Overwrite receipt contains a malformed record.")
+                continue
+            }
+            $relative = ([string]$entry.relativePath).Replace('/', '\')
+            if ([string]::IsNullOrWhiteSpace($relative)) {
+                $errors.Add("The $RelativePath pre-existing Overwrite receipt contains an empty path.")
+                continue
+            }
+            if ($preExisting.ContainsKey($relative) -or $copied.ContainsKey($relative)) { $errors.Add("The $RelativePath pre-existing Overwrite receipt repeats '$relative'.") }
+            else { $preExisting.Add($relative, $entry) }
+        }
+    }
+
+    $missingPaths = [Collections.Generic.List[string]]::new()
+    $changedProviderPaths = [Collections.Generic.List[string]]::new()
+    $changedOverwritePaths = [Collections.Generic.List[string]]::new()
+    foreach ($requiredEntry in $required.Values) {
+        $relative = [string]$requiredEntry.relativePath
+        if (-not $live.ContainsKey($relative)) { $missingPaths.Add($relative); continue }
+        $liveEntry = $live[$relative]
+        if ($copied.ContainsKey($relative)) {
+            $copy = $copied[$relative]
+            $copyValid = $null -ne $copy -and $copy.PSObject.Properties['winnerClass'] -and
+                $copy.PSObject.Properties['sourceModName'] -and $copy.PSObject.Properties['bytes'] -and
+                $copy.PSObject.Properties['sha256']
+            if (-not $copyValid -or [string]$copy.winnerClass -cne 'copied-provider' -or
+                [string]$copy.sourceModName -cne [string]$requiredEntry.sourceModName -or
+                [long]$copy.bytes -ne [long]$requiredEntry.bytes -or
+                [string]$copy.sha256 -cne [string]$requiredEntry.sha256) {
+                $changedProviderPaths.Add($relative)
+            }
+            if (-not $copyValid -or [long]$liveEntry.bytes -ne [long]$copy.bytes -or [string]$liveEntry.sha256 -cne [string]$copy.sha256) {
+                $changedOverwritePaths.Add($relative)
+            }
+        }
+        elseif ($preExisting.ContainsKey($relative)) {
+            $winner = $preExisting[$relative]
+            $winnerValid = $null -ne $winner -and $winner.PSObject.Properties['winnerClass'] -and
+                $winner.PSObject.Properties['bytes'] -and $winner.PSObject.Properties['sha256']
+            if (-not $winnerValid -or [string]$winner.winnerClass -cne 'pre-existing-overwrite' -or
+                [long]$liveEntry.bytes -ne [long]$winner.bytes -or [string]$liveEntry.sha256 -cne [string]$winner.sha256) {
+                $changedOverwritePaths.Add($relative)
+            }
+        }
+        else { $changedProviderPaths.Add($relative) }
+    }
+    if ($receiptShapeValid -and ([int]$Receipt.$RequiredCountProperty -ne $required.Count -or
+        $copied.Count + $preExisting.Count -ne $required.Count)) {
+        $errors.Add("The $RelativePath provider-shadow receipt no longer covers the complete current provider map.")
+    }
+    if ($missingPaths.Count -gt 0) { $errors.Add("MO2 Overwrite $RelativePath lacks $($missingPaths.Count) enabled-provider path(s): $($missingPaths -join ', ')") }
+    if ($changedProviderPaths.Count -gt 0) { $errors.Add("The $RelativePath copied-provider identity changed for: $($changedProviderPaths -join ', ')") }
+    if ($changedOverwritePaths.Count -gt 0) { $errors.Add("The $RelativePath Overwrite winner changed after materialization for: $($changedOverwritePaths -join ', ')") }
+    return [pscustomobject][ordered]@{
+        ok = $errors.Count -eq 0; requiredFiles = $required.Count
+        copiedProviderFiles = $copied.Count; preExistingOverwriteFiles = $preExisting.Count
+        missingPaths = @($missingPaths); changedProviderPaths = @($changedProviderPaths)
+        changedOverwritePaths = @($changedOverwritePaths); errors = @($errors)
+    }
+}
+
 function Get-MO2OverwriteWorkspaceIsolation {
     [CmdletBinding()]
     param(
@@ -330,6 +568,29 @@ function Get-MO2OverwriteWorkspaceIsolation {
     $output = $manifest.runtimeOutput
     $errors = [Collections.Generic.List[string]]::new()
     $checks = [Collections.Generic.List[object]]::new()
+    $requiredOutputPaths = @(
+        'overwritePath', 'cachePath', 'backupPath', 'ownerMarkerPath',
+        'cachePlanPath', 'cacheCompletionPath', 'backupCompletionPath'
+    )
+    foreach ($field in $requiredOutputPaths) {
+        if ($null -eq $output -or -not $output.PSObject.Properties[$field] -or
+            [string]::IsNullOrWhiteSpace([string]$output.$field)) {
+            $errors.Add("Task runtime-output manifest lacks required path '$field'.")
+        }
+    }
+    foreach ($field in @('mode', 'executable', 'ownerMarkerSha256')) {
+        if ($null -eq $output -or -not $output.PSObject.Properties[$field] -or
+            [string]::IsNullOrWhiteSpace([string]$output.$field)) {
+            $errors.Add("Task runtime-output manifest lacks required field '$field'.")
+        }
+    }
+    if ($errors.Count -gt 0) {
+        return [pscustomobject][ordered]@{
+            applicable = $true; ok = $false; profile = $Profile; executable = $Executable
+            workspace = $Owned; runtimeOutput = $output; cachePlan = $null
+            backupVerification = $null; checks = @($checks); errors = @($errors)
+        }
+    }
     if ([string]$manifest.status -cne 'ready') { $errors.Add("Task workspace status must be 'ready' before launch; observed '$($manifest.status)'.") }
     if ([string]::IsNullOrWhiteSpace($AccessId) -or [string]$manifest.accessId -cne $AccessId) { $errors.Add('Task workspace and MO2 session must use the exact explicit access lease.') }
 
@@ -351,8 +612,8 @@ function Get-MO2OverwriteWorkspaceIsolation {
         [pscustomobject]@{ name = 'shader-cache-path'; passed = Test-MO2SamePath ([string]$output.cachePath) $expectedCachePath },
         [pscustomobject]@{ name = 'backup-path'; passed = Test-MO2SamePath ([string]$output.backupPath) $expectedBackupPath },
         [pscustomobject]@{ name = 'executable-binding'; passed = [string]$output.executable -ceq $Executable },
-        [pscustomobject]@{ name = 'shader-cache-directory'; passed = Test-Path -LiteralPath $expectedCachePath -PathType Container },
-        [pscustomobject]@{ name = 'backup-directory'; passed = Test-Path -LiteralPath $expectedBackupPath -PathType Container }
+        [pscustomobject]@{ name = 'shader-cache-directory'; passed = $outputCompleted -or (Test-Path -LiteralPath $expectedCachePath -PathType Container) },
+        [pscustomobject]@{ name = 'backup-directory'; passed = $outputCompleted -or (Test-Path -LiteralPath $expectedBackupPath -PathType Container) }
     )) {
         $checks.Add($check)
         if (-not $check.passed) { $errors.Add("Task MO2 Overwrite check failed: $($check.name).") }
@@ -396,77 +657,84 @@ function Get-MO2OverwriteWorkspaceIsolation {
         }
     }
 
-    $transactionTool = Resolve-MO2ShaderCacheTransactionTool
-    $cacheProviders = $null; $backupProviders = $null; $cacheInventory = $null; $backupInventory = $null
+    $cacheProviders = $null; $backupProviders = $null; $cacheInventory = $null; $backupInventory = $null; $currentBuild = $null
     try {
-        $cacheProviders = ConvertFrom-MO2JsonText ([string](& $transactionTool providers -ProfilePath $modListPath -ModsPath $modsRoot -RelativeCachePath 'ShaderCache' -DeepInventory -NoExit -Confirm:$false))
-        $backupProviders = ConvertFrom-MO2JsonText ([string](& $transactionTool providers -ProfilePath $modListPath -ModsPath $modsRoot -RelativeCachePath 'backup' -DeepInventory -NoExit -Confirm:$false))
-        $cacheInspection = ConvertFrom-MO2JsonText ([string](& $transactionTool inspect -CachePath $expectedCachePath -RelativeCachePath 'ShaderCache' -NoExit -Confirm:$false))
-        $backupInspection = ConvertFrom-MO2JsonText ([string](& $transactionTool inspect -CachePath $expectedBackupPath -RelativeCachePath 'backup' -NoExit -Confirm:$false))
-        foreach ($operation in @(
-            [pscustomobject]@{ name = 'ShaderCache providers'; result = $cacheProviders },
-            [pscustomobject]@{ name = 'backup providers'; result = $backupProviders },
-            [pscustomobject]@{ name = 'ShaderCache inspection'; result = $cacheInspection },
-            [pscustomobject]@{ name = 'backup inspection'; result = $backupInspection }
-        )) {
-            if (-not [bool]$operation.result.ok) {
-                throw "$($operation.name) failed: $(@($operation.result.errors) -join '; ')"
+        $transactionTool = Resolve-MO2ShaderCacheTransactionTool
+        if (-not $outputCompleted) {
+            $currentBuild = Resolve-MO2CommunityShadersBuildBinding -TransactionTool $transactionTool -ProfilePath $modListPath -ModsPath $modsRoot
+            $cacheProviders = ConvertFrom-MO2JsonText ([string](& $transactionTool providers -ProfilePath $modListPath -ModsPath $modsRoot -RelativeCachePath 'ShaderCache' -DeepInventory -IncludeInventoryEntries -NoExit -Confirm:$false))
+            $backupProviders = ConvertFrom-MO2JsonText ([string](& $transactionTool providers -ProfilePath $modListPath -ModsPath $modsRoot -RelativeCachePath 'backup' -DeepInventory -IncludeInventoryEntries -NoExit -Confirm:$false))
+            $cacheInspection = ConvertFrom-MO2JsonText ([string](& $transactionTool inspect -CachePath $expectedCachePath -RelativeCachePath 'ShaderCache' -NoExit -Confirm:$false))
+            $backupInspection = ConvertFrom-MO2JsonText ([string](& $transactionTool inspect -CachePath $expectedBackupPath -RelativeCachePath 'backup' -NoExit -Confirm:$false))
+            foreach ($operation in @(
+                [pscustomobject]@{ name = 'ShaderCache providers'; result = $cacheProviders },
+                [pscustomobject]@{ name = 'backup providers'; result = $backupProviders },
+                [pscustomobject]@{ name = 'ShaderCache inspection'; result = $cacheInspection },
+                [pscustomobject]@{ name = 'backup inspection'; result = $backupInspection }
+            )) {
+                if (-not [bool]$operation.result.ok) {
+                    throw "$($operation.name) failed: $(@($operation.result.errors) -join '; ')"
+                }
             }
+            $cacheInventory = $cacheInspection.data
+            $backupInventory = $backupInspection.data
         }
-        $cacheInventory = $cacheInspection.data
-        $backupInventory = $backupInspection.data
     }
     catch { $errors.Add("Could not inspect bound MO2 Overwrite output: $($_.Exception.Message)") }
 
-    $testProviderCoverage = {
-        param($ProviderResult, $Inventory, [string]$RelativePath)
-        $required = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        foreach ($provider in @($ProviderResult.data.providers | Where-Object enabled | Sort-Object lineNumber)) {
-            if ([string]$provider.providerType -cne 'directory' -or $null -eq $provider.inventory) {
-                $errors.Add("An enabled $RelativePath provider is not an inventoried directory: $($provider.modName).")
-                continue
-            }
-            foreach ($entry in @($provider.inventory.entries)) { $null = $required.Add(([string]$entry.relativePath).Replace('/', '\')) }
-        }
-        $present = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        foreach ($entry in @($Inventory.entries)) { $null = $present.Add(([string]$entry.relativePath).Replace('/', '\')) }
-        $missing = @($required | Where-Object { -not $present.Contains([string]$_) } | Sort-Object)
-        if ($missing.Count -gt 0) { $errors.Add("MO2 Overwrite $RelativePath lacks $($missing.Count) enabled-provider path(s): $($missing -join ', ')") }
-        return [pscustomobject]@{ requiredFiles = $required.Count; missingPaths = $missing }
+    $expectedBuild = if ($output.PSObject.Properties['communityShadersPlugin']) { $output.communityShadersPlugin } else { $null }
+    if (-not $outputCompleted -and -not (Test-MO2CommunityShadersBuildBinding -Expected $expectedBuild -Current $currentBuild)) {
+        $errors.Add('The winning Community Shaders DLL, manifest, build ID, or shader-cache ABI changed after workspace creation.')
+    }
+    if ($RequirePreparedCache -and $outputCompleted) {
+        $errors.Add('The task output transactions are already complete and cannot authorize another launch.')
     }
 
     $backupCompletionPath = [string]$output.backupCompletionPath
     $backupCompleted = Test-Path -LiteralPath $backupCompletionPath -PathType Leaf
     $backupVerification = $null
     if ($null -ne $backupProviders -and $null -ne $backupInventory) {
-        $receipt = $output.shadowReceipt
+        $receipt = if ($output.PSObject.Properties['shadowReceipt']) { $output.shadowReceipt } else { $null }
         if ($RequirePreparedCache -and $backupCompleted) { $errors.Add('The task backup transaction is already complete and cannot authorize another launch.') }
+        $receiptValid = $null -ne $receipt -and
+            $receipt.PSObject.Properties['contractVersion'] -and
+            $receipt.PSObject.Properties['bindingMode'] -and
+            $receipt.PSObject.Properties['profilePath'] -and
+            $receipt.PSObject.Properties['profileSha256'] -and
+            $receipt.PSObject.Properties['targetPath'] -and
+            $receipt.PSObject.Properties['preparedInventory'] -and
+            $null -ne $receipt.preparedInventory -and
+            $receipt.preparedInventory.PSObject.Properties['treeSha256'] -and
+            $receipt.PSObject.Properties['requiredProviderFiles'] -and
+            $receipt.PSObject.Properties['beforeTreeSha256']
         if (-not $backupCompleted) {
-            if ($null -eq $receipt -or [string]$receipt.contractVersion -cne '3.0.0' -or
+            if (-not $receiptValid -or [string]$receipt.contractVersion -cne '3.0.0' -or
                 [string]$receipt.bindingMode -cne 'mo2-overwrite-output' -or
                 -not (Test-MO2SamePath ([string]$receipt.profilePath) $modListPath) -or
                 [string]$receipt.profileSha256 -cne [string]$backupProviders.data.profileSha256 -or
                 -not (Test-MO2SamePath ([string]$receipt.targetPath) $expectedBackupPath)) {
                 $errors.Add('The backup receipt does not bind the current task profile and MO2 Overwrite tree.')
             }
-            $coverage = & $testProviderCoverage $backupProviders $backupInventory 'backup'
-            if (-not $AllowPreparedCacheGrowth -and [string]$backupInventory.treeSha256 -cne [string]$receipt.preparedInventory.treeSha256) {
+            $coverage = Get-MO2OverwriteProviderShadowVerification -Receipt $receipt -ProviderResult $backupProviders -Inventory $backupInventory -RelativePath 'backup' -RequiredCountProperty 'requiredProviderFiles'
+            foreach ($coverageError in @($coverage.errors)) { $errors.Add([string]$coverageError) }
+            if ($receiptValid -and -not $AllowPreparedCacheGrowth -and [string]$backupInventory.treeSha256 -cne [string]$receipt.preparedInventory.treeSha256) {
                 $errors.Add('MO2 Overwrite backup changed after workspace creation and before its first launch.')
             }
-            if ([int]$receipt.requiredProviderFiles -ne [int]$coverage.requiredFiles) { $errors.Add('The backup receipt no longer covers the current enabled-provider inventory.') }
             $backupVerification = [pscustomobject]@{
-                ok = @($coverage.missingPaths).Count -eq 0
+                ok = [bool]$coverage.ok
                 allowPreparedCacheGrowth = [bool]$AllowPreparedCacheGrowth
                 requiredProviderFiles = [int]$coverage.requiredFiles
                 missingProviderPaths = @($coverage.missingPaths)
+                changedProviderPaths = @($coverage.changedProviderPaths)
+                changedOverwritePaths = @($coverage.changedOverwritePaths)
             }
         }
         else {
             try {
                 $backupCompletion = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $backupCompletionPath -Raw)
-                if ([string]$backupCompletion.state -cne 'complete' -or
+                if (-not $receiptValid -or [string]$backupCompletion.state -cne 'complete' -or
                     -not (Test-MO2SamePath ([string]$backupCompletion.backupPath) $expectedBackupPath) -or
-                    [string]$backupCompletion.restoredTreeSha256 -cne [string]$receipt.beforeTreeSha256) {
+                    ($receiptValid -and [string]$backupCompletion.restoredTreeSha256 -cne [string]$receipt.beforeTreeSha256)) {
                     $errors.Add('The backup completion does not restore the exact pre-task MO2 Overwrite tree.')
                 }
             }
@@ -482,35 +750,71 @@ function Get-MO2OverwriteWorkspaceIsolation {
         catch { $errors.Add("Shader-cache plan is unreadable: $planPath. $($_.Exception.Message)") }
     }
     elseif ($RequirePreparedCache) { $errors.Add("Task launch requires the bound shader-cache prepare plan: $planPath") }
+    $planComplete = $null -ne $plan
+    foreach ($requiredPlanField in @(
+        'state', 'requireMaterializedOutput', 'preparedTreeSha256', 'cachePath',
+        'evidenceDirectory', 'beforeTreeSha256', 'transactionReceiptPath',
+        'catalog', 'cacheBinding', 'providerShadow'
+    )) {
+        if ($planComplete -and -not $plan.PSObject.Properties[$requiredPlanField]) { $planComplete = $false }
+    }
+    if ($planComplete) {
+        foreach ($requiredTextField in @('state', 'preparedTreeSha256', 'cachePath', 'evidenceDirectory', 'beforeTreeSha256', 'transactionReceiptPath')) {
+            if ([string]::IsNullOrWhiteSpace([string]$plan.$requiredTextField)) { $planComplete = $false }
+        }
+        $planComplete = $planComplete -and $null -ne $plan.catalog -and
+            $plan.catalog.PSObject.Properties['path'] -and
+            -not [string]::IsNullOrWhiteSpace([string]$plan.catalog.path) -and
+            $null -ne $plan.cacheBinding -and $null -ne $plan.providerShadow -and
+            $plan.providerShadow.PSObject.Properties['receipt'] -and
+            $null -ne $plan.providerShadow.receipt -and
+            (Test-Path -LiteralPath ([string]$plan.transactionReceiptPath) -PathType Leaf)
+    }
+    if ($null -ne $plan -and -not $planComplete) {
+        $errors.Add('Shader-cache plan is missing required state or preparation fields, including binding, provider, or recovery-catalog evidence.')
+    }
     if ($null -ne $plan -and $null -ne $cacheProviders -and $null -ne $cacheInventory) {
-        $binding = $plan.cacheBinding
+        $binding = if ($plan.PSObject.Properties['cacheBinding']) { $plan.cacheBinding } else { $null }
+        $bindingComplete = $null -ne $binding
+        foreach ($requiredBindingField in @('mode', 'profilePath', 'modsPath', 'overwriteRoot', 'cachePath', 'profileSha256', 'workspaceId', 'ownershipId', 'ownerMarkerPath', 'ownerMarkerSha256', 'communityShadersPlugin')) {
+            if ($bindingComplete -and -not $binding.PSObject.Properties[$requiredBindingField]) { $bindingComplete = $false }
+        }
         $completionExists = Test-Path -LiteralPath $completionPath -PathType Leaf
-        $restored = -not $RequirePreparedCache -and $completionExists -and [string]$plan.state -ceq 'restored'
-        $prepared = [string]$plan.state -ceq 'prepared' -and $null -ne $binding -and
+        $bindingCurrent = $bindingComplete -and
             [string]$binding.mode -ceq 'mo2-overwrite-output' -and
             (Test-MO2SamePath ([string]$binding.profilePath) $modListPath) -and
             (Test-MO2SamePath ([string]$binding.modsPath) $modsRoot) -and
             (Test-MO2SamePath ([string]$binding.overwriteRoot) $overwriteRoot) -and
             (Test-MO2SamePath ([string]$binding.cachePath) $expectedCachePath) -and
             [string]$binding.profileSha256 -ceq [string]$cacheProviders.data.profileSha256 -and
+            [string]$binding.workspaceId -ceq [string]$manifest.workspaceId -and
+            [string]$binding.ownershipId -ceq [string]$manifest.ownershipId -and
+            (Test-MO2SamePath ([string]$binding.ownerMarkerPath) $expectedMarkerPath) -and
+            [string]$binding.ownerMarkerSha256 -ceq [string]$output.ownerMarkerSha256 -and
+            (Test-MO2CommunityShadersBuildBinding -Expected $binding.communityShadersPlugin -Current $currentBuild)
+        $restored = $planComplete -and -not $RequirePreparedCache -and $completionExists -and [string]$plan.state -ceq 'restored' -and $bindingCurrent
+        $prepared = $planComplete -and [string]$plan.state -ceq 'prepared' -and $bindingCurrent -and
             [bool]$plan.requireMaterializedOutput
         if (-not ($restored -or $prepared)) { $errors.Add('Shader-cache plan is not bound to the exact task profile and MO2 Overwrite tree.') }
         if ($RequirePreparedCache -and $prepared) {
             if ($completionExists) { $errors.Add('The task shader-cache transaction is already complete and cannot authorize another launch.') }
-            $coverage = & $testProviderCoverage $cacheProviders $cacheInventory 'ShaderCache'
-            if (-not $AllowPreparedCacheGrowth -and [string]$cacheInventory.treeSha256 -cne [string]$plan.preparedTreeSha256) {
+            $shadowReceipt = if ($plan.PSObject.Properties['providerShadow'] -and $null -ne $plan.providerShadow -and $plan.providerShadow.PSObject.Properties['receipt']) { $plan.providerShadow.receipt } else { $null }
+            $coverage = Get-MO2OverwriteProviderShadowVerification -Receipt $shadowReceipt -ProviderResult $cacheProviders -Inventory $cacheInventory -RelativePath 'ShaderCache' -RequiredCountProperty 'requiredLowerProviderFiles'
+            foreach ($coverageError in @($coverage.errors)) { $errors.Add([string]$coverageError) }
+            if ($planComplete -and -not $AllowPreparedCacheGrowth -and [string]$cacheInventory.treeSha256 -cne [string]$plan.preparedTreeSha256) {
                 $errors.Add('MO2 Overwrite ShaderCache changed after prepare and before its first launch.')
             }
-            $shadowReceipt = if ($plan.PSObject.Properties['providerShadow']) { $plan.providerShadow.receipt } else { $null }
-            if ($null -eq $shadowReceipt -or [string]$shadowReceipt.bindingMode -cne 'mo2-overwrite-output' -or
-                [int]$shadowReceipt.requiredLowerProviderFiles -ne [int]$coverage.requiredFiles) {
+            if ($null -eq $shadowReceipt -or -not $shadowReceipt.PSObject.Properties['bindingMode'] -or
+                [string]$shadowReceipt.bindingMode -cne 'mo2-overwrite-output') {
                 $errors.Add('The shader-cache provider receipt no longer covers the current enabled-provider inventory.')
             }
             $cacheVerification = [pscustomobject]@{
-                ok = @($coverage.missingPaths).Count -eq 0
+                ok = [bool]$coverage.ok
                 allowPreparedCacheGrowth = [bool]$AllowPreparedCacheGrowth
                 requiredProviderFiles = [int]$coverage.requiredFiles
                 missingProviderPaths = @($coverage.missingPaths)
+                changedProviderPaths = @($coverage.changedProviderPaths)
+                changedOverwritePaths = @($coverage.changedOverwritePaths)
             }
         }
     }
@@ -590,7 +894,31 @@ function Get-MO2TaskWorkspaceIsolation {
     }
 
     $output = $manifest.runtimeOutput
+    foreach ($requiredField in @('mode', 'executable')) {
+        if (-not $output.PSObject.Properties[$requiredField] -or [string]::IsNullOrWhiteSpace([string]$output.$requiredField)) {
+            $errors.Add("Task runtime-output manifest lacks required field '$requiredField'.")
+        }
+    }
+    if ($errors.Count -gt 0) {
+        return [pscustomobject][ordered]@{
+            applicable = $true; ok = $false; profile = $Profile
+            executable = $Executable; workspace = $owned; runtimeOutput = $output
+            cachePlan = $null; backupVerification = $null; checks = @($checks); errors = @($errors)
+        }
+    }
     if ([string]$output.mode -ceq 'mo2-overwrite-output') {
+        foreach ($requiredPath in @('cacheCompletionPath', 'backupCompletionPath')) {
+            if (-not $output.PSObject.Properties[$requiredPath] -or [string]::IsNullOrWhiteSpace([string]$output.$requiredPath)) {
+                $errors.Add("Task runtime-output manifest lacks required path '$requiredPath'.")
+            }
+        }
+        if ($errors.Count -gt 0) {
+            return [pscustomobject][ordered]@{
+                applicable = $true; ok = $false; profile = $Profile
+                executable = $Executable; workspace = $owned; runtimeOutput = $output
+                cachePlan = $null; backupVerification = $null; checks = @($checks); errors = @($errors)
+            }
+        }
         return Get-MO2OverwriteWorkspaceIsolation -Config $Config -Owned $owned -Profile $Profile -Executable $Executable -AccessId $AccessId -RequirePreparedCache:$RequirePreparedCache -AllowPreparedCacheGrowth:$AllowPreparedCacheGrowth
     }
     $profilesRoot = [IO.Path]::GetFullPath((Resolve-MO2ControlPath ([string]$Config.mo2.profilesDirectory)))
@@ -637,7 +965,7 @@ function Get-MO2TaskWorkspaceIsolation {
     if (Test-Path -LiteralPath $modListPath -PathType Leaf) {
         try {
             $transactionTool = Resolve-MO2ShaderCacheTransactionTool
-            $providerJson = & $transactionTool providers -ProfilePath $modListPath -ModsPath $modsRoot -RelativeCachePath 'ShaderCache' -DeepInventory:$RequirePreparedCache -NoExit -Confirm:$false
+            $providerJson = & $transactionTool providers -ProfilePath $modListPath -ModsPath $modsRoot -RelativeCachePath 'ShaderCache' -DeepInventory:$RequirePreparedCache -IncludeInventoryEntries:$RequirePreparedCache -NoExit -Confirm:$false
             $providerResult = ConvertFrom-MO2JsonText ([string]$providerJson)
             $winner = $providerResult.data.effectiveWinnerAmongEnabledMods
             if (-not $providerResult.ok -or $null -eq $winner -or
@@ -650,7 +978,7 @@ function Get-MO2TaskWorkspaceIsolation {
         catch { $errors.Add("Could not verify the current ShaderCache provider: $($_.Exception.Message)") }
         try {
             if ([string]::IsNullOrWhiteSpace([string]$transactionTool)) { $transactionTool = Resolve-MO2ShaderCacheTransactionTool }
-            $backupProviderJson = & $transactionTool providers -ProfilePath $modListPath -ModsPath $modsRoot -RelativeCachePath 'backup' -DeepInventory -NoExit -Confirm:$false
+            $backupProviderJson = & $transactionTool providers -ProfilePath $modListPath -ModsPath $modsRoot -RelativeCachePath 'backup' -DeepInventory -IncludeInventoryEntries -NoExit -Confirm:$false
             $backupProviderResult = ConvertFrom-MO2JsonText ([string]$backupProviderJson)
             $backupVerification = Get-MO2PreparedBackupShadowVerification `
                 -Output $output -ProviderResult $backupProviderResult -ProfilePath $modListPath `
@@ -1021,6 +1349,86 @@ function Get-MO2ExecutableModOwner {
     }
 }
 
+function Get-MO2DirectoryPhysicalIdentity {
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        return [SkyrimVRAutomation.Native.DirectoryIdentity]::Get(
+            [IO.Path]::GetFullPath($Path))
+    }
+    catch {
+        throw "physical directory identity could not be proven: $($_.Exception.Message)"
+    }
+}
+
+function Get-MO2ProfileRuntimeProviders {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$Profile,
+        [scriptblock]$IdentityResolver = ${function:Get-MO2DirectoryPhysicalIdentity}
+    )
+
+    $profilesRoot = [IO.Path]::GetFullPath((Resolve-MO2ControlPath ([string]$Config.mo2.profilesDirectory)).TrimEnd('\'))
+    $modsRoot = if ($Config.mo2.PSObject.Properties['modsDirectory']) {
+        [IO.Path]::GetFullPath((Resolve-MO2ControlPath ([string]$Config.mo2.modsDirectory)).TrimEnd('\'))
+    }
+    else {
+        [IO.Path]::GetFullPath((Join-Path (Resolve-MO2ControlPath ([string]$Config.mo2.root)) 'mods').TrimEnd('\'))
+    }
+    $modListPath = Join-Path (Join-Path $profilesRoot $Profile) 'modlist.txt'
+    $records = @()
+    $errors = @()
+    $providerPaths = [Collections.Generic.Dictionary[string, int]]::new([StringComparer]::OrdinalIgnoreCase)
+    if (-not (Test-Path -LiteralPath $modListPath -PathType Leaf)) {
+        return [pscustomobject][ordered]@{ profile = $Profile; modListPath = $modListPath; providers = @(); errors = @("Profile mod list does not exist: $modListPath") }
+    }
+
+    $lineNumber = 0
+    foreach ($line in Get-Content -LiteralPath $modListPath) {
+        $lineNumber++
+        if ($line -notmatch '^(?<marker>[+-])(?<name>.+)$') { continue }
+        $modName = $Matches.name.TrimEnd("`r")
+        try {
+            $modPath = [IO.Path]::GetFullPath((Join-Path $modsRoot $modName))
+            $directParent = [IO.Path]::GetDirectoryName($modPath)
+            if (-not $modPath.StartsWith($modsRoot + '\', [StringComparison]::OrdinalIgnoreCase) -or
+                -not [string]::Equals($directParent, $modsRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'mod name does not resolve to one direct child of the configured mods directory'
+            }
+            $openVrApi = Join-Path $modPath 'root\openvr_api.dll'
+            $openCompositeIni = Join-Path $modPath 'root\opencomposite.ini'
+            $openCompositeInput = Join-Path $modPath 'SKSE\Plugins\OpenCompositeInput.dll'
+            $hasOpenVrApi = Test-Path -LiteralPath $openVrApi -PathType Leaf
+            $hasOpenCompositeIni = Test-Path -LiteralPath $openCompositeIni -PathType Leaf
+            $hasOpenCompositeInput = Test-Path -LiteralPath $openCompositeInput -PathType Leaf
+            if (-not ($hasOpenVrApi -or $hasOpenCompositeIni -or $hasOpenCompositeInput)) { continue }
+            $modItem = Get-Item -LiteralPath $modPath -Force -ErrorAction Stop
+            if (($modItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'runtime-provider mod directories must not be reparse points because physical identity cannot be proven'
+            }
+            $providerKey = & $IdentityResolver $modPath
+            if ([string]::IsNullOrWhiteSpace([string]$providerKey)) {
+                throw 'physical directory identity resolver returned no identity'
+            }
+            if ($providerPaths.ContainsKey($providerKey)) {
+                throw "runtime-provider physical directory is repeated or contradicted by modlist line $($providerPaths[$providerKey])"
+            }
+            $providerPaths.Add($providerKey, $lineNumber)
+            $classification = if ($hasOpenVrApi -and ($hasOpenCompositeIni -or $hasOpenCompositeInput)) { 'OCU' } else { 'unclassified-openvr-provider' }
+            $records += [pscustomobject][ordered]@{
+                classification = $classification; modName = $modName; modPath = $modPath
+                lineNumber = $lineNumber; marker = $Matches.marker; enabled = $Matches.marker -eq '+'
+                markers = [pscustomobject][ordered]@{
+                    rootOpenVrApi = $hasOpenVrApi; rootOpenCompositeIni = $hasOpenCompositeIni
+                    openCompositeInput = $hasOpenCompositeInput
+                }
+            }
+        }
+        catch { $errors += "modlist line $lineNumber ('$modName'): $($_.Exception.Message)" }
+    }
+    return [pscustomobject][ordered]@{ profile = $Profile; modListPath = $modListPath; providers = @($records); errors = @($errors) }
+}
+
 function Get-MO2ProcessRecords {
     param([string[]]$Names)
 
@@ -1302,6 +1710,314 @@ function New-MO2Check {
     }
 }
 
+function Get-MO2SteamVRExclusionEntries {
+    return @('vrserver.exe', 'vrcompositor.exe', 'vrmonitor.exe', 'vrdashboard.exe', 'vrwebhelper.exe')
+}
+
+function Get-MO2BytesSha256 {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($algorithm.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant() }
+    finally { $algorithm.Dispose() }
+}
+
+function ConvertFrom-MO2IniEscapedName {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    # Detect QSettings aliases only; do not rewrite unrelated serialized names.
+    return [regex]::Replace($Value, '%(?:U([0-9a-f]{4})|([0-9a-f]{2}))', {
+        param($match)
+        $digits = if ($match.Groups[1].Success) { $match.Groups[1].Value } else { $match.Groups[2].Value }
+        return [string][char][Convert]::ToInt32($digits, 16)
+    }, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+}
+
+function Get-MO2SteamVRExclusionPlan {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $iniPath = [IO.Path]::GetFullPath((Resolve-MO2ControlPath $Path))
+    $item = Get-Item -LiteralPath $iniPath -ErrorAction Stop
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'The configured MO2 INI must be a regular file, not a directory or reparse point.'
+    }
+    $bytes = [IO.File]::ReadAllBytes($iniPath)
+    $offset = 0
+    $encodingName = 'utf8'
+    $encoding = [Text.UTF8Encoding]::new($false, $true)
+    if ($bytes.Length -ge 4 -and $bytes[0] -eq 0x2b -and $bytes[1] -eq 0x2f -and $bytes[2] -eq 0x76 -and $bytes[3] -in @(0x38, 0x39, 0x2b, 0x2f)) {
+        throw 'UTF-7 MO2 INI encoding is unsupported; no file was changed.'
+    }
+    if ($bytes.Length -ge 4 -and (($bytes[0] -eq 0xff -and $bytes[1] -eq 0xfe -and $bytes[2] -eq 0 -and $bytes[3] -eq 0) -or
+            ($bytes[0] -eq 0 -and $bytes[1] -eq 0 -and $bytes[2] -eq 0xfe -and $bytes[3] -eq 0xff))) {
+        throw 'UTF-32 MO2 INI encoding is unsupported; no file was changed.'
+    }
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf) {
+        $offset = 3
+        $encodingName = 'utf8-bom'
+    }
+    elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xff -and $bytes[1] -eq 0xfe) {
+        $offset = 2
+        $encodingName = 'utf16-le-bom'
+        $encoding = [Text.UnicodeEncoding]::new($false, $true, $true)
+    }
+    elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xfe -and $bytes[1] -eq 0xff) {
+        $offset = 2
+        $encodingName = 'utf16-be-bom'
+        $encoding = [Text.UnicodeEncoding]::new($true, $true, $true)
+    }
+    try { $text = $encoding.GetString($bytes, $offset, $bytes.Length - $offset) }
+    catch { throw "Unsupported or invalid MO2 INI encoding: $($_.Exception.Message)" }
+    if ($text.Contains([char]0)) { throw 'NUL bytes or unsupported BOM-less UTF-16 in MO2 INI; no file was changed.' }
+
+    $lines = @([regex]::Matches($text, '[^\r\n]*(?:\r\n|\n|\r|$)') | Where-Object Length -GT 0)
+    $section = ''
+    $settingsHeaders = @()
+    $generalHeaders = @()
+    $blacklistLines = @()
+    $versionLines = @()
+    $versionAliases = $false
+    $settingsEnd = $text.Length
+    $newline = $null
+    foreach ($line in $lines) {
+        $content = $line.Value.TrimEnd([char[]]"`r`n")
+        $ending = $line.Value.Substring($content.Length)
+        if ($null -eq $newline -and $ending.Length -gt 0) { $newline = $ending }
+        if ($content -match '^\s*\[([^\]]+)\]\s*$') {
+            if ($section -ieq 'Settings') { $settingsEnd = $line.Index }
+            $rawSection = $Matches[1]
+            $section = ConvertFrom-MO2IniEscapedName -Value $rawSection.Trim()
+            if ($section -ieq 'Settings' -and $rawSection -ine 'Settings') { throw 'An encoded or whitespace-ambiguous Settings section alias is unsupported; no file was changed.' }
+            if ($section -ieq 'General' -and $rawSection -ine 'General') { $versionAliases = $true }
+            if ($section -ieq 'Settings') { $settingsHeaders += $line }
+            if ($section -ieq 'General') { $generalHeaders += $line }
+        }
+        elseif ($content -match '^\s*\[') { throw 'Ambiguous or malformed MO2 INI section header; no file was changed.' }
+        elseif ($content -match '^\s*([^;#][^=]*?)\s*=') {
+            $rawKey = $Matches[1].Trim()
+            $logicalKey = (ConvertFrom-MO2IniEscapedName -Value $rawKey).Replace('\', '/')
+            $fullKey = if ($section -eq '' -or $section -ieq 'General') { $logicalKey } else { $section.Replace('\', '/') + '/' + $logicalKey }
+            if ($fullKey -ieq 'Settings/executable_blacklist') {
+                if ($section -ine 'Settings' -or $rawKey -ine 'executable_blacklist') { throw 'An encoded or grouped executable_blacklist alias is unsupported; no file was changed.' }
+                $blacklistLines += $line
+            }
+            if ($section -ieq 'General' -and $logicalKey -ieq 'version') {
+                if ($rawKey -ine 'version') { $versionAliases = $true }
+                $versionLines += $line
+            }
+        }
+    }
+    if ($settingsHeaders.Count -gt 1 -or $blacklistLines.Count -gt 1) {
+        throw 'Duplicate Settings sections or executable_blacklist keys are ambiguous; no file was changed.'
+    }
+    if ($null -eq $newline) { $newline = "`r`n" }
+    $keyPresent = $blacklistLines.Count -eq 1
+    $prefix = 'executable_blacklist='
+    $suffix = ''
+    $payload = ''
+    if ($keyPresent) {
+        $content = $blacklistLines[0].Value.TrimEnd([char[]]"`r`n")
+        $match = [regex]::Match($content, '^(?<prefix>\s*executable_blacklist\s*=\s*)(?<value>.*?)(?<suffix>[ \t]*)$', 'IgnoreCase')
+        $prefix = $match.Groups['prefix'].Value
+        $suffix = $match.Groups['suffix'].Value
+        $payload = $match.Groups['value'].Value
+        $quoted = $payload.StartsWith('"') -and $payload.EndsWith('"') -and $payload.Length -ge 2
+        if ($quoted) {
+            $payload = $payload.Substring(1, $payload.Length - 2)
+        }
+        elseif ($payload.Contains(';')) { throw 'An unquoted executable_blacklist contains a QSettings semicolon comment; no file was changed.' }
+        # QSettings escape sequences, variant/list encodings and inline annotations
+        # require semantic decoding. Refuse them instead of rewriting user entries.
+        if ($payload -match '["\\,@]' -or $payload.Contains('#')) {
+            throw 'Unsupported or ambiguous QSettings executable_blacklist serialization; no file was changed.'
+        }
+    }
+    else {
+        if ($versionAliases -or $generalHeaders.Count -ne 1 -or $versionLines.Count -ne 1 -or
+            $versionLines[0].Value.Trim() -notmatch '^version\s*=\s*(?:"2\.5\.2"|2\.5\.2)$') {
+            throw 'An absent executable_blacklist may only be materialized for the verified MO2 2.5.2 default baseline; unknown or ambiguous version.'
+        }
+        # MO2 v2.5.2 src/settings.cpp, Settings::executableBlacklist default.
+        # https://github.com/ModOrganizer2/modorganizer/blob/v2.5.2/src/settings.cpp
+        $payload = 'Chrome.exe;Firefox.exe;TSVNCache.exe;TGitCache.exe;Steam.exe;GameOverlayUI.exe;Discord.exe;GalaxyClient.exe;Spotify.exe;Brave.exe'
+    }
+    # MO2 passes tokens directly to usvfs: a whitespace-padded filename is not
+    # proof of an effective exclusion. Preserve it and append the exact name.
+    $entries = @($payload.Split(';') | Where-Object { $_.Length -gt 0 })
+    $required = @(Get-MO2SteamVRExclusionEntries)
+    $missing = @($required | Where-Object { $entries -inotcontains $_ })
+    $updatedText = $text
+    if ($missing.Count -gt 0) {
+        $separator = if ($payload.Length -gt 0 -and -not $payload.EndsWith(';')) { ';' } else { '' }
+        $replacementLine = $prefix + '"' + $payload + $separator + ($missing -join ';') + '"' + $suffix
+        if ($keyPresent) {
+            $originalLine = $blacklistLines[0]
+            $contentLength = $originalLine.Value.TrimEnd([char[]]"`r`n").Length
+            $updatedText = $text.Remove($originalLine.Index, $contentLength).Insert($originalLine.Index, $replacementLine)
+        }
+        else {
+            $insertAt = if ($settingsHeaders.Count -eq 1) { $settingsEnd } else { $text.Length }
+            $before = $text.Substring(0, $insertAt)
+            $separation = if ($before.Length -gt 0 -and -not $before.EndsWith("`n") -and -not $before.EndsWith("`r")) { $newline } else { '' }
+            $header = if ($settingsHeaders.Count -eq 0) { '[Settings]' + $newline } else { '' }
+            $updatedText = $text.Insert($insertAt, $separation + $header + $replacementLine + $newline)
+        }
+    }
+    $body = $encoding.GetBytes($updatedText)
+    $updatedBytes = [byte[]]::new($offset + $body.Length)
+    [Array]::Copy($bytes, 0, $updatedBytes, 0, $offset)
+    [Array]::Copy($body, 0, $updatedBytes, $offset, $body.Length)
+    $originalHash = Get-MO2BytesSha256 -Bytes $bytes
+    return [pscustomobject]@{
+        bytes = $bytes
+        updatedBytes = $updatedBytes
+        updatedSha256 = Get-MO2BytesSha256 -Bytes $updatedBytes
+        status = [pscustomobject][ordered]@{
+            iniPath = $iniPath
+            state = $(if ($missing.Count -eq 0) { 'configured' } else { 'missing-exclusions' })
+            complete = $missing.Count -eq 0
+            keyPresent = $keyPresent
+            defaultBaseline = $(if (-not $keyPresent) { 'MO2 2.5.2' } else { $null })
+            entries = $entries
+            requiredEntries = $required
+            missingEntries = $missing
+            encoding = $encodingName
+            originalSha256 = $originalHash
+            error = $null
+        }
+    }
+}
+
+function Get-MO2SteamVRExclusionStatus {
+    param([Parameter(Mandatory)][string]$Path)
+    try { return (Get-MO2SteamVRExclusionPlan -Path $Path).status }
+    catch {
+        return [pscustomobject][ordered]@{
+            iniPath = $Path; state = 'unavailable'; complete = $false
+            requiredEntries = @(Get-MO2SteamVRExclusionEntries); missingEntries = @()
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function Get-MO2SteamVRExclusionProcesses {
+    param([Parameter(Mandatory)]$Config)
+    $runtimeNames = @((Get-MO2SteamVRExclusionEntries) | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_) }) + @('vrstartup')
+    return [pscustomobject]@{
+        mo2 = @(Get-MO2ProcessRecords -Names (@($Config.mo2.processNames) + @([IO.Path]::GetFileNameWithoutExtension([string]$Config.mo2.executable))))
+        game = @(Get-MO2ProcessRecords -Names @($Config.mo2.gameProcessNames))
+        steamVr = @(Get-MO2ProcessRecords -Names (@($Config.mo2.runtimeProcessNames) + $runtimeNames))
+    }
+}
+
+function Invoke-MO2ConfigureSteamVRExclusions {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$AccessId, [switch]$WhatIf)
+
+    # This is installation-INI maintenance, not a game task: require an exact
+    # access-only lease, but neither create a session nor clone a game profile.
+    $owned = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
+    $operation = {
+        $current = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
+        if (-not [string]::IsNullOrWhiteSpace([string]$current.sessionId)) {
+            return New-MO2ActionResult -Config $Config -Command 'configure-steamvr-exclusions' -Ok $false -State 'blocked' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $current } -Errors @('INI maintenance requires an access-only lease; release its exact bound session first.')
+        }
+        $processes = Get-MO2SteamVRExclusionProcesses -Config $Config
+        if ($processes.mo2.Count -gt 0 -or $processes.game.Count -gt 0 -or $processes.steamVr.Count -gt 0) {
+            return New-MO2ActionResult -Config $Config -Command 'configure-steamvr-exclusions' -Ok $false -State 'blocked' -Data @{ processes = $processes } -Errors @('MO2, the game/loader and SteamVR (including vrstartup and helpers) must be closed. Exclusions cannot unload existing VFS hooks. No processes were stopped.')
+        }
+        $plan = Get-MO2SteamVRExclusionPlan -Path ([string]$Config.mo2.ini)
+        $data = [ordered]@{
+            iniPath = $plan.status.iniPath
+            addedEntries = @($plan.status.missingEntries)
+            statusBefore = $plan.status
+            statusAfter = $null
+            originalSha256 = $plan.status.originalSha256
+            updatedSha256 = $plan.updatedSha256
+            maintenancePath = $null; backupPath = $null; receiptPath = $null
+            wouldChange = -not $plan.status.complete
+            processesBefore = $processes
+            noProcessesStopped = $true
+        }
+        if ($WhatIf -or $plan.status.complete) {
+            if ($plan.status.complete) { $data.statusAfter = $plan.status }
+            return New-MO2ActionResult -Config $Config -Command 'configure-steamvr-exclusions' -Ok $true -State $(if ($WhatIf) { 'dry-run' } else { 'already-configured' }) -Data $data
+        }
+
+        $stagingRoot = [IO.Path]::GetFullPath((Resolve-MO2ControlPath ([string]$Config.storage.sessionStaging)))
+        $maintenanceId = 'steamvr-exclusions-{0}-{1}' -f [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'), [guid]::NewGuid().ToString('N')
+        $data.maintenancePath = Join-Path $stagingRoot $maintenanceId
+        $data.backupPath = Join-Path $data.maintenancePath 'ModOrganizer.ini.before'
+        $data.receiptPath = Join-Path $data.maintenancePath 'receipt.json'
+        $temporary = "$($data.iniPath).$maintenanceId.tmp"
+        $replaced = $false
+        $result = $null
+        $rollback = [ordered]@{ attempted = $false; restored = $false; error = $null }
+        try {
+            New-Item -ItemType Directory -Path $data.maintenancePath -ErrorAction Stop | Out-Null
+            [IO.File]::WriteAllBytes($data.backupPath, $plan.bytes)
+            if ((Get-MO2BytesSha256 -Bytes ([IO.File]::ReadAllBytes($data.backupPath))) -cne $data.originalSha256) { throw 'The exact INI backup did not verify.' }
+            Write-MO2JsonAtomic -Path (Join-Path $data.maintenancePath 'before.json') -Value ([pscustomobject]@{
+                command = 'configure-steamvr-exclusions'; timestampUtc = [DateTime]::UtcNow.ToString('o')
+                access = Get-MO2AccessLeaseSummary -Lock $current; data = $data
+            }) -CreateNew
+            [IO.File]::WriteAllBytes($temporary, $plan.updatedBytes)
+            if ((Get-MO2BytesSha256 -Bytes ([IO.File]::ReadAllBytes($temporary))) -cne $data.updatedSha256) { throw 'The staged INI did not verify.' }
+
+            # Recheck the process boundary and exact source immediately before
+            # atomic replacement; never overwrite an external INI edit.
+            $finalProcesses = Get-MO2SteamVRExclusionProcesses -Config $Config
+            if ($finalProcesses.mo2.Count -gt 0 -or $finalProcesses.game.Count -gt 0 -or $finalProcesses.steamVr.Count -gt 0) { throw 'MO2, the game or SteamVR started during exclusion preparation; INI unchanged.' }
+            $finalItem = Get-Item -LiteralPath $data.iniPath -ErrorAction Stop
+            if ($finalItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'The configured INI became a reparse point; replacement refused.' }
+            if ((Get-MO2BytesSha256 -Bytes ([IO.File]::ReadAllBytes($data.iniPath))) -cne $data.originalSha256) { throw 'The configured INI changed during exclusion preparation; replacement refused.' }
+            [IO.File]::Replace($temporary, $data.iniPath, [NullString]::Value)
+            $replaced = $true
+            $verified = Get-MO2SteamVRExclusionPlan -Path $data.iniPath
+            if (-not $verified.status.complete -or $verified.status.originalSha256 -cne $data.updatedSha256) { throw 'The replaced INI did not pass exact hash and exclusion verification.' }
+            $data.statusAfter = $verified.status
+            $result = New-MO2ActionResult -Config $Config -Command 'configure-steamvr-exclusions' -Ok $true -State 'configured' -Data $data
+            Write-MO2JsonAtomic -Path $data.receiptPath -Value $result -CreateNew
+            $receipt = ConvertFrom-MO2JsonText ([IO.File]::ReadAllText($data.receiptPath))
+            if (-not $receipt.ok -or $receipt.data.updatedSha256 -cne $data.updatedSha256) { throw 'The durable exclusion receipt did not verify.' }
+            return $result
+        }
+        catch {
+            $failure = $_.Exception.Message
+            if ($replaced) {
+                $rollback.attempted = $true
+                try {
+                    $rollbackProcesses = Get-MO2SteamVRExclusionProcesses -Config $Config
+                    if ($rollbackProcesses.mo2.Count -gt 0 -or $rollbackProcesses.game.Count -gt 0 -or $rollbackProcesses.steamVr.Count -gt 0) { throw 'MO2, the game or SteamVR started after replacement; automatic rollback refused. The exact backup is retained.' }
+                    [IO.File]::WriteAllBytes($temporary, $plan.bytes)
+                    if ((Get-MO2BytesSha256 -Bytes ([IO.File]::ReadAllBytes($temporary))) -cne $data.originalSha256) { throw 'The staged rollback INI did not verify.' }
+                    # An unrelated post-write edit must not be destroyed by rollback.
+                    if ((Get-Item -LiteralPath $data.iniPath -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'The INI became a reparse point after replacement; automatic rollback refused.' }
+                    if ((Get-MO2BytesSha256 -Bytes ([IO.File]::ReadAllBytes($data.iniPath))) -cne $data.updatedSha256) { throw 'INI changed after replacement; automatic rollback refused. Restore the retained backup only after classifying the external edit.' }
+                    [IO.File]::Replace($temporary, $data.iniPath, [NullString]::Value)
+                    $rollback.restored = (Get-MO2BytesSha256 -Bytes ([IO.File]::ReadAllBytes($data.iniPath))) -ceq $data.originalSha256
+                    if (-not $rollback.restored) { throw 'Rollback hash verification failed.' }
+                    $data.statusAfter = $plan.status
+                }
+                catch { $rollback.error = $_.Exception.Message }
+            }
+            $data['rollback'] = $rollback
+            $result = New-MO2ActionResult -Config $Config -Command 'configure-steamvr-exclusions' -Ok $false -State $(if ($replaced -and -not $rollback.restored) { 'rollback-failed' } elseif ($replaced) { 'rolled-back' } else { 'failed-unchanged' }) -Data $data -Errors @($failure, $rollback.error)
+            try { Write-MO2JsonAtomic -Path $data.receiptPath -Value $result }
+            catch { $result.errors += "Could not persist failure receipt: $($_.Exception.Message)" }
+            return $result
+        }
+        finally {
+            try {
+                if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force -ErrorAction Stop }
+            }
+            catch {
+                if ($null -ne $result) { $result.warnings += "The exact transaction temporary file remains at '$temporary': $($_.Exception.Message)" }
+            }
+        }
+    }
+    if ($WhatIf) { return & $operation }
+    return Invoke-WithMO2LeaseTransitionLock -LockPath $owned.path -Action $operation
+}
+
 function Get-MO2InspectionData {
     param(
         [Parameter(Mandatory)]$Config,
@@ -1353,6 +2069,7 @@ function Get-MO2InspectionData {
         selectedTaskWorkspace = $selectedTaskWorkspace
         profiles = @($profiles)
         executables = @($executables)
+        steamVrExclusions = Get-MO2SteamVRExclusionStatus -Path $mo2Ini
         processes = [pscustomobject][ordered]@{
             mo2 = @($mo2Processes)
             game = @($gameProcesses)
@@ -1360,6 +2077,7 @@ function Get-MO2InspectionData {
         }
         overwrite = $overwrite
         rootBuilder = Get-MO2RootBuilderRecords -Config $Config
+        runtimeProviders = Get-MO2ProfileRuntimeProviders -Config $Config -Profile $profile
         storage = [pscustomobject][ordered]@{
             staging = Get-MO2StorageRecord -Path ([string]$Config.storage.sessionStaging)
             archive = Get-MO2StorageRecord -Path ([string]$Config.storage.archive)
@@ -1456,6 +2174,7 @@ function Invoke-MO2Validate {
         [string]$Executable,
         [switch]$RequireSKSE,
         [switch]$RequireClosed,
+        [switch]$RequireRuntimeRoute,
         [string]$OwnedSessionId,
         [string]$OwnedAccessId
     )
@@ -1581,6 +2300,54 @@ function Invoke-MO2Validate {
     }
     else {
         $checks += New-MO2Check -Name 'session-lock' -Status 'pass' -Message 'No active MO2 control session lock exists.'
+    }
+
+    if ($RequireRuntimeRoute) {
+        $persistedRuntimeRoute = if ($data.sessionLock.exists -and $data.sessionLock.valid -and $data.sessionLock.data.PSObject.Properties['runtimeRoute']) { $data.sessionLock.data.runtimeRoute } else { $null }
+        $runtimeRoute = $null
+        $runtimeRouteError = $null
+        try {
+            $runtimeRoute = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $persistedRuntimeRoute
+        }
+        catch {
+            $runtimeRouteError = $_.Exception.Message
+        }
+        if ($runtimeRouteError) {
+            $details = [pscustomobject][ordered]@{ runtimeRoute = $persistedRuntimeRoute; inventory = $data.runtimeProviders; error = $runtimeRouteError }
+            $checks += New-MO2Check -Name 'runtime-route-provider' -Status 'fail' -Message "Runtime-route qualification failed: $runtimeRouteError" -Details $details
+        }
+        elseif ($data.runtimeProviders.errors.Count -gt 0) {
+            $checks += New-MO2Check -Name 'runtime-route-provider' -Status 'fail' -Message 'Runtime-provider discovery could not prove the exact profile state.' -Details $data.runtimeProviders
+        }
+        else {
+            $enabledProviders = @($data.runtimeProviders.providers | Where-Object enabled)
+            $enabledOpenVrReplacements = @($enabledProviders | Where-Object { $_.markers.rootOpenVrApi })
+            $enabledOcu = @($enabledProviders | Where-Object classification -eq 'OCU')
+            $routeId = [string]$runtimeRoute.id
+            $providerValid = if ($routeId -eq 'OCU') {
+                $enabledOcu.Count -eq 1 -and $enabledOpenVrReplacements.Count -eq 1
+            }
+            else {
+                $enabledOpenVrReplacements.Count -eq 0
+            }
+            $message = if ($providerValid -and $routeId -eq 'OCU') {
+                "The exact profile enables one qualified OCU provider: $($enabledOcu[0].modName)"
+            }
+            elseif ($providerValid) {
+                "The exact profile has no enabled OpenVR replacement for the $routeId route."
+            }
+            elseif ($routeId -eq 'OCU') {
+                "The OCU route requires exactly one enabled OCU provider and no additional root OpenVR replacement; observed OCU=$($enabledOcu.Count), root OpenVR replacements=$($enabledOpenVrReplacements.Count)."
+            }
+            else {
+                "The $routeId route is incompatible with enabled profile-local OpenVR replacement providers: $($enabledOpenVrReplacements.modName -join ', ')."
+            }
+            $details = [pscustomobject][ordered]@{ runtimeRoute = $runtimeRoute; inventory = $data.runtimeProviders }
+            $checks += New-MO2Check -Name 'runtime-route-provider' -Status $(if ($providerValid) { 'pass' } else { 'fail' }) -Message $message -Details $details
+        }
+    }
+    else {
+        $checks += New-MO2Check -Name 'runtime-route-provider' -Status 'info' -Message 'Runtime-route provider qualification was not requested.' -Details $data.runtimeProviders
     }
 
     if ($RequireClosed) {
@@ -1723,7 +2490,7 @@ function Write-MO2OwnedSessionAtomic {
         }
 
         $updated = $Value
-        foreach ($propertyName in @('contractVersion', 'accessId', 'leaseId', 'acquisitionMode', 'label', 'requestedUtc', 'lastRenewedUtc', 'estimatedDurationMinutes', 'estimatedReleaseUtc', 'ownerRequestPid', 'ownerRequestStartTime')) {
+        foreach ($propertyName in @('contractVersion', 'accessId', 'leaseId', 'acquisitionMode', 'label', 'requestedUtc', 'lastRenewedUtc', 'estimatedDurationMinutes', 'estimatedReleaseUtc', 'ownerRequestPid', 'ownerRequestStartTime', 'runtimeRoute')) {
             if ($current.data.PSObject.Properties[$propertyName]) {
                 $updated | Add-Member -NotePropertyName $propertyName -NotePropertyValue $current.data.$propertyName -Force
             }
@@ -1751,7 +2518,8 @@ function New-MO2DurableSessionController {
         [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'Invoke-MO2Control.ps1'); relativePath = 'Invoke-MO2Control.ps1' },
         [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'ConfigResolution.psm1'); relativePath = 'ConfigResolution.psm1' },
         [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'MO2Control.psm1'); relativePath = 'MO2Control.psm1' },
-        [pscustomobject]@{ source = (Join-Path (Split-Path -Parent $PSScriptRoot) 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'); relativePath = 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1' }
+        [pscustomobject]@{ source = (Join-Path (Split-Path -Parent $PSScriptRoot) 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'); relativePath = 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1' },
+        [pscustomobject]@{ source = (Join-Path (Split-Path -Parent $PSScriptRoot) 'shader-cache-control\ShaderCacheInventory.ps1'); relativePath = 'shader-cache-control\ShaderCacheInventory.ps1' }
     )
     if ($WhatIf) {
         return [pscustomobject][ordered]@{ controllerPath = $entryPath; configPath = $configPath; receiptPath = $receiptPath; durable = $true; wouldCopy = @($sourceFiles | ForEach-Object relativePath) }
@@ -1839,6 +2607,93 @@ function Test-MO2HasAccessLease {
             -not [string]::IsNullOrWhiteSpace([string]$Lock.data.accessCredentialSha256))
 }
 
+function Resolve-MO2RuntimeRouteContract {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('OCU', 'SteamVR', 'SteamVRNull')]
+        [string]$RuntimeRoute
+    )
+
+    switch ($RuntimeRoute) {
+        'OCU' {
+            return [pscustomobject][ordered]@{
+                id = 'OCU'
+                runtimeFamily = 'OpenComposite'
+                hmdMode = 'live'
+                requiresSteamVR = $false
+                requiresNullHmd = $false
+                incompatibleWith = @('SteamVR', 'SteamVRNull')
+            }
+        }
+        'SteamVR' {
+            return [pscustomobject][ordered]@{
+                id = 'SteamVR'
+                runtimeFamily = 'SteamVR'
+                hmdMode = 'live'
+                requiresSteamVR = $true
+                requiresNullHmd = $false
+                incompatibleWith = @('OCU', 'SteamVRNull')
+            }
+        }
+        'SteamVRNull' {
+            return [pscustomobject][ordered]@{
+                id = 'SteamVRNull'
+                runtimeFamily = 'SteamVR'
+                hmdMode = 'null'
+                requiresSteamVR = $true
+                requiresNullHmd = $true
+                incompatibleWith = @('OCU', 'SteamVR')
+            }
+        }
+    }
+}
+
+function Resolve-MO2PersistedRuntimeRouteContract {
+    param([Parameter(Mandatory)]$RuntimeRoute)
+
+    $requiredProperties = @('id', 'runtimeFamily', 'hmdMode', 'requiresSteamVR', 'requiresNullHmd', 'incompatibleWith')
+    foreach ($propertyName in $requiredProperties) {
+        if (-not $RuntimeRoute.PSObject.Properties[$propertyName]) {
+            throw "Persisted runtime route is missing required property '$propertyName'."
+        }
+    }
+
+    $routeId = [string]$RuntimeRoute.id
+    if ($routeId -cnotin @('OCU', 'SteamVR', 'SteamVRNull')) {
+        throw "Persisted runtime route id '$routeId' is not supported."
+    }
+    if ($RuntimeRoute.requiresSteamVR -isnot [bool] -or $RuntimeRoute.requiresNullHmd -isnot [bool]) {
+        throw 'Persisted runtime-route boolean properties must be JSON booleans.'
+    }
+
+    $canonical = Resolve-MO2RuntimeRouteContract -RuntimeRoute $routeId
+    foreach ($propertyName in @('id', 'runtimeFamily', 'hmdMode', 'requiresSteamVR', 'requiresNullHmd')) {
+        if ($RuntimeRoute.$propertyName -cne $canonical.$propertyName) {
+            throw "Persisted runtime route property '$propertyName' does not match the canonical '$routeId' contract."
+        }
+    }
+    $persistedIncompatible = @($RuntimeRoute.incompatibleWith)
+    $canonicalIncompatible = @($canonical.incompatibleWith)
+    if ($persistedIncompatible.Count -ne $canonicalIncompatible.Count -or
+        [string]::Join("`n", $persistedIncompatible) -cne [string]::Join("`n", $canonicalIncompatible)) {
+        throw "Persisted runtime route property 'incompatibleWith' does not match the canonical '$routeId' contract."
+    }
+    return $canonical
+}
+
+function Get-MO2RuntimeRouteContractFingerprint {
+    param([Parameter(Mandatory)]$RuntimeRoute)
+
+    $canonical = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $RuntimeRoute
+    return [string]::Join('|', @(
+        [string]$canonical.id,
+        [string]$canonical.runtimeFamily,
+        [string]$canonical.hmdMode,
+        [string][bool]$canonical.requiresSteamVR,
+        [string][bool]$canonical.requiresNullHmd,
+        [string]::Join(',', @($canonical.incompatibleWith))))
+}
+
 function Get-MO2AccessLeaseSummary {
     param([Parameter(Mandatory)]$Lock)
 
@@ -1892,6 +2747,7 @@ function Get-MO2AccessLeaseSummary {
         estimateOverdue = $estimateOverdue
         ownerRequestPid = $(if ($Lock.data.PSObject.Properties['ownerRequestPid']) { $Lock.data.ownerRequestPid } else { $null })
         ownerRequestStartTime = $(if ($Lock.data.PSObject.Properties['ownerRequestStartTime']) { [string]$Lock.data.ownerRequestStartTime } else { $null })
+        runtimeRoute = $(if ($Lock.data.PSObject.Properties['runtimeRoute']) { $Lock.data.runtimeRoute } else { $null })
         generation = $(if ($Lock.data.PSObject.Properties['generation']) { [long]$Lock.data.generation } else { 0L })
     }
 }
@@ -1927,6 +2783,9 @@ function Invoke-MO2RequestAccess {
         [Parameter(Mandatory)]$Config,
         [string]$Label = 'automation',
         [string]$TaskId,
+        [Parameter(Mandatory)]
+        [ValidateSet('OCU', 'SteamVR', 'SteamVRNull')]
+        [string]$RuntimeRoute,
         [Nullable[int]]$EstimatedMinutes,
         [ValidateRange(0, 600)][int]$WaitSeconds = 0,
         [switch]$WhatIf
@@ -1947,6 +2806,7 @@ function Invoke-MO2RequestAccess {
     $accessId = 'access-{0}-{1}' -f $now.ToString('yyyyMMddTHHmmssZ'), ([guid]::NewGuid().ToString('N').Substring(0, 12))
     $leaseId = 'lease-{0}-{1}' -f $now.ToString('yyyyMMddTHHmmssZ'), ([guid]::NewGuid().ToString('N').Substring(0, 8))
     $estimatedReleaseUtc = if ($null -ne $EstimatedMinutes) { $now.AddMinutes([int]$EstimatedMinutes).ToString('o') } else { $null }
+    $runtimeRouteContract = Resolve-MO2RuntimeRouteContract -RuntimeRoute $RuntimeRoute
     $lease = [pscustomobject][ordered]@{
         contractVersion = $script:MO2ControlContractVersion
         accessId = $accessId
@@ -1961,6 +2821,7 @@ function Invoke-MO2RequestAccess {
         estimatedReleaseUtc = $estimatedReleaseUtc
         ownerRequestPid = $PID
         ownerRequestStartTime = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+        runtimeRoute = $runtimeRouteContract
         generation = 1L
         sessionId = $null
         sessionPath = $null
@@ -1969,7 +2830,7 @@ function Invoke-MO2RequestAccess {
     $existing = Get-MO2SessionLockRecord -Path $lockPath
     if ($WhatIf) {
         $available = -not $existing.exists
-        return New-MO2ActionResult -Config $Config -Command 'request-access' -Ok $available -State $(if ($available) { 'dry-run' } else { 'access-busy' }) -Data @{ access = $lease; current = Get-MO2AccessLeaseSummary -Lock $existing; waitSeconds = $WaitSeconds; wouldCreateLock = $available; estimateIsAdvisory = $true } -Errors $(if ($available) { @() } else { @('MO2 access is already held. The estimate never expires or transfers ownership automatically.') })
+        return New-MO2ActionResult -Config $Config -Command 'request-access' -Ok $available -State $(if ($available) { 'dry-run' } else { 'access-busy' }) -Data @{ access = $lease; current = Get-MO2AccessLeaseSummary -Lock $existing; requestedRuntimeRoute = $runtimeRouteContract; waitSeconds = $WaitSeconds; wouldCreateLock = $available; estimateIsAdvisory = $true } -Errors $(if ($available) { @() } else { @('MO2 access is already held. The estimate never expires or transfers ownership automatically.') })
     }
 
     $deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
@@ -1987,7 +2848,7 @@ function Invoke-MO2RequestAccess {
             return New-MO2ActionResult -Config $Config -Command 'request-access' -Ok $true -State 'access-acquired' -Data @{ access = $lease; lockPath = $lockPath; waitedSeconds = [math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 3); estimateIsAdvisory = $true }
         }
         if ([DateTime]::UtcNow -ge $deadline) {
-            return New-MO2ActionResult -Config $Config -Command 'request-access' -Ok $false -State 'access-busy' -Data @{ current = Get-MO2AccessLeaseSummary -Lock $attempt.current; waitedSeconds = [math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 3); requestedWaitSeconds = $WaitSeconds; retryable = $true; estimateIsAdvisory = $true } -Errors @('MO2 access is already held. Retry later or explicitly recover an abandoned lease; an overdue estimate does not unlock it.')
+            return New-MO2ActionResult -Config $Config -Command 'request-access' -Ok $false -State 'access-busy' -Data @{ current = Get-MO2AccessLeaseSummary -Lock $attempt.current; requestedRuntimeRoute = $runtimeRouteContract; waitedSeconds = [math]::Round(([DateTime]::UtcNow - $started).TotalSeconds, 3); requestedWaitSeconds = $WaitSeconds; retryable = $true; estimateIsAdvisory = $true } -Errors @('MO2 access is already held. Retry later or explicitly recover an abandoned lease; an overdue estimate does not unlock it.')
         }
         Start-Sleep -Milliseconds 500
     }
@@ -2853,6 +3714,55 @@ function Resolve-MO2OwnedProcessTarget {
     }
 }
 
+function Bind-MO2PreparedAccessLease {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$AccessId,
+        [Parameter(Mandatory)][string]$LockPath,
+        [Parameter(Mandatory)]$PreparedLock,
+        [Parameter(Mandatory)]$ExpectedRuntimeRoute,
+        [Parameter(Mandatory)][string]$ExpectedRuntimeRouteFingerprint
+    )
+
+    Invoke-WithMO2LeaseTransitionLock -LockPath $LockPath -Action {
+        $currentAccess = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
+        if (-not [string]::IsNullOrWhiteSpace([string]$currentAccess.sessionId)) {
+            throw 'The access lease acquired a session before this prepare could bind it.'
+        }
+        $validatedRuntimeRoute = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $currentAccess.data.runtimeRoute
+        $currentRuntimeRouteFingerprint = Get-MO2RuntimeRouteContractFingerprint -RuntimeRoute $validatedRuntimeRoute
+        if ($currentRuntimeRouteFingerprint -cne $ExpectedRuntimeRouteFingerprint) {
+            throw "The access lease runtime route changed before session binding ('$($ExpectedRuntimeRoute.id)' to '$($validatedRuntimeRoute.id)')."
+        }
+        $bound = $currentAccess.data
+        foreach ($propertyName in @('sessionId', 'sessionPath', 'status', 'createdUtc', 'profile', 'profileName', 'profileDirectory', 'modListPath', 'executable', 'requirements', 'controllerPath', 'ownerPid')) {
+            $bound | Add-Member -NotePropertyName $propertyName -NotePropertyValue $PreparedLock.$propertyName -Force
+        }
+        $bound | Add-Member -NotePropertyName runtimeRoute -NotePropertyValue $validatedRuntimeRoute -Force
+        $bound | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $currentAccess.data) -Force
+        Write-MO2JsonAtomic -Path $LockPath -Value $bound
+    } | Out-Null
+}
+
+function Get-MO2PrepareRouteAdmission {
+    param(
+        [Parameter(Mandatory)]$Validation,
+        [Parameter(Mandatory)]$AccessLock
+    )
+
+    $validatedRuntimeRoute = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $Validation.data.sessionLock.data.runtimeRoute
+    $currentRuntimeRoute = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $AccessLock.data.runtimeRoute
+    $validatedFingerprint = Get-MO2RuntimeRouteContractFingerprint -RuntimeRoute $validatedRuntimeRoute
+    $currentFingerprint = Get-MO2RuntimeRouteContractFingerprint -RuntimeRoute $currentRuntimeRoute
+    return [pscustomobject][ordered]@{
+        matched = $validatedFingerprint -ceq $currentFingerprint
+        validatedRuntimeRoute = $validatedRuntimeRoute
+        currentRuntimeRoute = $currentRuntimeRoute
+        validatedFingerprint = $validatedFingerprint
+        currentFingerprint = $currentFingerprint
+    }
+}
+
 function Invoke-MO2Prepare {
     [CmdletBinding()]
     param(
@@ -2865,7 +3775,11 @@ function Invoke-MO2Prepare {
         [switch]$WhatIf
     )
 
-    $validation = Invoke-MO2Validate -Config $Config -Profile $Profile -Executable $Executable -RequireSKSE:$RequireSKSE -RequireClosed -OwnedAccessId $AccessId
+    if ([string]::IsNullOrWhiteSpace($AccessId)) {
+        return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'missing-access-id' -Data @{ requiredParameter = 'AccessId'; supplied = $false } -Errors @('Prepare requires -AccessId from a route-qualified request-access lease.')
+    }
+
+    $validation = Invoke-MO2Validate -Config $Config -Profile $Profile -Executable $Executable -RequireSKSE:$RequireSKSE -RequireClosed -RequireRuntimeRoute -OwnedAccessId $AccessId
     if (-not $validation.ok) {
         return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'blocked' -Data @{ validation = $validation } -Warnings $validation.warnings -Errors $validation.errors
     }
@@ -2882,16 +3796,20 @@ function Invoke-MO2Prepare {
     $sessionPath = Join-Path $stagingRoot $sessionId
     $lockPath = Resolve-MO2ControlPath ([string]$Config.session.lockFile)
     $arguments = @('--profile', $profileName, 'run', '--executable', $executableName)
-    $explicitAccess = -not [string]::IsNullOrWhiteSpace($AccessId)
-    $accessLock = $null
-    if ($explicitAccess) {
-        $accessLock = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
-        if (-not [string]::IsNullOrWhiteSpace([string]$accessLock.sessionId)) {
-            return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'blocked' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $accessLock } -Errors @('The access lease already has a bound session. Release that session before preparing another one.')
-        }
+    $explicitAccess = $true
+    $accessLock = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
+    if (-not [string]::IsNullOrWhiteSpace([string]$accessLock.sessionId)) {
+        return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'blocked' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $accessLock } -Errors @('The access lease already has a bound session. Release that session before preparing another one.')
     }
-    else {
-        $AccessId = 'access-{0}-{1}' -f ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')), ([guid]::NewGuid().ToString('N').Substring(0, 12))
+    $routeAdmission = Get-MO2PrepareRouteAdmission -Validation $validation -AccessLock $accessLock
+    $runtimeRoute = $routeAdmission.validatedRuntimeRoute
+    $runtimeRouteFingerprint = [string]$routeAdmission.validatedFingerprint
+    if (-not $routeAdmission.matched) {
+        return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'blocked' -Data @{
+            validation = $validation
+            validatedRuntimeRoute = $runtimeRoute
+            currentRuntimeRoute = $routeAdmission.currentRuntimeRoute
+        } -Errors @("The access lease runtime route changed after validation ('$($runtimeRoute.id)' to '$($routeAdmission.currentRuntimeRoute.id)'). Prepare created no session artifacts.")
     }
 
     $controller = New-MO2DurableSessionController -Config $Config -SessionPath $sessionPath -WhatIf
@@ -2908,6 +3826,7 @@ function Invoke-MO2Prepare {
         modListPath = (Join-Path $profileDirectory 'modlist.txt')
         executable = $executableName
         requirements = [pscustomobject][ordered]@{ skseLoader = [bool]$RequireSKSE }
+        runtimeRoute = $runtimeRoute
         mo2Path = [string]$validation.data.config.mo2Executable
         arguments = $arguments
         selectedProfileBefore = [string]$validation.data.selectedProfile
@@ -2915,7 +3834,7 @@ function Invoke-MO2Prepare {
         launchedUtc = $null
         stoppedUtc = $null
         accessId = $AccessId
-        acquisitionMode = $(if ($explicitAccess) { 'explicit-access' } else { 'implicit-session' })
+        acquisitionMode = 'explicit-access'
         controllerPath = [string]$controller.controllerPath
         controllerConfigPath = [string]$controller.configPath
         controllerReceiptPath = [string]$controller.receiptPath
@@ -2924,14 +3843,14 @@ function Invoke-MO2Prepare {
     $lock = [pscustomobject][ordered]@{
         contractVersion = $script:MO2ControlContractVersion
         accessId = $AccessId
-        acquisitionMode = $(if ($explicitAccess) { 'explicit-access' } else { 'implicit-session' })
-        label = $(if ($explicitAccess -and $accessLock.data.PSObject.Properties['label']) { [string]$accessLock.data.label } else { $safeLabel })
-        requestedUtc = $(if ($explicitAccess -and $accessLock.data.PSObject.Properties['requestedUtc']) { [string]$accessLock.data.requestedUtc } else { $manifest.createdUtc })
-        lastRenewedUtc = $(if ($explicitAccess -and $accessLock.data.PSObject.Properties['lastRenewedUtc']) { [string]$accessLock.data.lastRenewedUtc } else { $manifest.createdUtc })
-        estimatedDurationMinutes = $(if ($explicitAccess -and $accessLock.data.PSObject.Properties['estimatedDurationMinutes']) { $accessLock.data.estimatedDurationMinutes } else { $null })
-        estimatedReleaseUtc = $(if ($explicitAccess -and $accessLock.data.PSObject.Properties['estimatedReleaseUtc']) { $accessLock.data.estimatedReleaseUtc } else { $null })
-        ownerRequestPid = $(if ($explicitAccess -and $accessLock.data.PSObject.Properties['ownerRequestPid']) { $accessLock.data.ownerRequestPid } else { $PID })
-        generation = $(if ($explicitAccess) { Get-MO2NextLeaseGeneration -Lease $accessLock.data } else { 1L })
+        acquisitionMode = 'explicit-access'
+        label = $(if ($accessLock.data.PSObject.Properties['label']) { [string]$accessLock.data.label } else { $safeLabel })
+        requestedUtc = $(if ($accessLock.data.PSObject.Properties['requestedUtc']) { [string]$accessLock.data.requestedUtc } else { $manifest.createdUtc })
+        lastRenewedUtc = $(if ($accessLock.data.PSObject.Properties['lastRenewedUtc']) { [string]$accessLock.data.lastRenewedUtc } else { $manifest.createdUtc })
+        estimatedDurationMinutes = $(if ($accessLock.data.PSObject.Properties['estimatedDurationMinutes']) { $accessLock.data.estimatedDurationMinutes } else { $null })
+        estimatedReleaseUtc = $(if ($accessLock.data.PSObject.Properties['estimatedReleaseUtc']) { $accessLock.data.estimatedReleaseUtc } else { $null })
+        ownerRequestPid = $(if ($accessLock.data.PSObject.Properties['ownerRequestPid']) { $accessLock.data.ownerRequestPid } else { $PID })
+        generation = Get-MO2NextLeaseGeneration -Lease $accessLock.data
         sessionId = $sessionId
         sessionPath = $sessionPath
         status = 'prepared'
@@ -2942,39 +3861,20 @@ function Invoke-MO2Prepare {
         modListPath = (Join-Path $profileDirectory 'modlist.txt')
         executable = $executableName
         requirements = [pscustomobject][ordered]@{ skseLoader = [bool]$RequireSKSE }
+        runtimeRoute = $runtimeRoute
         controllerPath = [string]$controller.controllerPath
         ownerPid = $PID
     }
 
     if ($WhatIf) {
-        return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $true -State 'dry-run' -Data @{ session = $manifest; sessionPath = $sessionPath; lockPath = $lockPath; accessId = $AccessId; explicitAccess = $explicitAccess; controller = $controller; controllerPath = [string]$controller.controllerPath; wouldCreate = @($sessionPath, (Join-Path $sessionPath 'session.json'), [string]$controller.controllerPath); wouldCreateLock = -not $explicitAccess; wouldBindAccessLock = $explicitAccess } -Warnings $validation.warnings
-    }
-
-    if (-not $explicitAccess -and (Test-Path -LiteralPath $lockPath -PathType Leaf)) {
-        return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'blocked' -Data @{ lock = Get-MO2SessionLockRecord -Path $lockPath } -Errors @("An MO2 control session lock already exists: $lockPath")
+        return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $true -State 'dry-run' -Data @{ session = $manifest; sessionPath = $sessionPath; lockPath = $lockPath; accessId = $AccessId; explicitAccess = $true; controller = $controller; controllerPath = [string]$controller.controllerPath; wouldCreate = @($sessionPath, (Join-Path $sessionPath 'session.json'), [string]$controller.controllerPath); wouldCreateLock = $false; wouldBindAccessLock = $true } -Warnings $validation.warnings
     }
 
     New-Item -ItemType Directory -Path $sessionPath -ErrorAction Stop | Out-Null
     try {
         $controller = New-MO2DurableSessionController -Config $Config -SessionPath $sessionPath
         Write-MO2JsonAtomic -Path (Join-Path $sessionPath 'session.json') -Value $manifest -CreateNew
-        Invoke-WithMO2LeaseTransitionLock -LockPath $lockPath -Action {
-            if ($explicitAccess) {
-                $currentAccess = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
-                if (-not [string]::IsNullOrWhiteSpace([string]$currentAccess.sessionId)) {
-                    throw 'The access lease acquired a session before this prepare could bind it.'
-                }
-                $bound = $currentAccess.data
-                foreach ($propertyName in @('sessionId', 'sessionPath', 'status', 'createdUtc', 'profile', 'profileName', 'profileDirectory', 'modListPath', 'executable', 'requirements', 'controllerPath', 'ownerPid')) {
-                    $bound | Add-Member -NotePropertyName $propertyName -NotePropertyValue $lock.$propertyName -Force
-                }
-                $bound | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $currentAccess.data) -Force
-                Write-MO2JsonAtomic -Path $lockPath -Value $bound
-            }
-            else {
-                Write-MO2JsonAtomic -Path $lockPath -Value $lock -CreateNew
-            }
-        } | Out-Null
+        Bind-MO2PreparedAccessLease -Config $Config -AccessId $AccessId -LockPath $lockPath -PreparedLock $lock -ExpectedRuntimeRoute $runtimeRoute -ExpectedRuntimeRouteFingerprint $runtimeRouteFingerprint
     }
     catch {
         throw "Failed to prepare session '$sessionId'. The evidence directory is retained at '$sessionPath'. $($_.Exception.Message)"
@@ -3146,7 +4046,7 @@ function Invoke-MO2Launch {
 
     $resumeExistingMO2 = [string]$lockData.status -in @('game-stopped', 'stop-incomplete', 'mo2-open')
     $requireSKSE = $lockData.PSObject.Properties['requirements'] -and $lockData.requirements.PSObject.Properties['skseLoader'] -and [bool]$lockData.requirements.skseLoader
-    $validation = Invoke-MO2Validate -Config $Config -Profile ([string]$lockData.profile) -Executable ([string]$lockData.executable) -RequireSKSE:$requireSKSE -RequireClosed:(-not $resumeExistingMO2) -OwnedSessionId $SessionId
+    $validation = Invoke-MO2Validate -Config $Config -Profile ([string]$lockData.profile) -Executable ([string]$lockData.executable) -RequireSKSE:$requireSKSE -RequireClosed:(-not $resumeExistingMO2) -RequireRuntimeRoute -OwnedSessionId $SessionId
     if (-not $validation.ok) {
         return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'blocked' -Data @{ validation = $validation; lock = $owned } -Warnings $validation.warnings -Errors $validation.errors
     }
@@ -3448,6 +4348,13 @@ function Invoke-MO2RecoverClose {
     if ($targets.Count -eq 0) {
         return New-MO2ActionResult -Config $Config -Command 'recover-close' -Ok $true -State 'already-closed' -Data @{ accessId = $AccessId; accessRetained = $explicitAccess; targets = @(); forceTermination = $false; unrelatedProcessesTouched = @() }
     }
+    if (-not $explicitAccess) {
+        return New-MO2ActionResult -Config $Config -Command 'recover-close' -Ok $false -State 'missing-access-id' -Data @{ requiredParameter = 'AccessId'; supplied = $false; targets = $targets } -Errors @('Recovery close requires -AccessId from a route-qualified request-access lease before it can adopt a running MO2 process.')
+    }
+    if (-not $accessLock.data.PSObject.Properties['runtimeRoute']) {
+        return New-MO2ActionResult -Config $Config -Command 'recover-close' -Ok $false -State 'runtime-route-upgrade-required' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $accessLock; targets = $targets } -Errors @('The access lease predates runtime-route qualification. Release it and request a new access lease with an explicit RuntimeRoute before recovery.')
+    }
+    $runtimeRoute = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $accessLock.data.runtimeRoute
     Assert-MO2ExactProcessTargets -Config $Config -Processes $targets
     if ($targets.Count -ne 1) {
         return New-MO2ActionResult -Config $Config -Command 'recover-close' -Ok $false -State 'blocked' -Data @{ targets = $targets } -Errors @('Recovery close requires exactly one configured MO2 process; multiple instances require manual classification.')
@@ -3461,9 +4368,6 @@ function Invoke-MO2RecoverClose {
     $sessionPath = Join-Path (Resolve-MO2ControlPath ([string]$Config.storage.sessionStaging)) $sessionId
     $lockPath = Resolve-MO2ControlPath ([string]$Config.session.lockFile)
     $createdUtc = [DateTime]::UtcNow.ToString('o')
-    if (-not $explicitAccess) {
-        $AccessId = 'access-{0}-{1}' -f ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')), ([guid]::NewGuid().ToString('N').Substring(0, 12))
-    }
     $controller = New-MO2DurableSessionController -Config $Config -SessionPath $sessionPath -WhatIf
     $profileDirectory = Join-Path (Resolve-MO2ControlPath ([string]$Config.mo2.profilesDirectory)) ([string]$inspection.requested.profile)
     $manifest = [pscustomobject][ordered]@{
@@ -3477,11 +4381,12 @@ function Invoke-MO2RecoverClose {
         profileDirectory = $profileDirectory
         modListPath = (Join-Path $profileDirectory 'modlist.txt')
         executable = [string]$inspection.requested.executable
+        runtimeRoute = $runtimeRoute
         mo2Path = [string]$inspection.config.mo2Executable
         ownerPid = [int]$targets[0].id
         recovery = $true
         accessId = $AccessId
-        acquisitionMode = $(if ($explicitAccess) { 'explicit-access' } else { 'implicit-session' })
+        acquisitionMode = 'explicit-access'
         processesBefore = $inspection.processes
         windowsBefore = @(Get-MO2WindowSnapshot -Processes $targets)
         controllerPath = [string]$controller.controllerPath
@@ -3491,7 +4396,7 @@ function Invoke-MO2RecoverClose {
     $lock = [pscustomobject][ordered]@{
         contractVersion = $script:MO2ControlContractVersion
         accessId = $AccessId
-        acquisitionMode = $(if ($explicitAccess) { 'explicit-access' } else { 'implicit-session' })
+        acquisitionMode = 'explicit-access'
         label = $(if ($explicitAccess -and $accessLock.data.PSObject.Properties['label']) { [string]$accessLock.data.label } else { $safeLabel })
         requestedUtc = $(if ($explicitAccess -and $accessLock.data.PSObject.Properties['requestedUtc']) { [string]$accessLock.data.requestedUtc } else { $createdUtc })
         lastRenewedUtc = $(if ($explicitAccess -and $accessLock.data.PSObject.Properties['lastRenewedUtc']) { [string]$accessLock.data.lastRenewedUtc } else { $createdUtc })
@@ -3508,6 +4413,7 @@ function Invoke-MO2RecoverClose {
         profileDirectory = $profileDirectory
         modListPath = (Join-Path $profileDirectory 'modlist.txt')
         executable = [string]$inspection.requested.executable
+        runtimeRoute = $runtimeRoute
         controllerPath = [string]$controller.controllerPath
         ownerPid = [int]$targets[0].id
         recovery = $true
@@ -3521,21 +4427,20 @@ function Invoke-MO2RecoverClose {
         $controller = New-MO2DurableSessionController -Config $Config -SessionPath $sessionPath
         Write-MO2JsonAtomic -Path (Join-Path $sessionPath 'session.json') -Value $manifest -CreateNew
         Invoke-WithMO2LeaseTransitionLock -LockPath $lockPath -Action {
-            if ($explicitAccess) {
-                $currentAccess = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
-                if (-not [string]::IsNullOrWhiteSpace([string]$currentAccess.sessionId)) {
-                    throw 'The access lease acquired a session before recovery close could bind it.'
-                }
-                $bound = $currentAccess.data
-                foreach ($propertyName in @('sessionId', 'sessionPath', 'status', 'createdUtc', 'profile', 'profileName', 'profileDirectory', 'modListPath', 'executable', 'controllerPath', 'ownerPid', 'recovery')) {
-                    $bound | Add-Member -NotePropertyName $propertyName -NotePropertyValue $lock.$propertyName -Force
-                }
-                $bound | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $currentAccess.data) -Force
-                Write-MO2JsonAtomic -Path $lockPath -Value $bound
+            $currentAccess = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
+            if (-not [string]::IsNullOrWhiteSpace([string]$currentAccess.sessionId)) {
+                throw 'The access lease acquired a session before recovery close could bind it.'
             }
-            else {
-                Write-MO2JsonAtomic -Path $lockPath -Value $lock -CreateNew
+            $validatedRuntimeRoute = Resolve-MO2PersistedRuntimeRouteContract -RuntimeRoute $currentAccess.data.runtimeRoute
+            if ((Get-MO2RuntimeRouteContractFingerprint $validatedRuntimeRoute) -cne (Get-MO2RuntimeRouteContractFingerprint $runtimeRoute)) {
+                throw "The access lease runtime route changed before recovery-close binding ('$($runtimeRoute.id)' to '$($validatedRuntimeRoute.id)')."
             }
+            $bound = $currentAccess.data
+            foreach ($propertyName in @('sessionId', 'sessionPath', 'status', 'createdUtc', 'profile', 'profileName', 'profileDirectory', 'modListPath', 'executable', 'runtimeRoute', 'controllerPath', 'ownerPid', 'recovery')) {
+                $bound | Add-Member -NotePropertyName $propertyName -NotePropertyValue $lock.$propertyName -Force
+            }
+            $bound | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $currentAccess.data) -Force
+            Write-MO2JsonAtomic -Path $lockPath -Value $bound
         } | Out-Null
     }
     catch {
@@ -3900,19 +4805,20 @@ function Get-MO2ControlHelp {
         commands = @(
             [pscustomobject]@{ name = 'inspect'; mutation = $false; description = 'Inspect MO2 paths, profiles, registered executables, processes, RootBuilder state, overwrite usage, storage and locks.' },
             [pscustomobject]@{ name = 'validate'; mutation = $false; description = 'Validate an exact profile and registered executable. Add -RequireClosed before future state-changing operations.' },
-            [pscustomobject]@{ name = 'request-access'; mutation = $true; description = 'Atomically request the shared MO2 access lease. Supports a bounded wait and an optional advisory duration estimate.' },
+            [pscustomobject]@{ name = 'request-access'; mutation = $true; description = 'Atomically request the shared MO2 access lease for exactly one runtime route: OCU, SteamVR, or SteamVRNull.' },
             [pscustomobject]@{ name = 'access-status'; mutation = $false; description = 'Report whether access is available, held, bound to a session, or owned by the supplied AccessId.' },
             [pscustomobject]@{ name = 'renew-access'; mutation = $true; description = 'Refresh an owned access lease and optionally replace its advisory duration estimate. Never extends an automatic expiry because leases do not expire automatically.' },
             [pscustomobject]@{ name = 'release-access'; mutation = $true; description = 'Release an access-only lease after proving MO2, the game, and RootBuilder deployment are inactive.' },
             [pscustomobject]@{ name = 'recover-access'; mutation = $true; description = 'Explicitly recover a confirmed abandoned access lease after closed-state proof. Requires AccessId and ConfirmAbandoned; estimates never authorize recovery.' },
-            [pscustomobject]@{ name = 'prepare'; mutation = $true; description = 'Validate closed state and create a durable evidence session. Pass AccessId to bind an explicit lease; legacy implicit single-session use remains supported.' },
+            [pscustomobject]@{ name = 'configure-steamvr-exclusions'; mutation = $true; description = 'Append five SteamVR helper exclusions to only the selected installation INI, preserving existing entries with exact backup and receipt. Requires an access-only AccessId and closed MO2/game/SteamVR; supports WhatIf. Never stops processes or mutates profiles.' },
+            [pscustomobject]@{ name = 'prepare'; mutation = $true; description = 'Validate closed state and bind a route-qualified explicit access lease to a durable evidence session. Requires AccessId.' },
             [pscustomobject]@{ name = 'open'; mutation = $true; description = 'Open only the exact configured MO2 executable and profile in an owned session. Does not launch the game. -StartOnly returns after the durable receipt is written.' },
             [pscustomobject]@{ name = 'launch'; mutation = $true; description = 'Launch one exact registered executable under one exact profile. Requires -SessionId; -StartOnly returns after the durable receipt is written.' },
             [pscustomobject]@{ name = 'status'; mutation = $false; description = 'Report bounded MO2, game and runtime process state, optionally verifying -SessionId ownership.' },
             [pscustomobject]@{ name = 'stop-game'; mutation = $true; description = 'Request graceful game shutdown while retaining the exact owned MO2 process for controlled relaunch. Never force-terminates.' },
             [pscustomobject]@{ name = 'terminate-game'; mutation = $true; description = 'Terminate only launch-recorded exact game/loader PIDs after a deadlock, retain MO2, invoke exact Unlock, and require RootBuilder restoration.' },
             [pscustomobject]@{ name = 'close'; mutation = $true; description = 'Cooperatively close only exact session-owned MO2, including its exact Unlock control and MO2-owned modal windows. Never force-terminates.' },
-            [pscustomobject]@{ name = 'recover-close'; mutation = $true; description = 'Adopt one stranded exact-path MO2 into a recorded recovery session, then cooperatively close it. Never targets editor or crash-handler processes.' },
+            [pscustomobject]@{ name = 'recover-close'; mutation = $true; description = 'Use a route-qualified access lease to adopt one stranded exact-path MO2 into a recorded recovery session, then cooperatively close it. Never targets editor or crash-handler processes.' },
             [pscustomobject]@{ name = 'recover-rootbuilder'; mutation = $true; description = 'Recover one stranded RootBuilder BuildData transaction through one exact-profile launch, followed by the normal stop/Unlock path. Never deletes deployment metadata.' },
             [pscustomobject]@{ name = 'stop'; mutation = $true; description = 'Request graceful game shutdown, then cooperatively close exact owned MO2. Never force-terminates.' },
             [pscustomobject]@{ name = 'terminate'; mutation = $true; description = 'Force-terminate only owned MO2 processes after proving game absence and RootBuilder cleanup. Requires -SessionId and supports -WhatIf.' },
@@ -3921,12 +4827,18 @@ function Get-MO2ControlHelp {
         )
         examples = @(
             '.\Invoke-MO2Control.ps1 inspect',
-            '.\Invoke-MO2Control.ps1 request-access -Label "api-test" -EstimatedMinutes 20',
+            '.\Invoke-MO2Control.ps1 request-access -Label "api-test" -RuntimeRoute OCU -EstimatedMinutes 20',
             '.\Invoke-MO2Control.ps1 prepare -AccessId $accessId -Label "api-test-run"',
             '.\Invoke-MO2Control.ps1 validate -RequireClosed',
             '.\Invoke-MO2Control.ps1 validate -Profile "Codex" -Executable "Launch MGO - Do Not Unlock" -Compact'
         )
-        note = 'Version 0.8.0 preserves the lifecycle contract, adds session-scoped durable controllers, explicit profile identity, and retained failed-to-run dialog classification.'
+        runtimeRoutes = @(
+            Resolve-MO2RuntimeRouteContract -RuntimeRoute OCU
+            Resolve-MO2RuntimeRouteContract -RuntimeRoute SteamVR
+            Resolve-MO2RuntimeRouteContract -RuntimeRoute SteamVRNull
+        )
+        runtimeRouteRule = 'A lease selects exactly one route. OCU cannot coexist with either SteamVR route; SteamVRNull is the null-HMD mode of SteamVR and cannot coexist with physical SteamVR.'
+        note = 'Version 1.0.0 requires an explicit route-bound access lease, adds durable session controllers and profile identity, binds task output to MO2 Overwrite, and retains failed-to-run dialog classification.'
     }
 
     return [pscustomobject][ordered]@{
@@ -3942,4 +4854,4 @@ function Get-MO2ControlHelp {
     }
 }
 
-Export-ModuleMember -Function Read-MO2ControlConfig, Get-MO2TaskWorkspaceIsolation, Invoke-MO2Inspect, Invoke-MO2Validate, Invoke-MO2RequestAccess, Invoke-MO2AccessStatus, Invoke-MO2RenewAccess, Invoke-MO2ReleaseAccess, Invoke-MO2RecoverAccess, Invoke-MO2Prepare, Invoke-MO2Open, Invoke-MO2Launch, Invoke-MO2Status, Invoke-MO2StopGame, Invoke-MO2TerminateGame, Invoke-MO2Close, Invoke-MO2RecoverClose, Invoke-MO2RecoverRootBuilder, Invoke-MO2Stop, Invoke-MO2Terminate, Invoke-MO2Release, Get-MO2ControlHelp
+Export-ModuleMember -Function Read-MO2ControlConfig, Get-MO2TaskWorkspaceIsolation, Invoke-MO2Inspect, Invoke-MO2Validate, Invoke-MO2RequestAccess, Invoke-MO2AccessStatus, Invoke-MO2RenewAccess, Invoke-MO2ReleaseAccess, Invoke-MO2RecoverAccess, Invoke-MO2ConfigureSteamVRExclusions, Invoke-MO2Prepare, Invoke-MO2Open, Invoke-MO2Launch, Invoke-MO2Status, Invoke-MO2StopGame, Invoke-MO2TerminateGame, Invoke-MO2Close, Invoke-MO2RecoverClose, Invoke-MO2RecoverRootBuilder, Invoke-MO2Stop, Invoke-MO2Terminate, Invoke-MO2Release, Get-MO2ControlHelp

@@ -59,6 +59,11 @@ Assert-True (Test-Path -LiteralPath $runnerPlugin -PathType Leaf) 'Missing packa
 Assert-True ((Get-FileHash -LiteralPath $runnerSource -Algorithm SHA256).Hash -eq
     (Get-FileHash -LiteralPath $runnerPlugin -Algorithm SHA256).Hash) 'Deterministic tuning runner source/package parity failed.'
 $runner = Get-Content -LiteralPath $runnerSource -Raw
+foreach ($name in @('durable-worker.js', 'journal-worker.js', 'handoff.js', 'Invoke-RenderScaleTuningWorker.ps1', 'README.md')) {
+    $relative = "tools\renderscale-tuning-live\$name"
+    Assert-True ((Get-FileHash -LiteralPath (Join-Path $repositoryRoot $relative)).Hash -eq
+        (Get-FileHash -LiteralPath (Join-Path $repositoryRoot "plugins\skyrim-vr-automation\$relative")).Hash) "Worker package parity failed: $name"
+}
 $finalizerRelative = 'tools\renderscale-tuning-finalizer\finalizer.js'
 $finalizerSource = Join-Path $repositoryRoot $finalizerRelative
 $finalizerPlugin = Join-Path $repositoryRoot "plugins\skyrim-vr-automation\$finalizerRelative"
@@ -68,10 +73,7 @@ Assert-True ((Get-FileHash -LiteralPath $finalizerSource -Algorithm SHA256).Hash
     (Get-FileHash -LiteralPath $finalizerPlugin -Algorithm SHA256).Hash) 'Shared tuning finalizer source/package parity failed.'
 $finalizer = Get-Content -LiteralPath $finalizerSource -Raw
 foreach ($token in @(
-    'async function collectTracePages', 'afterSequence', 'moreAvailable',
-    'requestedSequenceOverwritten', 'trace_sequence_gap',
-    'trace_sequence_duplicate', 'trace_session_changed',
-    'trace_build_changed', 'function finalizeEvidence',
+    'function finalizeEvidence',
     'missing_required_mutation_boundary', 'phaseCountersAuthoritative',
     'assayExecution', 'task2Evidence', 'reportingStatus',
     'function evidenceValues', 'evidence-values.csv',
@@ -88,6 +90,9 @@ foreach ($token in @(
 }
 foreach ($token in @(
     'async function runRenderScaleTuningLive',
+    'async function collectTracePages', 'validateRetainedTrace',
+    'traceReadPages', 'trace_pages_incomplete', 'trace_sequence_gap',
+    'trace_sequence_duplicate', 'trace_session_changed',
     'mcp__devbench_vr__scenario',
     'mcp__devbench_vr__communityshaders_renderscale',
     'positioningRoot', 'positioningInputs', 'capabilities',
@@ -138,7 +143,7 @@ foreach ($token in @(
     'without another model handoff',
     'run-unique startup keys', '`raw/startup`',
     '`startup_evidence_incomplete`',
-    'forbid the comparison-ledger append',
+    'label unavailable comparison metrics',
     'Every later mutation and ownership scenario remains synchronous',
     'terminal baseline waiter receipt', '`milestoneTimings`',
     '`replacementTimeline`', 'Fast measured-loop contract',
@@ -146,13 +151,13 @@ foreach ($token in @(
     'Do not invent another previous-transition safety gate',
     '60,000 ms `position-settle`', '20,000 ms strict waiter',
     'record `nonStableNote`', 'not permission to overlap mutations',
-    '`store()` that exact terminal receipt', 'return only a compact', '`text()`',
+    '`store()` that exact terminal receipt', 'publish only a compact', 'projection through worker status',
     'Store the complete scenario envelope', '`failedStep`',
     '`firstUnreportedStep`', 'never invent that it failed',
-    'complete measured pass in that one live orchestration cell',
-    '`notify()`', '`yield_control()`',
+    'every measured pass and runnable lane in the same detached worker',
+    '`notify()`', 'Status reads never cancel, restart, or replay the worker',
     'sole server-owned `wait` of exactly 5,000 ms',
-    "preceding terminal waiter's", 'At pass finalization', '`load()`',
+    "preceding terminal waiter's", 'journal every received terminal response',
     'one cumulative evidence-read batch', 'generate the receipt index',
     '`continueOnError: true`', 'validate each labeled result independently',
     'unsupported optional operation', 'must not suppress',
@@ -202,7 +207,7 @@ foreach ($forbidden in @(
     'Require the runtime-only FOV/TAA `0.3/0.3/0.7` fixture,',
     'render-scale tool description to advertise independent',
     'generic process inventory, adapter description string, or upscaling API receipt is authoritative',
-    'one local evidence action before `prepare_coc`',
+    'one local evidence action before `prepare_tuning`',
     '`startupReadElapsedMs`',
     '`positioningDispatchElapsedMs`',
     '`slow_startup_reads`',
@@ -288,14 +293,18 @@ foreach ($variant in $variants) {
     Assert-Contains $skill 'does not authorize' $variant.Name
     Assert-Contains $skill 'VR FPS Stabilizer' $variant.Name
     Assert-Contains $skill 'outside this assay' $variant.Name
-    Assert-Contains $skill 'Direct `mcp__devbench_vr__*` tools are the only' $variant.Name
-    Assert-Contains $skill 'Do not enumerate tools or inspect fallbacks' $variant.Name
-    Assert-Contains $skill 'if a named tool is not callable' $variant.Name
-    Assert-Contains $skill 'never use the bundled controller' $variant.Name
+    foreach ($token in @('hidden detached Node worker', 'raw/journal.ndjson',
+        'A save backlog never aborts or slows measurement', 'every five completed transitions',
+        'same selected DevBench MCP', 'one persistent session', 'Startup uses direct',
+        '## Explicit failed-recovery replay', 'transition_recovery_failed')) {
+        Assert-Contains $skill $token $variant.Name
+    }
     Assert-True (-not $skill.Contains('evidence-values.csv', [StringComparison]::Ordinal)) "$($variant.Name) moved finalization into startup instructions."
     Assert-Contains $live '../../../docs/protocols/renderscale-tuning-fast-start.md' $variant.Name
     Assert-Contains $skill 'first `mcp__devbench_vr__communityshaders_menu`' $variant.Name
-    Assert-Contains $skill '`{"action":"prepare_coc"}`' $variant.Name
+    Assert-Contains $skill '`{"action":"prepare_tuning"}`' $variant.Name
+    Assert-True (-not $protocolContract.Contains('prepare_coc', [StringComparison]::Ordinal)) "$($variant.Name) still selects Stabilizer-dependent preparation."
+    Assert-True (-not $skill.Contains('after.vrFpsStabilizer.activeForSession', [StringComparison]::Ordinal)) "$($variant.Name) still requires Stabilizer startup sync."
     Assert-Contains $skill '"async":false' $variant.Name
     Assert-Contains $skill '"command":"coc WhiterunDragonsreach"' $variant.Name
     Assert-Contains $skill '"label":"position-renderscale"' $variant.Name
@@ -312,7 +321,7 @@ foreach ($variant in $variants) {
     Assert-Contains $skill '`load()`, compare object identity' $variant.Name
     Assert-Contains $skill 'never correct, restart, or replay' $variant.Name
     Assert-True (-not $skill.Contains('verify both keys with `load()`', [StringComparison]::Ordinal)) "$($variant.Name) still gates startup on stored-object verification."
-    Assert-Contains $skill 'finalization materializes both stored responses' $variant.Name
+    Assert-Contains $skill 'runner journals both stored responses before measurement' $variant.Name
     Assert-Contains $skill '`content[0].type: "text"`' $variant.Name
     Assert-Contains $skill '`JSON.parse`' $variant.Name
     Assert-Contains $skill '`content[0].text`' $variant.Name
@@ -335,7 +344,6 @@ foreach ($variant in $variants) {
     foreach ($fixtureToken in @(
         '`ready: true`', '`persisted: false`', '`producer.buildId`',
         '`after.ready`', '`after.vr`', '`after.inGame`',
-        '`after.vrFpsStabilizer.activeForSession`',
         '`after.developerMode.active`',
         '`after.developerMode.logLevel: "debug"`',
         '`after.foveation.ready`',
@@ -380,13 +388,13 @@ foreach ($variant in $variants) {
     Assert-True (-not $skill.Contains('"args": { "action": "scene" }', [StringComparison]::Ordinal)) "$($variant.Name) uses action instead of kind for inspect scene."
 
     foreach ($token in @(
-        '`prepare_coc`', '`0.3/0.3/0.7` fixture',
-        '`SKILL.md` owns runtime-only `prepare_coc`, positioning',
+        '`prepare_tuning`', '`0.3/0.3/0.7` fixture',
+        '`SKILL.md` owns runtime-only `prepare_tuning`, positioning',
         'one synchronous', 'Do not repeat live reads',
-        'Do not enumerate', 'audit schemas', '`plugin_direct_unavailable`',
-        'no fallback transport',
+        'Do not enumerate', 'audit schemas', 'select an alternate endpoint',
+        'never resumed measurement or mutation replay',
         'measured live loop before this file is read',
-        'deterministic runner in the positioning orchestration cell',
+        'deterministic runner in the detached worker launched after positioning',
         'Do not reopen, revalidate, or summarize the matrix',
         'reset then start the short', 'six baseline scenario steps',
         'one synchronous fail-closed handoff scenario',
@@ -432,7 +440,7 @@ foreach ($variant in $variants) {
         'Scenario steps cannot interpolate earlier',
         'short ownership sequence', 'Do not issue a separate',
         'atomically resets/starts', '`clear_history`',
-        'positioning `communityshaders.renderscale status` result',
+        'existing stress-start receipts and terminal waiters',
         'they are output evidence',
         'Native-generation evidence is optional',
         'do not relabel a core `PASS`',
@@ -510,7 +518,7 @@ foreach ($variant in $variants) {
     Assert-True ($matrix.protocol -eq $variant.Name) "$($variant.Name) matrix identity is wrong."
     Assert-True ($matrix.pacingMilliseconds -eq 5000) "$($variant.Name) pacing is wrong."
     Assert-True ($matrix.completionTimeoutMilliseconds -eq 20000) "$($variant.Name) timeout is wrong."
-    Assert-True ([int]$matrix.traceReadLimit -gt 0) "$($variant.Name) trace read limit is invalid."
+    Assert-True ($null -eq $matrix.PSObject.Properties['traceReadLimit']) "$($variant.Name) must use the producer trace page bound."
     Assert-True (@($matrix.transitions).Count -eq $variant.Count) "$($variant.Name) transition count is wrong."
     $ordinals = @($matrix.transitions | ForEach-Object ordinal)
     Assert-True (($ordinals -join ',') -eq ((1..$variant.Count) -join ',')) "$($variant.Name) ordinals are not contiguous."
@@ -602,11 +610,11 @@ foreach ($protocol in @(
 )) {
     $sharedProtocolText = "$($protocol.Text)`n$fastStart"
     foreach ($token in @(
-        "installed plugin's direct DevBench MCP tools exclusively",
+        "Startup uses the installed plugin's direct DevBench MCP tools",
         'Do not enumerate',
         'audit schemas',
-        '`plugin_direct_unavailable`',
-        'no fallback transport',
+        'same selected endpoint',
+        'never resumed measurement or mutation replay',
         'without changing the shared 20-second measurement deadline',
         '`qualification_status`',
         'Never replay the',
@@ -707,6 +715,8 @@ Assert-True (-not $simpleCsmProtocol.Contains('renderscale-tuning-amd', [StringC
 
 foreach ($script in @(
     'tests\Test-RenderScaleTuningLiveRunner.js',
+    'tests\Test-RenderScaleTuningWorker.js',
+    'tests\Test-AmdParityReview.js',
     'tests\Test-RenderScaleTuningFinalizer.js'
 )) {
     $output = & node (Join-Path $repositoryRoot $script) 2>&1

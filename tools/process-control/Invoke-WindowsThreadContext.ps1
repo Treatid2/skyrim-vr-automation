@@ -41,6 +41,39 @@ function Format-Address {
     return '0x{0:X}' -f $Value
 }
 
+function Close-NativeHandle {
+    param(
+        [Parameter(Mandatory)][IntPtr]$Handle,
+        [Parameter(Mandatory)][ValidateSet('process', 'thread')][string]$Kind,
+        [int]$Sample = 0,
+        [scriptblock]$CloseAction = { param([IntPtr]$Value) [SkyrimVRAutomation.LiveThreadContext.NativeMethods]::CloseHandle($Value) },
+        [scriptblock]$LastErrorAction = { [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+    )
+
+    try {
+        $closed = [bool](& $CloseAction $Handle)
+        $nativeError = if ($closed) { 0 } else { [int](& $LastErrorAction) }
+        return [pscustomobject][ordered]@{
+            kind = $Kind
+            sample = if ($Sample -gt 0) { $Sample } else { $null }
+            attempted = $true
+            ok = $closed
+            nativeError = if ($closed) { $null } else { $nativeError }
+            error = if ($closed) { $null } else { "CloseHandle failed for $Kind handle with Win32 error $nativeError." }
+        }
+    }
+    catch {
+        return [pscustomobject][ordered]@{
+            kind = $Kind
+            sample = if ($Sample -gt 0) { $Sample } else { $null }
+            attempted = $true
+            ok = $false
+            nativeError = $null
+            error = "CloseHandle threw for $Kind handle: $($_.Exception.Message)"
+        }
+    }
+}
+
 if (-not ('SkyrimVRAutomation.LiveThreadContext.NativeMethods' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -62,8 +95,20 @@ namespace SkyrimVRAutomation.LiveThreadContext
         [DllImport("kernel32.dll", SetLastError=true)]
         public static extern uint ResumeThread(IntPtr thread);
 
+        [DllImport("kernel32.dll")]
+        public static extern uint GetProcessIdOfThread(IntPtr thread);
+
+        [DllImport("kernel32.dll")]
+        public static extern uint GetCurrentThreadId();
+
         [DllImport("kernel32.dll", SetLastError=true)]
         public static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
+
+        [DllImport("kernel32.dll", SetLastError=true)]
+        public static extern bool IsWow64Process2(
+            IntPtr process,
+            out ushort processMachine,
+            out ushort nativeMachine);
 
         [DllImport("kernel32.dll", SetLastError=true)]
         public static extern bool ReadProcessMemory(
@@ -82,6 +127,8 @@ namespace SkyrimVRAutomation.LiveThreadContext
 
 $records = [System.Collections.Generic.List[object]]::new()
 $errors = [System.Collections.Generic.List[string]]::new()
+$cleanup = [System.Collections.Generic.List[object]]::new()
+$cleanupUncertain = $false
 $state = 'capture-failed'
 $identity = $null
 $processHandle = [IntPtr]::Zero
@@ -114,11 +161,19 @@ try {
         throw 'The live process does not match the expected path and start-time identity.'
     }
 
+    $currentThreadId = [SkyrimVRAutomation.LiveThreadContext.NativeMethods]::GetCurrentThreadId()
+    if ([uint32]$ThreadId -eq $currentThreadId) {
+        $state = 'thread-mismatch'
+        throw "Refusing to suspend the sampler's current thread '$ThreadId'."
+    }
+
     $threadMatches = @($process.Threads | Where-Object Id -eq $ThreadId)
     if ($threadMatches.Count -ne 1) {
         $state = 'thread-mismatch'
         throw "Thread '$ThreadId' is not owned exactly once by process '$ProcessId'."
     }
+    $expectedThreadStartTimeUtc = $threadMatches[0].StartTime.ToUniversalTime()
+    $identity | Add-Member -NotePropertyName threadStartTimeUtc -NotePropertyValue $expectedThreadStartTimeUtc.ToString('o')
 
     $modules = @($process.Modules | ForEach-Object {
         $moduleSize = [Int64]$_.ModuleMemorySize
@@ -138,6 +193,22 @@ try {
     if ($processHandle -eq [IntPtr]::Zero) {
         throw "OpenProcess failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
     }
+    [UInt16]$processMachine = 0
+    [UInt16]$nativeMachine = 0
+    if (-not [SkyrimVRAutomation.LiveThreadContext.NativeMethods]::IsWow64Process2(
+            $processHandle,
+            [ref]$processMachine,
+            [ref]$nativeMachine)) {
+        throw "IsWow64Process2 failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+    }
+    $identity | Add-Member -NotePropertyName architecture -NotePropertyValue ([pscustomobject][ordered]@{
+        processMachine = '0x{0:X4}' -f $processMachine
+        nativeMachine = '0x{0:X4}' -f $nativeMachine
+    })
+    if ($processMachine -ne 0 -or $nativeMachine -ne 0x8664) {
+        $state = 'target-architecture-mismatch'
+        throw "The target process is not native AMD64 (processMachine=0x$('{0:X4}' -f $processMachine), nativeMachine=0x$('{0:X4}' -f $nativeMachine))."
+    }
 
     $contextBytes = 0x4D0
     $threadAccess = 0x0002 -bor 0x0008 -bor 0x0040
@@ -156,14 +227,28 @@ try {
         if ($threadHandle -eq [IntPtr]::Zero) {
             throw "OpenThread failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
         }
-
-        $allocation = [Runtime.InteropServices.Marshal]::AllocHGlobal($contextBytes + 16)
-        # Stay in signed pointer-width arithmetic; Windows PowerShell cannot
-        # reliably bind a masked UInt64 back to IntPtr.
-        $alignedAddress = ($allocation.ToInt64() + [Int64]15) -band [Int64]-16
-        $aligned = [IntPtr]::new([Int64]$alignedAddress)
+        $allocation = [IntPtr]::Zero
         $suspended = $false
         try {
+            $threadOwner = [SkyrimVRAutomation.LiveThreadContext.NativeMethods]::GetProcessIdOfThread($threadHandle)
+            if ($threadOwner -ne [uint32]$ProcessId) {
+                $state = 'thread-mismatch'
+                throw "Thread '$ThreadId' is now owned by process '$threadOwner', not '$ProcessId'."
+            }
+            $liveProcess = Get-Process -Id $ProcessId -ErrorAction Stop
+            $liveThread = @($liveProcess.Threads | Where-Object Id -eq $ThreadId)
+            if ($liveThread.Count -ne 1 -or
+                $liveProcess.StartTime.ToUniversalTime().Ticks -ne $expectedStartUtc.Ticks -or
+                $liveThread[0].StartTime.ToUniversalTime().Ticks -ne $expectedThreadStartTimeUtc.Ticks) {
+                $state = 'thread-mismatch'
+                throw "Thread '$ThreadId' identity changed before sample '$sample'."
+            }
+
+            $allocation = [Runtime.InteropServices.Marshal]::AllocHGlobal($contextBytes + 16)
+            # Stay in signed pointer-width arithmetic; Windows PowerShell cannot
+            # reliably bind a masked UInt64 back to IntPtr.
+            $alignedAddress = ($allocation.ToInt64() + [Int64]15) -band [Int64]-16
+            $aligned = [IntPtr]::new([Int64]$alignedAddress)
             [Runtime.InteropServices.Marshal]::Copy(
                 (New-Object byte[] $contextBytes),
                 0,
@@ -246,10 +331,18 @@ try {
                     $errors.Add("ResumeThread retry failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())")
                 }
             }
-            [Runtime.InteropServices.Marshal]::FreeHGlobal($allocation)
-            [void][SkyrimVRAutomation.LiveThreadContext.NativeMethods]::CloseHandle(
-                $threadHandle)
+            if ($allocation -ne [IntPtr]::Zero) {
+                [Runtime.InteropServices.Marshal]::FreeHGlobal($allocation)
+            }
+            $threadRelease = Close-NativeHandle -Handle $threadHandle -Kind thread -Sample $sample
+            $cleanup.Add($threadRelease)
+            if (-not $threadRelease.ok) {
+                $cleanupUncertain = $true
+                $errors.Add([string]$threadRelease.error)
+            }
         }
+
+        if ($cleanupUncertain) { throw "Native handle release was not verified for sample $sample." }
 
         if ($sample -lt $Samples) {
             Start-Sleep -Milliseconds $IntervalMs
@@ -263,10 +356,16 @@ catch {
 }
 finally {
     if ($processHandle -ne [IntPtr]::Zero) {
-        [void][SkyrimVRAutomation.LiveThreadContext.NativeMethods]::CloseHandle(
-            $processHandle)
+        $processRelease = Close-NativeHandle -Handle $processHandle -Kind process
+        $cleanup.Add($processRelease)
+        if (-not $processRelease.ok) {
+            $cleanupUncertain = $true
+            $errors.Add([string]$processRelease.error)
+        }
     }
 }
+
+if ($cleanupUncertain) { $state = 'cleanup-uncertain' }
 
 $result = [pscustomobject][ordered]@{
     schemaVersion = 1
@@ -284,6 +383,10 @@ $result = [pscustomobject][ordered]@{
     intervalMs = $IntervalMs
     stackBytes = $StackBytes
     records = @($records)
+    cleanup = [pscustomobject][ordered]@{
+        ok = -not $cleanupUncertain
+        handles = @($cleanup)
+    }
     errors = @($errors)
 }
 $result | ConvertTo-Json -Depth 10

@@ -11,6 +11,15 @@ When this file is loaded at finalization, use its live-action sections only to
 audit preserved receipts. Never replay an action merely because it is
 described below.
 
+AMD and NVIDIA post-position execution uses the same packaged detached worker. It keeps
+the selected DevBench MCP endpoint and protocol matrix, while separating the
+measurement loop from chat and disk handling. Queue immutable complete
+receipts before the next operation, append one `raw/journal.ndjson` document
+on a dedicated writer, and flush only after measurement and cleanup. A save
+backlog never gates the next transition or pass. The startup prefix is unchanged.
+Every five transitions, pass boundary, and completion gets a compact status
+update read independently from the worker for both variants.
+
 ## Validate the one positioning response
 
 The packaged live runner exclusively validates the decoded positioning root.
@@ -32,21 +41,31 @@ reads:
   opaque evidence and no nested `result`, adapter shape, or vendor field gates
   startup.
 
+The runner verifies adapter identity from the existing stress-start receipts
+and terminal waiters. Their `status.adapter` must identify NVIDIA
+`0x10DE`/4318 or AMD `0x1002`/4098 for the requested assay. A safe non-stable
+waiter can omit status and retain the verified identity of its exact stress
+session. Missing or mismatched identity stops measurement with retained
+diagnostics. This adds no positioning gate or tool call; the positioning
+render-scale payload remains opaque.
+
 The positioning scenario owns one 60,000 ms `position-settle` wait immediately
 after the COC and before these observations. This startup stabilization is
 separate from each mutation's 20,000 ms strict waiter.
 
 The synchronous response is the positioning observation. The live skill
 decodes the MCP envelope exactly once from `content[0].text` and passes the
-root unchanged to the runner in the same orchestration cell. The runner owns
+root unchanged to the runner. Both variants hand it to the persistent worker
+from the positioning cell. The runner owns
 the fixed checks and reports positioning as soon as it admits the response.
 The client must not create an evidence directory, decode Base64, hash files,
 recursively search the response, or read this contract first. A failed
 scenario or required field stops without replaying the COC.
 
-After the positioning response, the same orchestration cell loads the packaged
-deterministic runner and matrix in parallel and starts the baseline without
-another model handoff. Pass the positioning receipt unchanged; the runner
+After the positioning response, the packaged deterministic runner and matrix
+start without another model handoff. Both variants load the shared handoff in
+the positioning cell and start the worker. Pass the positioning receipt
+unchanged; the runner
 admits it and decodes its snapshot once, then reads only each strict waiter's
 documented qualification snapshot. The client does not search, normalize, or
 validate positioning. Do not load
@@ -54,7 +73,7 @@ Simple COC/CSM, enumerate tools, inspect schemas, or run another
 admission/reset scenario. Vendor live-path, protocol, and this detailed
 contract are finalization-only reads.
 
-The vendor `SKILL.md` stores the exact `prepare_coc` and positioning responses
+The vendor `SKILL.md` stores the exact `prepare_tuning` and positioning responses
 under run-unique startup keys before this contract is read. They are startup
 identity/admission evidence, not measurement timing evidence. The live path
 keeps the returned envelopes in local variables and must not call `load()` or
@@ -65,7 +84,7 @@ receipt-index/hash batch.
 
 If either stored startup receipt is unexpectedly unavailable, never replay a
 startup call or invalidate completed render rows. Record
-`startup_evidence_incomplete`, forbid the comparison-ledger append, and make the
+`startup_evidence_incomplete`, label unavailable comparison metrics, and make the
 missing receipt explicit in the report. The normal protocol must not produce
 this state because both keys are stored before positioning is reported.
 
@@ -81,10 +100,12 @@ Every later mutation and ownership scenario remains synchronous with
 Reuse the post-position public snapshot and its exact `stateRevision` when it
 is complete, has no active operation, and still matches the bound Build ID.
 
-After that one prescribed live-path/matrix read and until transition 1 has
+After the prescribed runner handoff and until transition 1 has
 been dispatched, do not run another local command, create evidence, locate a
 ledger, hash/serialize a receipt, search source, inspect a schema, or prepare a
-report. Only compile and run the baseline, handoff, and transition 1's 5,000 ms
+report. The shared handoff request, process ownership lock, asynchronous journal,
+and status publisher are the permitted setup exception. Only compile and run
+the baseline, handoff, and transition 1's 5,000 ms
 settle. The ledger path is the repository-relative
 `docs/development/vr-render-scale-comparison-ledger.csv`; never search for it.
 
@@ -213,9 +234,10 @@ terminal failure rules.
 The terminal `qualification-wait` receipt is the transition boundary. Its
 closed owner, zero active operation, exact PID/Build ID, and unresolved-mutation
 state are the complete safety decision for starting the next row. Do not add a
-post-wait operation read, status read, final snapshot, local evidence write,
-hash, report update, source search, or model pause before starting the next
-row. Do not invent another previous-transition safety gate.
+post-wait operation read, status read, final snapshot, hash, report update,
+source search, or model pause before starting the next row. Queue each received
+envelope and row revision in the append-only receipt journal first. Neither
+variant awaits its disk write. Do not invent another previous-transition safety gate.
 
 When the 20,000 ms waiter returns unsatisfied but this safety decision passes,
 record `nonStableNote` with `status: not_stable`, the terminal presentation
@@ -224,11 +246,11 @@ failure codes. Then start the next row immediately. An active owner or API
 operation, identity loss, or unresolved physical mutation still stops the
 matrix; the note is evidence, not permission to overlap mutations.
 
-Invoke the direct scenario inside one orchestration cell. Extract its uniquely
+Invoke the synchronous scenario inside the worker. Extract its uniquely
 labeled `qualification-wait` result, `store()` that exact terminal receipt
 under a run-unique pass/lane/transition key together with any trace lifecycle
-subreceipts produced by that scenario, and return only a compact
-projection with `text()`. Keep only this projection in context:
+subreceipts produced by that scenario, and publish only a compact
+projection through worker status. Keep only this projection in context:
 pass/lane/ordinal,
 transition and owner IDs, target, classification and reason, dispatch and
 terminal QPC/frame, presentation/cleanup/strict elapsed values, closed-owner
@@ -239,8 +261,8 @@ raw evidence and never compare that object with numeric zero. Do not expand,
 quote, Base64-decode, or return the full response
 to the model/chat during the measured loop. The stored exact terminal receipt
 and same-scenario trace subreceipts are the only immediate per-row evidence
-action. A stable response-store handle is raw evidence until pass finalization;
-it is not a substitute in the completed evidence bundle.
+action. Every retained receipt is queued losslessly before the next operation;
+compact status is not a substitute for the flushed evidence journal.
 
 Store the complete scenario envelope under its own stable receipt key
 immediately after the direct call returns and before decoding, validating, or
@@ -255,18 +277,21 @@ the pass summary as each row closes. After interruption, materialize those
 keys plus the failed scenario before reporting; a later failure never discards
 an earlier completed pass or row.
 
-The orchestration cell and packaged runner are only a response-handling
-boundary. Every nested live call must still use the installed plugin's selected
-direct DevBench MCP tools; this does not authorize an external controller,
-HTTP call, alternate local transport, or fallback lane.
+The startup orchestration cell and packaged worker are response-handling
+boundaries. Every live call uses the installed plugin's selected DevBench MCP
+endpoint. Both variants use one persistent HTTP MCP session after positioning;
+this does not authorize an external controller, alternate local transport, or
+fallback lane.
 
-Keep the complete measured pass in that one live orchestration cell; do not
-end the cell between rows. After storing and classifying a terminal receipt,
-emit the compact progress projection with `notify()` and immediately call the
-next synchronous scenario. The next scenario owns its initial five-second
-wait. Use `yield_control()` when a user update is due while the cell continues;
-never return to model reasoning, local commands, or evidence processing between
-safe rows. Stop the loop in the cell on an unsafe terminal receipt.
+Keep every measured pass and runnable lane in the same detached worker. After
+queuing and classifying a terminal receipt, the runner emits the compact
+progress projection with `notify()` and immediately calls the next synchronous
+scenario. The next scenario owns its initial five-second wait. Read compact
+worker status independently at intervals of at most five seconds and report
+every five completed transitions, pass boundary, and completion. Status reads
+never cancel, restart, or replay the worker. Never return to model reasoning,
+local commands, or evidence processing between safe rows. Stop future
+mutations on an unsafe terminal receipt and perform ownership-guarded cleanup.
 
 When a terminal row proves the game remains loaded in the exact scene but its
 operation or physical mutation is stuck, preserve that failed row and make one
@@ -309,8 +334,11 @@ stop without retry. Never retry when DevBench may have accepted the scenario,
 when a new qualification owner exists, or when the response was lost; use the
 owner-correlated recovery rule in those cases.
 
-At pass finalization, use `load()` to materialize every retained terminal
-response and trace lifecycle receipt losslessly without first printing it to
+During measurement, journal every received terminal response and trace
+lifecycle receipt losslessly before the next operation. Each variant queues each
+immutable revision without waiting for disk, then drains and flushes after
+measurement and cleanup. At finalization,
+materialize the latest revisions from disk without first printing them to
 chat,
 then make one cumulative evidence-read batch for operation/event history,
 render-scale status, preparation/provider traces, telemetry, profiler, stress,
@@ -389,3 +417,25 @@ their exact returned guards, disable the task-owned profiler state, and verify
 all owners inactive. A semantic row failure never skips cleanup. If transport
 is genuinely unavailable, preserve the guards, warn the user that sessions may
 remain active, and make no speculative cleanup call.
+
+### Complete trace windows and native proof compatibility
+
+For NVIDIA, the deterministic runner retains every page of each stopped DLSS
+trace before the next row can reset it. The first read omits `limit`; subsequent
+reads reuse the producer-returned bound and advance `afterSequence` until
+`moreAvailable` is explicitly false. The shared validator checks all pages and
+the complete stopped record count. Offline finalization rejects partial,
+foreign, overwritten, or discontinuous windows independently of render truth.
+The AMD empty capability read also uses the producer default page bound.
+
+Native proof checks accept the producer's snapshot and cycle representations,
+including absent shape-specific flags and separate per-eye timestamps. Native
+vendor execution may have zero scaled-resource generations; it still requires
+matching owner/device/resource/stereo identity and same-frame vendor dispatch.
+No such compatibility rule permits absent required proof or mixed-eye identity.
+
+Partial measurement and reporting status do not prevent comparison. Retain and
+compare available values, explicitly label incomplete rows/passes and missing
+metrics, and use `n/a` instead of invented zeroes. Do not impose a complete-run
+admission rule on the ledger. The ledger preserves historical columns while
+adding the current run's available data and limitations.

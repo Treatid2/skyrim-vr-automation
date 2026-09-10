@@ -3,6 +3,10 @@
 MO2 Control is the shared, machine-readable entry point for Codex tasks that
 inspect or validate the Skyrim VR Mod Organizer 2 installation.
 
+Version `1.1.0` adds explicit `configure-steamvr-exclusions` maintenance and
+read-only `steamVrExclusions` inspection. Paths come from the resolved machine
+configuration; the implementation does not depend on a modlist name.
+
 Version `1.0.0` makes task launch authorization independently verify the cache
 materialization receipt, the complete generated `backup` shadow, prepared tree
 hashes, and every current lower-provider path. The first launch rejects
@@ -12,7 +16,10 @@ relaunch still rejects a missing shadow or changed lower-provider inventory.
 `validate-closed` is the explicit closed-state spelling of `validate
 -RequireClosed`; both commands are read-only and return the same proof.
 
-Version `0.8.0` retains cooperative access arbitration and adds a durable,
+Version `1.0.0` requires a route-qualified explicit access lease for every
+prepared or recovery session and validates its complete canonical runtime-route
+contract through launch. It retains cooperative access arbitration and adds a
+durable,
 session-scoped controller bundle, explicit profile identity fields, retained
 failed-to-run dialog cleanup, bounded launch
 pending state, helper-to-runtime PID adoption, structural Unlock handling, and
@@ -91,7 +98,7 @@ literal paths before execution):
 ```text
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> help -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> inspect -Compact
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -Label upscaling-api-tests -TaskId <stable-task-id> -EstimatedMinutes 20 -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -Label upscaling-api-tests -TaskId <stable-task-id> -RuntimeRoute OCU -EstimatedMinutes 20 -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate -AccessId <literal-access-id> -RequireClosed -RequireSKSE -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> prepare -AccessId <literal-access-id> -Label upscaling-api-run -RequireSKSE -Compact
 ```
@@ -147,14 +154,55 @@ RootBuilder failures.
 
 ## Cooperative access lifecycle
 
+### SteamVR VFS exclusion maintenance
+
+When a game starts SteamVR as a virtualized child, SteamVR can remain registered
+with MO2 after the game exits. Prevent this by explicitly adding SteamVR runtime
+executables to the selected MO2 instance's blacklist:
+
+```text
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> configure-steamvr-exclusions -ConfigPath <exact-machine-config> -AccessId <owned-access-id> -WhatIf -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> configure-steamvr-exclusions -ConfigPath <exact-machine-config> -AccessId <owned-access-id> -Compact
+```
+
+Acquire an access-only lease and validate closed state first. The command
+preserves existing exclusions and appends only missing `vrserver.exe`,
+`vrcompositor.exe`, `vrmonitor.exe`, `vrdashboard.exe`, and
+`vrwebhelper.exe` entries, case-insensitively. It preserves unrelated INI bytes,
+backs up the original, verifies the result, and is idempotent. A missing key
+requires a recognized MO2 default baseline; ambiguous settings fail closed.
+MO2, the game/loaders, and SteamVR helpers must be stopped. Release the lease
+afterward. No task profile clone or game launch is needed.
+
+This is a one-shot, authorized configuration change, never an implicit effect
+of inspection or launch. It does not close Steam or SteamVR. Already-injected
+processes need a separately authorized shutdown; adding exclusions cannot
+retroactively unload their VFS hooks. Do not blacklist Skyrim or SKSE.
+
+The existing `close` / `validate -RequireClosed` lifecycle proves MO2/game
+process closure, not the absence of VFS hooks in other processes. Do not report
+a completely clean VFS session solely from that result.
+
 `request-access` atomically acquires the one shared MO2 lock and returns an
-`accessId` bearer credential plus a distinct public `leaseId`. Retain the
+`accessId` bearer credential plus a distinct public `leaseId`. Every request
+must select exactly one `-RuntimeRoute`: `OCU`, `SteamVR`, or `SteamVRNull`.
+`OCU` is incompatible with both SteamVR routes. `SteamVRNull` is SteamVR with
+the null HMD and is mutually exclusive with physical `SteamVR`. The selected
+route is retained on the lease and copied into prepared session evidence so
+runtime controllers can enforce it without inference. Retain the
 `accessId` privately. `-TaskId` (alias `-ReporterTaskId`) records an optional
 stable task identity; when omitted it resolves `CODEX_THREAD_ID` or
 `CODEX_TASK_ID` if available. If another task owns the lock, `access-busy`
 reports only the public lease identity, owner label/state, and advisory release
 estimate; it never discloses or echoes an access credential. `-WaitSeconds` can
 perform a bounded retry, but no task is queued indefinitely.
+
+`prepare` and every launch revalidate the exact selected profile against the
+leased route. OCU requires exactly one enabled provider containing
+`root\openvr_api.dll` plus an OpenComposite marker. SteamVR and SteamVRNull
+require every profile-local root OpenVR replacement to be disabled. Discovery
+fails closed when provider identity is ambiguous; declaring a route never
+overrides the profile's actual runtime files.
 
 `-EstimatedMinutes` is useful coordination metadata, not a deadline. The tool
 never expires, steals, or transfers a lease because its estimate elapsed.
@@ -179,16 +227,15 @@ The normal explicit flow uses these separate direct calls. Read each JSON
 result, then substitute its literal returned identity into the next command:
 
 ```text
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -Label weather-api-tests -TaskId <stable-task-id> -EstimatedMinutes 20 -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -Label weather-api-tests -TaskId <stable-task-id> -RuntimeRoute SteamVRNull -EstimatedMinutes 20 -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate -AccessId <literal-access-id> -RequireClosed -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> prepare -AccessId <literal-access-id> -Label weather-api-run -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <literal-controllerPath> release -SessionId <literal-session-id> -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> release-access -AccessId <literal-access-id> -Compact
 ```
 
-For backward compatibility, `prepare` without `-AccessId` still acquires an
-implicit single-session lease, and `release` removes it as before. When an
-explicit lease is used, `release` retains access and returns
+`prepare` requires the explicit `accessId` returned by `request-access`.
+`release` retains access and returns
 `session-released-access-retained`; the task must then either prepare another
 session or call `release-access`.
 
@@ -196,12 +243,12 @@ session or call `release-access`.
 
 `prepare` requires a closed game/MO2 state, validates one exact profile and
 registered executable, and creates a durable evidence manifest on staging
-storage. It either binds the caller's exact access lease or, for legacy callers,
-atomically acquires an implicit lease. It also copies the exact entry point,
-modules, and resolved configuration into the session evidence directory and
-returns `controllerPath`. Use that path for the rest of the lifecycle so a
-plugin reinstall cannot invalidate an active session. `launch` requires the returned session
-identity and uses MO2's supported command line:
+storage. It binds the caller's exact route-qualified access lease. It also
+copies the exact entry point, modules, and resolved configuration into the
+session evidence directory and returns `controllerPath`. Use that path for the
+rest of the lifecycle so a plugin reinstall cannot invalidate an active
+session. `launch` requires the returned session identity and uses MO2's
+supported command line:
 
 ```text
 ModOrganizer.exe --profile NAME run --executable NAME
@@ -227,9 +274,9 @@ refuses while a game/loader exists and cooperatively resolves
 MO2's structured `File` → `Exit` path and visible modal chain, including the VFS
 `Unlock` prompt. `stop` first closes the game and then uses the same MO2
 resolver. `release` ends only the exactly owned session after proving MO2 and
-the game are closed, while retaining the evidence directory. It removes an
-implicit lease or returns an explicit lease to access-only state. All mutation
-commands have `-WhatIf`. Evidence
+the game are closed, while retaining the evidence directory. It returns the
+explicit lease to access-only state. All mutation commands have `-WhatIf`.
+Evidence
 collection, archive verification, profile mutation, cache management, and
 recovery remain deferred until separately bounded.
 

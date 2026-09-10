@@ -108,7 +108,8 @@ try {
     $nullRouteArgs = @{} + $selectArgs
     $nullRouteArgs.RenderPath = 'vr-steamvr-null'
     $nullRouteSelect = Invoke-Catalog $nullRouteArgs
-    Assert-Test ($nullRouteSelect.ok -and $nullRouteSelect.state -eq 'snapshot-selected' -and $nullRouteSelect.data.selection.selected.renderFamily -eq 'vr-steamvr' -and $nullRouteSelect.data.selection.selected.exactRenderFamilyProvenance -and $nullRouteSelect.data.selection.selected.manifest.compatibility.renderPath -eq 'vr-steamvr-physical') 'null HMD prefers the canonical compatible physical SteamVR cache'
+    $legacySteamVRCandidate = @($nullRouteSelect.data.selection.eligible | Where-Object { $_.manifest.compatibility.renderPath -eq 'steamvr-physical' })[0]
+    Assert-Test ($nullRouteSelect.ok -and $nullRouteSelect.state -eq 'snapshot-selected' -and $nullRouteSelect.data.selection.selected.renderFamily -eq 'vr-steamvr' -and $nullRouteSelect.data.selection.selected.exactRenderFamilyProvenance -and $nullRouteSelect.data.selection.selected.exactRenderPathProvenanceClass -and $nullRouteSelect.data.selection.selected.manifest.compatibility.renderPath -eq 'vr-steamvr-physical' -and $nullRouteSelect.data.selection.selected.score -gt $legacySteamVRCandidate.score) 'null HMD ranking proves the canonical physical SteamVR cache defeats the eligible legacy candidate'
 
     $openCompositeArgs = @{} + $nullRouteArgs
     $openCompositeArgs.RenderPath = 'vr-opencomposite'
@@ -267,8 +268,6 @@ try {
     $boundPrepareAgain = Invoke-Catalog $boundPrepareArgs
     Assert-Test ($boundPrepareAgain.ok -and $boundPrepareAgain.state -eq 'already-prepared' -and [string]$boundPrepareAgain.data.task.providerShadow.receipt.preparedInventory.treeSha256 -ceq [string]$boundPrepare.data.task.providerShadow.receipt.preparedInventory.treeSha256) 'provider-bound preparation retry validates the materialized task tree instead of the pre-shadow seed hash'
 
-    Remove-Item -LiteralPath $shadowedLowerCache -Force
-
     [IO.File]::WriteAllBytes($expectedPluginPath, [byte[]](9, 9, 9))
     $changedPluginComplete = Invoke-Catalog @{
         Command = 'complete'
@@ -295,7 +294,7 @@ try {
         NoExit = $true
     }
     $materializationFailurePath = Join-Path $boundEvidence 'shader-cache-task.materialization-failure.json'
-    Assert-Test (-not $emptyComplete.ok -and $emptyComplete.errors[0] -match 'no files beyond automation markers') 'task completion fails closed when the bound cache has no compiled output'
+    Assert-Test (-not $emptyComplete.ok -and $emptyComplete.errors[0] -match 'no file added or changed after preparation') 'task completion rejects a prepared provider shadow without task-generated output'
     Assert-Test ((Test-Path -LiteralPath $materializationFailurePath -PathType Leaf) -and -not (Test-Path -LiteralPath (Join-Path $boundEvidence 'shader-cache-task.completion.json'))) 'missing materialization preserves evidence and leaves the task transaction open'
     Assert-Test (Test-Path -LiteralPath (Join-Path $taskCache '.codex-vfs-sentinel.txt') -PathType Leaf) 'failed materialization does not restore or remove the live provider tree'
 
@@ -330,11 +329,22 @@ try {
 
     $wrongOverwriteChild = Join-Path (Split-Path -Parent $overwriteCache) 'WrongCache'
     New-Item -ItemType Directory -Path $wrongOverwriteChild -Force | Out-Null
+    $overwriteRoot = Split-Path -Parent $overwriteCache
+    $overwriteWorkspaceId = 'catalog-overwrite-workspace'
+    $overwriteOwnershipId = 'catalog-overwrite-owner'
+    $overwriteOwnerMarkerPath = Join-Path $overwriteRoot '.codex-workspace-output-owner.json'
+    [pscustomobject]@{
+        workspaceId = $overwriteWorkspaceId; ownershipId = $overwriteOwnershipId
+        mode = 'mo2-overwrite-output'; overwritePath = $overwriteRoot
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $overwriteOwnerMarkerPath -Encoding utf8
+    $overwriteOwnerMarkerSha256 = (Get-FileHash -LiteralPath $overwriteOwnerMarkerPath -Algorithm SHA256).Hash
     $wrongOverwriteBinding = Invoke-Catalog @{
         Command = 'prepare'; CatalogRoot = (Join-Path $resolvedTestRoot 'wrong-overwrite-catalog')
         CachePath = $wrongOverwriteChild; ProfilePath = $profilePath; ModsPath = $modsRoot
         BindToOverwrite = $true; EvidenceDirectory = (Join-Path $resolvedTestRoot 'wrong-overwrite-evidence')
-        ShaderCacheAbi = 'abi-bound'; ShaderSourceSha256 = $shaderSource
+        BuildId = 'build-bound-fixture'; ShaderCacheAbi = 'abi-bound'; ShaderSourceSha256 = $shaderSource
+        WorkspaceId = $overwriteWorkspaceId; OwnershipId = $overwriteOwnershipId
+        OwnerMarkerPath = $overwriteOwnerMarkerPath; OwnerMarkerSha256 = $overwriteOwnerMarkerSha256
         BlockingProcessNames = $blockers; Confirm = $false; Compact = $true; NoExit = $true
     }
     Assert-Test (-not $wrongOverwriteBinding.ok -and $wrongOverwriteBinding.errors[0] -match 'exact MO2 overwrite directory') 'Overwrite binding rejects a cache path outside the declared relative tree'
@@ -347,6 +357,8 @@ try {
         BindToOverwrite = $true; EvidenceDirectory = $overwriteEvidence
         ShaderCacheAbi = 'abi-bound'; ShaderSourceSha256 = $shaderSource
         BuildId = 'build-bound-fixture'; RequireMaterializedOutput = $true
+        WorkspaceId = $overwriteWorkspaceId; OwnershipId = $overwriteOwnershipId
+        OwnerMarkerPath = $overwriteOwnerMarkerPath; OwnerMarkerSha256 = $overwriteOwnerMarkerSha256
         BlockingProcessNames = $blockers; Confirm = $false; Compact = $true; NoExit = $true
     }
     Assert-Test ($overwritePrepare.ok -and [string]$overwritePrepare.data.task.cacheBinding.mode -eq 'mo2-overwrite-output') 'catalog explicitly binds the exact MO2 Overwrite tree'

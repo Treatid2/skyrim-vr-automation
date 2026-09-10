@@ -18,6 +18,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $packageWatch = [Diagnostics.Stopwatch]::StartNew()
 $resolvedEvidence = $null
+$packageDeadlineUtc = [DateTime]::UtcNow.AddSeconds(600)
+$boundedProcess = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\process-control\Invoke-BoundedProcess.ps1'))
 
 function Get-StableFixturePath {
     if (-not [string]::IsNullOrWhiteSpace($FixtureManifestPath)) {
@@ -48,7 +50,71 @@ function Write-PackageResult($Value) {
     exit 2
 }
 
+function Get-RemainingPackageSeconds {
+    $remaining = ($packageDeadlineUtc - [DateTime]::UtcNow).TotalSeconds
+    if ($remaining -lt 1) {
+        throw [TimeoutException]::new('The unattended qualification exceeded its 600-second process deadline.')
+    }
+    return [int][Math]::Max(1, [Math]::Ceiling($remaining))
+}
+
+function ConvertTo-PowerShellArguments([string]$ScriptPath, [object[]]$Leading, [hashtable]$Named) {
+    $arguments = [Collections.Generic.List[string]]::new()
+    foreach ($value in @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $ScriptPath)) {
+        $arguments.Add([string]$value)
+    }
+    foreach ($value in $Leading) { $arguments.Add([string]$value) }
+    foreach ($entry in $Named.GetEnumerator()) {
+        if ($entry.Value -is [bool]) {
+            if ([bool]$entry.Value) { $arguments.Add("-$($entry.Key)") }
+            continue
+        }
+        if ($null -eq $entry.Value) { continue }
+        $arguments.Add("-$($entry.Key)")
+        $arguments.Add([string]$entry.Value)
+    }
+    return [string[]]$arguments
+}
+
+function Invoke-BoundedQualificationScript(
+    [string]$ScriptPath,
+    [object[]]$Leading = @(),
+    [hashtable]$Named = @{}) {
+    if (-not (Test-Path -LiteralPath $boundedProcess -PathType Leaf)) {
+        throw "The bounded process controller is missing: $boundedProcess"
+    }
+    $hostPath = (Get-Command pwsh -ErrorAction Stop).Source
+    $arguments = ConvertTo-PowerShellArguments -ScriptPath $ScriptPath -Leading $Leading -Named $Named
+    $bounded = & $boundedProcess -FilePath $hostPath -ArgumentList $arguments `
+        -WorkingDirectory $PSScriptRoot -TimeoutSeconds (Get-RemainingPackageSeconds) `
+        -MaxAttempts 1 -RetryPatterns @() -NoExit -Compact | ConvertFrom-Json -Depth 100
+    $attempt = @($bounded.attempts | Select-Object -Last 1)
+    if ($attempt.Count -ne 1) {
+        throw "The bounded qualification process produced no attempt record: $(@($bounded.errors) -join ' ')"
+    }
+    if ([bool]$attempt[0].timedOut -or [bool]$attempt[0].unresolvedProcess) {
+        throw [TimeoutException]::new("The bounded qualification process exceeded the shared 600-second deadline: $ScriptPath")
+    }
+    if ($null -eq $attempt[0].exitCode -or [int]$attempt[0].exitCode -ne 0) {
+        throw "The bounded qualification process failed for '$ScriptPath': $([string]$attempt[0].stderr)"
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$attempt[0].stdout)) {
+        throw "The bounded qualification process returned no output: $ScriptPath"
+    }
+    return [string]$attempt[0].stdout
+}
+
 try {
+    $baselineArgumentsSupplied = $PSBoundParameters.ContainsKey('BaselinePath') -or
+        $PSBoundParameters.ContainsKey('ExpectedBaselineBuildId')
+    if (-not $PrMode -and $baselineArgumentsSupplied) {
+        throw 'Baseline inputs require -PrMode; local qualification cannot silently ignore them.'
+    }
+    if ($PrMode -and
+        ([string]::IsNullOrWhiteSpace($BaselinePath) -or [string]::IsNullOrWhiteSpace($ExpectedBaselineBuildId))) {
+        throw 'PR mode requires -BaselinePath and -ExpectedBaselineBuildId.'
+    }
+
     $resolvedRuntime = Get-StableRuntimePath
     if ([string]::IsNullOrWhiteSpace($resolvedRuntime)) {
         throw 'No running DevBench runtime was selected. Pass -RuntimePath, set CSX_DEVBENCH_RUNTIME_PATH, or configure devBenchRuntimePath in %LOCALAPPDATA%\SkyrimVRAutomation\machine.local.json before saying start.'
@@ -66,7 +132,11 @@ try {
 
     $controller = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\devbench-control\Invoke-DevBenchControl.ps1'))
     if (-not (Test-Path -LiteralPath $controller -PathType Leaf)) { throw 'The bundled DevBench controller is missing.' }
-    $listText = & $controller list -RuntimePath $resolvedRuntime -NoExit -Compact | Out-String
+    $listText = Invoke-BoundedQualificationScript -ScriptPath $controller -Leading @('list') -Named @{
+        RuntimePath = $resolvedRuntime
+        NoExit = $true
+        Compact = $true
+    }
     $list = $listText | ConvertFrom-Json -Depth 100
     if (-not [bool]$list.ok) { throw "Running DevBench discovery failed: $(@($list.errors) -join ' ')" }
     $buildId = ([string]$list.runtimeIdentity.build.buildId).ToLowerInvariant()
@@ -96,14 +166,11 @@ try {
     }
     if ($artifactSha256 -match '^[A-Fa-f0-9]{64}$') { $arguments.ExpectedArtifactSha256 = $artifactSha256 }
     if ($PrMode) {
-        if ([string]::IsNullOrWhiteSpace($BaselinePath) -or [string]::IsNullOrWhiteSpace($ExpectedBaselineBuildId)) {
-            throw 'PR mode requires -BaselinePath and -ExpectedBaselineBuildId.'
-        }
         $arguments.PrMode = $true
         $arguments.BaselinePath = $BaselinePath
         $arguments.ExpectedBaselineBuildId = $ExpectedBaselineBuildId
     }
-    $runnerText = & $runner @arguments | Out-String
+    $runnerText = Invoke-BoundedQualificationScript -ScriptPath $runner -Named $arguments
     $runnerResult = $runnerText | ConvertFrom-Json -Depth 100
     if ([string]$runnerResult.status -notin @('PASS', 'LOCAL_PASS', 'FAIL', 'INFRASTRUCTURE_ERROR')) {
         throw "The unattended runner returned an unsupported terminal status: $([string]$runnerResult.status)"

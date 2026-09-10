@@ -43,6 +43,12 @@ Freeze these fields before round zero:
     recording used by the image protocol; and
 -   no human viewing or judgment.
 
+Materialize the campaign from `reciprocal-search.template.json`, then run
+`node ../../tools/fork-reciprocal-search/validate-campaign.js <campaign.json>`.
+The validator rejects placeholder or unset artifact identities, adapter builds,
+GPU clocks, background-load policy, eye geometry, and other fixed-contract
+fields. A campaign that does not pass that validator cannot enter round zero.
+
 The search may change only paths declared in that fork's search-space
 manifest. Fork-native performance controls are allowed. Foveal geometry,
 feathering, periphery treatment, hard cutoffs, culling policy, and stereo work

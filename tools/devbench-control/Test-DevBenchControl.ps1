@@ -49,6 +49,20 @@ $nullEvidenceReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ d
 Assert-Test (-not $nullEvidenceReplay.known -and $nullEvidenceReplay.schedulerOnly) 'null or empty outcome fields do not verify replay semantics'
 $failedAssertionReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 5; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; assertions = @([pscustomobject]@{ passed = $false }) })
 Assert-Test ($failedAssertionReplay.known -and -not $failedAssertionReplay.ok -and -not $failedAssertionReplay.schedulerOnly) 'explicit failed assertions reject replay semantics'
+$readOnlyInspect = Test-DevBenchReadOnlyRequest -ToolName inspect -Arguments @{ kind = 'scene' }
+$readOnlyMenu = Test-DevBenchReadOnlyRequest -ToolName menu -Arguments @{ action = 'list' }
+$mutatingMenu = Test-DevBenchReadOnlyRequest -ToolName menu -Arguments @{ action = 'open'; name = 'InventoryMenu' }
+Assert-Test ($readOnlyInspect -and $readOnlyMenu -and -not $mutatingMenu) 'read-only request classification is explicit and action-sensitive'
+$inspectSemantic = Get-DevBenchCallSemanticStatus -ToolName inspect -Arguments @{ kind = 'state' } -Content @([pscustomobject]@{ playerLoaded = $true; frame = 42 })
+Assert-Test ($inspectSemantic.known -and $inspectSemantic.ok -and $inspectSemantic.outcome -eq 'read-contract-satisfied') 'structured read-only responses satisfy RequireSuccess semantics'
+$recordSemantic = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ action = 'start'; recording = $true; correlationId = 'capture-1' })
+Assert-Test ($recordSemantic.known -and $recordSemantic.ok -and $recordSemantic.outcome -eq 'record-start-contract-satisfied') 'record start validates the running receipt and correlation identity'
+$recordMismatch = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ action = 'start'; recording = $true; correlationId = 'other' })
+Assert-Test ($recordMismatch.known -and -not $recordMismatch.ok) 'record start rejects a mismatched correlation identity'
+$readFailure = Get-DevBenchCallSemanticStatus -ToolName inspect -Arguments @{ kind = 'state' } -Content @([pscustomobject]@{ error = 'main thread busy' })
+Assert-Test ($readFailure.known -and -not $readFailure.ok -and $readFailure.outcome -eq 'read-contract-failed') 'read-only adapters never promote a structured error to success'
+$incompleteMenu = Get-DevBenchCallSemanticStatus -ToolName menu -Arguments @{ action = 'list' } -Content @([pscustomobject]@{ openMenus = @() })
+Assert-Test (-not $incompleteMenu.known) 'read-only adapters require the tool-specific response shape'
 
 $ready = Test-DevBenchServiceReady -Content @([pscustomobject]@{ ok = $true; result = [pscustomobject]@{ state = 'ready' } })
 Assert-Test ($ready.ready -and -not $ready.retryable -and $ready.statePath -eq 'content.result.state') 'service readiness prefers result.state'
@@ -96,6 +110,7 @@ function New-TestRenderScaleStatus([bool]$RenderScale = $true) {
     $presentationEye = { param([uint32]$Frame) [pscustomobject]@{ frame = $Frame; valid = $true; path = 'VendorEvaluated'; loadingOrMenuContext = $false; transitionCooldown = $false } }
     [pscustomobject]@{
         frame = 105
+        upscalingSnapshot = [pscustomobject]@{ stateRevision = 12 }
         modeStatus = $(if ($RenderScale) { 'Active' } else { 'Disabled' })
         vendorWorkGate = [pscustomobject]@{
             active = $false; completedWorldFrame = $true; loadingMenu = $false; loadingPresentationActive = $false
@@ -132,6 +147,7 @@ function New-TestRenderScaleStatus([bool]$RenderScale = $true) {
 
 $renderProfile = New-TestUpscalingProfile
 $renderSnapshot = [pscustomobject]@{
+    stateRevision = 12
     profilePresence = 27; flags = 57; activeOperationId = 0
     transitionState = [pscustomobject]@{ name = 'active'; value = 6 }
     renderScaleStatus = [pscustomobject]@{ name = 'active'; value = 5 }
@@ -141,6 +157,9 @@ $renderSnapshot = [pscustomobject]@{
 }
 $renderStable = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus (New-TestRenderScaleStatus)
 Assert-Test ($renderStable.satisfied -and $renderStable.stereoEvidence -eq 'render_scale_fidelity') 'render-scale stability requires a latched coherent stereo contract'
+$wrongScaledProfile = New-TestUpscalingProfile -Method 'fsr'
+$wrongScaledTarget = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus (New-TestRenderScaleStatus) -ExpectedProfile $wrongScaledProfile
+Assert-Test (-not $wrongScaledTarget.satisfied -and $wrongScaledTarget.reasons -contains 'effective scaled profile does not match the expected target') 'targeted scaled stability rejects a different effective profile'
 $gatedStatus = New-TestRenderScaleStatus
 $gatedStatus.vendorWorkGate.loadingMenu = $true
 $renderGated = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus $gatedStatus
@@ -158,6 +177,7 @@ function New-TestNativeSnapshot {
     if ($null -eq $EffectiveProfile) { $EffectiveProfile = $RequestedProfile }
     if ($null -eq $StableProfile) { $StableProfile = $EffectiveProfile }
     [pscustomobject]@{
+        stateRevision = 12
         profilePresence = $ProfilePresence; flags = 1; activeOperationId = 0
         transitionState = [pscustomobject]@{ name = $TransitionState; value = $(if ($TransitionState -eq 'active') { 6 } else { 0 }) }
         renderScaleStatus = [pscustomobject]@{ name = 'disabled'; value = 0 }
@@ -191,12 +211,80 @@ $nativeFsrProfile = New-TestUpscalingProfile -Method 'fsr' -RenderScale $false
 $nativeFsrSnapshot = New-TestNativeSnapshot -RequestedProfile $nativeFsrProfile -EffectiveProfile $nativeFsrProfile -StableProfile $nativeFsrProfile -ProfilePresence 27
 $nativeFsrStable = Test-DevBenchUpscalingStable -UpscalingSnapshot $nativeFsrSnapshot -RenderScaleStatus (New-TestRenderScaleStatus -RenderScale $false)
 Assert-Test ($nativeFsrStable.satisfied -and $nativeFsrStable.method -eq 'fsr') 'native-resolution stability follows the effective method without prescribing DLSS or FSR'
+$nativePhysicalStatus = New-TestRenderScaleStatus -RenderScale $false
+$nativePhysicalStatus.controller.stable.active = $true
+$nativePhysicalState = Test-DevBenchUpscalingStable -UpscalingSnapshot (New-TestNativeSnapshot -RequestedProfile $nativeProfile) -RenderScaleStatus $nativePhysicalStatus
+Assert-Test (-not $nativePhysicalState.satisfied -and $nativePhysicalState.reasons -contains 'an active physical render-scale contract remains for a native-resolution profile') 'native-resolution stability rejects a contradictory active physical contract'
+$missingNativeStableActivity = New-TestRenderScaleStatus -RenderScale $false
+$missingNativeStableActivity.controller.stable.PSObject.Properties.Remove('active')
+$missingNativeStableActivityState = Test-DevBenchUpscalingStable -UpscalingSnapshot (New-TestNativeSnapshot -RequestedProfile $nativeProfile) -RenderScaleStatus $missingNativeStableActivity
+Assert-Test (-not $missingNativeStableActivityState.satisfied -and $missingNativeStableActivityState.reasons -contains 'stable render-scale activity telemetry is missing for a native-resolution profile') 'native-resolution stability rejects missing physical contract activity telemetry'
+$missingNativeFidelityActivity = New-TestRenderScaleStatus -RenderScale $false
+$missingNativeFidelityActivity.controller.fidelity.PSObject.Properties.Remove('active')
+$missingNativeFidelityActivityState = Test-DevBenchUpscalingStable -UpscalingSnapshot (New-TestNativeSnapshot -RequestedProfile $nativeProfile) -RenderScaleStatus $missingNativeFidelityActivity
+Assert-Test (-not $missingNativeFidelityActivityState.satisfied -and $missingNativeFidelityActivityState.reasons -contains 'render-scale fidelity activity telemetry is missing for a native-resolution profile') 'native-resolution stability rejects missing fidelity activity telemetry'
+$invalidNativeActivity = New-TestRenderScaleStatus -RenderScale $false
+$invalidNativeActivity.controller.stable.active = 'false'
+$invalidNativeActivityState = Test-DevBenchUpscalingStable -UpscalingSnapshot (New-TestNativeSnapshot -RequestedProfile $nativeProfile) -RenderScaleStatus $invalidNativeActivity
+Assert-Test (-not $invalidNativeActivityState.satisfied -and $invalidNativeActivityState.reasons -contains 'stable render-scale activity telemetry has invalid type for a native-resolution profile') 'native-resolution stability rejects coerced physical contract activity telemetry'
+$invalidCompletedFrame = New-TestRenderScaleStatus
+$invalidCompletedFrame.vendorWorkGate.completedWorldFrame = 'false'
+$invalidCompletedFrameState = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus $invalidCompletedFrame
+Assert-Test (-not $invalidCompletedFrameState.satisfied -and $invalidCompletedFrameState.reasons -contains 'completed world-frame telemetry has invalid type') 'render-scale stability rejects truthy strings for completed world-frame authority'
+$invalidRecoveryBoolean = New-TestRenderScaleStatus
+$invalidRecoveryBoolean.controller.postLoadRecovery.active = 'false'
+$invalidRecoveryBooleanState = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus $invalidRecoveryBoolean
+Assert-Test (-not $invalidRecoveryBooleanState.satisfied -and $invalidRecoveryBooleanState.reasons -contains 'post-load render-scale recovery active telemetry has invalid type') 'render-scale stability rejects coerced nested recovery telemetry'
+$invalidDimensionSnapshot = $renderSnapshot | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+$invalidDimensionSnapshot.dimensions.displayEyeWidth = 'wide'
+$invalidDimensionState = Test-DevBenchUpscalingStable -UpscalingSnapshot $invalidDimensionSnapshot -RenderScaleStatus (New-TestRenderScaleStatus)
+Assert-Test (-not $invalidDimensionState.satisfied -and $invalidDimensionState.reasons -contains 'upscaling dimensions are not materialized') 'upscaling stability rejects nonnumeric dimensions without throwing'
+$overflowDimensionSnapshot = $renderSnapshot | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+$overflowDimensionSnapshot.dimensions.renderEyeHeight = [uint64]::MaxValue
+$overflowDimensionState = Test-DevBenchUpscalingStable -UpscalingSnapshot $overflowDimensionSnapshot -RenderScaleStatus (New-TestRenderScaleStatus)
+Assert-Test (-not $overflowDimensionState.satisfied -and $overflowDimensionState.reasons -contains 'upscaling dimensions are not materialized') 'upscaling stability rejects dimensions outside the UInt32 contract without throwing'
 $mismatchedProfile = New-TestUpscalingProfile -Method 'fsr' -RenderScale $false
 $nativeMismatchSnapshot = New-TestNativeSnapshot -RequestedProfile $mismatchedProfile -EffectiveProfile $nativeProfile -StableProfile $nativeFsrProfile -ProfilePresence 27
 $nativeMismatch = Test-DevBenchUpscalingStable -UpscalingSnapshot $nativeMismatchSnapshot -RenderScaleStatus (New-TestRenderScaleStatus -RenderScale $false)
 Assert-Test (-not $nativeMismatch.satisfied -and $nativeMismatch.reasons -contains 'requested and effective profiles differ') 'native-resolution stability rejects profile divergence'
+$statusProfileMismatch = New-TestRenderScaleStatus
+$mismatchedPhysicalSnapshot = $renderSnapshot | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+$mismatchedPhysicalSnapshot.renderScaleStatus = [pscustomobject]@{ name = 'disabled'; value = 0 }
+$renderStatusMismatch = Test-DevBenchUpscalingStable -UpscalingSnapshot $mismatchedPhysicalSnapshot -RenderScaleStatus $statusProfileMismatch
+Assert-Test (-not $renderStatusMismatch.satisfied -and $renderStatusMismatch.reasons -contains 'render-scale status disagrees with the effective profile') 'physical render-scale status must agree with the effective profile'
+$revisionMismatchStatus = New-TestRenderScaleStatus
+$revisionMismatchStatus.upscalingSnapshot.stateRevision = 13
+$revisionMismatch = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus $revisionMismatchStatus
+Assert-Test (-not $revisionMismatch.satisfied -and $revisionMismatch.reasons -contains 'upscaling and render-scale observations are not revision-correlated') 'cross-RPC upscaling evidence requires a shared state revision'
+$invalidExpectedProfile = New-TestUpscalingProfile -RenderScale $false
+$invalidExpectedProfile.renderScaleMode = 'false'
+$invalidExpected = Test-DevBenchUpscalingStable -UpscalingSnapshot (New-TestNativeSnapshot -RequestedProfile $nativeProfile) -RenderScaleStatus (New-TestRenderScaleStatus -RenderScale $false) -ExpectedProfile $invalidExpectedProfile
+Assert-Test (-not $invalidExpected.satisfied -and $invalidExpected.reasons -contains 'the expected upscaling profile has invalid field types') 'expected profile boolean fields reject truthy strings'
 $missingSnapshotFields = Test-DevBenchUpscalingStable -UpscalingSnapshot ([pscustomobject]@{}) -RenderScaleStatus ([pscustomobject]@{})
 Assert-Test (-not $missingSnapshotFields.satisfied -and $missingSnapshotFields.reasons -contains 'render-scale controller telemetry is missing') 'missing optional snapshot fields fail closed without a strict-mode exception'
+$partialRenderStatus = New-TestRenderScaleStatus
+$partialRenderStatus.controller.PSObject.Properties.Remove('fidelity')
+$partialRenderState = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus $partialRenderStatus
+Assert-Test (-not $partialRenderState.satisfied -and $partialRenderState.reasons -contains 'render-scale fidelity telemetry is missing') 'partial active controller telemetry fails closed without a strict-mode exception'
+$partialProfileSnapshot = $renderSnapshot | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+$partialProfileSnapshot.profiles.effective.PSObject.Properties.Remove('qualityMode')
+$partialProfileState = Test-DevBenchUpscalingStable -UpscalingSnapshot $partialProfileSnapshot -RenderScaleStatus (New-TestRenderScaleStatus)
+Assert-Test (-not $partialProfileState.satisfied -and $partialProfileState.reasons -contains 'the effective upscaling profile has invalid field types') 'partial effective profiles fail closed without a strict-mode exception'
+
+$requiredRecoveryTelemetry = @(
+    [pscustomobject]@{ parent = 'postLoadRecovery'; field = 'active'; reason = 'post-load render-scale recovery active telemetry is missing' },
+    [pscustomobject]@{ parent = 'memoryTrim'; field = 'pending'; reason = 'render-scale memory trim pending telemetry is missing' },
+    [pscustomobject]@{ parent = 'retirement'; field = 'pendingSets'; reason = 'render-scale retirement pending-set telemetry is missing' },
+    [pscustomobject]@{ parent = 'retirement'; field = 'fencePending'; reason = 'render-scale retirement fence telemetry is missing' },
+    [pscustomobject]@{ parent = 'retirement'; field = 'capacityBlocked'; reason = 'render-scale retirement capacity telemetry is missing' },
+    [pscustomobject]@{ parent = 'engineTargetRetirement'; field = 'pending'; reason = 'engine render-target retirement pending telemetry is missing' }
+)
+foreach ($case in $requiredRecoveryTelemetry) {
+    $partialStatus = New-TestRenderScaleStatus
+    $partialStatus.controller.($case.parent).PSObject.Properties.Remove($case.field)
+    $partialState = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus $partialStatus
+    Assert-Test (-not $partialState.satisfied -and $partialState.reasons -contains $case.reason) "missing $($case.parent).$($case.field) telemetry fails closed"
+}
 
 $resourcePublication = Get-DevBenchResourcePublicationTelemetry -Response ([pscustomobject]@{
         status = [pscustomobject]@{
@@ -276,6 +364,8 @@ Assert-Test (-not $missingPreparation.available -and
     $missingPreparation.missingFields -contains 'events') 'missing preparation telemetry remains explicit'
 $mainReady = Test-DevBenchMainMenuReady -MenuState ([pscustomobject]@{ openMenus = @('HUD Menu', 'Main Menu'); messageBoxOpen = $false })
 Assert-Test $mainReady.satisfied 'mainMenuReady represents the normal main-menu state without treating Main Menu as blocking'
+$mainVrReady = Test-DevBenchMainMenuReady -MenuState ([pscustomobject]@{ openMenus = @('Main Menu', 'Mist Menu', 'Fader Menu'); messageBoxOpen = $false })
+Assert-Test $mainVrReady.satisfied 'mainMenuReady accepts the normal Skyrim VR mist and fader overlays'
 $mainMissing = Test-DevBenchMainMenuReady -MenuState ([pscustomobject]@{ openMenus = @('HUD Menu'); messageBoxOpen = $false })
 Assert-Test (-not $mainMissing.satisfied) 'mainMenuReady requires the main menu rather than accepting gameplay'
 $mainObscured = Test-DevBenchMainMenuReady -MenuState ([pscustomobject]@{ openMenus = @('HUD Menu', 'Main Menu', 'MessageBoxMenu'); messageBoxOpen = $true })
@@ -310,38 +400,66 @@ $simpleProbe = Resolve-DevBenchServiceProbeArguments -ToolDefinition $simpleTool
 Assert-Test ($simpleProbe.source -eq 'schema-empty-valid' -and $simpleProbe.arguments.Count -eq 0) 'schema-valid empty probes remain empty'
 
 $entryPointText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1') -Raw
+$entryPointPath = Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1'
+$parseErrors = $null
+$tokens = $null
+$entryPointAst = [Management.Automation.Language.Parser]::ParseFile($entryPointPath, [ref]$tokens, [ref]$parseErrors)
+$terminalWriterAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Write-TerminalInvocationEvidence' }, $true))[0]
+Invoke-Expression $terminalWriterAst.Extent.Text
+$headerReaderAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-McpSessionHeaderValue' }, $true))[0]
+Invoke-Expression $headerReaderAst.Extent.Text
+$missingHeader = Get-McpSessionHeaderValue -Response ([pscustomobject]@{ Headers = @{} })
+$arrayHeader = Get-McpSessionHeaderValue -Response ([pscustomobject]@{ Headers = @{ 'Mcp-Session-Id' = @('owned-session', 'ignored') } })
+Assert-Test ([string]::IsNullOrWhiteSpace($missingHeader) -and $arrayHeader -eq 'owned-session') 'session header lookup preserves missing-header parse failures and normalizes present array values'
+$completedFixture = [pscustomobject][ordered]@{ ok = $true; transportOk = $true; semantic = [pscustomobject]@{ known = $true; ok = $true }; data = [pscustomobject]@{ value = 42 }; errors = @() }
+$completionWriteSucceeded = Write-TerminalInvocationEvidence -Result $completedFixture -FailurePrefix 'fixture completion write failed' -WriteAction { throw 'fixture persistence fault' }
+Assert-Test (-not $completionWriteSucceeded -and $completedFixture.ok -and $completedFixture.transportOk -and $completedFixture.data.value -eq 42 -and $completedFixture.evidenceWarnings[0] -match 'fixture persistence fault' -and -not $completedFixture.evidenceJournalFinalized) 'post-completion journal failure preserves the exact completed response and reports evidence loss'
 Assert-Test ($entryPointText -notmatch '(?im)^\s*\$pid\s*=') 'entry point never assigns PowerShell reserved PID variable'
 Assert-Test ($entryPointText -match '\$expectations\.buildId\s+-and\s+\$actualBuildId\s+-and') 'deferred build identity never compares a missing runtime build ID'
 Assert-Test ($entryPointText -match '\$Command -eq ''wait'' -and \$statusCode -eq 404') 'transient MCP 404 recovery is restricted to bounded waits'
 Assert-Test ($entryPointText -match 'full-runtime-rebind-required') 'bounded waits route invalidated MCP sessions through a full runtime rebind'
 Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$RequirePerformanceNeutral\) -and -not \$semantic\.known') 'required semantic outcomes reject unknown responses'
 Assert-Test ($entryPointText -match 'ok = \[bool\]\$observation\.satisfied') 'wait semantics retain the observed unsatisfied condition'
-Assert-Test ($entryPointText -match '\$Command -eq ''call'' -and -not \$runtimeIdentity\.complete') 'mutation-capable calls require complete runtime identity'
+Assert-Test ($entryPointText -match '\$Command -eq ''call'' -and -not \$readOnlyCall -and -not \$runtimeIdentity\.complete') 'only mutation-capable calls require complete runtime identity'
 Assert-Test ($entryPointText -match 'if \(\$Command -eq ''call''\) \{[\s\S]{0,100}-not \$semantic\.known -or -not \$semantic\.ok') 'mutation-capable calls fail closed on unknown semantic outcomes'
+Assert-Test ($entryPointText -match '\[string\]\$ExpectedRuntimeIdentityJson') 'controller accepts an exact prior runtime identity for pre-dispatch continuity'
+Assert-Test ($entryPointText.IndexOf('Expected runtime identity is invalid:') -lt $entryPointText.IndexOf("Update-InvocationEvidence -State 'dispatching'")) 'runtime identity continuity is verified before mutation dispatch'
 Assert-Test ($entryPointText -match '\$Tool -eq ''communityshaders\.profiler''') 'profiler calls have an explicit semantic contract adapter'
 Assert-Test ($entryPointText -match '\$requestedAction -eq ''status''[\s\S]{0,180}\.status\.PSObject\.Properties\[''frame_count''\]') 'profiler status requires a frame-bearing status payload'
 Assert-Test ($entryPointText -match '\$requestedAction -eq ''enable''[\s\S]{0,160}\[bool\]\$profilerPayload\[0\]\.enabled') 'profiler enable requires observed enabled state'
 Assert-Test ($entryPointText -match '\$requestedAction -eq ''disable''[\s\S]{0,180}-not \[bool\]\$profilerPayload\[0\]\.enabled') 'profiler disable requires observed disabled state'
 Assert-Test ($entryPointText -match 'outcome = ''profiler-contract-satisfied''') 'accepted profiler responses report their contract-specific outcome'
-Assert-Test ($entryPointText -match 'Invoke-ToolRpc -Name \$Tool -Arguments \$arguments -Headers \$headers -Mutation') 'user calls are explicitly classified as mutations'
+Assert-Test ($entryPointText -match 'Invoke-ToolRpc -Name \$Tool -Arguments \$arguments -Headers \$headers -Mutation:\(-not \$readOnlyCall\)') 'user calls carry their explicit retry-safety classification'
 Assert-Test ($entryPointText -match 'not-retried-indeterminate') 'ambiguous mutation transport failures are not replayed'
 Assert-Test ($entryPointText -match 'Update-InvocationEvidence -State \$\(if \(\$indeterminateMutation\) \{ ''indeterminate'' \}') 'indeterminate mutation outcomes are durably journaled'
 Assert-Test ($entryPointText -match '\$headers = \$null[\s\S]{0,300}probeError') 'wait probe transport failures force full session and identity rebind'
 Assert-Test ($entryPointText -match '-TimeoutSec \(Get-RequestTimeoutSeconds\)') 'wait requests consume only their remaining operation budget'
-Assert-Test ($entryPointText -match '\$operationDeadlineUtc = \[DateTime\]::UtcNow.AddSeconds\(\$TimeoutSeconds\)' -and $entryPointText -notmatch '\[Math\]::Min\(15,') 'blocking calls use the declared operation budget instead of a fixed 15-second transport cap'
+Assert-Test ($entryPointText -match '\$operationStartedUtc = \[DateTime\]::UtcNow' -and $entryPointText -match '\$operationDeadlineUtc = \$operationStartedUtc.AddSeconds\(\$TimeoutSeconds\)' -and $entryPointText -notmatch '\[Math\]::Min\(15,') 'blocking calls use the declared operation budget instead of a fixed 15-second transport cap'
 Assert-Test ($entryPointText -notmatch 'Start-Sleep -Milliseconds \$currentDelay') 'wait poll delays cannot exceed the operation deadline'
 Assert-Test ($entryPointText -match 'mcp-session-reinitialized') 'bounded waits reinitialize invalidated MCP sessions'
 Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$Command -eq ''wait''\)') 'unsatisfied waits fail even without RequireSuccess'
 Assert-Test ($entryPointText -match 'function Close-McpSession') 'entry point defines deterministic MCP session cleanup'
 Assert-Test ($entryPointText -match '-Method Delete') 'owned MCP sessions are closed through the server lifecycle endpoint'
 Assert-Test ($entryPointText -match "state = 'already_absent'") 'an already-retired MCP session is a successful cleanup'
-Assert-Test ($entryPointText -match 'Close-McpSession -Endpoint \$endpoint -Headers \$sessionHeaders') 'partially opened MCP sessions are cleaned before rethrowing'
+Assert-Test ($entryPointText -match 'Close-OwnedMcpSession -Endpoint \$endpoint -Headers \$sessionHeaders') 'partially opened MCP sessions are cleaned before rethrowing'
 Assert-Test ($entryPointText -match 'Add-Member -NotePropertyName sessionCleanup') 'controller results preserve a structured session cleanup receipt'
 Assert-Test ($entryPointText -match "clientInfo = @\{ name = 'DevBenchControl'; version = '1\.5' \}") 'MCP client identity records the timeout-envelope revision'
 Assert-Test ($entryPointText -match '\[int\]\$RequestTimeoutSeconds = 15') 'controller exposes its default request timeout'
 Assert-Test ($entryPointText -match '\$arguments\.ContainsKey\(''timeoutMs''\)') 'controller detects a server-owned timeout budget'
 Assert-Test ($entryPointText -match 'Ceiling\(\$serverTimeoutMilliseconds / 1000\.0\)') 'controller converts the server budget without truncation'
 Assert-Test ($entryPointText -match '\$serverTimeoutSeconds \+ 5') 'controller keeps a five-second receipt envelope beyond the server budget'
+Assert-Test ($entryPointText -match 'function Set-ServerWaitBudgetAtDispatch' -and $entryPointText -match '\$script:operationDeadlineUtc = \$now.AddSeconds\(\$requiredOperationSeconds\)' -and $entryPointText -match 'Set-ServerWaitBudgetAtDispatch -Arguments \$Arguments') 'server-owned waits extend the actual operation deadline at dispatch'
+Assert-Test ($entryPointText -match 'operationDeadlineUtc = \$script:operationDeadlineUtc.ToString') 'receipts expose the effective operation deadline'
+Assert-Test ($entryPointText -match 'serverTimeoutDispatchRemainingSeconds') 'receipts expose the remaining dispatch allowance for a server-owned wait'
+Assert-Test ($entryPointText -match 'function Close-AllMcpSessions') 'controller retains cleanup evidence for every issued MCP session'
+Assert-Test ($entryPointText -match 'Close-McpSessionForRebind') 'session rebind requires a successful prior cleanup reconciliation'
+Assert-Test ($entryPointText -match 'elseif \(\$Condition -eq ''upscalingStable''\)[\s\S]+?catch \{[\s\S]+?Close-McpSessionForRebind -Headers \$headers[\s\S]+?\$headers = \$null') 'upscalingStable discards retryably invalidated sessions before another observation'
+Assert-Test ($entryPointText -match "DevBenchMcpSessionId" -and $entryPointText -match "returned malformed JSON") 'malformed initialization JSON preserves an already-issued MCP session identity'
+Assert-Test ($entryPointText -match "DevBenchCleanupUncertain" -and $entryPointText -match 'refusing automatic rebind') 'uncertain partial-session cleanup is never classified for automatic rebind'
+Assert-Test ($entryPointText -match "invocationRecord\['sessionCleanup'\]") 'final MCP cleanup evidence is written to the durable invocation journal'
+Assert-Test ($entryPointText -match "Session cleanup evidence could not be journaled" -and $entryPointText -match 'evidenceJournalFinalized') 'a final journal failure is reported without suppressing the completed controller result'
+Assert-Test ($entryPointText -match "outcome = 'tool-unavailable'" -and $entryPointText -match "codes = @\('tool_unavailable'\)") 'missing optional tools retain a structured unavailable outcome without dispatch'
+Assert-Test ($entryPointText -match 'method = ''tools/list''[\s\S]{0,400}currentTools') 'performance boundaries refresh the live tool registry'
 Assert-Test ($entryPointText -match 'function Invoke-ToolRpc[\s\S]{0,300}Invoke-McpRequest') 'tool calls use the shared deadline-bounded request path'
 Assert-Test ($entryPointText -match 'requestTimeoutSeconds = \$script:requestTimeoutSecondsForRpc') 'receipts expose the effective request timeout'
 Assert-Test ($entryPointText -match '\[string\]\$EvidenceLabel') 'runtime binding evidence accepts an explicit invocation label'

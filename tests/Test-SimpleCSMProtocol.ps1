@@ -12,10 +12,12 @@ $sourceProtocol = Join-Path $repositoryRoot 'skills\simple-csm\references\protoc
 $pluginSkill = Join-Path $repositoryRoot 'plugins\skyrim-vr-automation\skills\simple-csm\SKILL.md'
 $pluginProtocol = Join-Path $repositoryRoot 'plugins\skyrim-vr-automation\skills\simple-csm\references\protocol.md'
 $matrixPath = Join-Path $repositoryRoot 'tools\render-scale-qualification\protocol.v1.json'
+$pluginMatrixPath = Join-Path $repositoryRoot 'plugins\skyrim-vr-automation\tools\render-scale-qualification\protocol.v1.json'
 
 foreach ($pair in @(
     @($sourceSkill, $pluginSkill),
-    @($sourceProtocol, $pluginProtocol)
+    @($sourceProtocol, $pluginProtocol),
+    @($matrixPath, $pluginMatrixPath)
 )) {
     foreach ($path in $pair) {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -41,6 +43,7 @@ foreach ($required in @(
     '../../tools/render-scale-qualification/protocol.v1.json',
     'one positioning COC to `WhiterunDragonsreach`',
     '25 exact render-scale `apply` mutations',
+    'lifecycle, pacing, or result grouping',
     'Setup must not change upscaling'
 )) {
     if (-not $skill.Contains($required, [StringComparison]::Ordinal)) {
@@ -67,11 +70,18 @@ foreach ($required in @(
     '`actualDispatchBackend`',
     '`fsr_host`, `fsr_runtime`, or',
     'AMD hardware',
+    'pacing, DLSS-trace',
+    '`n/a (unsupported)` for every per-DLSS trace field',
+    'does not make the run incomplete',
+    'transitions, statuses, and stabilization aggregates remain mandatory',
+    'require zero DLSS trace dispatch records',
     'There must be exactly 25 begin, dispatch, apply, waiter, and status',
     'Immediately after transition 25',
     'final scene to remain `WhiterunDragonsreach`',
     'CPU, GPU, lifetime, presentation',
     'resource-publication, preparation-stage',
+    'Record `n/a` for methods absent from the',
+    'present-method and complete-assay values are mandatory',
     'Stop there'
 )) {
     if (-not $protocol.Contains($required, [StringComparison]::Ordinal)) {

@@ -17,15 +17,26 @@
             "vendor": null,
             "device": null,
             "driver": null,
-            "powerPolicy": null
+            "powerPolicy": null,
+            "clocks": {
+                "coreMHz": null,
+                "memoryMHz": null,
+                "policy": null
+            }
         },
+        "backgroundLoadPolicy": null,
         "hmd": {
             "mode": null,
             "profile": null,
             "refreshRateHz": null,
             "renderWidth": null,
             "renderHeight": null,
-            "motionSmoothing": null
+            "motionSmoothing": null,
+            "eyeGeometry": {
+                "source": null,
+                "left": null,
+                "right": null
+            }
         },
         "upscaling": {
             "method": "DLSS",
@@ -66,12 +77,36 @@
         {
             "id": "csx",
             "head": "d748e1089e4f696cb8d34ffc3a6154c279586a17",
+            "artifact": {
+                "buildId": null,
+                "package": {
+                    "path": null,
+                    "sha256": null
+                },
+                "dll": {
+                    "path": null,
+                    "sha256": null
+                }
+            },
+            "adapterBuild": null,
             "baselineSettings": "csx-d748e108/SettingsUser.json",
             "searchSpaceManifest": null
         },
         {
             "id": "open-shaders",
             "head": "6f532ca3ecf5bc63324e7ad5b9aa526fce8dabff",
+            "artifact": {
+                "buildId": null,
+                "package": {
+                    "path": null,
+                    "sha256": null
+                },
+                "dll": {
+                    "path": null,
+                    "sha256": null
+                }
+            },
+            "adapterBuild": null,
             "baselineSettings": "open-shaders-6f532ca3/SettingsUser.json",
             "searchSpaceManifest": null
         }

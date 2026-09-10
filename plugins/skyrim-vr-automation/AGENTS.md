@@ -4,7 +4,8 @@
   temporary worktree branch is not complete until its commits are integrated
   into `dev`; update `main` only through a `dev`-to-`main` pull request, and
   keep local `main` aligned with the latest merged `origin/main`. Open or merge
-  that pull request only when the user explicitly instructs it.
+  that pull request only when the user explicitly instructs it. Develop in
+  scoped feature branches and never push directly to `main`.
 - Treat every game, MO2, SteamVR, profile, and cache mutation as an attributable
   transaction. Inspect first and preserve its result with the test record.
 - Never silently fall back to a different MO2 profile, executable, runtime,
@@ -12,13 +13,59 @@
 - Give every independent test task a unique profile cloned from the configured
   stable source. Never share a mutable task profile or infer an experimental
   alternate profile as a safe template.
+- Retain each task-owned workspace and its profile-local changes by default.
+  End the live session and release scarce MO2 access, then reacquire access and
+  resume that exact workspace later. Run, turn, or task completion does not
+  authorize retirement, reset, or deletion. Retire only on explicit direction
+  to discard or replace that exact environment, or under a separately stated
+  policy that proves it obsolete.
+- Keep task-local environment retention separate from restoration of shared or
+  global transient state. Restoring SteamVR or another shared runtime must not
+  rewrite, revert, or retire the task-owned MO2 profile.
 - A task may delete or replace only uniquely named mods that its workspace
   proves did not predate the task and explicitly records as task-owned.
 - Do not inherit unknown-provenance saves, and do not treat COC as New Game.
 - Require MO2 and Skyrim to be closed before profile or package mutation.
+- Do not treat Virtual Desktop or `VirtualDesktop.Streamer` as a blocker for
+  profile mutation or SteamVR null-HMD. For the null-HMD route, an enabled
+  profile-local OCU/OpenComposite provider is the conflicting route.
 - Require SteamVR to be closed before applying or restoring null-HMD settings.
 - Retain exact backups and receipts until the associated test evidence has been
   classified. Never delete unclassified MO2 overwrite or shader-cache content.
+- Render-scale tuning queues an immutable copy of each received measurement
+  and later revision before the next operation. AMD and NVIDIA use the same
+  detached worker and one append-only journal; disk writes and flushes never
+  gate the next transition or pass. Drain and flush all queued evidence after
+  measurement and ownership cleanup, before reporting evidence completion. Never discard
+  receipts, reduce telemetry, or stop measurement because saving falls behind.
+  Report progress every five transitions without controlling worker execution.
+  Both variants follow identical pacing, deadlines, cleanup/replay rules,
+  evidence schemas, complete-ledger reporting, and comparison requirements.
+  Only adapter verification, backend capabilities, and vendor matrices differ.
+  Keep physical lane qualification separate from raw terminal verdicts.
+  Record one ledger column per run ID with explicit lane/pass metric rows;
+  retain blocked and interrupted lanes and their evidence gaps. Correctly
+  evidenced blocked lanes are inapplicable to memory completeness; missing
+  runnable-lane evidence is incomplete. Guard capability-capture ownership
+  before the first profile apply as well as during measured passes.
+  Compare available measurements even from partial runs, explicitly labeling
+  missing values and incomplete coverage instead of requiring a complete run
+  for ledger entry.
+- Every tuning ledger update includes the detailed side-by-side analysis in
+  `tools/renderscale-tuning-finalizer/README.md`. Preserve completion and
+  terminal results separately from full-history health and the
+  improvement-or-neutral assessment. Show actual relatch/strict frames and
+  milliseconds, stretch counts/frames/duration, retries and recovered failures
+  in the per-pass and per-transition comparison tables. The imposed-stretch
+  cutoff is diagnostic only. PR inclusion is solely the user's decision;
+  this analysis is not a PR requirement or merge gate.
+- Keep post-run reporting fast. In a shader repository with the maintained
+  `tools/compare-render-scale-ledger.py`, use its single-command workflow and
+  content-verified reuse. Preserve every evidence and ledger check; retain
+  missing-data limitations. Give brief useful progress updates without adding
+  repeated extraction, comparison generation, packaging or tool-development
+  work to a normal run. Record stage timings and surface material failures or
+  unexpected delays.
 - Keep automated waits bounded and report the observed postcondition. A CTD is
   useful evidence, not permission for unbounded retries.
 - Treat the render-scale tuning fixture, immediate positioning, and startup
@@ -30,18 +77,16 @@
 - Machine-specific paths belong only in ignored `machine.local.json` files,
   explicit parameters, or documented environment variables.
 - Never rotate an installed Codex plugin cache while any automation protocol
-  is active in any chat. Build and commit the marketplace package, then defer
-  installation until every run is terminal. Use the guarded repository
-  installer instead of direct `codex plugin add`, and fully reload the Codex
-  host after installation; a new chat alone is not a safe pickup boundary.
-- After every committed change that affects installed plugin behavior, skills,
-  tools, MCP configuration, manifests, or packaged AI guidance, automatically
-  rotate both plugin manifest cache identities, rebuild the managed marketplace
-  source from that exact commit, reinstall it with the guarded installer, and
-  verify the registered version plus source, marketplace, and installed-cache
-  hashes without waiting for a separate user request. If a protocol is active,
-  complete every step except installed-cache rotation and perform that rotation
-  as soon as all runs are terminal.
+  is active in any chat. Feature branches validate source/package parity but do
+  not rotate the installed cache. After an authorized merge to `main` that
+  affects installed plugin behavior, skills, tools, MCP configuration,
+  manifests, or packaged AI guidance, rotate both plugin manifest cache
+  identities once from the final integrated tree, rebuild the managed
+  marketplace package, and reinstall it with the guarded repository installer
+  instead of direct `codex plugin add`. Verify the registered version plus
+  source, marketplace, and installed-cache hashes, then fully reload the Codex
+  host; a new chat alone is not a safe pickup boundary. If a protocol is
+  active, defer installation until every run is terminal.
 - When an automation command behaves unexpectedly, its contract is ambiguous,
   or a concrete safety issue or enhancement is discovered, submit it through
   `tools/feedback-control/Invoke-AutomationFeedback.ps1`. Claim that feedback

@@ -5,133 +5,13 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { retryTelemetry } = require("./retry-telemetry.js");
+const { memoryConfirmation, memoryReport } = require("./memory-confirmation.js");
+const { transitionHealth, transitionTimings, switchHealthSummary,
+    healthReport, envelope } = require("./switch-health.js");
 
-function unwrapTraceRead(value) {
-    if (value && Array.isArray(value.content) && value.content[0] &&
-        typeof value.content[0].text === "string") {
-        return unwrapTraceRead(JSON.parse(value.content[0].text));
-    }
-    if (value && Array.isArray(value.results)) {
-        const step = value.results.find((entry) => entry &&
-            entry.result && entry.result.action === "dlss_trace_read");
-        return step && step.result;
-    }
-    return value && value.result && value.result.action === "dlss_trace_read" ?
-        value.result : value;
-}
-
-function recordSequence(record) {
-    const value = record && (record.sequence ??
-        (record.current && record.current.sequence));
-    return Number.isSafeInteger(value) && value > 0 ? value : null;
-}
-
-function traceCapacity(schema) {
-    const maximum = schema && (schema.maximum ?? schema.max ??
-        (schema.limit && schema.limit.maximum));
-    if (!Number.isSafeInteger(maximum) || maximum < 1) {
-        throw new Error("trace_schema_maximum_missing");
-    }
-    return maximum;
-}
-
-function validateTracePage(rawPage, state) {
-    const page = unwrapTraceRead(rawPage);
-    const capture = page && page.capture;
-    const producer = page && page.producer;
-    if (!page || page.action !== "dlss_trace_read" || !capture ||
-        !Array.isArray(capture.records)) {
-        throw new Error("invalid_trace_page");
-    }
-    if (!producer || producer.buildId !== state.buildId) {
-        throw new Error("trace_build_changed");
-    }
-    const sessionId = capture.summary && capture.summary.sessionID;
-    if (!Number.isSafeInteger(sessionId) || sessionId < 1) {
-        throw new Error("trace_session_missing");
-    }
-    if (state.sessionId !== null && sessionId !== state.sessionId) {
-        throw new Error("trace_session_changed");
-    }
-    if (capture.limit > state.maximum || capture.limit < 1) {
-        throw new Error("trace_page_limit_out_of_range");
-    }
-    if (capture.afterSequence !== state.afterSequence) {
-        throw new Error("trace_page_cursor_mismatch");
-    }
-    if (capture.requestedSequenceOverwritten === true ||
-        (Number.isSafeInteger(capture.availableFromSequence) &&
-            capture.availableFromSequence > state.afterSequence + 1)) {
-        throw new Error("trace_requested_sequence_overwritten");
-    }
-
-    let expected = state.afterSequence + 1;
-    for (const record of capture.records) {
-        const sequence = recordSequence(record);
-        if (sequence === null) throw new Error("trace_sequence_missing");
-        if (sequence < expected) throw new Error("trace_sequence_duplicate");
-        if (sequence > expected) throw new Error("trace_sequence_gap");
-        expected += 1;
-    }
-    const lastSequence = capture.records.length > 0 ? expected - 1 :
-        state.afterSequence;
-    if (capture.lastReturnedSequence !== lastSequence) {
-        throw new Error("trace_last_sequence_mismatch");
-    }
-    if (capture.moreAvailable === true && capture.records.length === 0) {
-        throw new Error("trace_empty_continuation_page");
-    }
-    return { page, sessionId, lastSequence };
-}
-
-async function collectTracePages(options) {
-    const {
-        readPage, expectedBuildId, schema, expectedSessionId = null,
-        existingPages = [], preservePage = async () => {},
-    } = options;
-    if (typeof readPage !== "function" || typeof preservePage !== "function" ||
-        typeof expectedBuildId !== "string" || expectedBuildId.length === 0) {
-        throw new Error("invalid_trace_paging_options");
-    }
-    const maximum = traceCapacity(schema);
-    const state = {
-        buildId: expectedBuildId,
-        sessionId: expectedSessionId,
-        afterSequence: 0,
-        maximum,
-    };
-    const pages = [];
-    const records = [];
-
-    for (const rawPage of existingPages) {
-        const checked = validateTracePage(rawPage, state);
-        state.sessionId = checked.sessionId;
-        state.afterSequence = checked.lastSequence;
-        pages.push(checked.page);
-        records.push(...checked.page.capture.records);
-        if (checked.page.capture.moreAvailable !== true) {
-            return { pages, records, sessionId: state.sessionId, maximum };
-        }
-    }
-
-    while (pages.length === 0 ||
-        pages[pages.length - 1].capture.moreAvailable === true) {
-        const rawPage = await readPage({
-            action: "dlss_trace_read",
-            afterSequence: state.afterSequence,
-            limit: maximum,
-            expectedBuildId,
-        });
-        // Preserve the producer receipt even when validation rejects it.
-        await preservePage(rawPage, pages.length + 1);
-        const checked = validateTracePage(rawPage, state);
-        state.sessionId = checked.sessionId;
-        state.afterSequence = checked.lastSequence;
-        pages.push(checked.page);
-        records.push(...checked.page.capture.records);
-    }
-    return { pages, records, sessionId: state.sessionId, maximum };
-}
+const { collectTracePages, traceCapacity, validateTracePage,
+    validateRetainedTrace, actualBackend, qualifyLaneBackend } = require("../renderscale-tuning-live/runner.js");
 
 function readJson(file) {
     return JSON.parse(fs.readFileSync(file, "utf8"));
@@ -165,13 +45,12 @@ function qualificationWait(value) {
     return value && value.action === "qualification_wait" ? value : null;
 }
 
-function interruptedLiveResult(root, variant, runId) {
+function readLiveResult(root, variant, runId) {
     const file = path.join(root, "raw", "live-result.json");
     if (!fs.existsSync(file)) return null;
     const value = readJson(file);
-    if (value.status !== "INTERRUPTED") return null;
     if (value.variant !== variant || value.runId !== runId) {
-        throw new Error("interrupted_result_identity_mismatch");
+        throw new Error("live_result_identity_mismatch");
     }
     return value;
 }
@@ -202,21 +81,6 @@ function validateBaselineOnlyInterruption(root, variant, runId, buildId) {
             throw new Error("baseline_interruption_receipt_mismatch");
         }
     }
-}
-
-function baselineOnlyMemoryConfirmation() {
-    return {
-        passesCompleted: 0,
-        cooldownMilliseconds: null,
-        boundaries: { pass1: null, cooldown: null, pass2: null },
-        deltas: null,
-        ratios: null,
-        predicateInputs: { available: false, reason: "repeat_not_completed" },
-        unavailableBoundaries: ["pass1_start", "pass1_end", "cooldown_start",
-            "cooldown_end", "pass2_start", "pass2_end"],
-        verdict: "repeat_not_completed",
-        conclusion: "no_leak_or_retention_conclusion_possible",
-    };
 }
 
 function deploymentVerification(root, buildId, options) {
@@ -408,23 +272,47 @@ function evidenceValues(root) {
         path.extname(file).toLowerCase() === ".json").sort() : [];
     const columns = ["source_path", "lane", "pass", "ordinal",
         "json_pointer", "value_type", "value_json"];
-    const lines = [columns.join(",")];
     const stats = { rawJsonFiles: files.length, values: 0, nullValues: 0,
         emptyContainers: 0 };
-    for (const file of files) {
-        const source = relative(root, file);
-        const identity = rawIdentity(root, file);
-        flattenJson(readJson(file), "", (pointer, type, valueJson) => {
-            stats.values += 1;
-            if (type === "null") stats.nullValues += 1;
-            if (type === "empty_array" || type === "empty_object") {
-                stats.emptyContainers += 1;
+    writeAtomic(path.join(root, "evidence-values.csv"), (descriptor) => {
+        let buffer = `${columns.join(",")}\n`;
+        const emit = (line) => {
+            // Bound aggregate memory even when the CSV exceeds V8's string limit.
+            if (buffer.length + line.length > 64 * 1024) {
+                fs.writeFileSync(descriptor, buffer);
+                buffer = "";
             }
-            lines.push([source, identity.lane, identity.pass, identity.ordinal,
-                pointer, type, valueJson].map(csvCell).join(","));
-        });
-    }
-    return { text: `${lines.join("\n")}\n`, stats };
+            if (line.length >= 64 * 1024) fs.writeFileSync(descriptor, line);
+            else buffer += line;
+        };
+        const extract = (value, source, identity) => {
+            flattenJson(value, "", (pointer, type, valueJson) => {
+                stats.values += 1;
+                if (type === "null") stats.nullValues += 1;
+                if (type === "empty_array" || type === "empty_object") {
+                    stats.emptyContainers += 1;
+                }
+                emit(`${[source, identity.lane, identity.pass, identity.ordinal,
+                    pointer, type, valueJson].map(csvCell).join(",")}\n`);
+            });
+        };
+        for (const file of files) {
+            extract(readJson(file), relative(root, file), rawIdentity(root, file));
+        }
+        const document = path.join(rawRoot, "journal.ndjson");
+        if (fs.existsSync(document)) {
+            stats.journalRecords = 0;
+            for (const { entry } of journalLines(document)) {
+                const row = entry.receiptKey.match(/:([^:]+):pass-(\d+):transition-(\d+)(?::|$)/);
+                extract(entry, `raw/journal.ndjson#sequence=${entry.sequence}`, {
+                    lane: row?.[1] || "", pass: row?.[2] || "", ordinal: row?.[3] || "",
+                });
+                stats.journalRecords++;
+            }
+        }
+        fs.writeFileSync(descriptor, buffer);
+    });
+    return { stats };
 }
 
 function normalizeTask2(retained) {
@@ -616,14 +504,62 @@ function presentationStretchDetails(waiter, projection, renderVerdict) {
 function sourceProfile(waiter) {
     const timeline = waiter.replacementTimeline || {};
     const proof = timeline.dispatch && timeline.dispatch.presentationProof || {};
+    const leftPresent = Object.hasOwn(proof, "leftEye");
+    const rightPresent = Object.hasOwn(proof, "rightEye");
+    const left = proof.leftEye;
+    const right = proof.rightEye;
+    if (leftPresent !== rightPresent) {
+        throw new Error("source_profile_method_incomplete");
+    }
+    if (leftPresent && (!left || typeof left !== "object" ||
+        !right || typeof right !== "object")) {
+        throw new Error("source_profile_method_invalid");
+    }
+    const leftMethod = left && typeof left === "object" ? left.method : undefined;
+    const rightMethod = right && typeof right === "object" ? right.method : undefined;
+    const leftExposed = leftMethod !== null && leftMethod !== undefined;
+    const rightExposed = rightMethod !== null && rightMethod !== undefined;
+    let method = "not_exposed";
+    if (leftExposed !== rightExposed) {
+        throw new Error("source_profile_method_incomplete");
+    }
+    if (leftExposed && rightExposed) {
+        if (typeof leftMethod !== "string" || typeof rightMethod !== "string" ||
+            leftMethod.length === 0 || rightMethod.length === 0) {
+            throw new Error("source_profile_method_invalid");
+        }
+        if (leftMethod !== rightMethod) {
+            throw new Error("source_profile_method_mismatch");
+        }
+        method = leftMethod;
+    }
     return {
-        method: proof.method ?? "not_exposed",
-        qualityMode: proof.qualityMode ?? "not_exposed",
-        renderScaleMode: proof.renderScaleMode ?? "not_exposed",
+        method,
+        qualityMode: Object.hasOwn(proof, "qualityMode") ?
+            proof.qualityMode : "not_exposed",
+        renderScaleMode: Object.hasOwn(proof, "renderScaleMode") ?
+            proof.renderScaleMode : "not_exposed",
     };
 }
 
-function transitionRow(root, file, retained) {
+function readLaneContext(root) {
+    const position = envelope(path.join(root, "raw/startup/positioning.json"));
+    const entries = position?.results?.filter(step => step.label === "position-capabilities" && step.ok !== false) || [];
+    return {
+        matrix: readJson(path.join(__dirname, "../../skills/renderscale-tuning-amd/references/matrix.v1.json")),
+        capabilities: entries.length === 1 ? entries[0].result?.capabilities : null,
+    };
+}
+
+function laneQualification(root, laneId, waiter, target, context) {
+    if (!laneId || laneId === "nvidia") return { verdict: "NOT_APPLICABLE", reasons: [] };
+    const { matrix, capabilities } = context || readLaneContext(root);
+    const lane = matrix.lanes.find(value => value.id === laneId);
+    if (!lane) return { verdict: "FAIL", reasons: ["unknown_amd_lane"] };
+    return qualifyLaneBackend(waiter, target, lane, capabilities);
+}
+
+function transitionRow(root, file, retained, laneContext) {
     const identity = rowIdentity(root, file);
     const waiter = retained.waiter || {};
     const projection = retained.projection || {};
@@ -636,14 +572,24 @@ function transitionRow(root, file, retained) {
     const renderVerdict = projection.renderVerdict ||
         (waiter.satisfied === true ? "PASS" : "FAIL");
     const stretch = presentationStretchDetails(waiter, projection, renderVerdict);
-    const traceRequired = target.method === "dlss";
-    const traceComplete = !traceRequired || ["traceReset", "traceStart", "traceStop",
-        "traceRead"].every((name) => retained[name]);
+    const traceRequired = retained.variant === "nvidia" &&
+        target.method === "dlss";
+    let traceEvidence = { complete: true, status: "not_applicable" };
+    if (traceRequired) {
+        try { traceEvidence = validateRetainedTrace(retained); }
+        catch (error) { traceEvidence = { complete: false, reason: error.message }; }
+    }
+    const traceComplete = traceEvidence.complete;
     const recovery = retained.recovery || null;
     return {
         ...identity,
         target,
         source: sourceProfile(waiter),
+        actualBackend: actualBackend(waiter, target),
+        laneQualification: laneQualification(root, identity.lane, waiter, target, laneContext),
+        retryTelemetry: retryTelemetry(retained),
+        switchHealth: transitionHealth(waiter),
+        switchTimings: transitionTimings(waiter),
         renderVerdict,
         task2Verdict: task2.verdict,
         task2MissingEvidence: task2.missingEvidence,
@@ -674,6 +620,7 @@ function transitionRow(root, file, retained) {
         presentationStretchRecoveryElapsedMs: stretch.recoveryElapsedMs,
         traceRequired,
         traceComplete,
+        traceEvidence,
         recoveryStatus: recovery ? recovery.status || "not_exposed" : "not_needed",
         recoveryTarget: recovery ? recovery.target || null : null,
         recoveryReceiptKey: retained.recoveryReceiptKey ||
@@ -699,8 +646,12 @@ function csvCell(value) {
 
 function csv(rows) {
     const columns = [
-        "lane", "pass", "ordinal", "method", "quality_mode", "render_scale_mode",
-        "render_verdict", "stability_status", "stability_presentation_disposition",
+        "lane", "pass", "ordinal", "strict_ms", "presentation_ms", "cleanup_ms",
+        "cleanup_tail_ms", "switch_health", "switch_timings", "retry_telemetry_status", "retry_outcome", "retry_count",
+        "retry_reasons", "viewport_waits", "retry_stabilization",
+        "method", "quality_mode", "render_scale_mode",
+        "actual_backend", "lane_qualification", "render_verdict", "stability_status",
+        "stability_presentation_disposition",
         "stability_left_eye_path", "stability_right_eye_path",
         "stability_controller_state", "stability_presentation_phase",
         "stability_failure_codes", "task2_verdict", "mutation_expectation",
@@ -712,7 +663,7 @@ function csv(rows) {
         "transition_evidence_complete",
         "physical_mutation_started", "final_method", "final_quality",
         "final_render_scale_mode", "final_state_revision", "trace_required",
-        "trace_complete", "recovery_status", "recovery_target",
+        "trace_complete", "trace_evidence", "recovery_status", "recovery_target",
         "recovery_receipt_key", "source_recovery_receipt_key",
         "presentation_stretch_selected",
         "presentation_stretch_consecutive_frames",
@@ -735,8 +686,15 @@ function csv(rows) {
     for (const row of rows) {
         const diagnostics = row.diagnostics;
         const note = row.nonStableNote;
-        const values = [row.lane, row.pass, row.ordinal, row.target.method,
-            row.target.qualityMode, row.target.renderScaleMode, row.renderVerdict,
+        const values = [row.lane, row.pass, row.ordinal,
+            row.switchTimings.strictMs, row.switchTimings.presentationMs,
+            row.switchTimings.cleanupMs, row.switchTimings.cleanupTailMs,
+            row.switchHealth, row.switchTimings,
+            row.retryTelemetry.status, row.retryTelemetry.outcome, row.retryTelemetry.retryCount ?? "n.d.",
+            row.retryTelemetry.retryReasons, JSON.stringify(row.retryTelemetry.waits),
+            JSON.stringify(row.retryTelemetry.stabilization), row.target.method,
+            row.target.qualityMode, row.target.renderScaleMode, row.actualBackend, JSON.stringify(row.laneQualification),
+            row.renderVerdict,
             note ? note.status : "stable",
             note ? note.presentationDisposition : "n/a",
             note ? note.leftEyePath : "n/a",
@@ -754,6 +712,7 @@ function csv(rows) {
             row.physicalMutationStarted,
             row.finalMethod, row.finalQuality, row.finalRenderScaleMode,
             row.finalStateRevision, row.traceRequired, row.traceComplete,
+            row.traceEvidence,
             row.recoveryStatus, row.recoveryTarget, row.recoveryReceiptKey,
             row.sourceRecoveryReceiptKey,
             row.presentationStretchSelected,
@@ -787,6 +746,16 @@ function csv(rows) {
 function report(summary) {
     const rows = summary.transitions.map((row) => {
         const note = row.nonStableNote;
+        const retry = row.retryTelemetry;
+        const waits = retry.waits.map(wait => `${wait.role}: ` +
+            (wait.observedWaitMs === null ? `n.d. (${wait.status}` +
+                (wait.observedUntilClosureMs === null ? "" :
+                    `; observed until closure: ${wait.observedUntilClosureMs.toFixed(3)} ms`) + ")" :
+                `${wait.observedWaitMs.toFixed(3)} ms`)).join("; ") ||
+            (retry.status === "complete" ? "none observed" : `n.d. (${retry.status})`);
+        const settle = retry.stabilization.map(entry => entry.status !== "complete" ? "n.d. (incomplete)" :
+            entry.readyToCandidateMs === null ? "n.d. (no viewport observation)" :
+                `${entry.readyToCandidateMs.toFixed(3)} ms`).join("; ") || "n.d.";
         const stability = note ?
             `not stable: ${note.presentationDisposition}; ` +
                 `${note.leftEyePath}/${note.rightEyePath}; ` +
@@ -796,7 +765,14 @@ function report(summary) {
                 "started after reset" : row.recoveryStatus;
         return (
         `| ${row.lane || "default"} | ${row.pass} | ${row.ordinal} | ` +
-        `${row.renderVerdict} | ${stability} | ${row.task2Verdict} | ` +
+        `${retry.outcome} (${retry.status}) | ` +
+        `${retry.retryCount === null ? "n.d." : retry.retryCount} | ` +
+        `${retry.retryReasons.join("; ") || retry.status} | ${waits} | ${settle} | ` +
+        `${row.actualBackend} | ${row.laneQualification.verdict}: ${row.laneQualification.reasons.join("; ") || "qualified/inapplicable"} | ${row.renderVerdict} | ${stability} | ` +
+        `${row.task2Verdict} | ` +
+        `${row.traceRequired ? (row.traceComplete ?
+            `${row.traceEvidence.records} records / ${row.traceEvidence.pages} pages` :
+            row.traceEvidence.reason) : "not_applicable"} | ` +
         `${row.presentationStretchSelected ?
             row.presentationStretchConsecutiveFrames : "none"} | ` +
         `${row.presentationStretchRecovered ?
@@ -824,7 +800,10 @@ function report(summary) {
         `- Assay execution: **${summary.assayExecution.status}**\n` +
         `- Transitions dispatched: **${summary.assayExecution.transitionsDispatched}/` +
         `${summary.assayExecution.expectedTransitions}**\n` +
-        `- Render verdict: **${summary.render.verdict}**\n` +
+        `- Terminal render verdict: **${summary.render.verdict}** (terminal condition only)\n` +
+        `- Lane qualification: **${summary.laneQualification.verdict}**\n` +
+        `- Full-history switch health: **${summary.switchHealth.status}**\n` +
+        `- Change assessment: **${summary.changeAssessment.status}**\n` +
         `- Non-stable terminal notes: **${summary.stabilityNotes.count}**\n` +
         `- Task 2/evidence: **per transition** ` +
         `(${summary.task2Evidence.counts.PASS} PASS, ` +
@@ -848,8 +827,7 @@ function report(summary) {
                 recovery.safeTerminal.satisfied})\n` : "") +
         (recoveryReasons.length > 0 ?
             `- Recovery blockers: **${recoveryReasons.join("; ")}**\n` : "") +
-        (summary.memoryConfirmation ?
-            `- Memory confirmation: **${summary.memoryConfirmation.verdict}**\n` : "") +
+        `- Memory confirmation: **${summary.memoryConfirmation.verdict}**\n` +
         `- Presentation stretch: **` +
         `${summary.presentationStretchAnomalies.selected} selected, ` +
         `${summary.presentationStretchAnomalies.recoveredPass} recovered PASS, ` +
@@ -859,10 +837,18 @@ function report(summary) {
         `rewrite the render result, and a render pass does not hide missing ` +
         `per-transition evidence. Every raw JSON value is available in ` +
         `\`${summary.evidenceExtraction.path}\`.\n\n` +
+        healthReport(summary.switchHealth) +
+        memoryReport(summary.memoryConfirmation) +
         `## Transitions\n\n` +
-        `| Lane | Pass | Row | Render | Stability | Task 2 | Stretch frames | Stretch recovery | Recovery | Authority | Reported violations | ` +
+        `Retry waits end at the first observed preparation-ready result. ` +
+        `Ready-to-candidate includes stereo qualification and the settling guard; ` +
+        `it is not isolated retry overhead. Overlapping viewport waits are not added. ` +
+        `Unavailable results are n.d. and the affected reporting outcome is n/a. ` +
+        `All retrieved values remain in raw evidence and evidence-values.csv; ` +
+        `reporting provenance never aborts or replays measurements.\n\n` +
+        `| Lane | Pass | Row | Retry telemetry | Retries | Retry reasons | Viewport wait | Ready-to-candidate | Actual backend | Lane qualification | Render | Stability | Task 2 | Trace evidence | Stretch frames | Stretch recovery | Recovery | Authority | Reported violations | ` +
         `Missing evidence | Invalid producer evidence |\n` +
-        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n\n` +
+        `| --- | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n${rows}\n\n` +
         `## Presentation stretch anomalies\n\n` +
         `| Lane | Pass | Row | From | To | Consecutive frames | Recovered PASS |\n` +
         `| --- | ---: | ---: | --- | --- | ---: | --- |\n` +
@@ -894,12 +880,124 @@ function presentationStretchAnomalies(rows) {
 
 function writeAtomic(file, content) {
     const temporary = `${file}.tmp-finalizer`;
-    fs.writeFileSync(temporary, content);
-    fs.renameSync(temporary, file);
+    let descriptor;
+    try {
+        descriptor = fs.openSync(temporary, "w");
+        try {
+            if (typeof content === "function") content(descriptor);
+            else fs.writeFileSync(descriptor, content);
+        } finally {
+            fs.closeSync(descriptor);
+        }
+        fs.renameSync(temporary, file);
+    } finally {
+        if (descriptor !== undefined) fs.rmSync(temporary, { force: true });
+    }
 }
 
 function sha256(file) {
-    return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+    const hash = crypto.createHash("sha256");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    const descriptor = fs.openSync(file, "r");
+    try {
+        let bytes;
+        while ((bytes = fs.readSync(descriptor, buffer, 0, buffer.length, null)) > 0) {
+            hash.update(buffer.subarray(0, bytes));
+        }
+    } finally {
+        fs.closeSync(descriptor);
+    }
+    return hash.digest("hex");
+}
+
+function* journalLines(file) {
+    const fd = fs.openSync(file, "r");
+    let offset = 0, parts = [], length = 0;
+    try {
+        const buffer = Buffer.allocUnsafe(64 * 1024);
+        let bytes;
+        while ((bytes = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+            let start = 0;
+            for (let i = 0; i < bytes; i++) {
+                if (buffer[i] !== 10) continue;
+                parts.push(Buffer.from(buffer.subarray(start, i)));
+                length += i - start;
+                yield { entry: JSON.parse(Buffer.concat(parts, length).toString("utf8")), offset, length };
+                offset += length + 1; parts = []; length = 0; start = i + 1;
+            }
+            if (start < bytes) {
+                parts.push(Buffer.from(buffer.subarray(start, bytes))); length += bytes - start;
+            }
+        }
+        if (length) throw new Error("receipt_journal_incomplete_line");
+    } finally { fs.closeSync(fd); }
+}
+
+function readJournalRevision(reference) {
+    if (reference.offset === undefined) return readJson(reference.file).value;
+    const fd = fs.openSync(reference.file, "r");
+    try {
+        const buffer = Buffer.allocUnsafe(reference.length);
+        let read = 0;
+        while (read < buffer.length) {
+            const bytes = fs.readSync(fd, buffer, read, buffer.length - read, reference.offset + read);
+            if (!bytes) throw new Error("receipt_journal_truncated");
+            read += bytes;
+        }
+        return JSON.parse(buffer.toString("utf8")).value;
+    } finally { fs.closeSync(fd); }
+}
+
+function materializeReceiptJournal(root, runId) {
+    const directory = path.join(root, "raw", "journal");
+    const document = path.join(root, "raw", "journal.ndjson");
+    const latest = new Map();
+    const retain = (entry, reference) => {
+        if (typeof entry.receiptKey !== "string" || !entry.receiptKey.startsWith(`${runId}:`)) {
+            throw new Error("receipt_journal_run_mismatch");
+        }
+        latest.set(entry.receiptKey.slice(runId.length + 1), reference);
+    };
+    for (const name of fs.existsSync(directory) ? fs.readdirSync(directory).sort() : []) {
+        if (!/^\d{6}\.json$/.test(name)) continue;
+        const file = path.join(directory, name);
+        retain(readJson(file), { file });
+    }
+    if (fs.existsSync(document)) {
+        if (latest.size) throw new Error("receipt_journal_formats_mixed");
+        let sequence = 0;
+        for (const { entry, offset, length } of journalLines(document)) {
+            if (entry.sequence !== ++sequence) throw new Error("receipt_journal_sequence_gap");
+            retain(entry, { file: document, offset, length });
+        }
+    }
+    for (const [key, reference] of latest) {
+        let relativePath;
+        if (/^startup-(prepare|positioning)$/.test(key)) {
+            relativePath = `raw/startup/${key.slice(8)}.json`;
+        } else if (key === "live-result") {
+            relativePath = "raw/live-result.json";
+        } else {
+            const row = key.match(/^([^:]+):pass-(\d+):transition-(\d+)(?::(scenario|trace-page-\d+|recovery))?$/);
+            const pass = key.match(/^([^:]+):pass-(\d+):([a-z-]+)$/);
+            if (row) relativePath = `raw/lane-${row[1]}/pass-${row[2]}/transitions/` +
+                `${row[3].padStart(2, "0")}/${row[4] || "retained"}.json`;
+            else if (pass) relativePath = `raw/lane-${pass[1]}/pass-${pass[2]}/` +
+                (pass[3] === "baseline" ? "baseline/baseline" :
+                    pass[3].includes("cleanup") ? `finalization/${pass[3]}` : pass[3]) + ".json";
+            else continue;
+        }
+        const value = readJournalRevision(reference);
+        const file = path.join(root, relativePath);
+        if (fs.existsSync(file)) {
+            if (JSON.stringify(readJson(file)) !== JSON.stringify(value)) {
+                throw new Error("receipt_projection_already_exists");
+            }
+            continue;
+        }
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        writeAtomic(file, `${JSON.stringify(value)}\n`);
+    }
 }
 
 function finalizeEvidence(options) {
@@ -908,6 +1006,7 @@ function finalizeEvidence(options) {
     if (!fs.statSync(root).isDirectory() || !["nvidia", "amd"].includes(variant)) {
         throw new Error("invalid_finalization_options");
     }
+    materializeReceiptJournal(root, options.runId);
     const retainedFiles = walk(root).filter((file) =>
         path.basename(file) === "retained.json" && rowIdentity(root, file));
     const allRetained = retainedFiles.map((file) => ({ file, value: readJson(file) }));
@@ -915,10 +1014,6 @@ function finalizeEvidence(options) {
         transitionWasDispatched(entry.value));
     const undispatchedFailures = allRetained.filter((entry) =>
         !transitionWasDispatched(entry.value));
-    const rows = retained.map(({ file, value }) => transitionRow(root, file, value))
-        .sort((left, right) => (left.lane || "").localeCompare(right.lane || "") ||
-            left.pass - right.pass || left.ordinal - right.ordinal);
-
     const existingSummaryPath = path.join(root, "summary.json");
     const existing = fs.existsSync(existingSummaryPath) ? readJson(existingSummaryPath) : {};
     const runIds = unique([options.runId, existing.runId]);
@@ -926,8 +1021,18 @@ function finalizeEvidence(options) {
     if (runIds.length !== 1 || buildIds.length !== 1) {
         throw new Error("finalization_identity_ambiguous");
     }
-    const interrupted = interruptedLiveResult(
-        root, variant, runIds[0]);
+    for (const entry of allRetained) {
+        if (!entry.value || entry.value.variant !== variant) {
+            throw new Error("terminal_receipt_variant_mismatch");
+        }
+    }
+    const laneContext = readLaneContext(root);
+    const rows = retained.map(({ file, value }) => transitionRow(root, file, value, laneContext))
+        .sort((left, right) => (left.lane || "").localeCompare(right.lane || "") ||
+            left.pass - right.pass || left.ordinal - right.ordinal);
+    const liveResult = readLiveResult(root, variant, runIds[0]);
+    const interrupted = liveResult && liveResult.status === "INTERRUPTED" ?
+        liveResult : null;
     const interruptedPass = interrupted && interrupted.lanes && interrupted.lanes
         .flatMap((lane) => lane.passes || [])
         .find((pass) => pass.status === "INTERRUPTED");
@@ -978,15 +1083,35 @@ function finalizeEvidence(options) {
     if (rows.some((row) => !row.traceComplete)) {
         reportingReasons.push("required_trace_evidence_incomplete");
     }
+    if (rows.some(row => row.retryTelemetry.status !== "complete")) {
+        reportingReasons.push("retry_telemetry_incomplete");
+    }
+    if (rows.some((row) => row.renderVerdict === "PASS" &&
+        row.actualBackend === "not_exposed")) {
+        reportingReasons.push("reporting_contract_incomplete");
+    }
+    if (variant === "amd" && (!liveResult || !liveResult.traceCapability ||
+        liveResult.traceCapability.status !== "supported")) {
+        reportingReasons.push("amd_trace_capability_evidence_incomplete");
+    }
     const deployment = deploymentVerification(root, buildIds[0], options);
     if (!deployment.complete) reportingReasons.push(deployment.reason);
+    const memory = memoryConfirmation({ root, variant, buildId: buildIds[0],
+        liveResult, writeAtomic, retained: retained.map(({ file, value }) => ({
+            ...rowIdentity(root, file), stressSessionId: value.waiter.baseline.stressSessionId,
+        })) });
+    if (memory.status !== "complete") reportingReasons.push("memory_evidence_incomplete");
+    const health = switchHealthSummary(root, rows, buildIds[0]);
+    if (health.evidenceStatus !== "COMPLETE") reportingReasons.push("switch_health_evidence_incomplete");
     const reportingStatus = reportingReasons.length === 0 ? "COMPLETE" : "INCOMPLETE";
     const extraction = evidenceValues(root);
     const generatedUtc = options.generatedUtc || existing.generatedUtc ||
         "not_exposed";
     const summary = {
         ...existing,
-        schemaVersion: `renderscale-tuning-${variant}-summary-v5`,
+        build: { ...(existing.build || {}), ...(retained[0]?.value.waiter.producer || {}),
+            buildId: buildIds[0] },
+        schemaVersion: `renderscale-tuning-${variant}-summary-v6`,
         protocol: `renderscale-tuning-${variant}`,
         runId: runIds[0],
         generatedUtc,
@@ -1010,7 +1135,21 @@ function finalizeEvidence(options) {
                 undispatchedTransitionReceipts: undispatchedFailures.map((entry) =>
                     relative(root, entry.file)),
             } : null },
-        render: { verdict: renderVerdict },
+        render: { verdict: renderVerdict, scope: "terminal_condition_only" },
+        laneQualification: { verdict: rows.some(row => row.laneQualification.verdict === "FAIL") ? "FAIL" :
+            variant === "amd" ? (assayStatus === "COMPLETE" ? "PASS" : "INCONCLUSIVE") : "NOT_APPLICABLE",
+            counts: rows.reduce((counts, row) => {
+                const verdict = row.laneQualification.verdict;
+                counts[verdict] = (counts[verdict] || 0) + 1;
+                return counts;
+            }, {}),
+            scope: "lane_capability_and_physical_backend" },
+        switchHealth: health,
+        changeAssessment: { status: health.passes.some(pass => pass.healthStandard === "NOT_MET") ?
+            "DOES_NOT_MEET_STANDARD" : "INCONCLUSIVE", scope: "improvement_or_neutral",
+            reasons: health.passes.some(pass => pass.healthStandard === "NOT_MET") ?
+                ["observed_health_findings_or_unmet_cumulative_gates"] : ["paired_comparison_required"],
+            changesTestResult: false },
         stabilityNotes: { count: nonStableTransitions.length,
             transitions: nonStableTransitions },
         presentationStretchAnomalies: presentationStretchAnomalies(rows),
@@ -1019,9 +1158,11 @@ function finalizeEvidence(options) {
         reporting: { status: reportingStatus, reasons: reportingReasons },
         reportingContract: { complete: reportingStatus === "COMPLETE",
             status: reportingStatus, reasons: reportingReasons },
+        traceCapability: variant === "amd" ?
+            liveResult && liveResult.traceCapability || { status: "missing" } :
+            { status: "not_applicable" },
         deploymentVerification: deployment,
-        memoryConfirmation: baselineOnlyInterrupted ?
-            baselineOnlyMemoryConfirmation() : existing.memoryConfirmation,
+        memoryConfirmation: memory,
         evidenceExtraction: { complete: true,
             path: "evidence-values.csv",
             format: "rfc6901-json-pointer-long-form-csv",
@@ -1039,7 +1180,6 @@ function finalizeEvidence(options) {
     writeAtomic(path.join(root, "summary.json"), summaryText);
     writeAtomic(path.join(root, "transitions.csv"), csvText);
     writeAtomic(path.join(root, "report.md"), reportText);
-    writeAtomic(path.join(root, "evidence-values.csv"), extraction.text);
 
     const files = walk(root).filter((file) =>
         path.basename(file) !== "receipt-index.json" &&
@@ -1054,6 +1194,8 @@ function finalizeEvidence(options) {
         task2Evidence: { mode: "per_transition", counts: task2Counts,
             aggregateVerdict: "NOT_COMPUTED" },
         reportingStatus,
+        switchHealthStatus: health.status,
+        changeAssessment: summary.changeAssessment,
         files: files.map((file) => ({ path: relative(root, file),
             bytes: fs.statSync(file).size, sha256: sha256(file) })),
     };
@@ -1092,7 +1234,9 @@ if (require.main === module) {
             renderVerdict: result.summary.render.verdict,
             task2EvidenceMode: result.summary.task2Evidence.mode,
             task2RowCounts: result.summary.task2Evidence.counts,
-            reportingStatus: result.summary.reporting.status })}\n`);
+            reportingStatus: result.summary.reporting.status,
+            switchHealthStatus: result.summary.switchHealth.status,
+            changeAssessment: result.summary.changeAssessment })}\n`);
     } catch (error) {
         process.stderr.write(`${error.stack || error}\n`);
         process.exitCode = 1;
@@ -1100,6 +1244,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+    sourceProfile,
+    actualBackend,
+    laneQualification,
+    readLaneContext,
     collectTracePages,
     deploymentVerification,
     finalizeEvidence,

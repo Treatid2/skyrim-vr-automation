@@ -6,7 +6,7 @@ run the Simple CSM matrix and never mutates a profile through
 
 ## 1. Bind and prepare
 
-The NVIDIA `SKILL.md` owns runtime-only `prepare_coc`, positioning, baseline,
+The NVIDIA `SKILL.md` owns runtime-only `prepare_tuning`, positioning, baseline,
 handoff, and the measured live loop before this file is read. Read this file
 only after a pass completes or is interrupted, for cumulative evidence,
 guarded finalization, and reporting. Do not repeat live reads or add another
@@ -14,17 +14,20 @@ preflight phase.
 Sections 2 and 3 audit actions already executed by the live skill; never replay
 them when this file is loaded for finalization.
 
-Use the installed plugin's direct DevBench MCP tools exclusively for every
-NVIDIA baseline, transition, evidence read, and guarded cleanup. Do not
-enumerate tools, audit schemas, use a controller, switch lanes, or generate a
-local orchestration script. If one of the named direct calls is unavailable,
-stop with `plugin_direct_unavailable`; there is no fallback transport.
+Startup uses the installed plugin's direct DevBench MCP tools. After
+positioning, the packaged detached worker uses the same selected endpoint
+from `.mcp.json`, one persistent session, and the positioned PID and bound
+Build ID. Do not enumerate tools, audit schemas, use a controller, select an
+alternate endpoint, or generate another orchestration script. A lost session
+permits one replacement on that exact endpoint solely for ownership-guarded
+cleanup, never resumed measurement or mutation replay.
 
-Require `status.adapter.available: true` and NVIDIA vendor ID `0x10DE`/4318 in
-the positioning `communityshaders.renderscale status` result. This is the
-bound active D3D adapter; do not substitute generic process inventory or a
-description string. Retain the fixture receipt and the single positioning
-scenario response.
+Require `status.adapter.available: true` and NVIDIA vendor ID `0x10DE`/4318
+in existing stress-start receipts and terminal waiters. A safe non-stable
+waiter without status retains the verified identity of its exact stress
+session. Missing or mismatched identity stops measurement with diagnostics.
+Do not add an adapter gate to positioning: its render-scale result is opaque.
+Retain the fixture receipt and the single positioning scenario response.
 
 Require public capabilities to expose DLSS, FSR, every matrix quality mode,
 and FSR3 before the baseline. Missing capability is `BLOCKED`; do not replace a
@@ -43,7 +46,7 @@ At native resolution they remain inactive with backend `none`, but retain the
 exact logical method and never replace a public profile.
 
 The live skill passes packaged `matrix.v1.json` unchanged to the deterministic
-runner in the positioning orchestration cell. Do not reopen, revalidate, or
+runner in the detached worker launched after positioning. Do not reopen, revalidate, or
 summarize the matrix while reading this protocol.
 
 ## 2. Establish the NVIDIA baseline
@@ -278,10 +281,10 @@ preparation, telemetry, and trace history once, correlate it by transition
 ID/QPC/frame, and write and hash the complete evidence bundle in one local
 batch. A response-store handle is permitted during the live loop but every
 retained terminal response must be a decoded raw file in the completed bundle.
-This per-transition evidence requirement does not duplicate `prepare_coc` or
+This per-transition evidence requirement does not duplicate `prepare_tuning` or
 the positioning scenario. Materialize their stored exact receipts once under
 `raw/startup` during finalization. Missing startup evidence is explicitly
-`startup_evidence_incomplete`, forbids a ledger append, and never replays the
+`startup_evidence_incomplete`, labels unavailable ledger metrics, and never replays the
 startup calls or changes completed row classifications.
 
 A semantic strict timeout, unsatisfied milestone, or native-stability timeout
@@ -368,6 +371,52 @@ stale old-provider dispatch after mutation, or ordinary-world fallback caused
 solely by pre-mutation replacement admission is a transition `FAIL`.
 
 ## 4. Completion and evidence rules
+
+Read retry diagnostics from the existing terminal waiter's
+`status.retryTelemetry` (schema version 1), retaining the complete object.
+`observation.status.retryTelemetry` is the equivalent fallback. Do not add a
+live read, polling loop, wait or admission gate to obtain these diagnostics.
+The finalizer owns interpretation through
+`tools/renderscale-tuning-finalizer/retry-telemetry.js`.
+
+Correlate the producer Build ID, stress session, request ID and transition epoch
+with that exact transition and its dispatch-to-terminal QPC window. Preserve
+every non-coalesced `Retry` reason/category and source file/line. Correlate each
+`ViewportWaitEnd` with its `ViewportWaitBegin` sequence, role and generation;
+report the observed pending-to-ready milliseconds, cache/slot/victim details,
+initial/final fence result and pending-observation count. Failed, cancelled,
+superseded, stopped and unresolved waits remain explicit unavailable durations.
+Never sum overlapping full-eye and foveated-center waits as transition cost.
+Retain the full ring inside the waiter once. Validate its unbroken sequence,
+sample ownership and QPC ordering before deriving counts or durations. An
+overwrite before a fully retained transition window is not a gap in that
+transition. Invalid global evidence leaves counts and timings unavailable;
+an invalid individual wait leaves its duration unavailable while an
+independently verified retry count remains usable.
+
+Keep `GuardArmed`, `ProofRevoked`, `SettleGuardSatisfied`, `PromotionCandidate`, `Promoted`, and
+`GuardCleared` events. Report ready-to-candidate and candidate-to-promotion
+intervals separately from viewport waits. The six-frame guard overlaps stereo
+qualification; neither retry-to-stable nor ready-to-candidate is isolated retry
+overhead. Preserve the applicable guard deadline, first observed satisfied
+guard age, and requeue-to-admission as observed scheduler backoff. A guard
+already satisfied before readiness does not imply a negative wait duration.
+Include immediate `ViewportReady` observations when finding the final ready
+role. Require the same uninterrupted guard segment for its candidate and
+promotion, with valid stereo counts and any required minimum guard age.
+Cleared or replaced guards cannot supply another segment's missing milestone.
+
+Put diagnostic status, retry count/reasons, per-role wait milliseconds and
+ready-to-candidate milliseconds directly after the transition identity in CSV
+and report columns. Keep all events and intervals in `summary.json` and retain
+the raw receipts. Missing telemetry is `not_exposed`, never zero retries.
+Unsupported schemas, invalid clocks or ownership, overwrites within the window and
+unmatched intervals make retry reporting incomplete. They do not change the
+render verdict, stop the worker, trigger recovery or authorize replay.
+Display unavailable measurements as `n.d.` and the affected reporting outcome
+as `n/a`, retaining the detailed reason. Keep every retrieved value in its raw
+receipt and the full `evidence-values.csv` export even when provenance cannot
+support a derived result. These checks run only during offline reporting.
 
 For scaled DLSS and FSR, require requested, effective, stable, and physical
 profiles to agree; scaled dimensions; coherent both-eye presentation; exact
@@ -574,13 +623,20 @@ fidelity violates this protocol.
 
 For each DLSS or DLAA transition, reset/start exactly one owned bounded DLSS
 trace after the row's five-second wait, then stop and bounded-read it after the
-terminal waiter in the same scenario. Retain the reset, start, stop, and raw
-read receipts together, and materialize them only at pass finalization.
+terminal waiter in the same scenario. Omit the initial read limit so the
+producer selects its supported default. Before another reset or transition,
+drain every continuation with the returned page bound and `afterSequence`.
+Retain the first read as `traceRead` and all ordered pages as `traceReadPages`,
+alongside the reset/start/stop receipts. Preserve each page before validating
+its build, session, cursor, sequence continuity, and stopped-window identity.
+An invalid or incomplete window stops later mutations. Journal these raw
+receipts during measurement before the next operation; finalization derives
+the analysis tables from the saved files.
 A missing trace action is `BLOCKED`; an exposed trace action that fails is a
 control failure. Do not start a DLSS trace for FSR, TAA, or None.
 
 Missing required trace lifecycle or raw-window evidence marks the evidence
-contract incomplete and forbids a ledger append, but it does not change an
+contract incomplete; label unavailable comparison metrics, but do not change an
 already completed row's render classification or authorize a replay.
 
 Unsupported preparation providers are `n/a`, never zero. Preserve raw values
@@ -594,6 +650,16 @@ native-resolution DLSS evaluation. TAA and None must not retain DLSS as the
 active presentation. Every FSR destination must retain configured FSR3 and
 resolve coherently to `fsr_host` or `fsr_runtime`; `fsr4_runtime` is a failure.
 Changing the logical native method must not retain the previous vendor.
+
+Native proof validation follows the producer's two evidence shapes. Snapshot
+proofs may omit `sharedVendorDispatchRequired`; cycle proofs may omit eye
+`valid` flags and record distinct per-eye QPC ticks. Explicit contradictory
+flags still fail. Require matching frame, compositor cycle, method/backend,
+epoch, resource revision, dimensions, device, and owner; the proof timestamp
+must equal the latest of its two eye timestamps. None/TAA require zero
+generations and no vendor dispatch. Native DLAA/vendor AA may use generation
+zero only with coherent same-frame, same-backend vendor execution for both
+eyes. Scaled vendor proofs retain positive generation requirements.
 
 No exact temporal/input tuple may receive duplicate Streamline evaluation. An
 `eErrorDuplicatedConstants` is a transition `FAIL` even if presentation recovers;
@@ -630,19 +696,24 @@ for example:
 This validation is finalization-only and must not insert another read, wait,
 or gate between measured rows or passes. Treat an unsupported optional
 operation or event history action as `not_exposed`; it must not abort the later
-status, telemetry, or cleanup reads. During live finalization,
-its `collectTracePages` helper obtains the maximum page size from the live
-producer schema, pages with `afterSequence` while `moreAvailable` is true, and
-rejects gaps, duplicates, overwritten requests, or build/session changes.
-Never supply an invented client limit. Materialize each raw page before
-validating it. Offline restart uses the retained per-row trace evidence and
+status, telemetry, or cleanup reads. The runner and finalizer share the
+`collectTracePages` helper and trace validation. Never supply an invented client limit.
+It advances `afterSequence` while `moreAvailable` and rejects gaps, duplicates, overwritten requests,
+or changed build/session identity. The live runner drains each stopped row using the producer's
+returned default page bound before any later reset; it never invents a client
+limit. The offline finalizer validates all retained pages through an explicit
+`moreAvailable: false`, including record totals, dropped/overwritten counters,
+and build/session ownership. Merely retaining a read receipt is insufficient.
+Missing pages keep reporting `INCOMPLETE` without changing render truth or
+authorizing a replay. Offline restart uses the retained per-row trace evidence and
 does not issue a live read. The finalizer must be restartable from the exact
 run/build/session-owned retained files and must never replay an in-game
 transition. It writes `summary.json`, `transitions.csv`,
 `evidence-values.csv`, `report.md`, and `receipt-index.json` atomically only
 after validation. Do not hash or render per
 row. An evidence root containing only `summary.json` and `transitions.csv` is
-incomplete and cannot support a ledger append.
+incomplete; it can still support a clearly labeled partial comparison using
+the measurements actually retained.
 
 If the live runner stops at baseline before any measured row, retain
 `raw/live-result.json` and the exact baseline waiter receipt. Run the same
@@ -660,8 +731,11 @@ counts. When a required mutation has no
 Task 2 `INCONCLUSIVE`; preserve its phase counters as non-authoritative raw
 observations. With a valid boundary, all existing post-boundary failure rules
 remain strict.
-Append one uniquely headed result column only after the complete two-pass
-comparison.
+Append one uniquely headed result column for a complete or partial comparison.
+State execution/reporting status, dispatched and retained row counts, and
+missing evidence explicitly. Use `n/a` for unavailable metrics; never replace
+missing measurements with zero or discard usable data because another facet
+is incomplete.
 
 ### Memory confirmation result
 
@@ -679,8 +753,41 @@ Write a `memoryConfirmation` object to `summary.json` containing
 computed deltas and ratios, `predicateInputs`, and `verdict`. Include `pass`
 in every `transitions.csv` row.
 
+The offline finalizer reconstructs this object on every invocation, even when
+no previous summary exists. Read its generated object and table directly;
+never carry forward a manually supplemented `memoryConfirmation`. Its
+`boundaries` contain each group's start/end/delta metrics, `retainedBoundaries`
+identify the exact receipts and stress/texture sessions, and `deltas`,
+`ratios`, `predicateInputs`, and `issues` retain the calculation and gaps.
+
+Use the measured stress/texture starts in each pass's `handoff.json` and the
+`finalization/final-status-before-cleanup.json` snapshots as pass boundaries.
+Use pass 1's `cooldown-start.json` and `cooldown-end.json` for cooldown, and
+read the observed wait duration from `cooldown.json`. These files live under
+`raw/lane-nvidia/pass-N`; the finalizer also supports the legacy
+`raw/pass-N` layout. It copies the six complete envelopes byte for byte to
+`raw/memory/<boundary>.json` before extraction and receipt indexing. An
+existing conflicting copy is a reporting gap; retain both it and the source,
+reference the source directly, and continue reporting without overwriting either.
+
+Check each memory and texture result's Build ID and session identity. Invalid
+or unavailable metrics are null in JSON and `n.d.` in the table, with explicit
+reasons; missing data never means zero growth. Incomplete texture tracking or
+unknown texture estimates prevent a conclusive memory classification.
+Validate capture activity, the stress start frame, and chronological sample
+frames across all six boundaries. `passesCompleted` requires exact fixed-matrix
+receipt coverage for each pass, with no duplicate ordinals. `coverage` records
+expected, retained, and missing transitions. Worker lifecycle status cannot
+complete missing measurements or erase a fully measured pass. Missing or
+invalid required memory evidence adds
+`memory_evidence_incomplete` to reporting without rewriting the render result.
+The memory `outcome` is `n/a` when evidence cannot support classification.
+Every retrieved value remains in the raw receipts and `evidence-values.csv`.
+Memory provenance gaps never abort, pace, or replay the assay; reconstruction
+runs only after measurement, and unaffected results remain reportable.
+
 Compute a ratio only when the pass 1 delta is positive; otherwise report
-`n/a`. Classify memory separately from render correctness:
+`n.d.`. Classify memory separately from render correctness:
 
 - `retention_signal` requires pass 2 process-private and system-commit growth
   each to be at least 75 percent of its positive pass 1 growth, plus positive
@@ -689,9 +796,9 @@ Compute a ratio only when the pass 1 delta is positive; otherwise report
   growth each to be no more than 25 percent of its positive pass 1 growth and
   no positive pass 2 increase in DXGI usage, live texture count, or live
   texture bytes.
-- Every other complete comparison is `inconclusive`. A missing repeat is
-  `repeat_not_completed`, makes the assay `INTERRUPTED`, and forbids a ledger
-  append.
+- Every other complete comparison is `inconclusive`. Missing repeat evidence
+  is `repeat_not_completed`, with unavailable metrics marked `n.d.` and outcome
+  `n/a`. This reporting gap does not change the assay's execution status.
 
 Always emit the memory table and `memoryConfirmation` object, including for an
 interrupted pass. When pass 2 never ran, set `passesCompleted` to the actual
@@ -708,7 +815,7 @@ render verdict separately. Memory growth alone never changes a transition's
 
 Treat each comparison-ledger column append as one transaction. Use exactly
 `docs/development/vr-render-scale-comparison-ledger.csv`; never search for a
-ledger. Read and parse it once after both passes for the comparison finish,
+ledger. Read and parse it once after measurement completes or stops,
 retain its original hash, and compose the
 complete candidate before any ledger write. Reject the candidate unless it has
 the same ordered metric rows and row count, exactly one additional rightmost
@@ -810,6 +917,25 @@ If the matrix ends early, label every entry that was never dispatched
 `NOT RUN`, never `BLOCKED`. Reserve `BLOCKED` for a row whose required admission
 or precondition failed before its mutation. Report the overall assay as
 `INTERRUPTED` while retaining the exact classifications of completed rows; do
-not convert it to overall `FAIL` merely because later rows were not run. Do not
-append the comparison ledger for an interrupted matrix. Print the complete
+not convert it to overall `FAIL` merely because later rows were not run.
+Include the available measurements in a clearly labeled partial ledger column. Print the complete
 tables and evidence paths, then stop; do not start another protocol.
+
+### Retention and partial comparisons
+
+Retain measurements as they arrive. After positioning, the worker queues an
+immutable copy of each scenario envelope and row revision before the next
+operation. A dedicated writer appends one `raw/journal.ndjson` document;
+disk acknowledgements and flushes never gate a transition or pass. Preserve
+the first trace page and all continuation pages before any reset. Repeated
+keys append new revisions without overwriting earlier evidence. Startup
+envelopes and the final live result use the same journal. An existing run
+directory is never reused for a new run. Drain and flush after all runnable
+lanes and ownership cleanup before reporting evidence complete.
+
+Offline finalization materializes the latest revision for each key from the
+journal, preserving every original revision. It does not depend on turn-local
+`store()` surviving. Partial runs remain valid comparison inputs. Report the
+measurements that exist, label incomplete execution/evidence and unavailable
+metrics, and preserve prior ledger cells. Missing evidence is not a reason to
+discard available timings or memory samples or to deny a partial comparison.

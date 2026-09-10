@@ -81,6 +81,9 @@ Run Codex non-interactively
         if (($CommandArguments -join '|') -in @('--help', 'exec|--help')) {
             return [pscustomobject]@{ exitCode = 0; stdout = $fakeHelp; stderr = ''; timedOut = $false }
         }
+        if ('--model' -in $CommandArguments) {
+            return [pscustomobject]@{ exitCode = 0; stdout = '{"type":"turn.completed"}'; stderr = ''; timedOut = $false }
+        }
         throw "Unexpected preflight arguments: $($CommandArguments -join ' ')"
     }
     $pwshPath = [IO.Path]::GetFullPath([string](Get-Command pwsh -CommandType Application | Select-Object -First 1).Source)
@@ -89,6 +92,7 @@ Run Codex non-interactively
     Assert-ProviderTest $preflight.ok "The fake preflight did not pass: $($preflight.errors -join ' | ')"
     Assert-ProviderTest ($preflight.version -eq '9.8.7-test') 'The preflight did not preserve the Codex version.'
     Assert-ProviderTest (@($preflight.missingFeatures).Count -eq 0) 'The preflight reported missing required CLI features.'
+    Assert-ProviderTest ($preflight.model -eq 'gpt-5.6-sol' -and $preflight.modelProbe.ok) 'The preflight did not prove the selected model before qualification.'
 
     $missingFeatureAdapter = {
         param([string]$ExecutablePath, [string[]]$CommandArguments, [int]$TimeoutMilliseconds)
@@ -102,6 +106,35 @@ Run Codex non-interactively
         -CommandAdapter $missingFeatureAdapter
     Assert-ProviderTest (-not $failedPreflight.ok) 'A preflight with missing CLI features passed.'
     Assert-ProviderTest (@($failedPreflight.missingFeatures).Count -gt 0) 'Missing CLI features were not reported.'
+
+    $stderrAdapter = {
+        param([string]$ExecutablePath, [string[]]$CommandArguments, [int]$TimeoutMilliseconds)
+
+        return [pscustomobject]@{ exitCode = 9; stdout = ''; stderr = "  diagnostic detail  `r`n"; timedOut = $false }
+    }
+    $stderrPreflight = Get-CSXCodexVisualReviewProviderPreflight -CodexExecutable $pwshPath `
+        -CommandAdapter $stderrAdapter
+    Assert-ProviderTest (-not $stderrPreflight.ok) 'A failed CLI preflight passed.'
+    foreach ($label in @('Codex --version failed', 'Codex --help failed', 'Codex exec --help failed')) {
+        Assert-ProviderTest ($label + ': diagnostic detail' -in @($stderrPreflight.errors)) "$label did not preserve trimmed stderr."
+    }
+    Assert-ProviderTest (-not (@($stderrPreflight.errors) -join ' | ').Contains('.Trim()')) 'Preflight failure evidence contains a literal Trim call.'
+
+    $modelFailureAdapter = {
+        param([string]$ExecutablePath, [string[]]$CommandArguments, [int]$TimeoutMilliseconds)
+
+        if (($CommandArguments -join '|') -eq '--version') {
+            return [pscustomobject]@{ exitCode = 0; stdout = "codex-cli 9.8.7-test`n"; stderr = ''; timedOut = $false }
+        }
+        if (($CommandArguments -join '|') -in @('--help', 'exec|--help')) {
+            return [pscustomobject]@{ exitCode = 0; stdout = $fakeHelp; stderr = ''; timedOut = $false }
+        }
+        return [pscustomobject]@{ exitCode = 2; stdout = ''; stderr = "  model unavailable  `n"; timedOut = $false }
+    }
+    $modelFailurePreflight = Get-CSXCodexVisualReviewProviderPreflight -CodexExecutable $pwshPath `
+        -CommandAdapter $modelFailureAdapter
+    Assert-ProviderTest (-not $modelFailurePreflight.ok -and -not $modelFailurePreflight.modelProbe.ok) 'An unavailable visual-review model passed preflight.'
+    Assert-ProviderTest ("Codex model capability probe failed for 'gpt-5.6-sol': model unavailable" -in @($modelFailurePreflight.errors)) 'Model capability failure was not reported with trimmed evidence.'
 
     $builderResponsePath = Join-Path $fakeWorkingDirectory 'builder response.json'
     $startInfo = New-CSXCodexVisualReviewProcessStartInfo -CodexExecutablePath $pwshPath `
@@ -121,7 +154,12 @@ Run Codex non-interactively
 
     $fakeExecPath = Join-Path $fakeWorkingDirectory 'fake codex exec.ps1'
     $fakeExec = @'
-param([Parameter(Mandatory)][string]$EncodedArguments)
+param(
+    [Parameter(Mandatory)][string]$EncodedArguments,
+    [Parameter(Mandatory)][string]$BarrierRoot,
+    [Parameter(Mandatory)][int]$PresentationPass,
+    [Parameter(Mandatory)][int]$Replicate
+)
 $ErrorActionPreference = 'Stop'
 $argumentsJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($EncodedArguments))
 $RemainingArguments = [string[]]@($argumentsJson | ConvertFrom-Json -Depth 20)
@@ -131,6 +169,14 @@ $responsePath = $RemainingArguments[$responseIndex + 1]
 $imageCount = @($RemainingArguments | Where-Object { $_ -eq '-i' }).Count
 $promptText = [Console]::In.ReadToEnd()
 $delay = if ($promptText -match 'delay=(?<delay>[0-9]+)') { [int]$Matches.delay } else { 500 }
+New-Item -ItemType Directory -Path $BarrierRoot -Force | Out-Null
+$readyPath = Join-Path $BarrierRoot "pass-$PresentationPass-replicate-$Replicate.ready"
+[IO.File]::WriteAllText($readyPath, '', [Text.UTF8Encoding]::new($false))
+$barrierDeadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
+while (@(Get-ChildItem -LiteralPath $BarrierRoot -Filter "pass-$PresentationPass-replicate-*.ready" -File).Count -lt 3) {
+    if ([DateTimeOffset]::UtcNow -ge $barrierDeadline) { throw 'replicate barrier timed out' }
+    [Threading.Thread]::Sleep(20)
+}
 [Threading.Thread]::Sleep($delay)
 $event = [ordered]@{
     type = 'fake.completed'
@@ -163,7 +209,14 @@ $response = [ordered]@{ fake = $true; imageCount = $imageCount; prompt = $prompt
         $replacement.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
         $argumentJson = @($OriginalStartInfo.CSXArguments) | ConvertTo-Json -Depth 10 -Compress
         $encodedArguments = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($argumentJson))
-        foreach ($argument in @('-NoLogo', '-NoProfile', '-File', $fakeExecPath, '-EncodedArguments', $encodedArguments)) {
+        $barrierRoot = Join-Path (Split-Path -Parent ([string]$OriginalStartInfo.CSXResponsePath)) '.replicate-barrier'
+        foreach ($argument in @(
+            '-NoLogo', '-NoProfile', '-File', $fakeExecPath,
+            '-EncodedArguments', $encodedArguments,
+            '-BarrierRoot', $barrierRoot,
+            '-PresentationPass', [string]$PresentationPass,
+            '-Replicate', [string]$Replicate
+        )) {
             [void]$replacement.ArgumentList.Add($argument)
         }
         return $replacement
@@ -172,7 +225,7 @@ $response = [ordered]@{ fake = $true; imageCount = $imageCount; prompt = $prompt
     $executionRoot = Join-Path $fakeWorkingDirectory 'successful execution'
     New-Item -ItemType Directory -Path $executionRoot | Out-Null
     $passes = New-ProviderTestPasses -Root $executionRoot -SchemaPath $schemaPath `
-        -Images @($imageOne, $imageTwo) -PromptSuffix 'delay=500'
+        -Images @($imageOne, $imageTwo) -PromptSuffix 'delay=25'
     $execution = Invoke-CSXCodexVisualReviewProvider -WorkingDirectory $fakeWorkingDirectory `
         -Passes $passes -Preflight $preflight -DeadlineSeconds 15 `
         -ProcessStartInfoAdapter $fakeProcessAdapter

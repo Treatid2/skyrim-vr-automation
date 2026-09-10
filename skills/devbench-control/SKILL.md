@@ -81,15 +81,18 @@ or construct HTTP or MCP requests ad hoc.
 12. Preserve the controller's `sessionCleanup` receipt with the command result.
    Cleanup is successful when it reports `closed`, `already_absent`, or
    `not_opened`; a cleanup failure is diagnostic and never changes the primary
-   operation result.
+   operation result. Likewise, once a call has completed, preserve its payload
+   and semantic outcome if terminal journal persistence fails; retain
+   `evidenceWarnings` and `evidenceJournalFinalized` with the cleanup receipt.
 13. If direct health succeeds but a redundant controller attempt returns a
    transport error, preserve that receipt as a runner-path anomaly. Continue
    on the already-selected direct lane; do not start a controller availability
    wait or classify the live DevBench service as unavailable.
 14. A server action's client transport envelope must exceed its `timeoutMs`.
    The selected controller derives `ceil(timeoutMs / 1000) + 5` seconds and
-   reports it as `requestTimeoutSeconds`; this never extends the server
-   measurement deadline. Set `-MaxTransientRetries 0` for ownership-bearing
+   binds it to the request and remaining operation budget at dispatch, then
+   reports the effective deadline; this never extends the server measurement
+   deadline. Set `-MaxTransientRetries 0` for ownership-bearing
    actions. If their response is lost, inspect the existing owner on the same
    lane and never replay the action or clean up its evidence prematurely.
 15. Preserve `invocationEvidencePath` for failed bundled calls. Never run

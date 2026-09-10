@@ -249,15 +249,12 @@ running public CSX profile is the sole observation source.
 The direct fixture call itself is required. A rejected or unavailable call is a
 blocked phase and requires a user question. A returned semantic fixture defect
 (`ready:false`, `persisted:true`, `promptRequired:true`, or a missing expected
-field) is recorded as an anomaly. It suppresses only the early baseline-success
-shortcut; the independent 10-second watchdog still dispatches the complete
-20-transition assay so a faulty build produces its full error history.
+field) is recorded as an anomaly and prevents the measured assay.
 
 ## Bounded parallel baseline
 
-The controller starts one monotonic 10-second watchdog immediately when the
-direct `prepare_coc` call returns. In parallel thread jobs it launches
-one bundle containing:
+The controller launches one parallel bundle with a monotonic 10-second
+admission deadline containing:
 
 - exact scene/player state;
 - the public upscaling snapshot and render-scale lifecycle/status;
@@ -280,16 +277,13 @@ CSX upscaling state.
 
 Do not precede that observation with hardware inventory, Stabilizer INI
 inspection, or MO2 file resolution. Those checks neither establish fidelity nor
-authorize a target and must not delay the watchdog or measured scenario.
+authorize a target.
 
-Before launching baseline calls, the controller creates the complete measured
-scenario and starts an independent monotonic watchdog job. The watchdog and an
-early-success path compete for one atomic file claim. The winner submits the
-scenario exactly once. If the complete bundle proves the expected baseline
-before the watchdog, the early path starts the assay immediately. Otherwise,
-at 10 seconds the watchdog starts it with the latest completed evidence. A
-slow, missing, or faulty baseline value cannot block the watchdog and is an
-anomaly, not permission to delay or cancel the 20-transition history.
+Before launching baseline calls, the controller journals the complete measured
+scenario contract. It submits the scenario exactly once only if every baseline
+result proves the expected state before the deadline. A slow, missing, faulty,
+or foreign-owned baseline fails closed without calling `prepare_coc` or
+submitting the mutating scenario.
 
 The only diagnostic ownership exception is an already-active CPU, GPU, or
 stress session not owned by this run. Do not take it over. Preserve its receipt
@@ -305,12 +299,15 @@ transitions: odd ordinals target `WhiterunDragonsreach` and even ordinals target
 Use the one async server scenario generated and submitted by
 `coc-stability-control` for setup and the complete transition sequence:
 
-1. render-scale stress `reset` then `start`; retain its `sessionId`;
-2. before every transition, call `qualification_status` with the exact expected
+1. call `qualification_status`, then acquire transition-1 ownership with
+   `qualification_begin`;
+2. run owner-bound render-scale stress `reset` then `start`; retain its
+   `sessionId`;
+3. before every later transition, call `qualification_status` with the exact expected
    Build ID, proving no foreign owner is being overrun;
-3. call `qualification_begin` with a unique nonzero transition ID and run owner
+4. call `qualification_begin` with a unique nonzero transition ID and run owner
    ID;
-4. call `qualification_dispatch` with the exact `cocCellEditorId` and, for
+5. call `qualification_dispatch` with the exact `cocCellEditorId` and, for
    transition 1, `startPerformanceTelemetry: true`. This one main-thread
    action starts CPU/GPU telemetry and records the timer immediately before it
    executes exactly that COC command; no separate console action is permitted;

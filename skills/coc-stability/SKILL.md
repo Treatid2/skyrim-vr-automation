@@ -69,16 +69,15 @@ Skyrim PID, Build ID, owned collector state, and evidence root. Do not call
 controller calls `communityshaders.menu` exactly once with
 `{"action":"prepare_coc","expectedBuildId":"<exact build ID>"}` and records
 `ready: true`, `persisted: false`, startup-active VR FPS Stabilizer, developer
-mode, and the FOV/TAA 0.3/0.3/0.7 fixture. It raises an `info` or less-verbose
-CSX log level to `debug`, then may correct only the FOV/TAA runtime settings;
-it must not save. A returned fixture defect prevents only the early-start
-shortcut; the 10-second watchdog still runs the measured assay.
+    mode, and the FOV/TAA 0.3/0.3/0.7 fixture. It raises an `info` or less-verbose
+    CSX log level to `debug`, then may correct only the FOV/TAA runtime settings;
+    it must not save. A returned fixture defect prevents the measured assay.
 
 VR FPS Stabilizer exclusively owns every DLSS/upscaling change. Observe its
 per-cell profiles; never apply an upscaling method, quality, preset, render
 scale, or dynamic policy through CSX. Every measured `qualification_wait`
-omits `target`; it requires a post-dispatch profile change and returns the
-coherent observed profile as evidence.
+omits `target`; it neither requires nor forbids a post-dispatch profile change
+and returns the coherent observed profile as evidence.
 
 That ownership includes profile discovery and policy selection. Do not inspect
 graphics adapters, infer a target from AMD/NVIDIA hardware, read or compare
@@ -86,15 +85,15 @@ Stabilizer INIs, resolve a winning MO2 file, or invoke `mo2-control` for an
 upscaling decision. Multiple adapters or Stabilizer INIs are irrelevant to the
 assay; record only the coherent profile exposed by the running CSX APIs.
 
-The controller starts one monotonic 10-second watchdog immediately after the
-fixture receipt and collects exact-cell, profile, lifecycle, stereo,
+The controller collects exact-cell, profile, lifecycle, stereo,
 diagnostic-status, and already-available image evidence in one parallel bundle.
-Its independent watchdog and atomic dispatch claim start the assay once only:
-immediately for a complete acceptable bundle, or at 10 seconds while preserving
-an incomplete or faulty baseline. Do not probe providers or retry checks.
+Every result must arrive and pass within the monotonic 10-second admission
+deadline. Incomplete, faulty, or foreign-owned evidence fails closed before the
+fixture or scenario. Do not probe providers or retry checks.
 
-The controller runs the stress reset/start and all 20 alternating transitions
-in one async server scenario. On transition 1, `qualification_dispatch` uses
+The controller runs the ownership check, qualification begin, owner-bound stress
+reset/start, and all 20 alternating transitions in one async server scenario.
+On transition 1, `qualification_dispatch` uses
 `startPerformanceTelemetry: true` immediately adjacent to the COC, so CPU and
 GPU counters share the first COC command boundary and exclude setup. Use
 `continueOnError: false`: semantic timeout/profile/fidelity/lifecycle faults are

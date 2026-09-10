@@ -6,6 +6,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { fixture: retryFixture, testRetryTelemetry } = require("./Test-RenderScaleRetryTelemetry.js");
+const { writeMemoryFixture, testMemoryConfirmation } = require("./Test-RenderScaleMemoryConfirmation.js");
 const {
     collectTracePages,
     deploymentVerification,
@@ -154,6 +156,7 @@ function retained(boundary, violation, identity = {}, nonStable = false) {
     const runId = identity.runId || "nvidia-test-run";
     const buildId = identity.buildId || "e".repeat(64);
     return {
+        variant: identity.variant || (runId.startsWith("amd-") ? "amd" : "nvidia"),
         analysisSentinel: {
             falseValue: false,
             zeroValue: 0,
@@ -362,10 +365,20 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
         counts: { transitionsDispatched: 2 },
     });
     writeDeploymentVerification(root, buildId);
+    if (variant === "amd") {
+        writeJson(path.join(root, "raw", "live-result.json"), {
+            ok: true,
+            status: "COMPLETE",
+            variant,
+            runId,
+            traceCapability: { status: "supported" },
+            lanes: [],
+        });
+    }
     writeJson(path.join(root, "raw", "pass-1", "transitions", "01",
-        "retained.json"), retained(false, true, { runId, buildId }));
+        "retained.json"), retained(false, true, { runId, buildId, variant }));
     writeJson(path.join(root, "raw", "pass-1", "transitions", "02",
-        "retained.json"), retained(true, true, { runId, buildId }, nonStable));
+        "retained.json"), retained(true, true, { runId, buildId, variant }, nonStable));
     return root;
 }
 
@@ -416,15 +429,17 @@ function testBaselineOnlyInterruptedFinalization() {
                 result.summary.reporting.reasons.includes(
                     "baseline_only_interrupted"),
             `${variant} baseline-only verdict separation is wrong.`);
-            assert(result.summary.memoryConfirmation.passesCompleted === 0 &&
-                result.summary.memoryConfirmation.verdict ===
-                    "repeat_not_completed" &&
-                result.summary.memoryConfirmation.unavailableBoundaries.length === 6,
+            const memory = result.summary.memoryConfirmation;
+            const memoryLanes = variant === "amd" ? Object.values(memory.lanes) : [memory];
+            assert(memoryLanes.length === (variant === "amd" ? 3 : 1) &&
+                memoryLanes.every(lane => lane.passesCompleted === 0 &&
+                    lane.verdict === "repeat_not_completed" && lane.unavailableBoundaries.length === 6),
             `${variant} baseline-only memory status is incomplete.`);
             const reportText = fs.readFileSync(path.join(evidence.root,
                 "report.md"), "utf8");
+            const memoryVerdict = variant === "amd" ? "per_lane" : "repeat_not_completed";
             assert(reportText.includes(`Transitions dispatched: **0/${expectedRows}**`) &&
-                reportText.includes("Memory confirmation: **repeat_not_completed**"),
+                reportText.includes(`Memory confirmation: **${memoryVerdict}**`),
             `${variant} baseline-only report is incomplete.`);
             const outputs = ["report.md", "summary.json", "transitions.csv",
                 "evidence-values.csv", "receipt-index.json"];
@@ -479,6 +494,7 @@ function testPartialInterruptedFinalization() {
         });
         writeJson(path.join(root, "raw", "pass-2", "transitions", "01",
             "retained.json"), {
+            variant: "nvidia",
             scenarioReceiptKey: failure.receiptKey,
             scenario: failure,
             waiter: null,
@@ -554,8 +570,10 @@ function testOfflineFinalization() {
             !Object.hasOwn(result.summary, "task2Verdict") &&
             !Object.hasOwn(result.summary, "overallVerdict"),
         "Legacy aggregate verdict fields were retained.");
-        assert(result.summary.reporting.status === "COMPLETE",
-            "Complete preserved receipts did not finalize.");
+        assert(result.summary.reporting.status === "INCOMPLETE" &&
+            result.summary.reporting.reasons.includes("retry_telemetry_incomplete") &&
+            result.summary.reporting.reasons.includes("memory_evidence_incomplete"),
+        "Missing memory and retry telemetry did not leave explicit reporting gaps.");
         assert(result.summary.stabilityNotes.count === 1 &&
             result.summary.stabilityNotes.transitions[0]
                 .presentationDisposition === "PresentationStretch",
@@ -801,7 +819,7 @@ function testRecoveryIsReportedWithoutRewritingFailure() {
             generatedUtc: "2026-08-30T20:00:00.000Z" });
         const row = result.summary.transitions[1];
         assert(result.summary.schemaVersion ===
-            "renderscale-tuning-nvidia-summary-v5" &&
+            "renderscale-tuning-nvidia-summary-v6" &&
             row.renderVerdict === "FAIL" &&
             row.recoveryStatus === "RECOVERED" &&
             row.recoveryTarget.method === "dlss" &&
@@ -839,6 +857,92 @@ function testValidationLeavesEvidenceUntouched() {
     }
 }
 
+function testAmdTraceCapabilityOnlyAffectsReporting() {
+    const root = createEvidenceRoot("amd");
+    try {
+        const options = { root, variant: "amd",
+            runId: "amd-test-run", buildId: "e".repeat(64), expectedRows: 2,
+            generatedUtc: "2026-08-30T20:00:00.000Z" };
+        const supported = finalizeEvidence(options);
+        const livePath = path.join(root, "raw", "live-result.json");
+        const live = JSON.parse(fs.readFileSync(livePath, "utf8"));
+        live.traceCapability = { status: "unsupported" };
+        writeJson(livePath, live);
+        const result = finalizeEvidence(options);
+        assert(result.summary.render.verdict === supported.summary.render.verdict &&
+            result.summary.reporting.status === "INCOMPLETE" &&
+            result.summary.traceCapability.status === "unsupported" &&
+            result.summary.reporting.reasons.includes(
+                "amd_trace_capability_evidence_incomplete"),
+        `Missing optional AMD trace evidence changed row results or allowed reporting completion: ${JSON.stringify({ render: result.summary.render, reporting: result.summary.reporting })}`);
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testVariantAndSourceProfileValidation() {
+    const root = createEvidenceRoot();
+    try {
+        const retainedPath = path.join(root, "raw", "pass-1", "transitions",
+            "01", "retained.json");
+        let receipt = JSON.parse(fs.readFileSync(retainedPath, "utf8"));
+        receipt.variant = "amd";
+        writeJson(retainedPath, receipt);
+        try {
+            finalizeEvidence({ root, variant: "nvidia", runId: "nvidia-test-run",
+                buildId: "e".repeat(64), expectedRows: 2 });
+            throw new Error("Expected variant mismatch.");
+        } catch (error) {
+            assert(error.message === "terminal_receipt_variant_mismatch",
+                "A mixed-variant receipt was accepted.");
+        }
+        receipt.variant = "nvidia";
+        receipt.waiter.replacementTimeline.dispatch.presentationProof
+            .rightEye.method = "taa";
+        writeJson(retainedPath, receipt);
+        try {
+            finalizeEvidence({ root, variant: "nvidia", runId: "nvidia-test-run",
+                buildId: "e".repeat(64), expectedRows: 2 });
+            throw new Error("Expected source method mismatch.");
+        } catch (error) {
+            assert(error.message === "source_profile_method_mismatch",
+                "Mismatched source-eye methods were accepted.");
+        }
+        receipt.waiter.replacementTimeline.dispatch.presentationProof.leftEye =
+            "none";
+        receipt.waiter.replacementTimeline.dispatch.presentationProof
+            .rightEye.method = "none";
+        writeJson(retainedPath, receipt);
+        try {
+            finalizeEvidence({ root, variant: "nvidia", runId: "nvidia-test-run",
+                buildId: "e".repeat(64), expectedRows: 2 });
+            throw new Error("Expected malformed source proof.");
+        } catch (error) {
+            assert(error.message === "source_profile_method_invalid",
+                "A malformed source-eye proof was accepted.");
+        }
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+
+    const missing = createEvidenceRoot();
+    try {
+        const retainedPath = path.join(missing, "raw", "pass-1", "transitions",
+            "01", "retained.json");
+        const receipt = JSON.parse(fs.readFileSync(retainedPath, "utf8"));
+        delete receipt.waiter.replacementTimeline.dispatch.presentationProof.leftEye;
+        delete receipt.waiter.replacementTimeline.dispatch.presentationProof.rightEye;
+        writeJson(retainedPath, receipt);
+        const result = finalizeEvidence({ root: missing, variant: "nvidia",
+            runId: "nvidia-test-run", buildId: "e".repeat(64), expectedRows: 2,
+            generatedUtc: "2026-08-30T20:00:00.000Z" });
+        assert(result.summary.transitions[0].source.method === "not_exposed",
+            "A genuinely unexposed source method was inferred.");
+    } finally {
+        fs.rmSync(missing, { recursive: true, force: true });
+    }
+}
+
 function testUnsafeEvidenceNumberFailsClosed() {
     const root = createEvidenceRoot();
     try {
@@ -861,16 +965,434 @@ function testUnsafeEvidenceNumberFailsClosed() {
     }
 }
 
+function testStreamedEvidence() {
+    const root = createEvidenceRoot();
+    const readFile = fs.readFileSync;
+    try {
+        const csvPath = path.join(root, "evidence-values.csv");
+        const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+            buildId: "e".repeat(64), expectedRows: 2 };
+        const initial = finalizeEvidence(options).summary.evidenceExtraction;
+        const value = 'quotes " and commas,\nUnicode: 雪 🐉'.repeat(4096);
+        writeJson(path.join(root, "raw/z-stream.json"), {
+            "a/~": [null, [], {}, false, 0, value],
+        });
+        // Hashing must not materialize the generated CSV as one buffer either.
+        fs.readFileSync = (file, ...args) => {
+            assert(file !== csvPath, "Receipt indexing read the entire CSV.");
+            return readFile(file, ...args);
+        };
+        const result = finalizeEvidence(options);
+        fs.readFileSync = readFile;
+        const actual = readFile(csvPath, "utf8");
+        const expected = [
+            'raw/z-stream.json,,,,/a~1~0/0,null,null',
+            'raw/z-stream.json,,,,/a~1~0/1,empty_array,[]',
+            'raw/z-stream.json,,,,/a~1~0/2,empty_object,{}',
+            'raw/z-stream.json,,,,/a~1~0/3,boolean,false',
+            'raw/z-stream.json,,,,/a~1~0/4,number,0',
+            `raw/z-stream.json,,,,/a~1~0/5,string,"${JSON.stringify(value)
+                .replace(/"/g, '""')}"`,
+            "",
+        ].join("\n");
+        assert(actual.endsWith(expected),
+            "Streaming changed CSV escaping, row order, or a large Unicode value.");
+        const stats = result.summary.evidenceExtraction;
+        assert(stats.rawJsonFiles === initial.rawJsonFiles + 1 &&
+            stats.values === initial.values + 6 &&
+            stats.nullValues === initial.nullValues + 1 &&
+            stats.emptyContainers === initial.emptyContainers + 2,
+        "Streamed extraction counts are incorrect.");
+        const indexed = result.index.files.find(file => file.path === "evidence-values.csv");
+        assert(indexed.sha256 === sha(csvPath) &&
+            indexed.bytes === Buffer.byteLength(actual),
+        "Streamed checksum or UTF-8 byte count differs from the written CSV.");
+    } finally {
+        fs.readFileSync = readFile;
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testEvidenceBeyondStringLimit() {
+    if (!process.argv.includes("--large-evidence")) return;
+    const root = createEvidenceRoot();
+    try {
+        const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+            buildId: "e".repeat(64), expectedRows: 2 };
+        const initial = finalizeEvidence(options).summary.evidenceExtraction;
+        const csvPath = path.join(root, "evidence-values.csv");
+        const expectedHash = crypto.createHash("sha256").update(fs.readFileSync(csvPath));
+        const limit = require("node:buffer").constants.MAX_STRING_LENGTH;
+        const payload = "x".repeat(8 * 1024 * 1024);
+        const count = Math.ceil(limit / payload.length);
+        for (let index = 0; index < count; index += 1) {
+            const source = `raw/z-large/${String(index).padStart(3, "0")}.json`;
+            writeJson(path.join(root, source), payload);
+            expectedHash.update(`${source},,,,,string,"""${payload}"""\n`);
+        }
+        const result = finalizeEvidence(options);
+        const indexed = result.index.files.find(file => file.path === "evidence-values.csv");
+        assert(indexed.bytes > limit && indexed.sha256 === expectedHash.digest("hex") &&
+            result.summary.evidenceExtraction.values === initial.values + count,
+        "Evidence beyond the JavaScript string limit was truncated or changed.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testEvidenceWriteFailures() {
+    for (const failure of ["parse", "numeric", "write", "rename"]) {
+        const root = createEvidenceRoot();
+        const writeFile = fs.writeFileSync;
+        const rename = fs.renameSync;
+        const open = fs.openSync;
+        const close = fs.closeSync;
+        const descriptors = new Set();
+        try {
+            const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+                buildId: "e".repeat(64), expectedRows: 2 };
+            finalizeEvidence(options);
+            const outputs = ["summary.json", "transitions.csv", "report.md",
+                "evidence-values.csv", "receipt-index.json"];
+            const before = outputs.map(name => sha(path.join(root, name)));
+            const temporary = path.join(root, "evidence-values.csv.tmp-finalizer");
+            fs.openSync = (file, ...args) => {
+                const descriptor = open(file, ...args);
+                if (file === temporary) descriptors.add(descriptor);
+                return descriptor;
+            };
+            fs.closeSync = (descriptor) => {
+                close(descriptor);
+                descriptors.delete(descriptor);
+            };
+            if (failure === "parse" || failure === "numeric") {
+                // A valid large row forces buffered output before validation fails.
+                writeJson(path.join(root, "raw/z-large.json"), "x".repeat(100000));
+                writeFile(path.join(root, "raw/zz-invalid.json"),
+                    failure === "parse" ? "{" : "9007199254740993");
+            } else if (failure === "write") {
+                fs.writeFileSync = (file, ...args) => {
+                    if (descriptors.has(file)) {
+                        writeFile(file, "partial output");
+                        throw new Error("injected_disk_full");
+                    }
+                    return writeFile(file, ...args);
+                };
+            } else {
+                fs.renameSync = (source, ...args) => {
+                    if (source === temporary) throw new Error("injected_rename_failure");
+                    return rename(source, ...args);
+                };
+            }
+            let error;
+            try { finalizeEvidence(options); } catch (caught) { error = caught; }
+            assert(error && (failure === "parse" ? error instanceof SyntaxError :
+                error.message === ({ numeric: "evidence_numeric_value_not_lossless",
+                    write: "injected_disk_full", rename: "injected_rename_failure" })[failure]),
+            `${failure} did not propagate the evidence failure.`);
+            assert(descriptors.size === 0 && !fs.existsSync(temporary),
+                `${failure} leaked a file descriptor or partial CSV.`);
+            assert(JSON.stringify(before) === JSON.stringify(outputs.map(name =>
+                sha(path.join(root, name)))),
+            `${failure} replaced previously finalized evidence.`);
+        } finally {
+            fs.writeFileSync = writeFile;
+            fs.renameSync = rename;
+            fs.openSync = open;
+            fs.closeSync = close;
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    }
+}
+
+function testActualBackendProjection() {
+    const root = createEvidenceRoot();
+    const firstPath = path.join(root, "raw", "pass-1", "transitions",
+        "01", "retained.json");
+    const secondPath = path.join(root, "raw", "pass-1", "transitions",
+        "02", "retained.json");
+    const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+        buildId: "e".repeat(64), expectedRows: 2,
+        generatedUtc: "2026-08-30T20:00:00.000Z" };
+    try {
+        const scaled = JSON.parse(fs.readFileSync(firstPath, "utf8"));
+        scaled.waiter.target = {
+            method: "dlss", qualityMode: 3, renderScaleMode: true,
+        };
+        scaled.waiter.replacementTimeline.terminal.presentationProof.backend =
+            "dlss";
+        writeJson(firstPath, scaled);
+
+        const native = JSON.parse(fs.readFileSync(secondPath, "utf8"));
+        native.waiter.target = {
+            method: "fsr", qualityMode: 0, renderScaleMode: false,
+        };
+        native.waiter.nativeVendorExecution = {
+            required: true,
+            sameFrameBothEyesValid: true,
+            actualBackend: "fsr_host",
+        };
+        writeJson(secondPath, native);
+
+        let result = finalizeEvidence(options);
+        assert(result.summary.transitions[0].actualBackend === "dlss" &&
+            result.summary.transitions[1].actualBackend === "fsr_host" &&
+            !result.summary.reporting.reasons.includes(
+                "reporting_contract_incomplete"),
+        "Owning backend evidence was not projected into complete reporting.");
+        const csvText = fs.readFileSync(path.join(root, "transitions.csv"),
+            "utf8");
+        const reportText = fs.readFileSync(path.join(root, "report.md"), "utf8");
+        assert(csvText.includes("actual_backend") &&
+            csvText.includes("dlss") && csvText.includes("fsr_host") &&
+            reportText.includes("Actual backend") &&
+            reportText.includes("| fsr_host |"),
+        "Actual backend was omitted from a rendered transition output.");
+
+        delete native.waiter.nativeVendorExecution;
+        writeJson(secondPath, native);
+        result = finalizeEvidence(options);
+        assert(result.summary.transitions[1].renderVerdict === "PASS" &&
+            result.summary.transitions[1].actualBackend === "not_exposed" &&
+            result.summary.reporting.status === "INCOMPLETE" &&
+            result.summary.reporting.reasons.includes(
+                "reporting_contract_incomplete"),
+        "Missing native backend evidence did not preserve PASS and fail reporting.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testTraceCompletenessPassability() {
+    const root = createEvidenceRoot();
+    const buildId = "e".repeat(64);
+    try {
+        const file = path.join(root, "raw/pass-1/transitions/02/retained.json");
+        const receipt = JSON.parse(fs.readFileSync(file, "utf8"));
+        receipt.waiter.target = { method: "dlss", qualityMode: 0, renderScaleMode: false };
+        receipt.waiter.nativeVendorExecution = { actualBackend: "dlss" };
+        const summary = { active: false, sessionID: 17, totalRecords: 70,
+            droppedRecords: 0, overwrittenRecords: 0 };
+        receipt.traceReset = { action: "dlss_trace_reset", producer: { buildId },
+            capture: { ...summary, totalRecords: 0 } };
+        receipt.traceStart = { action: "dlss_trace_start", producer: { buildId },
+            capture: { ...summary, active: true, totalRecords: 0 } };
+        receipt.traceStop = { action: "dlss_trace_stop", producer: { buildId }, capture: summary };
+        const pages = [0, 32, 64].map(cursor => {
+            const page = tracePage(buildId, 17, cursor,
+                records(cursor + 1, Math.min(32, 70 - cursor)), cursor < 64, 32);
+            page.capture.latestSequence = 70;
+            page.capture.summary = { ...summary };
+            return page;
+        });
+        receipt.traceRead = pages[0];
+        receipt.traceReadPages = pages;
+        const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+            buildId, expectedRows: 2 };
+        writeJson(file, receipt);
+        let result = finalizeEvidence(options);
+        assert(result.summary.transitions[1].traceComplete === true &&
+            result.summary.transitions[1].traceEvidence.records === 70 &&
+            result.summary.reporting.reasons.includes("retry_telemetry_incomplete") &&
+            result.summary.reporting.reasons.includes("memory_evidence_incomplete"),
+        "A complete producer-shaped trace cannot pass offline finalization.");
+        for (const change of [
+            row => { delete row.traceReadPages; },
+            row => { row.traceReadPages[1].capture.summary.sessionID += 1; },
+            row => { row.traceReadPages[1].capture.records[0].current.sequence -= 1; },
+            row => { row.traceReadPages[2].capture.latestSequence += 1; },
+            row => { row.traceStop.capture.active = true; },
+            row => { row.traceStop.capture.droppedRecords = 1; },
+        ]) {
+            const broken = JSON.parse(JSON.stringify(receipt));
+            change(broken);
+            writeJson(file, broken);
+            result = finalizeEvidence(options);
+            assert(result.summary.reporting.status === "INCOMPLETE" &&
+                result.summary.transitions[1].renderVerdict === "PASS" &&
+                result.summary.transitions[1].traceComplete === false,
+            "An incomplete or foreign trace passed reporting or rewrote render truth.");
+        }
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testJournalOnlyPartialFinalization(document = false) {
+    const root = createEvidenceRoot();
+    try {
+        const runId = "nvidia-test-run";
+        const journal = path.join(root, "raw/journal");
+        const row = retained(true, false, { runId, buildId: "e".repeat(64) });
+        writeJson(path.join(journal, "000001.json"), {
+            sequence: 1, receiptKey: `${runId}:nvidia:pass-1:transition-1`,
+            value: { ...row, projection: null },
+        });
+        writeJson(path.join(journal, "000002.json"), {
+            sequence: 2, receiptKey: `${runId}:nvidia:pass-1:transition-1`, value: row,
+        });
+        fs.rmSync(path.join(root, "raw/pass-1"), { recursive: true });
+        let original = path.join(journal, "000001.json");
+        if (document) {
+            original = path.join(root, "raw/journal.ndjson");
+            const records = ["000001.json", "000002.json"].map(name =>
+                JSON.stringify(JSON.parse(fs.readFileSync(path.join(journal, name), "utf8"))));
+            fs.writeFileSync(original, records.join("\n") + "\n");
+            fs.rmSync(journal, { recursive: true });
+        }
+        const before = sha(original);
+        const options = { root, variant: "nvidia", runId,
+            buildId: "e".repeat(64), expectedRows: 66 };
+        let result = finalizeEvidence(options);
+        assert(result.summary.assayExecution.transitionsDispatched === 1 &&
+            result.summary.assayExecution.status === "INCOMPLETE" &&
+            result.summary.transitions[0].renderVerdict === "PASS",
+        "Partial journal evidence was discarded instead of reported.");
+        result = finalizeEvidence(options);
+        assert(sha(original) === before &&
+            result.summary.transitions.length === 1,
+        "Restarting offline finalization changed or duplicated earlier evidence.");
+        const reconstructed = JSON.parse(fs.readFileSync(path.join(root,
+            "raw/lane-nvidia/pass-1/transitions/01/retained.json"), "utf8"));
+        assert(JSON.stringify(reconstructed) === JSON.stringify(row),
+            "Journal reconstruction changed raw evidence or timing fields.");
+        if (document) {
+            fs.appendFileSync(original, '{"sequence":3');
+            let rejected = false;
+            try { finalizeEvidence(options); }
+            catch (error) { rejected = error.message === "receipt_journal_incomplete_line"; }
+            assert(rejected, "A truncated document was silently declared complete.");
+        }
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testRetryReportingGaps() {
+    const root = createEvidenceRoot();
+    try {
+        const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+            buildId: "e".repeat(64), expectedRows: 2 };
+        const before = finalizeEvidence(options).summary;
+        const file = path.join(root, "raw/pass-1/transitions/01/retained.json");
+        const receipt = JSON.parse(fs.readFileSync(file, "utf8"));
+        const diagnostic = retryFixture().waiter;
+        receipt.waiter.status = diagnostic.status;
+        receipt.waiter.timing = diagnostic.timing;
+        receipt.waiter.baseline = diagnostic.baseline;
+        receipt.waiter.status.retryTelemetry.qpcFrequency = 0;
+        receipt.waiter.status.retryTelemetry.measuredRetrySentinel = 123.456;
+        writeJson(file, receipt);
+        const { summary } = finalizeEvidence(options);
+        assert(summary.assayExecution.status === before.assayExecution.status &&
+            summary.renderVerdict === before.renderVerdict &&
+            summary.transitions[0].retryTelemetry.outcome === "n/a",
+        "Retry provenance changed the measured assay result or prevented reporting.");
+        assert(fs.readFileSync(path.join(root, "evidence-values.csv"), "utf8")
+            .includes("123.456"), "An unverified retry measurement was discarded.");
+        assert(fs.readFileSync(path.join(root, "transitions.csv"), "utf8")
+            .includes("clock_unavailable,n/a,n.d."), "Retry gap labels were lost in CSV.");
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+}
+
+function testMemoryFinalizationWithoutExistingSummary() {
+    const root = createEvidenceRoot();
+    try {
+        fs.unlinkSync(path.join(root, "summary.json"));
+        const fixture = writeMemoryFixture(root);
+        writeJson(path.join(root, "raw/live-result.json"), fixture.liveResult);
+        for (const { pass, ordinal, stressSessionId } of fixture.retained) {
+            const receipt = retained(true, false);
+            receipt.waiter.baseline.stressSessionId = stressSessionId;
+            writeJson(path.join(root, "raw", `pass-${pass}`, "transitions",
+                String(ordinal).padStart(2, "0"), "retained.json"), receipt);
+        }
+        const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+            buildId: fixture.buildId, expectedRows: fixture.retained.length };
+        const { summary, index } = finalizeEvidence(options);
+        assert(summary.memoryConfirmation.verdict === "retention_signal" &&
+            summary.memoryConfirmation.status === "complete",
+        "Fresh finalization did not reconstruct memory from boundary receipts.");
+        assert(index.files.filter(file => file.path.startsWith("raw/memory/")).length === 6,
+            "Memory boundary copies were not indexed.");
+        assert(fs.readFileSync(path.join(root, "report.md"), "utf8")
+            .includes("| Metric | Pass 1 start |"), "Final report omitted the memory table.");
+        const outputs = ["summary.json", "report.md", "receipt-index.json", "evidence-values.csv"];
+        const first = outputs.map(file => sha(path.join(root, file)));
+        finalizeEvidence(options);
+        assert(JSON.stringify(first) === JSON.stringify(outputs.map(file => sha(path.join(root, file)))),
+            "Reconstructed memory changed on repeated finalization.");
+        summary.memoryConfirmation = { verdict: "stale_manual_value" };
+        writeJson(path.join(root, "summary.json"), summary);
+        assert(finalizeEvidence(options).summary.memoryConfirmation.verdict === "retention_signal",
+            "Existing summary data replaced the raw memory evidence.");
+        const foreign = JSON.parse(fs.readFileSync(fixture.files.pass2_end, "utf8"));
+        foreign.results[0].result.producer.buildId = "foreign-build";
+        foreign.results[0].result.status.controller.memory.processPrivateUsageBytes = 123456789;
+        writeJson(fixture.files.pass2_end, foreign);
+        const gap = finalizeEvidence(options);
+        assert(gap.summary.assayExecution.status === "COMPLETE" &&
+            gap.summary.renderVerdict === summary.renderVerdict &&
+            gap.summary.memoryConfirmation.outcome === "n/a",
+        "Memory provenance changed measured execution or prevented reporting.");
+        assert(fs.readFileSync(path.join(root, "evidence-values.csv"), "utf8")
+            .includes("123456789"), "An unverified measured value was discarded.");
+        assert(fs.readFileSync(path.join(root, "report.md"), "utf8").includes("n.d."),
+            "Unavailable memory measurements need the n.d. label.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testRecoveredHealthKeepsCompletedTest() {
+    const root = createEvidenceRoot();
+    try {
+        const file = path.join(root, "raw/pass-1/transitions/01/retained.json");
+        const value = JSON.parse(fs.readFileSync(file, "utf8"));
+        value.waiter.strictSatisfied = true;
+        value.waiter.diagnostics.delta.failures = { fidelityMismatches: 2 };
+        value.waiter.diagnostics.delta.presentation.vendorFailureStretchEyeObservations = 1;
+        writeJson(file, value);
+        const original = sha(file);
+        const { summary } = finalizeEvidence({ root, variant: "nvidia",
+            runId: "nvidia-test-run", buildId: "e".repeat(64), expectedRows: 2 });
+        assert(summary.assayExecution.status === "COMPLETE" && summary.render.verdict === "PASS",
+            "Recovered health findings rewrote the completed test or terminal verdict.");
+        assert(summary.render.scope === "terminal_condition_only" &&
+            summary.changeAssessment.status === "DOES_NOT_MEET_STANDARD" &&
+            summary.changeAssessment.changesTestResult === false,
+            "Finalization did not separate change assessment from terminal completion.");
+        assert(summary.switchHealth.passes[0].affectedTransitions[0].counters.fidelityMismatches === 2 &&
+            summary.transitions[0].switchHealth.counters.vendorFailureStretchEyeObservations === 1,
+            "Recovered failure observations were omitted from pass or transition summaries.");
+        assert(fs.readFileSync(path.join(root, "report.md"), "utf8").includes("fidelityMismatches=2"),
+            "Rendered summary hid recovered failure observations.");
+        assert(sha(file) === original, "Health reporting changed the retained receipt.");
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+}
+
 Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
+    .then(testRetryReportingGaps)
+    .then(testRetryTelemetry)
+    .then(testRecoveredHealthKeepsCompletedTest)
+    .then(testMemoryConfirmation).then(testMemoryFinalizationWithoutExistingSummary)
+    .then(testTraceCompletenessPassability)
+    .then(testJournalOnlyPartialFinalization)
+    .then(() => testJournalOnlyPartialFinalization(true))
     .then(testPagingResume).then(testDeploymentVerification)
     .then(testOfflineFinalization)
     .then(testReportingSeparation).then(testUnownedViolationRemainsReported)
     .then(testMatchedViolationSurvivesIncompletePeer)
     .then(testAmdParity)
+    .then(testAmdTraceCapabilityOnlyAffectsReporting)
     .then(testRecoveryIsReportedWithoutRewritingFailure)
     .then(testBaselineOnlyInterruptedFinalization)
     .then(testPartialInterruptedFinalization)
     .then(testValidationLeavesEvidenceUntouched)
+    .then(testVariantAndSourceProfileValidation)
+    .then(testActualBackendProjection)
+    .then(testStreamedEvidence).then(testEvidenceWriteFailures)
+    .then(testEvidenceBeyondStringLimit)
     .then(testUnsafeEvidenceNumberFailsClosed).then(() => {
         process.stdout.write("Render-scale tuning finalizer tests passed.\n");
     }).catch((error) => {

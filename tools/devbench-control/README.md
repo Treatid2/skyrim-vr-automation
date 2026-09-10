@@ -40,11 +40,24 @@ identity, transport retries, and terminal result. If the target exits during a
 synchronous call, the failed result returns `invocationEvidencePath` instead of
 discarding the last known request boundary. Without an explicit evidence
 directory these journals use the local Skyrim VR automation evidence root.
+Once a call has completed, a later journal-write failure never replaces its
+payload or semantic outcome. The returned result instead carries
+`evidenceWarnings` and `evidenceJournalFinalized: false`, alongside the final
+`sessionCleanup` receipt. If a requested tool is absent from the authoritative
+catalog, the controller reports `tool-unavailable` without dispatching it; a
+requested performance-neutrality boundary is still measured and retained.
 When available, add `buildId`, `artifactPath`/`dllPath`, and
 `artifactSha256` to runtime metadata (or pass their explicit parameter
 equivalents). The controller queries the CSX registry bridge and hashes the
 deployed DLL, binding source build, physical artifact, endpoint, and process in
 one evidence record.
+
+Mutation-capable calls require that complete identity. The controller keeps a
+strict, action-sensitive allowlist for read-only inspection: built-in
+`inspect` kinds, `menu list`, `record status`, and tracked-input
+observation/status. Those calls may proceed when listener and process identity
+are verified even if build or deployed-artifact provenance is unavailable.
+They do not broaden the mutation boundary.
 
 `ok` reflects transport success unless `-RequireSuccess` is supplied. Every
 call also reports `transportOk` and a normalized `semantic` result, so an API
@@ -54,6 +67,10 @@ its legacy response does not carry a generic top-level `ok`: `status` must
 contain a frame-bearing status object, while `enable` and `disable` must report
 the requested observed state. This keeps profiler collection fail-closed
 without misclassifying a valid bridge response as unknown.
+Structured responses from allowlisted read-only calls establish a successful
+read contract. `record start` has a separate adapter that requires
+`action=start`, `recording=true`, and the requested correlation ID before
+`-RequireSuccess` accepts the result.
 Replay completion receipts containing only scheduler facts such as `done`,
 `runId`, and `stepsRun` are classified as
 `scheduler-complete-unverified`, not semantic success. A replay response must
@@ -92,18 +109,20 @@ save availability.
 `call` uses a 15-second request timeout by default. When the top-level tool
 arguments contain `timeoutMs`, the controller automatically raises the request
 timeout to at least `ceil(timeoutMs / 1000) + 5` seconds and reports the
-effective value as `requestTimeoutSeconds`. This transport envelope does not
-extend the server's measurement deadline; it only leaves bounded time for the
-terminal receipt to return. Use `-MaxTransientRetries 0` for ownership-bearing
+effective value as `requestTimeoutSeconds`. It also extends the actual operation
+deadline at dispatch to cover that server budget plus the receipt allowance,
+and reports the effective deadline, duration, requested server timeout, and
+remaining dispatch allowance. This does not extend the server's own
+measurement deadline. Use `-MaxTransientRetries 0` for ownership-bearing
 or otherwise non-replayable actions. If their response is lost, recover their
 existing owner/status instead of sending the action again.
 
-Each controller invocation closes its owned Streamable HTTP MCP session before
-returning and reports the outcome under `sessionCleanup`. This prevents serial
-protocol steps from exhausting DevBench's bounded session table. A cleanup 404
-means the server already retired the session and is successful. Any other
-cleanup failure remains diagnostic evidence but does not replace the primary
-call or wait result.
+Each controller invocation tracks every Streamable HTTP MCP session it opens,
+closes all of them before returning, and reports every outcome under
+`sessionCleanup.sessions`. This prevents retries from leaking an earlier
+session and exhausting DevBench's bounded session table. A cleanup 404 means
+the server already retired the session and is successful. A wait will not bind
+a replacement session while cleanup of the prior session is uncertain.
 
 `wait -Condition noBlockingMenu` polls the menu tool client-side, ignores only
 the explicitly listed `-IgnoredMenus` (HUD by default), and always reports the
@@ -115,8 +134,10 @@ closed, with `-MaxMenuDismissals` bounding each menu and
 Message boxes and any unlisted blocking menu always prevent dismissal. This is
 an explicit unattended-recovery action, not a background menu monitor.
 
-`mainMenuReady` instead requires `Main Menu` to be open and rejects every menu
-outside `-AllowedMainMenuMenus` (HUD and Main Menu by default). It represents a
+`mainMenuReady` instead requires `Main Menu` to be open, permits Skyrim VR's
+normal `Mist Menu` and `Fader Menu` overlays, and rejects every other menu
+outside `-AllowedMainMenuMenus` (HUD, Main Menu, Mist Menu, and Fader Menu by
+default). It represents a
 usable front-end state without pretending that Skyrim's persistent menus have
 closed.
 
@@ -161,7 +182,13 @@ a new load transition.
 
 `upscalingStable` is the fail-closed barrier for paced cell-transition tests.
 It requires the exact `-ExpectedCell`, a loaded player, no blocking menu, and a
-CSX profile that remains unchanged across advancing frames. The destination's
+CSX profile that remains unchanged across advancing frames. Its public API
+snapshot must share a state revision with the render-scale diagnostic snapshot,
+and the physical render-scale status must agree with the effective profile.
+Expected profiles and required physical-state telemetry use typed fields; JSON
+strings cannot stand in for booleans or integer counters, and missing negative
+state is never interpreted as inactive.
+The destination's
 requested settings determine the method, quality, and render-scale state; the
 barrier does not impose a profile. When render-scale is active it additionally
 requires its physical contract to be latched and active, both
@@ -169,8 +196,9 @@ eyes to be valid and vendor-evaluated on the same presentation path, clean
 vendor lifecycle state, and no relatch, recovery, fallback, retirement, or
 memory-trim work. Native-resolution DLSS, FSR, TAA/AA, and DLAA use the
 authoritative upscaling service: requested and effective profiles must agree,
-the controller must be idle, and no transition or recovery condition may be
-present. Native-resolution stereo confidence comes from consecutive advancing
+the controller state must agree with its transition state, and no active
+physical render-scale contract or recovery condition may be present.
+Native-resolution stereo confidence comes from consecutive advancing
 world frames because the render-scale logger intentionally has no active
 physical stereo contract in that mode.
 
