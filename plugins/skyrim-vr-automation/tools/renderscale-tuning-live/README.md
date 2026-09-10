@@ -75,6 +75,22 @@ record, including revisions superseded by later rows. It also supports
 historical numbered journals. Reports and their
 additional files are generated only after measurement ends.
 
+Offline finalization always derives memory confirmation from the six saved
+pass/cooldown boundaries, including for partial runs or a fresh summary.
+It preserves exact envelopes under `raw/memory` (separate AMD lane folders),
+indexes them, and prints all six metrics with deltas, growth ratios, and the
+unrounded classification inputs. Build/session mismatches, invalid samples,
+incomplete trackers, missing boundaries, and missing cooldown waits remain
+explicit reporting gaps. They do not change render verdicts. Repeated
+finalization recomputes the result rather than trusting a previous summary.
+Pass completion requires every fixed-matrix transition exactly once, independent
+of worker lifecycle status. Memory boundaries must retain matching session start
+frames, expected capture activity, and chronological sample frames.
+Provenance gaps never abort or replay measurements. Every retrieved value remains
+in raw evidence and the full value export. Unavailable memory results display as
+`n.d.`, with outcome `n/a`; conflicting boundary copies are preserved alongside
+their source and recorded as a nonfatal reporting gap.
+
 The worker records extra dispatch gaps separately from producer timings.
 Exceeding the diagnostic 250 ms budget changes the pacing observation, never
 the run's control flow. Do not claim a runtime speedup from mocked tests.

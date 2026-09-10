@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { retryTelemetry } = require("./retry-telemetry.js");
+const { memoryConfirmation, memoryReport } = require("./memory-confirmation.js");
 
 const { collectTracePages, traceCapacity, validateTracePage,
     validateRetainedTrace } = require("../renderscale-tuning-live/runner.js");
@@ -78,21 +79,6 @@ function validateBaselineOnlyInterruption(root, variant, runId, buildId) {
             throw new Error("baseline_interruption_receipt_mismatch");
         }
     }
-}
-
-function baselineOnlyMemoryConfirmation() {
-    return {
-        passesCompleted: 0,
-        cooldownMilliseconds: null,
-        boundaries: { pass1: null, cooldown: null, pass2: null },
-        deltas: null,
-        ratios: null,
-        predicateInputs: { available: false, reason: "repeat_not_completed" },
-        unavailableBoundaries: ["pass1_start", "pass1_end", "cooldown_start",
-            "cooldown_end", "pass2_start", "pass2_end"],
-        verdict: "repeat_not_completed",
-        conclusion: "no_leak_or_retention_conclusion_possible",
-    };
 }
 
 function deploymentVerification(root, buildId, options) {
@@ -841,8 +827,7 @@ function report(summary) {
                 recovery.safeTerminal.satisfied})\n` : "") +
         (recoveryReasons.length > 0 ?
             `- Recovery blockers: **${recoveryReasons.join("; ")}**\n` : "") +
-        (summary.memoryConfirmation ?
-            `- Memory confirmation: **${summary.memoryConfirmation.verdict}**\n` : "") +
+        `- Memory confirmation: **${summary.memoryConfirmation.verdict}**\n` +
         `- Presentation stretch: **` +
         `${summary.presentationStretchAnomalies.selected} selected, ` +
         `${summary.presentationStretchAnomalies.recoveredPass} recovered PASS, ` +
@@ -852,6 +837,7 @@ function report(summary) {
         `rewrite the render result, and a render pass does not hide missing ` +
         `per-transition evidence. Every raw JSON value is available in ` +
         `\`${summary.evidenceExtraction.path}\`.\n\n` +
+        memoryReport(summary.memoryConfirmation) +
         `## Transitions\n\n` +
         `Retry waits end at the first observed preparation-ready result. ` +
         `Ready-to-candidate includes stereo qualification and the settling guard; ` +
@@ -1108,6 +1094,11 @@ function finalizeEvidence(options) {
     }
     const deployment = deploymentVerification(root, buildIds[0], options);
     if (!deployment.complete) reportingReasons.push(deployment.reason);
+    const memory = memoryConfirmation({ root, variant, buildId: buildIds[0],
+        liveResult, writeAtomic, retained: retained.map(({ file, value }) => ({
+            ...rowIdentity(root, file), stressSessionId: value.waiter.baseline.stressSessionId,
+        })) });
+    if (memory.status !== "complete") reportingReasons.push("memory_evidence_incomplete");
     const reportingStatus = reportingReasons.length === 0 ? "COMPLETE" : "INCOMPLETE";
     const extraction = evidenceValues(root);
     const generatedUtc = options.generatedUtc || existing.generatedUtc ||
@@ -1151,8 +1142,7 @@ function finalizeEvidence(options) {
             liveResult && liveResult.traceCapability || { status: "missing" } :
             { status: "not_applicable" },
         deploymentVerification: deployment,
-        memoryConfirmation: baselineOnlyInterrupted ?
-            baselineOnlyMemoryConfirmation() : existing.memoryConfirmation,
+        memoryConfirmation: memory,
         evidenceExtraction: { complete: true,
             path: "evidence-values.csv",
             format: "rfc6901-json-pointer-long-form-csv",

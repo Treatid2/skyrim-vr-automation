@@ -7,6 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { fixture: retryFixture, testRetryTelemetry } = require("./Test-RenderScaleRetryTelemetry.js");
+const { writeMemoryFixture, testMemoryConfirmation } = require("./Test-RenderScaleMemoryConfirmation.js");
 const {
     collectTracePages,
     deploymentVerification,
@@ -428,10 +429,11 @@ function testBaselineOnlyInterruptedFinalization() {
                 result.summary.reporting.reasons.includes(
                     "baseline_only_interrupted"),
             `${variant} baseline-only verdict separation is wrong.`);
-            assert(result.summary.memoryConfirmation.passesCompleted === 0 &&
-                result.summary.memoryConfirmation.verdict ===
-                    "repeat_not_completed" &&
-                result.summary.memoryConfirmation.unavailableBoundaries.length === 6,
+            const memory = result.summary.memoryConfirmation;
+            const memoryLanes = variant === "amd" ? Object.values(memory.lanes) : [memory];
+            assert(memoryLanes.length === (variant === "amd" ? 3 : 1) &&
+                memoryLanes.every(lane => lane.passesCompleted === 0 &&
+                    lane.verdict === "repeat_not_completed" && lane.unavailableBoundaries.length === 6),
             `${variant} baseline-only memory status is incomplete.`);
             const reportText = fs.readFileSync(path.join(evidence.root,
                 "report.md"), "utf8");
@@ -568,8 +570,9 @@ function testOfflineFinalization() {
             !Object.hasOwn(result.summary, "overallVerdict"),
         "Legacy aggregate verdict fields were retained.");
         assert(result.summary.reporting.status === "INCOMPLETE" &&
-            result.summary.reporting.reasons.includes("retry_telemetry_incomplete"),
-        "An older receipt without retry telemetry did not leave an explicit reporting gap.");
+            result.summary.reporting.reasons.includes("retry_telemetry_incomplete") &&
+            result.summary.reporting.reasons.includes("memory_evidence_incomplete"),
+        "Missing memory and retry telemetry did not leave explicit reporting gaps.");
         assert(result.summary.stabilityNotes.count === 1 &&
             result.summary.stabilityNotes.transitions[0]
                 .presentationDisposition === "PresentationStretch",
@@ -1189,7 +1192,8 @@ function testTraceCompletenessPassability() {
         let result = finalizeEvidence(options);
         assert(result.summary.transitions[1].traceComplete === true &&
             result.summary.transitions[1].traceEvidence.records === 70 &&
-            result.summary.reporting.reasons.includes("retry_telemetry_incomplete"),
+            result.summary.reporting.reasons.includes("retry_telemetry_incomplete") &&
+            result.summary.reporting.reasons.includes("memory_evidence_incomplete"),
         "A complete producer-shaped trace cannot pass offline finalization.");
         for (const change of [
             row => { delete row.traceReadPages; },
@@ -1290,9 +1294,59 @@ function testRetryReportingGaps() {
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
 }
 
+function testMemoryFinalizationWithoutExistingSummary() {
+    const root = createEvidenceRoot();
+    try {
+        fs.unlinkSync(path.join(root, "summary.json"));
+        const fixture = writeMemoryFixture(root);
+        writeJson(path.join(root, "raw/live-result.json"), fixture.liveResult);
+        for (const { pass, ordinal, stressSessionId } of fixture.retained) {
+            const receipt = retained(true, false);
+            receipt.waiter.baseline.stressSessionId = stressSessionId;
+            writeJson(path.join(root, "raw", `pass-${pass}`, "transitions",
+                String(ordinal).padStart(2, "0"), "retained.json"), receipt);
+        }
+        const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+            buildId: fixture.buildId, expectedRows: fixture.retained.length };
+        const { summary, index } = finalizeEvidence(options);
+        assert(summary.memoryConfirmation.verdict === "retention_signal" &&
+            summary.memoryConfirmation.status === "complete",
+        "Fresh finalization did not reconstruct memory from boundary receipts.");
+        assert(index.files.filter(file => file.path.startsWith("raw/memory/")).length === 6,
+            "Memory boundary copies were not indexed.");
+        assert(fs.readFileSync(path.join(root, "report.md"), "utf8")
+            .includes("| Metric | Pass 1 start |"), "Final report omitted the memory table.");
+        const outputs = ["summary.json", "report.md", "receipt-index.json", "evidence-values.csv"];
+        const first = outputs.map(file => sha(path.join(root, file)));
+        finalizeEvidence(options);
+        assert(JSON.stringify(first) === JSON.stringify(outputs.map(file => sha(path.join(root, file)))),
+            "Reconstructed memory changed on repeated finalization.");
+        summary.memoryConfirmation = { verdict: "stale_manual_value" };
+        writeJson(path.join(root, "summary.json"), summary);
+        assert(finalizeEvidence(options).summary.memoryConfirmation.verdict === "retention_signal",
+            "Existing summary data replaced the raw memory evidence.");
+        const foreign = JSON.parse(fs.readFileSync(fixture.files.pass2_end, "utf8"));
+        foreign.results[0].result.producer.buildId = "foreign-build";
+        foreign.results[0].result.status.controller.memory.processPrivateUsageBytes = 123456789;
+        writeJson(fixture.files.pass2_end, foreign);
+        const gap = finalizeEvidence(options);
+        assert(gap.summary.assayExecution.status === "COMPLETE" &&
+            gap.summary.renderVerdict === summary.renderVerdict &&
+            gap.summary.memoryConfirmation.outcome === "n/a",
+        "Memory provenance changed measured execution or prevented reporting.");
+        assert(fs.readFileSync(path.join(root, "evidence-values.csv"), "utf8")
+            .includes("123456789"), "An unverified measured value was discarded.");
+        assert(fs.readFileSync(path.join(root, "report.md"), "utf8").includes("n.d."),
+            "Unavailable memory measurements need the n.d. label.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
 Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testRetryReportingGaps)
     .then(testRetryTelemetry)
+    .then(testMemoryConfirmation).then(testMemoryFinalizationWithoutExistingSummary)
     .then(testTraceCompletenessPassability)
     .then(testJournalOnlyPartialFinalization)
     .then(() => testJournalOnlyPartialFinalization(true))

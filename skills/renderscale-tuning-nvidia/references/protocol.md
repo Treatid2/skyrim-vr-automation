@@ -750,8 +750,41 @@ Write a `memoryConfirmation` object to `summary.json` containing
 computed deltas and ratios, `predicateInputs`, and `verdict`. Include `pass`
 in every `transitions.csv` row.
 
+The offline finalizer reconstructs this object on every invocation, even when
+no previous summary exists. Read its generated object and table directly;
+never carry forward a manually supplemented `memoryConfirmation`. Its
+`boundaries` contain each group's start/end/delta metrics, `retainedBoundaries`
+identify the exact receipts and stress/texture sessions, and `deltas`,
+`ratios`, `predicateInputs`, and `issues` retain the calculation and gaps.
+
+Use the measured stress/texture starts in each pass's `handoff.json` and the
+`finalization/final-status-before-cleanup.json` snapshots as pass boundaries.
+Use pass 1's `cooldown-start.json` and `cooldown-end.json` for cooldown, and
+read the observed wait duration from `cooldown.json`. These files live under
+`raw/lane-nvidia/pass-N`; the finalizer also supports the legacy
+`raw/pass-N` layout. It copies the six complete envelopes byte for byte to
+`raw/memory/<boundary>.json` before extraction and receipt indexing. An
+existing conflicting copy is a reporting gap; retain both it and the source,
+reference the source directly, and continue reporting without overwriting either.
+
+Check each memory and texture result's Build ID and session identity. Invalid
+or unavailable metrics are null in JSON and `n.d.` in the table, with explicit
+reasons; missing data never means zero growth. Incomplete texture tracking or
+unknown texture estimates prevent a conclusive memory classification.
+Validate capture activity, the stress start frame, and chronological sample
+frames across all six boundaries. `passesCompleted` requires exact fixed-matrix
+receipt coverage for each pass, with no duplicate ordinals. `coverage` records
+expected, retained, and missing transitions. Worker lifecycle status cannot
+complete missing measurements or erase a fully measured pass. Missing or
+invalid required memory evidence adds
+`memory_evidence_incomplete` to reporting without rewriting the render result.
+The memory `outcome` is `n/a` when evidence cannot support classification.
+Every retrieved value remains in the raw receipts and `evidence-values.csv`.
+Memory provenance gaps never abort, pace, or replay the assay; reconstruction
+runs only after measurement, and unaffected results remain reportable.
+
 Compute a ratio only when the pass 1 delta is positive; otherwise report
-`n/a`. Classify memory separately from render correctness:
+`n.d.`. Classify memory separately from render correctness:
 
 - `retention_signal` requires pass 2 process-private and system-commit growth
   each to be at least 75 percent of its positive pass 1 growth, plus positive
@@ -760,9 +793,9 @@ Compute a ratio only when the pass 1 delta is positive; otherwise report
   growth each to be no more than 25 percent of its positive pass 1 growth and
   no positive pass 2 increase in DXGI usage, live texture count, or live
   texture bytes.
-- Every other complete comparison is `inconclusive`. A missing repeat is
-  `repeat_not_completed` and makes the assay `INTERRUPTED`. Preserve the
-  available pass in the comparison with unavailable repeat metrics marked `n/a`.
+- Every other complete comparison is `inconclusive`. Missing repeat evidence
+  is `repeat_not_completed`, with unavailable metrics marked `n.d.` and outcome
+  `n/a`. This reporting gap does not change the assay's execution status.
 
 Always emit the memory table and `memoryConfirmation` object, including for an
 interrupted pass. When pass 2 never ran, set `passesCompleted` to the actual
