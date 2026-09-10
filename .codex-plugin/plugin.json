@@ -1,6 +1,6 @@
 {
   "name": "skyrim-vr-automation",
-  "version": "0.9.0+codex.20260910071434",
+  "version": "0.9.0+codex.20260910083816",
   "description": "Codex tools and skills for transactional Skyrim VR automation, correlated capture and interaction, DevBench qualification and profiling, local feedback, and reusable shader-cache management.",
   "author": {
     "name": "Treatid2",
