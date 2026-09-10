@@ -81,7 +81,9 @@ or construct HTTP or MCP requests ad hoc.
 12. Preserve the controller's `sessionCleanup` receipt with the command result.
    Cleanup is successful when it reports `closed`, `already_absent`, or
    `not_opened`; a cleanup failure is diagnostic and never changes the primary
-   operation result.
+   operation result. Likewise, once a call has completed, preserve its payload
+   and semantic outcome if terminal journal persistence fails; retain
+   `evidenceWarnings` and `evidenceJournalFinalized` with the cleanup receipt.
 13. If direct health succeeds but a redundant controller attempt returns a
    transport error, preserve that receipt as a runner-path anomaly. Continue
    on the already-selected direct lane; do not start a controller availability

@@ -190,6 +190,26 @@ function Update-InvocationEvidence {
     Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord
 }
 
+function Write-TerminalInvocationEvidence {
+    param(
+        [Parameter(Mandatory)]$Result,
+        [Parameter(Mandatory)][string]$FailurePrefix,
+        [Parameter(Mandatory)][scriptblock]$WriteAction
+    )
+
+    try {
+        & $WriteAction | Out-Null
+        return $true
+    }
+    catch {
+        $journalError = "$FailurePrefix`: $($_.Exception.Message)"
+        $existingWarnings = if ($Result.PSObject.Properties['evidenceWarnings']) { @($Result.evidenceWarnings) } else { @() }
+        $Result | Add-Member -NotePropertyName evidenceWarnings -NotePropertyValue @($existingWarnings + $journalError) -Force
+        $Result | Add-Member -NotePropertyName evidenceJournalFinalized -NotePropertyValue $false -Force
+        return $false
+    }
+}
+
 function Find-UnsafeTfc1 {
     param($Value, [string]$Path = '$')
     if ($Value -is [string]) {
@@ -304,6 +324,41 @@ function Test-GameMutationPolicy {
     return [pscustomobject]@{ allowed = $true; override = $false; error = $null; policy = $policy; manifestPath = $resolvedManifest; loadName = $expectedName }
 }
 
+function Get-McpSessionHeaderValue {
+    param($Response)
+
+    if ($null -eq $Response -or -not $Response.PSObject.Properties['Headers'] -or $null -eq $Response.Headers) {
+        return $null
+    }
+    $headers = $Response.Headers
+    $value = $null
+    if ($headers.PSObject.Methods['ContainsKey']) {
+        if (-not $headers.ContainsKey('Mcp-Session-Id')) { return $null }
+        $value = $headers['Mcp-Session-Id']
+    }
+    elseif ($headers -is [Collections.IDictionary]) {
+        if (-not $headers.Contains('Mcp-Session-Id')) { return $null }
+        $value = $headers['Mcp-Session-Id']
+    }
+    elseif ($headers.PSObject.Methods['TryGetValues']) {
+        $values = $null
+        if (-not $headers.TryGetValues('Mcp-Session-Id', [ref]$values)) { return $null }
+        $value = $values
+    }
+    elseif ($headers.PSObject.Methods['GetValues']) {
+        try { $value = $headers.GetValues('Mcp-Session-Id') } catch { return $null }
+    }
+    else {
+        $property = $headers.PSObject.Properties['Mcp-Session-Id']
+        if (-not $property) { return $null }
+        $value = $property.Value
+    }
+    if ($value -is [array] -or ($value -is [Collections.IEnumerable] -and $value -isnot [string])) {
+        return [string](@($value) | Select-Object -First 1)
+    }
+    return [string]$value
+}
+
 function Invoke-McpRequest {
     param([string]$Endpoint, [hashtable]$Headers, $Payload, [switch]$Mutation)
     $body = $Payload | ConvertTo-Json -Depth 30 -Compress
@@ -320,8 +375,7 @@ function Invoke-McpRequest {
                 $parseFailure = [IO.InvalidDataException]::new(
                     "DevBench returned malformed JSON: $($_.Exception.Message)",
                     $_.Exception)
-                $returnedSession = $response.Headers['Mcp-Session-Id']
-                $returnedSessionId = if ($returnedSession -is [array]) { [string]$returnedSession[0] } else { [string]$returnedSession }
+                $returnedSessionId = Get-McpSessionHeaderValue -Response $response
                 if (-not [string]::IsNullOrWhiteSpace($returnedSessionId)) {
                     $parseFailure.Data['DevBenchMcpSessionId'] = $returnedSessionId
                 }
@@ -521,8 +575,7 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
                 protocolVersion = '2025-03-26'; capabilities = @{}; clientInfo = @{ name = 'DevBenchControl'; version = '1.5' }
             }
         }
-        $sessionHeader = $initialize.response.Headers['Mcp-Session-Id']
-        $sessionId = if ($sessionHeader -is [array]) { [string]$sessionHeader[0] } else { [string]$sessionHeader }
+        $sessionId = Get-McpSessionHeaderValue -Response $initialize.response
         if ([string]::IsNullOrWhiteSpace($sessionId)) { throw 'DevBench did not return an MCP session ID.' }
         $sessionHeaders = @{ Accept = 'application/json, text/event-stream'; 'Content-Type' = 'application/json'; 'Mcp-Session-Id' = $sessionId }
         $ownedMcpSessions.Add([pscustomobject][ordered]@{
@@ -789,7 +842,7 @@ try {
         $data = if ($NamesOnly) { [pscustomobject][ordered]@{ names = @($tools | ForEach-Object name); count = $tools.Count } } else { [pscustomobject][ordered]@{ tools = $tools } }
     }
     elseif ($Command -eq 'call') {
-        if (@($tools | Where-Object name -eq $Tool).Count -ne 1) { throw "Tool '$Tool' is not present in the authoritative tools/list response." }
+        $toolAvailable = @($tools | Where-Object name -eq $Tool).Count -eq 1
         $performanceGuard = if ($RequirePerformanceNeutral) {
             Get-PerformanceMeasurementGuard -Tools $tools -Headers $headers
         }
@@ -809,6 +862,41 @@ try {
                 codes = @('performance_measurement_distorted')
                 states = @()
                 reasons = @("Performance measurement rejected: $($performanceGuard.reason).")
+            }
+        }
+        elseif (-not $toolAvailable) {
+            $data = [pscustomobject][ordered]@{
+                tool = $Tool
+                toolAvailable = $false
+                toolCallSkipped = $true
+                performanceGuard = $performanceGuard
+            }
+            $semantic = [pscustomobject][ordered]@{
+                known = $true
+                ok = $false
+                outcome = 'tool-unavailable'
+                guarded = $false
+                transient = $false
+                codes = @('tool_unavailable')
+                states = @('tool_unavailable')
+                reasons = @("Tool '$Tool' is not present in the authoritative tools/list response.")
+            }
+            if ($performanceGuard) {
+                $performanceGuardAfter = Get-PerformanceMeasurementGuard -Tools $tools -Headers $headers
+                $performanceWindow = Test-DevBenchPerformanceWindow -Before $performanceGuard -After $performanceGuardAfter
+                $data | Add-Member -NotePropertyName performanceWindow -NotePropertyValue $performanceWindow -Force
+                if (-not $performanceWindow.valid) {
+                    $semantic = [pscustomobject][ordered]@{
+                        known = $true
+                        ok = $false
+                        outcome = 'guard-invalidated'
+                        guarded = $true
+                        transient = $false
+                        codes = @('performance_measurement_invalidated')
+                        states = @()
+                        reasons = @("Performance measurement rejected: $($performanceWindow.reason).")
+                    }
+                }
             }
         }
         else {
@@ -1101,6 +1189,8 @@ try {
                 }
                 catch {
                     if (-not (Test-WaitRetryableException -Exception $_.Exception)) { throw }
+                    Close-McpSessionForRebind -Headers $headers | Out-Null
+                    $headers = $null
                     $stableCandidateCount = 0
                     $stableFirstFrame = 0u
                     $stableLastFrame = 0u
@@ -1243,7 +1333,9 @@ try {
     }
     $guardedProperty = $semantic.PSObject.Properties['guarded']
     $completionState = if ($guardedProperty -and [bool]$guardedProperty.Value -and -not $semantic.ok) { 'guard-rejected' } else { 'completed' }
-    Update-InvocationEvidence -State $completionState -Semantic $semantic -Data $data -Errors @($result.errors)
+    $null = Write-TerminalInvocationEvidence -Result $result -FailurePrefix 'Completed invocation evidence could not be journaled' -WriteAction {
+        Update-InvocationEvidence -State $completionState -Semantic $semantic -Data $data -Errors @($result.errors)
+    }
 }
 catch {
     $failureMessage = $_.Exception.Message
@@ -1275,14 +1367,12 @@ catch {
 $sessionCleanup = Close-AllMcpSessions
 $result | Add-Member -NotePropertyName sessionCleanup -NotePropertyValue $sessionCleanup
 if ($invocationRecord -and -not [string]::IsNullOrWhiteSpace($invocationEvidencePath)) {
-    try {
+    $finalEvidenceWritten = Write-TerminalInvocationEvidence -Result $result -FailurePrefix 'Session cleanup evidence could not be journaled' -WriteAction {
         $invocationRecord['sessionCleanup'] = $sessionCleanup
         Write-JsonAtomic -Path $invocationEvidencePath -Value $invocationRecord
     }
-    catch {
-        $journalError = "Session cleanup evidence could not be journaled: $($_.Exception.Message)"
-        $result.errors = @($result.errors) + $journalError
-        $result | Add-Member -NotePropertyName evidenceJournalFinalized -NotePropertyValue $false -Force
+    if ($finalEvidenceWritten) {
+        $result | Add-Member -NotePropertyName evidenceJournalFinalized -NotePropertyValue $true -Force
     }
 }
 

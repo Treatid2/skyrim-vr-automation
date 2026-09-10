@@ -42,7 +42,10 @@ comparing data. Use these entry points:
    preparation events and stage summaries for admission/early exit,
    shader-cache deferral, SSS/SSGI, DLSS/FSR/FSR4, D3D creation, total,
    request-to-prepared, and prepared-to-creator. Missing fields are evidence,
-   never inferred.
+   never inferred. Both snapshot calls must retain the same performance-probe registration
+   and ownership epoch as the measured samples. An explicitly absent or
+   unsupported optional render-scale service may remain unavailable; guard,
+   identity, or epoch uncertainty must still fail the capture.
 7. Compare at least two raw captures with matching context fingerprints and
    identify the reference explicitly. Reject captures without at least three
    unique fresh frames or with non-finite metrics.
