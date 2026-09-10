@@ -1,13 +1,23 @@
 {
   "schemaVersion": 1,
   "name": "skyrim-vr-automation",
-  "version": "0.9.0+codex.20260908013933",
+  "version": "0.9.0+codex.20260910161727",
   "license": "GPL-3.0-or-later",
   "publisher": "Treatid2",
   "preservedUtc": "2026-08-21T00:00:00Z",
   "minimumPowerShellVersion": "7.0",
   "devBenchProtocolVersion": "2026-08-26",
   "tools": [
+    {
+      "name": "renderscale-tuning-worker",
+      "version": "1.0.0",
+      "entryPoint": "tools/renderscale-tuning-live/Invoke-RenderScaleTuningWorker.ps1"
+    },
+    {
+      "name": "modlist-control",
+      "version": "1.0.0",
+      "entryPoint": "tools/modlist-control/Invoke-SkyrimVRModlist.ps1"
+    },
     {
       "name": "doctor",
       "version": "1.1.0",
@@ -20,7 +30,7 @@
     },
     {
       "name": "mo2-control",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "entryPoint": "tools/mo2-control/Invoke-MO2Control.ps1"
     },
     {
@@ -49,9 +59,24 @@
       "entryPoint": "tools/devbench-control/Invoke-DevBenchControl.ps1"
     },
     {
+      "name": "render-scale-qualification",
+      "version": "2.0.0",
+      "entryPoint": "tools/render-scale-qualification/Start-CSXRenderScaleQualification.ps1"
+    },
+    {
       "name": "profiler-control",
       "version": "1.2.0",
       "entryPoint": "tools/profiler-control/Measure-CSXProfiler.ps1"
+    },
+    {
+      "name": "renderscale-tuning-live",
+      "version": "1.0.0",
+      "entryPoint": "tools/renderscale-tuning-live/runner.js"
+    },
+    {
+      "name": "renderscale-tuning-finalizer",
+      "version": "1.0.0",
+      "entryPoint": "tools/renderscale-tuning-finalizer/finalizer.js"
     },
     {
       "name": "shader-cache-control",
@@ -64,9 +89,19 @@
       "entryPoint": "tools/capture-interaction-control/Invoke-CaptureInteraction.ps1"
     },
     {
-      "name": "process-control",
+      "name": "coc-stability-control",
       "version": "1.0.0",
+      "entryPoint": "tools/coc-stability-control/Invoke-CocStabilityControl.ps1"
+    },
+    {
+      "name": "process-control",
+      "version": "1.1.0",
       "entryPoint": "tools/process-control/Invoke-BoundedProcess.ps1"
+    },
+    {
+      "name": "coc-evidence-control",
+      "version": "1.1.0",
+      "entryPoint": "tools/coc-evidence-control/Invoke-CocEvidenceControl.ps1"
     },
     {
       "name": "build-test-control",

@@ -3,6 +3,16 @@
 MO2 Control is the shared, machine-readable entry point for Codex tasks that
 inspect or validate the Skyrim VR Mod Organizer 2 installation.
 
+Version `1.1.0` adds explicit `configure-steamvr-exclusions` maintenance and
+read-only `steamVrExclusions` inspection. Paths come from the resolved machine
+configuration; the implementation does not depend on a modlist name.
+
+Version `1.0.0` makes task launch authorization independently verify the cache
+materialization receipt, the complete generated `backup` shadow, prepared tree
+hashes, and every current lower-provider path. The first launch rejects
+unexplained output drift. Retained game cycles may add task output, but every
+relaunch still rejects a missing shadow or changed lower-provider inventory.
+
 `validate-closed` is the explicit closed-state spelling of `validate
 -RequireClosed`; both commands are read-only and return the same proof.
 
@@ -60,9 +70,20 @@ session cannot silently fall back to the plain game executable.
 Overwrite is scanned recursively for `ShaderCache` and `ShaderCache.*`
 directories. Inspection classifies active, rollback (`.Previous`), temporary
 swap (`.Swap`), and other legacy trees and marks swap state older than one hour
-as stale. Validation blocks launch whenever any such tree remains, regardless
-of ordinary file-count thresholds; use workspace `prepare-source` to move the
-complete trees into an enabled stable-profile mod first.
+as stale. An ordinary profile cannot launch with unbound cache trees. A task
+profile may use the exact `mo2-overwrite-output` workspace contract, which is
+verified separately before session preparation and launch.
+
+A `Codex Task - ...` profile has an additional launch gate. The controller
+requires an exact owner marker for MO2 Overwrite and rejects both game and
+`Synthesis` entries in the cloned profile's `custom_overwrites` section. A
+launchable cache plan must use `-BindToOverwrite` and
+`RequireMaterializedOutput`. Preparation copies the complete enabled-provider
+union into `overwrite\ShaderCache`; workspace creation does the same for
+`overwrite\backup`. This makes Overwrite win paths that already existed in a
+mod while new-area paths use MO2's ordinary Overwrite route. First launch
+requires exact prepared hashes. Retained cycles may add files while every
+relaunch still checks complete provider coverage.
 
 ## Quick start
 
@@ -132,6 +153,35 @@ Profile fallback is never accepted as success. Quarantined
 RootBuilder failures.
 
 ## Cooperative access lifecycle
+
+### SteamVR VFS exclusion maintenance
+
+When a game starts SteamVR as a virtualized child, SteamVR can remain registered
+with MO2 after the game exits. Prevent this by explicitly adding SteamVR runtime
+executables to the selected MO2 instance's blacklist:
+
+```text
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> configure-steamvr-exclusions -ConfigPath <exact-machine-config> -AccessId <owned-access-id> -WhatIf -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> configure-steamvr-exclusions -ConfigPath <exact-machine-config> -AccessId <owned-access-id> -Compact
+```
+
+Acquire an access-only lease and validate closed state first. The command
+preserves existing exclusions and appends only missing `vrserver.exe`,
+`vrcompositor.exe`, `vrmonitor.exe`, `vrdashboard.exe`, and
+`vrwebhelper.exe` entries, case-insensitively. It preserves unrelated INI bytes,
+backs up the original, verifies the result, and is idempotent. A missing key
+requires a recognized MO2 default baseline; ambiguous settings fail closed.
+MO2, the game/loaders, and SteamVR helpers must be stopped. Release the lease
+afterward. No task profile clone or game launch is needed.
+
+This is a one-shot, authorized configuration change, never an implicit effect
+of inspection or launch. It does not close Steam or SteamVR. Already-injected
+processes need a separately authorized shutdown; adding exclusions cannot
+retroactively unload their VFS hooks. Do not blacklist Skyrim or SKSE.
+
+The existing `close` / `validate -RequireClosed` lifecycle proves MO2/game
+process closure, not the absence of VFS hooks in other processes. Do not report
+a completely clean VFS session solely from that result.
 
 `request-access` atomically acquires the one shared MO2 lock and returns an
 `accessId` bearer credential plus a distinct public `leaseId`. Every request

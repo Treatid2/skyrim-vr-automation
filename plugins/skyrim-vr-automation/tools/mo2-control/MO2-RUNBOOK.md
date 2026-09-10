@@ -33,6 +33,12 @@ location, archive, process names, and safety limits live in the ignored
 the doctor-reported configuration. Start from `config/machine.example.json`; do not
 commit the resulting machine file.
 
+Machines with multiple portable MO2 installations keep one exact config per
+modlist through `../modlist-control`. Inspect and select the intended name
+before preflight. A persisted exact selection is allowed; choosing the first
+config, assuming that `main` means safe, or falling back to the UI-selected
+profile is not.
+
 Before any elevated invocation, read `APPROVALS.md`. Use a direct literal
 `pwsh.exe -NoProfile -NonInteractive -File <entrypoint> <subcommand>` shape and
 the result's `data.approval.reusablePrefix`. Variables in this runbook describe
@@ -142,9 +148,12 @@ or resume one while holding access. On the first request, prepare the configured
 stable source and create a task workspace. On later requests, select an exact
 retained WorkspaceId or explicitly request a fresh clone. Pass the returned
 task profile explicitly to `prepare`.
-Source preparation moves every legacy `ShaderCache*` directory out of overwrite
-into a newly enabled stable-source mod; creation refuses to continue if any
-remain. Fresh creation also refuses to continue unless `fixture-status` is
+Except under `-WhatIf`, `prepare-source` transactionally moves legacy cache
+trees from Overwrite into a newly enabled stable-profile mod. Creation binds
+the workspace to snapshotted MO2 Overwrite output, removes the cloned
+profile's game and `Synthesis` custom-overwrite mappings, and materializes the
+enabled `backup` provider union there. Cache catalog preparation does the same
+for `ShaderCache`. Fresh creation also requires `fixture-status` to be
 `fixture-valid` for the maintained source's default world-entry save:
 
 ```text
@@ -271,8 +280,12 @@ the actual route independently.
    use the same durable controller for the bounded escalation `stop-game`,
    `terminate`, then `release`; the
    latter two commands prove game/RootBuilder absence and exact lock ownership.
-   `release -SessionId` ends the evidence session. For an explicitly requested
-   lease it deliberately retains access, so call `release-access -AccessId`
+   `release -SessionId` ends the evidence session. After the game, MO2, and
+   evidence session are closed, complete the shader-cache catalog transaction,
+   then run workspace `complete-output -AccessId <literal-access-id> -TaskId
+   <stable-task-id> -WorkspaceId <exact-workspace-id> -Confirm:$false`. This
+   preserves generated output, restores the exact pre-task Overwrite trees, and
+   releases the owner marker. Finally call `release-access -AccessId`
    immediately unless another MO2 session is about to begin.
 2. Collect only files attributable to the session. Common sources include:
    - CSX/SKSE/MO2 logs;
@@ -289,6 +302,30 @@ the actual route independently.
 
 ## Failure and recovery matrix
 
+### SteamVR keeps MO2 locked after Skyrim exits
+
+Inspect the exact runtime process identities and whether they still load the
+selected installation's `usvfs_x64.dll`. SteamVR being alive is not itself a
+failure: a separately started, unhooked runtime may legitimately remain open.
+The distinction is surviving VFS participation. MO2's Unlock action releases
+its interface, not the hooks in those other processes.
+
+For an explicitly authorized prevention change, use
+`configure-steamvr-exclusions` through the resolved machine configuration.
+Read the maintenance section in `README.md`, acquire an access-only lease,
+validate closed state, preview with `-WhatIf`, then apply and retain its backup
+receipt before releasing access. This installation-INI maintenance operation
+does not create or select a test profile. Never use a particular modlist's name
+or paths as an implicit target.
+
+The command will not terminate processes. If hooked SteamVR survives, use the
+SteamVR controller only after runtime shutdown is authorized; ordinary MO2
+shutdown does not authorize closing Steam, other games, or crash-log editors.
+Exit the already-hooked runtime before testing the new exclusions, and verify
+on the next controlled launch that Skyrim still sees its mods while SteamVR
+does not inherit the VFS. Do not treat the prevention change as live-qualified
+before that check.
+
 ### Missing profile or fallback warning
 
 Symptom: MO2 says the selected profile does not exist and chooses a different
@@ -298,6 +335,17 @@ Response: stop. Do not acknowledge the fallback and continue automation. Close
 MO2, verify the exact profile directory and `selected_profile`, then run
 `validate -RequireClosed`. A fallback is a failed precondition even if MO2 can
 launch.
+
+### Persisted legacy task profile
+
+Symptom: `inspect` reports that MO2 selects a `Codex Task -` profile whose
+workspace has no runtime-output isolation contract.
+
+Response: do not launch that profile. Close Skyrim and MO2, acquire the exact
+access lease, validate closed state, preview workspace
+`recover-legacy-selection`, and run it with the reported workspace ID. The
+operation selects the configured stable source and retains the legacy profile,
+mods, cache, manifest, exact INI backup, and recovery receipt.
 
 ### `Cannot start -r`
 

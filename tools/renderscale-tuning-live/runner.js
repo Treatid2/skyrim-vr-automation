@@ -1,0 +1,2403 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+function unwrapTraceRead(value) {
+    if (value && Array.isArray(value.content) && value.content[0] &&
+        typeof value.content[0].text === "string") {
+        return unwrapTraceRead(JSON.parse(value.content[0].text));
+    }
+    if (value && Array.isArray(value.results)) {
+        const step = value.results.find((entry) => entry &&
+            entry.result && entry.result.action === "dlss_trace_read");
+        return step && step.result;
+    }
+    return value && value.result && value.result.action === "dlss_trace_read" ?
+        value.result : value;
+}
+
+function recordSequence(record) {
+    const value = record && (record.sequence ??
+        (record.current && record.current.sequence));
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function traceCapacity(schema) {
+    const maximum = schema && (schema.maximum ?? schema.max ??
+        (schema.limit && schema.limit.maximum));
+    if (!Number.isSafeInteger(maximum) || maximum < 1) {
+        throw new Error("trace_schema_maximum_missing");
+    }
+    return maximum;
+}
+
+function validateTracePage(rawPage, state) {
+    const page = unwrapTraceRead(rawPage);
+    const capture = page && page.capture;
+    const producer = page && page.producer;
+    if (!page || page.action !== "dlss_trace_read" || !capture ||
+        !Array.isArray(capture.records)) {
+        throw new Error("invalid_trace_page");
+    }
+    if (!producer || producer.buildId !== state.buildId) {
+        throw new Error("trace_build_changed");
+    }
+    const sessionId = capture.summary && capture.summary.sessionID;
+    if (!Number.isSafeInteger(sessionId) || sessionId < 1) {
+        throw new Error("trace_session_missing");
+    }
+    if (state.sessionId !== null && sessionId !== state.sessionId) {
+        throw new Error("trace_session_changed");
+    }
+    if (!Number.isSafeInteger(capture.limit) ||
+        capture.limit > state.maximum || capture.limit < 1 ||
+        capture.records.length > capture.limit) {
+        throw new Error("trace_page_limit_out_of_range");
+    }
+    if (typeof capture.moreAvailable !== "boolean" ||
+        !Number.isSafeInteger(capture.latestSequence) || capture.latestSequence < 0) {
+        throw new Error("trace_continuation_missing");
+    }
+    if (state.latestSequence !== undefined && state.latestSequence !== capture.latestSequence) {
+        throw new Error("trace_window_changed");
+    }
+    state.latestSequence = capture.latestSequence;
+    if (capture.afterSequence !== state.afterSequence) {
+        throw new Error("trace_page_cursor_mismatch");
+    }
+    if (capture.requestedSequenceOverwritten === true ||
+        (Number.isSafeInteger(capture.availableFromSequence) &&
+            capture.availableFromSequence > state.afterSequence + 1)) {
+        throw new Error("trace_requested_sequence_overwritten");
+    }
+
+    let expected = state.afterSequence + 1;
+    for (const record of capture.records) {
+        const sequence = recordSequence(record);
+        if (sequence === null) throw new Error("trace_sequence_missing");
+        if (sequence < expected) throw new Error("trace_sequence_duplicate");
+        if (sequence > expected) throw new Error("trace_sequence_gap");
+        expected += 1;
+    }
+    const lastSequence = capture.records.length > 0 ? expected - 1 :
+        state.afterSequence;
+    if (capture.lastReturnedSequence !== lastSequence) {
+        throw new Error("trace_last_sequence_mismatch");
+    }
+    if (capture.moreAvailable === true && capture.records.length === 0) {
+        throw new Error("trace_empty_continuation_page");
+    }
+    if (lastSequence > capture.latestSequence ||
+        (capture.moreAvailable && lastSequence === capture.latestSequence)) {
+        throw new Error("trace_continuation_out_of_range");
+    }
+    return { page, sessionId, lastSequence };
+}
+
+async function collectTracePages(options) {
+    const {
+        readPage, expectedBuildId, schema, expectedSessionId = null,
+        existingPages = [], preservePage = async () => {},
+    } = options;
+    if (typeof readPage !== "function" || typeof preservePage !== "function" ||
+        typeof expectedBuildId !== "string" || expectedBuildId.length === 0) {
+        throw new Error("invalid_trace_paging_options");
+    }
+    const maximum = traceCapacity(schema);
+    const state = {
+        buildId: expectedBuildId,
+        sessionId: expectedSessionId,
+        afterSequence: 0,
+        maximum,
+    };
+    const pages = [];
+    const records = [];
+
+    for (const rawPage of existingPages) {
+        const checked = validateTracePage(rawPage, state);
+        state.sessionId = checked.sessionId;
+        state.afterSequence = checked.lastSequence;
+        pages.push(checked.page);
+        records.push(...checked.page.capture.records);
+        if (checked.page.capture.moreAvailable !== true) {
+            return { pages, records, sessionId: state.sessionId, maximum };
+        }
+    }
+
+    while (pages.length === 0 ||
+        pages[pages.length - 1].capture.moreAvailable === true) {
+        const rawPage = await readPage({
+            action: "dlss_trace_read",
+            afterSequence: state.afterSequence,
+            limit: maximum,
+            expectedBuildId,
+        });
+        // Preserve the producer receipt even when validation rejects it.
+        await preservePage(rawPage, pages.length + 1);
+        const checked = validateTracePage(rawPage, state);
+        state.sessionId = checked.sessionId;
+        state.afterSequence = checked.lastSequence;
+        pages.push(checked.page);
+        records.push(...checked.page.capture.records);
+    }
+    return { pages, records, sessionId: state.sessionId, maximum };
+}
+
+function validateRetainedTrace(retained) {
+    if (!["traceReset", "traceStart", "traceStop", "traceRead"]
+        .every(name => retained[name])) throw new Error("trace_lifecycle_missing");
+    const buildId = retained.waiter.producer.buildId;
+    const sessionId = retained.traceStart.capture && retained.traceStart.capture.sessionID;
+    for (const name of ["traceReset", "traceStart", "traceStop"]) {
+        const receipt = retained[name];
+        if (!receipt.producer || receipt.producer.buildId !== buildId) {
+            throw new Error("trace_build_changed");
+        }
+        if (!receipt.capture || receipt.action !== {
+            traceReset: "dlss_trace_reset", traceStart: "dlss_trace_start",
+            traceStop: "dlss_trace_stop",
+        }[name]) throw new Error("trace_lifecycle_invalid");
+    }
+    const stopped = retained.traceStop.capture;
+    if (!Number.isSafeInteger(sessionId) || sessionId < 1 ||
+        stopped.sessionID !== sessionId) throw new Error("trace_session_changed");
+    if (retained.traceReset.capture.active !== false ||
+        retained.traceStart.capture.active !== true || stopped.active !== false) {
+        throw new Error("trace_lifecycle_not_stopped");
+    }
+    const pages = retained.traceReadPages || [retained.traceRead];
+    if (!Array.isArray(pages) || pages.length === 0) throw new Error("trace_pages_missing");
+    const first = unwrapTraceRead(pages[0]);
+    if (JSON.stringify(first) !== JSON.stringify(retained.traceRead)) {
+        throw new Error("trace_first_page_mismatch");
+    }
+    const state = { buildId, sessionId, afterSequence: 0,
+        maximum: traceCapacity({ maximum: first.capture && first.capture.limit }) };
+    let records = 0;
+    for (let index = 0; index < pages.length; index += 1) {
+        const checked = validateTracePage(pages[index], state);
+        const capture = checked.page.capture;
+        if (capture.summary.active !== false ||
+            capture.summary.totalRecords !== stopped.totalRecords) {
+            throw new Error("trace_stopped_window_changed");
+        }
+        if (typeof capture.moreAvailable !== "boolean") throw new Error("trace_continuation_missing");
+        if (!capture.moreAvailable && index !== pages.length - 1) {
+            throw new Error("trace_pages_after_terminal");
+        }
+        if (capture.moreAvailable && index === pages.length - 1) {
+            throw new Error("trace_pages_incomplete");
+        }
+        state.afterSequence = checked.lastSequence;
+        records += capture.records.length;
+        if (!capture.moreAvailable && capture.latestSequence !== checked.lastSequence) {
+            throw new Error("trace_terminal_sequence_mismatch");
+        }
+    }
+    if (!Number.isSafeInteger(stopped.totalRecords) ||
+        records !== stopped.totalRecords || stopped.droppedRecords !== 0 ||
+        stopped.overwrittenRecords !== 0) throw new Error("trace_window_incomplete");
+    return { complete: true, pages: pages.length, records, sessionId };
+}
+
+async function createReceiptJournal(tools, runId) {
+    if (!/^[A-Za-z0-9_-]+$/.test(runId) ||
+        typeof tools.exec_command !== "function" || typeof tools.apply_patch !== "function") {
+        throw new Error("durable_receipt_store_unavailable");
+    }
+    const setup = await tools.exec_command({
+        cmd: `$root = [IO.Path]::GetFullPath((Join-Path (Get-Location).Path 'artifacts/renderscale-tuning/${runId}'))
+` +
+            `if (Test-Path -LiteralPath $root) { throw 'Evidence run already exists; preserve it and use a new run ID.' }
+` +
+            `[IO.Directory]::CreateDirectory($root) | Out-Null
+` +
+            `$owner = [IO.File]::Open((Join-Path $root 'receipt-owner'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+` +
+            `$owner.Dispose()
+[pscustomobject]@{ root = $root } | ConvertTo-Json -Compress`,
+        max_output_tokens: 300,
+    });
+    if (setup.exit_code !== 0) throw new Error("durable_receipt_store_creation_failed");
+    const root = JSON.parse(setup.output).root.replaceAll("\\", "/");
+    let sequence = 0;
+    return {
+        root,
+        write: async (receiptKey, value) => {
+            const number = String(++sequence).padStart(6, "0");
+            const entry = JSON.stringify({ sequence, receiptKey, value });
+            const result = await tools.apply_patch(
+                `*** Begin Patch\n*** Add File: ${root}/raw/journal/${number}.json\n+${entry}\n*** End Patch`);
+            if (result && (result.isError || result.exit_code > 0)) {
+                throw new Error("durable_receipt_write_failed");
+            }
+        },
+    };
+}
+
+function exposedBackend(value) {
+    return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function actualBackend(waiter, target) {
+    if (target.method === "none" || target.method === "taa") return "none";
+    if (target.method !== "dlss" && target.method !== "fsr") {
+        return "not_exposed";
+    }
+    if (target.renderScaleMode === false) {
+        const execution = waiter.nativeVendorExecution ||
+            waiter.observation && waiter.observation.nativeVendorExecution;
+        return exposedBackend(execution && execution.actualBackend) ||
+            "not_exposed";
+    }
+    if (target.renderScaleMode !== true) return "not_exposed";
+    const timeline = waiter.replacementTimeline || {};
+    const proof = timeline.terminal &&
+        timeline.terminal.presentationProof || {};
+    const direct = exposedBackend(proof.backend);
+    if (direct) return direct;
+    const left = exposedBackend(proof.leftEye && proof.leftEye.backend);
+    const right = exposedBackend(proof.rightEye && proof.rightEye.backend);
+    if (left && left === right) return left;
+    const dispatch = waiter.status && waiter.status.fsrDispatch;
+    return exposedBackend(dispatch && dispatch.actualDispatchBackend) ||
+        "not_exposed";
+}
+
+function amdLaneAvailability(lane, capabilities) {
+    const supported = capabilities?.supportedFSRRuntimeMask;
+    const unavailable = capabilities?.fsrRuntimeUnavailableConditions;
+    if (!Number.isSafeInteger(supported) || supported < 0 || supported > 3 ||
+        !Array.isArray(unavailable) || unavailable.length !== 2 ||
+        unavailable.some(entry => !Number.isSafeInteger(entry?.mask) || entry.mask < 0)) {
+        return { runnable: null, reason: "fsr_runtime_capability_shape_invalid" };
+    }
+    const fsr3 = (supported & 1) !== 0 && unavailable[0].mask === 0;
+    const runnable = lane.id === "explicit_fsr4" ?
+        (supported & 2) !== 0 && unavailable[1].mask === 0 :
+        lane.id === "explicit_fsr3" ? fsr3 :
+        lane.id === "fsr4_to_fsr3_fallback" ? fsr3 && unavailable[1].mask !== 0 : null;
+    return { runnable, reason: runnable === true ? null : "lane_capability_requirements_not_met",
+        supportedFSRRuntimeMask: supported, fsrRuntimeUnavailableConditions: unavailable };
+}
+
+function qualifyLaneBackend(waiter, target, lane, capabilities) {
+    if (!lane?.expectedBackends) return { verdict: "NOT_APPLICABLE", reasons: [] };
+    const eligibility = amdLaneAvailability(lane, capabilities);
+    const result = { verdict: "PASS", reasons: [], eligibility,
+        expectedBackends: lane.expectedBackends, actualBackend: actualBackend(waiter, target),
+        configuredFsrRuntime: target.fsrRuntime ?? null, runtimeFallbackObserved: null };
+    if (eligibility.runnable !== true) result.reasons.push("lane_not_eligible");
+    if (target.method === "fsr") {
+        if (target.fsrRuntime !== lane.configuredFsrRuntime) result.reasons.push("configured_runtime_mismatch");
+        if (!lane.expectedBackends.includes(result.actualBackend)) result.reasons.push("physical_backend_mismatch_or_missing");
+        const execution = waiter.nativeVendorExecution || waiter.observation?.nativeVendorExecution;
+        const proof = waiter.replacementTimeline?.terminal?.presentationProof;
+        const eyes = [proof?.leftEye, proof?.rightEye];
+        const fallback = target.renderScaleMode === false ? execution?.actualRuntimeFallbackObserved :
+            eyes.every(eye => typeof eye?.vendorRuntimeFallback === "boolean") ?
+                eyes.some(eye => eye.vendorRuntimeFallback) : null;
+        result.runtimeFallbackObserved = typeof fallback === "boolean" ? fallback : null;
+        if (target.renderScaleMode === true && typeof eyes[0]?.vendorRuntimeFallback === "boolean" &&
+            typeof eyes[1]?.vendorRuntimeFallback === "boolean" &&
+            eyes[0].vendorRuntimeFallback !== eyes[1].vendorRuntimeFallback)
+            result.reasons.push("eye_fallback_mismatch");
+        if (target.renderScaleMode === true && eyes.some(eye => eye?.backend &&
+            !lane.expectedBackends.includes(eye.backend))) result.reasons.push("eye_backend_mismatch");
+        if (lane.requiresDocumentedFsr4UnavailableCondition && result.runtimeFallbackObserved !== true)
+            result.reasons.push("runtime_fallback_not_proven");
+        if (lane.requiresFsr4Available && result.runtimeFallbackObserved !== false)
+            result.reasons.push("explicit_fsr4_without_fallback_not_proven");
+    } else if (!["none", "taa"].includes(target.method)) result.reasons.push("lane_method_invalid");
+    if (result.reasons.length) result.verdict = "FAIL";
+    return result;
+}
+
+async function runRenderScaleTuningLive(context) {
+    "use strict";
+
+    const {
+        tools, store, notify, variant, runId, buildId,
+        positioningRoot, matrix,
+    } = context;
+    const scenarioTool = tools.mcp__devbench_vr__scenario;
+    const renderScaleTool = tools.mcp__devbench_vr__communityshaders_renderscale;
+    if (typeof scenarioTool !== "function" || typeof renderScaleTool !== "function") {
+        throw new Error("plugin_direct_unavailable");
+    }
+    const retainedReceiptKeys = [];
+    let verifiedAdapter = null;
+    let cleanupMode = false;
+    let ownedCaptures = {};
+    let amdTraceMayBeActive = false;
+    const cleanupEvidenceErrors = [];
+
+    async function retain(key, value) {
+        store(key, value);
+        try { await receiptJournal.write(key, value); }
+        catch (error) {
+            if (!cleanupMode) throw error;
+            cleanupEvidenceErrors.push({ receiptKey: key, error: String(error.message || error) });
+        }
+        if (!retainedReceiptKeys.includes(key)) retainedReceiptKeys.push(key);
+    }
+
+    async function retainLiveResult(summary) {
+        const key = `${runId}:live-result`;
+        if (!retainedReceiptKeys.includes(key)) retainedReceiptKeys.push(key);
+        summary.receiptKeys = [...retainedReceiptKeys];
+        summary.evidenceRoot = receiptJournal.root;
+        summary.cleanupEvidenceErrors = cleanupEvidenceErrors;
+        await retain(key, summary);
+        if (receiptJournal.drain) await receiptJournal.drain();
+    }
+
+    const quality = Object.freeze({
+        native_aa: 0,
+        hoshipa: 1,
+        ultra_quality: 2,
+        quality: 3,
+        balanced: 4,
+        performance: 5,
+        ultra_performance: 6,
+    });
+    const qualityName = Object.freeze(Object.fromEntries(
+        Object.entries(quality).map(([name, value]) => [value, name])));
+    const dlssProfile = Object.freeze({ J: 0, K: 1, L: 2, M: 3, F: 4, E: 5 });
+    const foveation = Object.freeze({
+        foveatedVendorDispatch: true,
+        foveatedCenterArea: 0.3,
+        peripheryTAAEnable: true,
+        peripheryTAACenterArea: 0.3,
+        peripheryTAAOuterScale: 0.7,
+    });
+
+    function decodeEnvelope(envelope) {
+        const block = envelope && envelope.content && envelope.content[0];
+        if (!block || block.type !== "text" || typeof block.text !== "string") {
+            throw new Error("invalid_mcp_envelope");
+        }
+        return JSON.parse(block.text);
+    }
+
+    function resultMap(root) {
+        return new Map((root.results || [])
+            .filter((entry) => entry && typeof entry.label === "string")
+            .map((entry) => [entry.label, entry.result]));
+    }
+
+    function reportedError(value) {
+        if (!value || typeof value !== "object") return null;
+        for (const name of ["error", "message", "reason"]) {
+            if (typeof value[name] === "string" && value[name].length > 0) {
+                return value[name];
+            }
+        }
+        return null;
+    }
+
+    function scenarioDiagnostic(root, steps, receiptKey, phase = "response") {
+        const results = root && Array.isArray(root.results) ? root.results : [];
+        const reportedSteps = results.map((entry, index) => {
+            const planned = steps[index] || {};
+            const result = entry && entry.result;
+            const failed = Boolean(entry && (entry.ok === false ||
+                entry.isError === true ||
+                (result && (result.ok === false || result.isError === true))));
+            const error = failed ?
+                reportedError(entry) || reportedError(result) : null;
+            return {
+                index,
+                label: entry && typeof entry.label === "string" ?
+                    entry.label : planned.label || null,
+                failed,
+                error,
+            };
+        });
+        const failed = reportedSteps.find((entry) => entry.failed) || null;
+        const firstUnreported = results.length < steps.length ?
+            steps[results.length] : null;
+        return {
+            phase,
+            receiptKey,
+            ok: root && typeof root.ok === "boolean" ? root.ok : null,
+            aborted: root && typeof root.aborted === "boolean" ?
+                root.aborted : null,
+            stepsRun: root && Number.isSafeInteger(root.stepsRun) ?
+                root.stepsRun : null,
+            expectedSteps: steps.length,
+            reportedError: root && (root.ok === false || root.isError === true) ?
+                reportedError(root) || (failed && failed.error) || null :
+                failed && failed.error || null,
+            failedStep: failed && failed.label || null,
+            firstUnreportedStep: firstUnreported && firstUnreported.label || null,
+            reportedSteps,
+        };
+    }
+
+    function diagnosticError(code, diagnostic) {
+        const error = new Error(code);
+        error.diagnostic = diagnostic;
+        return error;
+    }
+
+    function requireScenario(root, steps, receiptKey) {
+        if (!root || root.ok !== true || root.aborted !== false ||
+            root.stepsRun !== steps.length || !Array.isArray(root.results)) {
+            throw diagnosticError("scenario_failed",
+                scenarioDiagnostic(root, steps, receiptKey));
+        }
+        return resultMap(root);
+    }
+
+    // Qualification producers have used flat profiles and wrapped public
+    // snapshots. Decode either shape without changing the measured sequence.
+    function terminalBoundary(waiter, validateTerminal = true) {
+        const snapshot = waiter && waiter.upscalingSnapshot;
+        if (validateTerminal && (!snapshot || typeof snapshot !== "object")) {
+            throw diagnosticError("effective_profile_missing", {
+                reason: "upscaling_snapshot_missing",
+            });
+        }
+        const profile = snapshot.effective ||
+            (snapshot.profiles && snapshot.profiles.effective);
+        const enumName = (value, names = null) =>
+            value && typeof value === "object" ? value.name :
+                names && Number.isSafeInteger(value) ? names[value] : value;
+        if (validateTerminal && (!profile || typeof profile !== "object")) {
+            throw diagnosticError("effective_profile_missing", {
+                reason: "effective_profile_missing",
+            });
+        }
+        const decoded = {
+            method: enumName(profile.method),
+            qualityMode: enumName(profile.qualityMode, qualityName),
+            renderScaleMode: profile.renderScaleMode,
+            dlssProfile: enumName(profile.dlssProfile),
+            fsrRuntime: enumName(profile.fsrRuntime),
+        };
+        const validName = (value) =>
+            typeof value === "string" && value.length > 0;
+        if (validateTerminal && (!Number.isSafeInteger(snapshot.stateRevision) ||
+            snapshot.stateRevision < 0 || !validName(decoded.method) ||
+            !validName(decoded.qualityMode) ||
+            typeof decoded.renderScaleMode !== "boolean" ||
+            !validName(decoded.dlssProfile) || !validName(decoded.fsrRuntime))) {
+            throw diagnosticError("effective_profile_invalid", {
+                reason: "effective_profile_shape_invalid",
+                stateRevision: snapshot.stateRevision ?? null,
+                fields: {
+                    method: decoded.method ?? null,
+                    qualityMode: decoded.qualityMode ?? null,
+                    renderScaleMode: decoded.renderScaleMode ?? null,
+                    dlssProfile: decoded.dlssProfile ?? null,
+                    fsrRuntime: decoded.fsrRuntime ?? null,
+                },
+            });
+        }
+        if (validateTerminal) requireTerminalAdapter(waiter);
+        return {
+            revision: snapshot.stateRevision,
+            profile: decoded,
+        };
+    }
+
+    function requireTerminalAdapter(waiter) {
+        const stressSessionId = waiter.baseline && waiter.baseline.stressSessionId ||
+            waiter.status && waiter.status.session && waiter.status.session.id;
+        const adapter = waiter.status ? waiter.status.adapter :
+            verifiedAdapter && verifiedAdapter.stressSessionId === stressSessionId ?
+                verifiedAdapter.adapter : null;
+        if (!adapter || adapter.available !== true) {
+            throw diagnosticError("terminal_adapter_unavailable", {
+                reason: "adapter_identity_not_available", variant,
+                adapter: adapter || null,
+            });
+        }
+        const vendorId = typeof adapter.vendorId === "string" &&
+            /^(?:0x[0-9a-f]+|[0-9]+)$/i.test(adapter.vendorId) ?
+            Number(adapter.vendorId) : adapter.vendorId;
+        const expectedVendorId = variant === "amd" ? 0x1002 : 0x10de;
+        if (!Number.isSafeInteger(vendorId) || vendorId !== expectedVendorId) {
+            throw diagnosticError("terminal_adapter_vendor_mismatch", {
+                reason: "adapter_vendor_mismatch", variant, expectedVendorId,
+                actualVendorId: Number.isSafeInteger(vendorId) ? vendorId : null,
+                adapter,
+            });
+        }
+        verifiedAdapter = { stressSessionId, adapter: { ...adapter, vendorId } };
+    }
+
+    // Keep positioning admission inside the runner so callers cannot add
+    // shape checks between the fixed COC prefix and measured execution.
+    function positioningInputs(root) {
+        if (!root || root.ok !== true || root.aborted !== false ||
+            !Number.isSafeInteger(root.stepsRun) ||
+            !Array.isArray(root.results) ||
+            root.stepsRun !== root.results.length) {
+            throw new Error("positioning_scenario_failed");
+        }
+        const requiredLabels = [
+            "position-coc",
+            "position-health",
+            "position-state",
+            "position-scene",
+            "position-capabilities",
+            "position-snapshot",
+            "position-renderscale",
+        ];
+        for (const label of requiredLabels) {
+            const entry = root.results.find((candidate) =>
+                candidate && candidate.label === label);
+            // Tool payloads are opaque; only the outer scenario result is
+            // part of positioning admission.
+            if (!entry || !Object.prototype.hasOwnProperty.call(entry, "result")) {
+                throw new Error(`positioning_tool_result_missing:${label}`);
+            }
+        }
+        const results = resultMap(root);
+        const sceneResult = results.get("position-scene");
+        const snapshotResult = results.get("position-snapshot");
+        const capabilitiesResult = results.get("position-capabilities");
+        if (!sceneResult || !sceneResult.cell ||
+            sceneResult.cell.editorId !== "WhiterunDragonsreach") {
+            throw new Error("positioning_scene_mismatch");
+        }
+        if (!snapshotResult || !snapshotResult.snapshot) {
+            throw new Error("positioning_snapshot_missing");
+        }
+        if (variant === "amd" &&
+            (!capabilitiesResult || !capabilitiesResult.capabilities)) {
+            throw new Error("positioning_capabilities_missing");
+        }
+        return {
+            cellEditorId: sceneResult.cell.editorId,
+            boundary: terminalBoundary({
+                upscalingSnapshot: snapshotResult.snapshot,
+            }, false),
+            capabilities: capabilitiesResult &&
+                capabilitiesResult.capabilities || {},
+        };
+    }
+
+    const positioning = positioningInputs(positioningRoot);
+    const receiptJournal = context.receiptJournal || await createReceiptJournal(tools, runId);
+    for (const [name, value] of Object.entries(context.startupReceipts || {})) {
+        await retain(`${runId}:startup-${name}`, value);
+    }
+
+    const capabilities = positioning.capabilities;
+    notify({
+        phase: "positioning",
+        status: "admitted",
+        cellEditorId: positioning.cellEditorId,
+        buildId,
+    });
+
+    function targetFor(boundary, destination, fsrRuntime) {
+        return {
+            method: destination.method,
+            qualityMode: destination.qualityMode,
+            renderScaleMode: destination.renderScaleMode,
+            dlssProfile: boundary.profile.dlssProfile,
+            fsrRuntime: fsrRuntime || destination.fsrRuntime || boundary.profile.fsrRuntime,
+        };
+    }
+
+    function waiterTarget(target) {
+        const result = {
+            method: target.method,
+            qualityMode: quality[target.qualityMode],
+            renderScaleMode: target.renderScaleMode,
+        };
+        if (target.method === "dlss") result.dlssProfile = target.dlssProfile;
+        if (target.method === "fsr") result.fsrRuntime = target.fsrRuntime;
+        return result;
+    }
+
+    function toolStep(label, tool, args) {
+        return { label, tool, args };
+    }
+
+    async function scenario(steps, receiptKey) {
+        let envelope;
+        try {
+            envelope = await scenarioTool({
+                action: "run",
+                async: false,
+                continueOnError: cleanupMode,
+                steps,
+            });
+        } catch (error) {
+            throw diagnosticError("scenario_transport_failed", {
+                phase: "transport",
+                receiptKey,
+                ok: null,
+                aborted: null,
+                stepsRun: null,
+                expectedSteps: steps.length,
+                reportedError: error instanceof Error ?
+                    error.message : String(error),
+                failedStep: null,
+                firstUnreportedStep: steps[0] && steps[0].label || null,
+                reportedSteps: [],
+            });
+        }
+        try {
+            const root = decodeEnvelope(envelope);
+            for (const entry of root.results || []) {
+                const value = entry.result;
+                if ((entry.label === "baseline-stress-start" || entry.label === "measured-stress-start") &&
+                    value?.status?.session?.active === true &&
+                    Number.isSafeInteger(value.status.session.id) && value.status.session.id > 0) {
+                    ownedCaptures = { stressSessionId: value.status.session.id };
+                }
+                if (entry.label === "texture-lifetime-start") ownedCaptures.textureSessionId = value?.capture?.sessionID;
+                if (entry.label === "load-presentation-start") ownedCaptures.probeSessionId = value?.status?.sessionID;
+                if (["dlss-trace-start", "amd-dlss-trace-start"].includes(entry.label)) ownedCaptures.traceSessionId = value?.capture?.sessionID;
+                if (entry.label === "profiler-enable") ownedCaptures.profilerEnabled = value?.ok === true;
+                if (entry.label === "qualification-dispatch" && value?.performanceTelemetry?.started) {
+                    ownedCaptures.cpuSessionId = value.performanceTelemetry.cpuPerformance?.sessionId;
+                    ownedCaptures.gpuStartFrame = value.performanceTelemetry.gpuPerformance?.startFrame;
+                }
+            }
+            if (context.observeOwnership) context.observeOwnership({ ...ownedCaptures });
+            await retain(receiptKey, envelope);
+            return { envelope, root };
+        } catch (error) {
+            throw diagnosticError("scenario_decode_failed", {
+                phase: "decode",
+                receiptKey,
+                ok: null,
+                aborted: null,
+                stepsRun: null,
+                expectedSteps: steps.length,
+                reportedError: error instanceof Error ?
+                    error.message : String(error),
+                failedStep: null,
+                firstUnreportedStep: null,
+                reportedSteps: [],
+            });
+        }
+    }
+
+    async function renderScale(args) {
+        const envelope = await renderScaleTool(args);
+        return { envelope, root: decodeEnvelope(envelope) };
+    }
+
+    function ids(laneIndex, pass, ordinal, baseline) {
+        const serial = laneIndex * 100 + pass * 40 + ordinal;
+        const stem = `${runId}-${variant}-${laneIndex}-${pass}-${baseline ? "b" : ordinal}`;
+        return {
+            transitionId: (baseline ? 900000 : 100000) + serial,
+            ownerId: `${stem}-owner`,
+            clientId: `${stem}-client`,
+            commandId: `${stem}-apply`,
+            profilerClientId: `${stem}-profiler-client`,
+            profilerCommandId: `${stem}-profiler-clear`,
+        };
+    }
+
+    function recoveryIds(laneIndex, pass, ordinal) {
+        const serial = laneIndex * 100 + pass * 40 + ordinal;
+        const stem = `${runId}-${variant}-${laneIndex}-${pass}-${ordinal}-recovery`;
+        return {
+            transitionId: 500000 + serial,
+            ownerId: `${stem}-owner`,
+        };
+    }
+
+    function qualificationSteps(boundary, target, identifiers, baseline, firstRow) {
+        const steps = [];
+        if (baseline) {
+            steps.push(toolStep("baseline-stress-reset", "communityshaders.renderscale", {
+                action: "reset", expectedBuildId: buildId,
+            }));
+            steps.push(toolStep("baseline-stress-start", "communityshaders.renderscale", {
+                action: "start", expectedBuildId: buildId,
+            }));
+        } else {
+            steps.push({ label: "transition-pace", wait: matrix.pacingMilliseconds });
+            if (variant === "nvidia" && target.method === "dlss") {
+                steps.push(toolStep("dlss-trace-reset", "communityshaders.renderscale", {
+                    action: "dlss_trace_reset", expectedBuildId: buildId,
+                }));
+                steps.push(toolStep("dlss-trace-start", "communityshaders.renderscale", {
+                    action: "dlss_trace_start", expectedBuildId: buildId,
+                }));
+            }
+        }
+        steps.push(toolStep("qualification-begin", "communityshaders.renderscale", {
+            action: "qualification_begin",
+            transitionId: identifiers.transitionId,
+            ownerId: identifiers.ownerId,
+            expectedBuildId: buildId,
+        }));
+        if (firstRow) {
+            steps.push(toolStep("profiler-clear-history", "communityshaders.profiler_api", {
+                contractMajor: 1,
+                clientId: identifiers.profilerClientId,
+                commandId: identifiers.profilerCommandId,
+                action: "clear_history",
+                expectedBuildId: buildId,
+            }));
+        }
+        steps.push(toolStep("qualification-dispatch", "communityshaders.renderscale", {
+            action: "qualification_dispatch",
+            transitionId: identifiers.transitionId,
+            ownerId: identifiers.ownerId,
+            startPerformanceTelemetry: firstRow,
+            expectedBuildId: buildId,
+        }));
+        steps.push(toolStep("profile-apply", "communityshaders.upscaling_api", {
+            action: "apply",
+            expectedBuildId: buildId,
+            expectedStateRevision: boundary.revision,
+            target,
+            purpose: "direct",
+            persistence: "runtime_only",
+            clientId: identifiers.clientId,
+            commandId: identifiers.commandId,
+            reason: baseline ? "render-scale tuning baseline" : "render-scale tuning transition",
+        }));
+        const waitArgs = {
+            action: "qualification_wait",
+            transitionId: identifiers.transitionId,
+            ownerId: identifiers.ownerId,
+            expectedCellEditorId: "WhiterunDragonsreach",
+            timeoutMs: matrix.completionTimeoutMilliseconds,
+            milestone: "strict",
+            target: waiterTarget(target),
+            expectedBuildId: buildId,
+        };
+        // None and TAA have no live vendor path; their configured fixture remains telemetry.
+        if (target.method === "dlss" || target.method === "fsr") {
+            waitArgs.foveation = foveation;
+        }
+        steps.push(toolStep("qualification-wait", "communityshaders.renderscale", waitArgs));
+        if (!baseline && variant === "nvidia" && target.method === "dlss") {
+            steps.push(toolStep("dlss-trace-stop", "communityshaders.renderscale", {
+                action: "dlss_trace_stop", expectedBuildId: buildId,
+            }));
+            steps.push(toolStep("dlss-trace-read", "communityshaders.renderscale", {
+                action: "dlss_trace_read", afterSequence: 0,
+                expectedBuildId: buildId,
+            }));
+        }
+        return steps;
+    }
+
+    function optionalSafetyFactClear(facts, name) {
+        // Older producers may omit diagnostics; an explicit non-true value still fails closed.
+        return !Object.prototype.hasOwnProperty.call(facts, name) ||
+            facts[name] === true;
+    }
+
+    function safeTerminalAssessment(waiter, identifiers) {
+        if (!waiter) return { satisfied: false, reasons: ["waiter_missing"] };
+        const reasons = [];
+        if (waiter.action !== "qualification_wait") reasons.push("action_mismatch");
+        if (waiter.transitionId !== identifiers.transitionId) {
+            reasons.push("transition_id_mismatch");
+        }
+        if (waiter.ownerId !== identifiers.ownerId) reasons.push("owner_id_mismatch");
+        const snapshot = waiter.upscalingSnapshot;
+        if (!snapshot) reasons.push("upscaling_snapshot_missing");
+        else if (snapshot.activeOperationId !== 0) {
+            reasons.push("active_operation_not_clear");
+        }
+        const facts = waiter.observation && waiter.observation.facts;
+        if (!facts) reasons.push("facts_missing");
+        else {
+            if (facts.stressSession !== true) reasons.push("stress_session_not_owned");
+            if (facts.exactCell !== true) reasons.push("exact_cell_not_proven");
+            if (facts.loadedInWorld !== true) reasons.push("in_world_not_proven");
+            if (facts.terminalClear !== true) reasons.push("terminal_not_clear");
+            if (!optionalSafetyFactClear(facts, "apiOperationClear")) {
+                reasons.push("api_operation_not_clear");
+            }
+            if (!optionalSafetyFactClear(facts, "physicalMutationClear")) {
+                reasons.push("physical_mutation_not_clear");
+            }
+        }
+        return { satisfied: reasons.length === 0, reasons };
+    }
+
+    function safeTerminal(waiter, identifiers) {
+        return safeTerminalAssessment(waiter, identifiers).satisfied;
+    }
+
+    function scalar(value) {
+        if (typeof value === "string" || typeof value === "boolean" ||
+            Number.isFinite(value)) {
+            return value;
+        }
+        return value && typeof value.name === "string" ? value.name : null;
+    }
+
+    function reasonProjection(reasons) {
+        const values = (Array.isArray(reasons) ? reasons : []).map((reason) => {
+            if (typeof reason === "string") return reason;
+            if (!reason || typeof reason !== "object") return null;
+            const category = typeof reason.category === "string" ?
+                `${reason.category}:` : "";
+            if (typeof reason.code === "string") return `${category}${reason.code}`;
+            return typeof reason.reason === "string" ? reason.reason : null;
+        }).filter(Boolean);
+        const limit = 32;
+        return {
+            values: values.slice(0, limit),
+            total: values.length,
+            truncated: values.length > limit,
+        };
+    }
+
+    function eyeIdentity(eye) {
+        if (!eye || typeof eye !== "object") return null;
+        return {
+            generation: scalar(eye.generation),
+            transitionEpoch: scalar(eye.transitionEpoch),
+            resourceRevision: scalar(eye.resourceRevision),
+            deviceIdentity: scalar(eye.deviceIdentity),
+            compositorCycleToken: scalar(eye.compositorCycleToken),
+            path: scalar(eye.path),
+        };
+    }
+
+    function recoveryAssessment(root, apply, waiter, identifiers) {
+        const safety = safeTerminalAssessment(waiter, identifiers);
+        const timeline = waiter && waiter.replacementTimeline;
+        const terminal = timeline && timeline.terminal;
+        const proof = terminal && terminal.presentationProof;
+        const reasons = [];
+        if (!root || root.ok !== true) reasons.push("scenario_not_ok");
+        if (!apply) reasons.push("apply_missing");
+        else if (apply.accepted !== true) reasons.push("apply_not_accepted");
+        if (!waiter) reasons.push("waiter_missing");
+        else if (waiter.satisfied !== true) reasons.push("waiter_not_satisfied");
+        reasons.push(...safety.reasons.map((reason) => `safe_terminal:${reason}`));
+        if (!waiter || !waiter.milestoneTimings) {
+            reasons.push("milestone_timings_missing");
+        }
+        if (!timeline) reasons.push("replacement_timeline_missing");
+        const snapshot = waiter && waiter.upscalingSnapshot;
+        const observation = waiter && waiter.observation;
+        const physical = observation && observation.physical;
+        const presentation = observation && observation.replacementPresentation;
+        const strictReasons = waiter &&
+            (waiter.strictFailureReasons || waiter.failureReasons);
+        return {
+            decision: { satisfied: reasons.length === 0, reasons },
+            scenarioOk: root && typeof root.ok === "boolean" ? root.ok : null,
+            apply: {
+                present: Boolean(apply),
+                accepted: apply && typeof apply.accepted === "boolean" ?
+                    apply.accepted : null,
+                status: scalar(apply && apply.status),
+                disposition: scalar(apply && apply.disposition),
+            },
+            waiter: {
+                present: Boolean(waiter),
+                satisfied: waiter && typeof waiter.satisfied === "boolean" ?
+                    waiter.satisfied : null,
+                outcome: scalar(waiter && waiter.outcome),
+                timedOutMilestone: scalar(waiter && waiter.timedOutMilestone),
+            },
+            milestones: {
+                presentationStable: waiter &&
+                    typeof waiter.presentationStable === "boolean" ?
+                    waiter.presentationStable : null,
+                cleanupDrained: waiter && typeof waiter.cleanupDrained === "boolean" ?
+                    waiter.cleanupDrained : null,
+                strictSatisfied: waiter && typeof waiter.strictSatisfied === "boolean" ?
+                    waiter.strictSatisfied : null,
+            },
+            failures: {
+                presentation: {
+                    mask: scalar(waiter && waiter.presentationFailureMask),
+                    reasons: reasonProjection(waiter && waiter.presentationFailureReasons),
+                },
+                cleanup: {
+                    mask: scalar(waiter && waiter.cleanupFailureMask),
+                    reasons: reasonProjection(waiter && waiter.cleanupFailureReasons),
+                },
+                strict: {
+                    mask: scalar(waiter && waiter.strictFailureMask),
+                    reasons: reasonProjection(strictReasons),
+                },
+            },
+            safeTerminal: safety,
+            controller: {
+                activeOperationId: scalar(snapshot && snapshot.activeOperationId),
+                stateRevision: scalar(snapshot && snapshot.stateRevision),
+                transitionState: scalar(snapshot && snapshot.transitionState),
+                physicalState: scalar(physical && physical.state),
+                presentationPhase: scalar(presentation && presentation.phase),
+            },
+            evidence: {
+                milestoneTimingsPresent: Boolean(waiter && waiter.milestoneTimings),
+                replacementTimelinePresent: Boolean(timeline),
+                terminalTimelinePresent: Boolean(terminal),
+            },
+            terminalIdentity: terminal ? {
+                frame: scalar(terminal.frame),
+                qpcTick: scalar(terminal.tick),
+                currentPresentationGeneration:
+                    scalar(terminal.currentPresentationGeneration),
+                currentPresentationProviderGeneration:
+                    scalar(terminal.currentPresentationProviderGeneration),
+                currentPresentationResourceRevision:
+                    scalar(terminal.currentPresentationResourceRevision),
+                replacementRequestId: scalar(terminal.replacementRequestId),
+                replacementTransitionEpoch:
+                    scalar(terminal.replacementTransitionEpoch),
+                replacementContractGeneration:
+                    scalar(terminal.replacementContractGeneration),
+                physicalMutationEpoch: scalar(terminal.physicalMutationEpoch),
+                proof: proof ? {
+                    proven: typeof proof.proven === "boolean" ? proof.proven : null,
+                    contractGeneration: scalar(proof.contractGeneration),
+                    transitionEpoch: scalar(proof.transitionEpoch),
+                    resourcePublicationGeneration:
+                        scalar(proof.resourcePublicationGeneration),
+                    resourceRevision: scalar(proof.resourceRevision),
+                    deviceIdentity: scalar(proof.deviceIdentity),
+                    compositorCycleToken: scalar(proof.compositorCycleToken),
+                    leftEye: eyeIdentity(proof.leftEye || terminal.leftEye),
+                    rightEye: eyeIdentity(proof.rightEye || terminal.rightEye),
+                } : null,
+            } : null,
+        };
+    }
+
+    function recoverableTerminal(waiter, identifiers) {
+        if (!waiter || waiter.action !== "qualification_wait" ||
+            waiter.transitionId !== identifiers.transitionId ||
+            waiter.ownerId !== identifiers.ownerId ||
+            !waiter.upscalingSnapshot ||
+            !Number.isSafeInteger(waiter.upscalingSnapshot.activeOperationId)) {
+            return false;
+        }
+        const facts = waiter.observation && waiter.observation.facts;
+        if (!facts || facts.stressSession !== true || facts.exactCell !== true ||
+            facts.loadedInWorld !== true) {
+            return false;
+        }
+        const failureCodes = Array.isArray(waiter.failureReasons) ?
+            waiter.failureReasons.map((reason) =>
+                typeof reason === "string" ? reason :
+                    reason && `${reason.category || ""}:${reason.code || ""}`)
+                .filter(Boolean).map((reason) => reason.toLowerCase()) : [];
+        return !failureCodes.some((reason) =>
+            /device[_ -]?los(?:s|t)|out[_ -]?of[_ -]?memory|(^|[:_ -])oom($|[:_ -])/.test(reason));
+    }
+
+    function nonStableNote(waiter) {
+        if (!waiter || waiter.satisfied === true) return null;
+        const timeline = waiter.replacementTimeline || {};
+        const observation = waiter.observation || {};
+        const physical = observation.physical || {};
+        const presentation = observation.replacementPresentation || {};
+        const facets = [timeline.terminal, timeline.firstNewGenerationProven,
+            timeline.firstPostMutation, timeline.firstPhysicalMutation,
+            timeline.lastPreMutation].filter((facet) => facet);
+        const dispositionFacet = facets.find((facet) =>
+            typeof facet.selectedPresentationDisposition === "string");
+        const terminal = timeline.terminal || {};
+        const proof = terminal.presentationProof || {};
+        const failureCodes = Array.isArray(waiter.failureReasons) ?
+            waiter.failureReasons.map((reason) => {
+                if (typeof reason === "string") return reason;
+                if (!reason || typeof reason !== "object") return null;
+                const category = typeof reason.category === "string" ?
+                    `${reason.category}:` : "";
+                return typeof reason.code === "string" ?
+                    `${category}${reason.code}` : null;
+            }).filter((reason) => reason) : [];
+        return {
+            status: "not_stable",
+            deadlineMilliseconds: matrix.completionTimeoutMilliseconds,
+            outcome: waiter.outcome || null,
+            timedOutMilestone: waiter.timedOutMilestone || null,
+            presentationDisposition: dispositionFacet ?
+                dispositionFacet.selectedPresentationDisposition : "not_exposed",
+            leftEyePath: presentation.leftEye && presentation.leftEye.path ||
+                proof.leftEye && proof.leftEye.path || "not_exposed",
+            rightEyePath: presentation.rightEye && presentation.rightEye.path ||
+                proof.rightEye && proof.rightEye.path || "not_exposed",
+            controllerState: physical.state || "not_exposed",
+            presentationPhase: physical.presentationPhase || "not_exposed",
+            failureCodes,
+        };
+    }
+
+    function facetProjection(facet) {
+        if (!facet || typeof facet !== "object") return null;
+        const proof = facet.presentationProof && typeof facet.presentationProof === "object" ?
+            facet.presentationProof : null;
+        const preparation = facet.preparationAdmission &&
+            typeof facet.preparationAdmission === "object" ? facet.preparationAdmission : null;
+        const mutationAdmission = facet.replacementMutationAdmission &&
+            typeof facet.replacementMutationAdmission === "object" ?
+            facet.replacementMutationAdmission : null;
+        const leftEye = proof && proof.leftEye && typeof proof.leftEye === "object" ?
+            proof.leftEye : null;
+        const rightEye = proof && proof.rightEye && typeof proof.rightEye === "object" ?
+            proof.rightEye : null;
+        return {
+            tick: facet.tick ?? null,
+            frame: facet.frame ?? null,
+            proof_kind: proof ? proof.kind ?? null : null,
+            proof_frame: proof ? proof.frame ?? null : null,
+            proof_qpc_tick: proof ? proof.qpcTick ?? null : null,
+            proof_method: proof ? proof.method ?? null : null,
+            proof_backend: proof ? proof.backend ?? null : null,
+            proof_request_id: proof ? proof.requestId ?? null : null,
+            proof_transition_epoch: proof ? proof.transitionEpoch ?? null : null,
+            proof_contract_generation: proof ? proof.contractGeneration ?? null : null,
+            proof_provider_runtime_generation: proof ?
+                proof.providerRuntimeGeneration ?? null : null,
+            proof_publication_generation: proof ?
+                proof.resourcePublicationGeneration ?? null : null,
+            proof_resource_revision: proof ? proof.resourceRevision ?? null : null,
+            proof_device_identity: proof ? proof.deviceIdentity ?? null : null,
+            proof_compositor_cycle_token: proof ? proof.compositorCycleToken ?? null : null,
+            proof_render_width: proof ? proof.renderWidth ?? null : null,
+            proof_render_height: proof ? proof.renderHeight ?? null : null,
+            proof_display_width: proof ? proof.displayWidth ?? null : null,
+            proof_display_height: proof ? proof.displayHeight ?? null : null,
+            left_eye_frame: leftEye ? leftEye.frame ?? null : null,
+            left_eye_compositor_cycle_token: leftEye ?
+                leftEye.compositorCycleToken ?? null : null,
+            left_eye_transition_epoch: leftEye ? leftEye.transitionEpoch ?? null : null,
+            left_eye_method: leftEye ? leftEye.method ?? null : null,
+            left_eye_path: leftEye ? leftEye.path ?? null : null,
+            left_eye_generation: leftEye ? leftEye.generation ?? null : null,
+            left_eye_device_identity: leftEye ? leftEye.deviceIdentity ?? null : null,
+            left_eye_resource_revision: leftEye ? leftEye.resourceRevision ?? null : null,
+            left_eye_loading_or_menu_context: leftEye ?
+                leftEye.loadingOrMenuContext === true : null,
+            left_eye_transition_cooldown: leftEye ?
+                leftEye.transitionCooldown === true : null,
+            right_eye_frame: rightEye ? rightEye.frame ?? null : null,
+            right_eye_compositor_cycle_token: rightEye ?
+                rightEye.compositorCycleToken ?? null : null,
+            right_eye_transition_epoch: rightEye ? rightEye.transitionEpoch ?? null : null,
+            right_eye_method: rightEye ? rightEye.method ?? null : null,
+            right_eye_path: rightEye ? rightEye.path ?? null : null,
+            right_eye_generation: rightEye ? rightEye.generation ?? null : null,
+            right_eye_device_identity: rightEye ? rightEye.deviceIdentity ?? null : null,
+            right_eye_resource_revision: rightEye ? rightEye.resourceRevision ?? null : null,
+            right_eye_loading_or_menu_context: rightEye ?
+                rightEye.loadingOrMenuContext === true : null,
+            right_eye_transition_cooldown: rightEye ?
+                rightEye.transitionCooldown === true : null,
+            preparation_status: preparation ? preparation.status ?? null : null,
+            preparation_reason_mask: preparation ? preparation.reasonMask ?? null : null,
+            mutation_admission_status: mutationAdmission ?
+                mutationAdmission.status ?? null : null,
+            mutation_admission_blocked: mutationAdmission ?
+                mutationAdmission.blocked === true : null,
+            mutation_admission_reason_mask: mutationAdmission ?
+                mutationAdmission.reasonMask ?? null : null,
+            physical_mutation_started: facet.physicalMutationStarted === true,
+            physical_mutation_source: facet.physicalMutationSource ?? null,
+            selected_presentation_disposition:
+                facet.selectedPresentationDisposition ?? null,
+        };
+    }
+
+    function invariantCount(audit, name) {
+        const violations = audit && audit.violations;
+        const value = violations && violations[name];
+        return Number.isSafeInteger(value) && value >= 0 ? value : null;
+    }
+
+    function positiveInteger(value) {
+        return Number.isSafeInteger(value) && value > 0;
+    }
+
+    function nonNegativeInteger(value) {
+        return Number.isSafeInteger(value) && value >= 0;
+    }
+
+    function isVendorTarget(target) {
+        return target && (target.method === "dlss" || target.method === "fsr");
+    }
+
+    function matchesMutationBoundaryGeneration(boundaryGeneration, proofGeneration, target) {
+        if (!nonNegativeInteger(boundaryGeneration) ||
+            !nonNegativeInteger(proofGeneration) || !target) {
+            return false;
+        }
+        return isVendorTarget(target) ?
+            boundaryGeneration === 0 || boundaryGeneration === proofGeneration :
+            proofGeneration === 0;
+    }
+
+    function exactNativeStereoProof(proof, target) {
+        const exactEye = (eye) => eye && (eye.valid === undefined || eye.valid === true) &&
+            positiveInteger(eye.frame) && eye.frame === proof.frame &&
+            positiveInteger(eye.qpcTick) && eye.qpcTick <= proof.qpcTick &&
+            positiveInteger(eye.compositorCycleToken) &&
+            eye.compositorCycleToken === proof.compositorCycleToken &&
+            positiveInteger(eye.transitionEpoch) &&
+            eye.transitionEpoch === proof.transitionEpoch &&
+            eye.method === target.method && eye.backend === "none" &&
+            eye.generation === 0 && eye.deviceIdentity === proof.deviceIdentity &&
+            eye.resourceRevision === proof.resourceRevision &&
+            eye.renderWidth === proof.renderWidth &&
+            eye.renderHeight === proof.renderHeight &&
+            eye.displayWidth === proof.displayWidth &&
+            eye.displayHeight === proof.displayHeight &&
+            eye.vendorDispatchFrame === 0 && eye.vendorDispatchSerial === 0 &&
+            eye.vendorRuntimeFallback === false;
+        return positiveInteger(proof.frame) && positiveInteger(proof.qpcTick) &&
+            positiveInteger(proof.compositorCycleToken) && proof.backend === "none" &&
+            proof.contractGeneration === 0 &&
+            proof.providerRuntimeGeneration === 0 &&
+            (proof.sharedVendorDispatchRequired === undefined ||
+                proof.sharedVendorDispatchRequired === false) &&
+            proof.vendorDispatchProven === false &&
+            exactEye(proof.leftEye) && exactEye(proof.rightEye) &&
+            proof.qpcTick === Math.max(proof.leftEye.qpcTick, proof.rightEye.qpcTick);
+    }
+
+    function exactNativeVendorProof(proof, target) {
+        const backendMatches = target.method === "dlss" ? proof.backend === "dlss" :
+            ["fsr_host", "fsr_runtime", "fsr4_runtime"].includes(proof.backend);
+        const exactEye = eye => eye && (eye.valid === undefined || eye.valid === true) &&
+            eye.frame === proof.frame && positiveInteger(eye.qpcTick) &&
+            eye.qpcTick <= proof.qpcTick &&
+            eye.compositorCycleToken === proof.compositorCycleToken &&
+            eye.transitionEpoch === proof.transitionEpoch &&
+            eye.method === target.method && eye.backend === proof.backend &&
+            eye.generation === proof.contractGeneration &&
+            eye.deviceIdentity === proof.deviceIdentity &&
+            eye.resourceRevision === proof.resourceRevision &&
+            eye.renderWidth === proof.renderWidth && eye.renderHeight === proof.renderHeight &&
+            eye.displayWidth === proof.displayWidth && eye.displayHeight === proof.displayHeight &&
+            eye.vendorDispatchFrame === proof.frame &&
+            nonNegativeInteger(eye.vendorDispatchSerial) &&
+            typeof eye.vendorRuntimeFallback === "boolean";
+        // Native vendor execution has no active scaled-resource generation.
+        return backendMatches && positiveInteger(proof.frame) &&
+            positiveInteger(proof.qpcTick) && positiveInteger(proof.compositorCycleToken) &&
+            nonNegativeInteger(proof.contractGeneration) &&
+            (proof.contractGeneration === 0 ? proof.providerRuntimeGeneration === 0 :
+                positiveInteger(proof.providerRuntimeGeneration)) &&
+            proof.vendorDispatchProven === true &&
+            exactEye(proof.leftEye) && exactEye(proof.rightEye) &&
+            proof.qpcTick === Math.max(proof.leftEye.qpcTick, proof.rightEye.qpcTick) &&
+            proof.leftEye.vendorDispatchSerial === proof.rightEye.vendorDispatchSerial &&
+            proof.leftEye.vendorRuntimeFallback === proof.rightEye.vendorRuntimeFallback;
+    }
+
+    function exactTargetProof(proof, target) {
+        if (!proof || proof.proven !== true || !target) return false;
+        const vendorTarget = isVendorTarget(target);
+        const expectedKind = vendorTarget ?
+            "exact_vendor_evaluation" : "exact_native_presentation";
+        if (proof.kind !== expectedKind || proof.method !== target.method ||
+            proof.qualityMode !== quality[target.qualityMode] ||
+            proof.renderScaleMode !== target.renderScaleMode) {
+            return false;
+        }
+        const identifiers = [
+            proof.requestId,
+            proof.transitionEpoch,
+            proof.resourcePublicationGeneration,
+            proof.resourceRevision,
+            proof.deviceIdentity,
+            proof.renderWidth,
+            proof.renderHeight,
+            proof.displayWidth,
+            proof.displayHeight,
+        ];
+        if (!identifiers.every(positiveInteger)) return false;
+        if (vendorTarget && target.renderScaleMode &&
+            (!positiveInteger(proof.contractGeneration) ||
+                !positiveInteger(proof.providerRuntimeGeneration))) return false;
+        if (vendorTarget && !target.renderScaleMode &&
+            !exactNativeVendorProof(proof, target)) return false;
+        if (!vendorTarget && !exactNativeStereoProof(proof, target)) return false;
+        return target.renderScaleMode ?
+            proof.renderWidth < proof.displayWidth &&
+                proof.renderHeight < proof.displayHeight :
+            proof.renderWidth === proof.displayWidth &&
+                proof.renderHeight === proof.displayHeight;
+    }
+
+    function boundaryOrder(offender, boundary) {
+        if (!offender || !boundary) return "unknown";
+        const offenderTick = offender.qpcTick ?? offender.tick;
+        const boundaryTick = boundary.qpcTick ?? boundary.tick;
+        const frameComparable = positiveInteger(offender.frame) &&
+            positiveInteger(boundary.frame);
+        const tickComparable = positiveInteger(offenderTick) &&
+            positiveInteger(boundaryTick);
+        if (!frameComparable || !tickComparable) return "unknown";
+        if (offender.frame === boundary.frame) {
+            return offenderTick < boundaryTick ? "before" : "at_or_after";
+        }
+        const frameBefore = offender.frame < boundary.frame;
+        const tickBefore = offenderTick < boundaryTick;
+        if (frameBefore && tickBefore) return "before";
+        if (!frameBefore && !tickBefore) return "at_or_after";
+        return "conflict";
+    }
+
+    function task2Projection(waiter, target) {
+        const timeline = waiter && waiter.replacementTimeline;
+        const audit = waiter && waiter.presentationCycleAudit;
+        const expectation = timeline && timeline.mutationExpectation || "unknown";
+        const expectationReason = timeline && timeline.mutationExpectationReason;
+        const required = expectation === "required";
+        const notRequired = expectation === "not_required";
+        const explicitNotRequiredReason = typeof expectationReason === "string" &&
+            expectationReason.length > 0 && expectationReason !== "replacement_not_observed";
+        const notRequiredEvidence = timeline &&
+            timeline.mutationNotRequiredTerminalProof;
+        const notRequiredProof = notRequiredEvidence &&
+            notRequiredEvidence.presentationProof;
+        const notRequiredOwnerProof = notRequiredEvidence && audit &&
+            notRequiredEvidence.stressSessionId ===
+                (waiter.baseline && waiter.baseline.stressSessionId) &&
+            notRequiredEvidence.qualificationTransitionId ===
+                waiter.transitionId &&
+            positiveInteger(notRequiredEvidence.ownershipToken) &&
+            notRequiredEvidence.ownershipToken === audit.ownerToken;
+        const notRequiredIdentityProof = notRequiredEvidence &&
+            notRequiredProof &&
+            positiveInteger(notRequiredEvidence.replacementRequestId) &&
+            notRequiredProof.requestId ===
+                notRequiredEvidence.replacementRequestId &&
+            positiveInteger(notRequiredEvidence.replacementTransitionEpoch) &&
+            notRequiredProof.transitionEpoch ===
+                notRequiredEvidence.replacementTransitionEpoch &&
+            matchesMutationBoundaryGeneration(
+                notRequiredEvidence.replacementContractGeneration,
+                notRequiredProof.contractGeneration, target) &&
+            positiveInteger(notRequiredEvidence.replacementDeviceIdentity) &&
+            notRequiredProof.deviceIdentity ===
+                notRequiredEvidence.replacementDeviceIdentity;
+        const exactTerminalProof = notRequiredOwnerProof &&
+            notRequiredIdentityProof &&
+            exactTargetProof(notRequiredProof, target);
+        const missing = [];
+        const producerInvalid = [];
+        if (!timeline || !timeline.dispatch) missing.push("dispatch");
+        else if (!timeline.dispatch.presentationProof ||
+            timeline.dispatch.presentationProof.proven !== true) {
+            missing.push("truthful_current_contract");
+        }
+        if (required && !timeline.firstPhysicalMutation) {
+            missing.push("missing_required_mutation_boundary");
+        }
+        if (required && !timeline.firstPostMutation) {
+            missing.push("first_post_mutation");
+        }
+        if (required && (!timeline.firstNewGenerationProven ||
+            !timeline.firstNewGenerationProven.presentationProof ||
+            timeline.firstNewGenerationProven.presentationProof.proven !== true)) {
+            missing.push("first_new_generation_proven");
+        }
+        if (notRequired && !explicitNotRequiredReason) {
+            missing.push("mutation_not_required_reason");
+        }
+        if (notRequired && !exactTerminalProof) {
+            missing.push("mutation_not_required_terminal_proof");
+        }
+        const auditStorageComplete = Boolean(audit &&
+            audit.evidenceComplete === true && audit.retentionOverflow !== true);
+        if (!auditStorageComplete) {
+            missing.push("authoritative_cycle_audit");
+        }
+        const auditOwnerAuthoritative = Boolean(audit &&
+            audit.ownerTransitionId === waiter.transitionId &&
+            positiveInteger(audit.ownerToken));
+        if (!auditOwnerAuthoritative) {
+            missing.push("authoritative_cycle_owner");
+        }
+        const auditHasObservations = Boolean(audit &&
+            positiveInteger(audit.eyeObservations));
+        if (!auditHasObservations) {
+            missing.push("authoritative_cycle_observations");
+        }
+        const violationSchemaAuthoritative = Number.isSafeInteger(
+            waiter.schemaRevision) && waiter.schemaRevision >= 14;
+        if (!violationSchemaAuthoritative) {
+            missing.push("authoritative_violation_schema");
+        }
+        const violationNames = [
+            "preMutationExactPresentationSuppressed",
+            "preMutationStretchWithoutMutation",
+            "postMutationOldGenerationPresented",
+            "postMutationUnprovenStereoSubmitted",
+        ];
+        const violations = Object.fromEntries(violationNames.map((name) =>
+            [name, invariantCount(audit, name)]));
+        const countersComplete = Object.values(violations)
+            .every((value) => value !== null);
+        if (!countersComplete) {
+            missing.push("authoritative_cycle_counters");
+        }
+        const boundary = timeline && timeline.firstPhysicalMutation;
+        const boundaryOwnerMismatch = Boolean(boundary &&
+            (!positiveInteger(boundary.stressSessionId) ||
+                boundary.stressSessionId !==
+                    (waiter.baseline && waiter.baseline.stressSessionId) ||
+                boundary.qualificationTransitionId !== waiter.transitionId ||
+                !positiveInteger(boundary.ownershipToken) || !audit ||
+                boundary.ownershipToken !== audit.ownerToken ||
+                !positiveInteger(boundary.replacementRequestId) ||
+                !positiveInteger(boundary.replacementTransitionEpoch) ||
+                !nonNegativeInteger(boundary.replacementContractGeneration) ||
+                !positiveInteger(boundary.replacementDeviceIdentity) ||
+                !positiveInteger(boundary.frame) ||
+                !positiveInteger(boundary.tick) ||
+                typeof boundary.physicalMutationSource !== "string" ||
+                boundary.physicalMutationSource.length === 0));
+        if (boundaryOwnerMismatch) {
+            producerInvalid.push("physical_mutation_boundary_owner_mismatch");
+        }
+        const transitionEvidenceComplete = Boolean(timeline && timeline.dispatch &&
+            auditStorageComplete && auditOwnerAuthoritative &&
+            auditHasObservations && countersComplete &&
+            violationSchemaAuthoritative);
+        const basePhaseCountersAuthoritative = transitionEvidenceComplete &&
+            (!required || Boolean(boundary) && !boundaryOwnerMismatch);
+        const authorityMismatchReasons = [];
+        if (audit && positiveInteger(audit.ownerTransitionId) &&
+            audit.ownerTransitionId !== waiter.transitionId) {
+            authorityMismatchReasons.push("audit_transition_owner_mismatch");
+        }
+        if (boundary && positiveInteger(boundary.stressSessionId) &&
+            positiveInteger(waiter.baseline && waiter.baseline.stressSessionId) &&
+            boundary.stressSessionId !== waiter.baseline.stressSessionId) {
+            authorityMismatchReasons.push("boundary_stress_session_mismatch");
+        }
+        if (boundary && positiveInteger(boundary.qualificationTransitionId) &&
+            boundary.qualificationTransitionId !== waiter.transitionId) {
+            authorityMismatchReasons.push("boundary_transition_owner_mismatch");
+        }
+        if (boundary && positiveInteger(boundary.ownershipToken) && audit &&
+            positiveInteger(audit.ownerToken) &&
+            boundary.ownershipToken !== audit.ownerToken) {
+            authorityMismatchReasons.push("boundary_audit_token_mismatch");
+        }
+        const baseAuthorityStatus = authorityMismatchReasons.length > 0 ?
+            "MISMATCHED" : basePhaseCountersAuthoritative ?
+                "MATCHED" : "INCOMPLETE";
+        const baseAuthorityReasons = authorityMismatchReasons.length > 0 ?
+            authorityMismatchReasons : [...new Set([
+                ...missing.filter((value) => value.startsWith("authoritative_") ||
+                    value === "missing_required_mutation_boundary"),
+                ...(boundaryOwnerMismatch ?
+                    ["physical_mutation_boundary_owner_mismatch"] : []),
+            ])];
+        const postMutationOffenders = {
+            postMutationOldGenerationPresented:
+                "firstPostMutationOldGenerationPresented",
+            postMutationUnprovenStereoSubmitted:
+                "firstPostMutationUnprovenStereoSubmitted",
+        };
+        const preMutationOffenders = {
+            preMutationExactPresentationSuppressed:
+                "firstPreMutationExactPresentationSuppressed",
+            preMutationStretchWithoutMutation:
+                "firstPreMutationStretchWithoutMutation",
+        };
+        const temporallyImpossible = [];
+        const genuineViolations = [];
+        const reportedViolations = [];
+        const violationAuthority = {};
+        for (const [name, count] of Object.entries(violations)) {
+            if (!(count > 0)) continue;
+            reportedViolations.push(name);
+            // Preserve producer counters even when their phase owner is unproven.
+            if (!basePhaseCountersAuthoritative) {
+                violationAuthority[name] = {
+                    status: baseAuthorityStatus,
+                    reasons: baseAuthorityReasons,
+                };
+                continue;
+            }
+            const offenderName = postMutationOffenders[name];
+            const preMutationOffenderName = preMutationOffenders[name];
+            const firstOffenderName = offenderName || preMutationOffenderName;
+            const offender = audit && audit.violations &&
+                audit.violations[firstOffenderName];
+            if (!offender) {
+                const reason = `${name}_first_offender_missing`;
+                producerInvalid.push(reason);
+                violationAuthority[name] = {
+                    status: "INCOMPLETE", reasons: [reason],
+                };
+                continue;
+            }
+            if (preMutationOffenderName && !boundary && notRequired) {
+                genuineViolations.push(name);
+                violationAuthority[name] = { status: "MATCHED", reasons: [] };
+                continue;
+            }
+            const order = boundaryOrder(offender, boundary);
+            if (preMutationOffenderName && order === "before") {
+                genuineViolations.push(name);
+                violationAuthority[name] = { status: "MATCHED", reasons: [] };
+            } else if (preMutationOffenderName && order === "at_or_after") {
+                temporallyImpossible.push(name);
+                const reason = `${name}_not_before_boundary`;
+                producerInvalid.push(reason);
+                violationAuthority[name] = {
+                    status: "MISMATCHED", reasons: [reason],
+                };
+            } else if (preMutationOffenderName && order === "conflict") {
+                temporallyImpossible.push(name);
+                const reason = `${name}_temporal_order_conflict`;
+                producerInvalid.push(reason);
+                violationAuthority[name] = {
+                    status: "MISMATCHED", reasons: [reason],
+                };
+            } else if (preMutationOffenderName) {
+                const reason = `${name}_temporal_order_unproven`;
+                producerInvalid.push(reason);
+                violationAuthority[name] = {
+                    status: "INCOMPLETE", reasons: [reason],
+                };
+            } else if (order === "before") {
+                temporallyImpossible.push(name);
+                const reason = `${name}_precedes_boundary`;
+                producerInvalid.push(reason);
+                violationAuthority[name] = {
+                    status: "MISMATCHED", reasons: [reason],
+                };
+            } else if (order === "conflict") {
+                temporallyImpossible.push(name);
+                const reason = `${name}_temporal_order_conflict`;
+                producerInvalid.push(reason);
+                violationAuthority[name] = {
+                    status: "MISMATCHED", reasons: [reason],
+                };
+            } else if (order === "unknown") {
+                const reason = `${name}_temporal_order_unproven`;
+                producerInvalid.push(reason);
+                violationAuthority[name] = {
+                    status: "INCOMPLETE", reasons: [reason],
+                };
+            } else {
+                genuineViolations.push(name);
+                violationAuthority[name] = { status: "MATCHED", reasons: [] };
+            }
+        }
+        const violationAuthorityValues = Object.values(violationAuthority);
+        const phaseCounterAuthorityStatus = violationAuthorityValues.some((value) =>
+            value.status === "MISMATCHED") ? "MISMATCHED" :
+            violationAuthorityValues.some((value) =>
+                value.status === "INCOMPLETE") ? "INCOMPLETE" : baseAuthorityStatus;
+        const phaseCounterAuthorityReasons = [...new Set([
+            ...(baseAuthorityStatus === "MATCHED" ? [] : baseAuthorityReasons),
+            ...violationAuthorityValues.flatMap((value) => value.reasons),
+        ])];
+        const phaseCountersAuthoritative =
+            phaseCounterAuthorityStatus === "MATCHED";
+
+        const firstExactCycles = audit && audit.firstExactNewGenerationCycles;
+        const firstNew = timeline && timeline.firstNewGenerationProven;
+        const firstNewProof = firstNew && firstNew.presentationProof;
+        if (!Number.isSafeInteger(firstExactCycles) || firstExactCycles < 0) {
+            producerInvalid.push("first_exact_new_generation_counter_invalid");
+        } else if (firstExactCycles > 0 && !firstNew) {
+            producerInvalid.push("first_exact_new_generation_proof_missing");
+        } else if (firstExactCycles === 0 && firstNew) {
+            producerInvalid.push("first_exact_new_generation_counter_missing");
+        }
+        if (firstNew) {
+            if (!exactTargetProof(firstNewProof, target)) {
+                producerInvalid.push("first_new_generation_target_mismatch");
+            }
+            if (boundaryOrder(firstNew, boundary) !== "at_or_after") {
+                producerInvalid.push("first_new_generation_not_after_boundary");
+            }
+            if (firstNew.qualificationTransitionId !== waiter.transitionId ||
+                !positiveInteger(firstNew.ownershipToken) ||
+                !audit || firstNew.ownershipToken !== audit.ownerToken ||
+                !boundary || firstNew.stressSessionId !== boundary.stressSessionId ||
+                firstNew.qualificationTransitionId !==
+                    boundary.qualificationTransitionId ||
+                firstNew.ownershipToken !== boundary.ownershipToken ||
+                !firstNewProof || firstNewProof.requestId !==
+                    boundary.replacementRequestId ||
+                firstNewProof.transitionEpoch !==
+                    boundary.replacementTransitionEpoch ||
+                !matchesMutationBoundaryGeneration(
+                    boundary.replacementContractGeneration,
+                    firstNewProof.contractGeneration, target) ||
+                firstNewProof.deviceIdentity !==
+                    boundary.replacementDeviceIdentity) {
+                producerInvalid.push("first_new_generation_owner_mismatch");
+            }
+        }
+        const exactViolation = genuineViolations.length > 0;
+        const evidenceVerdict = exactViolation ? "FAIL" :
+            missing.length > 0 || producerInvalid.length > 0 ||
+                expectation === "unknown" ? "INCONCLUSIVE" : "PASS";
+        return {
+            renderVerdict: waiter && waiter.satisfied === true ? "PASS" : "FAIL",
+            evidenceVerdict,
+            task2Verdict: evidenceVerdict,
+            mutationExpectation: expectation,
+            mutationExpectationReason: expectationReason || null,
+            mutationNotRequiredProven: notRequired &&
+                explicitNotRequiredReason && exactTerminalProof,
+            auditStorageComplete,
+            ownerCorrelatedAuditObserved: auditOwnerAuthoritative &&
+                auditHasObservations,
+            transitionEvidenceComplete,
+            missingEvidence: missing,
+            phaseCountersAuthoritative,
+            phaseCounterAuthorityStatus,
+            phaseCounterAuthorityReasons,
+            invariantViolations: violations,
+            reportedInvariantViolations: reportedViolations,
+            violationAuthority,
+            genuineInvariantViolations: genuineViolations,
+            temporallyImpossibleViolations: temporallyImpossible,
+            producerInvalidEvidence: producerInvalid,
+        };
+    }
+
+    function transitionProjection(waiter, target) {
+        const timeline = waiter && waiter.replacementTimeline || {};
+        const auditDispositions = waiter && waiter.presentationCycleAudit &&
+            waiter.presentationCycleAudit.dispositionCounts;
+        const presentationStretchSelected = [
+            timeline.firstPhysicalMutation,
+            timeline.firstPostMutation,
+            timeline.firstNewGenerationProven,
+            timeline.terminal,
+        ].some((facet) => facet &&
+            (facet.selectedPresentationDisposition === "PresentationStretch" ||
+                facet.selectedPresentationDisposition === "presentation_stretch")) ||
+            Boolean(auditDispositions &&
+                ((auditDispositions.beforeMutation &&
+                    auditDispositions.beforeMutation.presentation_stretch > 0) ||
+                    (auditDispositions.afterMutation &&
+                        auditDispositions.afterMutation.presentation_stretch > 0)));
+        const task2 = task2Projection(waiter, target);
+        return {
+            satisfied: waiter.satisfied === true,
+            nonStableNote: nonStableNote(waiter),
+            presentationStable: waiter.presentationStable === true,
+            cleanupDrained: waiter.cleanupDrained === true,
+            presentationStretchSelected: presentationStretchSelected === true,
+            presentationStretchTerminalRecovery: presentationStretchSelected === true &&
+                waiter.satisfied === true && waiter.presentationStable === true &&
+                waiter.cleanupDrained === true,
+            ...task2,
+            dispatch_: facetProjection(timeline.dispatch),
+            blocked_pre_mutation_: facetProjection(timeline.blockedPreMutation),
+            last_pre_mutation_: facetProjection(timeline.lastPreMutation),
+            first_physical_mutation_: facetProjection(timeline.firstPhysicalMutation) ||
+                (task2.mutationNotRequiredProven ?
+                    "not_required" : "not_exposed"),
+            first_post_mutation_: facetProjection(timeline.firstPostMutation),
+            first_new_generation_proven_: facetProjection(
+                timeline.firstNewGenerationProven),
+            terminal_: facetProjection(timeline.terminal),
+            phaseDurations: waiter.phaseDurations || null,
+            presentationCycleAudit: waiter.presentationCycleAudit || null,
+        };
+    }
+
+    async function recoverTerminal(identifiers) {
+        const status = await renderScale({
+            action: "qualification_status",
+            expectedBuildId: buildId,
+        });
+        await retain(`${runId}:recovery:${identifiers.transitionId}`, status.envelope);
+        const qualification = status.root.qualification;
+        const waiter = qualification && qualification.lastEvidence;
+        if (qualification && qualification.active === false && waiter &&
+            waiter.transitionId === identifiers.transitionId &&
+            waiter.ownerId === identifiers.ownerId) {
+            return waiter;
+        }
+        throw new Error("terminal_receipt_unavailable");
+    }
+
+    async function closeOpenQualification(identifiers) {
+        const status = await renderScale({
+            action: "qualification_status",
+            expectedBuildId: buildId,
+        });
+        await retain(`${runId}:recovery:${identifiers.transitionId}:close-status`,
+            status.envelope);
+        const qualification = status.root.qualification;
+        if (qualification && qualification.active === true &&
+            qualification.transitionId === identifiers.transitionId &&
+            qualification.ownerId === identifiers.ownerId) {
+            const cancel = await renderScale({
+                action: "qualification_cancel",
+                transitionId: identifiers.transitionId,
+                ownerId: identifiers.ownerId,
+                expectedBuildId: buildId,
+            });
+            await retain(`${runId}:recovery:${identifiers.transitionId}:cancel`,
+                cancel.envelope);
+        }
+    }
+
+    async function restoreBaseline(boundary, lane, laneIndex, pass, row,
+        closeDlssTrace) {
+        const target = targetFor(boundary,
+            matrix.destinations[matrix.initialDestination],
+            lane.configuredFsrRuntime);
+        if ((target.method !== "dlss" && target.method !== "fsr") ||
+            target.renderScaleMode !== true ||
+            !Number.isSafeInteger(quality[target.qualityMode])) {
+            throw new Error("recovery_baseline_target_invalid");
+        }
+        const identifiers = recoveryIds(laneIndex, pass, row.ordinal);
+        const steps = [];
+        if (closeDlssTrace) {
+            steps.push(toolStep("failed-dlss-trace-stop",
+                "communityshaders.renderscale", {
+                    action: "dlss_trace_stop", expectedBuildId: buildId,
+                }));
+            steps.push(toolStep("failed-dlss-trace-read",
+                "communityshaders.renderscale", {
+                    action: "dlss_trace_read", afterSequence: 0,
+                    expectedBuildId: buildId,
+                }));
+        }
+        steps.push(toolStep("recovery-qualification-begin",
+            "communityshaders.renderscale", {
+                action: "qualification_begin",
+                transitionId: identifiers.transitionId,
+                ownerId: identifiers.ownerId,
+                expectedBuildId: buildId,
+            }));
+        steps.push(toolStep("recovery-qualification-dispatch",
+            "communityshaders.renderscale", {
+                action: "qualification_dispatch",
+                transitionId: identifiers.transitionId,
+                ownerId: identifiers.ownerId,
+                startPerformanceTelemetry: false,
+                expectedBuildId: buildId,
+            }));
+        const applyArgs = {
+            action: "apply",
+            method: target.method,
+            enabled: true,
+            qualityMode: quality[target.qualityMode],
+            expectedBuildId: buildId,
+        };
+        if (target.method === "dlss") {
+            applyArgs.dlssPreset = dlssProfile[target.dlssProfile];
+        }
+        steps.push(toolStep("recovery-profile-apply",
+            "communityshaders.renderscale", applyArgs));
+        const waitArgs = {
+            action: "qualification_wait",
+            transitionId: identifiers.transitionId,
+            ownerId: identifiers.ownerId,
+            expectedCellEditorId: "WhiterunDragonsreach",
+            timeoutMs: matrix.completionTimeoutMilliseconds,
+            milestone: "strict",
+            target: waiterTarget(target),
+            foveation,
+            expectedBuildId: buildId,
+        };
+        steps.push(toolStep("qualification-wait",
+            "communityshaders.renderscale", waitArgs));
+        const receiptKey =
+            `${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}:recovery`;
+        const response = await scenario(steps, `${receiptKey}:scenario`);
+        const entries = resultMap(response.root);
+        const apply = entries.get("recovery-profile-apply");
+        const waiter = entries.get("qualification-wait");
+        const diagnostic = scenarioDiagnostic(
+            response.root, steps, `${receiptKey}:scenario`);
+        const assessment = recoveryAssessment(
+            response.root, apply, waiter, identifiers);
+        const recovered = assessment.decision.satisfied;
+        const evidence = {
+            status: recovered ? "RECOVERED" : "FAILED",
+            scenarioReceiptKey: `${receiptKey}:scenario`,
+            scenario: diagnostic,
+            target,
+            apply,
+            waiter,
+            failureSnapshot: recovered ? null : assessment,
+            traceStop: entries.get("failed-dlss-trace-stop") || null,
+            traceRead: entries.get("failed-dlss-trace-read") || null,
+        };
+        await retain(receiptKey, evidence);
+        if (!recovered) {
+            if (!waiter) await closeOpenQualification(identifiers);
+            throw diagnosticError("transition_recovery_failed", {
+                ...diagnostic,
+                recovery: assessment,
+            });
+        }
+        return {
+            boundary: {
+                ...terminalBoundary(waiter),
+                recoveryReceiptKey: receiptKey,
+            },
+            receiptKey,
+            evidence,
+            summary: {
+                status: "RECOVERED",
+                target,
+                receiptKey,
+                elapsedMs: waiter.timing ? waiter.timing.elapsedMs : null,
+            },
+        };
+    }
+
+    async function baseline(boundary, lane, laneIndex, pass) {
+        const target = targetFor(
+            boundary, matrix.destinations[matrix.initialDestination], lane.configuredFsrRuntime);
+        const identifiers = ids(laneIndex, pass, 0, true);
+        const steps = qualificationSteps(boundary, target, identifiers, true, false);
+        const receiptKey = `${runId}:${lane.id}:pass-${pass}:baseline`;
+        let response;
+        try {
+            response = await scenario(steps, receiptKey);
+        } catch (scenarioFailure) {
+            let waiter;
+            try {
+                waiter = await recoverTerminal(identifiers);
+            } catch {
+                throw diagnosticError("baseline_receipt_unavailable",
+                    scenarioFailure && scenarioFailure.diagnostic || null);
+            }
+            const stressSessionId = waiter.baseline && waiter.baseline.stressSessionId;
+            if (waiter.producer?.buildId === buildId &&
+                Number.isSafeInteger(stressSessionId) && stressSessionId > 0) {
+                ownedCaptures = { stressSessionId };
+                if (context.observeOwnership) context.observeOwnership({ ...ownedCaptures });
+            }
+            if (!safeTerminal(waiter, identifiers) || !waiter.milestoneTimings ||
+                !waiter.replacementTimeline) {
+                throw diagnosticError("baseline_failed",
+                    scenarioFailure && scenarioFailure.diagnostic || null);
+            }
+            return { boundary: terminalBoundary(waiter), stressSessionId, waiter,
+                nonStableNote: nonStableNote(waiter) };
+        }
+        const entries = resultMap(response.root);
+        const start = entries.get("baseline-stress-start");
+        const stressSessionId = start && start.status && start.status.session.id;
+        const waiter = entries.get("qualification-wait");
+        if (!response.root.ok || !waiter || !safeTerminal(waiter, identifiers) ||
+            !waiter.milestoneTimings ||
+            !waiter.replacementTimeline) {
+            await closeOpenQualification(identifiers);
+            throw diagnosticError("baseline_failed",
+                scenarioDiagnostic(response.root, steps, receiptKey));
+        }
+        requireTerminalAdapter(start);
+        return { boundary: terminalBoundary(waiter), stressSessionId, waiter,
+            nonStableNote: nonStableNote(waiter) };
+    }
+
+    async function armOwners(baselineResult, lane, laneIndex, pass, resetPerformance) {
+        const stem = `${runId}-${variant}-${laneIndex}-${pass}`;
+        const receiptKey = `${runId}:${lane.id}:pass-${pass}:handoff`;
+        const steps = [
+            toolStep("baseline-stress-stop", "communityshaders.renderscale", {
+                action: "stop", expectedSessionId: baselineResult.stressSessionId,
+                expectedBuildId: buildId,
+            }),
+            toolStep("measured-stress-start", "communityshaders.renderscale", {
+                action: "start", expectedBuildId: buildId,
+            }),
+            toolStep("texture-lifetime-reset", "communityshaders.renderscale", {
+                action: "texture_lifetime_reset", expectedBuildId: buildId,
+            }),
+            toolStep("texture-lifetime-start", "communityshaders.renderscale", {
+                action: "texture_lifetime_start", expectedBuildId: buildId,
+            }),
+            toolStep("load-presentation-reset", "communityshaders.renderscale", {
+                action: "probe_reset", expectedBuildId: buildId,
+            }),
+            toolStep("load-presentation-start", "communityshaders.renderscale", {
+                action: "probe_start", expectedBuildId: buildId,
+            }),
+        ];
+        if (resetPerformance) {
+            steps.push(toolStep("cpu-performance-reset", "communityshaders.renderscale", {
+                action: "cpu_performance_reset", expectedBuildId: buildId,
+            }));
+            steps.push(toolStep("gpu-performance-reset", "communityshaders.renderscale", {
+                action: "gpu_performance_reset", expectedBuildId: buildId,
+            }));
+        }
+        steps.push(toolStep("profiler-enable", "communityshaders.profiler_api", {
+            contractMajor: 1,
+            clientId: `${stem}-profiler-client`,
+            commandId: `${stem}-profiler-enable`,
+            action: "set_enabled",
+            enabled: true,
+            expectedBuildId: buildId,
+        }));
+        const response = await scenario(steps, receiptKey);
+        const entries = requireScenario(response.root, steps, receiptKey);
+        const start = entries.get("measured-stress-start");
+        const session = start && start.status && start.status.session;
+        if (!session || session.active !== true ||
+            !Number.isSafeInteger(session.id) || session.id < 1) {
+            const diagnostic = scenarioDiagnostic(
+                response.root, steps, receiptKey, "ownership");
+            diagnostic.ownership = {
+                status: "uncertain",
+                reason: "measured_stress_session_identity_missing",
+                cleanupAttempted: false,
+                baselineSessionId: baselineResult.stressSessionId,
+                reportedSessionId: session && session.id !== undefined ?
+                    session.id : null,
+            };
+            throw diagnosticError(
+                "measured_stress_session_identity_missing", diagnostic);
+        }
+        const sessionId = session.id;
+        requireTerminalAdapter(start);
+        return sessionId;
+    }
+
+    async function transition(boundary, lane, laneIndex, pass, row) {
+        const destination = matrix.destinations[row.destination];
+        const target = targetFor(boundary, destination, lane.configuredFsrRuntime);
+        const identifiers = ids(laneIndex, pass, row.ordinal, false);
+        const steps = qualificationSteps(
+            boundary, target, identifiers, false, row.ordinal === 1);
+        const receiptKey =
+            `${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}:scenario`;
+        let response;
+        let waiter;
+        let projection;
+        let diagnostic;
+        let entries = new Map();
+        const retainedKey =
+            `${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`;
+        let retained;
+        try {
+            response = await scenario(steps, receiptKey);
+        } catch (scenarioFailure) {
+            try {
+                waiter = await recoverTerminal(identifiers);
+            } catch {
+                await retain(retainedKey, {
+                    variant,
+                    scenarioReceiptKey: receiptKey,
+                    scenario: scenarioFailure && scenarioFailure.diagnostic || null,
+                    waiter: null,
+                    projection: null,
+                });
+                throw diagnosticError("transition_receipt_unavailable",
+                    scenarioFailure && scenarioFailure.diagnostic || null);
+            }
+            projection = { ...transitionProjection(waiter, target),
+                laneQualification: qualifyLaneBackend(waiter, target, lane, capabilities) };
+            diagnostic = scenarioFailure && scenarioFailure.diagnostic || null;
+            retained = {
+                variant,
+                scenarioReceiptKey: receiptKey,
+                scenario: diagnostic,
+                sourceRecoveryReceiptKey: boundary.recoveryReceiptKey || null,
+                recoveredTerminal: true,
+                waiter,
+                projection,
+                replacementTimeline: waiter.replacementTimeline || null,
+                presentationCycleAudit: waiter.presentationCycleAudit || null,
+            };
+        }
+        if (response) {
+            entries = resultMap(response.root);
+            waiter = entries.get("qualification-wait");
+            projection = waiter ? { ...transitionProjection(waiter, target),
+                laneQualification: qualifyLaneBackend(waiter, target, lane, capabilities) } : null;
+            diagnostic = scenarioDiagnostic(response.root, steps, receiptKey);
+            retained = {
+                variant,
+                scenarioReceiptKey: receiptKey,
+                scenario: diagnostic,
+                sourceRecoveryReceiptKey: boundary.recoveryReceiptKey || null,
+                apply: entries.get("profile-apply"),
+                waiter,
+                projection,
+                operation: waiter && waiter.upscalingSnapshot ? {
+                    activeOperationId: waiter.upscalingSnapshot.activeOperationId,
+                    stateRevision: waiter.upscalingSnapshot.stateRevision,
+                } : null,
+                preparation: waiter && waiter.observation ?
+                    waiter.observation.preparationTelemetry || null : null,
+                replacementTimeline: waiter ? waiter.replacementTimeline || null : null,
+                presentationCycleAudit: waiter ? waiter.presentationCycleAudit || null : null,
+                traceReset: entries.get("dlss-trace-reset") || null,
+                traceStart: entries.get("dlss-trace-start") || null,
+                traceStop: entries.get("dlss-trace-stop") || null,
+                traceRead: entries.get("dlss-trace-read") || null,
+            };
+            await retain(retainedKey, retained);
+            if (!waiter || (response.root.ok !== true &&
+                diagnostic.failedStep !== "qualification-wait")) {
+                await closeOpenQualification(identifiers);
+                throw diagnosticError("transition_scenario_failed", diagnostic);
+            }
+        }
+        await retain(retainedKey, retained);
+        let recovery = null;
+        let nextBoundary;
+        if (safeTerminal(waiter, identifiers)) {
+            nextBoundary = terminalBoundary(waiter);
+        } else {
+            if (!recoverableTerminal(waiter, identifiers)) {
+                throw new Error("transition_unsafe");
+            }
+            try {
+                const restored = await restoreBaseline(
+                    boundary, lane, laneIndex, pass, row,
+                    variant === "nvidia" && target.method === "dlss" &&
+                        !retained.traceStop);
+                recovery = restored.summary;
+                retained.recovery = recovery;
+                retained.recoveryReceiptKey = restored.receiptKey;
+                if (restored.evidence.traceStop) {
+                    retained.traceStop = restored.evidence.traceStop;
+                    retained.traceRead = restored.evidence.traceRead;
+                }
+                await retain(retainedKey, retained);
+                nextBoundary = restored.boundary;
+            } catch (error) {
+                const recoveryReceiptKey =
+                    `${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}:recovery`;
+                retained.recovery = {
+                    status: "FAILED",
+                    error: error instanceof Error ? error.message : String(error),
+                    receiptKey: recoveryReceiptKey,
+                    scenario: error && typeof error === "object" ?
+                        error.diagnostic || null : null,
+                };
+                retained.recoveryReceiptKey = recoveryReceiptKey;
+                await retain(retainedKey, retained);
+                throw error;
+            }
+        }
+        if (variant === "nvidia" && target.method === "dlss") {
+            await drainTransitionTrace(retained, retainedKey);
+            const trace = retained.traceStop.capture;
+            if (trace.duplicatedConstantsFailures > 0 || trace.evaluateFailures > 0) {
+                projection.renderVerdict = "FAIL";
+                retained.traceExecutionFailure = true;
+                await retain(retainedKey, retained);
+            }
+        }
+        notify({
+            lane: lane.id,
+            pass,
+            ordinal: row.ordinal,
+            target,
+            ...projection,
+            outcome: waiter.outcome,
+            elapsedMs: waiter.timing ? waiter.timing.elapsedMs : null,
+            recovery,
+            sourceRecoveryReceiptKey: retained.sourceRecoveryReceiptKey,
+        });
+        return { boundary: nextBoundary, waiter, projection, recovery,
+            sourceRecoveryReceiptKey: retained.sourceRecoveryReceiptKey };
+    }
+
+    async function drainTransitionTrace(retained, retainedKey) {
+        retained.traceReadPages = retained.traceRead ? [retained.traceRead] : [];
+        await retain(retainedKey, retained);
+        if (!retained.traceRead || !retained.traceStart || !retained.traceStop) {
+            throw new Error("trace_lifecycle_missing");
+        }
+        const first = retained.traceRead.capture;
+        // The first read uses the producer default; continuation reuses its returned bound.
+        await collectTracePages({
+            expectedBuildId: buildId,
+            expectedSessionId: retained.traceStart.capture.sessionID,
+            schema: { maximum: first.limit },
+            existingPages: retained.traceReadPages,
+            readPage: async args => {
+                const page = retained.traceReadPages.length + 1;
+                const label = `dlss-trace-page-${page}`;
+                const key = `${retainedKey}:trace-page-${page}`;
+                const steps = [toolStep(label, "communityshaders.renderscale", args)];
+                const response = await scenario(steps, key);
+                return requireScenario(response.root, steps, key).get(label);
+            },
+            preservePage: async page => {
+                retained.traceReadPages.push(page);
+                await retain(retainedKey, retained);
+            },
+        });
+        retained.traceEvidence = validateRetainedTrace(retained);
+        await retain(retainedKey, retained);
+    }
+
+    async function retainAmdTraceCapability() {
+        const receiptKey = `${runId}:amd:dlss-trace-capability`;
+        const steps = [
+            toolStep("amd-dlss-trace-status", "communityshaders.renderscale", {
+                action: "dlss_trace_status", expectedBuildId: buildId,
+            }),
+            toolStep("amd-dlss-trace-reset", "communityshaders.renderscale", {
+                action: "dlss_trace_reset", expectedBuildId: buildId,
+            }),
+            toolStep("amd-dlss-trace-start", "communityshaders.renderscale", {
+                action: "dlss_trace_start", expectedBuildId: buildId,
+            }),
+            toolStep("amd-dlss-trace-stop", "communityshaders.renderscale", {
+                action: "dlss_trace_stop", expectedBuildId: buildId,
+            }),
+            toolStep("amd-dlss-trace-read", "communityshaders.renderscale", {
+                action: "dlss_trace_read", afterSequence: 0,
+                expectedBuildId: buildId,
+            }),
+        ];
+        const unavailableTraceAction = (error) => {
+            const diagnostic = error && error.diagnostic;
+            const traceStep = diagnostic && [
+                diagnostic.failedStep,
+                diagnostic.firstUnreportedStep,
+            ].some((label) => typeof label === "string" &&
+                label.startsWith("amd-dlss-trace-"));
+            const reported = diagnostic && [
+                diagnostic.reportedError,
+                ...(diagnostic.reportedSteps || []).map((step) => step.error),
+            ].filter((value) => typeof value === "string").join(" ");
+            const unavailable =
+                /(?:unsupported|unknown|unrecognized|not[ _-](?:available|exposed|implemented)|missing)[\s\S]*(?:action|operation)|(?:action|operation)[\s\S]*(?:unsupported|unknown|unrecognized|not[ _-](?:available|exposed|implemented)|missing)/i
+                    .test(reported || "");
+            return traceStep && unavailable ? diagnostic : null;
+        };
+        const combined = [];
+        async function part(selected, suffix) {
+            const key = `${receiptKey}:${suffix}`;
+            const response = await scenario(selected, key);
+            combined.push(...(response.root.results || []));
+            return requireScenario(response.root, selected, key);
+        }
+        let initial;
+        try { initial = await part(steps.slice(0, 1), "inspect"); }
+        catch (error) {
+            const diagnostic = unavailableTraceAction(error);
+            if (diagnostic) return { status: "unsupported", receiptKey, diagnostic };
+            throw error;
+        }
+        const prior = initial.get("amd-dlss-trace-status")?.capture;
+        if (prior?.active !== false) throw new Error("amd_trace_not_inactive_before_start");
+        amdTraceMayBeActive = true;
+        await part(steps.slice(1, 3), "start");
+        const owner = ownedCaptures.traceSessionId;
+        if (!Number.isSafeInteger(owner) || owner <= 0) throw new Error("amd_trace_start_owner_missing");
+        for (const step of steps.slice(3)) step.args.expectedSessionId = owner;
+        const entries = await part(steps.slice(3), "stop-read");
+        if (entries.get("amd-dlss-trace-stop")?.capture?.active !== false ||
+            entries.get("amd-dlss-trace-read")?.capture?.summary?.active !== false)
+            throw new Error("amd_trace_stop_not_verified");
+        amdTraceMayBeActive = false;
+        await retain(receiptKey, { content: [{ type: "text", text: JSON.stringify({
+            ok: true, aborted: false, stepsRun: steps.length, results: combined,
+        }) }] });
+        const read = entries.get("amd-dlss-trace-read");
+        const capture = read && read.capture;
+        const summary = capture && capture.summary;
+        if (!capture || !summary || !Array.isArray(capture.records) ||
+            capture.records.length !== 0 || summary.totalRecords !== 0 ||
+            summary.setConstantsCalls !== 0 || summary.evaluateCalls !== 0) {
+            throw new Error("amd_dlss_trace_not_empty");
+        }
+        return { status: "supported", receiptKey };
+    }
+
+    async function status(lane, pass, suffix) {
+        const receiptKey = `${runId}:${lane.id}:pass-${pass}:${suffix}`;
+        const steps = [
+            toolStep("render-status", "communityshaders.renderscale", {
+                action: "status", expectedBuildId: buildId,
+            }),
+            toolStep("cpu-status", "communityshaders.renderscale", {
+                action: "cpu_performance_status", expectedBuildId: buildId,
+            }),
+            toolStep("gpu-status", "communityshaders.renderscale", {
+                action: "gpu_performance_status", expectedBuildId: buildId,
+            }),
+            toolStep("texture-status", "communityshaders.renderscale", {
+                action: "texture_lifetime_status", expectedBuildId: buildId,
+            }),
+            toolStep("qualification-status", "communityshaders.renderscale", {
+                action: "qualification_status", expectedBuildId: buildId,
+            }),
+            toolStep("profiler-status", "communityshaders.profiler_api", {
+                contractMajor: 1, action: "snapshot", expectedBuildId: buildId,
+                clientId: `${runId}-cleanup`, commandId: `${runId}-${pass}-${suffix}`,
+            }),
+        ];
+        if (variant === "nvidia" || amdTraceMayBeActive) steps.push(toolStep("trace-status", "communityshaders.renderscale", {
+            action: "dlss_trace_status", expectedBuildId: buildId,
+        }));
+        const response = await scenario(steps, receiptKey);
+        const entries = requireScenario(response.root, steps, receiptKey);
+        return entries;
+    }
+
+    async function cleanup(lane, pass, stressSessionId) {
+        cleanupMode = true;
+        try { return await cleanupCaptures(lane, pass, stressSessionId); }
+        catch (error) {
+            if (context.cleanupFailed) context.cleanupFailed(error);
+            throw error;
+        } finally { cleanupMode = false; }
+    }
+
+    async function cleanupCaptures(lane, pass, stressSessionId) {
+        if (context.prepareCleanup) await context.prepareCleanup();
+        let before;
+        try { before = await status(lane, pass, "final-status-before-cleanup"); }
+        catch (error) {
+            if (!context.recoverCleanupTransport) throw error;
+            await context.recoverCleanupTransport(error);
+            before = await status(lane, pass, "final-status-before-cleanup");
+        }
+        const render = before.get("render-status").status;
+        const cpu = before.get("cpu-status").cpuPerformance;
+        const gpu = before.get("gpu-status").capture;
+        const texture = before.get("texture-status").capture;
+        const trace = before.get("trace-status")?.capture;
+        const qualification = before.get("qualification-status")?.qualification;
+        const profiler = before.get("profiler-status")?.result;
+        const activeStates = [render?.session?.active, render?.loadPresentationProbe?.active,
+            cpu?.active, gpu?.active, texture?.active, qualification?.active, profiler?.enabled];
+        if (variant === "nvidia" || amdTraceMayBeActive) activeStates.push(trace?.active);
+        if (activeStates.some(value => typeof value !== "boolean")) {
+            throw new Error("cleanup_status_incomplete");
+        }
+        const requireOwner = (active, actual, expected, name) => {
+            if (active && (!Number.isSafeInteger(expected) || actual !== expected)) {
+                throw new Error(`cleanup_${name}_owner_mismatch`);
+            }
+        };
+        requireOwner(render.session.active, render.session.id, stressSessionId, "stress");
+        requireOwner(cpu.active, cpu.sessionId, ownedCaptures.cpuSessionId, "cpu");
+        requireOwner(gpu.active, gpu.startFrame, ownedCaptures.gpuStartFrame, "gpu");
+        requireOwner(texture.active, texture.sessionID, ownedCaptures.textureSessionId, "texture");
+        requireOwner(render.loadPresentationProbe.active, render.loadPresentationProbe.sessionID,
+            ownedCaptures.probeSessionId, "probe");
+        requireOwner(trace?.active, trace?.sessionID, ownedCaptures.traceSessionId, "trace");
+        if (qualification?.active !== false) throw new Error("cleanup_qualification_still_active");
+        if (profiler?.enabled && !ownedCaptures.profilerEnabled) throw new Error("cleanup_profiler_owner_missing");
+        const steps = [];
+        if (trace?.active) steps.push(toolStep("dlss-trace-stop", "communityshaders.renderscale", {
+            action: "dlss_trace_stop", expectedSessionId: ownedCaptures.traceSessionId, expectedBuildId: buildId,
+        }));
+        if (render.session.active) {
+            steps.push(toolStep("measured-stress-stop", "communityshaders.renderscale", {
+                action: "stop", expectedSessionId: stressSessionId, expectedBuildId: buildId,
+            }));
+        }
+        if (cpu.active) {
+            const args = { action: "cpu_performance_stop", expectedBuildId: buildId,
+                expectedSessionId: ownedCaptures.cpuSessionId };
+            steps.push(toolStep("cpu-performance-stop", "communityshaders.renderscale", args));
+        }
+        if (gpu.active) {
+            steps.push(toolStep("gpu-performance-stop", "communityshaders.renderscale", {
+                action: "gpu_performance_stop", expectedBuildId: buildId,
+                expectedStartFrame: ownedCaptures.gpuStartFrame,
+            }));
+        }
+        if (texture.active) {
+            steps.push(toolStep("texture-lifetime-stop", "communityshaders.renderscale", {
+                action: "texture_lifetime_stop", expectedBuildId: buildId,
+            }));
+        }
+        if (render.loadPresentationProbe.active) {
+            steps.push(toolStep("load-presentation-stop", "communityshaders.renderscale", {
+                action: "probe_stop", expectedBuildId: buildId,
+            }));
+        }
+        if (profiler?.enabled) steps.push(toolStep("profiler-disable", "communityshaders.profiler_api", {
+            contractMajor: 1,
+            clientId: `${runId}-${lane.id}-${pass}-cleanup-client`,
+            commandId: `${runId}-${lane.id}-${pass}-cleanup-disable`,
+            action: "set_enabled",
+            enabled: false,
+            expectedBuildId: buildId,
+        }));
+        const receiptKey = `${runId}:${lane.id}:pass-${pass}:cleanup`;
+        let stopError;
+        try {
+            if (steps.length) {
+                const response = await scenario(steps, receiptKey);
+                requireScenario(response.root, steps, receiptKey);
+            }
+        } catch (error) { stopError = error; }
+        // A lost stop response permits verification, never replay of the stop batch.
+        if (stopError && context.recoverCleanupTransport) await context.recoverCleanupTransport(stopError);
+        const after = await status(lane, pass, "final-status-after-cleanup");
+        if (after.get("render-status")?.status?.session?.active !== false ||
+            after.get("render-status")?.status?.loadPresentationProbe?.active !== false ||
+            after.get("cpu-status")?.cpuPerformance?.active !== false ||
+            after.get("gpu-status")?.capture?.active !== false ||
+            after.get("texture-status")?.capture?.active !== false ||
+            after.get("qualification-status")?.qualification?.active !== false ||
+            after.get("profiler-status")?.result?.enabled !== false ||
+            ((variant === "nvidia" || amdTraceMayBeActive) && after.get("trace-status")?.capture?.active !== false)) {
+            throw new Error("cleanup_verification_failed");
+        }
+        const mayContinueMeasurement = context.cleanupComplete ? context.cleanupComplete() : true;
+        if (stopError) await retain(`${receiptKey}:response-error`, {
+            error: String(stopError.message || stopError), verifiedInactive: true,
+        });
+        return mayContinueMeasurement;
+    }
+
+    async function cooldown(lane, pass) {
+        await status(lane, pass, "cooldown-start");
+        const receiptKey = `${runId}:${lane.id}:pass-${pass}:cooldown`;
+        const steps = [{ label: "memory-cooldown", wait: 10000 }];
+        const response = await scenario(steps, receiptKey);
+        requireScenario(response.root, steps, receiptKey);
+        await status(lane, pass, "cooldown-end");
+    }
+
+    function lanes() {
+        if (variant === "nvidia") {
+            return [{
+                id: "nvidia",
+                configuredFsrRuntime: matrix.initialDormantFsrRuntime,
+                runnable: true,
+            }];
+        }
+        const supported = capabilities.supportedFSRRuntimeMask;
+        const unavailable = capabilities.fsrRuntimeUnavailableConditions;
+        const validUnavailable = Array.isArray(unavailable) &&
+            unavailable.length === 2 && unavailable.every((entry) =>
+                entry && typeof entry === "object" &&
+                Number.isSafeInteger(entry.mask) && entry.mask >= 0);
+        if (!Number.isSafeInteger(supported) || supported < 0 || supported > 3 ||
+            !validUnavailable) {
+            throw diagnosticError("amd_capabilities_invalid", {
+                reason: "fsr_runtime_capability_shape_invalid",
+                supportedFSRRuntimeMask: supported ?? null,
+                unavailableConditionCount: Array.isArray(unavailable) ?
+                    unavailable.length : null,
+            });
+        }
+        const fsr3 = (supported & 1) !== 0 &&
+            unavailable[0].mask === 0;
+        const fsr4 = (supported & 2) !== 0;
+        const fsr4Unavailable = unavailable[1].mask !== 0;
+        return matrix.lanes.map((lane) => ({
+            ...lane,
+            runnable: lane.id === "explicit_fsr4" ? fsr4 && unavailable[1].mask === 0 :
+                lane.id === "explicit_fsr3" ? fsr3 : fsr3 && fsr4Unavailable,
+        }));
+    }
+
+    let boundary = positioning.boundary;
+    const summary = { ok: true, status: "COMPLETE", variant, runId,
+        traceCapability: variant === "amd" ? null : { status: "not_applicable" },
+        lanes: [] };
+    let passSequence = 0;
+    const selectedLanes = lanes();
+    if (variant === "amd" && selectedLanes.some((lane) => lane.runnable)) {
+        try {
+            summary.traceCapability = await retainAmdTraceCapability();
+        } catch (error) {
+            summary.ok = false;
+            summary.status = "INTERRUPTED";
+            summary.error = error instanceof Error ? error.message : String(error);
+            summary.failure = error && typeof error === "object" &&
+                error.diagnostic ? error.diagnostic : null;
+            if (amdTraceMayBeActive) {
+                try { await cleanup({ id: "amd-capability" }, 0, 0); }
+                catch (cleanupError) { summary.cleanupError = String(cleanupError.message || cleanupError); }
+            }
+            await retainLiveResult(summary);
+            return summary;
+        }
+    }
+    for (let laneIndex = 0; laneIndex < selectedLanes.length; laneIndex += 1) {
+        const lane = selectedLanes[laneIndex];
+        const laneSummary = { id: lane.id, eligibility: variant === "amd" ? amdLaneAvailability(lane, capabilities) : null, status: lane.runnable ? "COMPLETE" : "BLOCKED", passes: [] };
+        summary.lanes.push(laneSummary);
+        if (!lane.runnable) continue;
+        for (let pass = 1; pass <= 2; pass += 1) {
+            passSequence += 1;
+            let stressSessionId = 0;
+            let cleanupAttempted = false;
+            const passSummary = { pass, status: "RUNNING", rows: [] };
+            laneSummary.passes.push(passSummary);
+            try {
+                const base = await baseline(boundary, lane, laneIndex + 1, pass);
+                boundary = base.boundary;
+                passSummary.baseline = {
+                    satisfied: base.waiter.satisfied === true,
+                    outcome: base.waiter.outcome || null,
+                    nonStableNote: base.nonStableNote,
+                    laneQualification: qualifyLaneBackend(base.waiter,
+                        targetFor(boundary, matrix.destinations[matrix.initialDestination], lane.configuredFsrRuntime), lane, capabilities),
+                };
+                if (base.nonStableNote) {
+                    notify({ lane: lane.id, pass, phase: "baseline",
+                        ...base.nonStableNote });
+                }
+                stressSessionId = await armOwners(
+                    base, lane, laneIndex + 1, pass, passSequence > 1);
+                for (const row of matrix.transitions) {
+                    const completed = await transition(
+                        boundary, lane, laneIndex + 1, pass, row);
+                    boundary = completed.boundary;
+                    passSummary.rows.push({
+                        ordinal: row.ordinal,
+                        receiptKey: `${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`,
+                        ...completed.projection,
+                        recovery: completed.recovery,
+                        sourceRecoveryReceiptKey:
+                            completed.sourceRecoveryReceiptKey,
+                    });
+                }
+                cleanupAttempted = true;
+                const mayContinueMeasurement = await cleanup(lane, pass, stressSessionId);
+                stressSessionId = 0;
+                if (mayContinueMeasurement === false) throw new Error("cleanup_recovered_assay_interrupted");
+                passSummary.status = "COMPLETE";
+                notify({ lane: lane.id, pass, phase: "pass_complete", status: "COMPLETE" });
+                if (pass === 1) await cooldown(lane, pass);
+            } catch (error) {
+                const cleanupSessionId = ownedCaptures.stressSessionId || stressSessionId;
+                if (cleanupSessionId && !cleanupAttempted) {
+                    try { await cleanup(lane, pass, cleanupSessionId); }
+                    catch (cleanupError) {
+                        passSummary.cleanupError = String(cleanupError.message || cleanupError);
+                        passSummary.cleanupFailure = cleanupError.diagnostic || null;
+                    }
+                }
+                summary.ok = false;
+                summary.status = "INTERRUPTED";
+                laneSummary.status = "INTERRUPTED";
+                passSummary.status = "INTERRUPTED";
+                passSummary.error = error instanceof Error ?
+                    error.message : String(error);
+                passSummary.failure = error && typeof error === "object" &&
+                    error.diagnostic ? error.diagnostic : null;
+                await retainLiveResult(summary);
+                return summary;
+            }
+        }
+    }
+    await retainLiveResult(summary);
+    return summary;
+}
+
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = { runRenderScaleTuningLive, collectTracePages, traceCapacity,
+        validateTracePage, validateRetainedTrace, actualBackend, qualifyLaneBackend, amdLaneAvailability };
+}

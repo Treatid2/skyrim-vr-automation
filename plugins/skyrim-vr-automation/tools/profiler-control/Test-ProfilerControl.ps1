@@ -135,19 +135,33 @@ try {
     [IO.File]::WriteAllText($runtimePath, '{}', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText($fakeControl, @'
-param([string]$Command,[string]$Tool,[string]$ArgumentsJson,[string]$RuntimePath,[string]$EvidenceDirectory,[string]$EvidenceLabel,[int]$TimeoutSeconds,[switch]$RequireSuccess,[switch]$RequirePerformanceNeutral,[switch]$NoExit,[switch]$Compact)
+param([string]$Command,[string]$Tool,[string]$ArgumentsJson,[string]$RuntimePath,[string]$EvidenceDirectory,[string]$EvidenceLabel,[int]$TimeoutSeconds,[switch]$RequireSuccess,[switch]$RequirePerformanceNeutral,[switch]$NoExit,[switch]$Compact,[string]$ExpectedRuntimeIdentityJson)
 $state = Get-Content -LiteralPath $env:CSX_PROFILER_TEST_STATE -Raw | ConvertFrom-Json -AsHashtable
 $state.calls = [int]$state.calls + 1
 $isRenderScale = $Tool -eq 'communityshaders.renderscale'
 if ($isRenderScale) { $state.renderScaleCalls = [int]$state.renderScaleCalls + 1 }
 $action = ($ArgumentsJson | ConvertFrom-Json).action
+$listenerPid = if (-not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DRIFT_AT_CALL) -and [int]$env:CSX_PROFILER_TEST_DRIFT_AT_CALL -eq [int]$state.calls) { 456 } else { 123 }
+if (-not [string]::IsNullOrWhiteSpace($ExpectedRuntimeIdentityJson)) {
+    $expected = $ExpectedRuntimeIdentityJson | ConvertFrom-Json
+    if ([int]$expected.listenerPid -ne $listenerPid) {
+        $state.rejectedBeforeMutation = $true
+        $state | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:CSX_PROFILER_TEST_STATE -Encoding utf8
+        [pscustomobject]@{ok=$false;errors=@('Expected runtime identity changed before dispatch.')} | ConvertTo-Json -Compress
+        return
+    }
+}
 if ($action -eq 'enable') { $state.enabled = $true }
 elseif ($action -eq 'disable') { $state.enabled = $false }
 elseif ($action -eq 'status' -and -not $isRenderScale) { $state.frame = [int]$state.frame + 1 }
 $state | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:CSX_PROFILER_TEST_STATE -Encoding utf8
+$mirrorPath = Join-Path $EvidenceDirectory 'transaction.journal.json'
+if ($action -eq 'enable' -and $env:CSX_PROFILER_TEST_BREAK_MIRROR -eq '1') {
+    if (Test-Path -LiteralPath $EvidenceDirectory -PathType Container) { Remove-Item -LiteralPath $EvidenceDirectory -Recurse -Force }
+    'blocked-evidence-directory' | Set-Content -LiteralPath $EvidenceDirectory -Encoding utf8
+}
 $timer = [pscustomobject]@{name='Synthetic';activeGpu=$true;activeCpu=$true;hasGpu=$true;hasCpu=$true;gpuMs=1.0;topLevelMs=1.0;cpuMs=0.1}
 $status = [pscustomobject]@{enabled=[bool]$state.enabled;frame_count=[long]$state.frame;capturedFrameCount=[long]$state.frame;resolvedTotalMs=1.0;resolvedCpuTotalMs=0.1;acquiredSlots=1;slotRefusals=0;timers=@($timer)}
-$listenerPid = if (-not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DRIFT_AT_CALL) -and [int]$env:CSX_PROFILER_TEST_DRIFT_AT_CALL -eq [int]$state.calls) { 456 } else { 123 }
 $data = [ordered]@{content=@([pscustomobject]@{ok=$true;status=$status})}
 if ($RequirePerformanceNeutral) {
     $distorted = (-not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DISTORT_ACTION) -and $env:CSX_PROFILER_TEST_DISTORT_ACTION -eq $action) -or (-not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DISTORT_LABEL) -and $env:CSX_PROFILER_TEST_DISTORT_LABEL -eq $EvidenceLabel)
@@ -230,7 +244,18 @@ $semantic = if ($optionalUnavailable) { [pscustomobject]@{known=$true;ok=$false;
     catch { $driftError = $_.Exception.Message }
     Remove-Item Env:CSX_PROFILER_TEST_DRIFT_AT_CALL -ErrorAction SilentlyContinue
     $driftFinalState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
-    Assert-Test ($driftError -match 'runtime identity changed' -and -not $driftFinalState.enabled) 'measurement rejects a replacement runtime and restores state only through the original identity'
+    Assert-Test ($driftError -match 'Expected runtime identity changed before dispatch' -and $driftFinalState.rejectedBeforeMutation -and -not $driftFinalState.enabled) 'measurement rejects a replacement runtime before dispatching a profiler mutation'
+
+    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0}', [Text.UTF8Encoding]::new($false))
+    $env:CSX_PROFILER_TEST_BREAK_MIRROR = '1'
+    $mirrorFailure = $null
+    try { & $measure -Label mirror-failure -EvidenceDirectory (Join-Path $resolvedTestRoot 'mirror-failure') -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | Out-Null }
+    catch { $mirrorFailure = $_.Exception.Message }
+    Remove-Item Env:CSX_PROFILER_TEST_BREAK_MIRROR -ErrorAction SilentlyContinue
+    $mirrorFailureState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $leaseProbe = [IO.File]::Open((Join-Path $env:CSX_PROFILER_CONTROL_ROOT 'capture.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $leaseProbe.Dispose()
+    Assert-Test ($mirrorFailure -match 'evidence is incomplete after state restoration' -and -not $mirrorFailureState.enabled) 'journal mirror failure cannot prevent exact profiler restoration or lease release'
 
     [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
     $env:CSX_PROFILER_TEST_DISTORT_ACTION = 'status'
@@ -292,6 +317,7 @@ $semantic = if ($optionalUnavailable) { [pscustomobject]@{known=$true;ok=$false;
 finally {
     Remove-Item Env:CSX_PROFILER_TEST_STATE -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_DRIFT_AT_CALL -ErrorAction SilentlyContinue
+    Remove-Item Env:CSX_PROFILER_TEST_BREAK_MIRROR -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_RENDER_SCALE_EPOCH_AFTER -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_RENDER_SCALE_OPTIONAL_MODE -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_DISTORT_LABEL -ErrorAction SilentlyContinue

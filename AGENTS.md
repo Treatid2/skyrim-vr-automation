@@ -1,5 +1,11 @@
 # Automation repository rules
 
+- Treat `dev` as the sole integration line for ongoing automation work. A
+  temporary worktree branch is not complete until its commits are integrated
+  into `dev`; update `main` only through a `dev`-to-`main` pull request, and
+  keep local `main` aligned with the latest merged `origin/main`. Open or merge
+  that pull request only when the user explicitly instructs it. Develop in
+  scoped feature branches and never push directly to `main`.
 - Treat every game, MO2, SteamVR, profile, and cache mutation as an attributable
   transaction. Inspect first and preserve its result with the test record.
 - Never silently fall back to a different MO2 profile, executable, runtime,
@@ -26,15 +32,67 @@
 - Require SteamVR to be closed before applying or restoring null-HMD settings.
 - Retain exact backups and receipts until the associated test evidence has been
   classified. Never delete unclassified MO2 overwrite or shader-cache content.
+- Render-scale tuning queues an immutable copy of each received measurement
+  and later revision before the next operation. AMD and NVIDIA use the same
+  detached worker and one append-only journal; disk writes and flushes never
+  gate the next transition or pass. Drain and flush all queued evidence after
+  measurement and ownership cleanup, before reporting evidence completion. Never discard
+  receipts, reduce telemetry, or stop measurement because saving falls behind.
+  Report progress every five transitions without controlling worker execution.
+  Both variants follow identical pacing, deadlines, cleanup/replay rules,
+  evidence schemas, complete-ledger reporting, and comparison requirements.
+  Only adapter verification, backend capabilities, and vendor matrices differ.
+  Keep physical lane qualification separate from raw terminal verdicts.
+  Record one ledger column per run ID with explicit lane/pass metric rows;
+  retain blocked and interrupted lanes and their evidence gaps. Correctly
+  evidenced blocked lanes are inapplicable to memory completeness; missing
+  runnable-lane evidence is incomplete. Guard capability-capture ownership
+  before the first profile apply as well as during measured passes.
+  Compare available measurements even from partial runs, explicitly labeling
+  missing values and incomplete coverage instead of requiring a complete run
+  for ledger entry.
+- Every tuning ledger update includes the detailed side-by-side analysis in
+  `tools/renderscale-tuning-finalizer/README.md`. Preserve completion and
+  terminal results separately from full-history health and the
+  improvement-or-neutral assessment. Show actual relatch/strict frames and
+  milliseconds, stretch counts/frames/duration, retries and recovered failures
+  in the per-pass and per-transition comparison tables. The imposed-stretch
+  cutoff is diagnostic only. PR inclusion is solely the user's decision;
+  this analysis is not a PR requirement or merge gate.
+- Keep post-run reporting fast. In a shader repository with the maintained
+  `tools/compare-render-scale-ledger.py`, use its single-command workflow and
+  content-verified reuse. Preserve every evidence and ledger check; retain
+  missing-data limitations. Give brief useful progress updates without adding
+  repeated extraction, comparison generation, packaging or tool-development
+  work to a normal run. Record stage timings and surface material failures or
+  unexpected delays.
 - Keep automated waits bounded and report the observed postcondition. A CTD is
   useful evidence, not permission for unbounded retries.
+- Treat the render-scale tuning fixture, immediate positioning, and startup
+  admission sequence as frozen. Change that prefix only on explicit user
+  instruction or preserved evidence proving the prefix itself is defective;
+  post-position runner, telemetry, and reporting fixes must not alter it.
 - Tests must use temporary fixtures by default. Live checks must be explicitly
   selected and read-only unless the user has placed a state change in scope.
 - Machine-specific paths belong only in ignored `machine.local.json` files,
   explicit parameters, or documented environment variables.
+- Never rotate an installed Codex plugin cache while any automation protocol
+  is active in any chat. Feature branches validate source/package parity but do
+  not rotate the installed cache. After an authorized merge to `main` that
+  affects installed plugin behavior, skills, tools, MCP configuration,
+  manifests, or packaged AI guidance, rotate both plugin manifest cache
+  identities once from the final integrated tree, rebuild the managed
+  marketplace package, and reinstall it with the guarded repository installer
+  instead of direct `codex plugin add`. Verify the registered version plus
+  source, marketplace, and installed-cache hashes, then fully reload the Codex
+  host; a new chat alone is not a safe pickup boundary. If a protocol is
+  active, defer installation until every run is terminal.
 - When an automation command behaves unexpectedly, its contract is ambiguous,
   or a concrete safety issue or enhancement is discovered, submit it through
   `tools/feedback-control/Invoke-AutomationFeedback.ps1`. Claim that feedback
   was recorded only when the controller returns a durable `AUTO-...` receipt.
+  When an in-scope safe fix is available, implement and validate it before
+  resolving or amending feedback; record feedback first only when evidence
+  would otherwise be lost or the implementation is blocked.
   Tasks report desires; they do not publish issues or edit automation source
   unless that work is explicitly in scope.

@@ -48,9 +48,11 @@ OCU/OpenComposite provider is the blocker for the `SteamVRNull` route.
   lease release and resume, and `list-task` reports that choice.
 - `resume` verifies stable task ownership, requires the newly owned access
   lease, rebinds the workspace to that lease, and selects the retained profile.
-  It does not refresh the profile from the primary profile or requalify a save
-  after task-local edits. A task that needs the current known-good baseline must
-  explicitly request a fresh clone.
+  When the prior lease completed its output transaction, resume creates a fresh
+  owner marker, evidence directories, snapshots, and completion paths for the
+  new lease before returning ready. It does not refresh the profile from the
+  primary profile or requalify a save after task-local edits. A task that needs
+  the current known-good baseline must explicitly request a fresh clone.
 
 Success results identify the exact workspace, profile directory, selected
 profile transaction, save policy, and current lease. Missing profiles, wrong
@@ -59,10 +61,15 @@ applicable, the valid retained workspace IDs.
 
 ## Yield versus retirement
 
-After ending the live evidence session, call MO2 `release-access` as soon as the
-task can compile, edit, or analyse offline. This yields MO2 but preserves the
-task profile, its saves, its option state, and its task-owned mods. A later
-lease can resume it directly.
+After ending the live evidence session and completing the output transactions
+below, call MO2 `release-access` as soon as the task can compile, edit, or
+analyse offline. This yields MO2 but preserves the task profile, its saves,
+its option state, and its task-owned mods. A later lease can resume it directly.
+
+After the game and MO2 close, run shader-cache catalog `complete` and workspace
+`complete-output`. These preserve generated `ShaderCache` and `backup` trees,
+restore the exact pre-task MO2 Overwrite state, and release the output owner
+marker. They preserve the retained task profile and its local changes.
 
 This retained environment is the default end state. Do not restore it to the
 source profile, remove its task-local changes, or retire it merely because a
@@ -71,9 +78,9 @@ workspace when work continues.
 
 Use workspace `retire` only after explicit direction to discard or replace that
 exact environment, or when a separately stated retention policy proves it
-obsolete. Retirement is destructive: it selects the maintained primary profile
-and recursively removes only
-the exact task-owned profile. `-CleanupOwnedMods` additionally removes only
+obsolete. Retirement requires exact cache and backup completion receipts. It
+selects the maintained primary profile and recursively removes only the exact
+task-owned profile. `-CleanupOwnedMods` additionally removes only
 mods that the workspace created and registered. The old workspace `release`
 command now fails closed without mutation. It points callers to MO2
 `release-access` for lease yield and to the explicit `retire` command for
@@ -91,10 +98,11 @@ name, then disable the old mod and enable the new mod in the maintained primary
 profile. Existing task profiles retain their prior mod selections and shared
 mod references until the owning task explicitly requests a fresh clone.
 
-Some applications write runtime data into an existing mod, notably CSX writing
-compiled shaders into the managed shader-cache mod. That known exception is
-accepted. Automatic cache reset on lease yield is intentionally not part of
-this contract; it can be added later as a separately evidenced policy.
+CSX runtime output is bound to MO2 Overwrite, not an existing mod. Workspace
+creation removes the cloned profile's game and `Synthesis` custom-overwrite
+mappings, snapshots `backup`, and materializes its enabled-provider union.
+Shader-cache preparation does the same for `ShaderCache`. New paths and updates
+therefore resolve to Overwrite; shared mod directories remain immutable.
 
 Restoration of shared or global transient state is a separate lifecycle. For
 example, a requested SteamVR settings restoration may run after a test without
