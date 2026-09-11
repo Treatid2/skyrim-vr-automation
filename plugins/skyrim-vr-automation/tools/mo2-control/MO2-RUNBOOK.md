@@ -126,6 +126,8 @@ analysis, report writing, or any other phase that does not require MO2:
 
 This yields only the scarce access lease. It deliberately preserves the task's
 workspace profile, saves, options, and task-owned mods for a later `resume`.
+That retained environment is the normal end state for a run, turn, or task;
+completion never implies reverting its changes or retiring it.
 
 The task remains responsible for its lease even when the estimate is overdue.
 Use `renew-access` to update coordination metadata. Use `recover-access` only
@@ -161,10 +163,18 @@ unselected catalog candidates, and records the catalog hash and applied
 selection. Resume never changes that selection.
 
 After each live use, release the evidence session and access lease but retain
-the workspace. Use workspace `retire` only when its profile is no longer
-wanted. A task must never edit, replace, or delete a pre-existing shared mod;
+the workspace. Later, reacquire access and resume that exact environment. Use
+workspace `retire` only after explicit direction to discard or replace it, or
+when a separately stated retention policy proves it obsolete. A task must never
+edit, replace, or delete a pre-existing shared mod;
 it may change existing mod markers only in its own cloned profile. Primary-list
 updates install a new mod name and change primary-profile markers additively.
+
+Virtual Desktop and `VirtualDesktop.Streamer` do not block MO2 profile mutation
+or SteamVR null-HMD. The `SteamVRNull` route instead fails admission when the
+exact profile has an enabled OCU/OpenComposite provider. Shared runtime
+restoration is separate from workspace retention and must not rewrite or retire
+the task-owned profile.
 
 Preview first, then bind a session to the owned access lease:
 
