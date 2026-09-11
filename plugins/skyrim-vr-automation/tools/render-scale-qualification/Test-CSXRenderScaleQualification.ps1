@@ -1202,7 +1202,7 @@ function New-TestEvidenceEnvelope {
     Write-CSXJsonFile -Path (Join-Path $Root 'run.raw.json') -Value $raw | Out-Null
     $review = New-CSXAutomatedVisualReview -EvidenceDirectory $Root -RunRaw $raw -VisualIndex $visual.index -BaselineVisualIndex $baselineIndex
     Write-CSXJsonFile -Path (Join-Path $Root 'visual-review.json') -Value $review | Out-Null
-    $final = Update-CSXQualificationReport -EvidenceDirectory $Root
+    $final = Update-CSXQualificationReport -EvidenceDirectory $Root -AllowUnsealedSuccess
     $completion = [pscustomobject][ordered]@{
         schema = 'csx-render-scale-qualification-completion-v1'; runId = $RunId
         invocationStartedUtc = $raw.time.invocationStartedUtc; completedUtc = $raw.time.completedUtc
@@ -1575,6 +1575,11 @@ try {
         -ProtocolRecord $record -FixtureIdentity $fixtureIdentity -ProtocolSource $protocolPath -FixtureSource $fixtureManifestPath
     Assert-Test ($baselineEnvelope.final.report.status -eq 'LOCAL_PASS') `
         "Complete standalone baseline evidence did not finalize: $($baselineEnvelope.final.report.errors -join ' | ')"
+    $baselineRunHash = Get-CSXFileSha256 (Join-Path $baselineSourceRoot 'run.json')
+    $sealedBaseline = Update-CSXQualificationReport -EvidenceDirectory $baselineSourceRoot
+    Assert-Test ($sealedBaseline.report.status -eq 'LOCAL_PASS' -and
+        (Get-CSXFileSha256 (Join-Path $baselineSourceRoot 'run.json')) -eq $baselineRunHash) `
+        'Repeated finalization did not preserve an already sealed standalone projection byte for byte.'
     $standaloneAutomated = $baselineEnvelope.raw.assays.visual.automatedReview
     Assert-Test ($standaloneAutomated.schema -eq 'csx-render-scale-automated-review-v1' -and
         $standaloneAutomated.provider -eq 'codex_cli' -and $standaloneAutomated.model -eq 'gpt-5.6-sol' -and
@@ -1621,6 +1626,50 @@ try {
     $baselineIndex = $baselineEnvelope.index
     Assert-Test ($candidateEnvelope.final.report.status -eq 'PASS') `
         "Complete PR artifact envelope did not finalize: $($candidateEnvelope.final.report.errors -join ' | ')"
+    $candidateRunHash = Get-CSXFileSha256 (Join-Path $candidateRoot 'run.json')
+    $sealedCandidate = Update-CSXQualificationReport -EvidenceDirectory $candidateRoot
+    Assert-Test ($sealedCandidate.report.status -eq 'PASS' -and
+        (Get-CSXFileSha256 (Join-Path $candidateRoot 'run.json')) -eq $candidateRunHash) `
+        'Repeated finalization rewrote an already sealed PR projection or invalidated its completion binding.'
+    $sealedRunBytes = [IO.File]::ReadAllBytes((Join-Path $candidateRoot 'run.json'))
+    $sealedCompletionBytes = [IO.File]::ReadAllBytes((Join-Path $candidateRoot 'qualification-completion.json'))
+    foreach ($sealCase in @(
+        [pscustomobject]@{
+            name = 'missing'; pattern = 'completion receipt is missing'
+            mutate = { param($root) Remove-Item -LiteralPath (Join-Path $root 'qualification-completion.json') -Force }
+        },
+        [pscustomobject]@{
+            name = 'stale'; pattern = 'does not bind its artifact'
+            mutate = {
+                param($root)
+                $projection = Get-Content -LiteralPath (Join-Path $root 'run.json') -Raw | ConvertFrom-Json -Depth 100
+                $projection.generatedUtc = '2026-08-26T12:09:59Z'
+                Write-CSXJsonFile -Path (Join-Path $root 'run.json') -Value $projection | Out-Null
+            }
+        },
+        [pscustomobject]@{
+            name = 'outer-rejected'; pattern = 'outer package deadline'
+            mutate = {
+                param($root)
+                Write-CSXJsonFile -Path (Join-Path $root 'qualification-package-rejection.json') -Value ([pscustomobject][ordered]@{
+                    schema = 'csx-render-scale-package-deadline-rejection-v1'; reason = 'test rejection'
+                }) | Out-Null
+            }
+        }
+    )) {
+        try {
+            & $sealCase.mutate $candidateRoot
+            $sealResult = Update-CSXQualificationReport -EvidenceDirectory $candidateRoot
+            Assert-Test ($sealResult.report.status -eq 'INFRASTRUCTURE_ERROR' -and
+                ($sealResult.report.errors -join ' | ') -match $sealCase.pattern) `
+                "Public finalization accepted $($sealCase.name) candidate completion evidence. Status=$($sealResult.report.status); errors=$($sealResult.report.errors -join ' | ')"
+        }
+        finally {
+            [IO.File]::WriteAllBytes((Join-Path $candidateRoot 'run.json'), $sealedRunBytes)
+            [IO.File]::WriteAllBytes((Join-Path $candidateRoot 'qualification-completion.json'), $sealedCompletionBytes)
+            Remove-Item -LiteralPath (Join-Path $candidateRoot 'qualification-package-rejection.json') -Force -ErrorAction SilentlyContinue
+        }
+    }
     $prAutomated = $raw.assays.visual.automatedReview
     Assert-Test ((@($prAutomated.batches | ForEach-Object { "$($_.presentationPass):$($_.replicate)" }) -join ',') -eq
         '1:1,1:2,1:3,2:1,2:2,2:3') 'PR image-model batches are not in pass-major order.'

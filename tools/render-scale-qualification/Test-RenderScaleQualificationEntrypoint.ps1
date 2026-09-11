@@ -61,7 +61,24 @@ if ('PR mode requires a matching baseline artifact and explicit baseline Build I
     throw "Direct runner did not reject incomplete PR-mode baseline admission: $runnerText"
 }
 
+$expiredArguments = $runnerCommon.Clone()
+$expiredArguments.PackageDeadlineUtc = [DateTimeOffset]::UtcNow.AddSeconds(-1).ToString('o')
+$runnerText = & $runner @expiredArguments -NoExit -Compact | Out-String
+$runnerResult = $runnerText | ConvertFrom-Json -Depth 20
+if ('The complete qualification result deadline already elapsed.' -notin @($runnerResult.errors)) {
+    throw "Direct runner did not reject an expired shared deadline before runtime admission: $runnerText"
+}
+
+$qualificationModule = Join-Path $PSScriptRoot 'RenderScaleQualification.psm1'
+$moduleLiteral = $qualificationModule.Replace("'", "''")
+$exportProbe = & (Get-Command pwsh -ErrorAction Stop).Source -NoProfile -NonInteractive -Command `
+    "Import-Module '$moduleLiteral' -Force; if (-not (Get-Command Test-CSXQualificationCompletionReceipt -ErrorAction SilentlyContinue)) { exit 9 }; 'EXPORTED'" | Out-String
+if ($LASTEXITCODE -ne 0 -or $exportProbe.Trim() -ne 'EXPORTED') {
+    throw 'A clean PowerShell process cannot reach the qualification completion validator used by baseline admission.'
+}
+
 $entrypointText = Get-Content -LiteralPath $entrypoint -Raw
+$runnerSource = Get-Content -LiteralPath $runner -Raw
 if ($entrypointText -notmatch 'AddSeconds\(600\)' -or
     $entrypointText -notmatch 'Invoke-BoundedQualificationScript -ScriptPath \$controller' -or
     $entrypointText -notmatch 'Invoke-BoundedQualificationScript -ScriptPath \$runner' -or
@@ -69,6 +86,15 @@ if ($entrypointText -notmatch 'AddSeconds\(600\)' -or
     $entrypointText -notmatch 'boundedProcess = \$boundedAttempt' -or
     $entrypointText -notmatch 'state = \$\(if \(\$boundedChildLaunched\) \{ ''unknown'' \}') {
     throw 'Entrypoint does not apply one shared 600-second process deadline to controller and runner children.'
+}
+if ($runnerSource -notmatch 'Get-CSXResultBoundedTimeoutSeconds' -or
+    $runnerSource -notmatch "Assert-CSXResultBudget -Stage 'post-binding admission'" -or
+    $runnerSource -notmatch 'CommandTimeoutMilliseconds \$providerCommandTimeoutMs' -or
+    $runnerSource -notmatch 'remainingResultWorkMs' -or
+    $runnerSource -notmatch 'TimeoutSeconds \(Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000\)' -or
+    $runnerSource -notmatch 'Update-CSXQualificationReport -EvidenceDirectory \$script:evidenceRoot -AllowUnsealedSuccess' -or
+    $runnerSource -notmatch '(?s)qualification-completion\.json.*Update-CSXQualificationReport -EvidenceDirectory \$script:evidenceRoot') {
+    throw 'Direct runner does not propagate the shared result deadline and sealed-success boundary through production operations.'
 }
 
 $skillPath = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) `

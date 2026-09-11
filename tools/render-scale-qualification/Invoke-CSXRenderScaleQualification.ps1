@@ -86,6 +86,32 @@ function Assert-AuthoritativeRuntimeBinding($BindingIdentity, $Health) {
     }
 }
 
+function Get-CSXResultRemainingMilliseconds {
+    param([ValidateRange(0, 600000)][int]$ReserveMs = 0)
+    if ($null -eq $script:resultDeadlineUtc) { throw 'The complete qualification result deadline is unavailable.' }
+    return [int][Math]::Floor(($script:resultDeadlineUtc - [DateTimeOffset]::UtcNow).TotalMilliseconds) - $ReserveMs
+}
+
+function Get-CSXResultBoundedTimeoutSeconds {
+    param(
+        [Parameter(Mandatory)][ValidateRange(100, 600000)][int]$OperationCapMs,
+        [ValidateRange(0, 600000)][int]$ReserveMs = 0
+    )
+    $remaining = Get-CSXResultRemainingMilliseconds -ReserveMs $ReserveMs
+    if ($remaining -lt 1000) { throw 'The complete qualification result deadline has no remaining operation budget.' }
+    return [int][Math]::Max(1, [Math]::Floor(([Math]::Min($remaining, $OperationCapMs)) / 1000.0))
+}
+
+function Assert-CSXResultBudget {
+    param(
+        [Parameter(Mandatory)][string]$Stage,
+        [ValidateRange(0, 600000)][int]$ReserveMs = 15000
+    )
+    if ((Get-CSXResultRemainingMilliseconds -ReserveMs $ReserveMs) -lt 1000) {
+        throw "The complete qualification result deadline expired before $Stage."
+    }
+}
+
 function Invoke-BoundTool {
     param(
         [Parameter(Mandatory)][string]$Tool,
@@ -93,7 +119,10 @@ function Invoke-BoundTool {
         [int]$OperationCapMs = 15000,
         [switch]$AllowSemanticFailure
     )
-    $timeout = Get-CSXBoundedTimeoutSeconds -Stopwatch $script:orchestrationWatch -BudgetMs ([int]$script:protocol.timeBudget.orchestrationMs) -OperationCapMs $OperationCapMs
+    $orchestrationTimeout = Get-CSXBoundedTimeoutSeconds -Stopwatch $script:orchestrationWatch -BudgetMs ([int]$script:protocol.timeBudget.orchestrationMs) -OperationCapMs $OperationCapMs
+    $resultTimeout = Get-CSXResultBoundedTimeoutSeconds -OperationCapMs $OperationCapMs `
+        -ReserveMs ([int]$script:protocol.timeBudget.evidenceFinalizationMs)
+    $timeout = [Math]::Min($orchestrationTimeout, $resultTimeout)
     return Invoke-CSXMcpTool -Connection $script:connection -Tool $Tool -Arguments $Arguments -TimeoutSeconds $timeout -AllowSemanticFailure:$AllowSemanticFailure
 }
 
@@ -373,7 +402,7 @@ function Invoke-EmergencyCleanup {
         $cleanupConnection = New-CSXMcpConnection -Runtime $script:runtime -ClientName 'CSXRenderScaleQualificationCleanup'
         $cleanupHealth = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'inspect' -Arguments ([ordered]@{
             kind = 'health'
-        }) -TimeoutSeconds 5
+        }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000)
         $cleanupIdentity = Assert-AuthoritativeRuntimeBinding -BindingIdentity $script:bindingIdentity -Health $cleanupHealth
         Write-CleanupEvidenceSafely 'cleanup\runtime-identity.json' $cleanupIdentity $Warnings
         if ($script:visualStartUncertain -and -not $script:activeVisualRequestId) {
@@ -384,7 +413,7 @@ function Invoke-EmergencyCleanup {
                 $cancelReceipt = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.screenshot' -Arguments ([ordered]@{
                     contractMajor = 1; clientId = 'csx-render-scale-qualification-cleanup'; commandId = "$($script:runId)-cleanup-cancel"
                     action = 'request_cancel'; requestId = [string]$script:activeVisualRequestId
-                }) -TimeoutSeconds 5 -AllowSemanticFailure
+                }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000) -AllowSemanticFailure
                 Assert-CleanupReceipt $cancelReceipt 'Screenshot cancellation'
                 $terminalStates = @('completed', 'completed_with_warnings', 'failed', 'failed_partial', 'cancelled', 'cancelled_partial', 'stopped')
                 $cleanupReceipt = $null
@@ -392,7 +421,7 @@ function Invoke-EmergencyCleanup {
                     $cleanupReceipt = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.screenshot' -Arguments ([ordered]@{
                         contractMajor = 1; clientId = 'csx-render-scale-qualification-cleanup'; commandId = "$($script:runId)-cleanup-get-$attempt"
                         action = 'request_get'; requestId = [string]$script:activeVisualRequestId
-                    }) -TimeoutSeconds 2 -AllowSemanticFailure
+                    }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 2000) -AllowSemanticFailure
                     Assert-CleanupReceipt $cleanupReceipt 'Screenshot terminal query'
                     if ([string](Get-CSXPathValue $cleanupReceipt 'result.state') -in $terminalStates) { break }
                     Start-Sleep -Milliseconds 250
@@ -404,7 +433,7 @@ function Invoke-EmergencyCleanup {
             catch { $Warnings.Add("Task-owned screenshot cleanup failed: $($_.Exception.Message)") }
         }
         try {
-            $status = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{ action = 'qualification_status'; expectedBuildId = $script:expectedBuildId }) -TimeoutSeconds 5 -AllowSemanticFailure
+            $status = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{ action = 'qualification_status'; expectedBuildId = $script:expectedBuildId }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000) -AllowSemanticFailure
             Assert-CleanupReceipt $status 'Qualification cleanup status' -RequireCSXProducer
             $transitionId = Get-CSXPathValue $status 'qualification.transitionId' (Get-CSXPropertyValue $status 'transitionId')
             $transitionOwnerId = [string](Get-CSXPathValue $status 'qualification.ownerId')
@@ -412,20 +441,20 @@ function Invoke-EmergencyCleanup {
                 $cancelReceipt = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{
                     action = 'qualification_cancel'; transitionId = [uint64]$transitionId
                     ownerId = $script:runId; expectedBuildId = $script:expectedBuildId
-                }) -TimeoutSeconds 5 -AllowSemanticFailure
+                }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000) -AllowSemanticFailure
                 Assert-CleanupReceipt $cancelReceipt 'Qualification cancellation' -RequireCSXProducer
             }
         }
         catch { $Warnings.Add("Task-owned qualification cleanup failed: $($_.Exception.Message)") }
 
         try {
-            $trace = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{ action = 'dlss_trace_status'; expectedBuildId = $script:expectedBuildId }) -TimeoutSeconds 5 -AllowSemanticFailure
+            $trace = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{ action = 'dlss_trace_status'; expectedBuildId = $script:expectedBuildId }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000) -AllowSemanticFailure
             Assert-CleanupReceipt $trace 'DLSS trace cleanup status' -RequireCSXProducer
             if ($script:ownedTraceSessionId -ne 0 -and [bool](Get-CSXPathValue $trace 'capture.active' $false) -and
                 [uint64](Get-CSXPathValue $trace 'capture.sessionID' 0) -eq [uint64]$script:ownedTraceSessionId) {
                 $traceStop = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{
                     action = 'dlss_trace_stop'; expectedSessionId = [uint64]$script:ownedTraceSessionId; expectedBuildId = $script:expectedBuildId
-                }) -TimeoutSeconds 5 -AllowSemanticFailure
+                }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000) -AllowSemanticFailure
                 Assert-CleanupReceipt $traceStop 'DLSS trace cleanup stop' -RequireCSXProducer
             }
             elseif ($script:traceStartUncertain) { $Warnings.Add('DLSS trace start outcome is uncertain; cleanup did not stop an unproven global trace session.') }
@@ -433,13 +462,13 @@ function Invoke-EmergencyCleanup {
         catch { $Warnings.Add("Task-owned DLSS trace cleanup failed: $($_.Exception.Message)") }
 
         try {
-            $cpuStatus = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{ action = 'status'; expectedBuildId = $script:expectedBuildId }) -TimeoutSeconds 5 -AllowSemanticFailure
+            $cpuStatus = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{ action = 'status'; expectedBuildId = $script:expectedBuildId }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000) -AllowSemanticFailure
             Assert-CleanupReceipt $cpuStatus 'CPU cleanup status' -RequireCSXProducer
             if ($script:ownedCpuSessionId -ne 0 -and [bool](Get-CSXPathValue $cpuStatus 'status.cpuPerformance.active' $false) -and
                 [uint64](Get-CSXPathValue $cpuStatus 'status.cpuPerformance.sessionId' 0) -eq [uint64]$script:ownedCpuSessionId) {
                 $cpuStop = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{
                     action = 'cpu_performance_stop'; expectedSessionId = [uint64]$script:ownedCpuSessionId; expectedBuildId = $script:expectedBuildId
-                }) -TimeoutSeconds 5 -AllowSemanticFailure
+                }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000) -AllowSemanticFailure
                 Assert-CleanupReceipt $cpuStop 'CPU cleanup stop' -RequireCSXProducer
                 if ([uint64](Get-CSXPathValue $cpuStop 'cpuPerformance.sessionId' 0) -ne [uint64]$script:ownedCpuSessionId -or
                     [bool](Get-CSXPathValue $cpuStop 'cpuPerformance.active' $true)) {
@@ -451,13 +480,13 @@ function Invoke-EmergencyCleanup {
         catch { $Warnings.Add("Task-owned CPU cleanup failed: $($_.Exception.Message)") }
 
         try {
-            $stressStatus = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{ action = 'status'; expectedBuildId = $script:expectedBuildId }) -TimeoutSeconds 5 -AllowSemanticFailure
+            $stressStatus = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{ action = 'status'; expectedBuildId = $script:expectedBuildId }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000) -AllowSemanticFailure
             Assert-CleanupReceipt $stressStatus 'Stress cleanup status' -RequireCSXProducer
             if ($script:ownedStressSessionId -ne 0 -and [bool](Get-CSXPathValue $stressStatus 'status.session.active' $false) -and
                 [uint64](Get-CSXPathValue $stressStatus 'status.session.id' 0) -eq [uint64]$script:ownedStressSessionId) {
                 $stressStop = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{
                     action = 'stop'; expectedSessionId = [uint64]$script:ownedStressSessionId; expectedBuildId = $script:expectedBuildId
-                }) -TimeoutSeconds 5 -AllowSemanticFailure
+                }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000) -AllowSemanticFailure
                 Assert-CleanupReceipt $stressStop 'Stress cleanup stop' -RequireCSXProducer
                 if ([uint64](Get-CSXPathValue $stressStop 'status.session.id' 0) -ne [uint64]$script:ownedStressSessionId -or
                     [bool](Get-CSXPathValue $stressStop 'status.session.active' $true)) {
@@ -469,12 +498,12 @@ function Invoke-EmergencyCleanup {
         catch { $Warnings.Add("Task-owned stress cleanup failed: $($_.Exception.Message)") }
 
         try {
-            $postQualification = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{ action = 'qualification_status'; expectedBuildId = $script:expectedBuildId }) -TimeoutSeconds 5 -AllowSemanticFailure
-            $postTrace = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{ action = 'dlss_trace_status'; expectedBuildId = $script:expectedBuildId }) -TimeoutSeconds 5 -AllowSemanticFailure
-            $postRender = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{ action = 'status'; expectedBuildId = $script:expectedBuildId }) -TimeoutSeconds 5 -AllowSemanticFailure
+            $postQualification = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{ action = 'qualification_status'; expectedBuildId = $script:expectedBuildId }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000) -AllowSemanticFailure
+            $postTrace = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{ action = 'dlss_trace_status'; expectedBuildId = $script:expectedBuildId }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000) -AllowSemanticFailure
+            $postRender = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.renderscale' -Arguments ([ordered]@{ action = 'status'; expectedBuildId = $script:expectedBuildId }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000) -AllowSemanticFailure
             $postScreenshot = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'communityshaders.screenshot' -Arguments ([ordered]@{
                 contractMajor = 1; clientId = 'csx-render-scale-qualification-cleanup'; commandId = "$($script:runId)-cleanup-final-screenshot-status"; action = 'status'
-            }) -TimeoutSeconds 5 -AllowSemanticFailure
+            }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000) -AllowSemanticFailure
             Assert-CleanupReceipt $postQualification 'Qualification cleanup postcondition' -RequireCSXProducer
             Assert-CleanupReceipt $postTrace 'DLSS trace cleanup postcondition' -RequireCSXProducer
             Assert-CleanupReceipt $postRender 'Diagnostic cleanup postcondition' -RequireCSXProducer
@@ -1613,6 +1642,7 @@ try {
     }
     if ($script:resultDeadlineUtc -le [DateTimeOffset]::UtcNow) { throw 'The complete qualification result deadline already elapsed.' }
     $timeEvidence.resultDeadlineUtc = $script:resultDeadlineUtc.ToString('o')
+    Assert-CSXResultBudget -Stage 'qualification admission' -ReserveMs ([int]$script:protocol.timeBudget.evidenceFinalizationMs)
     if ($PrMode -and [bool]$script:protocol.thresholds.prBaselineRequired -and
         ([string]::IsNullOrWhiteSpace($BaselinePath) -or [string]::IsNullOrWhiteSpace($ExpectedBaselineBuildId))) {
         throw 'PR mode requires a matching baseline artifact and explicit baseline Build ID.'
@@ -1627,8 +1657,10 @@ try {
     $bindingDirectory = Join-Path $script:evidenceRoot 'binding'
     $arguments = @('list', '-RuntimePath', $runtimeFull, '-ExpectedBuildId', $script:expectedBuildId, '-EvidenceDirectory', $bindingDirectory, '-EvidenceLabel', 'render-scale-qualification', '-NoExit', '-Compact')
     if (-not [string]::IsNullOrWhiteSpace($ExpectedArtifactSha256)) { $arguments += @('-ExpectedArtifactSha256', $ExpectedArtifactSha256.ToLowerInvariant()) }
+    Assert-CSXResultBudget -Stage 'runtime binding' -ReserveMs ([int]$script:protocol.timeBudget.evidenceFinalizationMs)
     $bindingRaw = & $controller @arguments 2>&1
     $runtimeBinding = ($bindingRaw -join "`n") | ConvertFrom-Json -Depth 100
+    Assert-CSXResultBudget -Stage 'post-binding admission' -ReserveMs ([int]$script:protocol.timeBudget.evidenceFinalizationMs)
     Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'binding\authoritative-list.json') -Value $runtimeBinding | Out-Null
     if (-not [bool]$runtimeBinding.ok) { throw "Exact DevBench runtime binding failed: $($runtimeBinding.errors -join ' ')" }
     $script:bindingIdentity = Get-CSXPropertyValue $runtimeBinding 'runtimeIdentity'
@@ -1660,7 +1692,13 @@ try {
         Copy-Item -LiteralPath $assetBinding.source -Destination $assetBinding.destination
         if ((Get-CSXFileSha256 $assetBinding.destination) -ne $assetBinding.sha256) { throw "The copied automated visual-review $($assetBinding.label) hash changed." }
     }
-    $visualProviderPreflight = Get-CSXCodexVisualReviewProviderPreflight -CodexExecutable $CodexExecutable
+    $providerBudgetMs = Get-CSXResultRemainingMilliseconds -ReserveMs ([int]$script:protocol.timeBudget.evidenceFinalizationMs)
+    if ($providerBudgetMs -lt 1300) { throw 'The complete qualification result deadline cannot accommodate provider preflight.' }
+    $providerCommandTimeoutMs = [int][Math]::Min(5000, [Math]::Max(100, [Math]::Floor(($providerBudgetMs - 1000) / 3.0)))
+    $providerProbeTimeoutMs = [int][Math]::Min(30000, [Math]::Max(1000, $providerBudgetMs - (3 * $providerCommandTimeoutMs)))
+    $visualProviderPreflight = Get-CSXCodexVisualReviewProviderPreflight -CodexExecutable $CodexExecutable `
+        -CommandTimeoutMilliseconds $providerCommandTimeoutMs -ModelProbeTimeoutMilliseconds $providerProbeTimeoutMs
+    Assert-CSXResultBudget -Stage 'post-provider admission' -ReserveMs ([int]$script:protocol.timeBudget.evidenceFinalizationMs)
     Write-CSXJsonFile -Path (Join-Path $reviewRoot 'preflight.json') -Value $visualProviderPreflight | Out-Null
     if (-not [bool]$visualProviderPreflight.ok) {
         throw "Codex visual-review provider preflight failed: $(@($visualProviderPreflight.errors) -join ' | ')"
@@ -2017,6 +2055,8 @@ try {
 
     $script:phase = 'visual_evaluation'
     $remainingOrchestrationMs = [int]$script:protocol.timeBudget.orchestrationMs - [int][Math]::Ceiling($script:orchestrationWatch.Elapsed.TotalMilliseconds)
+    $remainingResultWorkMs = Get-CSXResultRemainingMilliseconds -ReserveMs ([int]$script:protocol.timeBudget.evidenceFinalizationMs)
+    $remainingOrchestrationMs = [Math]::Min($remainingOrchestrationMs, $remainingResultWorkMs)
     $evaluationBudgetMs = [int]$script:protocol.timeBudget.visualEvaluationMs
     if ($remainingOrchestrationMs -lt $evaluationBudgetMs) { throw 'The exact 90-second unattended visual-evaluation allocation no longer fits inside the orchestration deadline.' }
     $evaluationDeadlineSeconds = [int]($evaluationBudgetMs / 1000)
@@ -2054,7 +2094,7 @@ try {
     $rawPath = Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'run.raw.json') -Value $raw
     $review = New-CSXAutomatedVisualReview -EvidenceDirectory $script:evidenceRoot -RunRaw $raw -VisualIndex $visualIndex -BaselineVisualIndex $baselineIndex
     Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'visual-review.json') -Value $review | Out-Null
-    $updated = Update-CSXQualificationReport -EvidenceDirectory $script:evidenceRoot
+    $updated = Update-CSXQualificationReport -EvidenceDirectory $script:evidenceRoot -AllowUnsealedSuccess
     $timeEvidence.evidenceFinalizationElapsedMs = [Math]::Round($finalizationWatch.Elapsed.TotalMilliseconds, 3)
     $timeEvidence.invocationElapsedMs = [Math]::Round($script:invocationWatch.Elapsed.TotalMilliseconds, 3)
     $timeEvidence.completedUtc = [DateTimeOffset]::UtcNow.ToString('o')
@@ -2068,7 +2108,7 @@ try {
     $rawPath = Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'run.raw.json') -Value $raw
     $review = New-CSXAutomatedVisualReview -EvidenceDirectory $script:evidenceRoot -RunRaw $raw -VisualIndex $visualIndex -BaselineVisualIndex $baselineIndex
     Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'visual-review.json') -Value $review | Out-Null
-    $updated = Update-CSXQualificationReport -EvidenceDirectory $script:evidenceRoot
+    $updated = Update-CSXQualificationReport -EvidenceDirectory $script:evidenceRoot -AllowUnsealedSuccess
     $completionUtc = [DateTimeOffset]::UtcNow
     $completionElapsedMs = [Math]::Round($script:invocationWatch.Elapsed.TotalMilliseconds, 3)
     if ($completionElapsedMs -gt [double]$script:protocol.timeBudget.endToEndMs -or
@@ -2097,6 +2137,7 @@ try {
         throw 'The qualification completion receipt crossed its complete invocation or evidence-finalization deadline.'
     }
     $finalizationWatch.Stop()
+    $updated = Update-CSXQualificationReport -EvidenceDirectory $script:evidenceRoot
     $result = [pscustomobject][ordered]@{
         ok = [string]$updated.report.status -in @('PASS', 'LOCAL_PASS'); status = $updated.report.status
         runPath = $updated.runPath; summaryPath = $updated.summaryPath; reviewPath = (Join-Path $script:evidenceRoot 'visual-review.json')
@@ -2142,7 +2183,7 @@ catch {
             automatedGates = [pscustomobject][ordered]@{ passed = $false; failures = @($failures); infrastructureErrors = @($infrastructureFailures) }; warnings = @($warnings | Select-Object -Unique)
         }
         Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'run.raw.json') -Value $raw | Out-Null
-        $updated = Update-CSXQualificationReport -EvidenceDirectory $script:evidenceRoot
+        $updated = Update-CSXQualificationReport -EvidenceDirectory $script:evidenceRoot -AllowUnsealedSuccess
         $result = [pscustomobject][ordered]@{ ok = $false; status = $updated.report.status; runPath = $updated.runPath; summaryPath = $updated.summaryPath; reviewPath = $null; errors = @($updated.report.errors) }
     }
     catch { $result = [pscustomobject][ordered]@{ ok = $false; status = 'INFRASTRUCTURE_ERROR'; runPath = $null; summaryPath = $null; reviewPath = $null; errors = @($failures) + @($infrastructureFailures) + @("Evidence finalization failed: $($_.Exception.Message)") } } }
