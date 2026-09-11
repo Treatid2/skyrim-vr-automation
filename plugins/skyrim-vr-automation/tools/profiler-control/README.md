@@ -18,6 +18,12 @@ pre-state: it restores the exact profiler state when the same runtime survives,
 or terminally records that the old process was replaced without toggling the
 new process.
 
+Capture evidence and recovery evidence have separate failure domains. Normal
+samples write beneath the requested run directory, while status and restoration
+calls in the recovery reserve write beneath the authoritative control root.
+Losing the optional run directory therefore remains an explicit evidence error
+without preventing identity-bound restoration of the surviving runtime.
+
 ```powershell
 .\Measure-CSXProfiler.ps1 `
   -Label 'breezehome-enabled' `

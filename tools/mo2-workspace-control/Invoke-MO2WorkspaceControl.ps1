@@ -41,7 +41,7 @@ param(
     [long]$MaxProfileBytes = 34359738368,
     [ValidateRange(5, 600)]
     [int]$TreeOperationTimeoutSeconds = 120,
-    [ValidateSet('', 'selected-profile-before-cas', 'tree-operation-deadline', 'owner-marker-before-claim', 'resume-interrupt-after-output-rearm')]
+    [ValidateSet('', 'selected-profile-before-cas', 'tree-operation-deadline', 'owner-marker-before-claim', 'resume-interrupt-after-output-rearm', 'resume-rearm-fail-with-rollback-failure', 'resume-recovery-interrupt-after-owner-release')]
     [string]$InternalTestFailurePoint = '',
     [switch]$Compact,
     [switch]$NoExit
@@ -809,7 +809,7 @@ function Undo-RearmedWorkspaceRuntimeOutput($Config, $Workspace, $Output) {
     return @($errors)
 }
 
-function Undo-JournaledRuntimeOutputRearm($Config, [string]$WorkspaceId, [string]$OwnershipId, $Rearm) {
+function Undo-JournaledRuntimeOutputRearm($Config, [string]$WorkspaceId, [string]$OwnershipId, $Rearm, $Journal, [string]$JournalPath) {
     $overwriteRoot = [IO.Path]::GetFullPath([string]$Config.mo2.overwriteDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar)
     $overwritePath = [IO.Path]::GetFullPath([string]$Rearm['overwritePath']).TrimEnd([IO.Path]::DirectorySeparatorChar)
     if (-not (Test-WorkspaceSamePath $overwritePath $overwriteRoot)) { throw 'Runtime-output rearm targets a different MO2 Overwrite root.' }
@@ -820,29 +820,47 @@ function Undo-JournaledRuntimeOutputRearm($Config, [string]$WorkspaceId, [string
     $markerExists = Test-Path -LiteralPath $markerPath -PathType Leaf
     $receiptPath = Join-Path $evidenceRoot 'shader-cache-transaction.receipt.json'
     $snapshotExists = Test-Path -LiteralPath $receiptPath -PathType Leaf
+    $rearmState = [string]$Rearm['state']
+    $ownerReleaseAuthorized = $rearmState -in @('owner-release-authorized', 'owner-released', 'rolled-back')
     if (-not $markerExists) {
-        if ($snapshotExists -or [string]$Rearm['state'] -cne 'prepared') {
+        if ($ownerReleaseAuthorized) {
+            $Rearm['state'] = 'owner-released'
+            $Rearm['ownerReleasedUtc'] = [DateTime]::UtcNow.ToString('o')
+            $Journal['runtimeOutputRearm'] = $Rearm
+            Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
+            return
+        }
+        if ($snapshotExists -or $rearmState -cne 'prepared') {
             throw 'Interrupted runtime-output rearm lost its owner marker after mutation began.'
         }
         return
     }
     $null = Assert-WorkspaceOutputOwnerMarker -Path $markerPath -ExpectedSha256 ([string]$Rearm['ownerMarkerSha256']) -WorkspaceId $WorkspaceId -OwnershipId $OwnershipId -OverwritePath $overwriteRoot
-    if ($snapshotExists) {
+    if (-not $ownerReleaseAuthorized -and $snapshotExists) {
         $transactionTool = Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'
         $blockingProcessNames = @(Get-WorkspaceBlockingProcessNames -Config $Config)
         $restored = & $transactionTool restore -CachePath $backupPath -RelativeCachePath 'backup' -EvidenceDirectory $evidenceRoot -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
         if (-not $restored.ok) { throw "Interrupted runtime-output rearm backup recovery failed: $($restored.errors -join '; ')" }
     }
-    if (-not [bool]$Rearm['backupPathExistedBefore'] -and (Test-Path -LiteralPath $backupPath)) {
+    if (-not $ownerReleaseAuthorized -and -not [bool]$Rearm['backupPathExistedBefore'] -and (Test-Path -LiteralPath $backupPath)) {
         $null = Assert-WorkspaceOutputOwnerMarker -Path $markerPath -ExpectedSha256 ([string]$Rearm['ownerMarkerSha256']) -WorkspaceId $WorkspaceId -OwnershipId $OwnershipId -OverwritePath $overwriteRoot
         Remove-WorkspaceCreatedOutputTree -Path $backupPath -OverwritePath $overwriteRoot -Purpose 'Interrupted rearmed backup tree'
     }
-    if (-not [bool]$Rearm['cachePathExistedBefore'] -and (Test-Path -LiteralPath $cachePath)) {
+    if (-not $ownerReleaseAuthorized -and -not [bool]$Rearm['cachePathExistedBefore'] -and (Test-Path -LiteralPath $cachePath)) {
         $null = Assert-WorkspaceOutputOwnerMarker -Path $markerPath -ExpectedSha256 ([string]$Rearm['ownerMarkerSha256']) -WorkspaceId $WorkspaceId -OwnershipId $OwnershipId -OverwritePath $overwriteRoot
         Remove-WorkspaceCreatedOutputTree -Path $cachePath -OverwritePath $overwriteRoot -Purpose 'Interrupted rearmed ShaderCache tree'
     }
     $null = Assert-WorkspaceOutputOwnerMarker -Path $markerPath -ExpectedSha256 ([string]$Rearm['ownerMarkerSha256']) -WorkspaceId $WorkspaceId -OwnershipId $OwnershipId -OverwritePath $overwriteRoot
+    $Rearm['state'] = 'owner-release-authorized'
+    $Rearm['ownerReleaseAuthorizedUtc'] = [DateTime]::UtcNow.ToString('o')
+    $Journal['runtimeOutputRearm'] = $Rearm
+    Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
     Remove-Item -LiteralPath $markerPath -Force
+    if ($InternalTestFailurePoint -eq 'resume-recovery-interrupt-after-owner-release') { exit 92 }
+    $Rearm['state'] = 'owner-released'
+    $Rearm['ownerReleasedUtc'] = [DateTime]::UtcNow.ToString('o')
+    $Journal['runtimeOutputRearm'] = $Rearm
+    Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
 }
 
 function New-RearmedWorkspaceRuntimeOutput($Config, $Workspace, [string]$OperationId, $Journal, [string]$JournalPath) {
@@ -921,6 +939,10 @@ function New-RearmedWorkspaceRuntimeOutput($Config, $Workspace, [string]$Operati
         $backupSnapshotted = $true
         $Journal.runtimeOutputRearm.state = 'backup-snapshotted'
         Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
+        if ($InternalTestFailurePoint -eq 'resume-rearm-fail-with-rollback-failure') {
+            'partial-rearm-mutation' | Set-Content -LiteralPath (Join-Path $backupPath 'rollback-fixture.bin') -Encoding utf8
+            throw 'Fixture failure after partial runtime-output mutation.'
+        }
         $backupProviders = & $transactionTool providers -ProfilePath $modListPath -ModsPath $modsRoot -RelativeCachePath 'backup' -DeepInventory -IncludeInventoryEntries -NoExit -Confirm:$false | ConvertFrom-Json
         if (-not $backupProviders.ok) { throw "Could not inspect the task profile's backup providers: $($backupProviders.errors -join '; ')" }
         $backupShadow = Copy-WorkspaceProviderTreeShadow -ProviderResult $backupProviders -TargetPath $backupPath -RelativePath 'backup' -Purpose 'MO2 Overwrite backup provider union'
@@ -975,20 +997,41 @@ function New-RearmedWorkspaceRuntimeOutput($Config, $Workspace, [string]$Operati
         $rollbackErrors = [Collections.Generic.List[string]]::new()
         if ($backupSnapshotted) {
             try {
+                if ($InternalTestFailurePoint -eq 'resume-rearm-fail-with-rollback-failure') { throw 'Fixture backup restore failure.' }
                 $restored = & $transactionTool restore -CachePath $backupPath -RelativeCachePath 'backup' -EvidenceDirectory $backupEvidence -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
                 if (-not $restored.ok) { throw ($restored.errors -join '; ') }
             }
             catch { $rollbackErrors.Add("backup: $($_.Exception.Message)") }
         }
-        if ($markerCreated) {
+        if ($markerCreated -and $rollbackErrors.Count -eq 0) {
             try {
                 if (-not $backupExisted) { Remove-WorkspaceCreatedOutputTree -Path $backupPath -OverwritePath $overwritePath -Purpose 'Failed rearmed backup tree' }
                 if (-not $cacheExisted) { Remove-WorkspaceCreatedOutputTree -Path $cachePath -OverwritePath $overwritePath -Purpose 'Failed rearmed ShaderCache tree' }
+                $Journal.runtimeOutputRearm.state = 'owner-release-authorized'
+                $Journal.runtimeOutputRearm | Add-Member -NotePropertyName ownerReleaseAuthorizedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
+                Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
                 Remove-Item -LiteralPath $markerPath -Force
+                $Journal.runtimeOutputRearm.state = 'owner-released'
+                $Journal.runtimeOutputRearm | Add-Member -NotePropertyName ownerReleasedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
+                Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
             }
             catch { $rollbackErrors.Add("owner output: $($_.Exception.Message)") }
         }
-        if ($rollbackErrors.Count -gt 0) { throw "Runtime-output rearm failed and rollback requires recovery. $failure Rollback: $($rollbackErrors -join '; ')" }
+        if ($rollbackErrors.Count -gt 0) {
+            if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
+                $Journal.runtimeOutputRearm.state = 'recovery-required'
+            }
+            elseif ([string]$Journal.runtimeOutputRearm.state -eq 'owner-release-authorized') {
+                $Journal.runtimeOutputRearm.state = 'owner-released'
+            }
+            $Journal.runtimeOutputRearm | Add-Member -NotePropertyName rollback -NotePropertyValue ([pscustomobject][ordered]@{ verified = $false; errors = @($rollbackErrors); attemptedUtc = [DateTime]::UtcNow.ToString('o') }) -Force
+            try { Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal }
+            catch { $rollbackErrors.Add("journal: $($_.Exception.Message)") }
+            throw "Runtime-output rearm failed and rollback requires recovery. $failure Rollback: $($rollbackErrors -join '; ')"
+        }
+        $Journal.runtimeOutputRearm.state = 'rolled-back'
+        $Journal.runtimeOutputRearm | Add-Member -NotePropertyName rollback -NotePropertyValue ([pscustomobject][ordered]@{ verified = $true; errors = @(); completedUtc = [DateTime]::UtcNow.ToString('o') }) -Force
+        Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
         throw "Runtime-output rearm failed and was rolled back. $failure"
     }
 }
@@ -1458,7 +1501,7 @@ function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
     }
 
     if ($operation -eq 'resume' -and $journal.ContainsKey('runtimeOutputRearm') -and $null -ne $journal['runtimeOutputRearm']) {
-        Undo-JournaledRuntimeOutputRearm -Config $Config -WorkspaceId ([string]$journal['workspaceId']) -OwnershipId ([string]$journal['ownershipId']) -Rearm $journal['runtimeOutputRearm']
+        Undo-JournaledRuntimeOutputRearm -Config $Config -WorkspaceId ([string]$journal['workspaceId']) -OwnershipId ([string]$journal['ownershipId']) -Rearm $journal['runtimeOutputRearm'] -Journal $journal -JournalPath $JournalPath
     }
 
     if ($operation -eq 'retire') {
@@ -2490,9 +2533,21 @@ try {
                 catch {
                     $failure = $_.Exception.Message; $rollbackErrors = @()
                     if ($rearmedOutput) {
-                        foreach ($outputRollbackError in @(Undo-RearmedWorkspaceRuntimeOutput -Config $config -Workspace $current -Output $rearmedOutput)) {
-                            $rollbackErrors += "runtime-output: $outputRollbackError"
+                        $resumeJournal = $null
+                        try {
+                            $resumeJournal = $journal | ConvertTo-Json -Depth 80 | ConvertFrom-Json -AsHashtable -Depth 80
+                            Undo-JournaledRuntimeOutputRearm -Config $config -WorkspaceId ([string]$current.data.workspaceId) -OwnershipId ([string]$current.data.ownershipId) -Rearm $resumeJournal['runtimeOutputRearm'] -Journal $resumeJournal -JournalPath $journalPath
                         }
+                        catch { $rollbackErrors += "runtime-output: $($_.Exception.Message)" }
+                        finally {
+                            if ($resumeJournal) { $journal = $resumeJournal | ConvertTo-Json -Depth 80 | ConvertFrom-Json -Depth 80 }
+                        }
+                    }
+                    elseif ($journal.runtimeOutputRearm -and [string]$journal.runtimeOutputRearm.state -eq 'recovery-required') {
+                        [object[]]$childRollbackErrors = @()
+                        if ($journal.runtimeOutputRearm.PSObject.Properties['rollback'] -and $journal.runtimeOutputRearm.rollback) { $childRollbackErrors = @($journal.runtimeOutputRearm.rollback.errors) }
+                        if ($childRollbackErrors.Count -eq 0) { $rollbackErrors += 'runtime-output: nested rollback requires recovery' }
+                        else { foreach ($outputRollbackError in $childRollbackErrors) { $rollbackErrors += "runtime-output: $outputRollbackError" } }
                     }
                     try { Write-WorkspaceBytesAtomic -Path $current.path -Bytes $manifestPreimage } catch { $rollbackErrors += "manifest: $($_.Exception.Message)" }
                     if ($selection) {

@@ -51,6 +51,8 @@ $runtimeIdentity = $null
 $transportRetries = [Collections.Generic.List[object]]::new()
 $invocationEvidencePath = $null
 $invocationRecord = $null
+$data = $null
+$semantic = $null
 $operationDeadlineUtc = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 Import-Module (Join-Path $PSScriptRoot 'DevBenchControl.psm1') -Force
 
@@ -787,6 +789,10 @@ try {
     $result = [pscustomobject][ordered]@{
         ok = -not $semanticFailure
         transportOk = $true
+        state = $(if ($semanticFailure) { 'semantic-failed' } else { 'completed' })
+        indeterminate = $false
+        dispatchReached = [bool]($Command -eq 'call')
+        acceptedDataRetained = [bool]($Command -eq 'call' -and $null -ne $data)
         command = $Command
         endpoint = $endpoint
         timestampUtc = [DateTime]::UtcNow.ToString('o')
@@ -803,23 +809,28 @@ try {
 catch {
     $failureMessage = $_.Exception.Message
     $indeterminateMutation = [bool]$_.Exception.Data['DevBenchIndeterminateMutation']
+    $dispatchReached = [bool]($invocationRecord -and -not [string]::IsNullOrWhiteSpace([string]$invocationRecord.dispatchedUtc))
+    $acceptedDataRetained = [bool]($dispatchReached -and $null -ne $data)
+    $outcomeIndeterminate = [bool]($indeterminateMutation -or ((-not $readOnlyCall) -and $dispatchReached -and -not $acceptedDataRetained))
     if ($invocationRecord -and $invocationRecord.state -ne 'guard-rejected') {
-        try { Update-InvocationEvidence -State $(if ($indeterminateMutation) { 'indeterminate' } else { 'failed' }) -Errors @($failureMessage) } catch { $failureMessage = "$failureMessage Evidence update also failed: $($_.Exception.Message)" }
+        try { Update-InvocationEvidence -State $(if ($outcomeIndeterminate) { 'indeterminate' } else { 'failed' }) -Semantic $semantic -Data $data -Errors @($failureMessage) } catch { $failureMessage = "$failureMessage Evidence update also failed: $($_.Exception.Message)" }
     }
     $result = [pscustomobject][ordered]@{
         ok = $false
-        transportOk = $false
-        state = if ($indeterminateMutation) { 'indeterminate-mutation' } else { 'failed' }
-        indeterminate = $indeterminateMutation
+        transportOk = $acceptedDataRetained
+        state = if ($indeterminateMutation) { 'indeterminate-mutation' } elseif ($acceptedDataRetained) { 'post-dispatch-evidence-failed' } else { 'failed' }
+        indeterminate = $outcomeIndeterminate
+        dispatchReached = $dispatchReached
+        acceptedDataRetained = $acceptedDataRetained
         command = $Command
         endpoint = $endpoint
         timestampUtc = [DateTime]::UtcNow.ToString('o')
         runtimeIdentity = $runtimeIdentity
         evidencePath = $invocationEvidencePath
         invocationEvidencePath = $invocationEvidencePath
-        semantic = $null
+        semantic = $semantic
         transportRetries = @($transportRetries)
-        data = $null
+        data = $data
         errors = @($failureMessage)
     }
 }

@@ -776,7 +776,7 @@ function Get-MO2OverwriteWorkspaceIsolation {
     if ($null -ne $plan -and $null -ne $cacheProviders -and $null -ne $cacheInventory) {
         $binding = if ($plan.PSObject.Properties['cacheBinding']) { $plan.cacheBinding } else { $null }
         $bindingComplete = $null -ne $binding
-        foreach ($requiredBindingField in @('mode', 'profilePath', 'modsPath', 'overwriteRoot', 'cachePath', 'profileSha256', 'workspaceId', 'ownershipId', 'ownerMarkerPath', 'ownerMarkerSha256', 'communityShadersPlugin')) {
+        foreach ($requiredBindingField in @('mode', 'profilePath', 'modsPath', 'overwriteRoot', 'cachePath', 'relativeCachePath', 'profileSha256', 'workspaceId', 'ownershipId', 'ownerMarkerPath', 'ownerMarkerSha256', 'communityShadersPlugin')) {
             if ($bindingComplete -and -not $binding.PSObject.Properties[$requiredBindingField]) { $bindingComplete = $false }
         }
         $completionExists = Test-Path -LiteralPath $completionPath -PathType Leaf
@@ -786,6 +786,7 @@ function Get-MO2OverwriteWorkspaceIsolation {
             (Test-MO2SamePath ([string]$binding.modsPath) $modsRoot) -and
             (Test-MO2SamePath ([string]$binding.overwriteRoot) $overwriteRoot) -and
             (Test-MO2SamePath ([string]$binding.cachePath) $expectedCachePath) -and
+            [string]$binding.relativeCachePath -ceq 'ShaderCache' -and
             [string]$binding.profileSha256 -ceq [string]$cacheProviders.data.profileSha256 -and
             [string]$binding.workspaceId -ceq [string]$manifest.workspaceId -and
             [string]$binding.ownershipId -ceq [string]$manifest.ownershipId -and

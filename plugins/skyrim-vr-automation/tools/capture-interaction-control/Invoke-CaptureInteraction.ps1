@@ -85,7 +85,11 @@ function Invoke-DevBench([string]$Tool, [hashtable]$Arguments, [string]$Runtime,
     if ($SkipRuntimeIdentityVerification) { $parameters['SkipRuntimeIdentityVerification'] = $true }
     $raw = & $DevBenchScriptPath call @parameters
     $response = $raw | ConvertFrom-Json -Depth 100
-    if (-not $response.ok) { throw "DevBench tool '$Tool' failed: $(@($response.errors) -join '; ')" }
+    if (-not $response.ok) {
+        $failure = [InvalidOperationException]::new("DevBench tool '$Tool' failed: $(@($response.errors) -join '; ')")
+        $failure.Data['DevBenchResponse'] = $response
+        throw $failure
+    }
     $content = @($response.data.content)
     if ($content.Count -lt 1) { throw "DevBench tool '$Tool' returned no content." }
     return [pscustomobject][ordered]@{ value = $content[0]; envelope = $response }
@@ -215,6 +219,7 @@ function Add-ActionLog($State, $Entry) {
 
 function Invoke-CaptureStartupCleanup($Recovery) {
     $errors = [Collections.Generic.List[string]]::new()
+    $uncertainties = [Collections.Generic.List[string]]::new()
     $screenshotTerminal = $null
     $recordStop = $null
     if (-not [string]::IsNullOrWhiteSpace([string]$Recovery.screenshotRequestId)) {
@@ -227,16 +232,23 @@ function Invoke-CaptureStartupCleanup($Recovery) {
         }
         catch { $errors.Add("screenshot: $($_.Exception.Message)") }
     }
+    elseif ($Recovery.PSObject.Properties['screenshotOutcomeUncertain'] -and [bool]$Recovery.screenshotOutcomeUncertain) {
+        $uncertainties.Add('Screenshot start was dispatched without a retained accepted request identity; its terminal state is unproven.')
+    }
     if ([bool]$Recovery.recordAccepted) {
         try { $recordStop = (Invoke-DevBench -Tool 'record' -Arguments @{ action = 'stop' } -Runtime ([string]$Recovery.runtimePath) -RequireSuccess).value }
         catch { $errors.Add("record: $($_.Exception.Message)") }
     }
+    elseif ($Recovery.PSObject.Properties['recordOutcomeUncertain'] -and [bool]$Recovery.recordOutcomeUncertain) {
+        $uncertainties.Add('Recording start was dispatched without a retained accepted receipt; its terminal state is unproven.')
+    }
     $Recovery.cleanup = [pscustomobject][ordered]@{
-        state = $(if ($errors.Count -eq 0) { 'verified' } else { 'uncertain' })
+        state = $(if ($errors.Count -eq 0 -and $uncertainties.Count -eq 0) { 'verified' } else { 'uncertain' })
         attemptedUtc = [DateTime]::UtcNow.ToString('o')
         screenshotTerminal = $screenshotTerminal
         recordStop = $recordStop
         errors = @($errors)
+        uncertainties = @($uncertainties)
     }
     if (-not [string]::IsNullOrWhiteSpace([string]$Recovery.receiptPath)) {
         try { Write-JsonAtomic -Path ([string]$Recovery.receiptPath) -Value $Recovery }
@@ -271,13 +283,41 @@ try {
         $framesDirectory = Join-Path $resolvedSessionDirectory 'frames'
         if ($VisualMode -ne 'none') { New-Item -ItemType Directory -Path $framesDirectory -Force | Out-Null }
         $sessionId = [guid]::NewGuid().ToString()
-        $recordCall = Invoke-DevBench -Tool 'record' -Arguments @{ action = 'start'; intervalMs = $RecordIntervalMs; allowNoPlayer = [bool]$AllowNoPlayer; correlationId = $sessionId } -Runtime $RuntimePath -RequireSuccess
         $failureData = [pscustomobject][ordered]@{
             contractVersion = '1.0.0'; operation = 'capture-start-recovery'; sessionId = $sessionId
             runtimePath = [IO.Path]::GetFullPath($RuntimePath); sessionDirectory = $resolvedSessionDirectory
             intendedStatePath = $resolvedStatePath; receiptPath = (Join-Path $resolvedSessionDirectory 'capture-start-recovery.json')
-            recordAccepted = $true; recordStartReceipt = $recordCall.value; screenshotRequestId = $null
-            screenshotStartReceipt = $null; cleanup = $null
+            recordAccepted = $false; recordOutcomeUncertain = $false; recordStartReceipt = $null; recordInvocationEvidencePath = $null
+            screenshotRequestId = $null; screenshotOutcomeUncertain = $false; screenshotStartReceipt = $null; screenshotInvocationEvidencePath = $null
+            cleanup = $null
+        }
+        try {
+            $recordCall = Invoke-DevBench -Tool 'record' -Arguments @{ action = 'start'; intervalMs = $RecordIntervalMs; allowNoPlayer = [bool]$AllowNoPlayer; correlationId = $sessionId } -Runtime $RuntimePath -RequireSuccess
+            $failureData.recordAccepted = $true
+            $failureData.recordStartReceipt = $recordCall.value
+            if ($recordCall.envelope.PSObject.Properties['invocationEvidencePath']) {
+                $failureData.recordInvocationEvidencePath = [string]$recordCall.envelope.invocationEvidencePath
+            }
+        }
+        catch {
+            $recordFailure = $_.Exception.Message
+            $failedResponse = $_.Exception.Data['DevBenchResponse']
+            if ($failedResponse) {
+                if ($failedResponse.PSObject.Properties['invocationEvidencePath']) {
+                    $failureData.recordInvocationEvidencePath = [string]$failedResponse.invocationEvidencePath
+                }
+                [object[]]$retainedRecordContent = @()
+                if ($failedResponse.PSObject.Properties['data'] -and $failedResponse.data -and $failedResponse.data.PSObject.Properties['content']) { $retainedRecordContent = @($failedResponse.data.content) }
+                if ($retainedRecordContent.Count -gt 0 -and $failedResponse.PSObject.Properties['acceptedDataRetained'] -and [bool]$failedResponse.acceptedDataRetained) {
+                    $failureData.recordAccepted = $true
+                    $failureData.recordStartReceipt = $retainedRecordContent[0]
+                }
+                elseif ($failedResponse.PSObject.Properties['dispatchReached'] -and [bool]$failedResponse.dispatchReached) {
+                    $failureData.recordOutcomeUncertain = $true
+                }
+            }
+            $failureData = Invoke-CaptureStartupCleanup -Recovery $failureData
+            throw "Recording start failed; cleanup is '$($failureData.cleanup.state)'. $recordFailure"
         }
         $screenshotState = [pscustomobject][ordered]@{ requestId = $null; startReceipt = $null }
         try {
@@ -303,6 +343,23 @@ try {
         }
         catch {
             $startupFailure = $_.Exception.Message
+            $failedResponse = $_.Exception.Data['DevBenchResponse']
+            if ($failedResponse) {
+                if ($failedResponse.PSObject.Properties['invocationEvidencePath']) {
+                    $failureData.screenshotInvocationEvidencePath = [string]$failedResponse.invocationEvidencePath
+                }
+                [object[]]$retainedScreenshotContent = @()
+                if ($failedResponse.PSObject.Properties['data'] -and $failedResponse.data -and $failedResponse.data.PSObject.Properties['content']) { $retainedScreenshotContent = @($failedResponse.data.content) }
+                [object[]]$retainedReceipt = @()
+                if ($retainedScreenshotContent.Count -gt 0) { $retainedReceipt = @(Find-CaptureInteractionScreenshotReceipt -Value $retainedScreenshotContent | Select-Object -First 1) }
+                if ($retainedReceipt.Count -eq 1 -and -not [string]::IsNullOrWhiteSpace([string]$retainedReceipt[0].requestId)) {
+                    $failureData.screenshotRequestId = [string]$retainedReceipt[0].requestId
+                    $failureData.screenshotStartReceipt = $retainedReceipt[0]
+                }
+                elseif ($failedResponse.PSObject.Properties['dispatchReached'] -and [bool]$failedResponse.dispatchReached) {
+                    $failureData.screenshotOutcomeUncertain = $true
+                }
+            }
             $failureData = Invoke-CaptureStartupCleanup -Recovery $failureData
             throw "Visual capture start failed after recording began; cleanup is '$($failureData.cleanup.state)'. $startupFailure"
         }

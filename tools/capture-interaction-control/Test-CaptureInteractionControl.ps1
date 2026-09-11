@@ -55,6 +55,10 @@ param(
 )
 $argsObject = $ArgumentsJson | ConvertFrom-Json -Depth 80
 [IO.File]::AppendAllText((Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'calls.log'), "$Tool/$($argsObject.action)`n")
+if ($Tool -eq 'record' -and $argsObject.action -eq 'start' -and $env:CAPTURE_INTERACTION_LOSE_RECORD_RESULT -eq '1') {
+  [pscustomobject]@{ok=$false;transportOk=$false;state='indeterminate-mutation';indeterminate=$true;dispatchReached=$true;acceptedDataRetained=$false;invocationEvidencePath='record-start-invocation.json';data=$null;errors=@('fixture lost recording result after dispatch')} | ConvertTo-Json -Depth 20 -Compress
+  return
+}
 if ($Tool -eq 'record' -and $argsObject.action -eq 'stop' -and $env:CAPTURE_INTERACTION_FAIL_CLEANUP -eq '1') {
   [pscustomobject]@{ok=$false;data=$null;errors=@('fixture record stop failure')} | ConvertTo-Json -Compress
   return
@@ -76,6 +80,14 @@ if ($Tool -eq 'communityshaders.screenshot') {
   }
   if ($argsObject.action -in @('sequence_start','capture')) {
     $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='running';terminal=$false}}
+    if ($argsObject.action -eq 'sequence_start' -and $env:CAPTURE_INTERACTION_LOSE_VISUAL_ACCEPTED -eq '1') {
+      [pscustomobject]@{ok=$false;transportOk=$true;state='post-dispatch-evidence-failed';indeterminate=$false;dispatchReached=$true;acceptedDataRetained=$true;invocationEvidencePath='screenshot-start-invocation.json';semantic=[pscustomobject]@{known=$true;ok=$true};data=[pscustomobject]@{content=@($value)};errors=@('fixture final evidence write failed')} | ConvertTo-Json -Depth 30 -Compress
+      return
+    }
+    if ($argsObject.action -eq 'sequence_start' -and $env:CAPTURE_INTERACTION_LOSE_VISUAL_RESULT -eq '1') {
+      [pscustomobject]@{ok=$false;transportOk=$false;state='indeterminate-mutation';indeterminate=$true;dispatchReached=$true;acceptedDataRetained=$false;invocationEvidencePath='screenshot-start-indeterminate.json';data=$null;errors=@('fixture lost screenshot result after dispatch')} | ConvertTo-Json -Depth 20 -Compress
+      return
+    }
     if ($argsObject.action -eq 'sequence_start' -and $env:CAPTURE_INTERACTION_BREAK_SESSION_DIRECTORY) {
       $target = [string]$env:CAPTURE_INTERACTION_BREAK_SESSION_DIRECTORY
       if (Test-Path -LiteralPath $target -PathType Container) { Remove-Item -LiteralPath $target -Recurse -Force }
@@ -122,13 +134,32 @@ else { $value=[pscustomobject]@{ok=$true} }
     $env:CAPTURE_INTERACTION_FAIL_CLEANUP = '1'
     $failedVisualSession = Join-Path $root 'failed-visual-session'
     $failedVisual = & $entry start -SessionDirectory $failedVisualSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 500 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
-    Assert-Test (-not $failedVisual.ok -and $failedVisual.state -eq 'cleanup-uncertain' -and $failedVisual.data.sessionId -and $failedVisual.data.recordAccepted -and $failedVisual.data.cleanup.errors.Count -eq 1) 'visual-start failure returns recording identity and truthful uncertain cleanup evidence'
+    Assert-Test (-not $failedVisual.ok -and $failedVisual.state -eq 'cleanup-uncertain' -and $failedVisual.data.sessionId -and $failedVisual.data.recordAccepted -and $failedVisual.data.cleanup.errors.Count -eq 1) "visual-start failure returns recording identity and truthful uncertain cleanup evidence: $($failedVisual | ConvertTo-Json -Depth 20 -Compress)"
     Remove-Item Env:CAPTURE_INTERACTION_FAIL_VISUAL_START -ErrorAction SilentlyContinue
 
     $failedStateSession = Join-Path $root 'failed-state-session'
     $env:CAPTURE_INTERACTION_BREAK_SESSION_DIRECTORY = $failedStateSession
     $failedState = & $entry start -SessionDirectory $failedStateSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 500 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test (-not $failedState.ok -and $failedState.state -eq 'cleanup-uncertain' -and $failedState.data.screenshotRequestId -eq 'req-1' -and $failedState.data.cleanup.errors.Count -ge 2) 'state-persistence failure returns screenshot and recording recovery identities when cleanup also fails'
+
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_CLEANUP -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_BREAK_SESSION_DIRECTORY -ErrorAction SilentlyContinue
+    $env:CAPTURE_INTERACTION_LOSE_VISUAL_ACCEPTED = '1'
+    $lostAcceptedSession = Join-Path $root 'lost-accepted-visual-session'
+    $lostAccepted = & $entry start -SessionDirectory $lostAcceptedSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 500 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test (-not $lostAccepted.ok -and $lostAccepted.state -eq 'tool-error' -and $lostAccepted.data.screenshotRequestId -eq 'req-1' -and $lostAccepted.data.screenshotInvocationEvidencePath -eq 'screenshot-start-invocation.json' -and $lostAccepted.data.cleanup.state -eq 'verified' -and $lostAccepted.data.cleanup.screenshotTerminal.terminal) 'accepted screenshot receipt survives a final evidence-write failure and authorizes exact terminal cleanup'
+    Remove-Item Env:CAPTURE_INTERACTION_LOSE_VISUAL_ACCEPTED -ErrorAction SilentlyContinue
+
+    $env:CAPTURE_INTERACTION_LOSE_VISUAL_RESULT = '1'
+    $lostVisualSession = Join-Path $root 'lost-visual-session'
+    $lostVisual = & $entry start -SessionDirectory $lostVisualSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 500 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test (-not $lostVisual.ok -and $lostVisual.state -eq 'cleanup-uncertain' -and $lostVisual.data.screenshotOutcomeUncertain -and $lostVisual.data.screenshotInvocationEvidencePath -eq 'screenshot-start-indeterminate.json' -and $lostVisual.data.cleanup.errors.Count -eq 0 -and $lostVisual.data.cleanup.uncertainties.Count -eq 1) 'dispatched screenshot with no accepted receipt remains explicitly uncertain after recording cleanup'
+    Remove-Item Env:CAPTURE_INTERACTION_LOSE_VISUAL_RESULT -ErrorAction SilentlyContinue
+
+    $env:CAPTURE_INTERACTION_LOSE_RECORD_RESULT = '1'
+    $lostRecordSession = Join-Path $root 'lost-record-session'
+    $lostRecord = & $entry start -SessionDirectory $lostRecordSession -RuntimePath $runtime -VisualMode none -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test (-not $lostRecord.ok -and $lostRecord.state -eq 'cleanup-uncertain' -and $lostRecord.data.recordOutcomeUncertain -and $lostRecord.data.recordInvocationEvidencePath -eq 'record-start-invocation.json' -and $lostRecord.data.cleanup.uncertainties.Count -eq 1) "dispatched recording with a lost result is retained as unresolved rather than reported clean: $($lostRecord | ConvertTo-Json -Depth 20 -Compress)"
 
     [pscustomobject]@{ ok=$true; sessionPath=$started.data.statePath; actionCount=(Get-CaptureInteractionActionCatalog).actions.Count } | ConvertTo-Json -Compress
 }
@@ -137,5 +168,8 @@ finally {
     Remove-Item Env:CAPTURE_INTERACTION_FAIL_VISUAL_START -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_FAIL_CLEANUP -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_BREAK_SESSION_DIRECTORY -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_LOSE_VISUAL_ACCEPTED -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_LOSE_VISUAL_RESULT -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_LOSE_RECORD_RESULT -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
 }

@@ -171,9 +171,11 @@ function Start-ProfilerDelay([int]$RequestedMilliseconds) {
 function Invoke-ProfilerAction([string]$Action, [switch]$ForRestore) {
     $arguments = @{ action = $Action } | ConvertTo-Json -Compress
     $remainingSeconds = Get-RemainingProfilerSeconds -ForRestore:$ForRestore
+    $actionEvidenceDirectory = if ($ForRestore) { Join-Path $controlRoot 'restore-evidence' } else { $runDirectory }
+    $actionEvidenceLabel = if ($ForRestore) { "profiler-restore-$transactionId-$Action" } else { "profiler-$Action" }
     $controlArguments = @{
         Tool = 'communityshaders.profiler'; ArgumentsJson = $arguments; RuntimePath = $RuntimePath
-        EvidenceDirectory = $runDirectory; EvidenceLabel = "profiler-$Action"
+        EvidenceDirectory = $actionEvidenceDirectory; EvidenceLabel = $actionEvidenceLabel
         TimeoutSeconds = $remainingSeconds; RequireSuccess = $true; NoExit = $true; Compact = $true
     }
     if ($null -ne $script:expectedRuntimeIdentity) {

@@ -319,6 +319,14 @@ try {
         throw 'MO2 launch isolation did not reject a malformed cache-plan shape with structured evidence.'
     }
     [IO.File]::WriteAllBytes($cachePlanPath, $cachePlanBytes)
+    $missingRelativeBindingPlan = Get-Content -LiteralPath $cachePlanPath -Raw | ConvertFrom-Json -Depth 40
+    $missingRelativeBindingPlan.cacheBinding.PSObject.Properties.Remove('relativeCachePath')
+    $missingRelativeBindingPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $cachePlanPath -Encoding utf8
+    $missingRelativeBindingIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
+    if ($missingRelativeBindingIsolation.ok -or @($missingRelativeBindingIsolation.errors | Where-Object { $_ -match 'not bound to the exact task profile' }).Count -ne 1) {
+        throw 'MO2 launch isolation accepted a cache binding without the relative cache path required by completion.'
+    }
+    [IO.File]::WriteAllBytes($cachePlanPath, $cachePlanBytes)
     $missingCatalogPlan = Get-Content -LiteralPath $cachePlanPath -Raw | ConvertFrom-Json -Depth 40
     $missingCatalogPlan.PSObject.Properties.Remove('catalog')
     $missingCatalogPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $cachePlanPath -Encoding utf8
@@ -564,6 +572,13 @@ try {
     $overwriteBeforeInterruptedResume = Get-TestProfileFingerprint (Join-Path $mo2 'overwrite')
     & $powerShell -NoProfile -NonInteractive -File $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -InternalTestFailurePoint resume-interrupt-after-output-rearm -Confirm:$false -NoExit | Out-Null
     if ($LASTEXITCODE -ne 91) { throw 'Interrupted resume fixture did not terminate after publishing recoverable output-rearm evidence.' }
+    & $powerShell -NoProfile -NonInteractive -File $entry list-task -ConfigPath $configPath -TaskId $taskId -InternalTestFailurePoint resume-recovery-interrupt-after-owner-release -Compact -NoExit | Out-Null
+    if ($LASTEXITCODE -ne 92) { throw 'Recovery interruption fixture did not terminate immediately after attributable owner release.' }
+    $checkpointedResumeJournal = Get-ChildItem -LiteralPath $workspaceControlRoot -Filter ($created.data.workspaceId + '.resume.*.journal.json') -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    $checkpointedResumeData = Get-Content -LiteralPath $checkpointedResumeJournal.FullName -Raw | ConvertFrom-Json
+    if ([string]$checkpointedResumeData.runtimeOutputRearm.state -ne 'owner-release-authorized' -or (Test-Path -LiteralPath (Join-Path $mo2 'overwrite\.codex-workspace-output-owner.json'))) {
+        throw 'Interrupted recovery did not retain its durable pre-release checkpoint with an attributable absent marker.'
+    }
     $null = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
     $interruptedResumeJournal = Get-ChildItem -LiteralPath $workspaceControlRoot -Filter ($created.data.workspaceId + '.resume.*.journal.json') -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     $interruptedResumeData = Get-Content -LiteralPath $interruptedResumeJournal.FullName -Raw | ConvertFrom-Json
@@ -573,6 +588,18 @@ try {
         (Test-Path -LiteralPath (Join-Path $mo2 'overwrite\.codex-workspace-output-owner.json')) -or
         (Get-TestProfileFingerprint (Join-Path $mo2 'overwrite')) -cne $overwriteBeforeInterruptedResume) {
         throw 'Startup recovery did not roll back the interrupted runtime-output rearm, exact manifest, and Overwrite tree.'
+    }
+    $failedRollbackResume = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -InternalTestFailurePoint resume-rearm-fail-with-rollback-failure -Confirm:$false -NoExit | ConvertFrom-Json
+    $failedRollbackJournal = Get-ChildItem -LiteralPath $workspaceControlRoot -Filter ($created.data.workspaceId + '.resume.*.journal.json') -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    $failedRollbackData = Get-Content -LiteralPath $failedRollbackJournal.FullName -Raw | ConvertFrom-Json
+    $failedRollbackMarker = Join-Path $mo2 'overwrite\.codex-workspace-output-owner.json'
+    if ($failedRollbackResume.ok -or $failedRollbackData.phase -ne 'recovery-required' -or [string]$failedRollbackData.runtimeOutputRearm.state -ne 'recovery-required' -or [bool]$failedRollbackData.rollback.verified -or -not (Test-Path -LiteralPath $failedRollbackMarker -PathType Leaf) -or -not (Test-Path -LiteralPath (Join-Path $mo2 'overwrite\backup\rollback-fixture.bin') -PathType Leaf)) {
+        throw "Failed nested rearm rollback was not preserved as an attributable recovery-required parent operation. Result=$($failedRollbackResume | ConvertTo-Json -Depth 30 -Compress) Journal=$($failedRollbackData | ConvertTo-Json -Depth 30 -Compress) Marker=$([bool](Test-Path -LiteralPath $failedRollbackMarker -PathType Leaf)) Mutation=$([bool](Test-Path -LiteralPath (Join-Path $mo2 'overwrite\backup\rollback-fixture.bin') -PathType Leaf))"
+    }
+    $null = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
+    $recoveredFailedRollback = Get-Content -LiteralPath $failedRollbackJournal.FullName -Raw | ConvertFrom-Json
+    if ($recoveredFailedRollback.phase -ne 'rolled-back' -or (Test-Path -LiteralPath $failedRollbackMarker) -or (Test-Path -LiteralPath (Join-Path $mo2 'overwrite\backup\rollback-fixture.bin'))) {
+        throw 'A later authorized recovery did not finish the retained nested rearm rollback exactly.'
     }
     $resumed = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -Confirm:$false | ConvertFrom-Json
     if (-not $resumed.ok -or $resumed.state -ne 'workspace-resumed' -or $resumed.data.accessId -ne $nextAccessId -or -not (Test-Path -LiteralPath (Join-Path $created.data.profilePath 'task-state.txt'))) { throw "Retained workspace was not rebound without losing task state: $($resumed | ConvertTo-Json -Depth 12 -Compress)" }

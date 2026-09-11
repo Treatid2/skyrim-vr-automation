@@ -136,6 +136,8 @@ try {
     [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0}', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText($fakeControl, @'
 param([string]$Command,[string]$Tool,[string]$ArgumentsJson,[string]$RuntimePath,[string]$EvidenceDirectory,[string]$EvidenceLabel,[int]$TimeoutSeconds,[switch]$RequireSuccess,[switch]$NoExit,[switch]$Compact,[string]$ExpectedRuntimeIdentityJson)
+$null = New-Item -ItemType Directory -Path $EvidenceDirectory -Force
+[IO.File]::WriteAllText((Join-Path $EvidenceDirectory "$EvidenceLabel.admission.json"), '{"admitted":true}', [Text.UTF8Encoding]::new($false))
 $state = Get-Content -LiteralPath $env:CSX_PROFILER_TEST_STATE -Raw | ConvertFrom-Json -AsHashtable
 $state.calls = [int]$state.calls + 1
 $action = ($ArgumentsJson | ConvertFrom-Json).action

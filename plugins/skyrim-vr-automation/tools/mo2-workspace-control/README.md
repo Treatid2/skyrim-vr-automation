@@ -39,6 +39,14 @@ pre-state, or fails closed on unsafe paths or unclassified drift. Recovery is
 bounded by the same traversal budgets and never searches outside the configured
 workspace, profile, and mods roots.
 
+Runtime-output re-arm recovery uses a durable two-phase owner-release
+checkpoint. It records that exact output restoration finished while the owner
+marker is still verifiable, then releases the marker. A restart between those
+steps may finish the parent manifest and selection rollback without recreating
+ownership. Failed child restoration instead remains `recovery-required`, keeps
+its marker and snapshot evidence, and cannot be promoted to a verified parent
+rollback.
+
 Workspaces are durably owned by `-TaskId` (or `CODEX_THREAD_ID` /
 `CODEX_TASK_ID`), not by one access lease. `create` makes and selects a fresh
 profile. `list-task` reports retained profiles. `resume` rebinds one exact
