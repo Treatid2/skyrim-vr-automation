@@ -2,14 +2,23 @@
 
 `Invoke-CocStabilityControl.ps1` owns the post-Windhelm critical path of the
 fixed Skyrim VR COC assay. It verifies the exact DevBench/Skyrim identity and
-live crash collector, calls `prepare_coc` once, launches the baseline reads in
-parallel, and starts one async 20-transition scenario either when the complete
-baseline passes or at the ten-second monotonic deadline.
+live crash collector, launches the baseline reads in parallel, and starts one
+async 20-transition scenario only after every ownership and readiness result
+arrives within the ten-second admission deadline. An incomplete or faulty
+baseline fails closed before `prepare_coc` or scenario mutation.
 
-The watchdog runs independently from the baseline requests and claims an
-atomic dispatch marker before calling DevBench. Consequently, a slow or stuck
-baseline cannot prevent the measured scenario from being submitted, and an
-early baseline completion cannot race the watchdog into submitting it twice.
+Every DevBench interaction is pinned to the canonical endpoint, its exact
+listener PID, and the admitted Skyrim start time. The server scenario acquires
+qualification ownership before stress reset/start, and those diagnostic steps
+carry the same owner ID. A restarted process, substitute endpoint, or foreign
+stress, CPU, or GPU telemetry owner is rejected before diagnostic mutation.
+
+The dispatch journal exists before asynchronous submission. Its terminal state
+distinguishes explicit rejection, unknown remote outcome, local claim failure,
+ownership interruption, and known acceptance. If publication after acceptance
+fails, the result still returns the exact owner, run ID, endpoint, process
+identity, receipt, and intended state path; callers must reconcile that run
+before retrying.
 
 VR FPS Stabilizer exclusively owns profile selection. The controller never
 calls a CSX upscaling mutation and deliberately omits `target` from every
@@ -32,3 +41,8 @@ pwsh ./tools/coc-stability-control/Invoke-CocStabilityControl.ps1 status `
 
 Only `run` may apply the runtime-only fixture or enqueue the measured scenario.
 `status` is read-only apart from its DevBench status request.
+Terminal execution is reported as `complete` only when all mandatory wait and
+status receipts are attributable and structurally complete. The admitted
+protocol bytes and SHA-256 are stored in the journal, so later status cannot be
+reinterpreted through a replaced configuration file. Otherwise status returns
+`evidence-partial` while preserving the transcript and missing-field inventory.
