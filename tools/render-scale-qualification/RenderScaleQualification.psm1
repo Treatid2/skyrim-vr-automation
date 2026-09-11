@@ -4742,7 +4742,10 @@ function Test-CSXFinalizerEnvelope {
 }
 
 function Update-CSXQualificationReport {
-    param([Parameter(Mandatory)][string]$EvidenceDirectory)
+    param(
+        [Parameter(Mandatory)][string]$EvidenceDirectory,
+        [switch]$AllowUnsealedSuccess
+    )
     $root = [IO.Path]::GetFullPath($EvidenceDirectory)
     $rawPath = Join-Path $root 'run.raw.json'
     $indexPath = Join-Path $root 'visual-index.json'
@@ -4808,6 +4811,27 @@ function Update-CSXQualificationReport {
     elseif ($errors.Count -gt 0) { 'FAIL' }
     elseif ($reviewState -eq 'PASS') { $(if ($prMode) { 'PASS' } else { 'LOCAL_PASS' }) }
     else { 'FAIL' }
+    if (-not $AllowUnsealedSuccess -and $status -in @('PASS', 'LOCAL_PASS')) {
+        $completion = Test-CSXQualificationCompletionReceipt -EvidenceRoot $root -ExpectedRunId ([string]$raw.runId)
+        if ($completion.ok) {
+            $existingRunPath = Join-Path $root 'run.json'
+            $existingSummaryPath = Join-Path $root $(if ($prMode) { 'pr-summary.md' } else { 'qualification-summary.md' })
+            $existingReport = Get-Content -LiteralPath $existingRunPath -Raw | ConvertFrom-Json -Depth 100
+            if ([string](Get-CSXPropertyValue $existingReport 'runId') -ne [string]$raw.runId -or
+                [string](Get-CSXPropertyValue $existingReport 'status') -ne $status -or
+                -not (Test-Path -LiteralPath $existingSummaryPath -PathType Leaf)) {
+                throw 'The sealed qualification projection is missing or inconsistent with its validated completion receipt.'
+            }
+            return [pscustomobject][ordered]@{
+                report = $existingReport; runPath = $existingRunPath; summaryPath = $existingSummaryPath
+                completion = $completion
+            }
+        }
+        foreach ($completionError in @($completion.errors)) {
+            $infrastructureErrors.Add("Qualification success is not sealed: $completionError")
+        }
+        $status = 'INFRASTRUCTURE_ERROR'
+    }
     $report = [pscustomobject][ordered]@{
         schema = $(if ($prMode) { 'csx-render-scale-pr-v1' } else { 'csx-render-scale-local-v1' }); status = $status; runId = $raw.runId
         generatedUtc = [DateTime]::UtcNow.ToString('o'); prMode = $prMode
@@ -4927,4 +4951,4 @@ Export-ModuleMember -Function Assert-CSXProtocol, Get-CSXQualificationProtocol, 
     New-CSXAutomatedVisualPromptText, New-CSXAutomatedVisualReview, Test-CSXAutomatedVisualReviewEvidence,
     Test-CSXVisualReview, Test-CSXFlattenedBaselineVisualReview,
     Test-CSXJsonIdentity, Test-CSXAutomationArtifactInventory, Test-CSXProducerArtifactEvidence, Test-CSXVisualArtifactEvidence,
-    Test-CSXFinalizerEnvelope, Update-CSXQualificationReport
+    Test-CSXQualificationCompletionReceipt, Test-CSXFinalizerEnvelope, Update-CSXQualificationReport
