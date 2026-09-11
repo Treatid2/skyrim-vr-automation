@@ -572,6 +572,17 @@ function Test-CocBaseline {
     foreach ($name in @('state', 'scene', 'upscaling', 'renderscale', 'image')) {
         if (-not $Results.ContainsKey($name) -or $null -eq $Results[$name]) {
             $reasons.Add("baseline '$name' is incomplete")
+            continue
+        }
+        $receipt = $Results[$name]
+        $valueProperty = if ($receipt -is [Collections.IDictionary]) {
+            if ($receipt.Contains('value')) { $receipt['value'] } else { $null }
+        } else {
+            $property = $receipt.PSObject.Properties['value']
+            if ($property) { $property.Value } else { $null }
+        }
+        if ($null -eq $valueProperty) {
+            $reasons.Add("baseline '$name' application value is missing or null")
         }
     }
     if ($reasons.Count -gt 0) {

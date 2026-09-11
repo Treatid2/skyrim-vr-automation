@@ -461,6 +461,17 @@ if (-not $ownershipConflict.ownershipConflict -or
     $ownershipConflict.ownershipConflicts[0] -notlike '*unowned stress*') {
     throw 'A foreign diagnostic session was not classified as an ownership conflict.'
 }
+$nullSceneBaseline = Test-CocBaseline -Results @{
+    state = [pscustomobject]@{ value = [pscustomobject]@{ playerLoaded = $true } }
+    scene = [pscustomobject]@{ value = $null }
+    upscaling = [pscustomobject]@{ value = [pscustomobject]@{} }
+    renderscale = [pscustomobject]@{ value = [pscustomobject]@{} }
+    image = [pscustomobject]@{ value = [pscustomobject]@{} }
+} -ExpectedCell 'WindhelmExterior01'
+if ($nullSceneBaseline.acceptable -or
+    ($nullSceneBaseline.reasons -join ' | ') -notlike "*baseline 'scene' application value is missing or null*") {
+    throw 'A null application-level scene result did not become an attributable baseline rejection.'
+}
 
 $moduleScript = Get-Content -LiteralPath $modulePath -Raw
 foreach ($required in @(
@@ -478,6 +489,11 @@ foreach ($required in @(
 }
 
 $script = Get-Content -LiteralPath $scriptPath -Raw
+$semanticDecisionIndex = $script.IndexOf('$baselineVerdict = Test-CocBaseline', [StringComparison]::Ordinal)
+$finalDecisionTimestampIndex = $script.IndexOf('$baselineDecisionTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()', $semanticDecisionIndex, [StringComparison]::Ordinal)
+if ($semanticDecisionIndex -lt 0 -or $finalDecisionTimestampIndex -le $semanticDecisionIndex) {
+    throw 'The final baseline deadline timestamp does not include semantic baseline evaluation.'
+}
 foreach ($required in @(
     '[Diagnostics.Stopwatch]::GetTimestamp()',
     'New-CocDispatchClaim',
@@ -719,6 +735,215 @@ try {
 finally {
     if (Test-Path -LiteralPath $rejectedFixture) {
         Remove-Item -LiteralPath $rejectedFixture -Recurse -Force
+    }
+}
+
+# Exercise the actual run coordinator with controlled module and evidence-controller
+# dependencies. The production coordinator source is copied byte-for-byte; only
+# its external tool provider is replaced in the isolated fixture module.
+$coordinatorFixture = Join-Path ([IO.Path]::GetTempPath()) (
+    'coc-stability-coordinator-' + [Guid]::NewGuid().ToString('N')
+)
+$fixtureMarker = Join-Path $coordinatorFixture 'prepare-called.txt'
+$scenarioMarker = Join-Path $coordinatorFixture 'scenario-called.txt'
+$environmentNames = @(
+    'CSX_COC_TEST_STATE', 'CSX_COC_TEST_SCENE', 'CSX_COC_TEST_UPSCALING',
+    'CSX_COC_TEST_RENDERSCALE', 'CSX_COC_TEST_IMAGE',
+    'CSX_COC_TEST_FIXTURE_MARKER', 'CSX_COC_TEST_SCENARIO_MARKER',
+    'CSX_COC_TEST_PID', 'CSX_COC_TEST_START'
+)
+$priorEnvironment = @{}
+foreach ($name in $environmentNames) { $priorEnvironment[$name] = [Environment]::GetEnvironmentVariable($name) }
+try {
+    $fixtureToolRoot = Join-Path $coordinatorFixture 'tools'
+    $fixtureCocRoot = Join-Path $fixtureToolRoot 'coc-stability-control'
+    $fixtureDevBenchRoot = Join-Path $fixtureToolRoot 'devbench-control'
+    $fixtureEvidenceRoot = Join-Path $fixtureToolRoot 'coc-evidence-control'
+    New-Item -ItemType Directory -Path $fixtureCocRoot, $fixtureDevBenchRoot, $fixtureEvidenceRoot -Force | Out-Null
+    Copy-Item -LiteralPath $scriptPath -Destination (Join-Path $fixtureCocRoot 'Invoke-CocStabilityControl.ps1')
+    Copy-Item -LiteralPath $configPath -Destination (Join-Path $fixtureCocRoot 'protocol.v1.json')
+    Copy-Item -LiteralPath $modulePath -Destination (Join-Path $fixtureCocRoot 'CocStabilityControl.psm1')
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\devbench-control\DevBenchControl.psm1') `
+        -Destination (Join-Path $fixtureDevBenchRoot 'DevBenchControl.psm1')
+
+    $fixtureModulePath = Join-Path $fixtureCocRoot 'CocStabilityControl.psm1'
+    $fixtureModuleSource = [IO.File]::ReadAllText($fixtureModulePath)
+    $fixtureModuleTokens = $null
+    $fixtureModuleErrors = $null
+    $fixtureModuleAst = [Management.Automation.Language.Parser]::ParseInput(
+        $fixtureModuleSource, [ref]$fixtureModuleTokens, [ref]$fixtureModuleErrors
+    )
+    $fixtureInvokeAst = $fixtureModuleAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq 'Invoke-CocMcpTool'
+        }, $true)
+    if ($fixtureModuleErrors.Count -ne 0 -or $null -eq $fixtureInvokeAst) {
+        throw 'Could not create the controlled coordinator module fixture.'
+    }
+    $stubInvoke = @'
+function Invoke-CocMcpTool {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Endpoint,
+        [Parameter(Mandatory)][string]$Tool,
+        [Parameter(Mandatory)][hashtable]$Arguments,
+        [int]$TimeoutSeconds = 20,
+        [int]$ExpectedProcessId,
+        [string]$ExpectedProcessStartTimeUtc,
+        [string]$ExpectedBuildId
+    )
+    $decode = {
+        param([string]$Name)
+        [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(
+            [Environment]::GetEnvironmentVariable($Name)
+        )) | ConvertFrom-Json -Depth 100
+    }
+    $value = if ($Tool -eq 'inspect' -and [string]$Arguments.kind -eq 'state') {
+        & $decode 'CSX_COC_TEST_STATE'
+    } elseif ($Tool -eq 'inspect' -and [string]$Arguments.kind -eq 'scene') {
+        & $decode 'CSX_COC_TEST_SCENE'
+    } elseif ($Tool -eq 'communityshaders.upscaling_api') {
+        & $decode 'CSX_COC_TEST_UPSCALING'
+    } elseif ($Tool -eq 'communityshaders.renderscale') {
+        & $decode 'CSX_COC_TEST_RENDERSCALE'
+    } elseif ($Tool -eq 'communityshaders.screenshot') {
+        & $decode 'CSX_COC_TEST_IMAGE'
+    } elseif ($Tool -eq 'communityshaders.menu') {
+        [IO.File]::WriteAllText([Environment]::GetEnvironmentVariable('CSX_COC_TEST_FIXTURE_MARKER'), 'called')
+        throw 'synthetic prepare_coc failure'
+    } elseif ($Tool -eq 'scenario') {
+        [IO.File]::WriteAllText([Environment]::GetEnvironmentVariable('CSX_COC_TEST_SCENARIO_MARKER'), 'called')
+        [pscustomobject]@{ accepted = $true; runId = 99 }
+    } else {
+        throw "Unexpected controlled tool call: $Tool"
+    }
+    return [pscustomobject][ordered]@{
+        tool = $Tool; sessionId = 'controlled-test'; content = @($value)
+        value = $value; rawResult = [pscustomobject]@{ content = @($value) }
+    }
+}
+'@
+    $fixtureModuleSource = $fixtureModuleSource.Substring(0, $fixtureInvokeAst.Extent.StartOffset) +
+        $stubInvoke + $fixtureModuleSource.Substring($fixtureInvokeAst.Extent.EndOffset)
+    [IO.File]::WriteAllText($fixtureModulePath, $fixtureModuleSource, [Text.UTF8Encoding]::new($false))
+
+    $evidenceStub = @'
+param([string]$Command, [string]$StatePath, [switch]$Compact, [switch]$NoExit)
+[pscustomobject][ordered]@{
+    ok = $true; state = 'armed-attached'; errors = @()
+    data = [pscustomobject][ordered]@{
+        targetPids = @([int][Environment]::GetEnvironmentVariable('CSX_COC_TEST_PID'))
+        targetStartedUtc = [Environment]::GetEnvironmentVariable('CSX_COC_TEST_START')
+    }
+} | ConvertTo-Json -Depth 10 -Compress
+'@
+    [IO.File]::WriteAllText(
+        (Join-Path $fixtureEvidenceRoot 'Invoke-CocEvidenceControl.ps1'),
+        $evidenceStub,
+        [Text.UTF8Encoding]::new($false)
+    )
+
+    $devBenchTestPath = Join-Path $PSScriptRoot '..\devbench-control\Test-DevBenchControl.ps1'
+    $devBenchTokens = $null
+    $devBenchErrors = $null
+    $devBenchAst = [Management.Automation.Language.Parser]::ParseFile(
+        $devBenchTestPath, [ref]$devBenchTokens, [ref]$devBenchErrors
+    )
+    foreach ($helperName in @('New-TestUpscalingProfile', 'New-TestRenderScaleStatus')) {
+        $helperAst = $devBenchAst.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq $helperName
+            }, $true)
+        if ($null -eq $helperAst) { throw "Controlled coordinator fixture lacks $helperName." }
+        Invoke-Expression $helperAst.ToString()
+    }
+    $renderProfile = New-TestUpscalingProfile
+    $renderSnapshot = [pscustomobject]@{
+        stateRevision = 12; profilePresence = 27; flags = 57; activeOperationId = 0
+        transitionState = [pscustomobject]@{ name = 'active'; value = 6 }
+        renderScaleStatus = [pscustomobject]@{ name = 'active'; value = 5 }
+        observedConditions = [pscustomobject]@{ names = @() }
+        profiles = [pscustomobject]@{ requested = $renderProfile; effective = $renderProfile; stable = $renderProfile }
+        dimensions = [pscustomobject]@{ displayEyeWidth = 2468; displayEyeHeight = 2740; renderEyeWidth = 2096; renderEyeHeight = 2328 }
+    }
+    $renderStatus = New-TestRenderScaleStatus
+    $renderStatus | Add-Member -NotePropertyName session -NotePropertyValue ([pscustomobject]@{ active = $false }) -Force
+    $renderStatus | Add-Member -NotePropertyName cpuPerformance -NotePropertyValue ([pscustomobject]@{ active = $false }) -Force
+    $renderStatus | Add-Member -NotePropertyName gpuPerformance -NotePropertyValue ([pscustomobject]@{ active = $false }) -Force
+    $payloads = @{
+        CSX_COC_TEST_STATE = [pscustomobject]@{ playerLoaded = $true }
+        CSX_COC_TEST_SCENE = [pscustomobject]@{ cell = 'WindhelmExterior01' }
+        CSX_COC_TEST_UPSCALING = $renderSnapshot
+        CSX_COC_TEST_RENDERSCALE = [pscustomobject]@{ status = $renderStatus }
+        CSX_COC_TEST_IMAGE = [pscustomobject]@{ requestId = 'controlled-baseline-image' }
+    }
+    foreach ($entry in $payloads.GetEnumerator()) {
+        $json = $entry.Value | ConvertTo-Json -Depth 100 -Compress
+        [Environment]::SetEnvironmentVariable($entry.Key, [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)))
+    }
+    [Environment]::SetEnvironmentVariable('CSX_COC_TEST_FIXTURE_MARKER', $fixtureMarker)
+    [Environment]::SetEnvironmentVariable('CSX_COC_TEST_SCENARIO_MARKER', $scenarioMarker)
+    $expectedCollectorStart = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+    [Environment]::SetEnvironmentVariable('CSX_COC_TEST_PID', [string]$PID)
+    [Environment]::SetEnvironmentVariable('CSX_COC_TEST_START', $expectedCollectorStart)
+
+    $controlledController = Join-Path $fixtureCocRoot 'Invoke-CocStabilityControl.ps1'
+    $controlledEvidenceTool = Join-Path $fixtureEvidenceRoot 'Invoke-CocEvidenceControl.ps1'
+    $collectorProbe = & $controlledEvidenceTool status -StatePath (Join-Path $coordinatorFixture 'collector.json') -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    $probeTargets = @($collectorProbe.data.targetPids)
+    $probeStart = if ($collectorProbe.data.targetStartedUtc -is [DateTime]) {
+        $collectorProbe.data.targetStartedUtc.ToUniversalTime().ToString('o')
+    } else { [string]$collectorProbe.data.targetStartedUtc }
+    if (-not [bool]$collectorProbe.ok -or $probeTargets.Count -ne 1 -or
+        [int]$probeTargets[0] -ne $PID -or $probeStart -cne $expectedCollectorStart) {
+        throw "Controlled evidence stub mismatch: ok=$([bool]$collectorProbe.ok) count=$($probeTargets.Count) pid=$([int]$probeTargets[0]) expectedPid=$PID start=<$probeStart> expectedStart=<$expectedCollectorStart>."
+    }
+    $controlledEvidence = Join-Path $coordinatorFixture 'prepare-failure-evidence'
+    New-Item -ItemType Directory -Path $controlledEvidence | Out-Null
+    $controlledResult = & $controlledController run -ExpectedPid $PID -ExpectedBuildId ('a' * 64) `
+        -CollectorStatePath (Join-Path $coordinatorFixture 'collector.json') -EvidenceRoot $controlledEvidence `
+        -BaselineDeadlineMs 10000 -Compact -NoExit | ConvertFrom-Json -Depth 100
+    if ([string]::IsNullOrWhiteSpace([string]$controlledResult.data.statePath)) {
+        throw "Controlled prepare_coc run produced no state path: $($controlledResult | ConvertTo-Json -Depth 30 -Compress)"
+    }
+    $controlledState = Get-Content -LiteralPath $controlledResult.data.statePath -Raw | ConvertFrom-Json -Depth 100
+    if ($controlledResult.ok -or $controlledResult.state -ne 'blocked-awaiting-user' -or
+        $controlledState.outcome -ne 'fixture-call-failed' -or
+        $controlledState.fixtureFailure.error -ne 'synthetic prepare_coc failure' -or
+        @($controlledState.baseline.PSObject.Properties).Count -ne 5 -or
+        -not (Test-Path -LiteralPath $fixtureMarker -PathType Leaf) -or
+        (Test-Path -LiteralPath $scenarioMarker -PathType Leaf)) {
+        throw 'The actual coordinator did not terminalize a prepare_coc exception with retained baseline and zero scenario submission.'
+    }
+
+    [IO.File]::Delete($fixtureMarker)
+    $nullSceneJson = 'null'
+    [Environment]::SetEnvironmentVariable('CSX_COC_TEST_SCENE', [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($nullSceneJson)))
+    $nullEvidence = Join-Path $coordinatorFixture 'null-scene-evidence'
+    New-Item -ItemType Directory -Path $nullEvidence | Out-Null
+    $nullResult = & $controlledController run -ExpectedPid $PID -ExpectedBuildId ('a' * 64) `
+        -CollectorStatePath (Join-Path $coordinatorFixture 'collector.json') -EvidenceRoot $nullEvidence `
+        -BaselineDeadlineMs 10000 -Compact -NoExit | ConvertFrom-Json -Depth 100
+    if ([string]::IsNullOrWhiteSpace([string]$nullResult.data.statePath)) {
+        throw "Controlled null-scene run produced no state path: $($nullResult | ConvertTo-Json -Depth 30 -Compress)"
+    }
+    $nullState = Get-Content -LiteralPath $nullResult.data.statePath -Raw | ConvertFrom-Json -Depth 100
+    if ($nullResult.ok -or $nullState.outcome -ne 'dispatch-interrupted' -or
+        ($nullState.baselineVerdict.reasons -join ' | ') -notlike '*scene*missing or null*' -or
+        (Test-Path -LiteralPath $fixtureMarker -PathType Leaf) -or
+        (Test-Path -LiteralPath $scenarioMarker -PathType Leaf)) {
+        throw 'The actual coordinator did not retain a null scene application value as a terminal pre-fixture rejection.'
+    }
+}
+finally {
+    foreach ($name in $environmentNames) {
+        [Environment]::SetEnvironmentVariable($name, $priorEnvironment[$name])
+    }
+    if (Test-Path -LiteralPath $coordinatorFixture -PathType Container) {
+        Remove-Item -LiteralPath $coordinatorFixture -Recurse -Force
     }
 }
 

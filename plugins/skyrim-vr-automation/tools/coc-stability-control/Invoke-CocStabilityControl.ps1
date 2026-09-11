@@ -41,6 +41,12 @@ function Write-AtomicJson {
     }
 }
 
+function ConvertTo-CocUtcRoundtripText($Value) {
+    if ($Value -is [DateTime]) { return $Value.ToUniversalTime().ToString('o') }
+    if ($Value -is [DateTimeOffset]) { return $Value.UtcDateTime.ToString('o') }
+    return [string]$Value
+}
+
 function Get-JobResult($Job) {
     if ($Job.State -eq 'Completed') {
         $output = @(Receive-Job -Job $Job -Keep)
@@ -205,7 +211,7 @@ try {
             $journalPid = try {
                 if ($pidProperty) { [int]$pidProperty.Value } else { 0 }
             } catch { 0 }
-            $journalStart = if ($startProperty) { [string]$startProperty.Value } else { '' }
+            $journalStart = if ($startProperty) { ConvertTo-CocUtcRoundtripText $startProperty.Value } else { '' }
             $journalEndpoint = if ($endpointProperty) { [string]$endpointProperty.Value } else { '' }
             $journalOwner = if ($ownerProperty) { [string]$ownerProperty.Value } else { '' }
             $journalBuild = if ($buildProperty) { [string]$buildProperty.Value } else { '' }
@@ -324,10 +330,11 @@ try {
         $collectorText = & $evidenceTool status `
             -StatePath $CollectorStatePath -Compact -NoExit
         $collector = $collectorText | ConvertFrom-Json -Depth 50
+        $collectorTargetStartUtc = ConvertTo-CocUtcRoundtripText $collector.data.targetStartedUtc
         if (-not [bool]$collector.ok -or
             [string]$collector.state -ne 'armed-attached' -or
             $ExpectedPid -notin @($collector.data.targetPids) -or
-            [string]$collector.data.targetStartedUtc -cne $expectedProcessStartTimeUtc) {
+            $collectorTargetStartUtc -cne $expectedProcessStartTimeUtc) {
             throw 'The exact Skyrim PID does not have live owned crash coverage.'
         }
 
@@ -447,19 +454,30 @@ try {
                 }
             }
         }
+        $baselineResultSetComplete = @($baselineResults.Values | Where-Object {
+                -not $_.PSObject.Properties['error']
+            }).Count -eq $baselineSpecs.Count
+        $baselineVerdict = $null
+        if ($baselineResultSetComplete) {
+            try {
+                $baselineVerdict = Test-CocBaseline -Results $baselineResults `
+                    -ExpectedCell ([string]$protocolConfig.startCellEditorId)
+            }
+            catch {
+                $baselineVerdict = [pscustomobject][ordered]@{
+                    acceptable = $false
+                    ownershipConflict = $false
+                    ownershipConflicts = @()
+                    reasons = @("baseline semantic evaluation failed: $($_.Exception.Message)")
+                }
+            }
+        }
         $baselineDecisionTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
         $baselineTimingVerdict = Test-CocBaselineAdmissionTiming `
             -Timing $baselineTiming -DueTimestamp $dueTimestamp `
             -DecisionTimestamp $baselineDecisionTimestamp `
             -ExpectedCount $baselineSpecs.Count
-        $successful = [bool]$baselineTimingVerdict.acceptable -and
-            @($baselineResults.Values | Where-Object {
-                -not $_.PSObject.Properties['error']
-            }).Count -eq $baselineSpecs.Count
-        $baselineVerdict = if ($successful) {
-            Test-CocBaseline -Results $baselineResults `
-                -ExpectedCell ([string]$protocolConfig.startCellEditorId)
-        } else { $null }
+        $successful = [bool]$baselineTimingVerdict.acceptable -and $baselineResultSetComplete
         $dispatchResult = $null
         if (-not $successful) {
             $dispatchResult = [pscustomobject]@{

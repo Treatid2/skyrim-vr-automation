@@ -83,9 +83,13 @@ $workerStop = Get-CocStopOutcome -ProcessKind hang-capture-worker -Value (
 $failedWorkerStop = Get-CocStopOutcome -ProcessKind hang-capture-procdump -Value (
     [pscustomobject]@{ cleanupComplete = $false; captureExited = $false }
 )
+$cancellationStop = Get-CocStopOutcome -ProcessKind cancellation-helper -Value (
+    [pscustomobject]@{ cleanupComplete = $true; captureExited = $true }
+)
 if (-not $monitorStop.stopped -or $monitorStop.target -ne '42' -or
     $monitorStop.cancelState -ne 'exited' -or -not $workerStop.stopped -or
     $null -ne $workerStop.target -or $workerStop.cancelState -ne 'exited' -or
+    -not $cancellationStop.stopped -or $cancellationStop.cancelState -ne 'exited' -or
     $failedWorkerStop.stopped -or $null -ne $failedWorkerStop.target -or
     $failedWorkerStop.cancelState -ne 'cleanup-incomplete') {
     throw 'Stop-result normalization did not preserve process-specific result shapes.'
@@ -239,6 +243,8 @@ $fixture = Join-Path ([IO.Path]::GetTempPath()) (
     'coc-evidence-control-' + [Guid]::NewGuid().ToString('N')
 )
 $capture = $null
+$monitorFixture = $null
+$cancelFixture = $null
 try {
     New-Item -ItemType Directory -Path $fixture | Out-Null
     $pwsh = (Get-Process -Id $PID).Path
@@ -338,6 +344,41 @@ try {
         throw 'A later authorized stop did not resolve the retained ProcDump lifetime.'
     }
 
+    $monitorFixture = [Diagnostics.Process]::Start($startInfo)
+    $cancelFixture = [Diagnostics.Process]::Start($startInfo)
+    $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $state.monitorPid = $monitorFixture.Id
+    $state.monitorStartedUtc = $monitorFixture.StartTime.ToUniversalTime().ToString('o')
+    $state.capturePid = [int]::MaxValue
+    $state.captureStartedUtc = [DateTime]::UtcNow.ToString('o')
+    $state.captureProcDumpPid = [int]::MaxValue
+    $state.captureProcDumpStartedUtc = [DateTime]::UtcNow.ToString('o')
+    $state.captureState = 'capture-stopped'
+    $state | Add-Member -NotePropertyName cancelPid -NotePropertyValue $cancelFixture.Id -Force
+    $state | Add-Member -NotePropertyName cancelStartedUtc `
+        -NotePropertyValue $cancelFixture.StartTime.ToUniversalTime().ToString('o') -Force
+    $state | Add-Member -NotePropertyName cancelState -NotePropertyValue 'cleanup-incomplete' -Force
+    $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8
+    $cancellationStatus = & $scriptPath status -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if ($cancellationStatus.ok -or $cancellationStatus.state -ne 'cleanup-incomplete') {
+        throw 'Status did not retain the independently owned cancellation helper.'
+    }
+    $cancellationRecovery = & $scriptPath stop -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if ($cancellationRecovery.ok -or $cancellationRecovery.state -ne 'cleanup-incomplete' -or
+        (Get-Process -Id $cancelFixture.Id -ErrorAction SilentlyContinue) -or
+        -not (Get-Process -Id $monitorFixture.Id -ErrorAction SilentlyContinue)) {
+        throw 'Stop did not resolve the prior cancellation helper before preserving the still-live monitor.'
+    }
+    $afterCancellation = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    if ([string]$afterCancellation.cancelState -ne 'exited' -or
+        [int]$afterCancellation.monitorPid -ne $monitorFixture.Id) {
+        throw 'Cancellation recovery overwrote unresolved monitor ownership.'
+    }
+    $monitorFixture.Kill()
+    $monitorFixture.WaitForExit()
+
     $capture = [Diagnostics.Process]::Start($startInfo)
     $captureStartedUtc = $capture.StartTime.ToUniversalTime().ToString('o')
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
@@ -410,6 +451,12 @@ try {
     }
 }
 finally {
+    foreach ($process in @($cancelFixture, $monitorFixture)) {
+        if ($process -and -not $process.HasExited) {
+            $process.Kill()
+            $process.WaitForExit()
+        }
+    }
     if ($capture -and -not $capture.HasExited) {
         $capture.Kill()
         $capture.WaitForExit()

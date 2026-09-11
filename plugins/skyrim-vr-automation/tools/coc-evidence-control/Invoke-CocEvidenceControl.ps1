@@ -429,7 +429,7 @@ function Get-CocStopOutcome {
     param(
         [Parameter(Mandatory)]$Value,
         [Parameter(Mandatory)]
-        [ValidateSet('crash-monitor', 'hang-capture-worker', 'hang-capture-procdump')]
+        [ValidateSet('crash-monitor', 'hang-capture-worker', 'hang-capture-procdump', 'cancellation-helper')]
         [string]$ProcessKind
     )
 
@@ -929,10 +929,15 @@ try {
         $monitor = Get-OwnedMonitor $owned.data
         $capture = Get-OwnedHangCapture $owned.data
         $procDumpCapture = Get-OwnedProcDumpCapture $owned.data
-        $ownedProcess = if ($capture) {
+        $cancellation = Get-OwnedCancellation $owned.data
+        $ownedProcess = if ($cancellation) {
+            $cancellation
+        } elseif ($capture) {
             $capture
         } elseif ($procDumpCapture) { $procDumpCapture } else { $monitor }
-        $processKind = if ($capture) {
+        $processKind = if ($cancellation) {
+            'cancellation-helper'
+        } elseif ($capture) {
             'hang-capture-worker'
         } elseif ($procDumpCapture) { 'hang-capture-procdump' } else { 'crash-monitor' }
         if (-not $ownedProcess) {
@@ -963,7 +968,13 @@ try {
             Stop-HangCaptureWorker -Capture $ownedProcess
         }
         $stopOutcome = Get-CocStopOutcome -Value $cancel -ProcessKind $processKind
-        $stopped = [bool]$stopOutcome.stopped
+        $selectedStopped = [bool]$stopOutcome.stopped
+        $otherOwnedProcessAlive = if ($processKind -eq 'cancellation-helper') {
+            @($monitor, $capture, $procDumpCapture | Where-Object {
+                $null -ne $_ -and -not $_.HasExited
+            }).Count -gt 0
+        } else { $false }
+        $stopped = $selectedStopped -and -not $otherOwnedProcessAlive
         $owned.data | Add-Member -NotePropertyName cancelPid `
             -NotePropertyValue $(if ($cancel.PSObject.Properties['cancelPid']) {
                 $cancel.cancelPid
@@ -975,7 +986,7 @@ try {
         $owned.data | Add-Member -NotePropertyName cancelState `
             -NotePropertyValue $stopOutcome.cancelState -Force
         if (($cancel.PSObject.Properties['monitorExited'] -and $cancel.monitorExited) -or
-            $processKind -ne 'crash-monitor') {
+            $processKind -in @('hang-capture-worker', 'hang-capture-procdump')) {
             $owned.data | Add-Member -NotePropertyName captureState `
                 -NotePropertyValue $(if ($stopped) {
                     'capture-stopped'
