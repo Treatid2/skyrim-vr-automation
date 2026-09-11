@@ -13,12 +13,16 @@ param(
     [ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedBaselineBuildId,
     [string]$CodexExecutable = 'codex',
     [string]$ProtocolPath = (Join-Path $PSScriptRoot 'protocol.v1.json'),
+    [string]$PackageDeadlineUtc,
     [switch]$NoExit,
     [switch]$Compact
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:invocationStartedUtc = [DateTimeOffset]::UtcNow
+$script:invocationWatch = [Diagnostics.Stopwatch]::StartNew()
+$script:resultDeadlineUtc = $null
 Import-Module (Join-Path $PSScriptRoot 'RenderScaleQualification.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'AutomatedVisualReviewProvider.psm1') -Force
 
@@ -1302,11 +1306,16 @@ function Resolve-BaselineRun([string]$Path, [string]$ExpectedBuildId, [string]$C
         throw "Baseline visual review is invalid or differs from its recomputed result: $($reviewResult.errors -join ' ')"
     }
     $inventory = Get-Content -LiteralPath $inventoryPath -Raw | ConvertFrom-Json -Depth 100
+    $completion = Test-CSXQualificationCompletionReceipt -EvidenceRoot $root -ExpectedRunId ([string]$run.runId)
+    if (-not $completion.ok) {
+        throw "Baseline completion receipt is invalid: $($completion.errors -join ' ')"
+    }
     return [pscustomobject][ordered]@{
         path = $resolved; sha256 = Get-CSXFileSha256 $resolved; run = $run; root = $root
         raw = $raw; rawPath = $rawPath; rawSha256 = Get-CSXFileSha256 $rawPath
         review = $review; reviewPath = $reviewPath; reviewSha256 = Get-CSXFileSha256 $reviewPath
         inventory = $inventory; inventoryPath = $inventoryPath; inventorySha256 = Get-CSXFileSha256 $inventoryPath
+        completionPath = $completion.path; completionSha256 = $completion.sha256; completion = $completion.receipt
         visualIndexPath = $indexPath; visualIndexSha256 = $indexSha256; visualIndex = $index
     }
 }
@@ -1333,6 +1342,7 @@ function Copy-BaselineBundle($Baseline) {
         [pscustomobject]@{ name = 'run.raw.json'; source = $Baseline.rawPath; sha256 = $Baseline.rawSha256 },
         [pscustomobject]@{ name = 'run.json'; source = $Baseline.path; sha256 = $Baseline.sha256 },
         [pscustomobject]@{ name = 'visual-review.json'; source = $Baseline.reviewPath; sha256 = $Baseline.reviewSha256 }
+        [pscustomobject]@{ name = 'qualification-completion.json'; source = $Baseline.completionPath; sha256 = $Baseline.completionSha256 }
     )
     foreach ($file in $companions) {
         $destination = Join-Path $destinationRoot $file.name
@@ -1341,6 +1351,8 @@ function Copy-BaselineBundle($Baseline) {
         if ((Get-CSXFileSha256 $destination) -ne $file.sha256) { throw "Copied baseline companion hash changed: $($file.name)" }
     }
     return [pscustomobject][ordered]@{
+        sourceEvidenceRoot = [IO.Path]::GetFullPath($Baseline.root)
+        completionPath = 'baseline/qualification-completion.json'; completionSha256 = $Baseline.completionSha256
         path = 'baseline/run.json'; runSha256 = $Baseline.sha256
         rawPath = 'baseline/run.raw.json'; rawSha256 = $Baseline.rawSha256
         visualReviewPath = 'baseline/visual-review.json'; visualReviewSha256 = $Baseline.reviewSha256
@@ -1554,8 +1566,10 @@ $baselineEvidence = $null
 $baselineComparisonEvidence = $null
 $liveGpuEvidence = $null
 $timeEvidence = [ordered]@{
-    deadlineStartsAfterRuntimeBinding = $true; captureAssaysElapsedMs = $null; visualEvaluationElapsedMs = $null
-    orchestrationElapsedMs = $null; performanceElapsedMs = $null; within600Seconds = $false
+    deadlineIncludesRuntimeBinding = $true; invocationStartedUtc = $script:invocationStartedUtc.ToString('o')
+    resultDeadlineUtc = $null; bindingElapsedMs = $null; captureAssaysElapsedMs = $null
+    visualEvaluationElapsedMs = $null; orchestrationElapsedMs = $null; evidenceFinalizationElapsedMs = $null
+    invocationElapsedMs = $null; completedUtc = $null; performanceElapsedMs = $null; within600Seconds = $false
 }
 $performanceWatch = [Diagnostics.Stopwatch]::new()
 $script:visualWatch = [Diagnostics.Stopwatch]::new()
@@ -1587,6 +1601,18 @@ try {
     }
     $protocolRecord = Get-CSXQualificationProtocol -Path $ProtocolPath
     $script:protocol = $protocolRecord.protocol
+    $ownDeadline = $script:invocationStartedUtc.AddMilliseconds([double]$script:protocol.timeBudget.endToEndMs)
+    $script:resultDeadlineUtc = $ownDeadline
+    if (-not [string]::IsNullOrWhiteSpace($PackageDeadlineUtc)) {
+        $suppliedDeadline = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParse($PackageDeadlineUtc, [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind, [ref]$suppliedDeadline)) {
+            throw 'PackageDeadlineUtc is not a valid round-trip UTC timestamp.'
+        }
+        if ($suppliedDeadline -lt $script:resultDeadlineUtc) { $script:resultDeadlineUtc = $suppliedDeadline }
+    }
+    if ($script:resultDeadlineUtc -le [DateTimeOffset]::UtcNow) { throw 'The complete qualification result deadline already elapsed.' }
+    $timeEvidence.resultDeadlineUtc = $script:resultDeadlineUtc.ToString('o')
     if ($PrMode -and [bool]$script:protocol.thresholds.prBaselineRequired -and
         ([string]::IsNullOrWhiteSpace($BaselinePath) -or [string]::IsNullOrWhiteSpace($ExpectedBaselineBuildId))) {
         throw 'PR mode requires a matching baseline artifact and explicit baseline Build ID.'
@@ -1616,6 +1642,7 @@ try {
 
     # The hard wall-clock deadline starts only after exact runtime/tool binding.
     $script:orchestrationWatch = [Diagnostics.Stopwatch]::StartNew()
+    $timeEvidence.bindingElapsedMs = [Math]::Round($script:invocationWatch.Elapsed.TotalMilliseconds, 3)
     $fixtureManifestRecord = Get-CSXFixtureManifest -Path $FixtureManifestPath -GpuVendor $GpuVendor
     $script:fixtureManifest = $fixtureManifestRecord.manifest
     Copy-Item -LiteralPath $fixtureManifestRecord.path -Destination (Join-Path $script:evidenceRoot 'fixture-manifest.json')
@@ -1970,6 +1997,8 @@ try {
     if ($PrMode) {
         $bundle = Copy-BaselineBundle $baseline
         $baselineEvidence = [pscustomobject][ordered]@{
+            sourceEvidenceRoot = $bundle.sourceEvidenceRoot
+            completionPath = $bundle.completionPath; completionSha256 = $bundle.completionSha256
             path = $bundle.path; runSha256 = $bundle.runSha256; visualIndexPath = $bundle.visualIndexPath; visualIndexSha256 = $bundle.visualIndexSha256
             rawPath = $bundle.rawPath; rawSha256 = $bundle.rawSha256
             visualReviewPath = $bundle.visualReviewPath; visualReviewSha256 = $bundle.visualReviewSha256
@@ -2006,8 +2035,14 @@ try {
     $timeEvidence.within600Seconds = $timeEvidence.orchestrationElapsedMs -le [int]$script:protocol.timeBudget.orchestrationMs
     if (-not $timeEvidence.within600Seconds) { throw 'The run exceeded the 585 second orchestration deadline.' }
     $script:phase = 'evidence_finalization'
+    $finalizationWatch = [Diagnostics.Stopwatch]::StartNew()
     Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'mcp-transcript.json') -Value @($script:connection.transcript) | Out-Null
     $artifactInventory = Write-AutomationArtifactInventory
+    $timeEvidence.evidenceFinalizationElapsedMs = [Math]::Round($finalizationWatch.Elapsed.TotalMilliseconds, 3)
+    $timeEvidence.invocationElapsedMs = [Math]::Round($script:invocationWatch.Elapsed.TotalMilliseconds, 3)
+    $timeEvidence.completedUtc = [DateTimeOffset]::UtcNow.ToString('o')
+    $timeEvidence.within600Seconds = $script:invocationWatch.Elapsed.TotalMilliseconds -le [double]$script:protocol.timeBudget.endToEndMs -and
+        [DateTimeOffset]::UtcNow -le $script:resultDeadlineUtc
     $raw = [pscustomobject][ordered]@{
         schema = $(if ($PrMode) { 'csx-render-scale-pr-v1-raw' } else { 'csx-render-scale-local-v1-raw' }); runId = $script:runId; createdUtc = [DateTime]::UtcNow.ToString('o'); prMode = [bool]$PrMode
         protocol = [pscustomobject][ordered]@{ schema = $script:protocol.schema; revision = $script:protocol.protocolRevision; sha256 = $protocolRecord.sha256; requiredMethodsCommit = $script:protocol.requiredMethodsCommit }
@@ -2020,9 +2055,52 @@ try {
     $review = New-CSXAutomatedVisualReview -EvidenceDirectory $script:evidenceRoot -RunRaw $raw -VisualIndex $visualIndex -BaselineVisualIndex $baselineIndex
     Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'visual-review.json') -Value $review | Out-Null
     $updated = Update-CSXQualificationReport -EvidenceDirectory $script:evidenceRoot
+    $timeEvidence.evidenceFinalizationElapsedMs = [Math]::Round($finalizationWatch.Elapsed.TotalMilliseconds, 3)
+    $timeEvidence.invocationElapsedMs = [Math]::Round($script:invocationWatch.Elapsed.TotalMilliseconds, 3)
+    $timeEvidence.completedUtc = [DateTimeOffset]::UtcNow.ToString('o')
+    $timeEvidence.within600Seconds = $script:invocationWatch.Elapsed.TotalMilliseconds -le [double]$script:protocol.timeBudget.endToEndMs -and
+        [DateTimeOffset]::UtcNow -le $script:resultDeadlineUtc
+    if (-not $timeEvidence.within600Seconds -or
+        [double]$timeEvidence.evidenceFinalizationElapsedMs -gt [double]$script:protocol.timeBudget.evidenceFinalizationMs) {
+        throw 'The complete qualification result exceeded its end-to-end or evidence-finalization deadline.'
+    }
+    $raw.time = [pscustomobject]$timeEvidence
+    $rawPath = Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'run.raw.json') -Value $raw
+    $review = New-CSXAutomatedVisualReview -EvidenceDirectory $script:evidenceRoot -RunRaw $raw -VisualIndex $visualIndex -BaselineVisualIndex $baselineIndex
+    Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'visual-review.json') -Value $review | Out-Null
+    $updated = Update-CSXQualificationReport -EvidenceDirectory $script:evidenceRoot
+    $completionUtc = [DateTimeOffset]::UtcNow
+    $completionElapsedMs = [Math]::Round($script:invocationWatch.Elapsed.TotalMilliseconds, 3)
+    if ($completionElapsedMs -gt [double]$script:protocol.timeBudget.endToEndMs -or
+        $completionUtc -gt $script:resultDeadlineUtc) {
+        throw 'The sealed qualification result crossed its complete invocation deadline.'
+    }
+    $completionReceipt = [pscustomobject][ordered]@{
+        schema = 'csx-render-scale-qualification-completion-v1'; runId = $script:runId
+        invocationStartedUtc = $script:invocationStartedUtc.ToString('o')
+        completedUtc = $completionUtc.ToString('o'); resultDeadlineUtc = $script:resultDeadlineUtc.ToString('o')
+        invocationElapsedMs = $completionElapsedMs
+        evidenceFinalizationElapsedMs = [Math]::Round($finalizationWatch.Elapsed.TotalMilliseconds, 3)
+        within600Seconds = $true
+        runPath = 'run.json'; runSha256 = Get-CSXFileSha256 $updated.runPath
+        rawPath = 'run.raw.json'; rawSha256 = Get-CSXFileSha256 $rawPath
+        visualReviewPath = 'visual-review.json'; visualReviewSha256 = Get-CSXFileSha256 (Join-Path $script:evidenceRoot 'visual-review.json')
+    }
+    $completionPath = Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'qualification-completion.json') -Value $completionReceipt
+    $sealedFinalizationElapsedMs = [Math]::Round($finalizationWatch.Elapsed.TotalMilliseconds, 3)
+    if ($script:invocationWatch.Elapsed.TotalMilliseconds -gt [double]$script:protocol.timeBudget.endToEndMs -or
+        $sealedFinalizationElapsedMs -gt [double]$script:protocol.timeBudget.evidenceFinalizationMs -or
+        [DateTimeOffset]::UtcNow -gt $script:resultDeadlineUtc) {
+        $completionReceipt.within600Seconds = $false
+        $completionReceipt.evidenceFinalizationElapsedMs = $sealedFinalizationElapsedMs
+        Write-CSXJsonFile -Path $completionPath -Value $completionReceipt | Out-Null
+        throw 'The qualification completion receipt crossed its complete invocation or evidence-finalization deadline.'
+    }
+    $finalizationWatch.Stop()
     $result = [pscustomobject][ordered]@{
         ok = [string]$updated.report.status -in @('PASS', 'LOCAL_PASS'); status = $updated.report.status
         runPath = $updated.runPath; summaryPath = $updated.summaryPath; reviewPath = (Join-Path $script:evidenceRoot 'visual-review.json')
+        completionPath = $completionPath; completionSha256 = Get-CSXFileSha256 $completionPath
         errors = @($updated.report.errors)
     }
 }
@@ -2037,6 +2115,11 @@ catch {
         $timeEvidence.orchestrationElapsedMs = [Math]::Round($script:orchestrationWatch.Elapsed.TotalMilliseconds, 3)
         $timeEvidence.within600Seconds = $timeEvidence.orchestrationElapsedMs -le $(if ($script:protocol) { [int]$script:protocol.timeBudget.orchestrationMs } else { 585000 })
     }
+    $timeEvidence.invocationElapsedMs = [Math]::Round($script:invocationWatch.Elapsed.TotalMilliseconds, 3)
+    $timeEvidence.completedUtc = [DateTimeOffset]::UtcNow.ToString('o')
+    $timeEvidence.within600Seconds = $null -ne $script:resultDeadlineUtc -and
+        $script:invocationWatch.Elapsed.TotalMilliseconds -le $(if ($script:protocol) { [double]$script:protocol.timeBudget.endToEndMs } else { 600000 }) -and
+        [DateTimeOffset]::UtcNow -le $script:resultDeadlineUtc
     $timeEvidence.performanceElapsedMs = [Math]::Round($performanceWatch.Elapsed.TotalMilliseconds, 3)
     if (-not $script:evidenceWritable) {
         $result = [pscustomobject][ordered]@{

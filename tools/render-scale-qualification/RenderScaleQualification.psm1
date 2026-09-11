@@ -1219,6 +1219,41 @@ function Resolve-CSXContainedEvidencePath {
     return $resolved
 }
 
+function Resolve-CSXRecordedEvidencePath {
+    param(
+        [Parameter(Mandatory)][string]$RecordedEvidenceRoot,
+        [Parameter(Mandatory)][string]$RecordedPath,
+        [Parameter(Mandatory)][string]$Label
+    )
+    if ([string]::IsNullOrWhiteSpace($RecordedPath) -or
+        -not [IO.Path]::IsPathFullyQualified($RecordedPath)) {
+        throw "$Label path is missing or is not absolute."
+    }
+    $root = [IO.Path]::GetFullPath($RecordedEvidenceRoot).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar
+    ) + [IO.Path]::DirectorySeparatorChar
+    $resolved = [IO.Path]::GetFullPath($RecordedPath)
+    if (-not $resolved.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label path escapes the recorded evidence root: $RecordedPath"
+    }
+    return $resolved
+}
+
+function ConvertTo-CSXRecordedEvidencePath {
+    param(
+        [Parameter(Mandatory)][string]$EvidenceRoot,
+        [Parameter(Mandatory)][string]$RecordedEvidenceRoot,
+        [Parameter(Mandatory)][string]$PhysicalPath,
+        [Parameter(Mandatory)][string]$Label
+    )
+    $physical = Resolve-CSXContainedEvidencePath -EvidenceRoot $EvidenceRoot `
+        -RecordedPath $PhysicalPath -Label $Label
+    $relative = [IO.Path]::GetRelativePath(
+        [IO.Path]::GetFullPath($EvidenceRoot), $physical
+    )
+    return [IO.Path]::GetFullPath((Join-Path $RecordedEvidenceRoot $relative))
+}
+
 function Add-CSXUniqueVisualEvidencePath {
     param(
         [Parameter(Mandatory)][Collections.Generic.Dictionary[string, string]]$Paths,
@@ -1812,7 +1847,7 @@ function Test-CSXAutomationArtifactInventory {
     $root = [IO.Path]::GetFullPath($EvidenceRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)
     $mutableNames = @(
         '.csx-render-scale-qualification.lock', 'automation-artifacts.json', 'run.raw.json', 'run.json',
-        'visual-review.json', 'failures.json',
+        'visual-review.json', 'qualification-completion.json', 'qualification-package-rejection.json', 'failures.json',
         'pr-summary.md', 'qualification-summary.md'
     )
     $binding = Get-CSXPropertyValue $Raw 'artifactInventory'
@@ -2783,7 +2818,8 @@ function Test-CSXAutomatedVisualReviewEvidence {
         [Parameter(Mandatory)][string]$EvidenceDirectory,
         [Parameter(Mandatory)]$RunRaw,
         [Parameter(Mandatory)]$VisualIndex,
-        $BaselineVisualIndex = $null
+        $BaselineVisualIndex = $null,
+        [string]$RecordedEvidenceDirectory
     )
     $integrityErrors = [Collections.Generic.List[string]]::new()
     $qualityErrors = [Collections.Generic.List[string]]::new()
@@ -2795,6 +2831,9 @@ function Test-CSXAutomatedVisualReviewEvidence {
     $mode = if ($prMode) { 'pr_baseline' } else { 'standalone' }
     $automated = Get-CSXPathValue $RunRaw 'assays.visual.automatedReview'
     $latestCompletedUtc = [DateTimeOffset]::MinValue
+    $recordedEvidenceRoot = if ([string]::IsNullOrWhiteSpace($RecordedEvidenceDirectory)) {
+        [IO.Path]::GetFullPath($EvidenceDirectory)
+    } else { [IO.Path]::GetFullPath($RecordedEvidenceDirectory) }
     try {
         if ([int](Get-CSXPathValue $RunRaw 'protocol.revision' 0) -ne 5) {
             throw 'Automated visual review evidence requires protocol revision 5.'
@@ -3257,9 +3296,9 @@ function Test-CSXAutomatedVisualReviewEvidence {
                 $sourceFile = $sourceFiles[$sourceFullPath]
                 $aliasPath = [string](Get-CSXPropertyValue $binding 'aliasPath')
                 if (-not [IO.Path]::IsPathFullyQualified($aliasPath)) { throw "Automated visual batch $key receipt alias path is not absolute." }
-                $aliasFullPath = Resolve-CSXContainedEvidencePath -EvidenceRoot $EvidenceDirectory -RecordedPath $aliasPath `
+                $aliasFullPath = Resolve-CSXRecordedEvidencePath -RecordedEvidenceRoot $recordedEvidenceRoot -RecordedPath $aliasPath `
                     -Label "Automated visual batch $key receipt alias"
-                $aliasRelative = [IO.Path]::GetRelativePath([IO.Path]::GetFullPath($EvidenceDirectory), $aliasFullPath).Replace('\', '/')
+                $aliasRelative = [IO.Path]::GetRelativePath($recordedEvidenceRoot, $aliasFullPath).Replace('\', '/')
                 $aliasName = [string](Get-CSXPropertyValue $attachment 'aliasName')
                 $aliasPattern = '^visual-review/\.aliases-[A-Fa-f0-9-]{32,36}/pass-' + $presentationPass.ToString('D2') +
                     '-rep-' + $replicate.ToString('D2') + '/' + [regex]::Escape($aliasName) + '$'
@@ -3305,9 +3344,15 @@ function Test-CSXAutomatedVisualReviewEvidence {
                 -not (Test-CSXArrayProperty $providerBatch 'terminationErrors') -or
                 @(Get-CSXPropertyValue $providerBatch 'terminationErrors' @()).Count -ne 0 -or
                 [string](Get-CSXPropertyValue $providerBatch 'promptSha256') -cne $effectivePromptSha256 -or
-                -not [string]::Equals([string](Get-CSXPropertyValue $providerBatch 'outputSchemaPath'), $schemaRecord.path, [StringComparison]::OrdinalIgnoreCase) -or
-                -not [string]::Equals([string](Get-CSXPropertyValue $providerBatch 'responsePath'), $responseRecord.path, [StringComparison]::OrdinalIgnoreCase) -or
-                -not [string]::Equals([string](Get-CSXPropertyValue $providerBatch 'eventsPath'), $eventsRecord.path, [StringComparison]::OrdinalIgnoreCase) -or
+                -not [string]::Equals([string](Get-CSXPropertyValue $providerBatch 'outputSchemaPath'),
+                    (ConvertTo-CSXRecordedEvidencePath -EvidenceRoot $EvidenceDirectory -RecordedEvidenceRoot $recordedEvidenceRoot -PhysicalPath $schemaRecord.path -Label 'Automated visual-review schema'),
+                    [StringComparison]::OrdinalIgnoreCase) -or
+                -not [string]::Equals([string](Get-CSXPropertyValue $providerBatch 'responsePath'),
+                    (ConvertTo-CSXRecordedEvidencePath -EvidenceRoot $EvidenceDirectory -RecordedEvidenceRoot $recordedEvidenceRoot -PhysicalPath $responseRecord.path -Label "Automated visual batch $key response"),
+                    [StringComparison]::OrdinalIgnoreCase) -or
+                -not [string]::Equals([string](Get-CSXPropertyValue $providerBatch 'eventsPath'),
+                    (ConvertTo-CSXRecordedEvidencePath -EvidenceRoot $EvidenceDirectory -RecordedEvidenceRoot $recordedEvidenceRoot -PhysicalPath $eventsRecord.path -Label "Automated visual batch $key events"),
+                    [StringComparison]::OrdinalIgnoreCase) -or
                 [string](Get-CSXPropertyValue $providerBatch 'responseSha256') -cne $responseRecord.sha256 -or
                 [string](Get-CSXPropertyValue $providerBatch 'eventsSha256') -cne $eventsRecord.sha256 -or
                 [string](Get-CSXPropertyValue $providerBatch 'stderr') -ne '' -or
@@ -3507,9 +3552,10 @@ function New-CSXAutomatedVisualReview {
         [Parameter(Mandatory)][string]$EvidenceDirectory,
         [Parameter(Mandatory)]$RunRaw,
         [Parameter(Mandatory)]$VisualIndex,
-        $BaselineVisualIndex = $null
+        $BaselineVisualIndex = $null,
+        [string]$RecordedEvidenceDirectory
     )
-    $evidence = Test-CSXAutomatedVisualReviewEvidence -EvidenceDirectory $EvidenceDirectory -RunRaw $RunRaw -VisualIndex $VisualIndex -BaselineVisualIndex $BaselineVisualIndex
+    $evidence = Test-CSXAutomatedVisualReviewEvidence -EvidenceDirectory $EvidenceDirectory -RunRaw $RunRaw -VisualIndex $VisualIndex -BaselineVisualIndex $BaselineVisualIndex -RecordedEvidenceDirectory $RecordedEvidenceDirectory
     if (-not $evidence.integrityOk) { throw "Automated visual-review evidence is invalid: $($evidence.integrityErrors -join ' ')" }
     $prMode = [bool](Get-CSXPropertyValue $RunRaw 'prMode' $false)
     $rawPath = Join-Path $EvidenceDirectory 'run.raw.json'
@@ -3540,11 +3586,12 @@ function Test-CSXAutomatedVisualReview {
         [Parameter(Mandatory)]$RunRaw,
         [Parameter(Mandatory)]$VisualIndex,
         [Parameter(Mandatory)]$Review,
-        $BaselineVisualIndex = $null
+        $BaselineVisualIndex = $null,
+        [string]$RecordedEvidenceDirectory
     )
     $errors = [Collections.Generic.List[string]]::new()
     $reviewIntegrityOk = $true
-    $evidence = Test-CSXAutomatedVisualReviewEvidence -EvidenceDirectory $EvidenceDirectory -RunRaw $RunRaw -VisualIndex $VisualIndex -BaselineVisualIndex $BaselineVisualIndex
+    $evidence = Test-CSXAutomatedVisualReviewEvidence -EvidenceDirectory $EvidenceDirectory -RunRaw $RunRaw -VisualIndex $VisualIndex -BaselineVisualIndex $BaselineVisualIndex -RecordedEvidenceDirectory $RecordedEvidenceDirectory
     foreach ($error in $evidence.errors) { $errors.Add([string]$error) }
     if (-not $evidence.integrityOk) { $reviewIntegrityOk = $false }
     if ([string](Get-CSXPropertyValue $Review 'schema') -ne 'csx-render-scale-visual-review-v2' -or
@@ -3554,7 +3601,7 @@ function Test-CSXAutomatedVisualReview {
     }
     if ($evidence.integrityOk) {
         try {
-            $expected = New-CSXAutomatedVisualReview -EvidenceDirectory $EvidenceDirectory -RunRaw $RunRaw -VisualIndex $VisualIndex -BaselineVisualIndex $BaselineVisualIndex
+            $expected = New-CSXAutomatedVisualReview -EvidenceDirectory $EvidenceDirectory -RunRaw $RunRaw -VisualIndex $VisualIndex -BaselineVisualIndex $BaselineVisualIndex -RecordedEvidenceDirectory $RecordedEvidenceDirectory
             if (-not (Test-CSXJsonSemanticIdentity $Review $expected)) {
                 $errors.Add('Automated visual review is not the exact mechanical projection of its hash-bound model and telemetry evidence.')
                 $reviewIntegrityOk = $false
@@ -3596,7 +3643,8 @@ function Test-CSXFlattenedBaselineVisualReview {
         [Parameter(Mandatory)][string]$EvidenceDirectory,
         [Parameter(Mandatory)]$RunRaw,
         [Parameter(Mandatory)]$VisualIndex,
-        [Parameter(Mandatory)]$Review
+        [Parameter(Mandatory)]$Review,
+        [string]$RecordedEvidenceDirectory
     )
     if ([int](Get-CSXPathValue $RunRaw 'protocol.revision' 0) -ne 5) {
         return [pscustomobject][ordered]@{
@@ -3612,12 +3660,76 @@ function Test-CSXFlattenedBaselineVisualReview {
             reviewer = Get-CSXPropertyValue $Review 'reviewer'; reviewedUtc = Get-CSXPropertyValue $Review 'reviewedUtc'
         }
     }
-    return Test-CSXAutomatedVisualReview -EvidenceDirectory $EvidenceDirectory -RunRaw $RunRaw -VisualIndex $VisualIndex -Review $Review
+    return Test-CSXAutomatedVisualReview -EvidenceDirectory $EvidenceDirectory -RunRaw $RunRaw -VisualIndex $VisualIndex -Review $Review -RecordedEvidenceDirectory $RecordedEvidenceDirectory
 }
 
 function Test-CSXSha256Text {
     param($Value)
     return [string]$Value -match '^[A-Fa-f0-9]{64}$'
+}
+
+function Test-CSXQualificationCompletionReceipt {
+    param(
+        [Parameter(Mandatory)][string]$EvidenceRoot,
+        [Parameter(Mandatory)][string]$ExpectedRunId
+    )
+    $errors = [Collections.Generic.List[string]]::new()
+    $root = [IO.Path]::GetFullPath($EvidenceRoot)
+    $path = Join-Path $root 'qualification-completion.json'
+    $receipt = $null
+    try {
+        if (Test-Path -LiteralPath (Join-Path $root 'qualification-package-rejection.json') -PathType Leaf) {
+            throw 'The qualification was rejected by its outer package deadline.'
+        }
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw 'The qualification completion receipt is missing.'
+        }
+        $receipt = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -Depth 30
+        Assert-CSXExactObjectProperties -Value $receipt -Expected @(
+            'schema', 'runId', 'invocationStartedUtc', 'completedUtc', 'resultDeadlineUtc',
+            'invocationElapsedMs', 'evidenceFinalizationElapsedMs', 'within600Seconds',
+            'runPath', 'runSha256', 'rawPath', 'rawSha256', 'visualReviewPath', 'visualReviewSha256'
+        ) -Label 'Qualification completion receipt'
+        $started = [DateTimeOffset]::MinValue
+        $completed = [DateTimeOffset]::MinValue
+        $deadline = [DateTimeOffset]::MinValue
+        if ([string](Get-CSXPropertyValue $receipt 'schema') -ne 'csx-render-scale-qualification-completion-v1' -or
+            [string](Get-CSXPropertyValue $receipt 'runId') -ne $ExpectedRunId -or
+            -not [DateTimeOffset]::TryParse([string](Get-CSXPropertyValue $receipt 'invocationStartedUtc'), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$started) -or
+            -not [DateTimeOffset]::TryParse([string](Get-CSXPropertyValue $receipt 'completedUtc'), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$completed) -or
+            -not [DateTimeOffset]::TryParse([string](Get-CSXPropertyValue $receipt 'resultDeadlineUtc'), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$deadline) -or
+            $completed -lt $started -or $completed -gt $deadline -or
+            -not (Test-CSXFiniteNonNegativeNumber (Get-CSXPropertyValue $receipt 'invocationElapsedMs')) -or
+            [double](Get-CSXPropertyValue $receipt 'invocationElapsedMs') -gt 600000 -or
+            -not (Test-CSXFiniteNonNegativeNumber (Get-CSXPropertyValue $receipt 'evidenceFinalizationElapsedMs')) -or
+            [double](Get-CSXPropertyValue $receipt 'evidenceFinalizationElapsedMs') -gt 15000 -or
+            (Get-CSXPropertyValue $receipt 'within600Seconds') -isnot [bool] -or
+            -not [bool](Get-CSXPropertyValue $receipt 'within600Seconds')) {
+            throw 'The qualification completion receipt does not prove its complete invocation deadline.'
+        }
+        foreach ($binding in @(
+            [pscustomobject]@{ path = 'run.json'; pathField = 'runPath'; hashField = 'runSha256' },
+            [pscustomobject]@{ path = 'run.raw.json'; pathField = 'rawPath'; hashField = 'rawSha256' },
+            [pscustomobject]@{ path = 'visual-review.json'; pathField = 'visualReviewPath'; hashField = 'visualReviewSha256' }
+        )) {
+            if ([string](Get-CSXPropertyValue $receipt $binding.pathField) -cne $binding.path) {
+                throw "Qualification completion receipt path '$($binding.pathField)' is not canonical."
+            }
+            $boundPath = Resolve-CSXEvidencePath -EvidenceRoot $root -RelativePath $binding.path
+            $expectedHash = [string](Get-CSXPropertyValue $receipt $binding.hashField)
+            if (-not (Test-CSXSha256Text $expectedHash) -or
+                -not (Test-Path -LiteralPath $boundPath -PathType Leaf) -or
+                (Get-CSXFileSha256 $boundPath) -ne $expectedHash) {
+                throw "Qualification completion receipt hash '$($binding.hashField)' does not bind its artifact."
+            }
+        }
+    }
+    catch { $errors.Add($_.Exception.Message) }
+    return [pscustomobject][ordered]@{
+        ok = $errors.Count -eq 0; path = $path
+        sha256 = $(if (Test-Path -LiteralPath $path -PathType Leaf) { Get-CSXFileSha256 $path } else { $null })
+        receipt = $receipt; errors = @($errors)
+    }
 }
 
 function Test-CSXFiniteNonNegativeNumber {
@@ -4343,27 +4455,44 @@ function Test-CSXFinalizerEnvelope {
     if ($automatedPassed -isnot [bool] -or -not [bool]$automatedPassed) { $errors.Add('Automated gates are not explicitly passed.') }
     if (@(Get-CSXPathValue $Raw 'automatedGates.failures' @()).Count -ne 0) { $errors.Add('Automated gate failures are present.') }
     $withinBudget = Get-CSXPathValue $Raw 'time.within600Seconds'
-    $deadlineAfterBinding = Get-CSXPathValue $Raw 'time.deadlineStartsAfterRuntimeBinding'
+    $deadlineIncludesBinding = Get-CSXPathValue $Raw 'time.deadlineIncludesRuntimeBinding'
+    $bindingMs = Get-CSXPathValue $Raw 'time.bindingElapsedMs'
     $captureAssaysMs = Get-CSXPathValue $Raw 'time.captureAssaysElapsedMs'
     $visualEvaluationMs = Get-CSXPathValue $Raw 'time.visualEvaluationElapsedMs'
     $orchestrationMs = Get-CSXPathValue $Raw 'time.orchestrationElapsedMs'
+    $finalizationMs = Get-CSXPathValue $Raw 'time.evidenceFinalizationElapsedMs'
+    $invocationMs = Get-CSXPathValue $Raw 'time.invocationElapsedMs'
     $performanceMs = Get-CSXPathValue $Raw 'time.performanceElapsedMs'
     try {
         Assert-CSXExactObjectProperties -Value (Get-CSXPropertyValue $Raw 'time') -Expected @(
-            'deadlineStartsAfterRuntimeBinding', 'captureAssaysElapsedMs', 'visualEvaluationElapsedMs',
-            'orchestrationElapsedMs', 'performanceElapsedMs', 'within600Seconds'
+            'deadlineIncludesRuntimeBinding', 'invocationStartedUtc', 'resultDeadlineUtc', 'bindingElapsedMs',
+            'captureAssaysElapsedMs', 'visualEvaluationElapsedMs', 'orchestrationElapsedMs',
+            'evidenceFinalizationElapsedMs', 'invocationElapsedMs', 'completedUtc',
+            'performanceElapsedMs', 'within600Seconds'
         ) -Label 'Raw time evidence'
     }
     catch { $errors.Add($_.Exception.Message) }
-    if ($deadlineAfterBinding -isnot [bool] -or -not [bool]$deadlineAfterBinding -or
+    $invocationStarted = [DateTimeOffset]::MinValue
+    $resultDeadline = [DateTimeOffset]::MinValue
+    $resultCompleted = [DateTimeOffset]::MinValue
+    $timeIntervalValid = [DateTimeOffset]::TryParse([string](Get-CSXPathValue $Raw 'time.invocationStartedUtc'), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$invocationStarted) -and
+        [DateTimeOffset]::TryParse([string](Get-CSXPathValue $Raw 'time.resultDeadlineUtc'), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$resultDeadline) -and
+        [DateTimeOffset]::TryParse([string](Get-CSXPathValue $Raw 'time.completedUtc'), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$resultCompleted) -and
+        $resultCompleted -ge $invocationStarted -and $resultCompleted -le $resultDeadline
+    if ($deadlineIncludesBinding -isnot [bool] -or -not [bool]$deadlineIncludesBinding -or
         $withinBudget -isnot [bool] -or -not [bool]$withinBudget -or
+        -not $timeIntervalValid -or
+        -not (Test-CSXFiniteNonNegativeNumber $bindingMs) -or
         -not (Test-CSXFiniteNonNegativeNumber $captureAssaysMs) -or [double]$captureAssaysMs -gt 495000 -or
         -not (Test-CSXFiniteNonNegativeNumber $visualEvaluationMs) -or [double]$visualEvaluationMs -gt 90000 -or
         -not (Test-CSXFiniteNonNegativeNumber $orchestrationMs) -or [double]$orchestrationMs -gt 585000 -or
+        -not (Test-CSXFiniteNonNegativeNumber $finalizationMs) -or [double]$finalizationMs -gt 15000 -or
+        -not (Test-CSXFiniteNonNegativeNumber $invocationMs) -or [double]$invocationMs -gt 600000 -or
+        [double]$invocationMs + 5.0 -lt [double]$bindingMs + [double]$orchestrationMs + [double]$finalizationMs -or
         -not (Test-CSXFiniteNonNegativeNumber $performanceMs) -or
         -not (Test-CSXNumberClose $performanceMs $captureAssaysMs) -or
         [double]$orchestrationMs + 5.0 -lt [double]$captureAssaysMs + [double]$visualEvaluationMs) {
-        $errors.Add('Raw timing does not prove capture <=495 seconds, vision <=90 seconds, and orchestration <=585 seconds within the 600-second package cap.')
+        $errors.Add('Raw timing does not prove binding plus capture/vision orchestration and finalization completed inside one 600-second invocation deadline.')
     }
     if ($null -ne $protocolRecord) {
         try {
@@ -4448,6 +4577,11 @@ function Test-CSXFinalizerEnvelope {
             $baselineRaw = Get-Content -LiteralPath $baselineRawPath -Raw | ConvertFrom-Json -Depth 100
             $baselineReview = Get-Content -LiteralPath $baselineReviewPath -Raw | ConvertFrom-Json -Depth 100
             $baselineInventory = Get-Content -LiteralPath $baselineInventoryPath -Raw | ConvertFrom-Json -Depth 100
+            $baselineSourceEvidenceRoot = [string](Get-CSXPropertyValue $baseline 'sourceEvidenceRoot')
+            if ([string]::IsNullOrWhiteSpace($baselineSourceEvidenceRoot) -or
+                -not [IO.Path]::IsPathFullyQualified($baselineSourceEvidenceRoot)) {
+                throw 'Bundled baseline metadata omits its absolute immutable source evidence root.'
+            }
             if (@($baselineInventory.entries).Count -ne [int](Get-CSXPropertyValue $baseline 'artifactInventoryEntryCount') -or
                 -not (Test-CSXJsonIdentity (Get-CSXPropertyValue $baselineRaw 'artifactInventory') ([pscustomobject][ordered]@{
                     schema = 'csx-render-scale-automation-artifacts-v1'; path = 'automation-artifacts.json'
@@ -4457,11 +4591,19 @@ function Test-CSXFinalizerEnvelope {
             }
             $baselineEnvelope = Test-CSXFinalizerEnvelope -EvidenceRoot $baselineRoot -Raw $baselineRaw -SkipBaselineComparison
             if (-not $baselineEnvelope.ok) { throw "Bundled baseline raw envelope is invalid: $($baselineEnvelope.errors -join ' ')" }
+            $baselineCompletion = Test-CSXQualificationCompletionReceipt -EvidenceRoot $baselineRoot `
+                -ExpectedRunId ([string](Get-CSXPropertyValue $baselineRaw 'runId'))
+            if (-not $baselineCompletion.ok -or
+                [string](Get-CSXPropertyValue $baseline 'completionPath') -cne 'baseline/qualification-completion.json' -or
+                [string](Get-CSXPropertyValue $baseline 'completionSha256') -cne [string]$baselineCompletion.sha256) {
+                throw "Bundled baseline completion receipt is invalid or not hash-bound by candidate metadata: $($baselineCompletion.errors -join ' ')"
+            }
             if ($null -eq $baselineIndexPath) { throw 'Bundled baseline visual index was not loaded.' }
             $baselineIndexForArtifacts = Get-Content -LiteralPath $baselineIndexPath -Raw | ConvertFrom-Json -Depth 100
             $baselineVisualArtifacts = Test-CSXVisualArtifactEvidence -EvidenceRoot $baselineRoot -Raw $baselineRaw -VisualIndex $baselineIndexForArtifacts
             if (-not $baselineVisualArtifacts.ok) { throw "Bundled baseline visual artifact envelope is invalid: $($baselineVisualArtifacts.errors -join ' ')" }
-            $baselineReviewResult = Test-CSXFlattenedBaselineVisualReview -EvidenceDirectory $baselineRoot -RunRaw $baselineRaw -VisualIndex $baselineIndexForArtifacts -Review $baselineReview
+            $baselineReviewResult = Test-CSXFlattenedBaselineVisualReview -EvidenceDirectory $baselineRoot -RunRaw $baselineRaw -VisualIndex $baselineIndexForArtifacts -Review $baselineReview `
+                -RecordedEvidenceDirectory $baselineSourceEvidenceRoot
             if (-not $baselineReviewResult.ok) { throw "Bundled baseline visual review snapshot is invalid: $($baselineReviewResult.errors -join ' ')" }
             foreach ($name in @('runId', 'prMode', 'protocol', 'fixture', 'runtime', 'time', 'assays', 'recoveries', 'baseline', 'artifactInventory', 'automatedGates')) {
                 if (-not (Test-CSXJsonIdentity (Get-CSXPropertyValue $baselineRun $name) (Get-CSXPropertyValue $baselineRaw $name))) {
@@ -4514,28 +4656,45 @@ function Test-CSXFinalizerEnvelope {
                 [string](Get-CSXPathValue $baselineRun 'visualReview.state') -ne 'PASS') {
                 $errors.Add('Bundled baseline does not preserve passed automated and visual gates.')
             }
-            $baselineDeadlineAfterBinding = Get-CSXPathValue $baselineRun 'time.deadlineStartsAfterRuntimeBinding'
+            $baselineDeadlineIncludesBinding = Get-CSXPathValue $baselineRun 'time.deadlineIncludesRuntimeBinding'
             $baselineWithinBudget = Get-CSXPathValue $baselineRun 'time.within600Seconds'
+            $baselineBindingMs = Get-CSXPathValue $baselineRun 'time.bindingElapsedMs'
             $baselineCaptureAssaysMs = Get-CSXPathValue $baselineRun 'time.captureAssaysElapsedMs'
             $baselineVisualEvaluationMs = Get-CSXPathValue $baselineRun 'time.visualEvaluationElapsedMs'
             $baselineOrchestrationMs = Get-CSXPathValue $baselineRun 'time.orchestrationElapsedMs'
+            $baselineFinalizationMs = Get-CSXPathValue $baselineRun 'time.evidenceFinalizationElapsedMs'
+            $baselineInvocationMs = Get-CSXPathValue $baselineRun 'time.invocationElapsedMs'
             $baselinePerformanceMs = Get-CSXPathValue $baselineRun 'time.performanceElapsedMs'
             try {
                 Assert-CSXExactObjectProperties -Value (Get-CSXPropertyValue $baselineRun 'time') -Expected @(
-                    'deadlineStartsAfterRuntimeBinding', 'captureAssaysElapsedMs', 'visualEvaluationElapsedMs',
-                    'orchestrationElapsedMs', 'performanceElapsedMs', 'within600Seconds'
+                    'deadlineIncludesRuntimeBinding', 'invocationStartedUtc', 'resultDeadlineUtc', 'bindingElapsedMs',
+                    'captureAssaysElapsedMs', 'visualEvaluationElapsedMs', 'orchestrationElapsedMs',
+                    'evidenceFinalizationElapsedMs', 'invocationElapsedMs', 'completedUtc',
+                    'performanceElapsedMs', 'within600Seconds'
                 ) -Label 'Bundled baseline time evidence'
             }
             catch { $errors.Add($_.Exception.Message) }
-            if ($baselineDeadlineAfterBinding -isnot [bool] -or -not [bool]$baselineDeadlineAfterBinding -or
+            $baselineInvocationStarted = [DateTimeOffset]::MinValue
+            $baselineResultDeadline = [DateTimeOffset]::MinValue
+            $baselineResultCompleted = [DateTimeOffset]::MinValue
+            $baselineTimeIntervalValid = [DateTimeOffset]::TryParse([string](Get-CSXPathValue $baselineRun 'time.invocationStartedUtc'), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$baselineInvocationStarted) -and
+                [DateTimeOffset]::TryParse([string](Get-CSXPathValue $baselineRun 'time.resultDeadlineUtc'), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$baselineResultDeadline) -and
+                [DateTimeOffset]::TryParse([string](Get-CSXPathValue $baselineRun 'time.completedUtc'), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$baselineResultCompleted) -and
+                $baselineResultCompleted -ge $baselineInvocationStarted -and $baselineResultCompleted -le $baselineResultDeadline
+            if ($baselineDeadlineIncludesBinding -isnot [bool] -or -not [bool]$baselineDeadlineIncludesBinding -or
                 $baselineWithinBudget -isnot [bool] -or -not [bool]$baselineWithinBudget -or
+                -not $baselineTimeIntervalValid -or
+                -not (Test-CSXFiniteNonNegativeNumber $baselineBindingMs) -or
                 -not (Test-CSXFiniteNonNegativeNumber $baselineCaptureAssaysMs) -or [double]$baselineCaptureAssaysMs -gt 495000 -or
                 -not (Test-CSXFiniteNonNegativeNumber $baselineVisualEvaluationMs) -or [double]$baselineVisualEvaluationMs -gt 90000 -or
                 -not (Test-CSXFiniteNonNegativeNumber $baselineOrchestrationMs) -or [double]$baselineOrchestrationMs -gt 585000 -or
+                -not (Test-CSXFiniteNonNegativeNumber $baselineFinalizationMs) -or [double]$baselineFinalizationMs -gt 15000 -or
+                -not (Test-CSXFiniteNonNegativeNumber $baselineInvocationMs) -or [double]$baselineInvocationMs -gt 600000 -or
+                [double]$baselineInvocationMs + 5.0 -lt [double]$baselineBindingMs + [double]$baselineOrchestrationMs + [double]$baselineFinalizationMs -or
                 -not (Test-CSXFiniteNonNegativeNumber $baselinePerformanceMs) -or
                 -not (Test-CSXNumberClose $baselinePerformanceMs $baselineCaptureAssaysMs) -or
                 [double]$baselineOrchestrationMs + 5.0 -lt [double]$baselineCaptureAssaysMs + [double]$baselineVisualEvaluationMs) {
-                $errors.Add('Bundled baseline timing does not prove capture <=495 seconds, vision <=90 seconds, and orchestration <=585 seconds.')
+                $errors.Add('Bundled baseline timing does not prove complete binding, orchestration, and finalization inside one invocation deadline.')
             }
             if ($null -ne $protocolRecord) {
                 try {
