@@ -20,6 +20,43 @@ $script:CSXCodexRequiredExecHelpFeatures = @(
     '--model'
 )
 
+if (-not ('CSXProviderStreamCapture' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+
+public sealed class CSXProviderStreamCapture
+{
+    private readonly object gate = new object();
+    private readonly StringBuilder text = new StringBuilder();
+    public Task Completion { get; }
+
+    public CSXProviderStreamCapture(TextReader reader)
+    {
+        Completion = PumpAsync(reader);
+    }
+
+    private async Task PumpAsync(TextReader reader)
+    {
+        var buffer = new char[4096];
+        while (true)
+        {
+            int count = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
+            if (count == 0) return;
+            lock (gate) text.Append(buffer, 0, count);
+        }
+    }
+
+    public string Snapshot()
+    {
+        lock (gate) return text.ToString();
+    }
+}
+'@
+}
+
 function Get-CSXProviderPropertyValue {
     param($InputObject, [Parameter(Mandatory)][string]$Name, $Default = $null)
 
@@ -144,6 +181,8 @@ function Invoke-CSXProviderCommand {
     $processId = $null
     $stdoutTask = $null
     $stderrTask = $null
+    $stdoutCapture = $null
+    $stderrCapture = $null
     $stdinCloseTask = $null
     $setupError = $null
     $timedOut = $false
@@ -157,8 +196,10 @@ function Invoke-CSXProviderCommand {
         if (-not $process.Start()) { throw 'Process.Start returned false.' }
         $launched = $true
         $processId = $process.Id
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $stdoutCapture = [CSXProviderStreamCapture]::new($process.StandardOutput)
+        $stderrCapture = [CSXProviderStreamCapture]::new($process.StandardError)
+        $stdoutTask = $stdoutCapture.Completion
+        $stderrTask = $stderrCapture.Completion
         if ($CloseStandardInput) { $stdinCloseTask = $process.StandardInput.DisposeAsync().AsTask() }
     }
     catch {
@@ -222,8 +263,8 @@ function Invoke-CSXProviderCommand {
             $terminationErrors.Add('Provider command standard-input closure did not complete successfully within the command deadline.')
         }
     }
-    $stdout = if ($streamDrainComplete) { $stdoutTask.GetAwaiter().GetResult() } else { '' }
-    $stderr = if ($streamDrainComplete) { $stderrTask.GetAwaiter().GetResult() } else { '' }
+    $stdout = if ($null -ne $stdoutCapture) { $stdoutCapture.Snapshot() } else { '' }
+    $stderr = if ($null -ne $stderrCapture) { $stderrCapture.Snapshot() } else { '' }
     $watch.Stop()
     try {
         return [pscustomobject][ordered]@{
@@ -402,6 +443,12 @@ function Get-CSXCodexVisualReviewProviderPreflight {
                 $probeError = ([string](Get-CSXProviderPropertyValue $modelProbeResult 'stderr' '')).Trim()
                 $errors.Add("Codex model capability probe failed for '$($script:CSXCodexVisualReviewModel)': $probeError")
             }
+            elseif ([string]::IsNullOrWhiteSpace([string](Get-CSXProviderPropertyValue $modelProbeResult 'stdout' ''))) {
+                $errors.Add("Codex model capability probe returned no output for '$($script:CSXCodexVisualReviewModel)'.")
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace([string](Get-CSXProviderPropertyValue $modelProbeResult 'stderr' ''))) {
+                $errors.Add("Codex model capability probe returned stderr for '$($script:CSXCodexVisualReviewModel)'.")
+            }
         }
         catch {
             $errors.Add("Codex model capability probe failed for '$($script:CSXCodexVisualReviewModel)': $($_.Exception.Message)")
@@ -453,7 +500,9 @@ function Get-CSXCodexVisualReviewProviderPreflight {
             attempted = $null -ne $modelProbeResult
             ok = $null -ne $modelProbeResult -and
                 -not [bool](Get-CSXProviderPropertyValue $modelProbeResult 'timedOut' $false) -and
-                [int](Get-CSXProviderPropertyValue $modelProbeResult 'exitCode' -1) -eq 0
+                [int](Get-CSXProviderPropertyValue $modelProbeResult 'exitCode' -1) -eq 0 -and
+                -not [string]::IsNullOrWhiteSpace([string](Get-CSXProviderPropertyValue $modelProbeResult 'stdout' '')) -and
+                [string]::IsNullOrWhiteSpace([string](Get-CSXProviderPropertyValue $modelProbeResult 'stderr' ''))
             timeoutMilliseconds = $ModelProbeTimeoutMilliseconds
             exitCode = Get-CSXProviderPropertyValue $modelProbeResult 'exitCode'
             timedOut = [bool](Get-CSXProviderPropertyValue $modelProbeResult 'timedOut' $false)
@@ -820,6 +869,8 @@ function Invoke-CSXCodexVisualReviewProvider {
                 process = $process
                 stdoutTask = $null
                 stderrTask = $null
+                stdoutCapture = $null
+                stderrCapture = $null
                 inputTask = $null
                 inputCloseTask = $null
                 inputCompleted = $false
@@ -844,8 +895,15 @@ function Invoke-CSXCodexVisualReviewProvider {
                 if (-not $process.Start()) { throw 'Process.Start returned false.' }
                 $context.launched = $true
                 $context.processId = $process.Id
-                $context.stdoutTask = $process.StandardOutput.ReadToEndAsync()
-                $context.stderrTask = $process.StandardError.ReadToEndAsync()
+                if (-not $effectiveStartInfo.RedirectStandardOutput -or
+                    -not $effectiveStartInfo.RedirectStandardError -or
+                    -not $effectiveStartInfo.RedirectStandardInput) {
+                    throw 'Provider process streams are not fully redirected.'
+                }
+                $context.stdoutCapture = [CSXProviderStreamCapture]::new($process.StandardOutput)
+                $context.stderrCapture = [CSXProviderStreamCapture]::new($process.StandardError)
+                $context.stdoutTask = $context.stdoutCapture.Completion
+                $context.stderrTask = $context.stderrCapture.Completion
                 $context.inputTask = $process.StandardInput.WriteAsync($batch.promptText)
             }
             catch {
@@ -908,10 +966,10 @@ function Invoke-CSXCodexVisualReviewProvider {
             $stdoutComplete = $null -ne $context.stdoutTask -and $context.stdoutTask.IsCompletedSuccessfully
             $stderrComplete = $null -ne $context.stderrTask -and $context.stderrTask.IsCompletedSuccessfully
             $streamDrainComplete = $stdoutComplete -and $stderrComplete
-            if ($stdoutComplete) { $stdout = $context.stdoutTask.GetAwaiter().GetResult() }
-            else { $errors.Add('Codex stdout collection did not complete successfully within the shared provider deadline.') }
-            if ($stderrComplete) { $stderr = $context.stderrTask.GetAwaiter().GetResult() }
-            else { $errors.Add('Codex stderr collection did not complete successfully within the shared provider deadline.') }
+            if ($null -ne $context.stdoutCapture) { $stdout = $context.stdoutCapture.Snapshot() }
+            if ($null -ne $context.stderrCapture) { $stderr = $context.stderrCapture.Snapshot() }
+            if (-not $stdoutComplete) { $errors.Add('Codex stdout collection did not complete successfully within the shared provider deadline.') }
+            if (-not $stderrComplete) { $errors.Add('Codex stderr collection did not complete successfully within the shared provider deadline.') }
             if ($context.launched -and -not $context.inputCompleted) { $errors.Add('Codex prompt delivery did not complete within the shared provider deadline.') }
             if ($context.launched -and -not $context.exitVerified) { $errors.Add("Codex PID $($context.processId) remains unresolved after owned process-tree termination.") }
             foreach ($terminationError in @($context.terminationErrors)) { $errors.Add($terminationError) }

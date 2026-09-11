@@ -1121,7 +1121,8 @@ function Set-TestArtifactInventory {
     param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)]$Raw)
     $excluded = @(
         '.csx-render-scale-qualification.lock', 'automation-artifacts.json', 'run.raw.json', 'run.json',
-        'visual-review.json', 'failures.json', 'pr-summary.md', 'qualification-summary.md'
+        'visual-review.json', 'qualification-completion.json', 'qualification-package-rejection.json',
+        'failures.json', 'pr-summary.md', 'qualification-summary.md'
     )
     $entries = [Collections.Generic.List[object]]::new()
     foreach ($file in @(Get-ChildItem -LiteralPath $Root -File -Recurse | Sort-Object FullName)) {
@@ -1178,8 +1179,12 @@ function New-TestEvidenceEnvelope {
         fixture = Copy-TestObject $FixtureIdentity
         runtime = New-TestRuntimeEvidence $BuildId
         time = [pscustomobject][ordered]@{
-            deadlineStartsAfterRuntimeBinding = $true; captureAssaysElapsedMs = 450000.0; visualEvaluationElapsedMs = 50000.0
-            orchestrationElapsedMs = 500000.0; performanceElapsedMs = 450000.0; within600Seconds = $true
+            deadlineIncludesRuntimeBinding = $true; invocationStartedUtc = '2026-08-26T12:00:00Z'
+            resultDeadlineUtc = '2026-08-26T12:10:00Z'; bindingElapsedMs = 1000.0
+            captureAssaysElapsedMs = 450000.0; visualEvaluationElapsedMs = 50000.0
+            orchestrationElapsedMs = 500000.0; evidenceFinalizationElapsedMs = 5000.0
+            invocationElapsedMs = 506000.0; completedUtc = '2026-08-26T12:08:26Z'
+            performanceElapsedMs = 450000.0; within600Seconds = $true
         }
         assays = $assays; recoveries = New-TestRecoveries; baseline = $Baseline
         artifactInventory = $null
@@ -1198,7 +1203,20 @@ function New-TestEvidenceEnvelope {
     $review = New-CSXAutomatedVisualReview -EvidenceDirectory $Root -RunRaw $raw -VisualIndex $visual.index -BaselineVisualIndex $baselineIndex
     Write-CSXJsonFile -Path (Join-Path $Root 'visual-review.json') -Value $review | Out-Null
     $final = Update-CSXQualificationReport -EvidenceDirectory $Root
-    return [pscustomobject][ordered]@{ raw = $raw; review = $review; index = $visual.index; final = $final }
+    $completion = [pscustomobject][ordered]@{
+        schema = 'csx-render-scale-qualification-completion-v1'; runId = $RunId
+        invocationStartedUtc = $raw.time.invocationStartedUtc; completedUtc = $raw.time.completedUtc
+        resultDeadlineUtc = $raw.time.resultDeadlineUtc; invocationElapsedMs = $raw.time.invocationElapsedMs
+        evidenceFinalizationElapsedMs = $raw.time.evidenceFinalizationElapsedMs; within600Seconds = $true
+        runPath = 'run.json'; runSha256 = Get-CSXFileSha256 $final.runPath
+        rawPath = 'run.raw.json'; rawSha256 = Get-CSXFileSha256 (Join-Path $Root 'run.raw.json')
+        visualReviewPath = 'visual-review.json'; visualReviewSha256 = Get-CSXFileSha256 (Join-Path $Root 'visual-review.json')
+    }
+    $completionPath = Write-CSXJsonFile -Path (Join-Path $Root 'qualification-completion.json') -Value $completion
+    return [pscustomobject][ordered]@{
+        raw = $raw; review = $review; index = $visual.index; final = $final
+        completion = $completion; completionPath = $completionPath
+    }
 }
 
 function Assert-EvidenceTamperRejected {
@@ -1222,8 +1240,9 @@ function Assert-EvidenceTamperRejected {
         $review.baselineRunSha256 = $(if ([bool]$raw.prMode) { [string]$raw.baseline.runSha256 } else { $null })
         Write-CSXJsonFile -Path (Join-Path $CaseRoot 'visual-review.json') -Value $review | Out-Null
         $result = Update-CSXQualificationReport -EvidenceDirectory $CaseRoot
+        $errorText = $result.report.errors -join ' | '
         Assert-Test ($result.report.status -notin @('PASS', 'LOCAL_PASS') -and
-            ($result.report.errors -join ' | ') -match $ErrorPattern) $Message
+            $errorText -match $ErrorPattern) "$Message Status=$($result.report.status); errors=$errorText"
     }
     finally {
         if (Test-Path -LiteralPath $CaseRoot) { Remove-Item -LiteralPath $CaseRoot -Recurse -Force }
@@ -1548,10 +1567,11 @@ try {
         manifest = $fixtureManifestIdentity; inputs = $fixtureInputs
     }
     $candidateRoot = Join-Path $fixture 'candidate'
+    $baselineSourceRoot = Join-Path $fixture 'baseline-source'
     $baselineRoot = Join-Path $candidateRoot 'baseline'
     $candidateBuildId = 'e' * 64
     $baselineBuildId = 'f' * 64
-    $baselineEnvelope = New-TestEvidenceEnvelope -Root $baselineRoot -RunId rsq-baseline -BuildId $baselineBuildId `
+    $baselineEnvelope = New-TestEvidenceEnvelope -Root $baselineSourceRoot -RunId rsq-baseline -BuildId $baselineBuildId `
         -ProtocolRecord $record -FixtureIdentity $fixtureIdentity -ProtocolSource $protocolPath -FixtureSource $fixtureManifestPath
     Assert-Test ($baselineEnvelope.final.report.status -eq 'LOCAL_PASS') `
         "Complete standalone baseline evidence did not finalize: $($baselineEnvelope.final.report.errors -join ' | ')"
@@ -1562,8 +1582,8 @@ try {
         'Standalone synthetic evidence does not bind the exact unattended image-model envelope.'
     Assert-Test ((@($standaloneAutomated.batches | ForEach-Object { "$($_.presentationPass):$($_.replicate)" }) -join ',') -eq
         '1:1,1:2,1:3,2:1,2:2,2:3') 'Standalone image-model batches are not in pass-major order.'
-    $standalonePassOne = Get-Content -LiteralPath (Join-Path $baselineRoot $standaloneAutomated.batches[0].requestPath) -Raw | ConvertFrom-Json -Depth 100
-    $standalonePassTwo = Get-Content -LiteralPath (Join-Path $baselineRoot $standaloneAutomated.batches[3].requestPath) -Raw | ConvertFrom-Json -Depth 100
+    $standalonePassOne = Get-Content -LiteralPath (Join-Path $baselineSourceRoot $standaloneAutomated.batches[0].requestPath) -Raw | ConvertFrom-Json -Depth 100
+    $standalonePassTwo = Get-Content -LiteralPath (Join-Path $baselineSourceRoot $standaloneAutomated.batches[3].requestPath) -Raw | ConvertFrom-Json -Depth 100
     $standaloneOrderOne = @($standalonePassOne.body.attachmentOrder | ForEach-Object { "$($_.ordinal):$($_.view):$($_.sha256)" })
     $standaloneOrderTwo = @($standalonePassTwo.body.attachmentOrder | ForEach-Object { "$($_.ordinal):$($_.view):$($_.sha256)" })
     [array]::Reverse($standaloneOrderOne)
@@ -1572,10 +1592,14 @@ try {
         ($standaloneOrderOne -join ',') -eq ($standaloneOrderTwo -join ',')) `
         'Standalone pass two is not the exact reversed, one-based nine-attachment presentation.'
 
+    New-Item -ItemType Directory -Path $candidateRoot -Force | Out-Null
+    Copy-Item -LiteralPath $baselineSourceRoot -Destination $baselineRoot -Recurse
     $candidatePreview = New-TestCoreAssays -Protocol $protocol -RunId rsq-candidate -BuildId $candidateBuildId -VisualIndexSha256 ('0' * 64)
     $cocComparison = Get-CSXPairedComparison -Candidate @($candidatePreview.coc.records) -Baseline @($baselineEnvelope.raw.assays.coc.records)
     $menuComparison = Get-CSXPairedComparison -Candidate @($candidatePreview.menu.records) -Baseline @($baselineEnvelope.raw.assays.menu.records)
     $baselineMetadata = [pscustomobject][ordered]@{
+        sourceEvidenceRoot = [IO.Path]::GetFullPath($baselineSourceRoot)
+        completionPath = 'baseline/qualification-completion.json'; completionSha256 = Get-CSXFileSha256 (Join-Path $baselineRoot 'qualification-completion.json')
         path = 'baseline/run.json'; runSha256 = Get-CSXFileSha256 (Join-Path $baselineRoot 'run.json')
         rawPath = 'baseline/run.raw.json'; rawSha256 = Get-CSXFileSha256 (Join-Path $baselineRoot 'run.raw.json')
         visualReviewPath = 'baseline/visual-review.json'; visualReviewSha256 = Get-CSXFileSha256 (Join-Path $baselineRoot 'visual-review.json')
@@ -1586,6 +1610,8 @@ try {
         cocPaired = $cocComparison; menuPaired = $menuComparison
         gates = [pscustomobject][ordered]@{ cocAggregateMedianP95 = $true; menuAggregateMedianP95 = $true }
     }
+    Remove-Item -LiteralPath $baselineSourceRoot -Recurse -Force
+    Assert-Test (-not (Test-Path -LiteralPath $baselineSourceRoot)) 'The relocated baseline test still depended on its original evidence directory.'
     $candidateEnvelope = New-TestEvidenceEnvelope -Root $candidateRoot -RunId rsq-candidate -BuildId $candidateBuildId `
         -ProtocolRecord $record -FixtureIdentity $fixtureIdentity -ProtocolSource $protocolPath -FixtureSource $fixtureManifestPath `
         -Baseline $baselineMetadata
@@ -1766,6 +1792,9 @@ try {
         [pscustomobject]@{ name = 'automated gate'; pattern = 'Automated gates'; mutate = { param($value) $value.automatedGates.passed = $false } },
         [pscustomobject]@{ name = 'duplicate COC ordinal'; pattern = 'ordinal 2 is missing or duplicated'; mutate = { param($value) $value.assays.coc.records[1].ordinal = 1 } },
         [pscustomobject]@{ name = 'performance gate'; pattern = 'performance comparison gates'; mutate = { param($value) $value.baseline.gates.cocAggregateMedianP95 = $false } },
+        [pscustomobject]@{ name = 'baseline recorded root'; pattern = 'recorded evidence root|escapes'; mutate = { param($value) $value.baseline.sourceEvidenceRoot = [IO.Path]::GetFullPath($candidateRoot) } },
+        [pscustomobject]@{ name = 'baseline completion binding'; pattern = 'completion receipt'; mutate = { param($value) $value.baseline.completionSha256 = ('0' * 64) } },
+        [pscustomobject]@{ name = 'evidence finalization deadline'; pattern = 'Raw timing'; mutate = { param($value) $value.time.evidenceFinalizationElapsedMs = 15001.0 } },
         [pscustomobject]@{
             name = 'missing automated batch'; pattern = 'six|batch|Automated visual'
             mutate = { param($value) $value.assays.visual.automatedReview.batches = @($value.assays.visual.automatedReview.batches | Select-Object -First 5) }
@@ -1775,6 +1804,7 @@ try {
         Assert-FinalizerRejects -Root $candidateRoot -Raw $raw -Review $review -Mutation $case.mutate `
             -ErrorPattern $case.pattern -Message "Finalizer accepted invalid $($case.name) evidence." -RebindInventory
     }
+    Set-TestArtifactInventory -Root $candidateRoot -Raw $raw | Out-Null
     Write-CSXJsonFile -Path (Join-Path $candidateRoot 'run.raw.json') -Value $raw | Out-Null
     $review.runRawSha256 = Get-CSXFileSha256 (Join-Path $candidateRoot 'run.raw.json')
     $review.baselineRunSha256 = $raw.baseline.runSha256

@@ -151,6 +151,27 @@ Run Codex non-interactively
     Assert-ProviderTest (-not $modelFailurePreflight.ok -and -not $modelFailurePreflight.modelProbe.ok) 'An unavailable visual-review model passed preflight.'
     Assert-ProviderTest ("Codex model capability probe failed for 'gpt-5.6-sol': model unavailable" -in @($modelFailurePreflight.errors)) 'Model capability failure was not reported with trimmed evidence.'
 
+    foreach ($probeCase in @(
+        [pscustomobject]@{ name = 'empty stdout'; stdout = ''; stderr = ''; pattern = 'returned no output' },
+        [pscustomobject]@{ name = 'nonempty stderr'; stdout = '{"type":"turn.completed"}'; stderr = 'probe warning'; pattern = 'returned stderr' }
+    )) {
+        $probeAdapter = {
+            param([string]$ExecutablePath, [string[]]$CommandArguments, [int]$TimeoutMilliseconds)
+
+            if (($CommandArguments -join '|') -eq '--version') {
+                return New-ProviderCommandResult -ExitCode 0 -Stdout "codex-cli 9.8.7-test`n" -Stderr ''
+            }
+            if (($CommandArguments -join '|') -in @('--help', 'exec|--help')) {
+                return New-ProviderCommandResult -ExitCode 0 -Stdout $fakeHelp -Stderr ''
+            }
+            return New-ProviderCommandResult -ExitCode 0 -Stdout ([string]$probeCase.stdout) -Stderr ([string]$probeCase.stderr)
+        }.GetNewClosure()
+        $rejectedProbe = Get-CSXCodexVisualReviewProviderPreflight -CodexExecutable $pwshPath -CommandAdapter $probeAdapter
+        Assert-ProviderTest (-not $rejectedProbe.ok -and -not $rejectedProbe.modelProbe.ok -and
+            (($rejectedProbe.errors -join ' | ') -match $probeCase.pattern)) `
+            "A successful-process model probe with $($probeCase.name) crossed provider admission."
+    }
+
     $builderResponsePath = Join-Path $fakeWorkingDirectory 'builder response.json'
     $startInfo = New-CSXCodexVisualReviewProcessStartInfo -CodexExecutablePath $pwshPath `
         -WorkingDirectory $fakeWorkingDirectory -PromptText 'safe stdin prompt' `
@@ -281,6 +302,40 @@ $response = [ordered]@{ fake = $true; imageCount = $imageCount; prompt = $prompt
     Assert-ProviderTest (@($timeoutExecution.batches | Where-Object { $_.presentationPass -eq 1 -and $_.terminationRequested -and $_.terminationConfirmed -and -not $_.unresolvedProcess }).Count -eq 3) 'Timed-out replicate custody was not terminated and verified.'
     Assert-ProviderTest (@($timeoutExecution.batches | Where-Object { $_.presentationPass -eq 2 -and $_.status -eq 'not_started_deadline' }).Count -eq 3) 'The second presentation pass started after the shared deadline.'
 
+    $partialStreamAdapter = {
+        param(
+            [Diagnostics.ProcessStartInfo]$OriginalStartInfo,
+            [int]$PresentationPass,
+            [int]$Replicate
+        )
+
+        $replacement = [Diagnostics.ProcessStartInfo]::new()
+        $replacement.FileName = $pwshPath
+        $replacement.WorkingDirectory = $OriginalStartInfo.WorkingDirectory
+        $replacement.UseShellExecute = $false
+        $replacement.CreateNoWindow = $true
+        $replacement.RedirectStandardInput = $true
+        $replacement.RedirectStandardOutput = $true
+        $replacement.RedirectStandardError = $true
+        foreach ($argument in @('-NoLogo', '-NoProfile', '-Command',
+            "[Console]::Out.WriteLine('{`"type`":`"partial-prefix`"}'); [Console]::Error.Write('partial-stderr'); [Console]::Out.Flush(); [Console]::Error.Flush(); [Threading.Thread]::Sleep(5000)")) {
+            [void]$replacement.ArgumentList.Add($argument)
+        }
+        return $replacement
+    }
+    $partialRoot = Join-Path $fakeWorkingDirectory 'partial stream execution'
+    New-Item -ItemType Directory -Path $partialRoot | Out-Null
+    $partialPasses = New-ProviderTestPasses -Root $partialRoot -SchemaPath $schemaPath `
+        -Images @($imageOne) -PromptSuffix 'partial streams'
+    $partialExecution = Invoke-CSXCodexVisualReviewProvider -WorkingDirectory $fakeWorkingDirectory `
+        -Passes $partialPasses -Preflight $preflight -DeadlineSeconds 1 `
+        -ProcessStartInfoAdapter $partialStreamAdapter
+    $partialFirstPass = @($partialExecution.batches | Where-Object presentationPass -eq 1)
+    Assert-ProviderTest (@($partialFirstPass | Where-Object { $_.stdout -match 'partial-prefix' }).Count -eq 3) `
+        'Timed-out provider batches discarded their received stdout prefix.'
+    Assert-ProviderTest (@($partialFirstPass | Where-Object { $_.stderr -match 'partial-stderr' }).Count -eq 3) `
+        'Timed-out provider batches discarded their received stderr prefix.'
+
     $nonReadingAdapter = {
         param(
             [Diagnostics.ProcessStartInfo]$OriginalStartInfo,
@@ -330,7 +385,8 @@ $response = [ordered]@{ fake = $true; imageCount = $imageCount; prompt = $prompt
     $setupFailureExecution = Invoke-CSXCodexVisualReviewProvider -WorkingDirectory $fakeWorkingDirectory `
         -Passes $setupFailurePasses -Preflight $preflight -DeadlineSeconds 5 `
         -ProcessStartInfoAdapter $setupFailureAdapter
-    Assert-ProviderTest (@($setupFailureExecution.batches | Where-Object { $_.launched -and $_.status -eq 'setup_failed' }).Count -eq 6) 'Post-launch setup failures were mislabeled as unstarted processes.'
+    Assert-ProviderTest (@($setupFailureExecution.batches | Where-Object { $_.launched -and $_.status -eq 'setup_failed' }).Count -eq 6) `
+        "Post-launch setup failures were mislabeled: $(@($setupFailureExecution.batches | Select-Object presentationPass,replicate,status,launched,setupError,timedOut | ConvertTo-Json -Compress) -join '')"
     Assert-ProviderTest (@($setupFailureExecution.batches | Where-Object { $_.terminationRequested -and $_.terminationConfirmed -and $_.exitVerified -and -not $_.unresolvedProcess }).Count -eq 6) 'Post-launch setup failures lost owned-child termination evidence.'
 
     $selfExitAdapter = {

@@ -166,6 +166,7 @@ try {
         FixtureManifestPath = $resolvedFixture
         CodexExecutable = $CodexExecutable
         ProtocolPath = $ProtocolPath
+        PackageDeadlineUtc = ([DateTimeOffset]$packageDeadlineUtc).ToString('o')
         NoExit = $true
         Compact = $true
     }
@@ -184,6 +185,15 @@ try {
     $endToEndLimit = [int]((Get-Content -LiteralPath $ProtocolPath -Raw | ConvertFrom-Json -Depth 100).timeBudget.endToEndMs)
     $elapsedMs = [Math]::Round($packageWatch.Elapsed.TotalMilliseconds, 3)
     if ($elapsedMs -gt $endToEndLimit -and [string]$runnerResult.status -in @('PASS', 'LOCAL_PASS')) {
+        if (-not [string]::IsNullOrWhiteSpace($resolvedEvidence) -and
+            (Test-Path -LiteralPath $resolvedEvidence -PathType Container)) {
+            [pscustomobject][ordered]@{
+                schema = 'csx-render-scale-package-deadline-rejection-v1'
+                elapsedMs = $elapsedMs; deadlineMs = $endToEndLimit
+                timestampUtc = [DateTimeOffset]::UtcNow.ToString('o')
+                reason = 'The outer package deadline elapsed after runner completion.'
+            } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $resolvedEvidence 'qualification-package-rejection.json') -Encoding utf8
+        }
         throw "The unattended package took $elapsedMs ms, exceeding its $endToEndLimit ms limit."
     }
     $runnerResult | Add-Member -NotePropertyName packageElapsedMs -NotePropertyValue $elapsedMs -Force
