@@ -404,6 +404,14 @@ $entryPointPath = Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1'
 $parseErrors = $null
 $tokens = $null
 $entryPointAst = [Management.Automation.Language.Parser]::ParseFile($entryPointPath, [ref]$tokens, [ref]$parseErrors)
+$dispatchProvenanceAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-DevBenchDispatchProvenance' }, $true))[0]
+Invoke-Expression $dispatchProvenanceAst.Extent.Text
+$skippedDispatch = Get-DevBenchDispatchProvenance -InvocationRecord ([pscustomobject]@{ dispatchedUtc = $null }) -Data ([pscustomobject]@{ toolCallSkipped = $true }) -Semantic ([pscustomobject]@{ known = $true; ok = $false })
+$acceptedDispatch = Get-DevBenchDispatchProvenance -InvocationRecord ([pscustomobject]@{ dispatchedUtc = [DateTime]::UtcNow.ToString('o') }) -Data ([pscustomobject]@{ content = @([pscustomobject]@{ ok = $true }) }) -Semantic ([pscustomobject]@{ known = $true; ok = $true })
+$rejectedDispatch = Get-DevBenchDispatchProvenance -InvocationRecord ([pscustomobject]@{ dispatchedUtc = [DateTime]::UtcNow.ToString('o') }) -Data ([pscustomobject]@{ content = @([pscustomobject]@{ ok = $false }) }) -Semantic ([pscustomobject]@{ known = $true; ok = $false })
+Assert-Test (-not $skippedDispatch.dispatchReached -and -not $skippedDispatch.responseDataRetained -and -not $skippedDispatch.acceptedDataRetained) 'guard and tool-unavailable branches retain known target non-dispatch provenance'
+Assert-Test ($acceptedDispatch.dispatchReached -and $acceptedDispatch.responseDataRetained -and $acceptedDispatch.acceptedDataRetained -and -not $acceptedDispatch.semanticRejected) 'semantically accepted target data retains accepted dispatch authority'
+Assert-Test ($rejectedDispatch.dispatchReached -and $rejectedDispatch.responseDataRetained -and -not $rejectedDispatch.acceptedDataRetained -and $rejectedDispatch.semanticRejected) 'semantically rejected target data remains evidence without becoming accepted authority'
 $terminalWriterAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Write-TerminalInvocationEvidence' }, $true))[0]
 Invoke-Expression $terminalWriterAst.Extent.Text
 $headerReaderAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-McpSessionHeaderValue' }, $true))[0]
@@ -434,7 +442,8 @@ Assert-Test ($entryPointText -match 'not-retried-indeterminate') 'ambiguous muta
 Assert-Test ($entryPointText -match 'Update-InvocationEvidence -State \$\(if \(\$outcomeIndeterminate\) \{ ''indeterminate'' \}') 'indeterminate mutation outcomes are durably journaled'
 Assert-Test ($entryPointText -match '-Semantic \$semantic -Data \$data -Errors') 'post-dispatch failures preserve accepted data in the invocation journal when possible'
 Assert-Test (
-    $entryPointText -match 'acceptedDataRetained = \$acceptedDataRetained' -and
+    $entryPointText -match 'acceptedDataRetained = \[bool\]\$dispatch\.acceptedDataRetained' -and
+    $entryPointText -match 'responseDataRetained = \[bool\]\$dispatch\.responseDataRetained' -and
     $entryPointText -match 'data = \$data'
 ) 'post-dispatch failure envelopes retain accepted response data and expose its provenance'
 Assert-Test ($entryPointText -match '\$headers = \$null[\s\S]{0,300}probeError') 'wait probe transport failures force full session and identity rebind'

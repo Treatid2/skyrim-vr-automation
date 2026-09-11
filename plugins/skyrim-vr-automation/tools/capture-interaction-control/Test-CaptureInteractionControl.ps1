@@ -48,13 +48,31 @@ param(
     [string]$Tool,
     [string]$ArgumentsJson,
     [string]$RuntimePath,
+    [string]$ExpectedRuntimeIdentityJson,
     [switch]$RequireSuccess,
     [switch]$Compact,
     [switch]$NoExit,
     [switch]$SkipRuntimeIdentityVerification
 )
 $argsObject = $ArgumentsJson | ConvertFrom-Json -Depth 80
+$listenerPid = if ($env:CAPTURE_INTERACTION_RUNTIME_PID) { [int]$env:CAPTURE_INTERACTION_RUNTIME_PID } else { 101 }
+$runtimeIdentity = [pscustomobject]@{
+  listenerPid=$listenerPid; processPath='C:\fixture\SkyrimVR.exe'; processStartTimeUtc="2026-09-11T00:00:$('{0:d2}' -f ($listenerPid % 60)).0000000Z"
+  buildId=('a' * 64); artifactPath='C:\fixture\CommunityShaders.dll'; artifactSha256=('b' * 64)
+}
+if ($ExpectedRuntimeIdentityJson) {
+  $expectedIdentity = $ExpectedRuntimeIdentityJson | ConvertFrom-Json -Depth 20
+  if ([int]$expectedIdentity.listenerPid -ne $runtimeIdentity.listenerPid) {
+    [pscustomobject]@{ok=$false;transportOk=$false;state='failed';indeterminate=$false;dispatchReached=$false;acceptedDataRetained=$false;runtimeIdentity=$runtimeIdentity;data=$null;errors=@('fixture expected runtime identity mismatch')} | ConvertTo-Json -Depth 20 -Compress
+    return
+  }
+}
 [IO.File]::AppendAllText((Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'calls.log'), "$Tool/$($argsObject.action)`n")
+if ($Tool -eq 'record' -and $argsObject.action -eq 'start' -and $env:CAPTURE_INTERACTION_REJECT_RECORD_RECEIPT -eq '1') {
+  $rejected=[pscustomobject]@{action='start';recording=$true;correlationId='foreign-capture'}
+  [pscustomobject]@{ok=$false;transportOk=$true;state='semantic-failed';indeterminate=$false;dispatchReached=$true;responseDataRetained=$true;acceptedDataRetained=$false;runtimeIdentity=$runtimeIdentity;semantic=[pscustomobject]@{known=$true;ok=$false};data=[pscustomobject]@{content=@($rejected)};errors=@('fixture correlation mismatch')} | ConvertTo-Json -Depth 20 -Compress
+  return
+}
 if ($Tool -eq 'record' -and $argsObject.action -eq 'start' -and $env:CAPTURE_INTERACTION_LOSE_RECORD_RESULT -eq '1') {
   [pscustomobject]@{ok=$false;transportOk=$false;state='indeterminate-mutation';indeterminate=$true;dispatchReached=$true;acceptedDataRetained=$false;invocationEvidencePath='record-start-invocation.json';data=$null;errors=@('fixture lost recording result after dispatch')} | ConvertTo-Json -Depth 20 -Compress
   return
@@ -112,7 +130,7 @@ if ($Tool -eq 'communityshaders.screenshot') {
 } elseif ($Tool -eq 'menu') { $value=[pscustomobject]@{openMenus=@('HUD Menu');messageBoxOpen=$false} }
 elseif ($Tool -eq 'inspect') { $value=[pscustomobject]@{playerLoaded=$true;frame=40} }
 else { $value=[pscustomobject]@{ok=$true} }
-[pscustomobject]@{ok=$true;data=[pscustomobject]@{content=@($value)};errors=@()} | ConvertTo-Json -Depth 100 -Compress
+[pscustomobject]@{ok=$true;runtimeIdentity=$runtimeIdentity;data=[pscustomobject]@{content=@($value)};errors=@()} | ConvertTo-Json -Depth 100 -Compress
 '@
     Set-Content -LiteralPath $fake -Value $fakeText -Encoding utf8
     $runtime = Join-Path $root 'runtime.json'
@@ -121,7 +139,7 @@ else { $value=[pscustomobject]@{ok=$true} }
     $entry = Join-Path $PSScriptRoot 'Invoke-CaptureInteraction.ps1'
     $session = Join-Path $root 'session'
     $started = & $entry start -SessionDirectory $session -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 500 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
-    Assert-Test ($started.ok -and $started.state -eq 'session-started' -and $started.data.screenshot.requestId -eq 'req-1') 'sequence session starts recording and screenshot capture under one session'
+    Assert-Test ($started.ok -and $started.state -eq 'session-started' -and $started.data.screenshot.requestId -eq 'req-1') "sequence session starts recording and screenshot capture under one session: $($started | ConvertTo-Json -Depth 20 -Compress)"
     $observed = & $entry observe -SessionDirectory $session -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
     Assert-Test ($observed.ok -and $observed.data.observation.latestFrame.ordinal -eq 4) 'observe composites runtime state and the latest committed frame'
     Assert-Test (Test-Path -LiteralPath $observed.data.observationPath -PathType Leaf) 'observe persists a latest-observation receipt'
@@ -160,6 +178,27 @@ else { $value=[pscustomobject]@{ok=$true} }
     $lostRecordSession = Join-Path $root 'lost-record-session'
     $lostRecord = & $entry start -SessionDirectory $lostRecordSession -RuntimePath $runtime -VisualMode none -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test (-not $lostRecord.ok -and $lostRecord.state -eq 'cleanup-uncertain' -and $lostRecord.data.recordOutcomeUncertain -and $lostRecord.data.recordInvocationEvidencePath -eq 'record-start-invocation.json' -and $lostRecord.data.cleanup.uncertainties.Count -eq 1) "dispatched recording with a lost result is retained as unresolved rather than reported clean: $($lostRecord | ConvertTo-Json -Depth 20 -Compress)"
+    Remove-Item Env:CAPTURE_INTERACTION_LOSE_RECORD_RESULT -ErrorAction SilentlyContinue
+
+    $stopCountBeforeRejected = @((Get-Content -LiteralPath (Join-Path $root 'calls.log')) | Where-Object { $_ -eq 'record/stop' }).Count
+    $env:CAPTURE_INTERACTION_REJECT_RECORD_RECEIPT = '1'
+    $rejectedRecordSession = Join-Path $root 'rejected-record-session'
+    $rejectedRecord = & $entry start -SessionDirectory $rejectedRecordSession -RuntimePath $runtime -VisualMode none -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    $stopCountAfterRejected = @((Get-Content -LiteralPath (Join-Path $root 'calls.log')) | Where-Object { $_ -eq 'record/stop' }).Count
+    Assert-Test (-not $rejectedRecord.ok -and -not $rejectedRecord.data.recordAccepted -and -not $rejectedRecord.data.recordOutcomeUncertain -and
+        $rejectedRecord.data.recordRejectedReceipt.correlationId -eq 'foreign-capture' -and $stopCountAfterRejected -eq $stopCountBeforeRejected) 'a semantically rejected foreign recording receipt is retained without authorizing an unqualified stop'
+    Remove-Item Env:CAPTURE_INTERACTION_REJECT_RECORD_RECEIPT -ErrorAction SilentlyContinue
+
+    $env:CAPTURE_INTERACTION_RUNTIME_PID = '101'
+    $identitySession = Join-Path $root 'identity-session'
+    $identityStart = & $entry start -SessionDirectory $identitySession -RuntimePath $runtime -VisualMode none -DevBenchScriptPath $fake -Compact | ConvertFrom-Json -Depth 100
+    Assert-Test ($identityStart.ok -and $identityStart.data.runtimeIdentity.listenerPid -eq 101) 'capture state retains the complete identity of its accepting runtime'
+    $stopCountBeforeReplacement = @((Get-Content -LiteralPath (Join-Path $root 'calls.log')) | Where-Object { $_ -eq 'record/stop' }).Count
+    $env:CAPTURE_INTERACTION_RUNTIME_PID = '202'
+    $replacementStop = & $entry stop -SessionDirectory $identitySession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
+    $stopCountAfterReplacement = @((Get-Content -LiteralPath (Join-Path $root 'calls.log')) | Where-Object { $_ -eq 'record/stop' }).Count
+    Assert-Test (-not $replacementStop.ok -and $replacementStop.state -eq 'stopped-with-errors' -and
+        $replacementStop.data.runtimeIdentity.listenerPid -eq 101 -and $stopCountAfterReplacement -eq $stopCountBeforeReplacement) 'capture cleanup refuses a qualified replacement runtime before target mutation'
 
     [pscustomobject]@{ ok=$true; sessionPath=$started.data.statePath; actionCount=(Get-CaptureInteractionActionCatalog).actions.Count } | ConvertTo-Json -Compress
 }
@@ -171,5 +210,7 @@ finally {
     Remove-Item Env:CAPTURE_INTERACTION_LOSE_VISUAL_ACCEPTED -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_LOSE_VISUAL_RESULT -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_LOSE_RECORD_RESULT -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_REJECT_RECORD_RECEIPT -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_RUNTIME_PID -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
 }

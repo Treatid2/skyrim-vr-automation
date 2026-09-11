@@ -41,7 +41,7 @@ param(
     [long]$MaxProfileBytes = 34359738368,
     [ValidateRange(5, 600)]
     [int]$TreeOperationTimeoutSeconds = 120,
-    [ValidateSet('', 'selected-profile-before-cas', 'tree-operation-deadline', 'owner-marker-before-claim', 'resume-interrupt-after-output-rearm', 'resume-rearm-fail-with-rollback-failure', 'resume-recovery-interrupt-after-owner-release')]
+    [ValidateSet('', 'selected-profile-before-cas', 'tree-operation-deadline', 'owner-marker-before-claim', 'creation-fail-after-backup-snapshot', 'resume-interrupt-after-output-rearm', 'resume-rearm-fail-with-rollback-failure', 'resume-recovery-interrupt-after-owner-release', 'creation-recovery-interrupt-after-owner-release')]
     [string]$InternalTestFailurePoint = '',
     [switch]$Compact,
     [switch]$NoExit
@@ -808,6 +808,58 @@ function Undo-RearmedWorkspaceRuntimeOutput($Config, $Workspace, $Output) {
     return @($errors)
 }
 
+function Complete-CreationOutputOwnerRelease($Config, $Journal, [string]$JournalPath, [string]$MarkerPath, [string]$MarkerSha256) {
+    $release = if ($Journal.Contains('overwriteOwnerRelease') -and $Journal['overwriteOwnerRelease']) {
+        [hashtable]$Journal['overwriteOwnerRelease']
+    }
+    else { @{} }
+    $releaseState = [string]$release['state']
+    $releaseAuthorized = $releaseState -in @('owner-release-authorized', 'owner-released')
+    if ($releaseAuthorized) {
+        foreach ($binding in @(
+            @('workspaceId', [string]$Journal['workspaceId']),
+            @('ownershipId', [string]$Journal['ownershipId']),
+            @('ownerMarkerSha256', $MarkerSha256)
+        )) {
+            if ([string]$release[$binding[0]] -cne [string]$binding[1]) {
+                throw "Creation output owner-release authority has a mismatched $($binding[0]) binding."
+            }
+        }
+    }
+    $markerExists = Test-Path -LiteralPath $MarkerPath -PathType Leaf
+    if (-not $markerExists) {
+        if (-not $releaseAuthorized) {
+            throw 'Interrupted workspace creation lost its output owner marker without durable release authority.'
+        }
+        if ($releaseState -cne 'owner-released') {
+            $release['state'] = 'owner-released'
+            $release['ownerReleasedUtc'] = [DateTime]::UtcNow.ToString('o')
+            $Journal['overwriteOwnerRelease'] = $release
+            Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
+        }
+        return
+    }
+    $null = Assert-WorkspaceOutputOwnerMarker -Path $MarkerPath -ExpectedSha256 $MarkerSha256 -WorkspaceId ([string]$Journal['workspaceId']) -OwnershipId ([string]$Journal['ownershipId']) -OverwritePath ([string]$Config.mo2.overwriteDirectory)
+    if (-not $releaseAuthorized) {
+        $release = @{
+            state = 'owner-release-authorized'
+            workspaceId = [string]$Journal['workspaceId']
+            ownershipId = [string]$Journal['ownershipId']
+            ownerMarkerSha256 = $MarkerSha256
+            ownerReleaseAuthorizedUtc = [DateTime]::UtcNow.ToString('o')
+            ownerReleasedUtc = $null
+        }
+        $Journal['overwriteOwnerRelease'] = $release
+        Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
+    }
+    Remove-Item -LiteralPath $MarkerPath -Force
+    if ($InternalTestFailurePoint -eq 'creation-recovery-interrupt-after-owner-release') { exit 93 }
+    $release['state'] = 'owner-released'
+    $release['ownerReleasedUtc'] = [DateTime]::UtcNow.ToString('o')
+    $Journal['overwriteOwnerRelease'] = $release
+    Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
+}
+
 function Undo-JournaledRuntimeOutputRearm($Config, [string]$WorkspaceId, [string]$OwnershipId, $Rearm, $Journal, [string]$JournalPath) {
     $overwriteRoot = [IO.Path]::GetFullPath([string]$Config.mo2.overwriteDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar)
     $overwritePath = [IO.Path]::GetFullPath([string]$Rearm['overwritePath']).TrimEnd([IO.Path]::DirectorySeparatorChar)
@@ -1499,6 +1551,8 @@ function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
         $cacheExistedBefore = if ($journal.ContainsKey('cachePathExistedBefore')) { [bool]$journal['cachePathExistedBefore'] } else { $true }
         $backupExistedBefore = if ($journal.ContainsKey('backupPathExistedBefore')) { [bool]$journal['backupPathExistedBefore'] } else { $true }
         $markerSha256 = if ($journal.ContainsKey('overwriteOwnerMarkerSha256')) { [string]$journal['overwriteOwnerMarkerSha256'] } else { '' }
+        $ownerReleaseState = if ($journal.ContainsKey('overwriteOwnerRelease') -and $journal['overwriteOwnerRelease']) { [string]$journal['overwriteOwnerRelease']['state'] } else { '' }
+        $ownerReleaseAuthorized = $ownerReleaseState -in @('owner-release-authorized', 'owner-released')
         $committable = $false
         if ((Test-Path -LiteralPath $manifestPath -PathType Leaf) -and (Test-Path -LiteralPath $profilePath -PathType Container)) {
             try {
@@ -1521,7 +1575,7 @@ function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
         $null = Restore-ParentSelectedProfileTransaction -JournalPath $selectedJournalPath
         if (Test-Path -LiteralPath $profilePath -PathType Container) { Assert-NoWorkspaceReparsePoint -Path $profilePath -Purpose 'Interrupted workspace profile'; Remove-Item -LiteralPath $profilePath -Recurse -Force }
         if ($null -ne $runtimeOutputPath -and (Test-Path -LiteralPath $runtimeOutputPath -PathType Container)) { Assert-NoWorkspaceReparsePoint -Path $runtimeOutputPath -Purpose 'Interrupted workspace runtime-output mod'; Remove-Item -LiteralPath $runtimeOutputPath -Recurse -Force }
-        if ($null -ne $backupEvidenceDirectory -and (Test-Path -LiteralPath (Join-Path $backupEvidenceDirectory 'shader-cache-transaction.receipt.json') -PathType Leaf)) {
+        if (-not $ownerReleaseAuthorized -and $null -ne $backupEvidenceDirectory -and (Test-Path -LiteralPath (Join-Path $backupEvidenceDirectory 'shader-cache-transaction.receipt.json') -PathType Leaf)) {
             if ($null -eq $overwriteMarkerPath) { throw 'Interrupted workspace backup recovery lacks its exact owner-marker path.' }
             $null = Assert-WorkspaceOutputOwnerMarker -Path $overwriteMarkerPath -ExpectedSha256 $markerSha256 -WorkspaceId ([string]$journal['workspaceId']) -OwnershipId ([string]$journal['ownershipId']) -OverwritePath ([string]$Config.mo2.overwriteDirectory)
             $transactionTool = Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'
@@ -1529,17 +1583,18 @@ function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
             $restored = & $transactionTool restore -CachePath $backupPath -RelativeCachePath 'backup' -EvidenceDirectory $backupEvidenceDirectory -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
             if (-not $restored.ok) { throw "Interrupted workspace backup recovery failed: $($restored.errors -join '; ')" }
         }
-        if ($null -ne $overwriteMarkerPath -and -not $backupExistedBefore -and (Test-Path -LiteralPath $backupPath)) {
+        if (-not $ownerReleaseAuthorized -and $null -ne $overwriteMarkerPath -and -not $backupExistedBefore -and (Test-Path -LiteralPath $backupPath)) {
             $null = Assert-WorkspaceOutputOwnerMarker -Path $overwriteMarkerPath -ExpectedSha256 $markerSha256 -WorkspaceId ([string]$journal['workspaceId']) -OwnershipId ([string]$journal['ownershipId']) -OverwritePath ([string]$Config.mo2.overwriteDirectory)
             Remove-WorkspaceCreatedOutputTree -Path $backupPath -OverwritePath ([string]$Config.mo2.overwriteDirectory) -Purpose 'Interrupted task-created backup tree'
         }
-        if ($null -ne $overwriteMarkerPath -and -not $cacheExistedBefore -and (Test-Path -LiteralPath $cachePath)) {
+        if (-not $ownerReleaseAuthorized -and $null -ne $overwriteMarkerPath -and -not $cacheExistedBefore -and (Test-Path -LiteralPath $cachePath)) {
             $null = Assert-WorkspaceOutputOwnerMarker -Path $overwriteMarkerPath -ExpectedSha256 $markerSha256 -WorkspaceId ([string]$journal['workspaceId']) -OwnershipId ([string]$journal['ownershipId']) -OverwritePath ([string]$Config.mo2.overwriteDirectory)
             Remove-WorkspaceCreatedOutputTree -Path $cachePath -OverwritePath ([string]$Config.mo2.overwriteDirectory) -Purpose 'Interrupted task-created ShaderCache tree'
         }
-        if ($null -ne $overwriteMarkerPath -and (Test-Path -LiteralPath $overwriteMarkerPath -PathType Leaf)) {
-            $null = Assert-WorkspaceOutputOwnerMarker -Path $overwriteMarkerPath -ExpectedSha256 $markerSha256 -WorkspaceId ([string]$journal['workspaceId']) -OwnershipId ([string]$journal['ownershipId']) -OverwritePath ([string]$Config.mo2.overwriteDirectory)
-            Remove-Item -LiteralPath $overwriteMarkerPath -Force
+        $ownerMarkerExists = $null -ne $overwriteMarkerPath -and (Test-Path -LiteralPath $overwriteMarkerPath -PathType Leaf)
+        $ownerReleaseRequired = $ownerMarkerExists -or $ownerReleaseAuthorized -or [string]$journal['phase'] -cne 'output-owner-planned'
+        if ($ownerReleaseRequired -and $null -ne $overwriteMarkerPath -and -not [string]::IsNullOrWhiteSpace($markerSha256)) {
+            Complete-CreationOutputOwnerRelease -Config $Config -Journal $journal -JournalPath $JournalPath -MarkerPath $overwriteMarkerPath -MarkerSha256 $markerSha256
         }
         if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { Remove-Item -LiteralPath $manifestPath -Force }
         $journal['phase'] = 'rolled-back'; $journal['recoveredUtc'] = [DateTime]::UtcNow.ToString('o')
@@ -2267,14 +2322,14 @@ try {
                 if ([string](Get-ProfileSnapshot -Path $sourcePath).sha256 -cne [string]$sourceSnapshot.sha256) { throw 'Stable source profile changed after planning; no clone was started.' }
                 $selectionEvidence = Join-Path (Split-Path -Parent $manifestPath) ($workspaceId + '-create-select')
                 $selectedProfileJournalPath = Join-Path $selectionEvidence ('selected-profile-' + (Get-SafeName 'select-created-task-workspace') + '.selected-profile.journal.json')
-                $journal = [pscustomobject][ordered]@{
+                $journal = [ordered]@{
                     contractVersion = '2.0.0'; operation = 'create'; phase = 'prepared'; workspaceId = $workspaceId; ownershipId = $ownershipId
                     ownerTaskId = $resolvedTaskId; sourceProfile = $sourceName; sourceProfilePath = $sourcePath; sourceSnapshotSha256 = [string]$sourceSnapshot.sha256
                     profileName = $profileName; profilePath = $profilePath; manifestPath = $manifestPath
                     overwriteOwnerMarkerPath = $runtimeMarkerPath; backupEvidenceDirectory = $backupEvidenceDirectory
                     cachePath = $runtimeCachePath; backupPath = $runtimeBackupPath
                     cachePathExistedBefore = $null; backupPathExistedBefore = $null
-                    overwriteOwnerMarkerSha256 = $null; communityShadersPlugin = $null
+                    overwriteOwnerMarkerSha256 = $null; overwriteOwnerRelease = $null; communityShadersPlugin = $null
                     preparedUtc = [DateTime]::UtcNow.ToString('o')
                     selectedProfileJournalPath = $selectedProfileJournalPath; selectedProfileTransaction = $null; rollback = $null; committedUtc = $null
                 }
@@ -2383,6 +2438,7 @@ try {
                     $backupSnapshot = & $transactionTool snapshot -CachePath $runtimeBackupPath -RelativeCachePath 'backup' -EvidenceDirectory $backupEvidenceDirectory -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
                     if (-not $backupSnapshot.ok) { throw "Could not snapshot MO2 Overwrite backup: $($backupSnapshot.errors -join '; ')" }
                     $backupSnapshotCreated = $true
+                    if ($InternalTestFailurePoint -eq 'creation-fail-after-backup-snapshot') { throw 'Fixture creation failure after backup snapshot.' }
                     $null = Assert-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -ExpectedSha256 $runtimeMarkerHash -WorkspaceId $workspaceId -OwnershipId $ownershipId -OverwritePath $runtimeOutputPath
                     $backupProviders = & $transactionTool providers -ProfilePath (Join-Path $profilePath 'modlist.txt') -ModsPath $modsRoot -RelativeCachePath 'backup' -DeepInventory -IncludeInventoryEntries -NoExit -Confirm:$false | ConvertFrom-Json
                     if (-not $backupProviders.ok) { throw "Could not inspect the task profile's backup providers: $($backupProviders.errors -join '; ')" }
@@ -2471,10 +2527,9 @@ try {
                         }
                         catch { $rollbackErrors += "overwrite-shader-cache: $($_.Exception.Message)" }
                     }
-                    if ($runtimeMarkerCreated -and (Test-Path -LiteralPath $runtimeMarkerPath -PathType Leaf)) {
+                    if ($runtimeMarkerCreated -and $rollbackErrors.Count -eq 0) {
                         try {
-                            $null = Assert-WorkspaceOutputOwnerMarker -Path $runtimeMarkerPath -ExpectedSha256 $runtimeMarkerHash -WorkspaceId $workspaceId -OwnershipId $ownershipId -OverwritePath $runtimeOutputPath
-                            Remove-Item -LiteralPath $runtimeMarkerPath -Force
+                            Complete-CreationOutputOwnerRelease -Config $config -Journal $journal -JournalPath $creationJournalPath -MarkerPath $runtimeMarkerPath -MarkerSha256 $runtimeMarkerHash
                         }
                         catch { $rollbackErrors += "overwrite-owner-marker: $($_.Exception.Message)" }
                     }

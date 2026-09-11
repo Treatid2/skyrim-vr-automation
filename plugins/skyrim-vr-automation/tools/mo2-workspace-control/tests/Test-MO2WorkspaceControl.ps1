@@ -224,6 +224,16 @@ try {
     if ($ownerRace.ok -or -not (Test-Path -LiteralPath $competingMarkerPath -PathType Leaf)) { throw 'A competing Overwrite owner was not rejected by the exclusive in-lock claim.' }
     Remove-Item -LiteralPath $competingMarkerPath -Force
     if ((Get-TestProfileFingerprint (Join-Path $mo2 'overwrite')) -cne $overwriteBeforeOwnerRace) { throw 'The rejected competing owner mutated MO2 Overwrite before acquiring ownership.' }
+    $creationRollback = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label creation-rollback -SavePolicy FreshGame -WorkspaceContent Modlist -InternalTestFailurePoint creation-fail-after-backup-snapshot -Confirm:$false -NoExit | ConvertFrom-Json
+    $creationRollbackJournals = @(Get-ChildItem -LiteralPath (Join-Path $sessions 'workspaces') -Filter '*.creation.journal.json' | ForEach-Object {
+        Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json
+    } | Where-Object { [string]$_.workspaceId -like '*creation-rollback*' })
+    if ($creationRollback.ok -or $creationRollbackJournals.Count -ne 1 -or
+        $creationRollbackJournals[0].phase -ne 'rolled-back' -or
+        $creationRollbackJournals[0].overwriteOwnerRelease.state -ne 'owner-released' -or
+        (Test-Path -LiteralPath $competingMarkerPath)) {
+        throw 'Initial creation rollback did not durably authorize exact owner release before retiring the marker.'
+    }
     $created = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label weather -SavePolicy FreshGame -WorkspaceContent Modlist -Confirm:$false | ConvertFrom-Json
     if (-not $created.ok -or $created.state -ne 'workspace-ready') { throw "Workspace creation failed: $($created | ConvertTo-Json -Depth 12 -Compress)" }
     if ($created.data.configuration.source -ne 'explicit' -or [IO.Path]::GetFullPath([string]$created.data.configuration.path) -ne [IO.Path]::GetFullPath($configPath)) { throw 'Workspace result did not expose exact configuration resolution provenance.' }
@@ -431,8 +441,67 @@ try {
     $interruptedOutputJournalResult = Get-Content -LiteralPath $interruptedOutputJournal -Raw | ConvertFrom-Json
     if (-not $interruptedRecovery.ok -or $interruptedOutputJournalResult.phase -ne 'rolled-back' -or
         (Test-Path -LiteralPath $interruptedOutputMarker) -or (Test-Path -LiteralPath $interruptedCachePath) -or
-        (Test-Path -LiteralPath $interruptedBackupPath) -or (Test-Path -LiteralPath $interruptedOutputProfile)) {
+        (Test-Path -LiteralPath $interruptedBackupPath) -or (Test-Path -LiteralPath $interruptedOutputProfile) -or
+        $interruptedOutputJournalResult.overwriteOwnerRelease.state -ne 'owner-released') {
         throw 'Startup recovery did not restore absent output trees and release exact Overwrite ownership.'
+    }
+
+    foreach ($recoveryCase in @('restore-failure', 'release-interruption')) {
+        New-Item -ItemType Directory -Path $interruptedCachePath, $interruptedBackupPath -Force | Out-Null
+        $caseWorkspaceId = 'creation-recovery-' + $recoveryCase
+        $caseOwnershipId = $caseWorkspaceId + '-owner'
+        [pscustomobject]@{
+            workspaceId = $caseWorkspaceId; ownershipId = $caseOwnershipId
+            mode = 'mo2-overwrite-output'; overwritePath = (Join-Path $mo2 'overwrite')
+        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $interruptedOutputMarker -Encoding utf8
+        $caseMarkerHash = (Get-FileHash -LiteralPath $interruptedOutputMarker -Algorithm SHA256).Hash
+        $caseEvidence = Join-Path $workspaceControlRoot ($caseWorkspaceId + '-backup')
+        $caseSnapshot = & $transactionTool snapshot -CachePath $interruptedBackupPath -RelativeCachePath backup -EvidenceDirectory $caseEvidence -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json
+        if (-not $caseSnapshot.ok) { throw "Could not arrange $recoveryCase creation-recovery evidence." }
+        'interrupted-generated-backup' | Set-Content -LiteralPath (Join-Path $interruptedBackupPath 'generated.bin') -Encoding utf8
+        $caseProfile = Join-Path $profiles ('Codex ' + $caseWorkspaceId)
+        New-Item -ItemType Directory -Path $caseProfile -Force | Out-Null
+        $caseManifest = Join-Path $workspaceControlRoot ($caseWorkspaceId + '.json')
+        $caseJournal = Join-Path $workspaceControlRoot ($caseWorkspaceId + '.creation.journal.json')
+        [ordered]@{
+            contractVersion = '2.0.0'; operation = 'create'; phase = 'output-owner-claimed'
+            workspaceId = $caseWorkspaceId; ownershipId = $caseOwnershipId
+            profilePath = $caseProfile; manifestPath = $caseManifest
+            overwriteOwnerMarkerPath = $interruptedOutputMarker; overwriteOwnerMarkerSha256 = $caseMarkerHash
+            backupEvidenceDirectory = $caseEvidence; cachePath = $interruptedCachePath; backupPath = $interruptedBackupPath
+            cachePathExistedBefore = $false; backupPathExistedBefore = $false; overwriteOwnerRelease = $null
+        } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $caseJournal -Encoding utf8
+        if ($recoveryCase -eq 'restore-failure') {
+            $caseReceiptPath = Join-Path $caseEvidence 'shader-cache-transaction.receipt.json'
+            $caseReceiptBytes = [IO.File]::ReadAllBytes($caseReceiptPath)
+            '{broken-json' | Set-Content -LiteralPath $caseReceiptPath -Encoding utf8
+            $failedCreationRecovery = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact -NoExit | ConvertFrom-Json
+            $failedCreationJournal = Get-Content -LiteralPath $caseJournal -Raw | ConvertFrom-Json
+            if ($failedCreationRecovery.ok -or -not (Test-Path -LiteralPath $interruptedOutputMarker -PathType Leaf) -or
+                $failedCreationJournal.phase -eq 'rolled-back' -or $failedCreationJournal.overwriteOwnerRelease) {
+                throw 'Failed creation restoration did not retain its exact output owner marker and nonterminal recovery authority.'
+            }
+            [IO.File]::WriteAllBytes($caseReceiptPath, $caseReceiptBytes)
+        }
+        else {
+            & $powerShell -NoProfile -NonInteractive -File $entry list-task -ConfigPath $configPath -TaskId $taskId -InternalTestFailurePoint creation-recovery-interrupt-after-owner-release -Compact -NoExit | Out-Null
+            $interruptedReleaseJournal = Get-Content -LiteralPath $caseJournal -Raw | ConvertFrom-Json
+            if ((Test-Path -LiteralPath $interruptedOutputMarker) -or
+                $interruptedReleaseJournal.overwriteOwnerRelease.state -ne 'owner-release-authorized' -or
+                $interruptedReleaseJournal.phase -eq 'rolled-back') {
+                throw 'Creation recovery did not durably authorize owner release before deleting the marker.'
+            }
+        }
+        $completedCreationRecovery = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
+        $completedCreationJournal = Get-Content -LiteralPath $caseJournal -Raw | ConvertFrom-Json
+        if (-not $completedCreationRecovery.ok -or $completedCreationJournal.phase -ne 'rolled-back' -or
+            $completedCreationJournal.overwriteOwnerRelease.state -ne 'owner-released' -or
+            (Test-Path -LiteralPath $interruptedOutputMarker) -or (Test-Path -LiteralPath $interruptedCachePath) -or
+            (Test-Path -LiteralPath $interruptedBackupPath)) {
+            throw "Creation recovery did not finish restartably after $recoveryCase."
+        }
+        $idempotentCreationRecovery = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
+        if (-not $idempotentCreationRecovery.ok) { throw "Completed $recoveryCase creation recovery was not idempotent." }
     }
     foreach ($plannedMarkerPresent in @($true, $false)) {
         $plannedSuffix = if ($plannedMarkerPresent) { 'marker-created' } else { 'marker-absent' }

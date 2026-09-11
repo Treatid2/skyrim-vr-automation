@@ -84,6 +84,19 @@ function Get-RequestTimeoutSeconds {
     return [int][Math]::Max(1, [Math]::Min($script:requestTimeoutSecondsForRpc, [Math]::Ceiling($remainingSeconds)))
 }
 
+function Get-DevBenchDispatchProvenance($InvocationRecord, $Data, $Semantic) {
+    $dispatchReached = [bool]($InvocationRecord -and -not [string]::IsNullOrWhiteSpace([string]$InvocationRecord.dispatchedUtc))
+    $responseDataRetained = [bool]($dispatchReached -and $null -ne $Data)
+    $semanticKnown = [bool]($Semantic -and $Semantic.PSObject.Properties['known'] -and [bool]$Semantic.known)
+    $semanticAccepted = [bool]($semanticKnown -and $Semantic.PSObject.Properties['ok'] -and [bool]$Semantic.ok)
+    return [pscustomobject][ordered]@{
+        dispatchReached = $dispatchReached
+        responseDataRetained = $responseDataRetained
+        acceptedDataRetained = [bool]($responseDataRetained -and $semanticAccepted)
+        semanticRejected = [bool]($responseDataRetained -and $semanticKnown -and -not $semanticAccepted)
+    }
+}
+
 function Set-ServerWaitBudgetAtDispatch([hashtable]$Arguments) {
     if ($null -eq $Arguments -or -not $Arguments.ContainsKey('timeoutMs') -or $null -eq $Arguments.timeoutMs) { return }
     $serverTimeoutMilliseconds = [double]$Arguments.timeoutMs
@@ -1316,13 +1329,15 @@ try {
         -not $semantic.known -or -not $semantic.ok
     }
     else { $false }
+    $dispatch = Get-DevBenchDispatchProvenance -InvocationRecord $invocationRecord -Data $data -Semantic $semantic
     $result = [pscustomobject][ordered]@{
         ok = -not $semanticFailure
         transportOk = $true
         state = $(if ($semanticFailure) { 'semantic-failed' } else { 'completed' })
         indeterminate = $false
-        dispatchReached = [bool]($Command -eq 'call')
-        acceptedDataRetained = [bool]($Command -eq 'call' -and $null -ne $data)
+        dispatchReached = [bool]$dispatch.dispatchReached
+        responseDataRetained = [bool]$dispatch.responseDataRetained
+        acceptedDataRetained = [bool]$dispatch.acceptedDataRetained
         command = $Command
         endpoint = $endpoint
         timestampUtc = [DateTime]::UtcNow.ToString('o')
@@ -1346,19 +1361,19 @@ try {
 catch {
     $failureMessage = $_.Exception.Message
     $indeterminateMutation = [bool]$_.Exception.Data['DevBenchIndeterminateMutation']
-    $dispatchReached = [bool]($invocationRecord -and -not [string]::IsNullOrWhiteSpace([string]$invocationRecord.dispatchedUtc))
-    $acceptedDataRetained = [bool]($dispatchReached -and $null -ne $data)
-    $outcomeIndeterminate = [bool]($indeterminateMutation -or ((-not $readOnlyCall) -and $dispatchReached -and -not $acceptedDataRetained))
+    $dispatch = Get-DevBenchDispatchProvenance -InvocationRecord $invocationRecord -Data $data -Semantic $semantic
+    $outcomeIndeterminate = [bool]($indeterminateMutation -or ((-not $readOnlyCall) -and $dispatch.dispatchReached -and -not $dispatch.acceptedDataRetained -and -not $dispatch.semanticRejected))
     if ($invocationRecord -and $invocationRecord.state -ne 'guard-rejected') {
         try { Update-InvocationEvidence -State $(if ($outcomeIndeterminate) { 'indeterminate' } else { 'failed' }) -Semantic $semantic -Data $data -Errors @($failureMessage) } catch { $failureMessage = "$failureMessage Evidence update also failed: $($_.Exception.Message)" }
     }
     $result = [pscustomobject][ordered]@{
         ok = $false
-        transportOk = $acceptedDataRetained
-        state = if ($indeterminateMutation) { 'indeterminate-mutation' } elseif ($acceptedDataRetained) { 'post-dispatch-evidence-failed' } else { 'failed' }
+        transportOk = [bool]$dispatch.responseDataRetained
+        state = if ($outcomeIndeterminate) { 'indeterminate-mutation' } elseif ($dispatch.acceptedDataRetained) { 'post-dispatch-evidence-failed' } elseif ($dispatch.semanticRejected) { 'semantic-failed' } else { 'failed' }
         indeterminate = $outcomeIndeterminate
-        dispatchReached = $dispatchReached
-        acceptedDataRetained = $acceptedDataRetained
+        dispatchReached = [bool]$dispatch.dispatchReached
+        responseDataRetained = [bool]$dispatch.responseDataRetained
+        acceptedDataRetained = [bool]$dispatch.acceptedDataRetained
         command = $Command
         endpoint = $endpoint
         timestampUtc = [DateTime]::UtcNow.ToString('o')
