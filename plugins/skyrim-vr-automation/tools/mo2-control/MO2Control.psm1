@@ -1951,7 +1951,7 @@ function Invoke-MO2Validate {
     elseif ($data.overwrite.shaderCaches.Count -gt 0) {
         $checks += New-MO2Check -Name 'overwrite' -Status $(if ($overwriteIsTaskOutput) { 'pass' } else { 'fail' }) -Message $(
             if ($overwriteIsTaskOutput) { "MO2 Overwrite ShaderCache is declared task output; prepare and launch verify its exact owner, profile binding, provider union, and transaction." }
-            else { "MO2 Overwrite contains ShaderCache trees without a requested task-workspace output contract: $($data.overwrite.shaderCaches.relativePath -join ', ')." }
+            else { "MO2 Overwrite contains ShaderCache trees without a requested task-workspace output contract. Run workspace prepare-source before creating a task workspace: $($data.overwrite.shaderCaches.relativePath -join ', ')." }
         ) -Details $data.overwrite
     }
     elseif ($data.overwrite.truncated -or $data.overwrite.fileCount -ge [int]$Config.limits.overwriteBlockFiles -or $data.overwrite.bytes -ge [long]$Config.limits.overwriteBlockBytes) {

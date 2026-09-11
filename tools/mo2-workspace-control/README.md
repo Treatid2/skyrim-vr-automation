@@ -114,8 +114,20 @@ when an otherwise valid workspace outlives its transient access lease.
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> complete-output -AccessId <literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -Confirm:$false -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> create-mod -AccessId <new-literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -ModName "Codex Weather API Test 20260822" -Confirm:$false -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> register-mod -AccessId <new-literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -ModName "Codex Weather API Test 20260822" -ModDirectory "<exact-mod-directory>" -WinningPaths "SKSE\Plugins\CommunityShaders.dll" -Confirm:$false -Compact
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> retire -AccessId <new-literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -CleanupOwnedMods -Confirm:$false -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> release-access -AccessId <new-literal-access-id> -Compact
+```
+
+The normal end state is the retained workspace plus a released access lease.
+Run, turn, or task completion does not authorize resetting the cloned profile,
+removing its task-local changes, or retiring it. Reacquire access and use
+`resume` with the exact workspace ID when work continues.
+
+`retire` is an explicit-discard operation, not part of the normal workflow. Use
+it only after direction to discard or replace that exact environment, or when a
+separately stated retention policy proves it obsolete:
+
+```text
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> retire -AccessId <literal-access-id> -TaskId <stable-task-id> -WorkspaceId <literal-workspace-id> -CleanupOwnedMods -Confirm:$false -Compact
 ```
 
 `create-mod` must precede `register-mod`. It creates the exact empty directory
@@ -174,7 +186,8 @@ profile; retained task profiles are not rewritten. On every resume the tool
 adds newly observed, non-owned mod directories to the workspace's protected
 shared-mod inventory. Cleanup is restricted to
 the exact generated profile and registered task-owned mods; the stable source
-may have advanced since the clone. Before deleting a task profile, `retire`
+may have advanced since the clone. Only after explicit discard, replacement, or
+policy-proven obsolescence may `retire`
 atomically selects and verifies its stable source in `ModOrganizer.ini`, keeps
 the exact prior INI bytes and receipt, and only then removes the task profile.
 Workspace manifests and results expose `profileName`, `profileDirectory`, and
@@ -185,6 +198,10 @@ After the game and MO2 close, catalog `complete` preserves generated
 `complete-output` preserves the generated `backup` tree, restores its pre-task
 tree, and releases the Overwrite owner marker. `retire` requires both exact
 completion receipts and never deletes the Overwrite directory.
+Restoring shared runtime state is independent and must not rewrite or retire
+the retained workspace. Virtual Desktop and `VirtualDesktop.Streamer` never
+block profile mutation or SteamVR null-HMD; an enabled profile-local
+OCU/OpenComposite provider is the conflicting `SteamVRNull` route.
 The deprecated workspace `release` command is retained only to return safe
 recovery guidance; it fails before mutation and never deletes a profile.
 

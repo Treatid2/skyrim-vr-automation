@@ -15,6 +15,9 @@ the null-HMD route is a SteamVR mode rather than an OCU mode. The selected route
 belongs to the short-lived access lease and prepared session, not to the
 retained profile; switching routes therefore requires ending the session and
 requesting a new lease, but does not require rebuilding the task workspace.
+Virtual Desktop and `VirtualDesktop.Streamer` are unrelated to this admission
+decision and never block profile mutation or null-HMD. An enabled profile-local
+OCU/OpenComposite provider is the blocker for the `SteamVRNull` route.
 
 - On the task's first MO2 request, acquire MO2 access, run `prepare-source`, and
   run `fixture-status`. Proceed to `create -TaskId` only from
@@ -24,6 +27,18 @@ requesting a new lease, but does not require rebuilding the task workspace.
 - On a later request, the task must explicitly choose either `resume -TaskId
   -WorkspaceId` or a fresh `create -TaskId`. The tool never silently replaces a
   retained profile or guesses among multiple workspaces.
+- For `SteamVRNull`, select the task workspace and run closed-state validation
+  with the owned access lease before applying or starting null-HMD. The
+  `runtime-route-provider` check must prove that the exact selected profile has
+  no enabled OCU or other root OpenVR replacement. Only then transition the
+  runtime and continue with MO2 prepare and launch. This ordering prevents a
+  null-HMD run from inheriting an OCU-enabled profile.
+- A fresh `SteamVR` or `SteamVRNull` clone route-shapes only the new task
+  profile: every inherited root OpenVR provider is disabled, the result is
+  validated, and the maintained source profile remains byte-for-byte
+  untouched. `resume` does not rewrite an existing task profile; it fails
+  closed when that retained profile no longer satisfies its newly leased
+  runtime route.
 - Before a fresh clone, run `list-local-work-mods` and make the workspace
   content explicit. `Modlist` selects no optional local builds.
   `ModlistPlusLocalWorkMods` requires one or more exact catalog IDs. The tool
@@ -51,11 +66,20 @@ task can compile, edit, or analyse offline. This yields MO2 but preserves the
 task profile, its saves, its option state, and its task-owned mods. A later
 lease can resume it directly.
 
+This retained environment is the default end state. Do not restore it to the
+source profile, remove its task-local changes, or retire it merely because a
+run, turn, or task has completed. Reacquire access and resume the exact
+workspace when work continues.
+
 After the game and MO2 close, run shader-cache catalog `complete` and workspace
 `complete-output`. These preserve generated `ShaderCache` and `backup` trees,
 restore the exact pre-task MO2 Overwrite state, and release the output owner
-marker. Use workspace `retire` only when the task has finished with that profile.
-Retirement selects the maintained primary profile and recursively removes only
+marker without reverting the retained task profile.
+
+Use workspace `retire` only after explicit direction to discard or replace that
+exact environment, or when a separately stated retention policy proves it
+obsolete. Retirement is destructive: it selects the maintained primary profile
+and recursively removes only
 the exact task-owned profile. `-CleanupOwnedMods` additionally removes only
 mods that the workspace created and registered. The old workspace `release`
 command now fails closed without mutation. It points callers to MO2
@@ -79,3 +103,12 @@ creation removes the cloned profile's game and `Synthesis` custom-overwrite
 mappings, snapshots `backup`, and materializes its enabled-provider union.
 Shader-cache preparation does the same for `ShaderCache`. New paths and updates
 therefore resolve to Overwrite; shared mod directories remain immutable.
+
+Some applications write runtime data into an existing mod, notably CSX writing
+compiled shaders into the managed shader-cache mod. That known exception is
+accepted. Automatic cache reset on lease yield is intentionally not part of
+this contract; it can be added later as a separately evidenced policy.
+
+Restoration of shared or global transient state is a separate lifecycle. For
+example, a requested SteamVR settings restoration may run after a test without
+changing, reverting, or retiring the task-owned MO2 workspace.
