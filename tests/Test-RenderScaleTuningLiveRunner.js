@@ -98,7 +98,7 @@ function wrappedProfile(target) {
 }
 
 function createMock(semanticFailureOrdinal, receiptTransform = null,
-    scenarioTransform = null) {
+    scenarioTransform = null, directTransform = null) {
     let revision = 1;
     let stressSession = 0;
     let stressActive = false;
@@ -111,6 +111,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
     let traceActive = false;
     let traceRecords = [];
     const scenarioCalls = [];
+    const directCalls = [];
     const stores = new Map();
     const notifications = [];
 
@@ -473,10 +474,19 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
             tools: {
                 mcp__devbench_vr__scenario: scenario,
                 mcp__devbench_vr__communityshaders_renderscale: async (args) => {
+                    directCalls.push(args);
                     if (args.action === "qualification_status") {
                         return envelope({ qualification: {
                             active: false, lastEvidence: null,
                         } });
+                    }
+                    if (directTransform) {
+                        const replacement = directTransform(args, {
+                            setTraceActive: (value) => { traceActive = value; },
+                            setTraceSession: (value) => { traceSession = value; },
+                            traceSession: () => traceSession,
+                        });
+                        if (replacement !== undefined) return envelope(replacement);
                     }
                     return envelope(toolResult({ args }));
                 },
@@ -485,6 +495,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
             notify: (value) => notifications.push(value),
         },
         scenarioCalls,
+        directCalls,
         stores,
         notifications,
     };
@@ -655,16 +666,23 @@ async function testNvidia() {
     assert(retainedTraceRows.length === expectedTraceRows,
         "NVIDIA per-row trace evidence count is wrong.");
     const tracedScenarios = mock.scenarioCalls.filter((call) =>
-        call.steps.some((step) => step.label === "dlss-trace-read"));
+        call.steps.some((step) => step.label === "dlss-trace-start"));
     assert(tracedScenarios.length === expectedTraceRows,
-        "NVIDIA bounded trace reads were not executed per DLSS row.");
+        "NVIDIA trace windows were not started per DLSS row.");
     for (const call of tracedScenarios) {
-        const tail = call.steps.slice(-2);
-        assert(tail[0].label === "dlss-trace-stop" &&
-            tail[1].label === "dlss-trace-read" &&
-            tail[1].args.limit === matrix.traceReadLimit,
-        "NVIDIA trace stop/read ordering or bound is wrong.");
+        assert(!call.steps.some((step) => step.label === "dlss-trace-stop"),
+            "NVIDIA issued a normal trace stop before acquiring its session ID.");
     }
+    const normalStops = mock.directCalls.filter((call) =>
+        call.action === "dlss_trace_stop");
+    const traceReads = mock.directCalls.filter((call) =>
+        call.action === "dlss_trace_read");
+    assert(normalStops.length === expectedTraceRows &&
+        normalStops.every((call) => Number.isSafeInteger(call.expectedSessionId) &&
+            call.expectedSessionId > 0) &&
+        traceReads.length === expectedTraceRows &&
+        traceReads.every((call) => call.limit === matrix.traceReadLimit),
+    "NVIDIA normal trace closure was not session-guarded and bounded.");
     for (const [, retained] of retainedTraceRows) {
         assert(retained.traceReset.action === "dlss_trace_reset",
             "NVIDIA trace reset receipt was not retained.");
@@ -721,22 +739,23 @@ async function testAmd() {
     assert(transitionNotifications.every((row) => row.evidenceVerdict === "PASS" &&
         row.dispatch_ && row.first_new_generation_proven_),
     "AMD did not receive the shared Task 2 evidence projection.");
-    const capabilityEnvelope = mock.stores.get("amd-test:amd:dlss-trace-capability");
-    assert(capabilityEnvelope, "AMD DLSS trace capability lifecycle was not retained.");
-    const capability = JSON.parse(capabilityEnvelope.content[0].text);
-    const capabilityResults = new Map(capability.results.map((entry) =>
-        [entry.label, entry.result]));
-    assert(capabilityResults.get("amd-dlss-trace-reset").action === "dlss_trace_reset",
+    const capability = mock.stores.get("amd-test:amd:dlss-trace-capability");
+    assert(capability, "AMD DLSS trace capability lifecycle was not retained.");
+    assert(capability.traceReset.action === "dlss_trace_reset",
         "AMD trace reset receipt was not retained.");
-    assert(capabilityResults.get("amd-dlss-trace-start").action === "dlss_trace_start",
+    assert(capability.traceStart.action === "dlss_trace_start",
         "AMD trace start receipt was not retained.");
-    assert(capabilityResults.get("amd-dlss-trace-stop").action === "dlss_trace_stop",
+    assert(capability.traceStop.action === "dlss_trace_stop",
         "AMD trace stop receipt was not retained.");
-    const capabilityRead = capabilityResults.get("amd-dlss-trace-read");
+    const capabilityRead = capability.traceRead;
     assert(capabilityRead.action === "dlss_trace_read" &&
         capabilityRead.capture.records.length === 0 &&
         capabilityRead.capture.limit === matrix.traceReadLimit,
         "AMD capability trace raw window is not empty.");
+    const capabilityStop = mock.directCalls.find((call) =>
+        call.action === "dlss_trace_stop");
+    assert(capabilityStop && capabilityStop.expectedSessionId === 1,
+        "AMD capability trace stop was not bound to its acquired session.");
     const amdTransitionTrace = mock.scenarioCalls.some((call) =>
         call.steps.some((step) => step.label === "dlss-trace-start"));
     assert(amdTransitionTrace === false, "AMD matrix started a per-row DLSS trace.");
@@ -758,10 +777,11 @@ async function testAmdUnsupportedTraceContinues() {
     const matrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-amd", "references",
         "matrix.v1.json")));
-    const mock = createMock(0, null, (root, args) => {
+    const mock = createMock(0, null, (root, args, controls) => {
         if (!args.steps.some((step) => step.label === "amd-dlss-trace-status")) {
             return root;
         }
+        controls.setTraceActive(false);
         return {
             ok: false,
             aborted: true,
@@ -797,10 +817,11 @@ async function testAmdExposedTraceFailureStops() {
     const matrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-amd", "references",
         "matrix.v1.json")));
-    const mock = createMock(0, null, (root, args) => {
+    const mock = createMock(0, null, (root, args, controls) => {
         if (!args.steps.some((step) => step.label === "amd-dlss-trace-status")) {
             return root;
         }
+        controls.setTraceActive(false);
         return {
             ok: false,
             aborted: true,
@@ -826,7 +847,7 @@ async function testAmdExposedTraceFailureStops() {
     });
     assert(result.ok === false && result.status === "INTERRUPTED" &&
         result.error === "scenario_failed",
-    "A failing exposed AMD trace action was treated as unsupported.");
+    `A failing exposed AMD trace action was treated as unsupported: ${JSON.stringify(result)}`);
 }
 
 async function testAdmissionRejectsMalformedInputs() {
@@ -1109,19 +1130,14 @@ async function testAmdPostStartTraceFailureClosesOwner() {
     const matrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-amd", "references", "matrix.v1.json")));
     let injected = false;
-    const mock = createMock(0, null, (root, args, controls) => {
-        if (injected || !args.steps.some((step) =>
-            step.label === "amd-dlss-trace-start")) return root;
-        injected = true;
-        controls.setTraceActive(true);
-        const stopIndex = root.results.findIndex((entry) =>
-            entry.label === "amd-dlss-trace-stop");
-        const results = root.results.slice(0, stopIndex + 1);
-        results[stopIndex] = { label: "amd-dlss-trace-stop", ok: false,
-            error: "synthetic_trace_stop_failure",
-            result: { ok: false, error: "synthetic_trace_stop_failure" } };
-        return { ...root, ok: false, aborted: true,
-            stepsRun: results.length, results };
+    const mock = createMock(0, null, null, (args, controls) => {
+        if (!injected && args.action === "dlss_trace_stop") {
+            injected = true;
+            controls.setTraceActive(true);
+            return { ok: false,
+                error: "unsupported action dlss_trace_stop" };
+        }
+        return undefined;
     });
     const result = await runRenderScaleTuningLive({
         ...mock.context,
@@ -1137,10 +1153,10 @@ async function testAmdPostStartTraceFailureClosesOwner() {
     const decision = mock.stores.get(
         "amd-post-start-trace-failure:amd:dlss-trace-capability:cleanup:decision");
     assert(result.status === "INTERRUPTED" &&
-        result.error === "scenario_failed" && decision &&
+        result.error === "trace_owner_state_unproven" && decision &&
         decision.status === "CONFIRMED_INACTIVE" &&
         decision.started.id === 1 && decision.after.active === false,
-    "An AMD post-start trace failure left its owned trace unresolved.");
+    "An unsupported AMD post-start trace stop left its owner unresolved.");
 }
 
 async function testNvidiaPostStartTraceFailureClosesOwner() {
@@ -1184,6 +1200,88 @@ async function testNvidiaPostStartTraceFailureClosesOwner() {
         step.label === "dlss-trace-stop" &&
         step.args.expectedSessionId === cleanup.before.traceSessionId));
     assert(stop, "Trace cleanup did not use the retained session guard.");
+}
+
+async function testNvidiaNormalStopRejectsChangedOwner() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    let injected = false;
+    const mock = createMock(0, null, null, (args, controls) => {
+        if (!injected && args.action === "dlss_trace_stop") {
+            injected = true;
+            controls.setTraceSession(args.expectedSessionId + 1);
+            controls.setTraceActive(true);
+            return { ok: false, error: "expected trace session mismatch" };
+        }
+        return undefined;
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "nvidia",
+        runId: "nvidia-trace-owner-change",
+        buildId,
+        positioningRoot: positioningRoot(),
+        matrix,
+    });
+    const pass = result.lanes[0].passes[0];
+    const stop = mock.directCalls.find((call) =>
+        call.action === "dlss_trace_stop");
+    assert(result.status === "INTERRUPTED" && stop &&
+        Number.isSafeInteger(stop.expectedSessionId) &&
+        pass.cleanup && pass.cleanup.status === "UNRESOLVED" &&
+        pass.cleanup.reason === "cleanup_trace_owner_mismatch",
+    "A changed trace owner was not refused by the normal guarded stop path.");
+}
+
+async function testNvidiaRetainsMultiPageTrace() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    let firstWindow = true;
+    const mock = createMock(0, null, null, (args, controls) => {
+        if (!firstWindow || args.action !== "dlss_trace_read") return undefined;
+        const after = args.afterSequence;
+        const count = after === 0 ? 16 : 4;
+        const pageRecords = Array.from({ length: count }, (_, index) => ({
+            current: { sequence: after + index + 1 },
+        }));
+        const last = after + count;
+        const more = last < 20;
+        if (!more) firstWindow = false;
+        return {
+            action: "dlss_trace_read",
+            producer: { buildId },
+            capture: {
+                summary: { active: false,
+                    sessionID: controls.traceSession(), totalRecords: 20,
+                    setConstantsCalls: 1, evaluateCalls: 1 },
+                records: pageRecords,
+                afterSequence: after,
+                limit: args.limit,
+                availableFromSequence: 1,
+                latestSequence: 20,
+                lastReturnedSequence: last,
+                moreAvailable: more,
+                requestedSequenceOverwritten: false,
+            },
+        };
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "nvidia",
+        runId: "nvidia-paged-trace",
+        buildId,
+        positioningRoot: positioningRoot(),
+        matrix,
+    });
+    const paged = [...mock.stores.values()].find((value) =>
+        value && Array.isArray(value.tracePages) && value.tracePages.length === 2);
+    assert(result.status === "COMPLETE" && paged &&
+        paged.tracePages[0].capture.moreAvailable === true &&
+        paged.tracePages[1].capture.moreAvailable === false &&
+        paged.tracePages.flatMap((page) => page.capture.records).length === 20,
+    "The live runner did not retain a complete multi-page trace window.");
 }
 
 async function testBaselineOwnerAdmissionRejectsAmbiguity() {
@@ -2343,6 +2441,8 @@ Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
     testAmdExposedTraceFailureStops(),
     testAmdPostStartTraceFailureClosesOwner(),
     testNvidiaPostStartTraceFailureClosesOwner(),
+    testNvidiaNormalStopRejectsChangedOwner(),
+    testNvidiaRetainsMultiPageTrace(),
     testAdmissionRejectsMalformedInputs(), testEvidenceVerdicts(),
     testScenarioFailureRetention(), testInformationalReasonIsNotFailure(),
     testOptionalTerminalFacts(), testSafeUnstableBaselineContinues(),

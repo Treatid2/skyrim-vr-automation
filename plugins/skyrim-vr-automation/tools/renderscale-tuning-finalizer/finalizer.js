@@ -54,7 +54,8 @@ function validateTracePage(rawPage, state) {
         throw new Error("trace_session_changed");
     }
     if (!Number.isSafeInteger(capture.limit) ||
-        capture.limit > state.maximum || capture.limit < 1) {
+        capture.limit > state.maximum || capture.limit < 1 ||
+        capture.records.length > capture.limit) {
         throw new Error("trace_page_limit_out_of_range");
     }
     if (!Number.isSafeInteger(capture.afterSequence) ||
@@ -212,6 +213,10 @@ function amdTraceCapabilityEvidence(root, liveResult, buildId) {
         liveResult.traceCapability.status !== "supported") {
         return { complete: false,
             reasons: ["amd_trace_capability_not_supported_or_missing"] };
+    }
+    if (liveResult.traceCapability.lifecycle) {
+        return traceLifecycleEvidence(
+            liveResult.traceCapability.lifecycle, buildId, false);
     }
     const rawRoot = path.join(root, "raw");
     const files = fs.existsSync(rawRoot) ? walk(rawRoot).filter((file) =>
@@ -515,6 +520,35 @@ function normalizeTask2(retained) {
     let verdict = projection.task2Verdict || projection.evidenceVerdict ||
         "INCONCLUSIVE";
     const audit = waiter.presentationCycleAudit || retained.presentationCycleAudit || {};
+    const positiveInteger = (value) => Number.isSafeInteger(value) && value > 0;
+    const rawOwnerPrerequisiteReasons = [];
+    if (!positiveInteger(waiter.transitionId)) {
+        rawOwnerPrerequisiteReasons.push("waiter_transition_owner_invalid");
+    }
+    if (!positiveInteger(audit.ownerTransitionId)) {
+        rawOwnerPrerequisiteReasons.push("audit_transition_owner_invalid");
+    }
+    if (!positiveInteger(audit.ownerToken)) {
+        rawOwnerPrerequisiteReasons.push("audit_owner_token_invalid");
+    }
+    if (boundary) {
+        if (!positiveInteger(waiter.baseline &&
+            waiter.baseline.stressSessionId)) {
+            rawOwnerPrerequisiteReasons.push("baseline_stress_owner_invalid");
+        }
+        if (!positiveInteger(boundary.stressSessionId)) {
+            rawOwnerPrerequisiteReasons.push("boundary_stress_owner_invalid");
+        }
+        if (!positiveInteger(boundary.qualificationTransitionId)) {
+            rawOwnerPrerequisiteReasons.push("boundary_transition_owner_invalid");
+        }
+        if (!positiveInteger(boundary.ownershipToken)) {
+            rawOwnerPrerequisiteReasons.push("boundary_owner_token_invalid");
+        }
+    }
+    if (rawOwnerPrerequisiteReasons.length > 0) {
+        missing.push("authoritative_cycle_owner");
+    }
     if (!Number.isSafeInteger(waiter.schemaRevision) ||
         waiter.schemaRevision < 14) {
         missing.push("authoritative_violation_schema");
@@ -540,6 +574,9 @@ function normalizeTask2(retained) {
     let phaseCountersAuthoritative =
         projection.phaseCountersAuthoritative !== false &&
         !authorityMissing && !authorityInvalid;
+    if (rawOwnerPrerequisiteReasons.length > 0) {
+        authoritativeViolations = [];
+    }
 
     if (expectation === "required" && !boundary) {
         missing.push("missing_required_mutation_boundary");
@@ -601,8 +638,20 @@ function normalizeTask2(retained) {
         mismatchReasons : projectedAuthorityReasons ||
         [...missing.filter((value) => value.startsWith("authoritative_") ||
             value === "missing_required_mutation_boundary"),
+        ...rawOwnerPrerequisiteReasons,
         ...producerInvalid.filter((value) =>
             /_(first_offender_missing|temporal_order_unproven)$/.test(value))]);
+    const ownerCorrelatedAuditObserved =
+        positiveInteger(waiter.transitionId) &&
+        audit.ownerTransitionId === waiter.transitionId &&
+        positiveInteger(audit.ownerToken) &&
+        Number.isSafeInteger(audit.eyeObservations) &&
+        audit.eyeObservations > 0;
+    const transitionEvidenceComplete =
+        Boolean(timeline.dispatch) && audit.evidenceComplete === true &&
+        audit.retentionOverflow !== true && ownerCorrelatedAuditObserved &&
+        Number.isSafeInteger(waiter.schemaRevision) &&
+        waiter.schemaRevision >= 14;
     return {
         verdict,
         expectation,
@@ -614,26 +663,14 @@ function normalizeTask2(retained) {
         reportedViolations,
         violationAuthority,
         authoritativeViolations,
+        rawOwnerPrerequisitesValid:
+            rawOwnerPrerequisiteReasons.length === 0,
+        rawOwnerPrerequisiteReasons,
         producerInvalidEvidence: producerInvalid,
         auditStorageComplete: projection.auditStorageComplete ??
             (audit.evidenceComplete === true && audit.retentionOverflow !== true),
-        ownerCorrelatedAuditObserved:
-            projection.ownerCorrelatedAuditObserved ??
-            (audit.ownerTransitionId === waiter.transitionId &&
-                Number.isSafeInteger(audit.ownerToken) && audit.ownerToken > 0 &&
-                Number.isSafeInteger(audit.eyeObservations) &&
-                audit.eyeObservations > 0),
-        transitionEvidenceComplete:
-            projection.transitionEvidenceComplete ??
-            (Boolean(timeline.dispatch) &&
-                audit.evidenceComplete === true &&
-                audit.retentionOverflow !== true &&
-                audit.ownerTransitionId === waiter.transitionId &&
-                Number.isSafeInteger(audit.ownerToken) && audit.ownerToken > 0 &&
-                Number.isSafeInteger(audit.eyeObservations) &&
-                audit.eyeObservations > 0 &&
-                Number.isSafeInteger(waiter.schemaRevision) &&
-                waiter.schemaRevision >= 14),
+        ownerCorrelatedAuditObserved,
+        transitionEvidenceComplete,
     };
 }
 
@@ -715,6 +752,169 @@ function targetsMatch(actual, expected) {
         return false;
     }
     return true;
+}
+
+function rawPassEvidence(root) {
+    const rawRoot = path.join(root, "raw");
+    if (!fs.existsSync(rawRoot)) return { scenarios: [], cleanup: [] };
+    const scenarios = [];
+    const cleanup = [];
+    for (const file of walk(rawRoot).filter((candidate) =>
+        path.extname(candidate).toLowerCase() === ".json" &&
+        path.basename(candidate) !== "live-result.json")) {
+        let value;
+        try {
+            value = readJson(file);
+        } catch {
+            continue;
+        }
+        const rootValue = decodedScenarioRoot(value);
+        if (rootValue) scenarios.push(rootValue);
+        if (value && value.status === "CONFIRMED_INACTIVE" &&
+            Array.isArray(value.knownSessionIds) && value.after) {
+            cleanup.push(value);
+        }
+    }
+    return { scenarios, cleanup };
+}
+
+function scenarioResult(root, label) {
+    const entry = root && Array.isArray(root.results) ? root.results.find(
+        (candidate) => candidate && candidate.label === label) : null;
+    return entry && entry.result;
+}
+
+function stressSession(value) {
+    const session = value && value.status && value.status.session;
+    return {
+        id: session && Number.isSafeInteger(session.id) ? session.id : null,
+        active: session && typeof session.active === "boolean" ?
+            session.active : null,
+    };
+}
+
+function passFinalizationEvidence(root, liveResult, planEntries, rows, variant) {
+    const reasons = [];
+    if (!liveResult || liveResult.ok !== true ||
+        liveResult.status !== "COMPLETE" || !Array.isArray(liveResult.lanes)) {
+        return { complete: false, reasons: ["live_result_complete_missing"],
+            passes: [] };
+    }
+    const passKeys = unique(planEntries.map((entry) =>
+        `${entry.lane || "default"}|${entry.pass}`));
+    const raw = rawPassEvidence(root);
+    const results = [];
+    const ownerPairs = [];
+    for (const key of passKeys) {
+        const [laneId, passText] = key.split("|");
+        const passNumber = Number(passText);
+        const lane = liveResult.lanes.find((candidate) => candidate &&
+            (candidate.id || "default") === laneId);
+        const pass = lane && Array.isArray(lane.passes) ? lane.passes.find(
+            (candidate) => candidate && candidate.pass === passNumber) : null;
+        const passReasons = [];
+        const ownership = pass && pass.ownership || {};
+        const baseline = ownership.baseline || {};
+        const measured = ownership.measured || {};
+        const trace = ownership.trace || {};
+        const traceRequired = variant === "nvidia" && planEntries.some((entry) =>
+            `${entry.lane || "default"}|${entry.pass}` === key &&
+            entry.target && entry.target.method === "dlss");
+        const cleanup = pass && pass.cleanup || {};
+        const after = cleanup.after || {};
+        const positive = (value) => Number.isSafeInteger(value) && value > 0;
+        if (positive(baseline.startSessionId) && positive(measured.sessionId)) {
+            const ownerPair = `${baseline.startSessionId}|${measured.sessionId}`;
+            if (ownerPairs.includes(ownerPair)) {
+                passReasons.push("pass_owner_identity_reused");
+            }
+            ownerPairs.push(ownerPair);
+        }
+        if (!pass || pass.status !== "COMPLETE") {
+            passReasons.push("pass_complete_missing");
+        }
+        if (baseline.proven !== true || !positive(baseline.startSessionId) ||
+            baseline.active !== false) {
+            passReasons.push("baseline_owner_finalization_invalid");
+        }
+        if (measured.proven !== true || !positive(measured.sessionId) ||
+            measured.active !== false) {
+            passReasons.push("measured_owner_finalization_invalid");
+        }
+        if (cleanup.status !== "CONFIRMED_INACTIVE" ||
+            !Array.isArray(cleanup.knownSessionIds) ||
+            !cleanup.knownSessionIds.includes(baseline.startSessionId) ||
+            !cleanup.knownSessionIds.includes(measured.sessionId)) {
+            passReasons.push("cleanup_owner_certificate_invalid");
+        }
+        const activeNames = ["stressActive", "cpuActive", "gpuActive",
+            "textureActive", "probeActive", "traceActive"];
+        if (!Array.isArray(after.missing) || after.missing.length > 0 ||
+            activeNames.some((name) => after[name] !== false)) {
+            passReasons.push("cleanup_inactivity_unproven");
+        }
+        const baselineReceipt = raw.scenarios.find((candidate) => {
+            const start = stressSession(scenarioResult(candidate,
+                "baseline-stress-start"));
+            const waiter = scenarioResult(candidate, "qualification-wait");
+            return start.id === baseline.startSessionId &&
+                start.active === true && waiter && waiter.baseline &&
+                waiter.baseline.stressSessionId === baseline.startSessionId;
+        });
+        if (!baselineReceipt) {
+            passReasons.push("retained_baseline_owner_receipt_missing");
+        }
+        const handoffReceipt = raw.scenarios.find((candidate) => {
+            const stopped = stressSession(scenarioResult(candidate,
+                "baseline-stress-stop"));
+            const started = stressSession(scenarioResult(candidate,
+                "measured-stress-start"));
+            return stopped.id === baseline.startSessionId &&
+                stopped.active === false && started.id === measured.sessionId &&
+                started.active === true;
+        });
+        if (!handoffReceipt) {
+            passReasons.push("retained_handoff_owner_receipt_missing");
+        }
+        const cleanupReceipt = raw.cleanup.find((candidate) =>
+            candidate.knownSessionIds.includes(baseline.startSessionId) &&
+            candidate.knownSessionIds.includes(measured.sessionId) &&
+            (!traceRequired ||
+                Array.isArray(candidate.knownTraceSessionIds) &&
+                candidate.knownTraceSessionIds.includes(trace.sessionId) &&
+                candidate.after.traceSessionId === trace.sessionId) &&
+            Array.isArray(candidate.after.missing) &&
+            candidate.after.missing.length === 0 &&
+            ["stressActive", "cpuActive", "gpuActive", "textureActive",
+                "probeActive", "traceActive"].every((name) =>
+                candidate.after[name] === false));
+        if (!cleanupReceipt) {
+            passReasons.push("retained_cleanup_receipt_missing");
+        }
+        const ownedRows = rows.filter((row) =>
+            `${row.lane || "default"}|${row.pass}` === key);
+        if (ownedRows.length === 0 || !positive(measured.sessionId) ||
+            ownedRows.some((row) =>
+                row.terminalStressSessionId !== measured.sessionId)) {
+            passReasons.push("measured_row_owner_mismatch");
+        }
+        if (traceRequired) {
+            if (trace.proven !== true || !positive(trace.sessionId) ||
+                trace.active !== false ||
+                !Array.isArray(cleanup.knownTraceSessionIds) ||
+                !cleanup.knownTraceSessionIds.includes(trace.sessionId)) {
+                passReasons.push("trace_owner_finalization_invalid");
+            }
+        }
+        results.push({ lane: laneId, pass: passNumber,
+            complete: passReasons.length === 0,
+            reasons: unique(passReasons) });
+        reasons.push(...passReasons.map((reason) =>
+            `${laneId}:pass-${passNumber}:${reason}`));
+    }
+    if (passKeys.length === 0) reasons.push("planned_passes_missing");
+    return { complete: reasons.length === 0, reasons: unique(reasons),
+        passes: results };
 }
 
 function presentationStretchDetails(waiter, projection, renderVerdict) {
@@ -886,8 +1086,7 @@ function traceLifecycleEvidence(retained, buildId, requireDispatch) {
     const reasons = [];
     const names = [["traceReset", "dlss_trace_reset"],
         ["traceStart", "dlss_trace_start"],
-        ["traceStop", "dlss_trace_stop"],
-        ["traceRead", "dlss_trace_read"]];
+        ["traceStop", "dlss_trace_stop"]];
     for (const [name, action] of names) {
         const value = retained[name];
         if (!value || value.action !== action || value.ok === false ||
@@ -901,7 +1100,13 @@ function traceLifecycleEvidence(retained, buildId, requireDispatch) {
     const summaries = names.map(([name]) => retained[name] &&
         retained[name].capture && (retained[name].capture.summary ||
             retained[name].capture));
-    const sessions = summaries.map((summary) => summary && summary.sessionID);
+    const rawPages = Array.isArray(retained.tracePages) &&
+        retained.tracePages.length > 0 ? retained.tracePages :
+        retained.traceRead ? [retained.traceRead] : [];
+    const pageSummaries = rawPages.map((page) => page && page.capture &&
+        page.capture.summary);
+    const sessions = [...summaries, ...pageSummaries]
+        .map((summary) => summary && summary.sessionID);
     if (sessions.some((value) => !Number.isSafeInteger(value) || value < 1) ||
         unique(sessions).length !== 1) {
         reasons.push("trace_session_identity_invalid");
@@ -909,20 +1114,29 @@ function traceLifecycleEvidence(retained, buildId, requireDispatch) {
     if (!summaries[0] || summaries[0].active !== false ||
         !summaries[1] || summaries[1].active !== true ||
         !summaries[2] || summaries[2].active !== false ||
-        !summaries[3] || summaries[3].active !== false) {
+        pageSummaries.some((summary) => !summary || summary.active !== false)) {
         reasons.push("trace_lifecycle_state_invalid");
     }
-    const read = retained.traceRead;
-    if (read && read.capture && Number.isSafeInteger(sessions[3]) &&
-        sessions[3] > 0) {
+    const records = [];
+    if (rawPages.length > 0 && Number.isSafeInteger(sessions[0]) &&
+        sessions[0] > 0) {
         try {
-            const checked = validateTracePage(read, {
+            const firstLimit = rawPages[0] && rawPages[0].capture &&
+                rawPages[0].capture.limit;
+            const state = {
                 buildId,
-                sessionId: sessions[3],
+                sessionId: sessions[0],
                 afterSequence: 0,
-                maximum: 256,
-            });
-            if (checked.page.capture.moreAvailable !== false) {
+                maximum: Number.isSafeInteger(firstLimit) && firstLimit > 0 ?
+                    firstLimit : 256,
+            };
+            for (const rawPage of rawPages) {
+                const checked = validateTracePage(rawPage, state);
+                state.sessionId = checked.sessionId;
+                state.afterSequence = checked.lastSequence;
+                records.push(...checked.page.capture.records);
+            }
+            if (rawPages[rawPages.length - 1].capture.moreAvailable !== false) {
                 reasons.push("trace_page_nonterminal");
             }
         } catch (error) {
@@ -931,21 +1145,25 @@ function traceLifecycleEvidence(retained, buildId, requireDispatch) {
     } else {
         reasons.push("trace_read_capture_missing");
     }
-    const summary = summaries[3] || {};
-    const records = read && read.capture && read.capture.records;
+    const summary = pageSummaries[pageSummaries.length - 1] || {};
+    if (Number.isSafeInteger(summary.totalRecords) &&
+        summary.totalRecords !== records.length) {
+        reasons.push("trace_total_records_mismatch");
+    }
     if (requireDispatch && (!Number.isSafeInteger(summary.totalRecords) ||
         summary.totalRecords < 1 || !Number.isSafeInteger(summary.setConstantsCalls) ||
         summary.setConstantsCalls < 1 || !Number.isSafeInteger(summary.evaluateCalls) ||
-        summary.evaluateCalls < 1 || !Array.isArray(records) || records.length < 1)) {
+        summary.evaluateCalls < 1 || records.length < 1)) {
         reasons.push("trace_dispatch_evidence_missing");
     }
     if (!requireDispatch && (summary.totalRecords !== 0 ||
         summary.setConstantsCalls !== 0 || summary.evaluateCalls !== 0 ||
-        !Array.isArray(records) || records.length !== 0)) {
+        records.length !== 0)) {
         reasons.push("trace_capability_window_not_empty");
     }
     return { complete: unique(reasons).length === 0,
-        reasons: unique(reasons), sessionId: sessions[3] || null };
+        reasons: unique(reasons), sessionId: sessions[0] || null,
+        pages: rawPages.length, records: records.length };
 }
 
 function transitionRow(root, file, retained, planned) {
@@ -973,6 +1191,8 @@ function transitionRow(root, file, retained, planned) {
         ...identity,
         terminalTransitionId: waiter.transitionId ?? null,
         terminalOwnerId: waiter.ownerId ?? null,
+        terminalStressSessionId: (waiter.baseline &&
+            waiter.baseline.stressSessionId) ?? null,
         target,
         source: sourceProfile(waiter),
         actualBackend: backend.value,
@@ -989,6 +1209,8 @@ function transitionRow(root, file, retained, planned) {
         reportedTask2Violations: task2.reportedViolations,
         task2ViolationAuthority: task2.violationAuthority,
         authoritativeTask2Violations: task2.authoritativeViolations,
+        rawOwnerPrerequisitesValid: task2.rawOwnerPrerequisitesValid,
+        rawOwnerPrerequisiteReasons: task2.rawOwnerPrerequisiteReasons,
         auditStorageComplete: task2.auditStorageComplete,
         ownerCorrelatedAuditObserved: task2.ownerCorrelatedAuditObserved,
         transitionEvidenceComplete: task2.transitionEvidenceComplete,
@@ -1375,8 +1597,11 @@ function finalizeEvidence(options) {
             throw new Error("terminal_receipt_session_missing");
         }
     }
+    const passFinalization = passFinalizationEvidence(
+        root, liveResult, planEntries, rows, variant);
     const assayStatus = interrupted ? "INTERRUPTED" :
-        executionScopeComplete && rows.length === declaredExpectedRows ?
+        executionScopeComplete && rows.length === declaredExpectedRows &&
+            passFinalization.complete ?
             "COMPLETE" : "INCOMPLETE";
     const renderVerdict = aggregateVerdict(rows.map((row) => row.renderVerdict));
     const task2Counts = verdictCounts(rows.map((row) => row.task2Verdict));
@@ -1410,6 +1635,12 @@ function finalizeEvidence(options) {
     }
     if (rows.some((row) => row.phaseCounterAuthorityStatus === "MISMATCHED")) {
         reportingReasons.push("task2_owner_authority_mismatch");
+    }
+    if (rows.some((row) => row.rawOwnerPrerequisitesValid === false)) {
+        reportingReasons.push("task2_owner_authority_incomplete");
+    }
+    if (!passFinalization.complete) {
+        reportingReasons.push("pass_finalization_incomplete");
     }
     if (rows.some((row) => row.renderVerdict === "PASS" &&
         (row.actualBackend === "not_exposed" || !row.finalProfileComplete))) {
@@ -1468,7 +1699,8 @@ function finalizeEvidence(options) {
                     interruptedPass && interruptedPass.failure || null,
                 undispatchedTransitionReceipts: undispatchedFailures.map((entry) =>
                     relative(root, entry.file)),
-            } : null },
+            } : null,
+            passFinalization },
         render: { verdict: renderVerdict },
         stabilityNotes: { count: nonStableTransitions.length,
             transitions: nonStableTransitions },

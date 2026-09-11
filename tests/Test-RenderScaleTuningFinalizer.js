@@ -243,6 +243,9 @@ function retained(boundary, violation, identity = {}, nonStable = false) {
                 ...(boundary ? { firstPhysicalMutation: {
                     tick: 110,
                     frame: 11,
+                    stressSessionId: 7,
+                    qualificationTransitionId: transitionId,
+                    ownershipToken: 1,
                     physicalMutationStarted: true,
                     physicalMutationSource: "engine_target_creator",
                 } } : { firstPhysicalMutation: null }),
@@ -427,6 +430,51 @@ function testDeploymentVerification() {
     }
 }
 
+function completedLiveResult(variant, runId) {
+    const trace = variant === "nvidia" ? {
+        proven: true, sessionId: 55, active: false,
+        source: "dlss-trace-start", stopSource: "dlss-trace-stop",
+    } : null;
+    return {
+        ok: true,
+        status: "COMPLETE",
+        variant,
+        runId,
+        traceCapability: variant === "amd" ? { status: "supported" } :
+            { status: "not_applicable" },
+        lanes: [{
+            id: "default",
+            status: "COMPLETE",
+            passes: [{
+                pass: 1,
+                status: "COMPLETE",
+                cleanup: {
+                    status: "CONFIRMED_INACTIVE",
+                    knownSessionIds: [6, 7],
+                    knownTraceSessionIds: trace ? [trace.sessionId] : [],
+                    after: {
+                        stressSessionId: 7,
+                        stressActive: false,
+                        cpuActive: false,
+                        gpuActive: false,
+                        textureActive: false,
+                        probeActive: false,
+                        traceSessionId: trace ? trace.sessionId : null,
+                        traceActive: false,
+                        missing: [],
+                    },
+                },
+                ownership: {
+                    baseline: { proven: true, startSessionId: 6,
+                        active: false },
+                    measured: { proven: true, sessionId: 7, active: false },
+                    ...(trace ? { trace } : {}),
+                },
+            }],
+        }],
+    };
+}
+
 function createEvidenceRoot(variant = "nvidia", nonStable = false) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "rst-finalizer-"));
     const runId = `${variant}-test-run`;
@@ -442,15 +490,49 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
         planEntry(runId, { ordinal: 1, transitionId: 101 }),
         planEntry(runId, { ordinal: 2, transitionId: 102 }),
     ]);
+    writeJson(path.join(root, "raw", "live-result.json"),
+        completedLiveResult(variant, runId));
+    writeJson(path.join(root, "raw", "pass-1", "baseline", "baseline.json"), {
+        ok: true,
+        aborted: false,
+        results: [
+            { label: "baseline-stress-start", result: {
+                status: { session: { id: 6, active: true } },
+            } },
+            { label: "qualification-wait", result: {
+                baseline: { stressSessionId: 6 },
+            } },
+        ],
+    });
+    writeJson(path.join(root, "raw", "pass-1", "handoff", "handoff.json"), {
+        ok: true,
+        aborted: false,
+        results: [
+            { label: "baseline-stress-stop", result: {
+                status: { session: { id: 6, active: false } },
+            } },
+            { label: "measured-stress-start", result: {
+                status: { session: { id: 7, active: true } },
+            } },
+        ],
+    });
+    writeJson(path.join(root, "raw", "pass-1", "cleanup", "decision.json"), {
+        status: "CONFIRMED_INACTIVE",
+        knownSessionIds: [6, 7],
+        knownTraceSessionIds: variant === "nvidia" ? [55] : [],
+        after: {
+            stressSessionId: 7,
+            stressActive: false,
+            cpuActive: false,
+            gpuActive: false,
+            textureActive: false,
+            probeActive: false,
+            traceSessionId: variant === "nvidia" ? 55 : null,
+            traceActive: false,
+            missing: [],
+        },
+    });
     if (variant === "amd") {
-        writeJson(path.join(root, "raw", "live-result.json"), {
-            ok: true,
-            status: "COMPLETE",
-            variant,
-            runId,
-            traceCapability: { status: "supported" },
-            lanes: [],
-        });
         const lifecycle = traceLifecycle(buildId, 41, []);
         writeJson(path.join(root, "raw", "amd-trace-capability.json"), {
             ok: true,
@@ -1465,6 +1547,166 @@ function testAmdSupportedClaimRequiresRetainedLifecycle() {
     }
 }
 
+function testPassFinalizationControlsCompletion() {
+    const cases = [
+        ["missing-live-result", (root) => fs.unlinkSync(path.join(root,
+            "raw", "live-result.json")), "live_result_complete_missing"],
+        ["missing-cleanup", (root) => {
+            const file = path.join(root, "raw", "live-result.json");
+            const value = readJson(file);
+            delete value.lanes[0].passes[0].cleanup;
+            writeJson(file, value);
+        }, "cleanup_owner_certificate_invalid"],
+        ["wrong-measured-owner", (root) => {
+            const file = path.join(root, "raw", "live-result.json");
+            const value = readJson(file);
+            value.lanes[0].passes[0].ownership.measured.sessionId = 99;
+            writeJson(file, value);
+        }, "measured_row_owner_mismatch"],
+        ["still-active", (root) => {
+            const file = path.join(root, "raw", "live-result.json");
+            const value = readJson(file);
+            value.lanes[0].passes[0].cleanup.after.gpuActive = true;
+            writeJson(file, value);
+        }, "cleanup_inactivity_unproven"],
+        ["unresolved-cleanup", (root) => {
+            const file = path.join(root, "raw", "live-result.json");
+            const value = readJson(file);
+            value.lanes[0].passes[0].cleanup.status = "UNRESOLVED";
+            writeJson(file, value);
+        }, "cleanup_owner_certificate_invalid"],
+        ["missing-raw-baseline", (root) => fs.unlinkSync(path.join(root,
+            "raw", "pass-1", "baseline", "baseline.json")),
+        "retained_baseline_owner_receipt_missing"],
+        ["missing-raw-handoff", (root) => fs.unlinkSync(path.join(root,
+            "raw", "pass-1", "handoff", "handoff.json")),
+        "retained_handoff_owner_receipt_missing"],
+        ["missing-raw-cleanup", (root) => fs.unlinkSync(path.join(root,
+            "raw", "pass-1", "cleanup", "decision.json")),
+        "retained_cleanup_receipt_missing"],
+    ];
+    for (const [name, mutate, reason] of cases) {
+        const root = createEvidenceRoot();
+        try {
+            mutate(root);
+            const result = finalizeEvidence({ root, variant: "nvidia",
+                runId: "nvidia-test-run", buildId: "e".repeat(64),
+                expectedRows: 2 });
+            assert(result.summary.assayExecution.status === "INCOMPLETE" &&
+                result.summary.render.verdict === "PASS" &&
+                result.summary.reporting.status === "INCOMPLETE" &&
+                result.summary.reporting.reasons.includes(
+                    "pass_finalization_incomplete") &&
+                result.summary.assayExecution.passFinalization.reasons.some(
+                    (entry) => entry.includes(reason)),
+            `Pass-finalization case '${name}' was accepted.`);
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    }
+}
+
+function testInvalidRawTask2OwnersOverrideCachedAuthority() {
+    const cases = [
+        ["missing-transition", (receipt) => {
+            delete receipt.waiter.presentationCycleAudit.ownerTransitionId;
+        }],
+        ["zero-transition", (receipt) => {
+            receipt.waiter.presentationCycleAudit.ownerTransitionId = 0;
+        }],
+        ["negative-token", (receipt) => {
+            receipt.waiter.presentationCycleAudit.ownerToken = -1;
+        }],
+        ["string-token", (receipt) => {
+            receipt.waiter.presentationCycleAudit.ownerToken = "1";
+        }],
+    ];
+    for (const [name, mutate] of cases) {
+        const root = createEvidenceRoot();
+        try {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "02", "retained.json");
+            const receipt = readJson(file);
+            receipt.projection.task2Verdict = "PASS";
+            receipt.projection.evidenceVerdict = "PASS";
+            receipt.projection.phaseCountersAuthoritative = true;
+            receipt.projection.phaseCounterAuthorityStatus = "MATCHED";
+            receipt.projection.ownerCorrelatedAuditObserved = true;
+            receipt.projection.transitionEvidenceComplete = true;
+            mutate(receipt);
+            writeJson(file, receipt);
+            const result = finalizeEvidence({ root, variant: "nvidia",
+                runId: "nvidia-test-run", buildId: "e".repeat(64),
+                expectedRows: 2 });
+            const row = result.summary.transitions[1];
+            assert(row.task2Verdict === "INCONCLUSIVE" &&
+                row.phaseCountersAuthoritative === false &&
+                row.phaseCounterAuthorityStatus === "INCOMPLETE" &&
+                row.rawOwnerPrerequisitesValid === false &&
+                row.ownerCorrelatedAuditObserved === false &&
+                row.transitionEvidenceComplete === false &&
+                result.summary.reporting.reasons.includes(
+                    "task2_owner_authority_incomplete"),
+            `Invalid raw Task2 owner '${name}' retained cached authority: ${JSON.stringify(row)}`);
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    }
+}
+
+function testMultiPageTraceFinalization() {
+    const root = createEvidenceRoot();
+    const file = path.join(root, "raw", "pass-1", "transitions", "01",
+        "retained.json");
+    const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+        buildId: "e".repeat(64), expectedRows: 2 };
+    try {
+        const receipt = readJson(file);
+        receipt.waiter.target = {
+            method: "dlss", qualityMode: 3, renderScaleMode: true,
+        };
+        receipt.waiter.replacementTimeline.terminal.presentationProof.backend =
+            "dlss";
+        const lifecycle = traceLifecycle("e".repeat(64), 55);
+        const pages = [
+            tracePage("e".repeat(64), 55, 0, records(1, 256), true, 256),
+            tracePage("e".repeat(64), 55, 256, records(257, 256), true, 256),
+            tracePage("e".repeat(64), 55, 512, records(513, 88), false, 256),
+        ];
+        for (const page of pages) {
+            page.capture.summary.totalRecords = 600;
+            page.capture.summary.setConstantsCalls = 1;
+            page.capture.summary.evaluateCalls = 1;
+        }
+        Object.assign(receipt, lifecycle, { traceRead: pages[0],
+            tracePages: pages });
+        writeJson(file, receipt);
+        updatePlanEntry(root, 1, receipt.waiter.target, {
+            id: "nvidia", configuredFsrRuntime: "fsr3",
+            expectedBackends: ["dlss"],
+            requiresDocumentedFsr4UnavailableCondition: false,
+            fallbackQualification: { required: false, satisfied: true,
+                unavailableCondition: null },
+        });
+        let result = finalizeEvidence(options);
+        assert(result.summary.transitions[0].traceComplete === true &&
+            result.summary.transitions[0].traceValidationReasons.length === 0 &&
+            result.summary.reporting.status === "COMPLETE",
+        "A complete retained multi-page trace did not finalize.");
+
+        receipt.tracePages = [pages[0], pages[2]];
+        writeJson(file, receipt);
+        result = finalizeEvidence(options);
+        assert(result.summary.transitions[0].traceComplete === false &&
+            result.summary.transitions[0].traceValidationReasons.includes(
+                "trace_page_cursor_mismatch") &&
+            result.summary.reporting.status === "INCOMPLETE",
+        "A missing middle trace page completed reporting.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
 Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testPagingResume).then(testDeploymentVerification)
     .then(testOfflineFinalization)
@@ -1484,6 +1726,9 @@ Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testRawOwnerMismatchDowngradesProjectedPass)
     .then(testFinalProfileAndExecutionScopeGateCompletion)
     .then(testAmdSupportedClaimRequiresRetainedLifecycle)
+    .then(testPassFinalizationControlsCompletion)
+    .then(testInvalidRawTask2OwnersOverrideCachedAuthority)
+    .then(testMultiPageTraceFinalization)
     .then(testUnsafeEvidenceNumberFailsClosed).then(() => {
         process.stdout.write("Render-scale tuning finalizer tests passed.\n");
     }).catch((error) => {

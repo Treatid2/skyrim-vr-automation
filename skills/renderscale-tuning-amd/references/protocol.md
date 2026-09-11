@@ -638,6 +638,22 @@ row. An evidence root containing only `summary.json` and `transitions.csv` is
 incomplete and cannot support a ledger append. Append one uniquely headed
 result column per completed two-pass lane.
 
+Optional trace unavailability is non-blocking only before a trace session has
+been acquired. After `dlss_trace_start` returns a positive active session, the
+ordinary stop must carry that exact `expectedSessionId`; every later failure,
+including an unsupported stop or read, must run guarded cleanup and interrupt
+before the first FSR lane mutation unless inactivity is proved. Preserve the
+original bounded read responses as an ordered `tracePages` chain rather than a
+synthetic merged producer receipt.
+
+`COMPLETE` assay/reporting output also requires the retained live-result pass
+certificate for every planned lane/pass. Each certificate must bind the
+baseline and measured stress owners to the terminal rows, record
+`CONFIRMED_INACTIVE` cleanup, and prove stress, CPU, GPU, texture, probe, and
+trace inactivity. Missing, contradictory, wrong-owner, still-active, or
+unresolved pass evidence leaves the observations intact but makes finalization
+`INCOMPLETE`.
+
 If the live runner stops at baseline before any measured row, retain
 `raw/live-result.json` and the exact baseline waiter receipt. Run the same
 offline finalizer with the exact run ID, Build ID, and expected row count. It

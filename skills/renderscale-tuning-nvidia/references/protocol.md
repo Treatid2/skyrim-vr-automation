@@ -656,6 +656,21 @@ after validation. Do not hash or render per
 row. An evidence root containing only `summary.json` and `transitions.csv` is
 incomplete and cannot support a ledger append.
 
+The live runner obtains the positive trace session from `dlss_trace_start`
+before issuing the ordinary `dlss_trace_stop`; every normal and recovery stop
+must carry that exact `expectedSessionId`. It retains the original bounded read
+responses as the row's ordered `tracePages` chain (and `traceRead` as the first
+page for compatibility). Offline finalization validates that complete chain;
+it never replaces the producer pages with a synthetic merged receipt.
+
+`COMPLETE` assay/reporting output also requires the retained live-result pass
+certificate for every planned lane/pass. Each certificate must bind the
+baseline and measured stress owners to the terminal rows, record
+`CONFIRMED_INACTIVE` cleanup, and prove stress, CPU, GPU, texture, probe, and
+trace inactivity. Missing, contradictory, wrong-owner, still-active, or
+unresolved pass evidence leaves the observations intact but makes finalization
+`INCOMPLETE`.
+
 If the live runner stops at baseline before any measured row, retain
 `raw/live-result.json` and the exact baseline waiter receipt. Run the same
 offline finalizer with the exact run ID, Build ID, and expected row count. It

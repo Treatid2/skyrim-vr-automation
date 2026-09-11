@@ -431,15 +431,6 @@ async function runRenderScaleTuningLive(context) {
             waitArgs.foveation = foveation;
         }
         steps.push(toolStep("qualification-wait", "communityshaders.renderscale", waitArgs));
-        if (!baseline && variant === "nvidia" && target.method === "dlss") {
-            steps.push(toolStep("dlss-trace-stop", "communityshaders.renderscale", {
-                action: "dlss_trace_stop", expectedBuildId: buildId,
-            }));
-            steps.push(toolStep("dlss-trace-read", "communityshaders.renderscale", {
-                action: "dlss_trace_read", afterSequence: 0,
-                limit: matrix.traceReadLimit, expectedBuildId: buildId,
-            }));
-        }
         return steps;
     }
 
@@ -1598,6 +1589,117 @@ async function runRenderScaleTuningLive(context) {
         }
     }
 
+    function traceRecordSequence(record) {
+        const value = record && (record.sequence ??
+            (record.current && record.current.sequence));
+        return Number.isSafeInteger(value) && value > 0 ? value : null;
+    }
+
+    function requireOwnedTraceState(result, action, sessionId, active) {
+        const state = traceSession(result);
+        if (!result || result.action !== action || result.ok === false ||
+            result.isError === true || !result.producer ||
+            result.producer.buildId !== buildId || !state.present ||
+            state.id !== sessionId || state.active !== active) {
+            throw diagnosticError("trace_owner_state_unproven", {
+                action, expectedSessionId: sessionId, expectedActive: active,
+                observed: state,
+                reportedError: reportedError(result),
+            });
+        }
+        return state;
+    }
+
+    async function closeOwnedTraceWindow(retainedKey, ownerState) {
+        const owner = ownerState.trace;
+        if (!owner || owner.proven !== true || owner.active !== true ||
+            !Number.isSafeInteger(owner.sessionId) || owner.sessionId < 1) {
+            throw diagnosticError("trace_owner_identity_missing", {
+                owner: owner || null,
+            });
+        }
+        const stopResult = await renderScale({
+            action: "dlss_trace_stop",
+            expectedSessionId: owner.sessionId,
+            expectedBuildId: buildId,
+        });
+        retain(`${retainedKey}:trace-stop`, stopResult.envelope);
+        requireOwnedTraceState(stopResult.root, "dlss_trace_stop",
+            owner.sessionId, false);
+        owner.active = false;
+        owner.stopSource = "dlss-trace-stop";
+
+        const pages = [];
+        let afterSequence = 0;
+        for (let pageNumber = 1; pageNumber <= 4096; pageNumber += 1) {
+            const readResult = await renderScale({
+                action: "dlss_trace_read",
+                afterSequence,
+                limit: matrix.traceReadLimit,
+                expectedBuildId: buildId,
+            });
+            retain(`${retainedKey}:trace-page-${pageNumber}`,
+                readResult.envelope);
+            const page = readResult.root;
+            const capture = page && page.capture;
+            const summary = capture && capture.summary;
+            if (!page || page.action !== "dlss_trace_read" ||
+                page.ok === false || page.isError === true ||
+                !page.producer || page.producer.buildId !== buildId ||
+                !capture || !Array.isArray(capture.records) ||
+                !summary || summary.sessionID !== owner.sessionId ||
+                summary.active !== false ||
+                capture.afterSequence !== afterSequence ||
+                !Number.isSafeInteger(capture.limit) || capture.limit < 1 ||
+                capture.limit > matrix.traceReadLimit ||
+                capture.records.length > capture.limit ||
+                typeof capture.moreAvailable !== "boolean" ||
+                capture.requestedSequenceOverwritten !== false) {
+                throw diagnosticError("trace_page_invalid", {
+                    pageNumber, expectedSessionId: owner.sessionId,
+                    afterSequence,
+                });
+            }
+            let expectedSequence = afterSequence + 1;
+            for (const record of capture.records) {
+                if (traceRecordSequence(record) !== expectedSequence) {
+                    throw diagnosticError("trace_page_sequence_invalid", {
+                        pageNumber, expectedSequence,
+                    });
+                }
+                expectedSequence += 1;
+            }
+            const lastSequence = capture.records.length > 0 ?
+                expectedSequence - 1 : afterSequence;
+            if (capture.lastReturnedSequence !== lastSequence ||
+                (capture.moreAvailable === true &&
+                    (capture.records.length === 0 ||
+                        capture.latestSequence <= lastSequence)) ||
+                (capture.moreAvailable === false &&
+                    capture.latestSequence !== lastSequence)) {
+                throw diagnosticError("trace_page_terminal_invalid", {
+                    pageNumber, lastSequence,
+                });
+            }
+            pages.push(page);
+            afterSequence = lastSequence;
+            if (capture.moreAvailable === false) {
+                if (!Number.isSafeInteger(summary.totalRecords) ||
+                    summary.totalRecords !== afterSequence) {
+                    throw diagnosticError("trace_total_records_mismatch", {
+                        pageNumber, totalRecords: summary.totalRecords,
+                        retainedRecords: afterSequence,
+                    });
+                }
+                return { traceStop: stopResult.root,
+                    traceRead: pages[0], tracePages: pages };
+            }
+        }
+        throw diagnosticError("trace_page_count_exceeded", {
+            expectedSessionId: owner.sessionId,
+        });
+    }
+
     async function transition(boundary, lane, laneIndex, pass, row, ownerState) {
         const destination = matrix.destinations[row.destination];
         const target = targetFor(boundary, destination, lane.configuredFsrRuntime);
@@ -1650,6 +1752,29 @@ async function runRenderScaleTuningLive(context) {
             waiter = entries.get("qualification-wait");
             projection = waiter ? transitionProjection(waiter, target) : null;
             diagnostic = scenarioDiagnostic(response.root, steps, receiptKey);
+            let traceEvidence = null;
+            if (variant === "nvidia" && target.method === "dlss" &&
+                ownerState.trace && ownerState.trace.active === true && waiter) {
+                try {
+                    traceEvidence = await closeOwnedTraceWindow(
+                        retainedKey, ownerState);
+                } catch (error) {
+                    retain(retainedKey, {
+                        variant,
+                        scenarioReceiptKey: receiptKey,
+                        scenario: diagnostic,
+                        apply: entries.get("profile-apply"),
+                        waiter,
+                        projection,
+                        traceReset: entries.get("dlss-trace-reset") || null,
+                        traceStart: entries.get("dlss-trace-start") || null,
+                        traceCollectionFailure: error && error.diagnostic || {
+                            reason: error.message || String(error),
+                        },
+                    });
+                    throw error;
+                }
+            }
             retained = {
                 variant,
                 scenarioReceiptKey: receiptKey,
@@ -1668,8 +1793,11 @@ async function runRenderScaleTuningLive(context) {
                 presentationCycleAudit: waiter ? waiter.presentationCycleAudit || null : null,
                 traceReset: entries.get("dlss-trace-reset") || null,
                 traceStart: entries.get("dlss-trace-start") || null,
-                traceStop: entries.get("dlss-trace-stop") || null,
-                traceRead: entries.get("dlss-trace-read") || null,
+                traceStop: traceEvidence && traceEvidence.traceStop ||
+                    entries.get("dlss-trace-stop") || null,
+                traceRead: traceEvidence && traceEvidence.traceRead ||
+                    entries.get("dlss-trace-read") || null,
+                tracePages: traceEvidence && traceEvidence.tracePages || null,
             };
             retain(retainedKey, retained);
             if (!waiter || (response.root.ok !== true &&
@@ -1798,13 +1926,6 @@ async function runRenderScaleTuningLive(context) {
             toolStep("amd-dlss-trace-start", "communityshaders.renderscale", {
                 action: "dlss_trace_start", expectedBuildId: buildId,
             }),
-            toolStep("amd-dlss-trace-stop", "communityshaders.renderscale", {
-                action: "dlss_trace_stop", expectedBuildId: buildId,
-            }),
-            toolStep("amd-dlss-trace-read", "communityshaders.renderscale", {
-                action: "dlss_trace_read", afterSequence: 0,
-                limit: matrix.traceReadLimit, expectedBuildId: buildId,
-            }),
         ];
         const unavailableTraceAction = (error) => {
             const diagnostic = error && error.diagnostic;
@@ -1816,11 +1937,13 @@ async function runRenderScaleTuningLive(context) {
             const reported = diagnostic && [
                 diagnostic.reportedError,
                 ...(diagnostic.reportedSteps || []).map((step) => step.error),
-            ].filter((value) => typeof value === "string").join(" ");
+            ].filter((value) => typeof value === "string").join(" ") ||
+                (error && error.message || String(error || ""));
             const unavailable =
                 /(?:unsupported|unknown|unrecognized|not[ _-](?:available|exposed|implemented)|missing)[\s\S]*(?:action|operation)|(?:action|operation)[\s\S]*(?:unsupported|unknown|unrecognized|not[ _-](?:available|exposed|implemented)|missing)/i
                     .test(reported || "");
-            return traceStep && unavailable ? diagnostic : null;
+            return (traceStep || !diagnostic) && unavailable ?
+                diagnostic || { reportedError: reported } : null;
         };
         let response;
         try {
@@ -1850,14 +1973,17 @@ async function runRenderScaleTuningLive(context) {
             entries = requireScenario(response.root, steps, receiptKey);
         } catch (error) {
             const diagnostic = unavailableTraceAction(error);
-            if (diagnostic) {
+            const startReceipt = resultMap(response.root)
+                .get("amd-dlss-trace-start");
+            const started = traceSession(startReceipt);
+            if (diagnostic && !(started.present && started.id !== null &&
+                started.active === true)) {
                 return { status: "unsupported", receiptKey, diagnostic };
             }
             let cleanup;
             try {
                 cleanup = await closeTraceAfterCapabilityFailure(
-                    `${receiptKey}:cleanup`,
-                    resultMap(response.root).get("amd-dlss-trace-start"));
+                    `${receiptKey}:cleanup`, startReceipt);
             } catch (cleanupError) {
                 throw diagnosticError("amd_trace_capability_cleanup_unresolved", {
                     original: error && error.diagnostic || error.message || String(error),
@@ -1869,15 +1995,56 @@ async function runRenderScaleTuningLive(context) {
                 original: error.diagnostic || null, traceCleanup: cleanup,
             });
         }
-        const read = entries.get("amd-dlss-trace-read");
+        const startReceipt = entries.get("amd-dlss-trace-start");
+        const started = traceSession(startReceipt);
+        if (!startReceipt || startReceipt.action !== "dlss_trace_start" ||
+            !startReceipt.producer || startReceipt.producer.buildId !== buildId ||
+            !started.present || started.id === null || started.active !== true) {
+            throw diagnosticError("amd_trace_capability_owner_unproven", {
+                started,
+            });
+        }
+        const ownerState = { trace: { proven: true, sessionId: started.id,
+            active: true, source: "amd-dlss-trace-start" } };
+        let traceEvidence;
+        try {
+            traceEvidence = await closeOwnedTraceWindow(receiptKey, ownerState);
+        } catch (error) {
+            let cleanup;
+            try {
+                cleanup = await closeTraceAfterCapabilityFailure(
+                    `${receiptKey}:cleanup`, startReceipt);
+            } catch (cleanupError) {
+                throw diagnosticError("amd_trace_capability_cleanup_unresolved", {
+                    original: error && error.diagnostic ||
+                        error.message || String(error),
+                    cleanup: cleanupError && cleanupError.diagnostic ||
+                        cleanupError.message || String(cleanupError),
+                });
+            }
+            throw diagnosticError(error.message, {
+                original: error.diagnostic || null, traceCleanup: cleanup,
+            });
+        }
+        const read = traceEvidence.tracePages[traceEvidence.tracePages.length - 1];
         const capture = read && read.capture;
         const summary = capture && capture.summary;
-        if (!capture || !summary || !Array.isArray(capture.records) ||
-            capture.records.length !== 0 || summary.totalRecords !== 0 ||
+        const records = traceEvidence.tracePages.flatMap((page) =>
+            page.capture.records);
+        if (!capture || !summary || records.length !== 0 ||
+            summary.totalRecords !== 0 ||
             summary.setConstantsCalls !== 0 || summary.evaluateCalls !== 0) {
             throw new Error("amd_dlss_trace_not_empty");
         }
-        return { status: "supported", receiptKey };
+        const lifecycle = {
+            traceReset: entries.get("amd-dlss-trace-reset"),
+            traceStart: startReceipt,
+            traceStop: traceEvidence.traceStop,
+            traceRead: traceEvidence.traceRead,
+            tracePages: traceEvidence.tracePages,
+        };
+        retain(receiptKey, lifecycle);
+        return { status: "supported", receiptKey, lifecycle };
     }
 
     async function status(lane, pass, suffix, includeTrace = false) {
