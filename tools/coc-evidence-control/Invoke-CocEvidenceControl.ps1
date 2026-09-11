@@ -15,6 +15,8 @@ param(
     [ValidateRange(0, [int]::MaxValue)][int]$TargetPid = 0,
     [ValidateRange(1, 2048)][int]$MinimumFreeGiB = 100,
     [ValidateRange(10, 300)][int]$CaptureTimeoutSeconds = 120,
+    [ValidateSet('none', 'stop-before-termination')]
+    [string]$InternalTestFailurePoint = 'none',
     [switch]$Compact,
     [switch]$NoExit
 )
@@ -310,7 +312,9 @@ function Get-OwnedMonitor($State) {
 function Get-OwnedHangCapture($State) {
     $captureState = $State.PSObject.Properties['captureState']
     if (-not $captureState -or
-        [string]$captureState.Value -notin @('capture-running', 'hash-pending')) {
+        [string]$captureState.Value -notin @(
+            'capture-running', 'hash-pending', 'capture-cleanup-incomplete'
+        )) {
         return $null
     }
     return Get-OwnedProcess $State 'capturePid' 'captureStartedUtc'
@@ -323,7 +327,9 @@ function Get-TargetProcesses([string]$Name, [int]$ProcessId) {
 
 function Get-OwnedProcDumpCapture($State) {
     if (-not $State.PSObject.Properties['captureState'] -or
-        [string]$State.captureState -notin @('capture-running', 'hash-pending')) {
+        [string]$State.captureState -notin @(
+            'capture-running', 'hash-pending', 'capture-cleanup-incomplete'
+        )) {
         return $null
     }
     return Get-OwnedProcess $State 'captureProcDumpPid' `
@@ -942,7 +948,16 @@ try {
             throw 'A dump was written recently; wait before stopping ProcDump.'
         }
 
-        $cancel = if ($processKind -eq 'crash-monitor') {
+        $cancel = if ($InternalTestFailurePoint -eq 'stop-before-termination' -and
+            $processKind -ne 'crash-monitor') {
+            [pscustomobject][ordered]@{
+                cleanupComplete = $false
+                capturePid = $ownedProcess.Id
+                captureStartedUtc = $ownedProcess.StartTime.ToUniversalTime().ToString('o')
+                captureExited = $false
+                error = 'Injected stop failure before exact-process termination.'
+            }
+        } elseif ($processKind -eq 'crash-monitor') {
             Stop-OwnedProcDumpMonitor -Owned $owned -Monitor $ownedProcess
         } else {
             Stop-HangCaptureWorker -Capture $ownedProcess

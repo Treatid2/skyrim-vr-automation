@@ -47,6 +47,24 @@ foreach ($invalidCall in @(
         if ($_.Exception.Message -notlike 'test health returned no *') { throw }
     }
 }
+foreach ($invalidContent in @(
+        'not-an-array',
+        [pscustomobject]@{ type = 'text'; text = '{}' },
+        @([pscustomobject]@{ text = '{}' }),
+        @($null)
+    )) {
+    try {
+        Get-CocMcpResultContent -Call ([pscustomobject]@{
+                json = [pscustomobject]@{
+                    result = [pscustomobject]@{ content = $invalidContent }
+                }
+            }) -Context 'test content' | Out-Null
+        throw 'Malformed MCP content was accepted.'
+    }
+    catch {
+        if ($_.Exception.Message -notlike 'test content returned *content*') { throw }
+    }
+}
 try {
     Get-CocMcpResultContent -Call ([pscustomobject]@{
             json = [pscustomobject]@{
@@ -492,7 +510,10 @@ $controllerAst = [System.Management.Automation.Language.Parser]::ParseFile(
 if ($controllerParseErrors.Count -ne 0) {
     throw 'The COC stability controller does not parse.'
 }
-foreach ($functionName in @('Get-JobResult', 'Get-CocFixtureAnomalies')) {
+foreach ($functionName in @(
+        'Get-JobResult', 'Get-CocFixtureAnomalies',
+        'Test-CocBaselineAdmissionTiming'
+    )) {
     $functionAst = $controllerAst.Find({
             param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
@@ -525,6 +546,48 @@ $fixtureAnomalies = @(Get-CocFixtureAnomalies -Value ([pscustomobject]@{
         }))
 if ($fixtureAnomalies.Count -ne 3) {
     throw 'Independent prepare_coc defects were collapsed into one anomaly.'
+}
+$validFixtureAnomalies = @(Get-CocFixtureAnomalies -Value ([pscustomobject]@{
+            ready = $true; persisted = $false; promptRequired = $false
+        }))
+if ($validFixtureAnomalies.Count -ne 0) {
+    throw 'A correctly typed affirmative prepare_coc gate was rejected.'
+}
+foreach ($invalidFixture in @(
+        [pscustomobject]@{ ready = 'false'; persisted = $false; promptRequired = $false },
+        [pscustomobject]@{ ready = $true; persisted = $null; promptRequired = $false },
+        [pscustomobject]@{ ready = $true; persisted = $false; promptRequired = $null }
+    )) {
+    $invalidFixtureAnomalies = @(Get-CocFixtureAnomalies -Value $invalidFixture)
+    if ($invalidFixtureAnomalies.Count -ne 1 -or
+        $invalidFixtureAnomalies[0] -notlike '*non-null Boolean*') {
+        throw 'A malformed or null prepare_coc gate was not rejected explicitly.'
+    }
+}
+
+$timelyTiming = [ordered]@{
+    state = [pscustomobject]@{ completedTimestamp = 90 }
+    scene = [pscustomobject]@{ completedTimestamp = 91 }
+}
+$timelyAdmission = Test-CocBaselineAdmissionTiming -Timing $timelyTiming `
+    -DueTimestamp 100 -DecisionTimestamp 99 -ExpectedCount 2
+if (-not $timelyAdmission.acceptable) {
+    throw 'A wholly timely baseline was rejected by the admission clock.'
+}
+$lateTiming = [ordered]@{
+    state = [pscustomobject]@{ completedTimestamp = 90 }
+    scene = [pscustomobject]@{ completedTimestamp = 101 }
+}
+$lateAdmission = Test-CocBaselineAdmissionTiming -Timing $lateTiming `
+    -DueTimestamp 100 -DecisionTimestamp 101 -ExpectedCount 2
+if ($lateAdmission.acceptable -or $lateAdmission.lateResults[0] -ne 'scene' -or
+    -not $lateAdmission.decisionLate) {
+    throw 'A baseline completing across its admission deadline was accepted.'
+}
+$lateDecision = Test-CocBaselineAdmissionTiming -Timing $timelyTiming `
+    -DueTimestamp 100 -DecisionTimestamp 101 -ExpectedCount 2
+if ($lateDecision.acceptable -or -not $lateDecision.decisionLate) {
+    throw 'A late final baseline admission decision was accepted.'
 }
 
 $claimFixture = Join-Path ([IO.Path]::GetTempPath()) (
@@ -636,13 +699,20 @@ try {
         protocolConfigPath = $configPath
         scenarioRunId = $null
         dispatchFailure = [pscustomobject]@{ error = 'fixture dispatch rejection' }
+        baseline = [pscustomobject]@{ state = [pscustomobject]@{ ok = $true } }
+        baselineVerdict = [pscustomobject]@{ acceptable = $true }
+        baselineTiming = [pscustomobject]@{ state = [pscustomobject]@{ completedTimestamp = 1 } }
+        fixtureFailure = [pscustomobject]@{ effect = 'unknown'; error = 'fixture dispatch rejection' }
     } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $rejectedStatePath -Encoding utf8
     $rejectedStatus = & $scriptPath status -StatePath $rejectedStatePath `
         -Compact -NoExit | ConvertFrom-Json -Depth 30
     if ($rejectedStatus.ok -or $rejectedStatus.state -ne 'failed' -or
         $null -ne $rejectedStatus.data.scenarioRunId -or
         $rejectedStatus.errors[0] -ne 'fixture dispatch rejection' -or
-        $rejectedStatus.data.dispatchFailure.error -ne 'fixture dispatch rejection') {
+        $rejectedStatus.data.dispatchFailure.error -ne 'fixture dispatch rejection' -or
+        -not $rejectedStatus.data.baselineVerdict.acceptable -or
+        $rejectedStatus.data.fixtureFailure.effect -ne 'unknown' -or
+        $null -eq $rejectedStatus.data.baselineTiming.state) {
         throw 'Rejected scenario status did not preserve the terminal dispatch failure.'
     }
 }

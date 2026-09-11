@@ -145,6 +145,10 @@ foreach ($requiredProtocolText in @(
     '"waitUntil": "playerLoaded", "timeoutMs": 20000',
     'never postpone the scheduled COC',
     '## One-time post-load fixture gate',
+    'baseline or a failed mandatory `ready`/`promptRequired`/`persisted` fixture gate',
+    'is an admission block and the measured assay is not submitted',
+    'admission, retain in-assay semantic anomalies and mismatches',
+    'non-gating fixture, profile, fidelity, lifecycle, or presentation observations',
     'are mandatory dispatch gates',
     '"action": "prepare_coc"',
     'raises an `info` or less-verbose CSX log level to `debug`',
@@ -367,7 +371,7 @@ Assert-Protocol (
     boundedParallelBaseline = $true
     failClosedBaselineAdmission = $true
     firstCocOwnsPerformanceOrigin = $true
-    semanticAnomaliesContinue = $true
+    postAdmissionSemanticAnomaliesContinue = $true
     hardControlFailuresAbort = $true
     fidelityPredicatePreserved = $true
     sourceAndPluginMatch = $true

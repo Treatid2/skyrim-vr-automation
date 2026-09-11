@@ -25,9 +25,12 @@ command fails, times out, is rejected, lacks a required receipt or tool family,
 or needs an action outside that command's scope. On a block, preserve all
 receipts, make no retry or substitute call, make no game, console, menu,
 configuration, GPU, INI, MO2, hardware, or upscaling change, and
-ask one concise question identifying the blocked phase and receipt. A semantic
-baseline, fixture, profile, fidelity, lifecycle, or presentation anomaly is
-not a block: record it and retain the scheduled measured history.
+ask one concise question identifying the blocked phase and receipt. A failed
+baseline or a failed mandatory `ready`/`promptRequired`/`persisted` fixture gate
+is an admission block and the measured assay is not submitted. After valid
+admission, retain in-assay semantic anomalies and mismatches in the explicitly
+non-gating fixture, profile, fidelity, lifecycle, or presentation observations
+as measured history rather than treating them as new dispatch gates.
 
 The first command is `start COC protocol`, issued while Skyrim is at its main
 menu/load window. It authorizes only readiness. Register or verify tools, start

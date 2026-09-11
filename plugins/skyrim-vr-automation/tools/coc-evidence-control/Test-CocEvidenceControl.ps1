@@ -293,6 +293,61 @@ try {
         throw 'Status did not recognize the persisted live hang capture.'
     }
 
+    $failedWorkerCleanup = & $scriptPath stop -StatePath $statePath `
+        -InternalTestFailurePoint stop-before-termination -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if ($failedWorkerCleanup.ok -or $failedWorkerCleanup.state -ne 'cleanup-incomplete' -or
+        -not (Get-Process -Id $capture.Id -ErrorAction SilentlyContinue)) {
+        throw 'Controlled worker cleanup failure did not retain the live exact process.'
+    }
+    $reloadedWorker = & $scriptPath status -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if (-not $reloadedWorker.data.captureActive -or
+        $reloadedWorker.data.activeProcessKind -ne 'hang-capture-worker') {
+        throw 'Reloaded cleanup-incomplete state lost the live owned worker.'
+    }
+    $recoveredWorker = & $scriptPath stop -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if (-not $recoveredWorker.ok -or $recoveredWorker.state -ne 'stopped' -or
+        (Get-Process -Id $capture.Id -ErrorAction SilentlyContinue)) {
+        throw 'A later authorized stop did not resolve the retained worker lifetime.'
+    }
+
+    $capture = [Diagnostics.Process]::Start($startInfo)
+    $captureStartedUtc = $capture.StartTime.ToUniversalTime().ToString('o')
+    $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $state.capturePid = [int]::MaxValue
+    $state.captureStartedUtc = [DateTime]::UtcNow.ToString('o')
+    $state | Add-Member -NotePropertyName captureProcDumpPid -NotePropertyValue $capture.Id -Force
+    $state | Add-Member -NotePropertyName captureProcDumpStartedUtc -NotePropertyValue $captureStartedUtc -Force
+    $state.captureState = 'capture-running'
+    $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8
+    $failedProcDumpCleanup = & $scriptPath stop -StatePath $statePath `
+        -InternalTestFailurePoint stop-before-termination -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    $reloadedProcDump = & $scriptPath status -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if ($failedProcDumpCleanup.ok -or -not $reloadedProcDump.data.captureActive -or
+        $reloadedProcDump.data.activeProcessKind -ne 'hang-capture-procdump') {
+        throw 'Reloaded cleanup-incomplete state lost the live owned ProcDump child.'
+    }
+    $recoveredProcDump = & $scriptPath stop -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if (-not $recoveredProcDump.ok -or
+        (Get-Process -Id $capture.Id -ErrorAction SilentlyContinue)) {
+        throw 'A later authorized stop did not resolve the retained ProcDump lifetime.'
+    }
+
+    $capture = [Diagnostics.Process]::Start($startInfo)
+    $captureStartedUtc = $capture.StartTime.ToUniversalTime().ToString('o')
+    $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $state.capturePid = $capture.Id
+    $state.captureStartedUtc = $captureStartedUtc
+    $state.captureProcDumpPid = [int]::MaxValue
+    $state.captureProcDumpStartedUtc = [DateTime]::UtcNow.ToString('o')
+    $state.captureState = 'capture-running'
+    $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8
+
     $capture.Kill()
     $capture.WaitForExit()
     $exited = & $scriptPath status -StatePath $statePath -Compact -NoExit |
