@@ -92,7 +92,11 @@ function Invoke-BoundedQualificationScript(
     if ($attempt.Count -ne 1) {
         throw "The bounded qualification process produced no attempt record: $(@($bounded.errors) -join ' ')"
     }
-    if ([bool]$attempt[0].timedOut -or [bool]$attempt[0].unresolvedProcess) {
+    $script:lastBoundedAttempt = $attempt[0]
+    if ([bool]$attempt[0].unresolvedProcess) {
+        throw "The bounded qualification process left unresolved child PID $([string]$attempt[0].pid): $ScriptPath"
+    }
+    if ([bool]$attempt[0].timedOut) {
         throw [TimeoutException]::new("The bounded qualification process exceeded the shared 600-second deadline: $ScriptPath")
     }
     if ($null -eq $attempt[0].exitCode -or [int]$attempt[0].exitCode -ne 0) {
@@ -105,6 +109,7 @@ function Invoke-BoundedQualificationScript(
 }
 
 try {
+    $script:lastBoundedAttempt = $null
     $baselineArgumentsSupplied = $PSBoundParameters.ContainsKey('BaselinePath') -or
         $PSBoundParameters.ContainsKey('ExpectedBaselineBuildId')
     if (-not $PrMode -and $baselineArgumentsSupplied) {
@@ -189,11 +194,25 @@ try {
 }
 catch {
     if ($packageWatch.IsRunning) { $packageWatch.Stop() }
+    $boundedAttempt = $script:lastBoundedAttempt
+    $boundedChildLaunched = $null -ne $boundedAttempt -and $null -ne $boundedAttempt.pid
     Write-PackageResult ([pscustomobject][ordered]@{
         ok = $false
         status = 'INFRASTRUCTURE_ERROR'
         packageElapsedMs = [Math]::Round($packageWatch.Elapsed.TotalMilliseconds, 3)
         evidenceDirectory = $resolvedEvidence
+        processId = $(if ($null -ne $boundedAttempt) { $boundedAttempt.pid } else { $null })
+        exitCode = $(if ($null -ne $boundedAttempt) { $boundedAttempt.exitCode } else { $null })
+        timedOut = [bool]($null -ne $boundedAttempt -and $boundedAttempt.timedOut)
+        terminationRequested = [bool]($null -ne $boundedAttempt -and $boundedAttempt.terminationRequested)
+        terminationConfirmed = [bool]($null -ne $boundedAttempt -and $boundedAttempt.terminationConfirmed)
+        unresolvedProcess = [bool]($null -ne $boundedAttempt -and $boundedAttempt.unresolvedProcess)
+        terminationErrors = @(if ($null -ne $boundedAttempt) { @($boundedAttempt.terminationErrors) } else { @() })
+        runtimeCleanup = [pscustomobject][ordered]@{
+            state = $(if ($boundedChildLaunched) { 'unknown' } else { 'not_applicable' })
+            reason = $(if ($boundedChildLaunched) { 'The outer wrapper cannot establish that the terminated runner completed its owner-aware runtime cleanup.' } else { 'No qualification child was launched.' })
+        }
+        boundedProcess = $boundedAttempt
         errors = @($_.Exception.Message)
     })
 }

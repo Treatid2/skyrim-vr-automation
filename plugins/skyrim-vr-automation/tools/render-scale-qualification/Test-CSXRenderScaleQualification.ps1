@@ -4,8 +4,10 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $module = Join-Path $PSScriptRoot 'RenderScaleQualification.psm1'
+$providerModule = Join-Path $PSScriptRoot 'AutomatedVisualReviewProvider.psm1'
 $protocolPath = Join-Path $PSScriptRoot 'protocol.v1.json'
 Import-Module $module -Force
+Import-Module $providerModule -Force
 
 function Assert-Test([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -902,20 +904,26 @@ function Write-TestAutomatedVisualReviewEvidence {
     Assert-Test ($outputSchemaSourceSha256 -eq [string]$Protocol.visualAssay.evaluation.outputSchemaSha256) `
         'Synthetic visual-review output schema does not match the protocol pin.'
 
-    $versionText = 'codex-cli 0.0-test'
-    $codexVersionSha256 = Get-TestTextSha256 $versionText
-    $codexRootHelpSha256 = Get-TestTextSha256 '--ask-for-approval'
-    $codexExecHelpSha256 = Get-TestTextSha256 '--ephemeral --ignore-user-config --skip-git-repo-check --sandbox --json --output-schema --output-last-message --image --model'
-    $features = [ordered]@{ '--ask-for-approval' = $true }
-    foreach ($feature in @('--ephemeral', '--ignore-user-config', '--skip-git-repo-check', '--sandbox', '--json', '--output-schema', '--output-last-message', '--image', '--model')) {
-        $features[$feature] = $true
+    $fakeHelp = '--ephemeral --ignore-user-config --skip-git-repo-check --sandbox --ask-for-approval --json --output-schema --output-last-message --image --model'
+    $preflightAdapter = {
+        param([string]$ExecutablePath, [string[]]$CommandArguments, [int]$TimeoutMilliseconds)
+
+        $stdout = if (($CommandArguments -join '|') -eq '--version') { "codex-cli 0.0-test`n" }
+            elseif ('--model' -in $CommandArguments) { '{"type":"turn.completed"}' }
+            else { $fakeHelp }
+        return [pscustomobject][ordered]@{
+            launched = $true; processId = 4199; exitCode = 0; stdout = $stdout; stderr = ''; timedOut = $false; setupError = $null
+            exitVerified = $true; terminationRequested = $false; terminationConfirmed = $false
+            unresolvedProcess = $false; streamDrainComplete = $true; inputCompleted = $true; terminationErrors = @()
+        }
     }
-    $preflight = [pscustomobject][ordered]@{
-        schema = 'csx-codex-visual-review-preflight-v1'; ok = $true; executablePath = 'C:\Tools\codex.exe'
-        version = '0.0-test'; versionText = $versionText; versionSha256 = $codexVersionSha256
-        rootHelpSha256 = $codexRootHelpSha256; execHelpSha256 = $codexExecHelpSha256
-        features = [pscustomobject]$features; missingFeatures = @(); errors = @()
-    }
+    $preflight = Get-CSXCodexVisualReviewProviderPreflight `
+        -CodexExecutable ([string](Get-Command pwsh -CommandType Application | Select-Object -First 1).Source) `
+        -CommandAdapter $preflightAdapter
+    Assert-Test ([bool]$preflight.ok) "The producer-generated synthetic provider preflight failed: $(@($preflight.errors) -join ' | ')"
+    $codexVersionSha256 = [string]$preflight.versionSha256
+    $codexRootHelpSha256 = [string]$preflight.rootHelpSha256
+    $codexExecHelpSha256 = [string]$preflight.execHelpSha256
     $preflightRelative = 'visual-review/preflight.json'
     $preflightFull = Write-CSXJsonFile -Path (Join-Path $Root $preflightRelative) -Value $preflight
     $preflightSha256 = Get-CSXFileSha256 $preflightFull
@@ -1080,7 +1088,10 @@ function Write-TestAutomatedVisualReviewEvidence {
             })
             $executionBatches.Add([pscustomobject][ordered]@{
                 presentationPass = $presentationPass; replicate = $replicate; ok = $true; status = 'completed'; processId = 4200 + $presentationPass * 10 + $replicate
-                exitCode = 0; timedOut = $false; startedUtc = $started.ToString('o'); completedUtc = $completed.ToString('o'); durationMs = 500.0
+                launched = $true; exitCode = 0; timedOut = $false; exitVerified = $true
+                terminationRequested = $false; terminationConfirmed = $false; unresolvedProcess = $false
+                streamDrainComplete = $true; inputCompleted = $true; terminationErrors = @()
+                startedUtc = $started.ToString('o'); completedUtc = $completed.ToString('o'); durationMs = 500.0
                 promptSha256 = $promptEffectiveSha256; imageBindings = @($providerBindings); outputSchemaPath = [IO.Path]::GetFullPath($schemaPath)
                 responsePath = [IO.Path]::GetFullPath($responseFull); eventsPath = [IO.Path]::GetFullPath($eventsFull)
                 stdout = $eventsText; stdoutJsonl = @($event); stderr = ''; response = $response; responseText = $responseText
@@ -1263,6 +1274,27 @@ function Update-TestAutomatedResponseEvidence {
     $providerBatch.stdout = $eventsText
     $providerBatch.stdoutJsonl = @($eventObjects)
     $providerBatch.eventsSha256 = $eventsSha256
+    Write-CSXJsonFile -Path $executionPath -Value $execution | Out-Null
+    $automated.executionSha256 = Get-CSXFileSha256 $executionPath
+}
+
+function Update-TestAutomatedPreflightEvidence {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)]$Raw,
+        [Parameter(Mandatory)][scriptblock]$Mutation
+    )
+
+    $automated = $Raw.assays.visual.automatedReview
+    $preflightPath = Join-Path $Root $automated.preflightPath
+    $preflight = Get-Content -LiteralPath $preflightPath -Raw | ConvertFrom-Json -Depth 100
+    & $Mutation $preflight
+    Write-CSXJsonFile -Path $preflightPath -Value $preflight | Out-Null
+    $automated.preflightSha256 = Get-CSXFileSha256 $preflightPath
+
+    $executionPath = Join-Path $Root $automated.executionPath
+    $execution = Get-Content -LiteralPath $executionPath -Raw | ConvertFrom-Json -Depth 100
+    $execution.preflight = $preflight
     Write-CSXJsonFile -Path $executionPath -Value $execution | Out-Null
     $automated.executionSha256 = Get-CSXFileSha256 $executionPath
 }
@@ -1639,6 +1671,50 @@ try {
         [pscustomobject]@{
             name = 'preflight hash'; pattern = 'preflight SHA-256 binding'
             mutate = { param($root, $value) $value.assays.visual.automatedReview.preflightSha256 = ('0' * 64) }
+        },
+        [pscustomobject]@{
+            name = 'preflight wrong model'; pattern = 'successful fully identified Codex CLI preflight'
+            mutate = {
+                param($root, $value)
+                Update-TestAutomatedPreflightEvidence -Root $root -Raw $value -Mutation {
+                    param($preflight) $preflight.model = 'wrong-model'
+                }
+            }
+        },
+        [pscustomobject]@{
+            name = 'preflight missing model probe'; pattern = 'provider preflight properties are not the exact closed contract'
+            mutate = {
+                param($root, $value)
+                Update-TestAutomatedPreflightEvidence -Root $root -Raw $value -Mutation {
+                    param($preflight) $preflight.PSObject.Properties.Remove('modelProbe')
+                }
+            }
+        },
+        [pscustomobject]@{
+            name = 'preflight failed model probe'; pattern = 'process custody is not a successful bounded execution|model probe does not prove'
+            mutate = {
+                param($root, $value)
+                Update-TestAutomatedPreflightEvidence -Root $root -Raw $value -Mutation {
+                    param($preflight)
+                    $preflight.modelProbe.ok = $false
+                    $preflight.modelProbe.exitCode = 2
+                    $preflight.modelProbe.process.exitCode = 2
+                    $preflight.processes.modelProbe.exitCode = 2
+                }
+            }
+        },
+        [pscustomobject]@{
+            name = 'preflight timed-out model probe'; pattern = 'process custody is not a successful bounded execution|model probe does not prove'
+            mutate = {
+                param($root, $value)
+                Update-TestAutomatedPreflightEvidence -Root $root -Raw $value -Mutation {
+                    param($preflight)
+                    $preflight.modelProbe.ok = $false
+                    $preflight.modelProbe.timedOut = $true
+                    $preflight.modelProbe.process.timedOut = $true
+                    $preflight.processes.modelProbe.timedOut = $true
+                }
+            }
         },
         [pscustomobject]@{
             name = 'visual diagnostic owned session'; pattern = 'task-owned|transcript does not contain exactly one stress'

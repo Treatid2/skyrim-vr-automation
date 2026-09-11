@@ -2858,7 +2858,7 @@ function Test-CSXAutomatedVisualReviewEvidence {
         $execution = $executionRecord.value
         Assert-CSXExactObjectProperties -Value $preflight -Expected @(
             'schema', 'ok', 'executablePath', 'version', 'versionText', 'versionSha256', 'rootHelpSha256',
-            'execHelpSha256', 'features', 'missingFeatures', 'errors'
+            'execHelpSha256', 'model', 'processes', 'modelProbe', 'features', 'missingFeatures', 'errors'
         ) -Label 'Automated visual-review provider preflight'
         if ([string](Get-CSXPropertyValue $preflight 'schema') -ne 'csx-codex-visual-review-preflight-v1' -or
             (Get-CSXPropertyValue $preflight 'ok') -isnot [bool] -or -not [bool](Get-CSXPropertyValue $preflight 'ok') -or
@@ -2868,11 +2868,54 @@ function Test-CSXAutomatedVisualReviewEvidence {
             -not (Test-CSXSha256Text (Get-CSXPropertyValue $preflight 'versionSha256')) -or
             -not (Test-CSXSha256Text (Get-CSXPropertyValue $preflight 'rootHelpSha256')) -or
             -not (Test-CSXSha256Text (Get-CSXPropertyValue $preflight 'execHelpSha256')) -or
+            [string](Get-CSXPropertyValue $preflight 'model') -ne [string](Get-CSXPropertyValue $automated 'model') -or
             -not (Test-CSXArrayProperty $preflight 'missingFeatures') -or
             -not (Test-CSXArrayProperty $preflight 'errors') -or
             @(Get-CSXPropertyValue $preflight 'missingFeatures' @()).Count -ne 0 -or
             @(Get-CSXPropertyValue $preflight 'errors' @()).Count -ne 0) {
             throw 'Automated visual-review provider preflight is not a successful fully identified Codex CLI preflight.'
+        }
+        $preflightProcesses = Get-CSXPropertyValue $preflight 'processes'
+        Assert-CSXExactObjectProperties -Value $preflightProcesses -Expected @('version', 'rootHelp', 'execHelp', 'modelProbe') `
+            -Label 'Automated visual-review provider preflight processes'
+        foreach ($commandName in @('version', 'rootHelp', 'execHelp', 'modelProbe')) {
+            $commandProcess = Get-CSXPropertyValue $preflightProcesses $commandName
+            Assert-CSXExactObjectProperties -Value $commandProcess -Expected @(
+                'launched', 'processId', 'exitCode', 'timedOut', 'setupError', 'exitVerified',
+                'terminationRequested', 'terminationConfirmed', 'unresolvedProcess', 'streamDrainComplete', 'inputCompleted', 'terminationErrors'
+            ) -Label "Automated visual-review provider preflight $commandName process"
+            if ((Get-CSXPropertyValue $commandProcess 'launched') -isnot [bool] -or -not [bool](Get-CSXPropertyValue $commandProcess 'launched') -or
+                -not (Test-CSXFiniteNonNegativeNumber (Get-CSXPropertyValue $commandProcess 'processId')) -or
+                [double](Get-CSXPropertyValue $commandProcess 'processId') -le 0 -or
+                [double](Get-CSXPropertyValue $commandProcess 'processId') -ne [Math]::Truncate([double](Get-CSXPropertyValue $commandProcess 'processId')) -or
+                -not (Test-CSXNumberEquals (Get-CSXPropertyValue $commandProcess 'exitCode') 0) -or
+                (Get-CSXPropertyValue $commandProcess 'timedOut') -isnot [bool] -or [bool](Get-CSXPropertyValue $commandProcess 'timedOut') -or
+                -not [string]::IsNullOrEmpty([string](Get-CSXPropertyValue $commandProcess 'setupError')) -or
+                (Get-CSXPropertyValue $commandProcess 'exitVerified') -isnot [bool] -or -not [bool](Get-CSXPropertyValue $commandProcess 'exitVerified') -or
+                (Get-CSXPropertyValue $commandProcess 'terminationRequested') -isnot [bool] -or [bool](Get-CSXPropertyValue $commandProcess 'terminationRequested') -or
+                (Get-CSXPropertyValue $commandProcess 'terminationConfirmed') -isnot [bool] -or [bool](Get-CSXPropertyValue $commandProcess 'terminationConfirmed') -or
+                (Get-CSXPropertyValue $commandProcess 'unresolvedProcess') -isnot [bool] -or [bool](Get-CSXPropertyValue $commandProcess 'unresolvedProcess') -or
+                (Get-CSXPropertyValue $commandProcess 'streamDrainComplete') -isnot [bool] -or -not [bool](Get-CSXPropertyValue $commandProcess 'streamDrainComplete') -or
+                (Get-CSXPropertyValue $commandProcess 'inputCompleted') -isnot [bool] -or -not [bool](Get-CSXPropertyValue $commandProcess 'inputCompleted') -or
+                -not (Test-CSXArrayProperty $commandProcess 'terminationErrors') -or
+                @(Get-CSXPropertyValue $commandProcess 'terminationErrors' @()).Count -ne 0) {
+                throw "Automated visual-review provider preflight $commandName process custody is not a successful bounded execution."
+            }
+        }
+        $modelProbe = Get-CSXPropertyValue $preflight 'modelProbe'
+        Assert-CSXExactObjectProperties -Value $modelProbe -Expected @(
+            'attempted', 'ok', 'timeoutMilliseconds', 'exitCode', 'timedOut', 'stdoutSha256', 'stderr', 'process'
+        ) -Label 'Automated visual-review provider model probe'
+        if ((Get-CSXPropertyValue $modelProbe 'attempted') -isnot [bool] -or -not [bool](Get-CSXPropertyValue $modelProbe 'attempted') -or
+            (Get-CSXPropertyValue $modelProbe 'ok') -isnot [bool] -or -not [bool](Get-CSXPropertyValue $modelProbe 'ok') -or
+            -not (Test-CSXFiniteNonNegativeNumber (Get-CSXPropertyValue $modelProbe 'timeoutMilliseconds')) -or
+            [double](Get-CSXPropertyValue $modelProbe 'timeoutMilliseconds') -lt 1000 -or
+            -not (Test-CSXNumberEquals (Get-CSXPropertyValue $modelProbe 'exitCode') 0) -or
+            (Get-CSXPropertyValue $modelProbe 'timedOut') -isnot [bool] -or [bool](Get-CSXPropertyValue $modelProbe 'timedOut') -or
+            -not (Test-CSXSha256Text (Get-CSXPropertyValue $modelProbe 'stdoutSha256')) -or
+            -not [string]::IsNullOrEmpty([string](Get-CSXPropertyValue $modelProbe 'stderr')) -or
+            -not (Test-CSXJsonSemanticIdentity (Get-CSXPropertyValue $modelProbe 'process') (Get-CSXPropertyValue $preflightProcesses 'modelProbe'))) {
+            throw 'Automated visual-review provider model probe does not prove the pinned model with exact bounded process evidence.'
         }
         $featureNames = @(Get-CSXPropertyNames (Get-CSXPropertyValue $preflight 'features'))
         if ($featureNames.Count -eq 0 -or @($featureNames | Where-Object {
@@ -3236,7 +3279,9 @@ function Test-CSXAutomatedVisualReviewEvidence {
             }
 
             Assert-CSXExactObjectProperties -Value $providerBatch -Expected @(
-                'presentationPass', 'replicate', 'ok', 'status', 'processId', 'exitCode', 'timedOut', 'startedUtc',
+                'presentationPass', 'replicate', 'ok', 'status', 'launched', 'processId', 'exitCode', 'timedOut',
+                'exitVerified', 'terminationRequested', 'terminationConfirmed', 'unresolvedProcess', 'streamDrainComplete',
+                'inputCompleted', 'terminationErrors', 'startedUtc',
                 'completedUtc', 'durationMs', 'promptSha256', 'imageBindings', 'outputSchemaPath', 'responsePath',
                 'eventsPath', 'stdout', 'stdoutJsonl', 'stderr', 'response', 'responseText', 'responseSha256',
                 'eventsSha256', 'errors'
@@ -3245,11 +3290,20 @@ function Test-CSXAutomatedVisualReviewEvidence {
                 -not (Test-CSXNumberEquals (Get-CSXPropertyValue $providerBatch 'replicate') $replicate) -or
                 (Get-CSXPropertyValue $providerBatch 'ok') -isnot [bool] -or -not [bool](Get-CSXPropertyValue $providerBatch 'ok') -or
                 [string](Get-CSXPropertyValue $providerBatch 'status') -ne 'completed' -or
+                (Get-CSXPropertyValue $providerBatch 'launched') -isnot [bool] -or -not [bool](Get-CSXPropertyValue $providerBatch 'launched') -or
                 -not (Test-CSXFiniteNonNegativeNumber (Get-CSXPropertyValue $providerBatch 'processId')) -or
                 [double](Get-CSXPropertyValue $providerBatch 'processId') -le 0 -or
                 [double](Get-CSXPropertyValue $providerBatch 'processId') -ne [Math]::Truncate([double](Get-CSXPropertyValue $providerBatch 'processId')) -or
                 -not (Test-CSXNumberEquals (Get-CSXPropertyValue $providerBatch 'exitCode') 0) -or
                 (Get-CSXPropertyValue $providerBatch 'timedOut') -isnot [bool] -or [bool](Get-CSXPropertyValue $providerBatch 'timedOut') -or
+                (Get-CSXPropertyValue $providerBatch 'exitVerified') -isnot [bool] -or -not [bool](Get-CSXPropertyValue $providerBatch 'exitVerified') -or
+                (Get-CSXPropertyValue $providerBatch 'terminationRequested') -isnot [bool] -or [bool](Get-CSXPropertyValue $providerBatch 'terminationRequested') -or
+                (Get-CSXPropertyValue $providerBatch 'terminationConfirmed') -isnot [bool] -or [bool](Get-CSXPropertyValue $providerBatch 'terminationConfirmed') -or
+                (Get-CSXPropertyValue $providerBatch 'unresolvedProcess') -isnot [bool] -or [bool](Get-CSXPropertyValue $providerBatch 'unresolvedProcess') -or
+                (Get-CSXPropertyValue $providerBatch 'streamDrainComplete') -isnot [bool] -or -not [bool](Get-CSXPropertyValue $providerBatch 'streamDrainComplete') -or
+                (Get-CSXPropertyValue $providerBatch 'inputCompleted') -isnot [bool] -or -not [bool](Get-CSXPropertyValue $providerBatch 'inputCompleted') -or
+                -not (Test-CSXArrayProperty $providerBatch 'terminationErrors') -or
+                @(Get-CSXPropertyValue $providerBatch 'terminationErrors' @()).Count -ne 0 -or
                 [string](Get-CSXPropertyValue $providerBatch 'promptSha256') -cne $effectivePromptSha256 -or
                 -not [string]::Equals([string](Get-CSXPropertyValue $providerBatch 'outputSchemaPath'), $schemaRecord.path, [StringComparison]::OrdinalIgnoreCase) -or
                 -not [string]::Equals([string](Get-CSXPropertyValue $providerBatch 'responsePath'), $responseRecord.path, [StringComparison]::OrdinalIgnoreCase) -or
