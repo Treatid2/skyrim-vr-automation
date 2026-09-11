@@ -576,6 +576,11 @@ For each DLSS or DLAA transition, reset/start exactly one owned bounded DLSS
 trace after the row's five-second wait, then stop and bounded-read it after the
 terminal waiter in the same scenario. Retain the reset, start, stop, and raw
 read receipts together, and materialize them only at pass finalization.
+A successful trace start immediately becomes task-owned state. Every later
+failure, continuation, recovery, and pass exit must either stop that exact
+returned session with its session guard and prove it inactive, or retain a
+separate unresolved-cleanup anomaly. Stress-session cleanup alone is not trace
+cleanup and must never support `CONFIRMED_INACTIVE` while the trace is active.
 A missing trace action is `BLOCKED`; an exposed trace action that fails is a
 control failure. Do not start a DLSS trace for FSR, TAA, or None.
 
@@ -626,6 +631,13 @@ for example:
   }
 }
 ```
+
+Before the first assay mutation, the runner retains
+`renderscale-tuning-execution-plan-v1`; materialize it as
+`raw/execution-plan.json`. Finalization correlates every lane/pass/ordinal,
+target, transition ID, and owner ID to that independent plan and rejects
+relabelled duplicate receipts. Unknown scope remains `INCOMPLETE` and repeated
+offline finalization with the same evidence remains restartable.
 
 This validation is finalization-only and must not insert another read, wait,
 or gate between measured rows or passes. Treat an unsupported optional

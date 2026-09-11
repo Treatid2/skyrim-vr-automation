@@ -93,6 +93,9 @@ note, including its presentation disposition and eye paths. A safely closed
 failure advances directly. A stuck operation or physical mutation gets one
 runner-owned reset to the lane's proven starting profile; preserve the failed
 row, do not retry it, and continue only after that reset strictly stabilizes.
+The runner stores its lane-qualified pre-mutation execution plan under the
+run-unique `execution-plan` key; finalization must materialize it as
+`raw/execution-plan.json` with the retained transition receipts.
 Device loss, OOM, lost ownership/scene/transport, or a failed reset stops the
 run. Do not translate the matrix or
 live-path prose into another cell, normalize receipt shapes, or add client

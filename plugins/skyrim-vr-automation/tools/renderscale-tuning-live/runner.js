@@ -1270,7 +1270,7 @@ async function runRenderScaleTuningLive(context) {
     }
 
     async function restoreBaseline(boundary, lane, laneIndex, pass, row,
-        closeDlssTrace) {
+        closeDlssTraceSessionId) {
         const target = targetFor(boundary,
             matrix.destinations[matrix.initialDestination],
             lane.configuredFsrRuntime);
@@ -1281,10 +1281,13 @@ async function runRenderScaleTuningLive(context) {
         }
         const identifiers = recoveryIds(laneIndex, pass, row.ordinal);
         const steps = [];
-        if (closeDlssTrace) {
+        if (Number.isSafeInteger(closeDlssTraceSessionId) &&
+            closeDlssTraceSessionId > 0) {
             steps.push(toolStep("failed-dlss-trace-stop",
                 "communityshaders.renderscale", {
-                    action: "dlss_trace_stop", expectedBuildId: buildId,
+                    action: "dlss_trace_stop",
+                    expectedSessionId: closeDlssTraceSessionId,
+                    expectedBuildId: buildId,
                 }));
             steps.push(toolStep("failed-dlss-trace-read",
                 "communityshaders.renderscale", {
@@ -1565,7 +1568,37 @@ async function runRenderScaleTuningLive(context) {
         return ownerState.measured.sessionId;
     }
 
-    async function transition(boundary, lane, laneIndex, pass, row) {
+    function traceSession(value) {
+        const capture = value && value.capture;
+        const summary = capture && (capture.summary || capture);
+        return {
+            present: Boolean(summary && typeof summary === "object"),
+            id: summary && Number.isSafeInteger(summary.sessionID) ?
+                summary.sessionID : null,
+            active: summary && typeof summary.active === "boolean" ?
+                summary.active : null,
+        };
+    }
+
+    function updateTraceOwnership(entries, ownerState) {
+        const started = traceSession(entries.get("dlss-trace-start"));
+        if (started.present && started.id !== null && started.active === true) {
+            ownerState.trace = {
+                proven: true,
+                sessionId: started.id,
+                active: true,
+                source: "dlss-trace-start",
+            };
+        }
+        const stopped = traceSession(entries.get("dlss-trace-stop"));
+        if (stopped.present && ownerState.trace && ownerState.trace.proven &&
+            stopped.id === ownerState.trace.sessionId && stopped.active === false) {
+            ownerState.trace.active = false;
+            ownerState.trace.stopSource = "dlss-trace-stop";
+        }
+    }
+
+    async function transition(boundary, lane, laneIndex, pass, row, ownerState) {
         const destination = matrix.destinations[row.destination];
         const target = targetFor(boundary, destination, lane.configuredFsrRuntime);
         const identifiers = ids(laneIndex, pass, row.ordinal, false);
@@ -1613,6 +1646,7 @@ async function runRenderScaleTuningLive(context) {
         }
         if (response) {
             entries = resultMap(response.root);
+            updateTraceOwnership(entries, ownerState);
             waiter = entries.get("qualification-wait");
             projection = waiter ? transitionProjection(waiter, target) : null;
             diagnostic = scenarioDiagnostic(response.root, steps, receiptKey);
@@ -1657,13 +1691,17 @@ async function runRenderScaleTuningLive(context) {
                 const restored = await restoreBaseline(
                     boundary, lane, laneIndex, pass, row,
                     variant === "nvidia" && target.method === "dlss" &&
-                        !retained.traceStop);
+                        !retained.traceStop && ownerState.trace &&
+                        ownerState.trace.proven ? ownerState.trace.sessionId : null);
                 recovery = restored.summary;
                 retained.recovery = recovery;
                 retained.recoveryReceiptKey = restored.receiptKey;
                 if (restored.evidence.traceStop) {
                     retained.traceStop = restored.evidence.traceStop;
                     retained.traceRead = restored.evidence.traceRead;
+                    updateTraceOwnership(new Map([
+                        ["dlss-trace-stop", restored.evidence.traceStop],
+                    ]), ownerState);
                 }
                 retain(retainedKey, retained);
                 nextBoundary = restored.boundary;
@@ -1695,6 +1733,57 @@ async function runRenderScaleTuningLive(context) {
         });
         return { boundary: nextBoundary, waiter, projection, recovery,
             sourceRecoveryReceiptKey: retained.sourceRecoveryReceiptKey };
+    }
+
+    async function closeTraceAfterCapabilityFailure(receiptKey, startReceipt) {
+        const started = traceSession(startReceipt);
+        const evidence = {
+            status: "PENDING",
+            started,
+            before: null,
+            stop: null,
+            after: null,
+        };
+        try {
+            const beforeResult = await renderScale({
+                action: "dlss_trace_status", expectedBuildId: buildId,
+            });
+            retain(`${receiptKey}:status-before`, beforeResult.envelope);
+            evidence.before = traceSession(beforeResult.root);
+            if (!evidence.before.present || evidence.before.active === null) {
+                throw new Error("trace_cleanup_status_missing");
+            }
+            if (evidence.before.active === true) {
+                if (!started.present || started.active !== true ||
+                    started.id === null || evidence.before.id !== started.id) {
+                    throw new Error("trace_cleanup_owner_mismatch");
+                }
+                const stopResult = await renderScale({
+                    action: "dlss_trace_stop",
+                    expectedSessionId: started.id,
+                    expectedBuildId: buildId,
+                });
+                retain(`${receiptKey}:stop`, stopResult.envelope);
+                evidence.stop = traceSession(stopResult.root);
+            }
+            const afterResult = await renderScale({
+                action: "dlss_trace_status", expectedBuildId: buildId,
+            });
+            retain(`${receiptKey}:status-after`, afterResult.envelope);
+            evidence.after = traceSession(afterResult.root);
+            if (!evidence.after.present || evidence.after.active !== false ||
+                (started.id !== null && evidence.after.id !== started.id)) {
+                throw new Error("trace_cleanup_postcondition_active");
+            }
+            evidence.status = "CONFIRMED_INACTIVE";
+            retain(`${receiptKey}:decision`, evidence);
+            return evidence;
+        } catch (error) {
+            evidence.status = "UNRESOLVED";
+            evidence.reason = error.message || String(error);
+            retain(`${receiptKey}:decision`, evidence);
+            throw diagnosticError(evidence.reason, evidence);
+        }
     }
 
     async function retainAmdTraceCapability() {
@@ -1741,7 +1830,20 @@ async function runRenderScaleTuningLive(context) {
             if (diagnostic) {
                 return { status: "unsupported", receiptKey, diagnostic };
             }
-            throw error;
+            let cleanup;
+            try {
+                cleanup = await closeTraceAfterCapabilityFailure(
+                    `${receiptKey}:cleanup`, null);
+            } catch (cleanupError) {
+                throw diagnosticError("amd_trace_capability_cleanup_unresolved", {
+                    original: error && error.diagnostic || error.message || String(error),
+                    cleanup: cleanupError && cleanupError.diagnostic ||
+                        cleanupError.message || String(cleanupError),
+                });
+            }
+            throw diagnosticError(error.message, {
+                original: error.diagnostic || null, traceCleanup: cleanup,
+            });
         }
         let entries;
         try {
@@ -1751,7 +1853,21 @@ async function runRenderScaleTuningLive(context) {
             if (diagnostic) {
                 return { status: "unsupported", receiptKey, diagnostic };
             }
-            throw error;
+            let cleanup;
+            try {
+                cleanup = await closeTraceAfterCapabilityFailure(
+                    `${receiptKey}:cleanup`,
+                    resultMap(response.root).get("amd-dlss-trace-start"));
+            } catch (cleanupError) {
+                throw diagnosticError("amd_trace_capability_cleanup_unresolved", {
+                    original: error && error.diagnostic || error.message || String(error),
+                    cleanup: cleanupError && cleanupError.diagnostic ||
+                        cleanupError.message || String(cleanupError),
+                });
+            }
+            throw diagnosticError(error.message, {
+                original: error.diagnostic || null, traceCleanup: cleanup,
+            });
         }
         const read = entries.get("amd-dlss-trace-read");
         const capture = read && read.capture;
@@ -1764,7 +1880,7 @@ async function runRenderScaleTuningLive(context) {
         return { status: "supported", receiptKey };
     }
 
-    async function status(lane, pass, suffix) {
+    async function status(lane, pass, suffix, includeTrace = false) {
         const receiptKey = `${runId}:${lane.id}:pass-${pass}:${suffix}`;
         const steps = [
             toolStep("render-status", "communityshaders.renderscale", {
@@ -1780,6 +1896,12 @@ async function runRenderScaleTuningLive(context) {
                 action: "texture_lifetime_status", expectedBuildId: buildId,
             }),
         ];
+        if (variant === "nvidia" && includeTrace) {
+            steps.push(toolStep("dlss-trace-status",
+                "communityshaders.renderscale", {
+                    action: "dlss_trace_status", expectedBuildId: buildId,
+                }));
+        }
         const response = await scenario(steps, receiptKey);
         const entries = requireScenario(response.root, steps, receiptKey);
         return entries;
@@ -1792,10 +1914,13 @@ async function runRenderScaleTuningLive(context) {
         const cpuResult = entries && entries.get("cpu-status");
         const gpuResult = entries && entries.get("gpu-status");
         const textureResult = entries && entries.get("texture-status");
+        const traceResult = entries && entries.get("dlss-trace-status");
         const cpu = cpuResult && cpuResult.cpuPerformance;
         const gpu = gpuResult && gpuResult.capture;
         const texture = textureResult && textureResult.capture;
         const probe = render && render.loadPresentationProbe;
+        const trace = variant === "nvidia" ? traceSession(traceResult) :
+            { present: true, id: null, active: false };
         const missing = [];
         if (!session || typeof session.active !== "boolean" ||
             !Object.hasOwn(session, "id")) missing.push("render_session_status_missing");
@@ -1811,11 +1936,18 @@ async function runRenderScaleTuningLive(context) {
         if (!probe || typeof probe.active !== "boolean") {
             missing.push("probe_status_missing");
         }
-        return { render, session, cpu, gpu, texture, probe, missing };
+        if (variant === "nvidia" && (!trace.present ||
+            typeof trace.active !== "boolean" ||
+            (trace.active === true &&
+                (!Number.isSafeInteger(trace.id) || trace.id < 1)))) {
+            missing.push("trace_status_missing");
+        }
+        return { render, session, cpu, gpu, texture, probe, trace, missing };
     }
 
     async function cleanup(lane, pass, ownerState) {
-        const before = await status(lane, pass, "final-status-before-cleanup");
+        const before = await status(
+            lane, pass, "final-status-before-cleanup", true);
         const observed = cleanupState(before);
         const receiptKey = `${runId}:${lane.id}:pass-${pass}:cleanup`;
         const knownSessionIds = unique([
@@ -1824,10 +1956,15 @@ async function runRenderScaleTuningLive(context) {
             ownerState.measured && ownerState.measured.proven ?
                 ownerState.measured.sessionId : null,
         ]);
+        const knownTraceSessionIds = unique([
+            ownerState.trace && ownerState.trace.proven ?
+                ownerState.trace.sessionId : null,
+        ]);
         const evidence = {
             status: "PENDING",
             cleanupAttempted: false,
             knownSessionIds,
+            knownTraceSessionIds,
             before: {
                 stressSessionId: observed.session ? observed.session.id : null,
                 stressActive: observed.session ? observed.session.active : null,
@@ -1835,6 +1972,8 @@ async function runRenderScaleTuningLive(context) {
                 gpuActive: observed.gpu ? observed.gpu.active : null,
                 textureActive: observed.texture ? observed.texture.active : null,
                 probeActive: observed.probe ? observed.probe.active : null,
+                traceSessionId: observed.trace ? observed.trace.id : null,
+                traceActive: observed.trace ? observed.trace.active : null,
                 missing: observed.missing,
             },
         };
@@ -1850,6 +1989,13 @@ async function runRenderScaleTuningLive(context) {
             evidence.reason = "cleanup_stress_owner_mismatch";
             retain(`${receiptKey}:decision`, evidence);
             throw diagnosticError("cleanup_stress_owner_mismatch", evidence);
+        }
+        if (observed.trace.active === true &&
+            !knownTraceSessionIds.includes(observed.trace.id)) {
+            evidence.status = "UNRESOLVED";
+            evidence.reason = "cleanup_trace_owner_mismatch";
+            retain(`${receiptKey}:decision`, evidence);
+            throw diagnosticError("cleanup_trace_owner_mismatch", evidence);
         }
         const steps = [];
         if (observed.session.active) {
@@ -1878,6 +2024,13 @@ async function runRenderScaleTuningLive(context) {
                 action: "probe_stop", expectedBuildId: buildId,
             }));
         }
+        if (observed.trace.active) {
+            steps.push(toolStep("dlss-trace-stop", "communityshaders.renderscale", {
+                action: "dlss_trace_stop",
+                expectedSessionId: observed.trace.id,
+                expectedBuildId: buildId,
+            }));
+        }
         steps.push(toolStep("profiler-disable", "communityshaders.profiler_api", {
             contractMajor: 1,
             clientId: `${runId}-${lane.id}-${pass}-cleanup-client`,
@@ -1890,7 +2043,7 @@ async function runRenderScaleTuningLive(context) {
         const response = await scenario(steps, receiptKey);
         requireScenario(response.root, steps, receiptKey);
         const after = cleanupState(await status(
-            lane, pass, "final-status-after-cleanup"));
+            lane, pass, "final-status-after-cleanup", true));
         evidence.after = {
             stressSessionId: after.session ? after.session.id : null,
             stressActive: after.session ? after.session.active : null,
@@ -1898,12 +2051,14 @@ async function runRenderScaleTuningLive(context) {
             gpuActive: after.gpu ? after.gpu.active : null,
             textureActive: after.texture ? after.texture.active : null,
             probeActive: after.probe ? after.probe.active : null,
+            traceSessionId: after.trace ? after.trace.id : null,
+            traceActive: after.trace ? after.trace.active : null,
             missing: after.missing,
         };
         const stillActive = after.missing.length > 0 ||
             after.session.active !== false || after.cpu.active !== false ||
             after.gpu.active !== false || after.texture.active !== false ||
-            after.probe.active !== false;
+            after.probe.active !== false || after.trace.active !== false;
         if (stillActive) {
             evidence.status = "UNRESOLVED";
             evidence.reason = after.missing.length > 0 ?
@@ -1913,6 +2068,7 @@ async function runRenderScaleTuningLive(context) {
         }
         if (ownerState.baseline) ownerState.baseline.active = false;
         if (ownerState.measured) ownerState.measured.active = false;
+        if (ownerState.trace) ownerState.trace.active = false;
         evidence.status = "CONFIRMED_INACTIVE";
         evidence.reason = null;
         retain(`${receiptKey}:decision`, evidence);
@@ -1959,7 +2115,58 @@ async function runRenderScaleTuningLive(context) {
             ...lane,
             runnable: lane.id === "explicit_fsr4" ? fsr4 && unavailable[1].mask === 0 :
                 lane.id === "explicit_fsr3" ? fsr3 : fsr3 && fsr4Unavailable,
+            fallbackQualification: {
+                required: lane.requiresDocumentedFsr4UnavailableCondition === true,
+                satisfied: lane.requiresDocumentedFsr4UnavailableCondition !== true ||
+                    (fsr3 && fsr4Unavailable),
+                unavailableCondition: lane.requiresDocumentedFsr4UnavailableCondition === true ?
+                    unavailable[1] : null,
+            },
         }));
+    }
+
+    function executionPlan(selectedLanes) {
+        const entries = [];
+        for (let laneIndex = 0; laneIndex < selectedLanes.length; laneIndex += 1) {
+            const lane = selectedLanes[laneIndex];
+            if (!lane.runnable) continue;
+            for (let pass = 1; pass <= 2; pass += 1) {
+                for (const row of matrix.transitions) {
+                    const destination = matrix.destinations[row.destination];
+                    const target = targetFor(positioning.boundary, destination,
+                        lane.configuredFsrRuntime);
+                    const identifiers = ids(laneIndex + 1, pass, row.ordinal, false);
+                    entries.push({
+                        lane: variant === "nvidia" ? null : lane.id,
+                        pass,
+                        ordinal: row.ordinal,
+                        destination: row.destination,
+                        transitionId: identifiers.transitionId,
+                        ownerId: identifiers.ownerId,
+                        target: waiterTarget(target),
+                        laneContract: {
+                            id: lane.id,
+                            configuredFsrRuntime: lane.configuredFsrRuntime,
+                            expectedBackends: destination.expectedBackends ||
+                                lane.expectedBackends || [],
+                            requiresDocumentedFsr4UnavailableCondition:
+                                lane.requiresDocumentedFsr4UnavailableCondition === true,
+                            fallbackQualification: lane.fallbackQualification || {
+                                required: false, satisfied: true,
+                                unavailableCondition: null,
+                            },
+                        },
+                    });
+                }
+            }
+        }
+        return {
+            schemaVersion: "renderscale-tuning-execution-plan-v1",
+            variant,
+            runId,
+            buildId,
+            entries,
+        };
     }
 
     let boundary = positioning.boundary;
@@ -1968,6 +2175,7 @@ async function runRenderScaleTuningLive(context) {
         lanes: [] };
     let passSequence = 0;
     const selectedLanes = lanes();
+    retain(`${runId}:execution-plan`, executionPlan(selectedLanes));
     if (variant === "amd" && selectedLanes.some((lane) => lane.runnable)) {
         try {
             summary.traceCapability = await retainAmdTraceCapability();
@@ -2010,7 +2218,7 @@ async function runRenderScaleTuningLive(context) {
                     passSequence > 1, ownerState);
                 for (const row of matrix.transitions) {
                     const completed = await transition(
-                        boundary, lane, laneIndex + 1, pass, row);
+                        boundary, lane, laneIndex + 1, pass, row, ownerState);
                     boundary = completed.boundary;
                     passSummary.rows.push({
                         ordinal: row.ordinal,

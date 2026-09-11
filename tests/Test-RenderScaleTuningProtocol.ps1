@@ -315,12 +315,18 @@ foreach ($variant in $variants) {
     Assert-Contains $skill 'never correct, restart, or replay' $variant.Name
     Assert-True (-not $skill.Contains('verify both keys with `load()`', [StringComparison]::Ordinal)) "$($variant.Name) still gates startup on stored-object verification."
     Assert-Contains $skill 'finalization materializes both stored responses' $variant.Name
+    Assert-Contains $skill 'run-unique `execution-plan` key' $variant.Name
+    Assert-Contains $skill '`raw/execution-plan.json`' $variant.Name
     Assert-Contains $skill '`content[0].type: "text"`' $variant.Name
     Assert-Contains $skill '`JSON.parse`' $variant.Name
     Assert-Contains $skill '`content[0].text`' $variant.Name
     Assert-Contains $protocol '`dlss_trace_status` once' $variant.Name
     Assert-Contains $protocol 'packaged shared render-scale finalizer' $variant.Name
     Assert-Contains $protocol '`tools/renderscale-tuning-finalizer/finalizer.js`' $variant.Name
+    Assert-Contains $protocol '`renderscale-tuning-execution-plan-v1`' $variant.Name
+    Assert-Contains $protocol '`raw/execution-plan.json`' $variant.Name
+    Assert-Contains $protocol 'relabelled duplicate receipts' $variant.Name
+    Assert-Contains $protocol 'repeated offline finalization' $variant.Name
     Assert-Contains $protocol '`collectTracePages` helper' $variant.Name
     Assert-Contains $protocol '`afterSequence` while `moreAvailable`' $variant.Name
     Assert-Contains $protocol 'rejects gaps, duplicates, overwritten requests' $variant.Name

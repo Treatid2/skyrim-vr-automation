@@ -27,7 +27,8 @@ function tracePage(buildId, sessionId, afterSequence, records, moreAvailable,
             afterSequence,
             availableFromSequence: 1,
             lastReturnedSequence,
-            latestSequence: 600,
+            latestSequence: moreAvailable ? Math.max(600,
+                lastReturnedSequence + 1) : lastReturnedSequence,
             limit: maximum,
             moreAvailable,
             requestedSequenceOverwritten: false,
@@ -180,6 +181,8 @@ function sha(file) {
 function retained(boundary, violation, identity = {}, nonStable = false) {
     const runId = identity.runId || "nvidia-test-run";
     const buildId = identity.buildId || "e".repeat(64);
+    const transitionId = identity.transitionId || 101;
+    const ownerId = identity.ownerId || `${runId}-owner-${transitionId}`;
     return {
         variant: identity.variant || (runId.startsWith("amd-") ? "amd" : "nvidia"),
         analysisSentinel: {
@@ -192,9 +195,9 @@ function retained(boundary, violation, identity = {}, nonStable = false) {
         },
         waiter: {
             schemaRevision: 14,
-            transitionId: 101,
+            transitionId,
             satisfied: !nonStable,
-            ownerId: `${runId}-owner`,
+            ownerId,
             baseline: { stressSessionId: 7 },
             producer: { buildId },
             presentationStable: !nonStable,
@@ -279,7 +282,7 @@ function retained(boundary, violation, identity = {}, nonStable = false) {
             presentationCycleAudit: {
                 evidenceComplete: true,
                 retentionOverflow: false,
-                ownerTransitionId: 101,
+                ownerTransitionId: transitionId,
                 ownerToken: 1,
                 eyeObservations: 2,
                 violations: {
@@ -338,6 +341,47 @@ function readJson(file) {
     return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
+function writeExecutionPlan(root, variant, runId, buildId, entries) {
+    writeJson(path.join(root, "raw", "execution-plan.json"), {
+        schemaVersion: "renderscale-tuning-execution-plan-v1",
+        variant,
+        runId,
+        buildId,
+        entries,
+    });
+}
+
+function planEntry(runId, identity = {}, target = null, laneContract = null) {
+    const transitionId = identity.transitionId || 101;
+    return {
+        lane: identity.lane || null,
+        pass: identity.pass || 1,
+        ordinal: identity.ordinal || 1,
+        transitionId,
+        ownerId: identity.ownerId || `${runId}-owner-${transitionId}`,
+        target: target || { method: "none", qualityMode: 0,
+            renderScaleMode: false },
+        laneContract: laneContract || {
+            id: identity.lane || "nvidia",
+            configuredFsrRuntime: "fsr3",
+            expectedBackends: [],
+            requiresDocumentedFsr4UnavailableCondition: false,
+            fallbackQualification: { required: false, satisfied: true,
+                unavailableCondition: null },
+        },
+    };
+}
+
+function updatePlanEntry(root, ordinal, target, laneContract = undefined) {
+    const file = path.join(root, "raw", "execution-plan.json");
+    const plan = readJson(file);
+    const entry = plan.entries.find((candidate) =>
+        candidate.pass === 1 && candidate.ordinal === ordinal);
+    entry.target = target;
+    if (laneContract !== undefined) entry.laneContract = laneContract;
+    writeJson(file, plan);
+}
+
 function writeDeploymentVerification(root, buildId) {
     const retainedManifest = path.join(root, "raw", "startup",
         "deployment-manifest.json");
@@ -394,6 +438,10 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
         counts: { transitionsDispatched: 2 },
     });
     writeDeploymentVerification(root, buildId);
+    writeExecutionPlan(root, variant, runId, buildId, [
+        planEntry(runId, { ordinal: 1, transitionId: 101 }),
+        planEntry(runId, { ordinal: 2, transitionId: 102 }),
+    ]);
     if (variant === "amd") {
         writeJson(path.join(root, "raw", "live-result.json"), {
             ok: true,
@@ -421,9 +469,11 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
         });
     }
     writeJson(path.join(root, "raw", "pass-1", "transitions", "01",
-        "retained.json"), retained(false, true, { runId, buildId, variant }));
+        "retained.json"), retained(false, true, { runId, buildId, variant,
+            transitionId: 101 }));
     writeJson(path.join(root, "raw", "pass-1", "transitions", "02",
-        "retained.json"), retained(true, true, { runId, buildId, variant }, nonStable));
+        "retained.json"), retained(true, true, { runId, buildId, variant,
+            transitionId: 102 }, nonStable));
     return root;
 }
 
@@ -649,7 +699,7 @@ function testOfflineFinalization() {
                 first.diagnostics.dispatchLeft.generation === 1,
         "Dispatch/terminal diagnostic values were not retained independently.");
         assert(result.summary.evidenceExtraction.complete === true &&
-            result.summary.evidenceExtraction.rawJsonFiles === 4 &&
+            result.summary.evidenceExtraction.rawJsonFiles >= 4 &&
             result.summary.evidenceExtraction.values > 0 &&
             result.summary.evidenceExtraction.nullValues > 0 &&
             result.summary.evidenceExtraction.emptyContainers > 0,
@@ -1023,10 +1073,12 @@ function testActualBackendProjection() {
         scaled.waiter.replacementTimeline.terminal.presentationProof.backend =
             "dlss";
         writeJson(firstPath, scaled);
+        updatePlanEntry(root, 1, scaled.waiter.target);
 
         const native = JSON.parse(fs.readFileSync(secondPath, "utf8"));
         native.waiter.target = {
             method: "fsr", qualityMode: 0, renderScaleMode: false,
+            fsrRuntime: "fsr3",
         };
         native.waiter.nativeVendorExecution = {
             required: true,
@@ -1034,6 +1086,13 @@ function testActualBackendProjection() {
             actualBackend: "fsr_host",
         };
         writeJson(secondPath, native);
+        updatePlanEntry(root, 2, native.waiter.target, {
+            id: "nvidia", configuredFsrRuntime: "fsr3",
+            expectedBackends: ["fsr_host", "fsr_runtime"],
+            requiresDocumentedFsr4UnavailableCondition: false,
+            fallbackQualification: { required: false, satisfied: true,
+                unavailableCondition: null },
+        });
 
         let result = finalizeEvidence(options);
         assert(result.summary.transitions[0].actualBackend === "dlss" &&
@@ -1085,6 +1144,13 @@ function testBackendContractRejectsCrossMethodEvidence() {
             actualDispatchBackend: "fsr_runtime",
         } };
         writeJson(file, receipt);
+        updatePlanEntry(root, 1, receipt.waiter.target, {
+            id: "nvidia", configuredFsrRuntime: "fsr3",
+            expectedBackends: ["dlss"],
+            requiresDocumentedFsr4UnavailableCondition: false,
+            fallbackQualification: { required: false, satisfied: true,
+                unavailableCondition: null },
+        });
         let result = finalizeEvidence(options);
         let row = result.summary.transitions[0];
         assert(row.actualBackend === "not_exposed" &&
@@ -1104,6 +1170,13 @@ function testBackendContractRejectsCrossMethodEvidence() {
         receipt.waiter.replacementTimeline.terminal.presentationProof.rightEye.backend =
             "fsr_host";
         writeJson(file, receipt);
+        updatePlanEntry(root, 1, receipt.waiter.target, {
+            id: "nvidia", configuredFsrRuntime: "fsr3",
+            expectedBackends: ["fsr_host", "fsr_runtime"],
+            requiresDocumentedFsr4UnavailableCondition: false,
+            fallbackQualification: { required: false, satisfied: true,
+                unavailableCondition: null },
+        });
         result = finalizeEvidence(options);
         row = result.summary.transitions[0];
         assert(row.actualBackend === "fsr_host" &&
@@ -1111,6 +1184,61 @@ function testBackendContractRejectsCrossMethodEvidence() {
             row.actualBackendRejectedEvidence.some((entry) =>
                 entry.source === "terminal.presentationProof.backend"),
         "Rejected higher-priority evidence hid a valid compatible backend.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testAmdLaneBackendContracts() {
+    const root = createEvidenceRoot("amd");
+    const file = path.join(root, "raw", "pass-1", "transitions",
+        "01", "retained.json");
+    const options = { root, variant: "amd", runId: "amd-test-run",
+        buildId: "e".repeat(64), expectedRows: 2 };
+    const target = { method: "fsr", qualityMode: 3,
+        renderScaleMode: true, fsrRuntime: "fsr4" };
+    try {
+        const receipt = readJson(file);
+        receipt.waiter.target = target;
+        receipt.waiter.replacementTimeline.terminal.presentationProof.backend =
+            "fsr4_runtime";
+        writeJson(file, receipt);
+        updatePlanEntry(root, 1, target, {
+            id: "explicit_fsr4", configuredFsrRuntime: "fsr4",
+            expectedBackends: ["fsr4_runtime"],
+            requiresDocumentedFsr4UnavailableCondition: false,
+            fallbackQualification: { required: false, satisfied: true,
+                unavailableCondition: null },
+        });
+        let result = finalizeEvidence(options);
+        assert(result.summary.transitions[0].actualBackend === "fsr4_runtime",
+            "Explicit FSR4 rejected its required physical backend.");
+
+        receipt.waiter.replacementTimeline.terminal.presentationProof.backend =
+            "fsr_runtime";
+        writeJson(file, receipt);
+        result = finalizeEvidence(options);
+        assert(result.summary.transitions[0].actualBackend === "not_exposed",
+            "Explicit FSR4 accepted an unqualified FSR3 backend.");
+
+        updatePlanEntry(root, 1, target, {
+            id: "fsr4_to_fsr3_fallback", configuredFsrRuntime: "fsr4",
+            expectedBackends: ["fsr_host", "fsr_runtime"],
+            requiresDocumentedFsr4UnavailableCondition: true,
+            fallbackQualification: { required: true, satisfied: true,
+                unavailableCondition: { mask: 1 } },
+        });
+        result = finalizeEvidence(options);
+        assert(result.summary.transitions[0].actualBackend === "fsr_runtime",
+            "Qualified FSR4-to-FSR3 fallback rejected its backend.");
+
+        const planFile = path.join(root, "raw", "execution-plan.json");
+        const plan = readJson(planFile);
+        plan.entries[0].laneContract.fallbackQualification.satisfied = false;
+        writeJson(planFile, plan);
+        result = finalizeEvidence(options);
+        assert(result.summary.transitions[0].actualBackend === "not_exposed",
+            "Unqualified FSR4 fallback accepted an FSR3 backend.");
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -1132,11 +1260,32 @@ function testTraceLifecycleControlsCompleteness() {
         Object.assign(receipt, traceLifecycle(
             "e".repeat(64), 55, records(1, 2)));
         writeJson(file, receipt);
+        updatePlanEntry(root, 1, receipt.waiter.target, {
+            id: "nvidia", configuredFsrRuntime: "fsr3",
+            expectedBackends: ["dlss"],
+            requiresDocumentedFsr4UnavailableCondition: false,
+            fallbackQualification: { required: false, satisfied: true,
+                unavailableCondition: null },
+        });
         let result = finalizeEvidence(options);
         assert(result.summary.transitions[0].traceComplete === true,
             "A valid retained trace lifecycle was rejected.");
 
+        receipt.traceRead.capture.latestSequence =
+            receipt.traceRead.capture.lastReturnedSequence + 1;
+        writeJson(file, receipt);
+        result = finalizeEvidence(options);
+        assert(result.summary.transitions[0].traceComplete === false &&
+            result.summary.transitions[0].traceValidationReasons.includes(
+                "trace_terminal_sequence_mismatch") &&
+            result.summary.reporting.reasons.includes(
+                "required_trace_evidence_incomplete"),
+        "Contradictory terminal trace metadata completed reporting.");
+
+        receipt.traceRead.capture.latestSequence =
+            receipt.traceRead.capture.lastReturnedSequence;
         receipt.traceRead.capture.moreAvailable = true;
+        receipt.traceRead.capture.latestSequence += 1;
         writeJson(file, receipt);
         result = finalizeEvidence(options);
         assert(result.summary.transitions[0].traceComplete === false &&
@@ -1180,6 +1329,10 @@ function testRawOwnerMismatchDowngradesProjectedPass() {
             row.phaseCounterAuthorityReasons.includes(
                 "audit_transition_owner_mismatch"),
         "Raw owner mismatch did not overrule a stale projected PASS.");
+        assert(result.summary.reporting.status === "INCOMPLETE" &&
+            result.summary.reporting.reasons.includes(
+                "task2_owner_authority_mismatch"),
+        "Raw owner mismatch did not block completed reporting.");
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -1206,8 +1359,32 @@ function testFinalProfileAndExecutionScopeGateCompletion() {
         fs.rmSync(missingProfile, { recursive: true, force: true });
     }
 
+    const wrappedProfile = createEvidenceRoot();
+    try {
+        const file = path.join(wrappedProfile, "raw", "pass-1", "transitions",
+            "01", "retained.json");
+        const receipt = readJson(file);
+        receipt.waiter.upscalingSnapshot.profiles = { stable: {
+            method: { name: "none", value: 0 },
+            qualityMode: { name: "native_aa", value: 0 },
+            renderScaleMode: false,
+        } };
+        delete receipt.waiter.upscalingSnapshot.stable;
+        writeJson(file, receipt);
+        const result = finalizeEvidence({ root: wrappedProfile,
+            variant: "nvidia", runId: "nvidia-test-run",
+            buildId: "e".repeat(64), expectedRows: 2 });
+        assert(result.summary.transitions[0].finalMethod === "none" &&
+            result.summary.transitions[0].finalQuality === "native_aa" &&
+            result.summary.transitions[0].finalProfileComplete === true,
+        "The live runner's wrapped final profile was rejected offline.");
+    } finally {
+        fs.rmSync(wrappedProfile, { recursive: true, force: true });
+    }
+
     const missingScope = createEvidenceRoot();
     try {
+        fs.unlinkSync(path.join(missingScope, "raw", "execution-plan.json"));
         const result = finalizeEvidence({ root: missingScope,
             variant: "nvidia", runId: "nvidia-test-run",
             buildId: "e".repeat(64) });
@@ -1216,6 +1393,14 @@ function testFinalProfileAndExecutionScopeGateCompletion() {
                 "not_exposed" &&
             result.summary.reporting.reasons.includes("execution_scope_missing"),
         "Observed receipts defined their own completion target.");
+        const repeated = finalizeEvidence({ root: missingScope,
+            variant: "nvidia", runId: "nvidia-test-run",
+            buildId: "e".repeat(64) });
+        assert(repeated.summary.assayExecution.status === "INCOMPLETE" &&
+            repeated.summary.assayExecution.expectedTransitions ===
+                "not_exposed" &&
+            repeated.summary.reporting.reasons.includes("execution_scope_missing"),
+        "A retained unknown scope made incomplete finalization non-restartable.");
     } finally {
         fs.rmSync(missingScope, { recursive: true, force: true });
     }
@@ -1237,6 +1422,26 @@ function testFinalProfileAndExecutionScopeGateCompletion() {
         "Duplicate logical rows satisfied the explicit receipt count.");
     } finally {
         fs.rmSync(duplicateScope, { recursive: true, force: true });
+    }
+
+    const duplicateReceipt = createEvidenceRoot();
+    try {
+        const first = path.join(duplicateReceipt, "raw", "pass-1",
+            "transitions", "01", "retained.json");
+        const second = path.join(duplicateReceipt, "raw", "pass-1",
+            "transitions", "02", "retained.json");
+        writeJson(second, readJson(first));
+        const result = finalizeEvidence({ root: duplicateReceipt,
+            variant: "nvidia", runId: "nvidia-test-run",
+            buildId: "e".repeat(64), expectedRows: 2 });
+        assert(result.summary.assayExecution.status === "INCOMPLETE" &&
+            result.summary.reporting.reasons.includes(
+                "duplicate_terminal_receipt_identity") &&
+            result.summary.assayExecution.executionScope.conflicts.includes(
+                "terminal_receipt_owner_mismatch"),
+        "A relabelled duplicate owned receipt satisfied the execution plan.");
+    } finally {
+        fs.rmSync(duplicateReceipt, { recursive: true, force: true });
     }
 }
 
@@ -1274,6 +1479,7 @@ Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testVariantAndSourceProfileValidation)
     .then(testActualBackendProjection)
     .then(testBackendContractRejectsCrossMethodEvidence)
+    .then(testAmdLaneBackendContracts)
     .then(testTraceLifecycleControlsCompleteness)
     .then(testRawOwnerMismatchDowngradesProjectedPass)
     .then(testFinalProfileAndExecutionScopeGateCompletion)

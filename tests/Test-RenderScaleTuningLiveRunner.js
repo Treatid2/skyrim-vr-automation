@@ -460,15 +460,26 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
             results,
         };
         return envelope(scenarioTransform ?
-            scenarioTransform(root, args, { transitionOrdinal, recovery }) : root);
+            scenarioTransform(root, args, {
+                transitionOrdinal,
+                recovery,
+                setTraceActive: (value) => { traceActive = value; },
+                traceSession: () => traceSession,
+            }) : root);
     }
 
     return {
         context: {
             tools: {
                 mcp__devbench_vr__scenario: scenario,
-                mcp__devbench_vr__communityshaders_renderscale: async () =>
-                    envelope({ qualification: { active: false, lastEvidence: null } }),
+                mcp__devbench_vr__communityshaders_renderscale: async (args) => {
+                    if (args.action === "qualification_status") {
+                        return envelope({ qualification: {
+                            active: false, lastEvidence: null,
+                        } });
+                    }
+                    return envelope(toolResult({ args }));
+                },
             },
             store: (key, value) => stores.set(key, value),
             notify: (value) => notifications.push(value),
@@ -632,6 +643,11 @@ async function testNvidia() {
         "Failed stretch was incorrectly projected as recovered.");
     assert(mock.stores.has("nvidia-test:nvidia:pass-2:transition-33"),
         "NVIDIA terminal receipt was not retained.");
+    const executionPlan = mock.stores.get("nvidia-test:execution-plan");
+    assert(executionPlan && executionPlan.entries.length === 66 &&
+        new Set(executionPlan.entries.map((entry) => entry.transitionId)).size === 66 &&
+        new Set(executionPlan.entries.map((entry) => entry.ownerId)).size === 66,
+    "NVIDIA did not retain its independent owned execution plan.");
     const expectedTraceRows = matrix.transitions.filter((row) =>
         matrix.destinations[row.destination].method === "dlss").length * 2;
     const retainedTraceRows = [...mock.stores.entries()].filter(([key, value]) =>
@@ -677,7 +693,8 @@ async function testAmd() {
         }),
         matrix,
     });
-    assert(result.ok === true && result.status === "COMPLETE", "AMD mock run did not complete.");
+    assert(result.ok === true && result.status === "COMPLETE",
+        `AMD mock run did not complete: ${JSON.stringify(result)}`);
     assertQualificationTimeouts(mock.scenarioCalls, matrix, "AMD");
     assertProviderTargetSeparation(mock.scenarioCalls, "AMD");
     assertFoveationTargetScope(mock.scenarioCalls, "AMD");
@@ -694,6 +711,13 @@ async function testAmd() {
         row.status === "admitted").length === 1,
     "AMD positioning admission was not reported by the runner.");
     assert(transitionNotifications.length === 124, "AMD progress count is wrong.");
+    const executionPlan = mock.stores.get("amd-test:execution-plan");
+    assert(executionPlan && executionPlan.entries.length === 124 &&
+        executionPlan.entries.filter((entry) =>
+            entry.laneContract.id === "fsr4_to_fsr3_fallback").every((entry) =>
+            entry.laneContract.fallbackQualification.satisfied === true &&
+            entry.laneContract.fallbackQualification.unavailableCondition.mask === 1),
+    "AMD did not retain its lane-qualified execution plan.");
     assert(transitionNotifications.every((row) => row.evidenceVerdict === "PASS" &&
         row.dispatch_ && row.first_new_generation_proven_),
     "AMD did not receive the shared Task 2 evidence projection.");
@@ -1079,6 +1103,87 @@ async function testMalformedMeasuredStressOwnershipIsRetained() {
     const retained = mock.stores.get("malformed-measured-stress-owner:live-result");
     assert(retained && retained.lanes[0].passes[0].failure === failure,
         "Malformed measured-stress ownership evidence was not retained.");
+}
+
+async function testAmdPostStartTraceFailureClosesOwner() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-amd", "references", "matrix.v1.json")));
+    let injected = false;
+    const mock = createMock(0, null, (root, args, controls) => {
+        if (injected || !args.steps.some((step) =>
+            step.label === "amd-dlss-trace-start")) return root;
+        injected = true;
+        controls.setTraceActive(true);
+        const stopIndex = root.results.findIndex((entry) =>
+            entry.label === "amd-dlss-trace-stop");
+        const results = root.results.slice(0, stopIndex + 1);
+        results[stopIndex] = { label: "amd-dlss-trace-stop", ok: false,
+            error: "synthetic_trace_stop_failure",
+            result: { ok: false, error: "synthetic_trace_stop_failure" } };
+        return { ...root, ok: false, aborted: true,
+            stepsRun: results.length, results };
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "amd",
+        runId: "amd-post-start-trace-failure",
+        buildId,
+        positioningRoot: positioningRoot({
+            supportedFSRRuntimeMask: 1,
+            fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }],
+        }),
+        matrix,
+    });
+    const decision = mock.stores.get(
+        "amd-post-start-trace-failure:amd:dlss-trace-capability:cleanup:decision");
+    assert(result.status === "INTERRUPTED" &&
+        result.error === "scenario_failed" && decision &&
+        decision.status === "CONFIRMED_INACTIVE" &&
+        decision.started.id === 1 && decision.after.active === false,
+    "An AMD post-start trace failure left its owned trace unresolved.");
+}
+
+async function testNvidiaPostStartTraceFailureClosesOwner() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    let injected = false;
+    const mock = createMock(0, null, (root, args, controls) => {
+        if (injected || !args.steps.some((step) =>
+            step.label === "dlss-trace-start") || args.steps.some((step) =>
+            step.label === "baseline-stress-start")) return root;
+        injected = true;
+        controls.setTraceActive(true);
+        const applyIndex = root.results.findIndex((entry) =>
+            entry.label === "profile-apply");
+        const results = root.results.slice(0, applyIndex + 1);
+        results[applyIndex] = { label: "profile-apply", ok: false,
+            error: "synthetic_profile_apply_failure",
+            result: { ok: false, error: "synthetic_profile_apply_failure" } };
+        return { ...root, ok: false, aborted: true,
+            stepsRun: results.length, results };
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "nvidia",
+        runId: "nvidia-post-start-trace-failure",
+        buildId,
+        positioningRoot: positioningRoot(),
+        matrix,
+    });
+    const pass = result.lanes[0].passes[0];
+    const cleanup = mock.stores.get(
+        "nvidia-post-start-trace-failure:nvidia:pass-1:cleanup:decision");
+    assert(result.status === "INTERRUPTED" &&
+        pass.error === "transition_scenario_failed" && cleanup &&
+        cleanup.status === "CONFIRMED_INACTIVE" &&
+        cleanup.before.traceActive === true && cleanup.after.traceActive === false &&
+        pass.ownership.trace && pass.ownership.trace.active === false,
+    "A NVIDIA post-start trace failure escaped ownership-qualified cleanup.");
+    const stop = mock.scenarioCalls.find((call) => call.steps.some((step) =>
+        step.label === "dlss-trace-stop" &&
+        step.args.expectedSessionId === cleanup.before.traceSessionId));
+    assert(stop, "Trace cleanup did not use the retained session guard.");
 }
 
 async function testBaselineOwnerAdmissionRejectsAmbiguity() {
@@ -2236,6 +2341,8 @@ async function testEvidenceVerdicts() {
 
 Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
     testAmdExposedTraceFailureStops(),
+    testAmdPostStartTraceFailureClosesOwner(),
+    testNvidiaPostStartTraceFailureClosesOwner(),
     testAdmissionRejectsMalformedInputs(), testEvidenceVerdicts(),
     testScenarioFailureRetention(), testInformationalReasonIsNotFailure(),
     testOptionalTerminalFacts(), testSafeUnstableBaselineContinues(),

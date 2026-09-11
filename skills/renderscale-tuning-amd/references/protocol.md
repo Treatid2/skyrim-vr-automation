@@ -570,6 +570,9 @@ control failure. Retain the complete lifecycle envelope so its action receipts
 and empty raw read can be materialized during finalization. Do not start a DLSS
 trace during AMD matrix transitions. Missing lifecycle evidence forbids a
 ledger append but does not change completed AMD row classifications.
+Once the capability trace start succeeds, every failure path must close that
+exact returned session with its session guard and prove it inactive, or retain
+an unresolved-cleanup anomaly and stop before the first lane mutation.
 
 Unsupported preparation providers are `n/a`, never zero. Preserve raw values
 before summarizing. Archive any log before reading it under the repository's
@@ -607,6 +610,15 @@ for example:
   }
 }
 ```
+
+Before the first assay mutation, the runner retains
+`renderscale-tuning-execution-plan-v1`; materialize it as
+`raw/execution-plan.json`. The plan preserves each lane's configured runtime,
+expected physical backends, and the actual documented FSR4-unavailable
+condition for fallback. Finalization correlates every lane/pass/ordinal,
+target, transition ID, and owner ID to the plan and rejects relabelled
+duplicate receipts. Unknown scope remains `INCOMPLETE` and repeated offline
+finalization with the same evidence remains restartable.
 
 This validation is finalization-only and must not insert another read, wait,
 or gate between measured rows or passes. Treat an unsupported optional

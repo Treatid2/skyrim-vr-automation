@@ -90,6 +90,14 @@ function validateTracePage(rawPage, state) {
     if (capture.lastReturnedSequence !== lastSequence) {
         throw new Error("trace_last_sequence_mismatch");
     }
+    if (capture.moreAvailable === false &&
+        capture.latestSequence !== lastSequence) {
+        throw new Error("trace_terminal_sequence_mismatch");
+    }
+    if (capture.moreAvailable === true &&
+        capture.latestSequence <= lastSequence) {
+        throw new Error("trace_continuation_sequence_mismatch");
+    }
     if (capture.moreAvailable === true && capture.records.length === 0) {
         throw new Error("trace_empty_continuation_page");
     }
@@ -634,11 +642,15 @@ function finalProfile(waiter) {
     const profiles = snapshot.profiles || {};
     const stable = snapshot.stable || profiles.stable ||
         snapshot.effective || profiles.effective || {};
-    const method = typeof stable.method === "string" && stable.method.length > 0 ?
-        stable.method : "not_exposed";
-    const quality = (typeof stable.qualityMode === "string" &&
-        stable.qualityMode.length > 0) || Number.isSafeInteger(stable.qualityMode) ?
-        stable.qualityMode : "not_exposed";
+    const named = (value) => value && typeof value === "object" &&
+        typeof value.name === "string" ? value.name : value;
+    const methodValue = named(stable.method);
+    const qualityValue = named(stable.qualityMode);
+    const method = typeof methodValue === "string" && methodValue.length > 0 ?
+        methodValue : "not_exposed";
+    const quality = (typeof qualityValue === "string" &&
+        qualityValue.length > 0) || Number.isSafeInteger(qualityValue) ?
+        qualityValue : "not_exposed";
     const renderScaleMode = typeof stable.renderScaleMode === "boolean" ?
         stable.renderScaleMode : "not_exposed";
     const stateRevision = Number.isSafeInteger(snapshot.stateRevision) &&
@@ -660,6 +672,49 @@ function finalProfile(waiter) {
         complete: missing.length === 0,
         missing,
     };
+}
+
+function identityKey(identity) {
+    return `${identity && identity.lane || "default"}|${identity && identity.pass}|${identity && identity.ordinal}`;
+}
+
+function readExecutionPlan(root, variant, runId, buildId) {
+    const file = path.join(root, "raw", "execution-plan.json");
+    if (!fs.existsSync(file)) {
+        return { file: null, plan: null, reasons: ["execution_plan_missing"] };
+    }
+    const plan = readJson(file);
+    const reasons = [];
+    if (!plan || plan.schemaVersion !== "renderscale-tuning-execution-plan-v1" ||
+        plan.variant !== variant || plan.runId !== runId || plan.buildId !== buildId ||
+        !Array.isArray(plan.entries) || plan.entries.length < 1) {
+        reasons.push("execution_plan_identity_invalid");
+    }
+    if (Array.isArray(plan && plan.entries) && plan.entries.some((entry) =>
+        !entry || !Number.isSafeInteger(entry.pass) || entry.pass < 1 ||
+        !Number.isSafeInteger(entry.ordinal) || entry.ordinal < 1 ||
+        !Number.isSafeInteger(entry.transitionId) || entry.transitionId < 1 ||
+        typeof entry.ownerId !== "string" || !entry.ownerId.startsWith(`${runId}-`) ||
+        !entry.target || typeof entry.target !== "object" ||
+        !entry.laneContract || typeof entry.laneContract !== "object")) {
+        reasons.push("execution_plan_entry_invalid");
+    }
+    return { file: relative(root, file), plan, reasons };
+}
+
+function targetsMatch(actual, expected) {
+    if (!actual || !expected) return false;
+    for (const name of ["method", "qualityMode", "renderScaleMode"]) {
+        if (actual[name] !== expected[name]) return false;
+    }
+    if (actual.method === "fsr" && actual.fsrRuntime !== expected.fsrRuntime) {
+        return false;
+    }
+    if (actual.method === "dlss" && Object.hasOwn(expected, "dlssProfile") &&
+        actual.dlssProfile !== expected.dlssProfile) {
+        return false;
+    }
+    return true;
 }
 
 function presentationStretchDetails(waiter, projection, renderVerdict) {
@@ -738,21 +793,31 @@ function sourceProfile(waiter) {
     };
 }
 
-function backendContract(target) {
+function backendContract(target, laneContract) {
     if (target.method === "none" || target.method === "taa") {
         return target.renderScaleMode === false ? ["none"] : [];
     }
     if (target.method === "dlss") return ["dlss"];
-    if (target.method === "fsr" &&
-        (target.fsrRuntime === undefined ||
-            target.fsrRuntime === "fsr3" || target.fsrRuntime === "fsr4")) {
-        return ["fsr_host", "fsr_runtime"];
+    if (target.method === "fsr" && laneContract &&
+        laneContract.configuredFsrRuntime === target.fsrRuntime &&
+        Array.isArray(laneContract.expectedBackends)) {
+        if (laneContract.requiresDocumentedFsr4UnavailableCondition === true &&
+            (!laneContract.fallbackQualification ||
+                laneContract.fallbackQualification.satisfied !== true ||
+                !laneContract.fallbackQualification.unavailableCondition ||
+                !Number.isSafeInteger(
+                    laneContract.fallbackQualification.unavailableCondition.mask) ||
+                laneContract.fallbackQualification.unavailableCondition.mask < 1)) {
+            return [];
+        }
+        return laneContract.expectedBackends.filter((value) =>
+            typeof value === "string" && value.length > 0);
     }
     return [];
 }
 
-function actualBackendEvidence(waiter, target) {
-    const allowed = backendContract(target);
+function actualBackendEvidence(waiter, target, laneContract) {
+    const allowed = backendContract(target, laneContract);
     const rejected = [];
     const accept = (value, source) => {
         const normalized = typeof value === "string" ? value.trim() : "";
@@ -883,7 +948,7 @@ function traceLifecycleEvidence(retained, buildId, requireDispatch) {
         reasons: unique(reasons), sessionId: sessions[3] || null };
 }
 
-function transitionRow(root, file, retained) {
+function transitionRow(root, file, retained, planned) {
     const identity = rowIdentity(root, file);
     const waiter = retained.waiter || {};
     const projection = retained.projection || {};
@@ -901,10 +966,13 @@ function transitionRow(root, file, retained) {
     const traceValidation = traceRequired ? traceLifecycleEvidence(retained,
         waiter.producer && waiter.producer.buildId, true) :
         { complete: true, reasons: [], sessionId: null };
-    const backend = actualBackendEvidence(waiter, target);
+    const backend = actualBackendEvidence(waiter, target,
+        planned && planned.laneContract);
     const recovery = retained.recovery || null;
     return {
         ...identity,
+        terminalTransitionId: waiter.transitionId ?? null,
+        terminalOwnerId: waiter.ownerId ?? null,
         target,
         source: sourceProfile(waiter),
         actualBackend: backend.value,
@@ -1206,7 +1274,16 @@ function finalizeEvidence(options) {
             throw new Error("terminal_receipt_variant_mismatch");
         }
     }
-    const rows = retained.map(({ file, value }) => transitionRow(root, file, value))
+    const planState = readExecutionPlan(root, variant, runIds[0], buildIds[0]);
+    const planEntries = planState.plan && Array.isArray(planState.plan.entries) ?
+        planState.plan.entries : [];
+    const planByIdentity = new Map(planEntries.map((entry) =>
+        [identityKey(entry), entry]));
+    const rows = retained.map(({ file, value }) => {
+        const identity = rowIdentity(root, file);
+        return transitionRow(root, file, value,
+            planByIdentity.get(identityKey(identity)) || null);
+    })
         .sort((left, right) => (left.lane || "").localeCompare(right.lane || "") ||
             left.pass - right.pass || left.ordinal - right.ordinal);
     const liveResult = readLiveResult(root, variant, runIds[0]);
@@ -1215,22 +1292,69 @@ function finalizeEvidence(options) {
     const interruptedPass = interrupted && interrupted.lanes && interrupted.lanes
         .flatMap((lane) => lane.passes || [])
         .find((pass) => pass.status === "INTERRUPTED");
+    const persistedExpectedRows = existing.assayExecution &&
+        existing.assayExecution.expectedTerminalReceipts;
+    const persistedCountExpected = existing.counts &&
+        existing.counts.transitionsExpected;
     const declaredExpectedRows = options.expectedRows ??
-        (existing.assayExecution &&
-            existing.assayExecution.expectedTerminalReceipts) ??
-        (existing.counts && existing.counts.transitionsExpected) ?? null;
+        (Number.isSafeInteger(persistedExpectedRows) ? persistedExpectedRows : null) ??
+        (Number.isSafeInteger(persistedCountExpected) ? persistedCountExpected : null) ??
+        (planEntries.length > 0 ? planEntries.length : null);
     if (declaredExpectedRows !== null &&
         (!Number.isSafeInteger(declaredExpectedRows) ||
             declaredExpectedRows < rows.length || declaredExpectedRows < 1)) {
         throw new Error("invalid_expected_terminal_receipts");
     }
     const expectedRows = declaredExpectedRows ?? "not_exposed";
-    const rowKeys = rows.map((row) =>
-        `${row.lane || "default"}|${row.pass}|${row.ordinal}`);
+    const rowKeys = rows.map(identityKey);
     const duplicateRowIdentities = unique(rowKeys.filter((key, index) =>
         rowKeys.indexOf(key) !== index));
+    const planKeys = planEntries.map(identityKey);
+    const duplicatePlanIdentities = unique(planKeys.filter((key, index) =>
+        planKeys.indexOf(key) !== index));
+    const duplicatePlanTransitionIds = unique(planEntries
+        .map((entry) => entry.transitionId)
+        .filter((value, index, values) => values.indexOf(value) !== index));
+    const duplicatePlanOwnerIds = unique(planEntries
+        .map((entry) => entry.ownerId)
+        .filter((value, index, values) => values.indexOf(value) !== index));
+    const terminalTransitionIds = rows.map((row) => row.terminalTransitionId);
+    const terminalOwnerIds = rows.map((row) => row.terminalOwnerId);
+    const duplicateTerminalTransitionIds = unique(terminalTransitionIds
+        .filter((value, index, values) => value !== null &&
+            values.indexOf(value) !== index));
+    const duplicateTerminalOwnerIds = unique(terminalOwnerIds
+        .filter((value, index, values) => value !== null &&
+            values.indexOf(value) !== index));
+    const executionPlanConflicts = [...planState.reasons];
+    if (duplicatePlanIdentities.length > 0 ||
+        duplicatePlanTransitionIds.length > 0 || duplicatePlanOwnerIds.length > 0) {
+        executionPlanConflicts.push("execution_plan_duplicate_identity");
+    }
+    if (declaredExpectedRows !== null && planEntries.length > 0 &&
+        declaredExpectedRows !== planEntries.length) {
+        executionPlanConflicts.push("execution_plan_count_mismatch");
+    }
+    for (const row of rows) {
+        const planned = planByIdentity.get(identityKey(row));
+        if (!planned) {
+            executionPlanConflicts.push("terminal_receipt_not_planned");
+            continue;
+        }
+        if (row.terminalTransitionId !== planned.transitionId ||
+            row.terminalOwnerId !== planned.ownerId) {
+            executionPlanConflicts.push("terminal_receipt_owner_mismatch");
+        }
+        if (!targetsMatch(row.target, planned.target)) {
+            executionPlanConflicts.push("terminal_receipt_target_mismatch");
+        }
+    }
+    const uniqueExecutionPlanConflicts = unique(executionPlanConflicts);
     const executionScopeComplete = declaredExpectedRows !== null &&
-        duplicateRowIdentities.length === 0;
+        duplicateRowIdentities.length === 0 &&
+        duplicateTerminalTransitionIds.length === 0 &&
+        duplicateTerminalOwnerIds.length === 0 &&
+        uniqueExecutionPlanConflicts.length === 0;
     const baselineOnlyInterrupted = rows.length === 0;
     if (baselineOnlyInterrupted) {
         validateBaselineOnlyInterruption(root, variant, runIds[0], buildIds[0]);
@@ -1270,12 +1394,22 @@ function finalizeEvidence(options) {
     if (duplicateRowIdentities.length > 0) {
         reportingReasons.push("duplicate_transition_identity");
     }
+    if (duplicateTerminalTransitionIds.length > 0 ||
+        duplicateTerminalOwnerIds.length > 0) {
+        reportingReasons.push("duplicate_terminal_receipt_identity");
+    }
+    if (uniqueExecutionPlanConflicts.length > 0) {
+        reportingReasons.push("execution_plan_mismatch");
+    }
     if (baselineOnlyInterrupted) reportingReasons.push("baseline_only_interrupted");
     if (interrupted && !baselineOnlyInterrupted) {
         reportingReasons.push("assay_interrupted");
     }
     if (rows.some((row) => !row.traceComplete)) {
         reportingReasons.push("required_trace_evidence_incomplete");
+    }
+    if (rows.some((row) => row.phaseCounterAuthorityStatus === "MISMATCHED")) {
+        reportingReasons.push("task2_owner_authority_mismatch");
     }
     if (rows.some((row) => row.renderVerdict === "PASS" &&
         (row.actualBackend === "not_exposed" || !row.finalProfileComplete))) {
@@ -1313,7 +1447,8 @@ function finalizeEvidence(options) {
             expectedTransitions: expectedRows,
             executionScope: {
                 complete: executionScopeComplete,
-                source: options.expectedRows !== undefined ? "argument" :
+                source: planEntries.length > 0 ? planState.file :
+                    options.expectedRows !== undefined ? "argument" :
                     existing.assayExecution &&
                         existing.assayExecution.expectedTerminalReceipts !== undefined ?
                         "retained_assay_execution" :
@@ -1321,6 +1456,10 @@ function finalizeEvidence(options) {
                             existing.counts.transitionsExpected !== undefined ?
                             "retained_counts" : "missing",
                 duplicateRowIdentities,
+                duplicateTerminalTransitionIds,
+                duplicateTerminalOwnerIds,
+                planEntries: planEntries.length,
+                conflicts: uniqueExecutionPlanConflicts,
             },
             interruption: interrupted ? {
                 error: interrupted.error || interruptedPass &&
