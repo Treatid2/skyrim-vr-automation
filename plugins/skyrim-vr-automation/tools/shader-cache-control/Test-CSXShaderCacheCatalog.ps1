@@ -108,7 +108,33 @@ try {
     $nullRouteArgs = @{} + $selectArgs
     $nullRouteArgs.RenderPath = 'vr-steamvr-null'
     $nullRouteSelect = Invoke-Catalog $nullRouteArgs
-    Assert-Test ($nullRouteSelect.ok -and $nullRouteSelect.state -eq 'snapshot-selected' -and $nullRouteSelect.data.selection.selected.renderFamily -eq 'vr-steamvr') 'null HMD selects a compatible physical SteamVR cache'
+    $legacySteamVRCandidate = @($nullRouteSelect.data.selection.eligible | Where-Object { $_.manifest.compatibility.renderPath -eq 'steamvr-physical' })[0]
+    Assert-Test ($nullRouteSelect.ok -and $nullRouteSelect.state -eq 'snapshot-selected' -and $nullRouteSelect.data.selection.selected.renderFamily -eq 'vr-steamvr' -and $nullRouteSelect.data.selection.selected.exactRenderFamilyProvenance -and $nullRouteSelect.data.selection.selected.exactRenderPathProvenanceClass -and $nullRouteSelect.data.selection.selected.manifest.compatibility.renderPath -eq 'vr-steamvr-physical' -and $nullRouteSelect.data.selection.selected.score -gt $legacySteamVRCandidate.score) 'null HMD ranking proves the canonical physical SteamVR cache defeats the eligible legacy candidate'
+
+    $legacyNullRouteArgs = @{} + $selectArgs
+    $legacyNullRouteArgs.RenderPath = 'steamvr-null'
+    $legacyNullRouteSelect = Invoke-Catalog $legacyNullRouteArgs
+    $canonicalCandidateForLegacy = @($legacyNullRouteSelect.data.selection.eligible | Where-Object { $_.manifest.compatibility.renderPath -eq 'vr-steamvr-physical' })[0]
+    Assert-Test ($legacyNullRouteSelect.ok -and $legacyNullRouteSelect.data.selection.selected.manifest.compatibility.renderPath -eq 'steamvr-physical' -and $legacyNullRouteSelect.data.selection.selected.exactRenderPathProvenanceClass -and $legacyNullRouteSelect.data.selection.selected.score -gt $canonicalCandidateForLegacy.score) 'legacy null HMD ranking reciprocally prefers legacy physical provenance after a canonical record exists'
+
+    $openCompositeCaptureArgs = @{} + $captureArgs
+    $openCompositeCaptureArgs.RenderPath = 'vr-opencomposite'
+    $openCompositeCaptureArgs.Label = 'OpenComposite fixture'
+    $openCompositeCapture = Invoke-Catalog $openCompositeCaptureArgs
+    Assert-Test ($openCompositeCapture.ok) 'catalog captures a cross-family competitive candidate'
+    $sameFamilySelect = Invoke-Catalog $nullRouteArgs
+    $sameFamilyCandidate = @($sameFamilySelect.data.selection.eligible | Where-Object { $_.manifest.compatibility.renderPath -eq 'vr-steamvr-physical' })[0]
+    $crossFamilyCandidate = @($sameFamilySelect.data.selection.eligible | Where-Object { $_.manifest.compatibility.renderPath -eq 'vr-opencomposite' })[0]
+    Assert-Test ($sameFamilySelect.data.selection.selected.snapshotId -eq $sameFamilyCandidate.snapshotId -and $sameFamilyCandidate.exactRenderFamilyProvenance -and -not $crossFamilyCandidate.exactRenderFamilyProvenance -and $sameFamilyCandidate.score -gt $crossFamilyCandidate.score) 'same-family provenance outranks a newer cross-family candidate with otherwise equal compatibility'
+
+    $exactNullCaptureArgs = @{} + $captureArgs
+    $exactNullCaptureArgs.RenderPath = 'vr-steamvr-null'
+    $exactNullCaptureArgs.Label = 'exact null HMD fixture'
+    $exactNullCapture = Invoke-Catalog $exactNullCaptureArgs
+    Assert-Test ($exactNullCapture.ok) 'catalog captures an exact-route competitive candidate'
+    $exactNullSelect = Invoke-Catalog $nullRouteArgs
+    $nonExactSameFamilyCandidate = @($exactNullSelect.data.selection.eligible | Where-Object { $_.manifest.compatibility.renderPath -eq 'vr-steamvr-physical' })[0]
+    Assert-Test ($exactNullSelect.data.selection.selected.manifest.compatibility.renderPath -eq 'vr-steamvr-null' -and $exactNullSelect.data.selection.selected.exactRenderPathProvenance -and $exactNullSelect.data.selection.selected.score -gt $nonExactSameFamilyCandidate.score) 'exact route provenance outranks a nonexact candidate from the same render family'
 
     $openCompositeArgs = @{} + $nullRouteArgs
     $openCompositeArgs.RenderPath = 'vr-opencomposite'
@@ -188,7 +214,7 @@ try {
     Assert-Test ($completeAgain.ok -and $completeAgain.state -eq 'already-complete') 'task completion retry returns the immutable existing completion'
 
     $finalList = Invoke-Catalog @{ Command = 'list'; CatalogRoot = $catalogRoot; Compact = $true; NoExit = $true }
-    Assert-Test (@($finalList.data.snapshots).Count -eq 3 -and @($finalList.data.issues).Count -eq 0) 'catalog retains all known-working compatibility records and validates every manifest'
+    Assert-Test (@($finalList.data.snapshots).Count -eq 5 -and @($finalList.data.issues).Count -eq 0) 'catalog retains all known-working compatibility records and validates every manifest'
 }
 finally {
     $env:CSX_SHADER_CACHE_CONTROL_ROOT = $priorControlRoot
