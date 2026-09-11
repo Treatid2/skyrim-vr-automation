@@ -65,6 +65,31 @@ $ownedProcessFunction = $scriptAst.Find({
 if ($parseErrors.Count -ne 0 -or $null -eq $ownedProcessFunction) {
     throw 'Could not isolate Get-OwnedProcess for inaccessible-process coverage.'
 }
+$stopOutcomeFunction = $scriptAst.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-CocStopOutcome'
+    }, $true)
+if ($null -eq $stopOutcomeFunction) {
+    throw 'Could not isolate Get-CocStopOutcome for stop-result coverage.'
+}
+Invoke-Expression $stopOutcomeFunction.ToString()
+$monitorStop = Get-CocStopOutcome -ProcessKind crash-monitor -Value (
+    [pscustomobject]@{ cleanupComplete = $true; target = '42'; cancelExited = $true }
+)
+$workerStop = Get-CocStopOutcome -ProcessKind hang-capture-worker -Value (
+    [pscustomobject]@{ cleanupComplete = $true; captureExited = $true }
+)
+$failedWorkerStop = Get-CocStopOutcome -ProcessKind hang-capture-procdump -Value (
+    [pscustomobject]@{ cleanupComplete = $false; captureExited = $false }
+)
+if (-not $monitorStop.stopped -or $monitorStop.target -ne '42' -or
+    $monitorStop.cancelState -ne 'exited' -or -not $workerStop.stopped -or
+    $null -ne $workerStop.target -or $workerStop.cancelState -ne 'exited' -or
+    $failedWorkerStop.stopped -or $null -ne $failedWorkerStop.target -or
+    $failedWorkerStop.cancelState -ne 'cleanup-incomplete') {
+    throw 'Stop-result normalization did not preserve process-specific result shapes.'
+}
 $ownedProcessOriginal = $ownedProcessFunction.ToString()
 $ownedProcessSource = $ownedProcessOriginal.Replace(
     '$process = Get-Process -Id ([int]$pidValue.Value) -ErrorAction SilentlyContinue',

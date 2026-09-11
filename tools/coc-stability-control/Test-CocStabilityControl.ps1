@@ -11,6 +11,80 @@ $scriptPath = Join-Path $PSScriptRoot 'Invoke-CocStabilityControl.ps1'
 $configPath = Join-Path $PSScriptRoot 'protocol.v1.json'
 Import-Module $modulePath -Force
 
+$moduleTokens = $null
+$moduleParseErrors = $null
+$moduleAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $modulePath, [ref]$moduleTokens, [ref]$moduleParseErrors
+)
+if ($moduleParseErrors.Count -ne 0) {
+    throw 'The COC stability module does not parse.'
+}
+foreach ($functionName in @('Get-CocMcpResultContent', 'Get-CocHealthValue')) {
+    $functionAst = $moduleAst.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $functionName
+        }, $true)
+    if ($null -eq $functionAst) {
+        throw "The COC stability module helper is missing: $functionName"
+    }
+    Invoke-Expression $functionAst.ToString()
+}
+
+foreach ($invalidCall in @(
+        [pscustomobject]@{},
+        [pscustomobject]@{ json = [pscustomobject]@{} },
+        [pscustomobject]@{ json = [pscustomobject]@{ result = $null } },
+        [pscustomobject]@{
+            json = [pscustomobject]@{ result = [pscustomobject]@{} }
+        }
+    )) {
+    try {
+        Get-CocMcpResultContent -Call $invalidCall -Context 'test health' | Out-Null
+        throw 'A malformed MCP response shape was accepted.'
+    }
+    catch {
+        if ($_.Exception.Message -notlike 'test health returned no *') { throw }
+    }
+}
+try {
+    Get-CocMcpResultContent -Call ([pscustomobject]@{
+            json = [pscustomobject]@{
+                result = [pscustomobject]@{
+                    isError = $true
+                    content = @([pscustomobject]@{ type = 'text'; text = 'health failed' })
+                }
+            }
+        }) -Context 'test health' | Out-Null
+    throw 'An MCP error result was accepted.'
+}
+catch {
+    if ($_.Exception.Message -ne 'test health reported an error result: health failed') {
+        throw
+    }
+}
+$healthValue = Get-CocHealthValue -Content @([pscustomobject]@{
+        type = 'text'; text = '{"pid":42}'
+    })
+if ([int]$healthValue.pid -ne 42) {
+    throw 'A valid health payload did not round-trip.'
+}
+foreach ($invalidHealthContent in @(
+        @(),
+        @([pscustomobject]@{ type = 'image'; data = 'ignored' }),
+        @([pscustomobject]@{ type = 'text'; text = 'not-json' })
+    )) {
+    try {
+        Get-CocHealthValue -Content $invalidHealthContent | Out-Null
+        throw 'A malformed health payload was accepted.'
+    }
+    catch {
+        if ($_.Exception.Message -notlike 'DevBench health call returned * JSON text payload.') {
+            throw
+        }
+    }
+}
+
 $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json -Depth 30
 $protocolRaw = [IO.File]::ReadAllText($configPath)
 $protocolSnapshot = New-CocProtocolSnapshot -ProtocolJson $protocolRaw

@@ -419,6 +419,29 @@ function Stop-HangCaptureWorker([Diagnostics.Process]$Capture) {
     }
 }
 
+function Get-CocStopOutcome {
+    param(
+        [Parameter(Mandatory)]$Value,
+        [Parameter(Mandatory)]
+        [ValidateSet('crash-monitor', 'hang-capture-worker', 'hang-capture-procdump')]
+        [string]$ProcessKind
+    )
+
+    $exitProperty = if ($ProcessKind -eq 'crash-monitor') {
+        'cancelExited'
+    } else { 'captureExited' }
+    $exitMember = $Value.PSObject.Properties[$exitProperty]
+    $exited = $null -ne $exitMember -and [bool]$exitMember.Value
+    return [pscustomobject][ordered]@{
+        stopped = $Value.PSObject.Properties['cleanupComplete'] -and
+            [bool]$Value.cleanupComplete
+        target = if ($Value.PSObject.Properties['target']) {
+            $Value.target
+        } else { $null }
+        cancelState = if ($exited) { 'exited' } else { 'cleanup-incomplete' }
+    }
+}
+
 function Get-ValidatedCaptureCompletion($State) {
     if (-not $State.PSObject.Properties['captureState'] -or
         [string]$State.captureState -cne 'capture-complete' -or
@@ -924,7 +947,8 @@ try {
         } else {
             Stop-HangCaptureWorker -Capture $ownedProcess
         }
-        $stopped = [bool]$cancel.cleanupComplete
+        $stopOutcome = Get-CocStopOutcome -Value $cancel -ProcessKind $processKind
+        $stopped = [bool]$stopOutcome.stopped
         $owned.data | Add-Member -NotePropertyName cancelPid `
             -NotePropertyValue $(if ($cancel.PSObject.Properties['cancelPid']) {
                 $cancel.cancelPid
@@ -934,10 +958,7 @@ try {
                 $cancel.cancelStartedUtc
             } else { $null }) -Force
         $owned.data | Add-Member -NotePropertyName cancelState `
-            -NotePropertyValue $(if (-not $cancel.PSObject.Properties['cancelExited'] -or
-                $cancel.cancelExited) {
-                'exited'
-            } else { 'cleanup-incomplete' }) -Force
+            -NotePropertyValue $stopOutcome.cancelState -Force
         if (($cancel.PSObject.Properties['monitorExited'] -and $cancel.monitorExited) -or
             $processKind -ne 'crash-monitor') {
             $owned.data | Add-Member -NotePropertyName captureState `
@@ -974,7 +995,7 @@ try {
                 monitorPid = [int]$owned.data.monitorPid
                 processKind = $processKind
                 processPid = $ownedProcess.Id
-                target = $cancel.target
+                target = $stopOutcome.target
                 captureDirectory = [string]$owned.data.captureDirectory
                 cleanup = $cancel
             }

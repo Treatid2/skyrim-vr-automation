@@ -220,7 +220,9 @@ The controller invokes the direct `communityshaders.menu` tool once:
 }
 ```
 
-Record these fixture fields without making a returned mismatch a dispatch gate:
+Record these fixture fields. The `ready`, `promptRequired`, and `persisted`
+values in the first bullet are mandatory dispatch gates. Record mismatches in
+the remaining observational fields without making them dispatch gates:
 
 - `ready: true`, `promptRequired: false`, and `persisted: false`;
 - `after.vr` and `after.inGame` are true;
@@ -248,8 +250,8 @@ running public CSX profile is the sole observation source.
 
 The direct fixture call itself is required. A rejected or unavailable call is a
 blocked phase and requires a user question. A returned semantic fixture defect
-(`ready:false`, `persisted:true`, `promptRequired:true`, or a missing expected
-field) is recorded as an anomaly and prevents the measured assay.
+(`ready:false`, `persisted:true`, `promptRequired:true`, or a missing required
+gate field) is recorded as an anomaly and prevents the measured assay.
 
 ## Bounded parallel baseline
 

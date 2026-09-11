@@ -151,6 +151,70 @@ function Assert-CocProcessLifetime {
     }
 }
 
+function Get-CocMcpResultContent {
+    [CmdletBinding()]
+    param(
+        $Call,
+        [Parameter(Mandatory)][string]$Context
+    )
+
+    if ($null -eq $Call -or -not $Call.PSObject.Properties['json'] -or
+        $null -eq $Call.json) {
+        throw "$Context returned no JSON response."
+    }
+    $json = $Call.json
+    if ($json.PSObject.Properties['error']) {
+        throw "$Context failed: $($json.error | ConvertTo-Json -Compress)"
+    }
+    if (-not $json.PSObject.Properties['result'] -or $null -eq $json.result) {
+        throw "$Context returned no result."
+    }
+    $result = $json.result
+    if ($result.PSObject.Properties['isError'] -and [bool]$result.isError) {
+        $messages = @(if ($result.PSObject.Properties['content']) {
+            $result.content | ForEach-Object {
+                    if ($null -ne $_ -and $_.PSObject.Properties['text']) {
+                        [string]$_.text
+                    }
+                }
+        })
+        $detail = if ($messages.Count -gt 0) {
+            $messages -join "`n"
+        } else { 'unspecified error' }
+        throw "$Context reported an error result: $detail"
+    }
+    if (-not $result.PSObject.Properties['content'] -or $null -eq $result.content) {
+        throw "$Context returned no content."
+    }
+    return @($result.content)
+}
+
+function Get-CocHealthValue {
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][object[]]$Content = @())
+
+    $healthText = @($Content | ForEach-Object {
+            if ($null -ne $_ -and $_.PSObject.Properties['type'] -and
+                [string]$_.type -eq 'text' -and $_.PSObject.Properties['text']) {
+                [string]$_.text
+            }
+        } | Select-Object -First 1)
+    if ($healthText.Count -eq 0 -or
+        [string]::IsNullOrWhiteSpace([string]$healthText[0])) {
+        throw 'DevBench health call returned no JSON text payload.'
+    }
+    try {
+        $value = [string]$healthText[0] | ConvertFrom-Json -Depth 30
+    }
+    catch {
+        throw 'DevBench health call returned an invalid JSON text payload.'
+    }
+    if ($null -eq $value) {
+        throw 'DevBench health call returned an invalid JSON text payload.'
+    }
+    return $value
+}
+
 function Invoke-CocMcpTool {
     [CmdletBinding()]
     param(
@@ -186,9 +250,9 @@ function Invoke-CocMcpTool {
             method = 'tools/call'
             params = @{ name = 'inspect'; arguments = @{ kind = 'health' } }
         }
-    $healthText = @($healthCall.json.result.content | Where-Object type -eq 'text' |
-            Select-Object -First 1).text
-    $healthValue = try { $healthText | ConvertFrom-Json -Depth 30 } catch { $null }
+    $healthContent = @(Get-CocMcpResultContent -Call $healthCall `
+            -Context 'DevBench health call')
+    $healthValue = Get-CocHealthValue -Content $healthContent
     $healthPid = Get-CocPropertyValue -Value $healthValue -Name 'pid'
     if ($null -eq $healthPid -or [int]$healthPid -ne $ExpectedProcessId) {
         throw "DevBench endpoint process identity changed; expected PID $ExpectedProcessId."
@@ -214,18 +278,13 @@ function Invoke-CocMcpTool {
     Assert-CocEndpointBinding -Endpoint $Endpoint `
         -ExpectedProcessId $ExpectedProcessId `
         -ExpectedProcessStartTimeUtc $ExpectedProcessStartTimeUtc
-    if ($call.json.PSObject.Properties['error']) {
-        throw "DevBench tools/call failed: $($call.json.error | ConvertTo-Json -Compress)"
-    }
-    if ($call.json.result.PSObject.Properties['isError'] -and
-        [bool]$call.json.result.isError) {
-        $message = (@($call.json.result.content) | ForEach-Object text) -join "`n"
-        throw "DevBench tool '$Tool' failed: $message"
-    }
+    $callContent = @(Get-CocMcpResultContent -Call $call `
+            -Context "DevBench tool '$Tool'")
 
     $content = [Collections.Generic.List[object]]::new()
-    foreach ($item in @($call.json.result.content)) {
-        if ($item.type -eq 'text') {
+    foreach ($item in $callContent) {
+        if ($null -ne $item -and $item.PSObject.Properties['type'] -and
+            [string]$item.type -eq 'text' -and $item.PSObject.Properties['text']) {
             try { $content.Add(($item.text | ConvertFrom-Json -Depth 80)) }
             catch { $content.Add([string]$item.text) }
         } else {

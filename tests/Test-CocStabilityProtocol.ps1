@@ -145,6 +145,7 @@ foreach ($requiredProtocolText in @(
     '"waitUntil": "playerLoaded", "timeoutMs": 20000',
     'never postpone the scheduled COC',
     '## One-time post-load fixture gate',
+    'are mandatory dispatch gates',
     '"action": "prepare_coc"',
     'raises an `info` or less-verbose CSX log level to `debug`',
     'A returned semantic fixture defect',
