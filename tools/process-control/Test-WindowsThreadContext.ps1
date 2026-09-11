@@ -13,6 +13,15 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
 }
 
 $tool = Join-Path $PSScriptRoot 'Invoke-WindowsThreadContext.ps1'
+$parseErrors = $null
+$tokens = $null
+$toolAst = [Management.Automation.Language.Parser]::ParseFile($tool, [ref]$tokens, [ref]$parseErrors)
+$closeHelperAst = @($toolAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Close-NativeHandle' }, $true))[0]
+Invoke-Expression $closeHelperAst.Extent.Text
+$simulatedCloseFailure = Close-NativeHandle -Handle ([IntPtr]1) -Kind thread -Sample 7 -CloseAction { param($handle) $false } -LastErrorAction { 5 }
+if ($simulatedCloseFailure.ok -or $simulatedCloseFailure.kind -ne 'thread' -or $simulatedCloseFailure.sample -ne 7 -or $simulatedCloseFailure.nativeError -ne 5 -or $simulatedCloseFailure.error -notmatch 'Win32 error 5') {
+    throw 'Native handle close failure was not retained with exact attribution.'
+}
 $currentHost = (Get-Process -Id $PID -ErrorAction Stop).Path
 $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $hosts = @($currentHost, $windowsPowerShell) |
@@ -65,6 +74,9 @@ try {
             $capture.identity.processId -ne $helper.Id -or
             $capture.identity.threadId -ne $thread.Id -or
             [string]::IsNullOrWhiteSpace([string]$capture.identity.threadStartTimeUtc) -or
+            -not $capture.cleanup.ok -or
+            @($capture.cleanup.handles).Count -ne 3 -or
+            @($capture.cleanup.handles | Where-Object { -not $_.ok }).Count -ne 0 -or
             $capture.records[0].rip -notmatch '^0x[0-9A-F]+$' -or
             $capture.records[0].rsp -notmatch '^0x[0-9A-F]+$') {
             throw "Thread-context capture returned an invalid contract under '$hostPath'."
@@ -133,6 +145,7 @@ try {
         identityMismatchGuard = $true
         perSampleThreadIdentityGuard = $true
         targetArchitectureGuard = $targetArchitectureGuard
+        handleCleanupFailureAttribution = $true
     } | ConvertTo-Json -Depth 5
 }
 finally {

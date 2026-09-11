@@ -1002,17 +1002,17 @@ function Invoke-AutomatedVisualEvaluation($CandidateIndex, $BaselineIndex, $Prov
     $schemaPath = Join-Path $script:evidenceRoot $schemaRelative
     $preflightPath = Join-Path $script:evidenceRoot $preflightRelative
     if (-not (Test-Path -LiteralPath $reviewRoot -PathType Container)) { New-Item -ItemType Directory -Path $reviewRoot -Force | Out-Null }
-    foreach ($binding in @(
+    foreach ($assetBinding in @(
         [pscustomobject]@{ source = Join-Path $PSScriptRoot ([string]$evaluation.promptFile); destination = $promptPath; sha256 = [string]$evaluation.promptSha256; label = 'prompt' },
         [pscustomobject]@{ source = Join-Path $PSScriptRoot ([string]$evaluation.outputSchemaFile); destination = $schemaPath; sha256 = [string]$evaluation.outputSchemaSha256; label = 'output schema' }
     )) {
-        if (-not (Test-Path -LiteralPath $binding.source -PathType Leaf) -or (Get-CSXFileSha256 $binding.source) -ne $binding.sha256) {
-            throw "The automated visual-review $($binding.label) does not match the protocol hash."
+        if (-not (Test-Path -LiteralPath $assetBinding.source -PathType Leaf) -or (Get-CSXFileSha256 $assetBinding.source) -ne $assetBinding.sha256) {
+            throw "The automated visual-review $($assetBinding.label) does not match the protocol hash."
         }
-        if (-not (Test-Path -LiteralPath $binding.destination -PathType Leaf)) {
-            Copy-Item -LiteralPath $binding.source -Destination $binding.destination
+        if (-not (Test-Path -LiteralPath $assetBinding.destination -PathType Leaf)) {
+            Copy-Item -LiteralPath $assetBinding.source -Destination $assetBinding.destination
         }
-        if ((Get-CSXFileSha256 $binding.destination) -ne $binding.sha256) { throw "The copied automated visual-review $($binding.label) hash changed." }
+        if ((Get-CSXFileSha256 $assetBinding.destination) -ne $assetBinding.sha256) { throw "The copied automated visual-review $($assetBinding.label) hash changed." }
     }
     Write-CSXJsonFile -Path $preflightPath -Value $ProviderPreflight | Out-Null
 
@@ -1580,6 +1580,11 @@ $protocolRecord = $null
 $visualProviderPreflight = $null
 
 try {
+    $baselineArgumentsSupplied = $PSBoundParameters.ContainsKey('BaselinePath') -or
+        $PSBoundParameters.ContainsKey('ExpectedBaselineBuildId')
+    if (-not $PrMode -and $baselineArgumentsSupplied) {
+        throw 'Baseline inputs require -PrMode; local qualification cannot silently ignore them.'
+    }
     $protocolRecord = Get-CSXQualificationProtocol -Path $ProtocolPath
     $script:protocol = $protocolRecord.protocol
     if ($PrMode -and [bool]$script:protocol.thresholds.prBaselineRequired -and
@@ -1597,11 +1602,11 @@ try {
     $arguments = @('list', '-RuntimePath', $runtimeFull, '-ExpectedBuildId', $script:expectedBuildId, '-EvidenceDirectory', $bindingDirectory, '-EvidenceLabel', 'render-scale-qualification', '-NoExit', '-Compact')
     if (-not [string]::IsNullOrWhiteSpace($ExpectedArtifactSha256)) { $arguments += @('-ExpectedArtifactSha256', $ExpectedArtifactSha256.ToLowerInvariant()) }
     $bindingRaw = & $controller @arguments 2>&1
-    $binding = ($bindingRaw -join "`n") | ConvertFrom-Json -Depth 100
-    Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'binding\authoritative-list.json') -Value $binding | Out-Null
-    if (-not [bool]$binding.ok) { throw "Exact DevBench runtime binding failed: $($binding.errors -join ' ')" }
-    $script:bindingIdentity = Get-CSXPropertyValue $binding 'runtimeIdentity'
-    $tools = @(Get-CSXPathValue $binding 'data.tools')
+    $runtimeBinding = ($bindingRaw -join "`n") | ConvertFrom-Json -Depth 100
+    Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'binding\authoritative-list.json') -Value $runtimeBinding | Out-Null
+    if (-not [bool]$runtimeBinding.ok) { throw "Exact DevBench runtime binding failed: $($runtimeBinding.errors -join ' ')" }
+    $script:bindingIdentity = Get-CSXPropertyValue $runtimeBinding 'runtimeIdentity'
+    $tools = @(Get-CSXPathValue $runtimeBinding 'data.tools')
     $requiredTools = @('scenario', 'console', 'inspect', 'communityshaders.renderscale', 'communityshaders.upscaling_api', 'communityshaders.feature_api', 'communityshaders.screenshot')
     foreach ($name in $requiredTools) { if (@($tools | Where-Object name -eq $name).Count -ne 1) { throw "Authoritative tools/list did not expose exactly one '$name'." } }
     $renderDescriptor = @($tools | Where-Object name -eq 'communityshaders.renderscale')[0]
@@ -1618,15 +1623,15 @@ try {
     $reviewRoot = Join-Path $script:evidenceRoot 'visual-review'
     New-Item -ItemType Directory -Path $reviewRoot -Force | Out-Null
     $evaluation = $script:protocol.visualAssay.evaluation
-    foreach ($binding in @(
+    foreach ($assetBinding in @(
         [pscustomobject]@{ source = Join-Path $PSScriptRoot ([string]$evaluation.promptFile); destination = Join-Path $reviewRoot 'prompt.v1.md'; sha256 = [string]$evaluation.promptSha256; label = 'prompt' },
         [pscustomobject]@{ source = Join-Path $PSScriptRoot ([string]$evaluation.outputSchemaFile); destination = Join-Path $reviewRoot 'output-schema.v1.json'; sha256 = [string]$evaluation.outputSchemaSha256; label = 'output schema' }
     )) {
-        if (-not (Test-Path -LiteralPath $binding.source -PathType Leaf) -or (Get-CSXFileSha256 $binding.source) -ne $binding.sha256) {
-            throw "The automated visual-review $($binding.label) does not match the protocol hash."
+        if (-not (Test-Path -LiteralPath $assetBinding.source -PathType Leaf) -or (Get-CSXFileSha256 $assetBinding.source) -ne $assetBinding.sha256) {
+            throw "The automated visual-review $($assetBinding.label) does not match the protocol hash."
         }
-        Copy-Item -LiteralPath $binding.source -Destination $binding.destination
-        if ((Get-CSXFileSha256 $binding.destination) -ne $binding.sha256) { throw "The copied automated visual-review $($binding.label) hash changed." }
+        Copy-Item -LiteralPath $assetBinding.source -Destination $assetBinding.destination
+        if ((Get-CSXFileSha256 $assetBinding.destination) -ne $assetBinding.sha256) { throw "The copied automated visual-review $($assetBinding.label) hash changed." }
     }
     $visualProviderPreflight = Get-CSXCodexVisualReviewProviderPreflight -CodexExecutable $CodexExecutable
     Write-CSXJsonFile -Path (Join-Path $reviewRoot 'preflight.json') -Value $visualProviderPreflight | Out-Null
@@ -1703,7 +1708,7 @@ try {
     $fixtureHashBytes = [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($fixtureJson))
     $fixtureHash = [Convert]::ToHexString($fixtureHashBytes).ToLowerInvariant()
     $fixture = [pscustomobject][ordered]@{ gpuVendor = $GpuVendor; fsrRuntime = $fsrRuntime; matrixName = $fixtureObject.matrixName; fingerprint = $fixtureHash; manifest = $fixtureObject.fixtureManifest; inputs = $fixtureObject }
-    $runtimeEvidence = [pscustomobject][ordered]@{ buildId = $script:expectedBuildId; artifactSha256 = $ExpectedArtifactSha256; binding = $binding.runtimeIdentity; health = $health }
+    $runtimeEvidence = [pscustomobject][ordered]@{ buildId = $script:expectedBuildId; artifactSha256 = $ExpectedArtifactSha256; binding = $script:bindingIdentity; health = $health }
 
     $baseline = if ($PrMode) { Resolve-BaselineRun -Path $BaselinePath -ExpectedBuildId $ExpectedBaselineBuildId -CandidateBuildId $script:expectedBuildId } else { $null }
     if ($PrMode) {

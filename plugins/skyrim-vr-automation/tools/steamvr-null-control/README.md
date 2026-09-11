@@ -31,12 +31,15 @@ remains fail-closed until its other runtime conflicts are separately qualified.
 
 Before `start`, the controller reads the OpenVR registration file (normally
 `%LOCALAPPDATA%\openvr\openvrpaths.vrpath`) and inventories every external
-driver manifest with exact paths and hashes. An external driver declaring
-`redirectsDisplay=true` conflicts with the forced null display path: `inspect`
-returns `external-driver-conflict`, and `start` refuses with the exact driver
-inventory. Use `-OpenVRPathsPath` for a nonstandard registration file. This
-preflight also refuses startup when a registered driver cannot be classified;
-it does not silently mutate or unregister third-party drivers.
+driver manifest with exact paths and hashes. A non-Virtual-Desktop external
+driver declaring `redirectsDisplay=true` conflicts with the forced null display
+path: `inspect` returns `external-driver-conflict`, and `start` refuses with the
+exact driver inventory. A Virtual Desktop registration remains visible in the
+inventory with disposition `ignored-virtual-desktop`; it is not a null-HMD
+blocker and is never selected for isolation. Use `-OpenVRPathsPath` for a
+nonstandard registration file. This preflight also refuses startup when a
+registered driver cannot be classified; it does not silently mutate or
+unregister third-party drivers.
 
 For a measurement-qualified transaction with one classified redirector, pass
 `-IsolateExternalDisplayRedirectors` to `apply`. The controller backs up and
@@ -155,9 +158,9 @@ possible.
 Operator diagnostics never describe unverified cleanup as successfully stopped.
 
 ```powershell
-.\Invoke-SteamVRNullControl.ps1 apply -EvidenceDirectory <session-evidence> -Compact
-.\Invoke-SteamVRNullControl.ps1 apply -EvidenceDirectory <session-evidence> -IsolateExternalDisplayRedirectors -Compact
-.\Invoke-SteamVRNullControl.ps1 start -EvidenceDirectory <session-evidence> -Compact
+.\Invoke-SteamVRNullControl.ps1 apply -MO2AccessId <access-id> -MO2Profile <task-profile> -EvidenceDirectory <session-evidence> -Compact
+.\Invoke-SteamVRNullControl.ps1 apply -MO2AccessId <access-id> -MO2Profile <task-profile> -EvidenceDirectory <session-evidence> -IsolateExternalDisplayRedirectors -Compact
+.\Invoke-SteamVRNullControl.ps1 start -MO2AccessId <access-id> -MO2Profile <task-profile> -EvidenceDirectory <session-evidence> -Compact
 .\Invoke-SteamVRNullControl.ps1 inspect -Compact
 .\Invoke-SteamVRNullControl.ps1 stop -Compact
 .\Invoke-SteamVRNullControl.ps1 stop -Force -Compact
@@ -170,8 +173,15 @@ requires SteamVR to be closed and uses the bundled native package by default.
 
 Launch Skyrim only after `start` or `inspect` returns current-session runtime
 proof, and do not interpret the `-unqualified` state as replay or measurement
-readiness. Also use an MO2 profile that disables OpenComposite; a running null
-SteamVR instance does not prove an application bypassing SteamVR is attached to
-it.
+readiness. For an MO2-backed run, acquire a `SteamVRNull` MO2 access lease,
+select the exact task workspace, and pass closed-state runtime-route validation
+before applying or starting null-HMD. Pass that exact lease's bearer
+`-MO2AccessId` and selected `-MO2Profile` to both `apply` and `start`. The
+controller independently repeats the `runtime-route-provider` check, requires
+the `SteamVRNull` route, and binds the public admission proof into the apply
+receipt. `start` rejects lease, profile, or provider-inventory drift. The
+explicit `-Standalone` escape is for non-MO2 SteamVR diagnostics only and must
+not be used for Skyrim through MO2. A running null SteamVR instance does not
+prove an application bypassing SteamVR is attached to it.
 
 Run `Test-SteamVRNullControl.ps1` after changing the control contract.
