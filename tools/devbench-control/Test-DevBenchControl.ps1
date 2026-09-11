@@ -215,6 +215,34 @@ $nativePhysicalStatus = New-TestRenderScaleStatus -RenderScale $false
 $nativePhysicalStatus.controller.stable.active = $true
 $nativePhysicalState = Test-DevBenchUpscalingStable -UpscalingSnapshot (New-TestNativeSnapshot -RequestedProfile $nativeProfile) -RenderScaleStatus $nativePhysicalStatus
 Assert-Test (-not $nativePhysicalState.satisfied -and $nativePhysicalState.reasons -contains 'an active physical render-scale contract remains for a native-resolution profile') 'native-resolution stability rejects a contradictory active physical contract'
+$missingNativeStableActivity = New-TestRenderScaleStatus -RenderScale $false
+$missingNativeStableActivity.controller.stable.PSObject.Properties.Remove('active')
+$missingNativeStableActivityState = Test-DevBenchUpscalingStable -UpscalingSnapshot (New-TestNativeSnapshot -RequestedProfile $nativeProfile) -RenderScaleStatus $missingNativeStableActivity
+Assert-Test (-not $missingNativeStableActivityState.satisfied -and $missingNativeStableActivityState.reasons -contains 'stable render-scale activity telemetry is missing for a native-resolution profile') 'native-resolution stability rejects missing physical contract activity telemetry'
+$missingNativeFidelityActivity = New-TestRenderScaleStatus -RenderScale $false
+$missingNativeFidelityActivity.controller.fidelity.PSObject.Properties.Remove('active')
+$missingNativeFidelityActivityState = Test-DevBenchUpscalingStable -UpscalingSnapshot (New-TestNativeSnapshot -RequestedProfile $nativeProfile) -RenderScaleStatus $missingNativeFidelityActivity
+Assert-Test (-not $missingNativeFidelityActivityState.satisfied -and $missingNativeFidelityActivityState.reasons -contains 'render-scale fidelity activity telemetry is missing for a native-resolution profile') 'native-resolution stability rejects missing fidelity activity telemetry'
+$invalidNativeActivity = New-TestRenderScaleStatus -RenderScale $false
+$invalidNativeActivity.controller.stable.active = 'false'
+$invalidNativeActivityState = Test-DevBenchUpscalingStable -UpscalingSnapshot (New-TestNativeSnapshot -RequestedProfile $nativeProfile) -RenderScaleStatus $invalidNativeActivity
+Assert-Test (-not $invalidNativeActivityState.satisfied -and $invalidNativeActivityState.reasons -contains 'stable render-scale activity telemetry has invalid type for a native-resolution profile') 'native-resolution stability rejects coerced physical contract activity telemetry'
+$invalidCompletedFrame = New-TestRenderScaleStatus
+$invalidCompletedFrame.vendorWorkGate.completedWorldFrame = 'false'
+$invalidCompletedFrameState = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus $invalidCompletedFrame
+Assert-Test (-not $invalidCompletedFrameState.satisfied -and $invalidCompletedFrameState.reasons -contains 'completed world-frame telemetry has invalid type') 'render-scale stability rejects truthy strings for completed world-frame authority'
+$invalidRecoveryBoolean = New-TestRenderScaleStatus
+$invalidRecoveryBoolean.controller.postLoadRecovery.active = 'false'
+$invalidRecoveryBooleanState = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus $invalidRecoveryBoolean
+Assert-Test (-not $invalidRecoveryBooleanState.satisfied -and $invalidRecoveryBooleanState.reasons -contains 'post-load render-scale recovery active telemetry has invalid type') 'render-scale stability rejects coerced nested recovery telemetry'
+$invalidDimensionSnapshot = $renderSnapshot | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+$invalidDimensionSnapshot.dimensions.displayEyeWidth = 'wide'
+$invalidDimensionState = Test-DevBenchUpscalingStable -UpscalingSnapshot $invalidDimensionSnapshot -RenderScaleStatus (New-TestRenderScaleStatus)
+Assert-Test (-not $invalidDimensionState.satisfied -and $invalidDimensionState.reasons -contains 'upscaling dimensions are not materialized') 'upscaling stability rejects nonnumeric dimensions without throwing'
+$overflowDimensionSnapshot = $renderSnapshot | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+$overflowDimensionSnapshot.dimensions.renderEyeHeight = [uint64]::MaxValue
+$overflowDimensionState = Test-DevBenchUpscalingStable -UpscalingSnapshot $overflowDimensionSnapshot -RenderScaleStatus (New-TestRenderScaleStatus)
+Assert-Test (-not $overflowDimensionState.satisfied -and $overflowDimensionState.reasons -contains 'upscaling dimensions are not materialized') 'upscaling stability rejects dimensions outside the UInt32 contract without throwing'
 $mismatchedProfile = New-TestUpscalingProfile -Method 'fsr' -RenderScale $false
 $nativeMismatchSnapshot = New-TestNativeSnapshot -RequestedProfile $mismatchedProfile -EffectiveProfile $nativeProfile -StableProfile $nativeFsrProfile -ProfilePresence 27
 $nativeMismatch = Test-DevBenchUpscalingStable -UpscalingSnapshot $nativeMismatchSnapshot -RenderScaleStatus (New-TestRenderScaleStatus -RenderScale $false)
@@ -242,6 +270,21 @@ $partialProfileSnapshot = $renderSnapshot | ConvertTo-Json -Depth 20 | ConvertFr
 $partialProfileSnapshot.profiles.effective.PSObject.Properties.Remove('qualityMode')
 $partialProfileState = Test-DevBenchUpscalingStable -UpscalingSnapshot $partialProfileSnapshot -RenderScaleStatus (New-TestRenderScaleStatus)
 Assert-Test (-not $partialProfileState.satisfied -and $partialProfileState.reasons -contains 'the effective upscaling profile has invalid field types') 'partial effective profiles fail closed without a strict-mode exception'
+
+$requiredRecoveryTelemetry = @(
+    [pscustomobject]@{ parent = 'postLoadRecovery'; field = 'active'; reason = 'post-load render-scale recovery active telemetry is missing' },
+    [pscustomobject]@{ parent = 'memoryTrim'; field = 'pending'; reason = 'render-scale memory trim pending telemetry is missing' },
+    [pscustomobject]@{ parent = 'retirement'; field = 'pendingSets'; reason = 'render-scale retirement pending-set telemetry is missing' },
+    [pscustomobject]@{ parent = 'retirement'; field = 'fencePending'; reason = 'render-scale retirement fence telemetry is missing' },
+    [pscustomobject]@{ parent = 'retirement'; field = 'capacityBlocked'; reason = 'render-scale retirement capacity telemetry is missing' },
+    [pscustomobject]@{ parent = 'engineTargetRetirement'; field = 'pending'; reason = 'engine render-target retirement pending telemetry is missing' }
+)
+foreach ($case in $requiredRecoveryTelemetry) {
+    $partialStatus = New-TestRenderScaleStatus
+    $partialStatus.controller.($case.parent).PSObject.Properties.Remove($case.field)
+    $partialState = Test-DevBenchUpscalingStable -UpscalingSnapshot $renderSnapshot -RenderScaleStatus $partialStatus
+    Assert-Test (-not $partialState.satisfied -and $partialState.reasons -contains $case.reason) "missing $($case.parent).$($case.field) telemetry fails closed"
+}
 
 $resourcePublication = Get-DevBenchResourcePublicationTelemetry -Response ([pscustomobject]@{
         status = [pscustomobject]@{
@@ -357,6 +400,20 @@ $simpleProbe = Resolve-DevBenchServiceProbeArguments -ToolDefinition $simpleTool
 Assert-Test ($simpleProbe.source -eq 'schema-empty-valid' -and $simpleProbe.arguments.Count -eq 0) 'schema-valid empty probes remain empty'
 
 $entryPointText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1') -Raw
+$entryPointPath = Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1'
+$parseErrors = $null
+$tokens = $null
+$entryPointAst = [Management.Automation.Language.Parser]::ParseFile($entryPointPath, [ref]$tokens, [ref]$parseErrors)
+$terminalWriterAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Write-TerminalInvocationEvidence' }, $true))[0]
+Invoke-Expression $terminalWriterAst.Extent.Text
+$headerReaderAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-McpSessionHeaderValue' }, $true))[0]
+Invoke-Expression $headerReaderAst.Extent.Text
+$missingHeader = Get-McpSessionHeaderValue -Response ([pscustomobject]@{ Headers = @{} })
+$arrayHeader = Get-McpSessionHeaderValue -Response ([pscustomobject]@{ Headers = @{ 'Mcp-Session-Id' = @('owned-session', 'ignored') } })
+Assert-Test ([string]::IsNullOrWhiteSpace($missingHeader) -and $arrayHeader -eq 'owned-session') 'session header lookup preserves missing-header parse failures and normalizes present array values'
+$completedFixture = [pscustomobject][ordered]@{ ok = $true; transportOk = $true; semantic = [pscustomobject]@{ known = $true; ok = $true }; data = [pscustomobject]@{ value = 42 }; errors = @() }
+$completionWriteSucceeded = Write-TerminalInvocationEvidence -Result $completedFixture -FailurePrefix 'fixture completion write failed' -WriteAction { throw 'fixture persistence fault' }
+Assert-Test (-not $completionWriteSucceeded -and $completedFixture.ok -and $completedFixture.transportOk -and $completedFixture.data.value -eq 42 -and $completedFixture.evidenceWarnings[0] -match 'fixture persistence fault' -and -not $completedFixture.evidenceJournalFinalized) 'post-completion journal failure preserves the exact completed response and reports evidence loss'
 Assert-Test ($entryPointText -notmatch '(?im)^\s*\$pid\s*=') 'entry point never assigns PowerShell reserved PID variable'
 Assert-Test ($entryPointText -match '\$expectations\.buildId\s+-and\s+\$actualBuildId\s+-and') 'deferred build identity never compares a missing runtime build ID'
 Assert-Test ($entryPointText -match '\$Command -eq ''wait'' -and \$statusCode -eq 404') 'transient MCP 404 recovery is restricted to bounded waits'
@@ -394,9 +451,12 @@ Assert-Test ($entryPointText -match 'operationDeadlineUtc = \$script:operationDe
 Assert-Test ($entryPointText -match 'serverTimeoutDispatchRemainingSeconds') 'receipts expose the remaining dispatch allowance for a server-owned wait'
 Assert-Test ($entryPointText -match 'function Close-AllMcpSessions') 'controller retains cleanup evidence for every issued MCP session'
 Assert-Test ($entryPointText -match 'Close-McpSessionForRebind') 'session rebind requires a successful prior cleanup reconciliation'
+Assert-Test ($entryPointText -match 'elseif \(\$Condition -eq ''upscalingStable''\)[\s\S]+?catch \{[\s\S]+?Close-McpSessionForRebind -Headers \$headers[\s\S]+?\$headers = \$null') 'upscalingStable discards retryably invalidated sessions before another observation'
 Assert-Test ($entryPointText -match "DevBenchMcpSessionId" -and $entryPointText -match "returned malformed JSON") 'malformed initialization JSON preserves an already-issued MCP session identity'
 Assert-Test ($entryPointText -match "DevBenchCleanupUncertain" -and $entryPointText -match 'refusing automatic rebind') 'uncertain partial-session cleanup is never classified for automatic rebind'
 Assert-Test ($entryPointText -match "invocationRecord\['sessionCleanup'\]") 'final MCP cleanup evidence is written to the durable invocation journal'
+Assert-Test ($entryPointText -match "Session cleanup evidence could not be journaled" -and $entryPointText -match 'evidenceJournalFinalized') 'a final journal failure is reported without suppressing the completed controller result'
+Assert-Test ($entryPointText -match "outcome = 'tool-unavailable'" -and $entryPointText -match "codes = @\('tool_unavailable'\)") 'missing optional tools retain a structured unavailable outcome without dispatch'
 Assert-Test ($entryPointText -match 'method = ''tools/list''[\s\S]{0,400}currentTools') 'performance boundaries refresh the live tool registry'
 Assert-Test ($entryPointText -match 'function Invoke-ToolRpc[\s\S]{0,300}Invoke-McpRequest') 'tool calls use the shared deadline-bounded request path'
 Assert-Test ($entryPointText -match 'requestTimeoutSeconds = \$script:requestTimeoutSecondsForRpc') 'receipts expose the effective request timeout'
