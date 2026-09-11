@@ -53,11 +53,23 @@ function validateTracePage(rawPage, state) {
     if (state.sessionId !== null && sessionId !== state.sessionId) {
         throw new Error("trace_session_changed");
     }
-    if (capture.limit > state.maximum || capture.limit < 1) {
+    if (!Number.isSafeInteger(capture.limit) ||
+        capture.limit > state.maximum || capture.limit < 1) {
         throw new Error("trace_page_limit_out_of_range");
     }
-    if (capture.afterSequence !== state.afterSequence) {
+    if (!Number.isSafeInteger(capture.afterSequence) ||
+        capture.afterSequence < 0 || capture.afterSequence !== state.afterSequence) {
         throw new Error("trace_page_cursor_mismatch");
+    }
+    if (typeof capture.moreAvailable !== "boolean" ||
+        typeof capture.requestedSequenceOverwritten !== "boolean" ||
+        !Number.isSafeInteger(capture.availableFromSequence) ||
+        capture.availableFromSequence < 0 ||
+        !Number.isSafeInteger(capture.latestSequence) ||
+        capture.latestSequence < 0 ||
+        !Number.isSafeInteger(capture.lastReturnedSequence) ||
+        capture.lastReturnedSequence < 0) {
+        throw new Error("trace_page_metadata_invalid");
     }
     if (capture.requestedSequenceOverwritten === true ||
         (Number.isSafeInteger(capture.availableFromSequence) &&
@@ -173,6 +185,52 @@ function readLiveResult(root, variant, runId) {
         throw new Error("live_result_identity_mismatch");
     }
     return value;
+}
+
+function decodedScenarioRoot(value) {
+    if (value && Array.isArray(value.content) && value.content[0] &&
+        typeof value.content[0].text === "string") {
+        try {
+            return decodedScenarioRoot(JSON.parse(value.content[0].text));
+        } catch {
+            return null;
+        }
+    }
+    return value && Array.isArray(value.results) ? value : null;
+}
+
+function amdTraceCapabilityEvidence(root, liveResult, buildId) {
+    if (!liveResult || !liveResult.traceCapability ||
+        liveResult.traceCapability.status !== "supported") {
+        return { complete: false,
+            reasons: ["amd_trace_capability_not_supported_or_missing"] };
+    }
+    const rawRoot = path.join(root, "raw");
+    const files = fs.existsSync(rawRoot) ? walk(rawRoot).filter((file) =>
+        path.extname(file).toLowerCase() === ".json") : [];
+    for (const file of files) {
+        let scenarioRoot;
+        try {
+            scenarioRoot = decodedScenarioRoot(readJson(file));
+        } catch {
+            continue;
+        }
+        if (!scenarioRoot) continue;
+        const entries = new Map(scenarioRoot.results
+            .filter((entry) => entry && typeof entry.label === "string")
+            .map((entry) => [entry.label, entry.result]));
+        const retained = {
+            traceReset: entries.get("amd-dlss-trace-reset"),
+            traceStart: entries.get("amd-dlss-trace-start"),
+            traceStop: entries.get("amd-dlss-trace-stop"),
+            traceRead: entries.get("amd-dlss-trace-read"),
+        };
+        if (Object.values(retained).every(Boolean)) {
+            return traceLifecycleEvidence(retained, buildId, false);
+        }
+    }
+    return { complete: false,
+        reasons: ["amd_trace_capability_lifecycle_missing"] };
 }
 
 function validateBaselineOnlyInterruption(root, variant, runId, buildId) {
@@ -519,6 +577,11 @@ function normalizeTask2(retained) {
     const mismatchReasons = unique([...derivedMismatchReasons,
         ...temporalMismatchReasons, ...projectedMismatchReasons]);
     const explicitMismatch = mismatchReasons.length > 0;
+    if (explicitMismatch) {
+        phaseCountersAuthoritative = false;
+        authoritativeViolations = [];
+        verdict = "INCONCLUSIVE";
+    }
     const authorityStatus = explicitMismatch ? "MISMATCHED" :
         !phaseCountersAuthoritative ? "INCOMPLETE" :
             projection.phaseCounterAuthorityStatus || "MATCHED";
@@ -568,12 +631,34 @@ function normalizeTask2(retained) {
 
 function finalProfile(waiter) {
     const snapshot = waiter.upscalingSnapshot || {};
-    const stable = snapshot.stable || snapshot.effective || {};
+    const profiles = snapshot.profiles || {};
+    const stable = snapshot.stable || profiles.stable ||
+        snapshot.effective || profiles.effective || {};
+    const method = typeof stable.method === "string" && stable.method.length > 0 ?
+        stable.method : "not_exposed";
+    const quality = (typeof stable.qualityMode === "string" &&
+        stable.qualityMode.length > 0) || Number.isSafeInteger(stable.qualityMode) ?
+        stable.qualityMode : "not_exposed";
+    const renderScaleMode = typeof stable.renderScaleMode === "boolean" ?
+        stable.renderScaleMode : "not_exposed";
+    const stateRevision = Number.isSafeInteger(snapshot.stateRevision) &&
+        snapshot.stateRevision >= 0 ? snapshot.stateRevision : "not_exposed";
+    const missing = [];
+    if (method === "not_exposed") missing.push("final_method_not_exposed");
+    if (quality === "not_exposed") missing.push("final_quality_not_exposed");
+    if (renderScaleMode === "not_exposed") {
+        missing.push("final_render_scale_mode_not_exposed");
+    }
+    if (stateRevision === "not_exposed") {
+        missing.push("final_state_revision_not_exposed");
+    }
     return {
-        method: stable.method ?? "not_exposed",
-        quality: stable.qualityMode ?? "not_exposed",
-        renderScaleMode: stable.renderScaleMode ?? "not_exposed",
-        stateRevision: snapshot.stateRevision ?? "not_exposed",
+        method,
+        quality,
+        renderScaleMode,
+        stateRevision,
+        complete: missing.length === 0,
+        missing,
     };
 }
 
@@ -653,33 +738,149 @@ function sourceProfile(waiter) {
     };
 }
 
-function exposedBackend(value) {
-    return typeof value === "string" && value.length > 0 ? value : null;
+function backendContract(target) {
+    if (target.method === "none" || target.method === "taa") {
+        return target.renderScaleMode === false ? ["none"] : [];
+    }
+    if (target.method === "dlss") return ["dlss"];
+    if (target.method === "fsr" &&
+        (target.fsrRuntime === undefined ||
+            target.fsrRuntime === "fsr3" || target.fsrRuntime === "fsr4")) {
+        return ["fsr_host", "fsr_runtime"];
+    }
+    return [];
 }
 
-function actualBackend(waiter, target) {
-    if (target.method === "none" || target.method === "taa") return "none";
-    if (target.method !== "dlss" && target.method !== "fsr") {
-        return "not_exposed";
+function actualBackendEvidence(waiter, target) {
+    const allowed = backendContract(target);
+    const rejected = [];
+    const accept = (value, source) => {
+        const normalized = typeof value === "string" ? value.trim() : "";
+        if (normalized.length === 0) {
+            rejected.push({ source, value: value ?? null,
+                reason: "backend_not_exposed" });
+            return null;
+        }
+        if (!allowed.includes(normalized)) {
+            rejected.push({ source, value,
+                reason: "backend_incompatible_with_target" });
+            return null;
+        }
+        return { value: normalized, source };
+    };
+    if (allowed.length === 0) {
+        return { value: "not_exposed", source: "none", rejected: [{
+            source: "target", value: target,
+            reason: "target_backend_contract_invalid",
+        }] };
+    }
+    if (target.method === "none" || target.method === "taa") {
+        return { value: "none", source: "logical_native", rejected };
     }
     if (target.renderScaleMode === false) {
         const execution = waiter.nativeVendorExecution ||
             waiter.observation && waiter.observation.nativeVendorExecution;
-        return exposedBackend(execution && execution.actualBackend) ||
-            "not_exposed";
+        const candidate = accept(execution && execution.actualBackend,
+            "native_vendor_execution");
+        return candidate ? { ...candidate, rejected } :
+            { value: "not_exposed", source: "none", rejected };
     }
-    if (target.renderScaleMode !== true) return "not_exposed";
+    if (target.renderScaleMode !== true) {
+        return { value: "not_exposed", source: "none", rejected: [{
+            source: "target.renderScaleMode", value: target.renderScaleMode ?? null,
+            reason: "render_scale_mode_invalid",
+        }] };
+    }
     const timeline = waiter.replacementTimeline || {};
     const proof = timeline.terminal &&
         timeline.terminal.presentationProof || {};
-    const direct = exposedBackend(proof.backend);
-    if (direct) return direct;
-    const left = exposedBackend(proof.leftEye && proof.leftEye.backend);
-    const right = exposedBackend(proof.rightEye && proof.rightEye.backend);
-    if (left && left === right) return left;
-    const dispatch = waiter.status && waiter.status.fsrDispatch;
-    return exposedBackend(dispatch && dispatch.actualDispatchBackend) ||
-        "not_exposed";
+    const direct = accept(proof.backend, "terminal.presentationProof.backend");
+    if (direct) return { ...direct, rejected };
+    const leftValue = proof.leftEye && proof.leftEye.backend;
+    const rightValue = proof.rightEye && proof.rightEye.backend;
+    const left = accept(leftValue, "terminal.presentationProof.leftEye.backend");
+    const right = accept(rightValue, "terminal.presentationProof.rightEye.backend");
+    if (left && right && left.value === right.value) {
+        return { value: left.value, source: "terminal.presentationProof.eyes",
+            rejected };
+    }
+    if (left && right && left.value !== right.value) {
+        rejected.push({ source: "terminal.presentationProof.eyes",
+            value: [left.value, right.value], reason: "backend_eye_mismatch" });
+    }
+    if (target.method === "fsr") {
+        const dispatch = waiter.status && waiter.status.fsrDispatch;
+        const candidate = accept(dispatch && dispatch.actualDispatchBackend,
+            "status.fsrDispatch.actualDispatchBackend");
+        if (candidate) return { ...candidate, rejected };
+    }
+    return { value: "not_exposed", source: "none", rejected };
+}
+
+function traceLifecycleEvidence(retained, buildId, requireDispatch) {
+    const reasons = [];
+    const names = [["traceReset", "dlss_trace_reset"],
+        ["traceStart", "dlss_trace_start"],
+        ["traceStop", "dlss_trace_stop"],
+        ["traceRead", "dlss_trace_read"]];
+    for (const [name, action] of names) {
+        const value = retained[name];
+        if (!value || value.action !== action || value.ok === false ||
+            value.isError === true) {
+            reasons.push(`${name}_invalid`);
+        }
+        if (!value || !value.producer || value.producer.buildId !== buildId) {
+            reasons.push(`${name}_build_mismatch`);
+        }
+    }
+    const summaries = names.map(([name]) => retained[name] &&
+        retained[name].capture && (retained[name].capture.summary ||
+            retained[name].capture));
+    const sessions = summaries.map((summary) => summary && summary.sessionID);
+    if (sessions.some((value) => !Number.isSafeInteger(value) || value < 1) ||
+        unique(sessions).length !== 1) {
+        reasons.push("trace_session_identity_invalid");
+    }
+    if (!summaries[0] || summaries[0].active !== false ||
+        !summaries[1] || summaries[1].active !== true ||
+        !summaries[2] || summaries[2].active !== false ||
+        !summaries[3] || summaries[3].active !== false) {
+        reasons.push("trace_lifecycle_state_invalid");
+    }
+    const read = retained.traceRead;
+    if (read && read.capture && Number.isSafeInteger(sessions[3]) &&
+        sessions[3] > 0) {
+        try {
+            const checked = validateTracePage(read, {
+                buildId,
+                sessionId: sessions[3],
+                afterSequence: 0,
+                maximum: 256,
+            });
+            if (checked.page.capture.moreAvailable !== false) {
+                reasons.push("trace_page_nonterminal");
+            }
+        } catch (error) {
+            reasons.push(error.message);
+        }
+    } else {
+        reasons.push("trace_read_capture_missing");
+    }
+    const summary = summaries[3] || {};
+    const records = read && read.capture && read.capture.records;
+    if (requireDispatch && (!Number.isSafeInteger(summary.totalRecords) ||
+        summary.totalRecords < 1 || !Number.isSafeInteger(summary.setConstantsCalls) ||
+        summary.setConstantsCalls < 1 || !Number.isSafeInteger(summary.evaluateCalls) ||
+        summary.evaluateCalls < 1 || !Array.isArray(records) || records.length < 1)) {
+        reasons.push("trace_dispatch_evidence_missing");
+    }
+    if (!requireDispatch && (summary.totalRecords !== 0 ||
+        summary.setConstantsCalls !== 0 || summary.evaluateCalls !== 0 ||
+        !Array.isArray(records) || records.length !== 0)) {
+        reasons.push("trace_capability_window_not_empty");
+    }
+    return { complete: unique(reasons).length === 0,
+        reasons: unique(reasons), sessionId: sessions[3] || null };
 }
 
 function transitionRow(root, file, retained) {
@@ -697,14 +898,18 @@ function transitionRow(root, file, retained) {
     const stretch = presentationStretchDetails(waiter, projection, renderVerdict);
     const traceRequired = retained.variant === "nvidia" &&
         target.method === "dlss";
-    const traceComplete = !traceRequired || ["traceReset", "traceStart", "traceStop",
-        "traceRead"].every((name) => retained[name]);
+    const traceValidation = traceRequired ? traceLifecycleEvidence(retained,
+        waiter.producer && waiter.producer.buildId, true) :
+        { complete: true, reasons: [], sessionId: null };
+    const backend = actualBackendEvidence(waiter, target);
     const recovery = retained.recovery || null;
     return {
         ...identity,
         target,
         source: sourceProfile(waiter),
-        actualBackend: actualBackend(waiter, target),
+        actualBackend: backend.value,
+        actualBackendSource: backend.source,
+        actualBackendRejectedEvidence: backend.rejected,
         renderVerdict,
         task2Verdict: task2.verdict,
         task2MissingEvidence: task2.missingEvidence,
@@ -727,6 +932,8 @@ function transitionRow(root, file, retained) {
         finalQuality: profile.quality,
         finalRenderScaleMode: profile.renderScaleMode,
         finalStateRevision: profile.stateRevision,
+        finalProfileComplete: profile.complete,
+        finalProfileMissing: profile.missing,
         nonStableNote: projection.nonStableNote || null,
         presentationStretchSelected: stretch.selected,
         presentationStretchConsecutiveFrames: stretch.consecutiveFrames,
@@ -734,7 +941,9 @@ function transitionRow(root, file, retained) {
         presentationStretchRecoveryFrame: stretch.recoveryFrame,
         presentationStretchRecoveryElapsedMs: stretch.recoveryElapsedMs,
         traceRequired,
-        traceComplete,
+        traceComplete: traceValidation.complete,
+        traceValidationReasons: traceValidation.reasons,
+        traceSessionId: traceValidation.sessionId,
         recoveryStatus: recovery ? recovery.status || "not_exposed" : "not_needed",
         recoveryTarget: recovery ? recovery.target || null : null,
         recoveryReceiptKey: retained.recoveryReceiptKey ||
@@ -761,7 +970,8 @@ function csvCell(value) {
 function csv(rows) {
     const columns = [
         "lane", "pass", "ordinal", "method", "quality_mode", "render_scale_mode",
-        "actual_backend", "render_verdict", "stability_status",
+        "actual_backend", "actual_backend_source",
+        "actual_backend_rejected_evidence", "render_verdict", "stability_status",
         "stability_presentation_disposition",
         "stability_left_eye_path", "stability_right_eye_path",
         "stability_controller_state", "stability_presentation_phase",
@@ -773,8 +983,10 @@ function csv(rows) {
         "audit_storage_complete", "owner_correlated_audit_observed",
         "transition_evidence_complete",
         "physical_mutation_started", "final_method", "final_quality",
-        "final_render_scale_mode", "final_state_revision", "trace_required",
-        "trace_complete", "recovery_status", "recovery_target",
+        "final_render_scale_mode", "final_state_revision", "final_profile_complete",
+        "final_profile_missing", "trace_required", "trace_complete",
+        "trace_validation_reasons", "trace_session_id",
+        "recovery_status", "recovery_target",
         "recovery_receipt_key", "source_recovery_receipt_key",
         "presentation_stretch_selected",
         "presentation_stretch_consecutive_frames",
@@ -799,6 +1011,7 @@ function csv(rows) {
         const note = row.nonStableNote;
         const values = [row.lane, row.pass, row.ordinal, row.target.method,
             row.target.qualityMode, row.target.renderScaleMode, row.actualBackend,
+            row.actualBackendSource, row.actualBackendRejectedEvidence,
             row.renderVerdict,
             note ? note.status : "stable",
             note ? note.presentationDisposition : "n/a",
@@ -816,7 +1029,9 @@ function csv(rows) {
             row.ownerCorrelatedAuditObserved, row.transitionEvidenceComplete,
             row.physicalMutationStarted,
             row.finalMethod, row.finalQuality, row.finalRenderScaleMode,
-            row.finalStateRevision, row.traceRequired, row.traceComplete,
+            row.finalStateRevision, row.finalProfileComplete,
+            row.finalProfileMissing, row.traceRequired, row.traceComplete,
+            row.traceValidationReasons, row.traceSessionId,
             row.recoveryStatus, row.recoveryTarget, row.recoveryReceiptKey,
             row.sourceRecoveryReceiptKey,
             row.presentationStretchSelected,
@@ -1000,14 +1215,22 @@ function finalizeEvidence(options) {
     const interruptedPass = interrupted && interrupted.lanes && interrupted.lanes
         .flatMap((lane) => lane.passes || [])
         .find((pass) => pass.status === "INTERRUPTED");
-    const expectedRows = options.expectedRows ??
+    const declaredExpectedRows = options.expectedRows ??
         (existing.assayExecution &&
             existing.assayExecution.expectedTerminalReceipts) ??
-        (existing.counts && existing.counts.transitionsExpected) ?? rows.length;
-    if (!Number.isSafeInteger(expectedRows) || expectedRows < rows.length ||
-        expectedRows < 1) {
+        (existing.counts && existing.counts.transitionsExpected) ?? null;
+    if (declaredExpectedRows !== null &&
+        (!Number.isSafeInteger(declaredExpectedRows) ||
+            declaredExpectedRows < rows.length || declaredExpectedRows < 1)) {
         throw new Error("invalid_expected_terminal_receipts");
     }
+    const expectedRows = declaredExpectedRows ?? "not_exposed";
+    const rowKeys = rows.map((row) =>
+        `${row.lane || "default"}|${row.pass}|${row.ordinal}`);
+    const duplicateRowIdentities = unique(rowKeys.filter((key, index) =>
+        rowKeys.indexOf(key) !== index));
+    const executionScopeComplete = declaredExpectedRows !== null &&
+        duplicateRowIdentities.length === 0;
     const baselineOnlyInterrupted = rows.length === 0;
     if (baselineOnlyInterrupted) {
         validateBaselineOnlyInterruption(root, variant, runIds[0], buildIds[0]);
@@ -1029,7 +1252,8 @@ function finalizeEvidence(options) {
         }
     }
     const assayStatus = interrupted ? "INTERRUPTED" :
-        rows.length === expectedRows ? "COMPLETE" : "INCOMPLETE";
+        executionScopeComplete && rows.length === declaredExpectedRows ?
+            "COMPLETE" : "INCOMPLETE";
     const renderVerdict = aggregateVerdict(rows.map((row) => row.renderVerdict));
     const task2Counts = verdictCounts(rows.map((row) => row.task2Verdict));
     const nonStableTransitions = rows.filter((row) => row.nonStableNote).map((row) => ({
@@ -1040,6 +1264,12 @@ function finalizeEvidence(options) {
     }));
     const reportingReasons = [];
     if (assayStatus !== "COMPLETE") reportingReasons.push("terminal_receipts_incomplete");
+    if (declaredExpectedRows === null) {
+        reportingReasons.push("execution_scope_missing");
+    }
+    if (duplicateRowIdentities.length > 0) {
+        reportingReasons.push("duplicate_transition_identity");
+    }
     if (baselineOnlyInterrupted) reportingReasons.push("baseline_only_interrupted");
     if (interrupted && !baselineOnlyInterrupted) {
         reportingReasons.push("assay_interrupted");
@@ -1048,11 +1278,13 @@ function finalizeEvidence(options) {
         reportingReasons.push("required_trace_evidence_incomplete");
     }
     if (rows.some((row) => row.renderVerdict === "PASS" &&
-        row.actualBackend === "not_exposed")) {
+        (row.actualBackend === "not_exposed" || !row.finalProfileComplete))) {
         reportingReasons.push("reporting_contract_incomplete");
     }
-    if (variant === "amd" && (!liveResult || !liveResult.traceCapability ||
-        liveResult.traceCapability.status !== "supported")) {
+    const amdTraceEvidence = variant === "amd" ?
+        amdTraceCapabilityEvidence(root, liveResult, buildIds[0]) :
+        { complete: true, reasons: [] };
+    if (variant === "amd" && !amdTraceEvidence.complete) {
         reportingReasons.push("amd_trace_capability_evidence_incomplete");
     }
     const deployment = deploymentVerification(root, buildIds[0], options);
@@ -1079,6 +1311,17 @@ function finalizeEvidence(options) {
             expectedTerminalReceipts: expectedRows,
             transitionsDispatched: rows.length,
             expectedTransitions: expectedRows,
+            executionScope: {
+                complete: executionScopeComplete,
+                source: options.expectedRows !== undefined ? "argument" :
+                    existing.assayExecution &&
+                        existing.assayExecution.expectedTerminalReceipts !== undefined ?
+                        "retained_assay_execution" :
+                        existing.counts &&
+                            existing.counts.transitionsExpected !== undefined ?
+                            "retained_counts" : "missing",
+                duplicateRowIdentities,
+            },
             interruption: interrupted ? {
                 error: interrupted.error || interruptedPass &&
                     interruptedPass.error || null,
@@ -1099,6 +1342,8 @@ function finalizeEvidence(options) {
         traceCapability: variant === "amd" ?
             liveResult && liveResult.traceCapability || { status: "missing" } :
             { status: "not_applicable" },
+        traceCapabilityEvidence: variant === "amd" ? amdTraceEvidence :
+            { complete: true, reasons: [], status: "not_applicable" },
         deploymentVerification: deployment,
         memoryConfirmation: baselineOnlyInterrupted ?
             baselineOnlyMemoryConfirmation() : existing.memoryConfirmation,

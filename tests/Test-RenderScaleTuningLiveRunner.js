@@ -142,30 +142,45 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
         if (args.action === "cpu_performance_stop") cpuActive = false;
         if (args.action === "gpu_performance_stop") gpuActive = false;
         if (args.action === "dlss_trace_status") {
-            return { action: args.action, capture: traceSummary() };
+            return { action: args.action, producer: { buildId },
+                capture: traceSummary() };
         }
         if (args.action === "dlss_trace_reset") {
             traceSession += 1;
             traceActive = false;
             traceRecords = [];
-            return { action: args.action, capture: traceSummary() };
+            return { action: args.action, producer: { buildId },
+                capture: traceSummary() };
         }
         if (args.action === "dlss_trace_start") {
             traceActive = true;
-            return { action: args.action, capture: traceSummary() };
+            return { action: args.action, producer: { buildId },
+                capture: traceSummary() };
         }
         if (args.action === "dlss_trace_stop") {
             traceActive = false;
-            return { action: args.action, capture: traceSummary() };
+            return { action: args.action, producer: { buildId },
+                capture: traceSummary() };
         }
         if (args.action === "dlss_trace_read") {
             return {
                 action: args.action,
+                producer: { buildId },
                 capture: {
                     summary: traceSummary(),
                     records: traceRecords,
                     afterSequence: args.afterSequence,
                     limit: args.limit,
+                    availableFromSequence: traceRecords.length > 0 ? 1 : 0,
+                    latestSequence: traceRecords.length > 0 ?
+                        (traceRecords[traceRecords.length - 1].sequence ??
+                            traceRecords[traceRecords.length - 1].current.sequence) : 0,
+                    lastReturnedSequence: traceRecords.length > 0 ?
+                        (traceRecords[traceRecords.length - 1].sequence ??
+                            traceRecords[traceRecords.length - 1].current.sequence) :
+                        args.afterSequence,
+                    moreAvailable: false,
+                    requestedSequenceOverwritten: false,
                 },
             };
         }
@@ -572,7 +587,8 @@ async function testNvidia() {
         positioningRoot: positioningRoot(),
         matrix,
     });
-    assert(result.ok === true && result.status === "COMPLETE", "NVIDIA mock run did not complete.");
+    assert(result.ok === true && result.status === "COMPLETE",
+        `NVIDIA mock run did not complete: ${JSON.stringify(result)}`);
     assertQualificationTimeouts(mock.scenarioCalls, matrix, "NVIDIA");
     assertProviderTargetSeparation(mock.scenarioCalls, "NVIDIA");
     assertFoveationTargetScope(mock.scenarioCalls, "NVIDIA");
@@ -1063,6 +1079,118 @@ async function testMalformedMeasuredStressOwnershipIsRetained() {
     const retained = mock.stores.get("malformed-measured-stress-owner:live-result");
     assert(retained && retained.lanes[0].passes[0].failure === failure,
         "Malformed measured-stress ownership evidence was not retained.");
+}
+
+async function testBaselineOwnerAdmissionRejectsAmbiguity() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const cases = [
+        ["missing-session", (start) => { delete start.status.session; }],
+        ["string-id", (start) => { start.status.session.id = "1"; }],
+        ["inactive", (start) => { start.status.session.active = false; }],
+        ["mismatched-id", (start) => { start.status.session.id += 100; }],
+    ];
+    for (const [name, mutate] of cases) {
+        let changed = false;
+        const mock = createMock(0, null, (root) => {
+            const start = root.results.find((entry) =>
+                entry.label === "baseline-stress-start");
+            if (start && !changed) {
+                changed = true;
+                mutate(start.result);
+            }
+            return root;
+        });
+        const result = await runRenderScaleTuningLive({
+            ...mock.context,
+            variant: "nvidia",
+            runId: `baseline-owner-${name}`,
+            buildId,
+            positioningRoot: positioningRoot(),
+            matrix,
+        });
+        const pass = result.lanes[0].passes[0];
+        assert(result.status === "INTERRUPTED" &&
+            pass.error === "baseline_owner_identity_unproven" &&
+            pass.failure && pass.failure.ownership &&
+            pass.failure.handoffDecision === "REFUSED" &&
+            !mock.scenarioCalls.some((call) => call.steps.some((step) =>
+                step.label === "measured-stress-start")),
+        `Ambiguous baseline ownership '${name}' entered measured handoff.`);
+        assert(pass.cleanup && pass.cleanup.status === "UNRESOLVED" &&
+            pass.cleanup.reason === "cleanup_stress_owner_mismatch",
+        `Ambiguous baseline ownership '${name}' lost cleanup disposition.`);
+    }
+}
+
+async function testFailedHandoffRetainsAndCleansMeasuredOwner() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    let injected = false;
+    const mock = createMock(0, null, (root) => {
+        if (injected || !root.results.some((entry) =>
+            entry.label === "measured-stress-start")) return root;
+        injected = true;
+        const results = root.results.slice(0, 3);
+        results[2] = { label: "texture-lifetime-reset", ok: false,
+            error: "synthetic_post_start_failure",
+            result: { ok: false, error: "synthetic_post_start_failure" } };
+        return { ...root, ok: false, aborted: true, stepsRun: 3, results };
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "nvidia",
+        runId: "measured-owner-partial-handoff",
+        buildId,
+        positioningRoot: positioningRoot(),
+        matrix,
+    });
+    const pass = result.lanes[0].passes[0];
+    assert(pass.error === "measured_owner_handoff_failed" &&
+        pass.failure && pass.failure.ownership &&
+        pass.failure.ownership.reason ===
+            "handoff_step_failed_after_measured_start" &&
+        pass.cleanup && pass.cleanup.status === "CONFIRMED_INACTIVE" &&
+        pass.ownership.measured && pass.ownership.measured.active === false,
+    "A measured owner created before handoff failure was not recovered.");
+}
+
+async function testCleanupPostconditionsRemainAuthoritative() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    let cleanupRan = false;
+    let injected = false;
+    const mock = createMock(0, null, (root, args) => {
+        if (args.steps.some((step) => step.label === "profiler-disable")) {
+            cleanupRan = true;
+            return root;
+        }
+        if (cleanupRan && !injected && args.steps.some((step) =>
+            step.label === "render-status")) {
+            injected = true;
+            const render = root.results.find((entry) =>
+                entry.label === "render-status");
+            render.result.status.session.active = true;
+        }
+        return root;
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "nvidia",
+        runId: "cleanup-postcondition",
+        buildId,
+        positioningRoot: positioningRoot(),
+        matrix,
+    });
+    const pass = result.lanes[0].passes[0];
+    assert(pass.status === "INTERRUPTED" &&
+        pass.error === "cleanup_postcondition_active" &&
+        pass.cleanup && pass.cleanup.status === "UNRESOLVED" &&
+        pass.cleanup.reason === "cleanup_postcondition_active",
+    "An active post-cleanup owner was reported as a completed pass.");
 }
 
 async function testUnsafeTransitionRestoresBaselineAndContinues() {
@@ -2113,6 +2241,9 @@ Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
     testOptionalTerminalFacts(), testSafeUnstableBaselineContinues(),
     testFlatTerminalBoundary(), testPositionRenderScaleAdapterAdmission(),
     testMalformedMeasuredStressOwnershipIsRetained(),
+    testBaselineOwnerAdmissionRejectsAmbiguity(),
+    testFailedHandoffRetainsAndCleansMeasuredOwner(),
+    testCleanupPostconditionsRemainAuthoritative(),
     testUnsafeTransitionRestoresBaselineAndContinues(),
     testAmdUnsafeTransitionUsesLaneBaseline(),
     testFailedRecoveryStopsLaterTransitions(),

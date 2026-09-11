@@ -32,8 +32,35 @@ function tracePage(buildId, sessionId, afterSequence, records, moreAvailable,
             moreAvailable,
             requestedSequenceOverwritten: false,
             records,
-            summary: { sessionID: sessionId },
+            summary: {
+                sessionID: sessionId,
+                active: false,
+                totalRecords: records.length,
+                setConstantsCalls: records.length > 0 ? 1 : 0,
+                evaluateCalls: records.length > 0 ? 1 : 0,
+            },
         },
+    };
+}
+
+function traceLifecycle(buildId, sessionId, traceRecords = []) {
+    const producer = { buildId };
+    const summary = (active) => ({
+        active,
+        sessionID: sessionId,
+        totalRecords: traceRecords.length,
+        setConstantsCalls: traceRecords.length > 0 ? 1 : 0,
+        evaluateCalls: traceRecords.length > 0 ? 1 : 0,
+    });
+    const read = tracePage(buildId, sessionId, 0, traceRecords, false, 16);
+    return {
+        traceReset: { action: "dlss_trace_reset", producer,
+            capture: summary(false) },
+        traceStart: { action: "dlss_trace_start", producer,
+            capture: summary(true) },
+        traceStop: { action: "dlss_trace_stop", producer,
+            capture: summary(false) },
+        traceRead: read,
     };
 }
 
@@ -307,6 +334,10 @@ function writeJson(file, value) {
     fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function readJson(file) {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
 function writeDeploymentVerification(root, buildId) {
     const retainedManifest = path.join(root, "raw", "startup",
         "deployment-manifest.json");
@@ -371,6 +402,22 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
             runId,
             traceCapability: { status: "supported" },
             lanes: [],
+        });
+        const lifecycle = traceLifecycle(buildId, 41, []);
+        writeJson(path.join(root, "raw", "amd-trace-capability.json"), {
+            ok: true,
+            aborted: false,
+            stepsRun: 4,
+            results: [
+                { label: "amd-dlss-trace-reset",
+                    result: lifecycle.traceReset },
+                { label: "amd-dlss-trace-start",
+                    result: lifecycle.traceStart },
+                { label: "amd-dlss-trace-stop",
+                    result: lifecycle.traceStop },
+                { label: "amd-dlss-trace-read",
+                    result: lifecycle.traceRead },
+            ],
         });
     }
     writeJson(path.join(root, "raw", "pass-1", "transitions", "01",
@@ -1017,6 +1064,202 @@ function testActualBackendProjection() {
     }
 }
 
+function testBackendContractRejectsCrossMethodEvidence() {
+    const root = createEvidenceRoot();
+    const file = path.join(root, "raw", "pass-1", "transitions",
+        "01", "retained.json");
+    const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+        buildId: "e".repeat(64), expectedRows: 2 };
+    try {
+        const receipt = readJson(file);
+        receipt.waiter.target = {
+            method: "dlss", qualityMode: 3, renderScaleMode: true,
+        };
+        receipt.waiter.replacementTimeline.terminal.presentationProof.backend =
+            "fsr_runtime";
+        receipt.waiter.replacementTimeline.terminal.presentationProof.leftEye.backend =
+            "fsr_host";
+        receipt.waiter.replacementTimeline.terminal.presentationProof.rightEye.backend =
+            "fsr_host";
+        receipt.waiter.status = { fsrDispatch: {
+            actualDispatchBackend: "fsr_runtime",
+        } };
+        writeJson(file, receipt);
+        let result = finalizeEvidence(options);
+        let row = result.summary.transitions[0];
+        assert(row.actualBackend === "not_exposed" &&
+            row.actualBackendRejectedEvidence.some((entry) =>
+                entry.reason === "backend_incompatible_with_target") &&
+            result.summary.reporting.status === "INCOMPLETE",
+        "DLSS borrowed cross-method FSR backend evidence.");
+
+        receipt.waiter.target = {
+            method: "fsr", qualityMode: 3, renderScaleMode: true,
+            fsrRuntime: "fsr3",
+        };
+        receipt.waiter.replacementTimeline.terminal.presentationProof.backend =
+            "dlss";
+        receipt.waiter.replacementTimeline.terminal.presentationProof.leftEye.backend =
+            "fsr_host";
+        receipt.waiter.replacementTimeline.terminal.presentationProof.rightEye.backend =
+            "fsr_host";
+        writeJson(file, receipt);
+        result = finalizeEvidence(options);
+        row = result.summary.transitions[0];
+        assert(row.actualBackend === "fsr_host" &&
+            row.actualBackendSource === "terminal.presentationProof.eyes" &&
+            row.actualBackendRejectedEvidence.some((entry) =>
+                entry.source === "terminal.presentationProof.backend"),
+        "Rejected higher-priority evidence hid a valid compatible backend.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testTraceLifecycleControlsCompleteness() {
+    const root = createEvidenceRoot();
+    const file = path.join(root, "raw", "pass-1", "transitions",
+        "01", "retained.json");
+    const options = { root, variant: "nvidia", runId: "nvidia-test-run",
+        buildId: "e".repeat(64), expectedRows: 2 };
+    try {
+        const receipt = readJson(file);
+        receipt.waiter.target = {
+            method: "dlss", qualityMode: 3, renderScaleMode: true,
+        };
+        receipt.waiter.replacementTimeline.terminal.presentationProof.backend =
+            "dlss";
+        Object.assign(receipt, traceLifecycle(
+            "e".repeat(64), 55, records(1, 2)));
+        writeJson(file, receipt);
+        let result = finalizeEvidence(options);
+        assert(result.summary.transitions[0].traceComplete === true,
+            "A valid retained trace lifecycle was rejected.");
+
+        receipt.traceRead.capture.moreAvailable = true;
+        writeJson(file, receipt);
+        result = finalizeEvidence(options);
+        assert(result.summary.transitions[0].traceComplete === false &&
+            result.summary.transitions[0].traceValidationReasons.includes(
+                "trace_page_nonterminal") &&
+            result.summary.reporting.reasons.includes(
+                "required_trace_evidence_incomplete"),
+        "A nonterminal retained trace page completed reporting.");
+
+        receipt.traceRead.capture.moreAvailable = false;
+        delete receipt.traceRead.capture.limit;
+        writeJson(file, receipt);
+        result = finalizeEvidence(options);
+        assert(result.summary.transitions[0].traceValidationReasons.includes(
+            "trace_page_limit_out_of_range"),
+        "Malformed trace paging metadata completed reporting.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testRawOwnerMismatchDowngradesProjectedPass() {
+    const root = createEvidenceRoot();
+    try {
+        const file = path.join(root, "raw", "pass-1", "transitions",
+            "02", "retained.json");
+        const receipt = readJson(file);
+        receipt.projection.task2Verdict = "PASS";
+        receipt.projection.evidenceVerdict = "PASS";
+        receipt.projection.phaseCountersAuthoritative = true;
+        receipt.projection.producerInvalidEvidence = [];
+        receipt.waiter.presentationCycleAudit.ownerTransitionId = 999;
+        writeJson(file, receipt);
+        const result = finalizeEvidence({ root, variant: "nvidia",
+            runId: "nvidia-test-run", buildId: "e".repeat(64),
+            expectedRows: 2 });
+        const row = result.summary.transitions[1];
+        assert(row.task2Verdict === "INCONCLUSIVE" &&
+            row.phaseCountersAuthoritative === false &&
+            row.phaseCounterAuthorityStatus === "MISMATCHED" &&
+            row.phaseCounterAuthorityReasons.includes(
+                "audit_transition_owner_mismatch"),
+        "Raw owner mismatch did not overrule a stale projected PASS.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
+function testFinalProfileAndExecutionScopeGateCompletion() {
+    const missingProfile = createEvidenceRoot();
+    try {
+        const file = path.join(missingProfile, "raw", "pass-1", "transitions",
+            "01", "retained.json");
+        const receipt = readJson(file);
+        delete receipt.waiter.upscalingSnapshot.stateRevision;
+        writeJson(file, receipt);
+        const result = finalizeEvidence({ root: missingProfile,
+            variant: "nvidia", runId: "nvidia-test-run",
+            buildId: "e".repeat(64), expectedRows: 2 });
+        assert(result.summary.transitions[0].finalStateRevision ===
+            "not_exposed" &&
+            result.summary.transitions[0].finalProfileComplete === false &&
+            result.summary.reporting.reasons.includes(
+                "reporting_contract_incomplete"),
+        "Missing authoritative final profile state completed reporting.");
+    } finally {
+        fs.rmSync(missingProfile, { recursive: true, force: true });
+    }
+
+    const missingScope = createEvidenceRoot();
+    try {
+        const result = finalizeEvidence({ root: missingScope,
+            variant: "nvidia", runId: "nvidia-test-run",
+            buildId: "e".repeat(64) });
+        assert(result.summary.assayExecution.status === "INCOMPLETE" &&
+            result.summary.assayExecution.expectedTransitions ===
+                "not_exposed" &&
+            result.summary.reporting.reasons.includes("execution_scope_missing"),
+        "Observed receipts defined their own completion target.");
+    } finally {
+        fs.rmSync(missingScope, { recursive: true, force: true });
+    }
+
+    const duplicateScope = createEvidenceRoot();
+    try {
+        const source = path.join(duplicateScope, "raw", "pass-1",
+            "transitions", "01", "retained.json");
+        writeJson(path.join(duplicateScope, "raw", "pass-1", "transitions",
+            "1", "retained.json"), readJson(source));
+        const result = finalizeEvidence({ root: duplicateScope,
+            variant: "nvidia", runId: "nvidia-test-run",
+            buildId: "e".repeat(64), expectedRows: 3 });
+        assert(result.summary.assayExecution.status === "INCOMPLETE" &&
+            result.summary.assayExecution.executionScope
+                .duplicateRowIdentities.length === 1 &&
+            result.summary.reporting.reasons.includes(
+                "duplicate_transition_identity"),
+        "Duplicate logical rows satisfied the explicit receipt count.");
+    } finally {
+        fs.rmSync(duplicateScope, { recursive: true, force: true });
+    }
+}
+
+function testAmdSupportedClaimRequiresRetainedLifecycle() {
+    const root = createEvidenceRoot("amd");
+    try {
+        let result = finalizeEvidence({ root, variant: "amd",
+            runId: "amd-test-run", buildId: "e".repeat(64), expectedRows: 2 });
+        assert(result.summary.traceCapabilityEvidence.complete === true,
+            "Valid AMD capability lifecycle evidence was rejected.");
+        fs.unlinkSync(path.join(root, "raw", "amd-trace-capability.json"));
+        result = finalizeEvidence({ root, variant: "amd",
+            runId: "amd-test-run", buildId: "e".repeat(64), expectedRows: 2 });
+        assert(result.summary.traceCapability.status === "supported" &&
+            result.summary.traceCapabilityEvidence.complete === false &&
+            result.summary.reporting.reasons.includes(
+                "amd_trace_capability_evidence_incomplete"),
+        "An AMD supported label completed without retained lifecycle evidence.");
+    } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+}
+
 Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testPagingResume).then(testDeploymentVerification)
     .then(testOfflineFinalization)
@@ -1030,6 +1273,11 @@ Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testValidationLeavesEvidenceUntouched)
     .then(testVariantAndSourceProfileValidation)
     .then(testActualBackendProjection)
+    .then(testBackendContractRejectsCrossMethodEvidence)
+    .then(testTraceLifecycleControlsCompleteness)
+    .then(testRawOwnerMismatchDowngradesProjectedPass)
+    .then(testFinalProfileAndExecutionScopeGateCompletion)
+    .then(testAmdSupportedClaimRequiresRetainedLifecycle)
     .then(testUnsafeEvidenceNumberFailsClosed).then(() => {
         process.stdout.write("Render-scale tuning finalizer tests passed.\n");
     }).catch((error) => {

@@ -26,6 +26,11 @@ async function runRenderScaleTuningLive(context) {
         store(key, summary);
     }
 
+    function unique(values) {
+        return [...new Set(values.filter((value) => value !== null &&
+            value !== undefined && value !== ""))];
+    }
+
     const quality = Object.freeze({
         native_aa: 0,
         hoshipa: 1,
@@ -1373,7 +1378,43 @@ async function runRenderScaleTuningLive(context) {
         };
     }
 
-    async function baseline(boundary, lane, laneIndex, pass) {
+    function sessionSnapshot(value) {
+        const session = value && value.status && value.status.session;
+        return {
+            present: Boolean(session && typeof session === "object"),
+            id: session && Object.hasOwn(session, "id") ? session.id : null,
+            active: session && typeof session.active === "boolean" ?
+                session.active : null,
+        };
+    }
+
+    function baselineOwnership(start, waiter) {
+        const started = sessionSnapshot(start);
+        const waiterId = waiter && waiter.baseline &&
+            waiter.baseline.stressSessionId;
+        const reasons = [];
+        if (!started.present) reasons.push("start_session_missing");
+        if (!Number.isSafeInteger(started.id) || started.id < 1) {
+            reasons.push("start_session_id_invalid");
+        }
+        if (started.active !== true) reasons.push("start_session_not_active");
+        if (!Number.isSafeInteger(waiterId) || waiterId < 1) {
+            reasons.push("waiter_session_id_invalid");
+        }
+        if (Number.isSafeInteger(started.id) && Number.isSafeInteger(waiterId) &&
+            started.id !== waiterId) {
+            reasons.push("baseline_session_id_mismatch");
+        }
+        return {
+            status: reasons.length === 0 ? "MATCHED_ACTIVE" : "UNPROVEN",
+            startSessionId: started.id,
+            waiterSessionId: waiterId ?? null,
+            startActive: started.active,
+            reasons,
+        };
+    }
+
+    async function baseline(boundary, lane, laneIndex, pass, ownerState) {
         const target = targetFor(
             boundary, matrix.destinations[matrix.initialDestination], lane.configuredFsrRuntime);
         const identifiers = ids(laneIndex, pass, 0, true);
@@ -1390,37 +1431,50 @@ async function runRenderScaleTuningLive(context) {
                 throw diagnosticError("baseline_receipt_unavailable",
                     scenarioFailure && scenarioFailure.diagnostic || null);
             }
-            const stressSessionId = waiter.baseline && waiter.baseline.stressSessionId;
             if (!safeTerminal(waiter, identifiers) || !waiter.milestoneTimings ||
                 !waiter.replacementTimeline) {
                 throw diagnosticError("baseline_failed",
                     scenarioFailure && scenarioFailure.diagnostic || null);
             }
-            return { boundary: terminalBoundary(waiter), stressSessionId, waiter,
-                nonStableNote: nonStableNote(waiter) };
+            const ownership = baselineOwnership(null, waiter);
+            ownerState.baseline = { ...ownership, active: true, proven: false };
+            throw diagnosticError("baseline_owner_identity_unproven", {
+                phase: "ownership",
+                receiptKey,
+                scenario: scenarioFailure && scenarioFailure.diagnostic || null,
+                ownership,
+                handoffDecision: "REFUSED",
+                cleanupDisposition: "PENDING_RECONCILIATION",
+            });
         }
         const entries = resultMap(response.root);
         const start = entries.get("baseline-stress-start");
-        const stressSessionId = start && start.status && start.status.session.id;
         const waiter = entries.get("qualification-wait");
+        const ownership = baselineOwnership(start, waiter);
+        ownerState.baseline = {
+            ...ownership,
+            active: ownership.startActive === true,
+            proven: ownership.status === "MATCHED_ACTIVE",
+        };
         if (!response.root.ok || !waiter || !safeTerminal(waiter, identifiers) ||
             !waiter.milestoneTimings ||
-            !waiter.replacementTimeline) {
+            !waiter.replacementTimeline || ownership.status !== "MATCHED_ACTIVE") {
             await closeOpenQualification(identifiers);
-            if (stressSessionId) {
-                await renderScale({
-                    action: "stop", expectedSessionId: stressSessionId,
-                    expectedBuildId: buildId,
-                });
-            }
-            throw diagnosticError("baseline_failed",
-                scenarioDiagnostic(response.root, steps, receiptKey));
+            const diagnostic = scenarioDiagnostic(response.root, steps, receiptKey,
+                ownership.status === "MATCHED_ACTIVE" ? "response" : "ownership");
+            diagnostic.ownership = ownership;
+            diagnostic.handoffDecision = "REFUSED";
+            diagnostic.cleanupDisposition = "PENDING_RECONCILIATION";
+            throw diagnosticError(ownership.status === "MATCHED_ACTIVE" ?
+                "baseline_failed" : "baseline_owner_identity_unproven", diagnostic);
         }
-        return { boundary: terminalBoundary(waiter), stressSessionId, waiter,
+        return { boundary: terminalBoundary(waiter),
+            stressSessionId: ownership.startSessionId, waiter, ownership,
             nonStableNote: nonStableNote(waiter) };
     }
 
-    async function armOwners(baselineResult, lane, laneIndex, pass, resetPerformance) {
+    async function armOwners(baselineResult, lane, laneIndex, pass,
+        resetPerformance, ownerState) {
         const stem = `${runId}-${variant}-${laneIndex}-${pass}`;
         const receiptKey = `${runId}:${lane.id}:pass-${pass}:handoff`;
         const steps = [
@@ -1461,26 +1515,54 @@ async function runRenderScaleTuningLive(context) {
             expectedBuildId: buildId,
         }));
         const response = await scenario(steps, receiptKey);
-        const entries = requireScenario(response.root, steps, receiptKey);
+        const entries = resultMap(response.root);
+        const baselineStop = sessionSnapshot(entries.get("baseline-stress-stop"));
         const start = entries.get("measured-stress-start");
-        const session = start && start.status && start.status.session;
-        if (!session || session.active !== true ||
-            !Number.isSafeInteger(session.id) || session.id < 1) {
+        const measured = sessionSnapshot(start);
+        if (baselineStop.present && baselineStop.active === false &&
+            baselineStop.id === baselineResult.stressSessionId) {
+            ownerState.baseline.active = false;
+        }
+        if (measured.present && measured.active === true &&
+            Number.isSafeInteger(measured.id) && measured.id > 0) {
+            ownerState.measured = { sessionId: measured.id, active: true,
+                proven: true, source: "measured-stress-start" };
+        }
+        const ownership = {
+            status: "uncertain",
+            baselineSessionId: baselineResult.stressSessionId,
+            baselineStopSessionId: baselineStop.id,
+            baselineStopActive: baselineStop.active,
+            measuredSessionId: measured.id,
+            measuredActive: measured.active,
+            cleanupAttempted: false,
+        };
+        let scenarioError = null;
+        try {
+            requireScenario(response.root, steps, receiptKey);
+        } catch (error) {
+            scenarioError = error;
+        }
+        if (scenarioError || baselineStop.active !== false ||
+            baselineStop.id !== baselineResult.stressSessionId ||
+            !ownerState.measured) {
             const diagnostic = scenarioDiagnostic(
                 response.root, steps, receiptKey, "ownership");
-            diagnostic.ownership = {
-                status: "uncertain",
-                reason: "measured_stress_session_identity_missing",
-                cleanupAttempted: false,
-                baselineSessionId: baselineResult.stressSessionId,
-                reportedSessionId: session && session.id !== undefined ?
-                    session.id : null,
-            };
-            throw diagnosticError(
-                "measured_stress_session_identity_missing", diagnostic);
+            diagnostic.ownership = ownership;
+            diagnostic.ownership.reason = !ownerState.measured ?
+                "measured_stress_session_identity_missing" :
+                baselineStop.id !== baselineResult.stressSessionId ?
+                    "baseline_stop_owner_mismatch" :
+                    baselineStop.active !== false ?
+                        "baseline_stop_not_confirmed" :
+                        "handoff_step_failed_after_measured_start";
+            throw diagnosticError(!ownerState.measured ?
+                "measured_stress_session_identity_missing" :
+                scenarioError ? "measured_owner_handoff_failed" :
+                    "baseline_owner_stop_unconfirmed", diagnostic);
         }
-        const sessionId = session.id;
-        return sessionId;
+        ownerState.measured.source = "measured-stress-start";
+        return ownerState.measured.sessionId;
     }
 
     async function transition(boundary, lane, laneIndex, pass, row) {
@@ -1703,34 +1785,95 @@ async function runRenderScaleTuningLive(context) {
         return entries;
     }
 
-    async function cleanup(lane, pass, stressSessionId) {
+    function cleanupState(entries) {
+        const renderResult = entries && entries.get("render-status");
+        const render = renderResult && renderResult.status;
+        const session = render && render.session;
+        const cpuResult = entries && entries.get("cpu-status");
+        const gpuResult = entries && entries.get("gpu-status");
+        const textureResult = entries && entries.get("texture-status");
+        const cpu = cpuResult && cpuResult.cpuPerformance;
+        const gpu = gpuResult && gpuResult.capture;
+        const texture = textureResult && textureResult.capture;
+        const probe = render && render.loadPresentationProbe;
+        const missing = [];
+        if (!session || typeof session.active !== "boolean" ||
+            !Object.hasOwn(session, "id")) missing.push("render_session_status_missing");
+        if (!cpu || typeof cpu.active !== "boolean") {
+            missing.push("cpu_status_missing");
+        }
+        if (!gpu || typeof gpu.active !== "boolean") {
+            missing.push("gpu_status_missing");
+        }
+        if (!texture || typeof texture.active !== "boolean") {
+            missing.push("texture_status_missing");
+        }
+        if (!probe || typeof probe.active !== "boolean") {
+            missing.push("probe_status_missing");
+        }
+        return { render, session, cpu, gpu, texture, probe, missing };
+    }
+
+    async function cleanup(lane, pass, ownerState) {
         const before = await status(lane, pass, "final-status-before-cleanup");
-        const render = before.get("render-status").status;
-        const cpu = before.get("cpu-status").cpuPerformance;
-        const gpu = before.get("gpu-status").capture;
-        const texture = before.get("texture-status").capture;
+        const observed = cleanupState(before);
+        const receiptKey = `${runId}:${lane.id}:pass-${pass}:cleanup`;
+        const knownSessionIds = unique([
+            ownerState.baseline && ownerState.baseline.proven ?
+                ownerState.baseline.startSessionId : null,
+            ownerState.measured && ownerState.measured.proven ?
+                ownerState.measured.sessionId : null,
+        ]);
+        const evidence = {
+            status: "PENDING",
+            cleanupAttempted: false,
+            knownSessionIds,
+            before: {
+                stressSessionId: observed.session ? observed.session.id : null,
+                stressActive: observed.session ? observed.session.active : null,
+                cpuActive: observed.cpu ? observed.cpu.active : null,
+                gpuActive: observed.gpu ? observed.gpu.active : null,
+                textureActive: observed.texture ? observed.texture.active : null,
+                probeActive: observed.probe ? observed.probe.active : null,
+                missing: observed.missing,
+            },
+        };
+        if (observed.missing.length > 0) {
+            evidence.status = "UNRESOLVED";
+            evidence.reason = "cleanup_status_incomplete";
+            retain(`${receiptKey}:decision`, evidence);
+            throw diagnosticError("cleanup_status_incomplete", evidence);
+        }
+        if (observed.session.active === true &&
+            !knownSessionIds.includes(observed.session.id)) {
+            evidence.status = "UNRESOLVED";
+            evidence.reason = "cleanup_stress_owner_mismatch";
+            retain(`${receiptKey}:decision`, evidence);
+            throw diagnosticError("cleanup_stress_owner_mismatch", evidence);
+        }
         const steps = [];
-        if (render.session.active) {
+        if (observed.session.active) {
             steps.push(toolStep("measured-stress-stop", "communityshaders.renderscale", {
-                action: "stop", expectedSessionId: stressSessionId, expectedBuildId: buildId,
+                action: "stop", expectedSessionId: observed.session.id,
+                expectedBuildId: buildId,
             }));
         }
-        if (cpu.active) {
+        if (observed.cpu.active) {
             const args = { action: "cpu_performance_stop", expectedBuildId: buildId };
-            if (cpu.sessionId) args.expectedSessionId = cpu.sessionId;
+            if (observed.cpu.sessionId) args.expectedSessionId = observed.cpu.sessionId;
             steps.push(toolStep("cpu-performance-stop", "communityshaders.renderscale", args));
         }
-        if (gpu.active) {
+        if (observed.gpu.active) {
             steps.push(toolStep("gpu-performance-stop", "communityshaders.renderscale", {
                 action: "gpu_performance_stop", expectedBuildId: buildId,
             }));
         }
-        if (texture.active) {
+        if (observed.texture.active) {
             steps.push(toolStep("texture-lifetime-stop", "communityshaders.renderscale", {
                 action: "texture_lifetime_stop", expectedBuildId: buildId,
             }));
         }
-        if (render.loadPresentationProbe.active) {
+        if (observed.probe.active) {
             steps.push(toolStep("load-presentation-stop", "communityshaders.renderscale", {
                 action: "probe_stop", expectedBuildId: buildId,
             }));
@@ -1743,10 +1886,37 @@ async function runRenderScaleTuningLive(context) {
             enabled: false,
             expectedBuildId: buildId,
         }));
-        const receiptKey = `${runId}:${lane.id}:pass-${pass}:cleanup`;
+        evidence.cleanupAttempted = true;
         const response = await scenario(steps, receiptKey);
         requireScenario(response.root, steps, receiptKey);
-        await status(lane, pass, "final-status-after-cleanup");
+        const after = cleanupState(await status(
+            lane, pass, "final-status-after-cleanup"));
+        evidence.after = {
+            stressSessionId: after.session ? after.session.id : null,
+            stressActive: after.session ? after.session.active : null,
+            cpuActive: after.cpu ? after.cpu.active : null,
+            gpuActive: after.gpu ? after.gpu.active : null,
+            textureActive: after.texture ? after.texture.active : null,
+            probeActive: after.probe ? after.probe.active : null,
+            missing: after.missing,
+        };
+        const stillActive = after.missing.length > 0 ||
+            after.session.active !== false || after.cpu.active !== false ||
+            after.gpu.active !== false || after.texture.active !== false ||
+            after.probe.active !== false;
+        if (stillActive) {
+            evidence.status = "UNRESOLVED";
+            evidence.reason = after.missing.length > 0 ?
+                "cleanup_post_status_incomplete" : "cleanup_postcondition_active";
+            retain(`${receiptKey}:decision`, evidence);
+            throw diagnosticError(evidence.reason, evidence);
+        }
+        if (ownerState.baseline) ownerState.baseline.active = false;
+        if (ownerState.measured) ownerState.measured.active = false;
+        evidence.status = "CONFIRMED_INACTIVE";
+        evidence.reason = null;
+        retain(`${receiptKey}:decision`, evidence);
+        return evidence;
     }
 
     async function cooldown(lane, pass) {
@@ -1818,23 +1988,26 @@ async function runRenderScaleTuningLive(context) {
         if (!lane.runnable) continue;
         for (let pass = 1; pass <= 2; pass += 1) {
             passSequence += 1;
-            let stressSessionId = 0;
+            const ownerState = { baseline: null, measured: null };
+            let cleanupAttempted = false;
             const passSummary = { pass, status: "RUNNING", rows: [] };
             laneSummary.passes.push(passSummary);
             try {
-                const base = await baseline(boundary, lane, laneIndex + 1, pass);
+                const base = await baseline(
+                    boundary, lane, laneIndex + 1, pass, ownerState);
                 boundary = base.boundary;
                 passSummary.baseline = {
                     satisfied: base.waiter.satisfied === true,
                     outcome: base.waiter.outcome || null,
                     nonStableNote: base.nonStableNote,
+                    ownership: base.ownership,
                 };
                 if (base.nonStableNote) {
                     notify({ lane: lane.id, pass, phase: "baseline",
                         ...base.nonStableNote });
                 }
-                stressSessionId = await armOwners(
-                    base, lane, laneIndex + 1, pass, passSequence > 1);
+                await armOwners(base, lane, laneIndex + 1, pass,
+                    passSequence > 1, ownerState);
                 for (const row of matrix.transitions) {
                     const completed = await transition(
                         boundary, lane, laneIndex + 1, pass, row);
@@ -1848,13 +2021,32 @@ async function runRenderScaleTuningLive(context) {
                             completed.sourceRecoveryReceiptKey,
                     });
                 }
-                await cleanup(lane, pass, stressSessionId);
-                stressSessionId = 0;
+                cleanupAttempted = true;
+                passSummary.cleanup = await cleanup(lane, pass, ownerState);
+                passSummary.ownership = ownerState;
                 passSummary.status = "COMPLETE";
                 if (pass === 1) await cooldown(lane, pass);
             } catch (error) {
-                if (stressSessionId) {
-                    try { await cleanup(lane, pass, stressSessionId); } catch { }
+                let cleanupFailure = null;
+                if (!cleanupAttempted) {
+                    cleanupAttempted = true;
+                    try {
+                        passSummary.cleanup = await cleanup(
+                            lane, pass, ownerState);
+                    } catch (cleanupError) {
+                        cleanupFailure = cleanupError &&
+                            typeof cleanupError === "object" ?
+                            cleanupError.diagnostic || {
+                                status: "UNRESOLVED",
+                                reason: cleanupError.message || String(cleanupError),
+                            } : { status: "UNRESOLVED",
+                                reason: String(cleanupError) };
+                        passSummary.cleanup = cleanupFailure;
+                    }
+                } else if (error && typeof error === "object" &&
+                    error.diagnostic) {
+                    cleanupFailure = error.diagnostic;
+                    passSummary.cleanup = cleanupFailure;
                 }
                 summary.ok = false;
                 summary.status = "INTERRUPTED";
@@ -1862,8 +2054,14 @@ async function runRenderScaleTuningLive(context) {
                 passSummary.status = "INTERRUPTED";
                 passSummary.error = error instanceof Error ?
                     error.message : String(error);
-                passSummary.failure = error && typeof error === "object" &&
+                const originalFailure = error && typeof error === "object" &&
                     error.diagnostic ? error.diagnostic : null;
+                passSummary.failure = originalFailure && cleanupFailure &&
+                    cleanupFailure !== originalFailure ?
+                    { ...originalFailure, cleanup: cleanupFailure } :
+                    originalFailure || (cleanupFailure ?
+                        { cleanup: cleanupFailure } : null);
+                passSummary.ownership = ownerState;
                 retainLiveResult(summary);
                 return summary;
             }
