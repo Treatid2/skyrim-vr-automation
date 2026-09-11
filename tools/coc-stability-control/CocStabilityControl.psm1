@@ -170,23 +170,35 @@ function Get-CocMcpResultContent {
         throw "$Context returned no result."
     }
     $result = $json.result
+    if (-not $result.PSObject.Properties['content'] -or $null -eq $result.content) {
+        throw "$Context returned no content."
+    }
+    $rawContent = $result.content
+    if ($rawContent -is [string] -or $rawContent -is [Collections.IDictionary] -or
+        $rawContent -isnot [Collections.IList]) {
+        throw "$Context returned content that is not an array of content blocks."
+    }
+    $content = @($rawContent)
+    foreach ($block in $content) {
+        if ($null -eq $block -or -not $block.PSObject.Properties['type'] -or
+            [string]::IsNullOrWhiteSpace([string]$block.type)) {
+            throw "$Context returned a malformed content block."
+        }
+    }
     if ($result.PSObject.Properties['isError'] -and [bool]$result.isError) {
-        $messages = @(if ($result.PSObject.Properties['content']) {
-            $result.content | ForEach-Object {
+        $messages = @(
+            $content | ForEach-Object {
                     if ($null -ne $_ -and $_.PSObject.Properties['text']) {
                         [string]$_.text
                     }
                 }
-        })
+        )
         $detail = if ($messages.Count -gt 0) {
             $messages -join "`n"
         } else { 'unspecified error' }
         throw "$Context reported an error result: $detail"
     }
-    if (-not $result.PSObject.Properties['content'] -or $null -eq $result.content) {
-        throw "$Context returned no content."
-    }
-    return @($result.content)
+    return $content
 }
 
 function Get-CocHealthValue {

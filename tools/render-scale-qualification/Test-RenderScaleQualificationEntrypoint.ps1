@@ -4,6 +4,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $entrypoint = Join-Path $PSScriptRoot 'Start-CSXRenderScaleQualification.ps1'
+$runner = Join-Path $PSScriptRoot 'Invoke-CSXRenderScaleQualification.ps1'
 
 function Assert-EntrypointFailure {
     param(
@@ -32,10 +33,41 @@ Assert-EntrypointFailure -Arguments @{
 Assert-EntrypointFailure -Arguments @{ PrMode = $true } `
     -ExpectedError 'PR mode requires -BaselinePath and -ExpectedBaselineBuildId.'
 
+$runnerCommon = @{
+    EvidenceDirectory = Join-Path ([IO.Path]::GetTempPath()) "csx-runner-admission-$([guid]::NewGuid().ToString('N'))"
+    RuntimePath = 'C:\missing-runtime.json'
+    ExpectedBuildId = $buildId
+    GpuVendor = 'NVIDIA'
+    FixtureManifestPath = 'C:\missing-fixture.json'
+}
+foreach ($baselineArguments in @(
+    @{ BaselinePath = 'C:\baseline' },
+    @{ ExpectedBaselineBuildId = $buildId },
+    @{ BaselinePath = 'C:\baseline'; ExpectedBaselineBuildId = $buildId }
+)) {
+    $arguments = $runnerCommon.Clone()
+    foreach ($entry in $baselineArguments.GetEnumerator()) { $arguments[$entry.Key] = $entry.Value }
+    $runnerText = & $runner @arguments -NoExit -Compact | Out-String
+    $runnerResult = $runnerText | ConvertFrom-Json -Depth 20
+    if ($baselineError -notin @($runnerResult.errors)) {
+        throw "Direct runner did not enforce explicit PR-mode admission: $runnerText"
+    }
+}
+$incompletePrArguments = $runnerCommon.Clone()
+$incompletePrArguments.PrMode = $true
+$runnerText = & $runner @incompletePrArguments -NoExit -Compact | Out-String
+$runnerResult = $runnerText | ConvertFrom-Json -Depth 20
+if ('PR mode requires a matching baseline artifact and explicit baseline Build ID.' -notin @($runnerResult.errors)) {
+    throw "Direct runner did not reject incomplete PR-mode baseline admission: $runnerText"
+}
+
 $entrypointText = Get-Content -LiteralPath $entrypoint -Raw
 if ($entrypointText -notmatch 'AddSeconds\(600\)' -or
     $entrypointText -notmatch 'Invoke-BoundedQualificationScript -ScriptPath \$controller' -or
-    $entrypointText -notmatch 'Invoke-BoundedQualificationScript -ScriptPath \$runner') {
+    $entrypointText -notmatch 'Invoke-BoundedQualificationScript -ScriptPath \$runner' -or
+    $entrypointText -notmatch 'unresolvedProcess = \[bool\]' -or
+    $entrypointText -notmatch 'boundedProcess = \$boundedAttempt' -or
+    $entrypointText -notmatch 'state = \$\(if \(\$boundedChildLaunched\) \{ ''unknown'' \}') {
     throw 'Entrypoint does not apply one shared 600-second process deadline to controller and runner children.'
 }
 

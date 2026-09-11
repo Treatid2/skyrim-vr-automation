@@ -40,6 +40,12 @@ identity, transport retries, and terminal result. If the target exits during a
 synchronous call, the failed result returns `invocationEvidencePath` instead of
 discarding the last known request boundary. Without an explicit evidence
 directory these journals use the local Skyrim VR automation evidence root.
+Once a call has completed, a later journal-write failure never replaces its
+payload or semantic outcome. The returned result instead carries
+`evidenceWarnings` and `evidenceJournalFinalized: false`, alongside the final
+`sessionCleanup` receipt. If a requested tool is absent from the authoritative
+catalog, the controller reports `tool-unavailable` without dispatching it; a
+requested performance-neutrality boundary is still measured and retained.
 When available, add `buildId`, `artifactPath`/`dllPath`, and
 `artifactSha256` to runtime metadata (or pass their explicit parameter
 equivalents). The controller queries the CSX registry bridge and hashes the
@@ -179,7 +185,9 @@ It requires the exact `-ExpectedCell`, a loaded player, no blocking menu, and a
 CSX profile that remains unchanged across advancing frames. Its public API
 snapshot must share a state revision with the render-scale diagnostic snapshot,
 and the physical render-scale status must agree with the effective profile.
-Expected profiles use typed fields; JSON strings cannot stand in for booleans.
+Expected profiles and required physical-state telemetry use typed fields; JSON
+strings cannot stand in for booleans or integer counters, and missing negative
+state is never interpreted as inactive.
 The destination's
 requested settings determine the method, quality, and render-scale state; the
 barrier does not impose a profile. When render-scale is active it additionally

@@ -30,6 +30,9 @@ Exact targets are bound by PID and process start time. A replacement process is
 never accepted merely because Windows reused its numeric PID. Monitor, capture,
 and cancellation-helper children remain attributable across every return; a
 timed-out helper is reported as `cleanup-incomplete`, not as successful stop.
+That incomplete state remains eligible for exact PID/start-time status and a
+later authorized stop, so a surviving worker or ProcDump child is neither hidden
+nor broadened to numeric-PID ownership.
 
 `capture-complete` requires the exact nonempty dump plus its matching completion
 receipt and successful ProcDump exit record. Empty, unrelated, or unfinalized

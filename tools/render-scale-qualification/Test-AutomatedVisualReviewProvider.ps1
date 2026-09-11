@@ -12,6 +12,21 @@ function Assert-ProviderTest {
     if (-not $Condition) { throw $Message }
 }
 
+function New-ProviderCommandResult {
+    param(
+        [int]$ExitCode,
+        [AllowEmptyString()][string]$Stdout,
+        [AllowEmptyString()][string]$Stderr,
+        [bool]$TimedOut = $false
+    )
+
+    return [pscustomobject][ordered]@{
+        launched = $true; processId = 4101; exitCode = $ExitCode; stdout = $Stdout; stderr = $Stderr; timedOut = $TimedOut
+        setupError = $null; exitVerified = -not $TimedOut; terminationRequested = $TimedOut; terminationConfirmed = $TimedOut
+        unresolvedProcess = $false; streamDrainComplete = $true; inputCompleted = $true; terminationErrors = @()
+    }
+}
+
 function New-ProviderTestPasses {
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -76,13 +91,13 @@ Run Codex non-interactively
         param([string]$ExecutablePath, [string[]]$CommandArguments, [int]$TimeoutMilliseconds)
 
         if (($CommandArguments -join '|') -eq '--version') {
-            return [pscustomobject]@{ exitCode = 0; stdout = "codex-cli 9.8.7-test`n"; stderr = ''; timedOut = $false }
+            return New-ProviderCommandResult -ExitCode 0 -Stdout "codex-cli 9.8.7-test`n" -Stderr ''
         }
         if (($CommandArguments -join '|') -in @('--help', 'exec|--help')) {
-            return [pscustomobject]@{ exitCode = 0; stdout = $fakeHelp; stderr = ''; timedOut = $false }
+            return New-ProviderCommandResult -ExitCode 0 -Stdout $fakeHelp -Stderr ''
         }
         if ('--model' -in $CommandArguments) {
-            return [pscustomobject]@{ exitCode = 0; stdout = '{"type":"turn.completed"}'; stderr = ''; timedOut = $false }
+            return New-ProviderCommandResult -ExitCode 0 -Stdout '{"type":"turn.completed"}' -Stderr ''
         }
         throw "Unexpected preflight arguments: $($CommandArguments -join ' ')"
     }
@@ -98,9 +113,9 @@ Run Codex non-interactively
         param([string]$ExecutablePath, [string[]]$CommandArguments, [int]$TimeoutMilliseconds)
 
         if (($CommandArguments -join '|') -eq '--version') {
-            return [pscustomobject]@{ exitCode = 0; stdout = "codex-cli 9.8.7-test`n"; stderr = ''; timedOut = $false }
+            return New-ProviderCommandResult -ExitCode 0 -Stdout "codex-cli 9.8.7-test`n" -Stderr ''
         }
-        return [pscustomobject]@{ exitCode = 0; stdout = '--ephemeral'; stderr = ''; timedOut = $false }
+        return New-ProviderCommandResult -ExitCode 0 -Stdout '--ephemeral' -Stderr ''
     }
     $failedPreflight = Get-CSXCodexVisualReviewProviderPreflight -CodexExecutable $pwshPath `
         -CommandAdapter $missingFeatureAdapter
@@ -110,7 +125,7 @@ Run Codex non-interactively
     $stderrAdapter = {
         param([string]$ExecutablePath, [string[]]$CommandArguments, [int]$TimeoutMilliseconds)
 
-        return [pscustomobject]@{ exitCode = 9; stdout = ''; stderr = "  diagnostic detail  `r`n"; timedOut = $false }
+        return New-ProviderCommandResult -ExitCode 9 -Stdout '' -Stderr "  diagnostic detail  `r`n"
     }
     $stderrPreflight = Get-CSXCodexVisualReviewProviderPreflight -CodexExecutable $pwshPath `
         -CommandAdapter $stderrAdapter
@@ -124,12 +139,12 @@ Run Codex non-interactively
         param([string]$ExecutablePath, [string[]]$CommandArguments, [int]$TimeoutMilliseconds)
 
         if (($CommandArguments -join '|') -eq '--version') {
-            return [pscustomobject]@{ exitCode = 0; stdout = "codex-cli 9.8.7-test`n"; stderr = ''; timedOut = $false }
+            return New-ProviderCommandResult -ExitCode 0 -Stdout "codex-cli 9.8.7-test`n" -Stderr ''
         }
         if (($CommandArguments -join '|') -in @('--help', 'exec|--help')) {
-            return [pscustomobject]@{ exitCode = 0; stdout = $fakeHelp; stderr = ''; timedOut = $false }
+            return New-ProviderCommandResult -ExitCode 0 -Stdout $fakeHelp -Stderr ''
         }
-        return [pscustomobject]@{ exitCode = 2; stdout = ''; stderr = "  model unavailable  `n"; timedOut = $false }
+        return New-ProviderCommandResult -ExitCode 2 -Stdout '' -Stderr "  model unavailable  `n"
     }
     $modelFailurePreflight = Get-CSXCodexVisualReviewProviderPreflight -CodexExecutable $pwshPath `
         -CommandAdapter $modelFailureAdapter
@@ -235,6 +250,8 @@ $response = [ordered]@{ fake = $true; imageCount = $imageCount; prompt = $prompt
     Assert-ProviderTest (-not $execution.deadlineReached) 'The successful fake execution reached its deadline.'
     foreach ($batch in $execution.batches) {
         Assert-ProviderTest ($batch.exitCode -eq 0 -and $batch.status -eq 'completed') 'A successful fake batch did not report completion.'
+        Assert-ProviderTest ($batch.launched -and $batch.exitVerified -and $batch.streamDrainComplete -and $batch.inputCompleted) 'A successful fake batch omitted completed process-custody evidence.'
+        Assert-ProviderTest (-not $batch.terminationRequested -and -not $batch.unresolvedProcess -and @($batch.terminationErrors).Count -eq 0) 'A successful fake batch reported unexpected process cleanup.'
         Assert-ProviderTest (Test-Path -LiteralPath $batch.responsePath -PathType Leaf) 'A fake response was not captured.'
         Assert-ProviderTest (Test-Path -LiteralPath $batch.eventsPath -PathType Leaf) 'Fake stdout JSONL was not preserved.'
         Assert-ProviderTest (@($batch.stdoutJsonl).Count -eq 1) 'Fake stdout JSONL was not parsed.'
@@ -261,7 +278,95 @@ $response = [ordered]@{ fake = $true; imageCount = $imageCount; prompt = $prompt
     Assert-ProviderTest (-not $timeoutExecution.ok -and $timeoutExecution.deadlineReached) 'The shared deadline did not fail closed.'
     Assert-ProviderTest (@($timeoutExecution.batches).Count -eq 6) 'Deadline execution did not return all six batch identities.'
     Assert-ProviderTest (@($timeoutExecution.batches | Where-Object { $_.presentationPass -eq 1 -and $_.timedOut }).Count -eq 3) 'Running replicate processes were not timed out together.'
+    Assert-ProviderTest (@($timeoutExecution.batches | Where-Object { $_.presentationPass -eq 1 -and $_.terminationRequested -and $_.terminationConfirmed -and -not $_.unresolvedProcess }).Count -eq 3) 'Timed-out replicate custody was not terminated and verified.'
     Assert-ProviderTest (@($timeoutExecution.batches | Where-Object { $_.presentationPass -eq 2 -and $_.status -eq 'not_started_deadline' }).Count -eq 3) 'The second presentation pass started after the shared deadline.'
+
+    $nonReadingAdapter = {
+        param(
+            [Diagnostics.ProcessStartInfo]$OriginalStartInfo,
+            [int]$PresentationPass,
+            [int]$Replicate
+        )
+
+        $replacement = [Diagnostics.ProcessStartInfo]::new()
+        $replacement.FileName = $pwshPath
+        $replacement.WorkingDirectory = $OriginalStartInfo.WorkingDirectory
+        $replacement.UseShellExecute = $false
+        $replacement.CreateNoWindow = $true
+        $replacement.RedirectStandardInput = $true
+        $replacement.RedirectStandardOutput = $true
+        $replacement.RedirectStandardError = $true
+        foreach ($argument in @('-NoLogo', '-NoProfile', '-Command', '[Threading.Thread]::Sleep(5000)')) {
+            [void]$replacement.ArgumentList.Add($argument)
+        }
+        return $replacement
+    }
+    $blockedInputRoot = Join-Path $fakeWorkingDirectory 'blocked input execution'
+    New-Item -ItemType Directory -Path $blockedInputRoot | Out-Null
+    $blockedInputPasses = New-ProviderTestPasses -Root $blockedInputRoot -SchemaPath $schemaPath `
+        -Images @($imageOne) -PromptSuffix ('x' * (8 * 1024 * 1024))
+    $blockedInputExecution = Invoke-CSXCodexVisualReviewProvider -WorkingDirectory $fakeWorkingDirectory `
+        -Passes $blockedInputPasses -Preflight $preflight -DeadlineSeconds 1 `
+        -ProcessStartInfoAdapter $nonReadingAdapter
+    Assert-ProviderTest ([double]$blockedInputExecution.durationMs -lt 2000) 'Blocked standard-input delivery bypassed the provider execution deadline.'
+    Assert-ProviderTest (@($blockedInputExecution.batches | Where-Object { $_.presentationPass -eq 1 -and -not $_.inputCompleted }).Count -gt 0) 'The blocked-input fixture did not preserve incomplete prompt delivery.'
+    Assert-ProviderTest (@($blockedInputExecution.batches | Where-Object { $_.presentationPass -eq 1 -and $_.terminationConfirmed -and -not $_.unresolvedProcess }).Count -eq 3) 'Blocked-input children were not terminated within their shared budget.'
+
+    $setupFailureAdapter = {
+        param(
+            [Diagnostics.ProcessStartInfo]$OriginalStartInfo,
+            [int]$PresentationPass,
+            [int]$Replicate
+        )
+
+        $replacement = & $nonReadingAdapter $OriginalStartInfo $PresentationPass $Replicate
+        $replacement.RedirectStandardOutput = $false
+        return $replacement
+    }
+    $setupFailureRoot = Join-Path $fakeWorkingDirectory 'post launch setup failure'
+    New-Item -ItemType Directory -Path $setupFailureRoot | Out-Null
+    $setupFailurePasses = New-ProviderTestPasses -Root $setupFailureRoot -SchemaPath $schemaPath `
+        -Images @($imageOne) -PromptSuffix 'setup failure'
+    $setupFailureExecution = Invoke-CSXCodexVisualReviewProvider -WorkingDirectory $fakeWorkingDirectory `
+        -Passes $setupFailurePasses -Preflight $preflight -DeadlineSeconds 5 `
+        -ProcessStartInfoAdapter $setupFailureAdapter
+    Assert-ProviderTest (@($setupFailureExecution.batches | Where-Object { $_.launched -and $_.status -eq 'setup_failed' }).Count -eq 6) 'Post-launch setup failures were mislabeled as unstarted processes.'
+    Assert-ProviderTest (@($setupFailureExecution.batches | Where-Object { $_.terminationRequested -and $_.terminationConfirmed -and $_.exitVerified -and -not $_.unresolvedProcess }).Count -eq 6) 'Post-launch setup failures lost owned-child termination evidence.'
+
+    $selfExitAdapter = {
+        param(
+            [Diagnostics.ProcessStartInfo]$OriginalStartInfo,
+            [int]$PresentationPass,
+            [int]$Replicate
+        )
+
+        $replacement = & $nonReadingAdapter $OriginalStartInfo $PresentationPass $Replicate
+        $replacement.ArgumentList.Clear()
+        foreach ($argument in @('-NoLogo', '-NoProfile', '-Command', '[Threading.Thread]::Sleep(1500)')) {
+            [void]$replacement.ArgumentList.Add($argument)
+        }
+        return $replacement
+    }
+    $refusedTermination = { param([Diagnostics.Process]$Process, [string]$Reason); throw 'synthetic termination refusal' }
+    $unresolvedRoot = Join-Path $fakeWorkingDirectory 'unresolved execution'
+    New-Item -ItemType Directory -Path $unresolvedRoot | Out-Null
+    $unresolvedPasses = New-ProviderTestPasses -Root $unresolvedRoot -SchemaPath $schemaPath `
+        -Images @($imageOne) -PromptSuffix 'unresolved custody'
+    $unresolvedExecution = Invoke-CSXCodexVisualReviewProvider -WorkingDirectory $fakeWorkingDirectory `
+        -Passes $unresolvedPasses -Preflight $preflight -DeadlineSeconds 1 `
+        -ProcessStartInfoAdapter $selfExitAdapter -ProcessTerminationAdapter $refusedTermination
+    $unresolvedBatches = @($unresolvedExecution.batches | Where-Object presentationPass -eq 1)
+    Assert-ProviderTest (@($unresolvedBatches | Where-Object { $_.status -eq 'unresolved_process' -and $_.unresolvedProcess -and -not $_.exitVerified }).Count -eq 3) 'Failed termination did not retain exact unresolved child custody.'
+    Assert-ProviderTest (@($unresolvedBatches | Where-Object { (@($_.terminationErrors) -join ' | ') -match 'synthetic termination refusal' }).Count -eq 3) 'Termination failures were discarded from unresolved child receipts.'
+    [Threading.Thread]::Sleep(2000)
+    foreach ($processId in @($unresolvedBatches.processId)) {
+        try {
+            $remainingProcess = [Diagnostics.Process]::GetProcessById([int]$processId)
+            try { Assert-ProviderTest $remainingProcess.HasExited "Synthetic unresolved child PID $processId did not self-exit." }
+            finally { $remainingProcess.Dispose() }
+        }
+        catch [ArgumentException] { }
+    }
 
     'Automated visual review provider tests passed.'
 }

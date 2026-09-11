@@ -6,6 +6,13 @@ live crash collector, launches the baseline reads in parallel, and starts one
 async 20-transition scenario only after every ownership and readiness result
 arrives within the ten-second admission deadline. An incomplete or faulty
 baseline fails closed before `prepare_coc` or scenario mutation.
+Each worker records a monotonic completion timestamp and the controller checks
+the final baseline decision against the same deadline. The three fixture gates
+must be actual non-null Booleans with values `true`, `false`, and `false` for
+`ready`, `persisted`, and `promptRequired`; truthy strings and nulls are rejected.
+Known pre-dispatch fixture failures retain the completed baseline and terminal
+failure in the state journal. If that final publication fails, the same evidence
+is returned in-memory with the publication error.
 
 Every DevBench interaction is pinned to the canonical endpoint, its exact
 listener PID, and the admitted Skyrim start time. The server scenario acquires

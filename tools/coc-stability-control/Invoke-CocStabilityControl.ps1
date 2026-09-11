@@ -65,25 +65,54 @@ function Get-CocFixtureAnomalies($Value) {
         return @($anomalies)
     }
 
-    $missingFields = @(
-        @('ready', 'persisted', 'promptRequired') | Where-Object {
+    $missingFields = @(@('ready', 'persisted', 'promptRequired') | Where-Object {
             $null -eq $Value.PSObject.Properties[$_]
-        }
-    )
+        })
     if ($missingFields.Count -gt 0) {
         $anomalies.Add('prepare_coc omitted a required fixture field')
     }
-    if ($Value.PSObject.Properties['ready'] -and -not [bool]$Value.ready) {
+    foreach ($name in @('ready', 'persisted', 'promptRequired')) {
+        $property = $Value.PSObject.Properties[$name]
+        if ($property -and $property.Value -isnot [bool]) {
+            $anomalies.Add("prepare_coc field '$name' must be a non-null Boolean")
+        }
+    }
+    if ($Value.PSObject.Properties['ready'] -and $Value.ready -is [bool] -and
+        -not [bool]$Value.ready) {
         $anomalies.Add('prepare_coc reported ready:false')
     }
-    if ($Value.PSObject.Properties['persisted'] -and [bool]$Value.persisted) {
+    if ($Value.PSObject.Properties['persisted'] -and $Value.persisted -is [bool] -and
+        [bool]$Value.persisted) {
         $anomalies.Add('prepare_coc reported persisted:true')
     }
     if ($Value.PSObject.Properties['promptRequired'] -and
+        $Value.promptRequired -is [bool] -and
         [bool]$Value.promptRequired) {
         $anomalies.Add('prepare_coc reported promptRequired:true')
     }
     return @($anomalies)
+}
+
+function Test-CocBaselineAdmissionTiming {
+    param(
+        [Parameter(Mandatory)]$Timing,
+        [Parameter(Mandatory)][long]$DueTimestamp,
+        [Parameter(Mandatory)][long]$DecisionTimestamp,
+        [Parameter(Mandatory)][int]$ExpectedCount
+    )
+    $late = @($Timing.GetEnumerator() | Where-Object {
+            $null -eq $_.Value -or -not $_.Value.PSObject.Properties['completedTimestamp'] -or
+            [long]$_.Value.completedTimestamp -gt $DueTimestamp
+        } | ForEach-Object Key)
+    $decisionLate = $DecisionTimestamp -gt $DueTimestamp
+    return [pscustomobject][ordered]@{
+        acceptable = $Timing.Count -eq $ExpectedCount -and $late.Count -eq 0 -and
+            -not $decisionLate
+        lateResults = @($late)
+        decisionLate = $decisionLate
+        dueTimestamp = $DueTimestamp
+        decisionTimestamp = $DecisionTimestamp
+    }
 }
 
 $toolJobScript = {
@@ -100,10 +129,18 @@ $toolJobScript = {
             -ExpectedProcessId $ExpectedProcessId `
             -ExpectedProcessStartTimeUtc $ExpectedProcessStartTimeUtc `
             -ExpectedBuildId $ExpectedBuildId
-        [pscustomobject]@{ ok = $true; receipt = $value }
+        [pscustomobject]@{
+            ok = $true
+            receipt = $value
+            completedTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
+        }
     }
     catch {
-        [pscustomobject]@{ ok = $false; error = $_.Exception.Message }
+        [pscustomobject]@{
+            ok = $false
+            error = $_.Exception.Message
+            completedTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
+        }
     }
 }
 
@@ -142,6 +179,11 @@ try {
                     scenario = $null
                     analysis = $null
                     dispatchFailure = $dispatchFailure
+                    fixture = if ($state.PSObject.Properties['fixture']) { $state.fixture } else { $null }
+                    fixtureFailure = if ($state.PSObject.Properties['fixtureFailure']) { $state.fixtureFailure } else { $null }
+                    baseline = if ($state.PSObject.Properties['baseline']) { $state.baseline } else { $null }
+                    baselineVerdict = if ($state.PSObject.Properties['baselineVerdict']) { $state.baselineVerdict } else { $null }
+                    baselineTiming = if ($state.PSObject.Properties['baselineTiming']) { $state.baselineTiming } else { $null }
                 }
                 errors = @($dispatchError)
             }
@@ -298,6 +340,7 @@ try {
         $scenario = New-CocMeasuredScenario -ProtocolConfig $protocolConfig `
             -ExpectedBuildId $ExpectedBuildId -OwnerId $ownerId
         $fixture = $null
+        $fixtureFailure = $null
         $fixtureAnomalies = @()
 
         $initialState = [pscustomobject][ordered]@{
@@ -358,13 +401,29 @@ try {
         }
 
         $baselineResults = @{}
+        $baselineTiming = [ordered]@{}
         while ($baselineResults.Count -lt $baselineSpecs.Count -and
             [Diagnostics.Stopwatch]::GetTimestamp() -lt $dueTimestamp) {
             foreach ($entry in $baselineJobs.GetEnumerator()) {
                 if (-not $baselineResults.ContainsKey($entry.Key) -and
                     $entry.Value.State -in @('Completed', 'Failed', 'Stopped')) {
                     $jobResult = Get-JobResult $entry.Value
-                    $baselineResults[$entry.Key] = if ([bool]$jobResult.ok) {
+                    $receivedTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
+                    $completedTimestamp = if ($jobResult.PSObject.Properties['completedTimestamp']) {
+                        [long]$jobResult.completedTimestamp
+                    } else { $receivedTimestamp }
+                    $baselineTiming[$entry.Key] = [pscustomobject][ordered]@{
+                        completedTimestamp = $completedTimestamp
+                        receivedTimestamp = $receivedTimestamp
+                    }
+                    $baselineResults[$entry.Key] = if ($completedTimestamp -gt $dueTimestamp) {
+                        [pscustomobject]@{
+                            incomplete = $true
+                            late = $true
+                            error = 'baseline admission deadline expired before this check completed'
+                            receipt = if ([bool]$jobResult.ok) { $jobResult.receipt } else { $null }
+                        }
+                    } elseif ([bool]$jobResult.ok) {
                         $jobResult.receipt
                     } else {
                         [pscustomobject]@{ error = [string]$jobResult.error }
@@ -388,7 +447,13 @@ try {
                 }
             }
         }
-        $successful = @($baselineResults.Values | Where-Object {
+        $baselineDecisionTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
+        $baselineTimingVerdict = Test-CocBaselineAdmissionTiming `
+            -Timing $baselineTiming -DueTimestamp $dueTimestamp `
+            -DecisionTimestamp $baselineDecisionTimestamp `
+            -ExpectedCount $baselineSpecs.Count
+        $successful = [bool]$baselineTimingVerdict.acceptable -and
+            @($baselineResults.Values | Where-Object {
                 -not $_.PSObject.Properties['error']
             }).Count -eq $baselineSpecs.Count
         $baselineVerdict = if ($successful) {
@@ -399,7 +464,10 @@ try {
         if (-not $successful) {
             $dispatchResult = [pscustomobject]@{
                 ok = $false
-                state = 'baseline-incomplete'
+                state = if ($baselineTimingVerdict.decisionLate -or
+                    @($baselineTimingVerdict.lateResults).Count -gt 0) {
+                    'baseline-deadline-expired'
+                } else { 'baseline-incomplete' }
                 source = 'baseline-admission'
                 error = 'Every baseline ownership and readiness check must complete before scenario mutation.'
             }
@@ -414,22 +482,38 @@ try {
             }
         } else {
             $phase = 'fixture'
-            $fixture = Invoke-CocMcpTool -Endpoint $Endpoint `
-                -Tool 'communityshaders.menu' -Arguments @{
-                    action = 'prepare_coc'
-                    expectedBuildId = $ExpectedBuildId
-                } -TimeoutSeconds 15 -ExpectedProcessId $ExpectedPid `
-                -ExpectedProcessStartTimeUtc $expectedProcessStartTimeUtc `
-                -ExpectedBuildId $ExpectedBuildId
-            $fixtureAnomalies = @(Get-CocFixtureAnomalies -Value $fixture.value)
-            if ($fixtureAnomalies.Count -gt 0) {
+            try {
+                $fixture = Invoke-CocMcpTool -Endpoint $Endpoint `
+                    -Tool 'communityshaders.menu' -Arguments @{
+                        action = 'prepare_coc'
+                        expectedBuildId = $ExpectedBuildId
+                    } -TimeoutSeconds 15 -ExpectedProcessId $ExpectedPid `
+                    -ExpectedProcessStartTimeUtc $expectedProcessStartTimeUtc `
+                    -ExpectedBuildId $ExpectedBuildId
+            }
+            catch {
+                $fixtureFailure = [pscustomobject][ordered]@{
+                    effect = 'unknown'
+                    error = $_.Exception.Message
+                }
+                $dispatchResult = [pscustomobject]@{
+                    ok = $false
+                    state = 'fixture-call-failed'
+                    source = 'fixture-admission'
+                    error = $_.Exception.Message
+                }
+            }
+            if ($null -eq $dispatchResult) {
+                $fixtureAnomalies = @(Get-CocFixtureAnomalies -Value $fixture.value)
+            }
+            if ($null -eq $dispatchResult -and $fixtureAnomalies.Count -gt 0) {
                 $dispatchResult = [pscustomobject]@{
                     ok = $false
                     state = 'fixture-rejected'
                     source = 'fixture-admission'
                     error = @($fixtureAnomalies) -join '; '
                 }
-            } else {
+            } elseif ($null -eq $dispatchResult) {
                 $claim = New-CocDispatchClaim -Path $claimPath -Source 'baseline-complete'
                 if ([string]$claim.state -ne 'dispatch-claimed') {
                     $dispatchResult = $claim
@@ -520,8 +604,11 @@ try {
                 }
             }
             fixture = if ($fixture) { $fixture.value } else { $null }
+            fixtureFailure = $fixtureFailure
             fixtureAnomalies = @($fixtureAnomalies)
             baseline = $baselineResults
+            baselineTiming = $baselineTiming
+            baselineTimingVerdict = $baselineTimingVerdict
             baselineVerdict = $baselineVerdict
         }
         $failureData = [pscustomobject][ordered]@{
@@ -539,6 +626,19 @@ try {
             dispatchReceipt = if ($dispatchResult.PSObject.Properties['receipt']) {
                 $dispatchResult.receipt
             } else { $null }
+            dispatchFailure = if ($dispatchAccepted) { $null } else {
+                [pscustomobject][ordered]@{
+                    error = $dispatchError
+                    detail = $dispatchResult
+                }
+            }
+            fixture = if ($fixture) { $fixture.value } else { $null }
+            fixtureFailure = $fixtureFailure
+            fixtureAnomalies = @($fixtureAnomalies)
+            baseline = $baselineResults
+            baselineTiming = $baselineTiming
+            baselineTimingVerdict = $baselineTimingVerdict
+            baselineVerdict = $baselineVerdict
         }
         Write-AtomicJson -Value $stateRecord -Path $resolvedStatePath
         $publishedStatePath = $resolvedStatePath

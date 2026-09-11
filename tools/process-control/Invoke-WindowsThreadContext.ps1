@@ -41,6 +41,39 @@ function Format-Address {
     return '0x{0:X}' -f $Value
 }
 
+function Close-NativeHandle {
+    param(
+        [Parameter(Mandatory)][IntPtr]$Handle,
+        [Parameter(Mandatory)][ValidateSet('process', 'thread')][string]$Kind,
+        [int]$Sample = 0,
+        [scriptblock]$CloseAction = { param([IntPtr]$Value) [SkyrimVRAutomation.LiveThreadContext.NativeMethods]::CloseHandle($Value) },
+        [scriptblock]$LastErrorAction = { [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+    )
+
+    try {
+        $closed = [bool](& $CloseAction $Handle)
+        $nativeError = if ($closed) { 0 } else { [int](& $LastErrorAction) }
+        return [pscustomobject][ordered]@{
+            kind = $Kind
+            sample = if ($Sample -gt 0) { $Sample } else { $null }
+            attempted = $true
+            ok = $closed
+            nativeError = if ($closed) { $null } else { $nativeError }
+            error = if ($closed) { $null } else { "CloseHandle failed for $Kind handle with Win32 error $nativeError." }
+        }
+    }
+    catch {
+        return [pscustomobject][ordered]@{
+            kind = $Kind
+            sample = if ($Sample -gt 0) { $Sample } else { $null }
+            attempted = $true
+            ok = $false
+            nativeError = $null
+            error = "CloseHandle threw for $Kind handle: $($_.Exception.Message)"
+        }
+    }
+}
+
 if (-not ('SkyrimVRAutomation.LiveThreadContext.NativeMethods' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -94,6 +127,8 @@ namespace SkyrimVRAutomation.LiveThreadContext
 
 $records = [System.Collections.Generic.List[object]]::new()
 $errors = [System.Collections.Generic.List[string]]::new()
+$cleanup = [System.Collections.Generic.List[object]]::new()
+$cleanupUncertain = $false
 $state = 'capture-failed'
 $identity = $null
 $processHandle = [IntPtr]::Zero
@@ -299,9 +334,15 @@ try {
             if ($allocation -ne [IntPtr]::Zero) {
                 [Runtime.InteropServices.Marshal]::FreeHGlobal($allocation)
             }
-            [void][SkyrimVRAutomation.LiveThreadContext.NativeMethods]::CloseHandle(
-                $threadHandle)
+            $threadRelease = Close-NativeHandle -Handle $threadHandle -Kind thread -Sample $sample
+            $cleanup.Add($threadRelease)
+            if (-not $threadRelease.ok) {
+                $cleanupUncertain = $true
+                $errors.Add([string]$threadRelease.error)
+            }
         }
+
+        if ($cleanupUncertain) { throw "Native handle release was not verified for sample $sample." }
 
         if ($sample -lt $Samples) {
             Start-Sleep -Milliseconds $IntervalMs
@@ -315,10 +356,16 @@ catch {
 }
 finally {
     if ($processHandle -ne [IntPtr]::Zero) {
-        [void][SkyrimVRAutomation.LiveThreadContext.NativeMethods]::CloseHandle(
-            $processHandle)
+        $processRelease = Close-NativeHandle -Handle $processHandle -Kind process
+        $cleanup.Add($processRelease)
+        if (-not $processRelease.ok) {
+            $cleanupUncertain = $true
+            $errors.Add([string]$processRelease.error)
+        }
     }
 }
+
+if ($cleanupUncertain) { $state = 'cleanup-uncertain' }
 
 $result = [pscustomobject][ordered]@{
     schemaVersion = 1
@@ -336,6 +383,10 @@ $result = [pscustomobject][ordered]@{
     intervalMs = $IntervalMs
     stackBytes = $StackBytes
     records = @($records)
+    cleanup = [pscustomobject][ordered]@{
+        ok = -not $cleanupUncertain
+        handles = @($cleanup)
+    }
     errors = @($errors)
 }
 $result | ConvertTo-Json -Depth 10
