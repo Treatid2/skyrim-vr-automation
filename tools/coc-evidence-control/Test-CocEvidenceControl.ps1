@@ -359,10 +359,39 @@ try {
         -NotePropertyValue $cancelFixture.StartTime.ToUniversalTime().ToString('o') -Force
     $state | Add-Member -NotePropertyName cancelState -NotePropertyValue 'cleanup-incomplete' -Force
     $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8
+    $blockedCapture = & $scriptPath capture-hang -StatePath $statePath `
+        -Compact -NoExit | ConvertFrom-Json -Depth 20
+    $afterBlockedCapture = Get-Content -LiteralPath $statePath -Raw |
+        ConvertFrom-Json
+    if ($blockedCapture.ok -or $blockedCapture.state -ne 'tool-error' -or
+        @($blockedCapture.errors)[0] -notlike '*cancellation helper must be stopped*' -or
+        [int]($afterBlockedCapture.cancelPid) -ne $cancelFixture.Id -or
+        ([DateTime]$afterBlockedCapture.cancelStartedUtc).ToUniversalTime().ToString('o') -cne
+            $cancelFixture.StartTime.ToUniversalTime().ToString('o') -or
+        -not (Get-Process -Id $cancelFixture.Id -ErrorAction SilentlyContinue) -or
+        -not (Get-Process -Id $monitorFixture.Id -ErrorAction SilentlyContinue)) {
+        throw 'Capture-hang replaced or lost an unresolved cancellation helper.'
+    }
     $cancellationStatus = & $scriptPath status -StatePath $statePath -Compact -NoExit |
         ConvertFrom-Json -Depth 20
     if ($cancellationStatus.ok -or $cancellationStatus.state -ne 'cleanup-incomplete') {
         throw 'Status did not retain the independently owned cancellation helper.'
+    }
+    $failedCancellationCleanup = & $scriptPath stop -StatePath $statePath `
+        -InternalTestFailurePoint stop-before-termination -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    $afterFailedCancellation = Get-Content -LiteralPath $statePath -Raw |
+        ConvertFrom-Json
+    $reloadedCancellation = & $scriptPath status -StatePath $statePath `
+        -Compact -NoExit | ConvertFrom-Json -Depth 20
+    if ($failedCancellationCleanup.ok -or
+        $failedCancellationCleanup.state -ne 'cleanup-incomplete' -or
+        [int]($afterFailedCancellation.cancelPid) -ne $cancelFixture.Id -or
+        ([DateTime]$afterFailedCancellation.cancelStartedUtc).ToUniversalTime().ToString('o') -cne
+            $cancelFixture.StartTime.ToUniversalTime().ToString('o') -or
+        $afterFailedCancellation.cancelState -ne 'cleanup-incomplete' -or
+        $reloadedCancellation.data.activeProcessKind -ne 'cancellation-helper') {
+        throw 'Failed cancellation cleanup did not retain exact lifetime authority across reload.'
     }
     $cancellationRecovery = & $scriptPath stop -StatePath $statePath -Compact -NoExit |
         ConvertFrom-Json -Depth 20
@@ -378,6 +407,34 @@ try {
     }
     $monitorFixture.Kill()
     $monitorFixture.WaitForExit()
+
+    $cancelFixture = [Diagnostics.Process]::Start($startInfo)
+    $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $state.monitorPid = [int]::MaxValue
+    $state.monitorStartedUtc = [DateTime]::UtcNow.ToString('o')
+    $state.cancelPid = $cancelFixture.Id
+    $state.cancelStartedUtc = $cancelFixture.StartTime.ToUniversalTime().ToString('o')
+    $state.cancelState = 'cleanup-incomplete'
+    $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8
+    $failedHelperOnlyCleanup = & $scriptPath stop -StatePath $statePath `
+        -InternalTestFailurePoint stop-before-termination -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    $helperOnlyState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $helperOnlyStatus = & $scriptPath status -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if ($failedHelperOnlyCleanup.ok -or
+        [int]($helperOnlyState.cancelPid) -ne $cancelFixture.Id -or
+        ([DateTime]$helperOnlyState.cancelStartedUtc).ToUniversalTime().ToString('o') -cne
+            $cancelFixture.StartTime.ToUniversalTime().ToString('o') -or
+        $helperOnlyStatus.data.activeProcessKind -ne 'cancellation-helper') {
+        throw 'Helper-only cleanup failure did not retain exact lifetime authority.'
+    }
+    $helperOnlyRecovery = & $scriptPath stop -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if (-not $helperOnlyRecovery.ok -or $helperOnlyRecovery.state -ne 'stopped' -or
+        (Get-Process -Id $cancelFixture.Id -ErrorAction SilentlyContinue)) {
+        throw 'A later stop did not resolve the retained helper-only lifetime.'
+    }
 
     $capture = [Diagnostics.Process]::Start($startInfo)
     $captureStartedUtc = $capture.StartTime.ToUniversalTime().ToString('o')

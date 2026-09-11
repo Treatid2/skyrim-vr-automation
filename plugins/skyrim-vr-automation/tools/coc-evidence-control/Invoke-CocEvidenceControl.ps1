@@ -731,7 +731,9 @@ try {
                 captureDirectory = [string]$owned.data.captureDirectory
                 coverageActive = $null -ne $monitor
                 captureActive = $null -ne $capture -or $null -ne $procDumpCapture
-                activeProcessKind = if ($capture) {
+                activeProcessKind = if ($cancellation) {
+                    'cancellation-helper'
+                } elseif ($capture) {
                     'hang-capture-worker'
                 } elseif ($procDumpCapture) {
                     'hang-capture-procdump'
@@ -763,6 +765,17 @@ try {
     }
     elseif ($Command -eq 'capture-hang') {
         $owned = Read-OwnedState
+        $existingCancellation = Get-OwnedCancellation $owned.data
+        if ($existingCancellation) {
+            $failureData = [pscustomobject][ordered]@{
+                statePath = $owned.path
+                cancelPid = $existingCancellation.Id
+                cancelStartedUtc = $existingCancellation.StartTime.
+                    ToUniversalTime().ToString('o')
+                cancelState = 'cleanup-incomplete'
+            }
+            throw 'An unresolved owned ProcDump cancellation helper must be stopped before capture-hang.'
+        }
         $monitor = Get-OwnedMonitor $owned.data
         if (-not $monitor) {
             throw 'The state does not identify a live owned ProcDump monitor.'
@@ -969,6 +982,20 @@ try {
         }
         $stopOutcome = Get-CocStopOutcome -Value $cancel -ProcessKind $processKind
         $selectedStopped = [bool]$stopOutcome.stopped
+        $retainedCancelPid = if ($processKind -eq 'cancellation-helper') {
+            if ($selectedStopped) { $null } else { $ownedProcess.Id }
+        } elseif ($cancel.PSObject.Properties['cancelPid']) {
+            $cancel.cancelPid
+        } else { $null }
+        $retainedCancelStartedUtc = if ($processKind -eq 'cancellation-helper') {
+            if ($selectedStopped) {
+                $null
+            } else {
+                $ownedProcess.StartTime.ToUniversalTime().ToString('o')
+            }
+        } elseif ($cancel.PSObject.Properties['cancelStartedUtc']) {
+            $cancel.cancelStartedUtc
+        } else { $null }
         $otherOwnedProcessAlive = if ($processKind -eq 'cancellation-helper') {
             @($monitor, $capture, $procDumpCapture | Where-Object {
                 $null -ne $_ -and -not $_.HasExited
@@ -976,13 +1003,9 @@ try {
         } else { $false }
         $stopped = $selectedStopped -and -not $otherOwnedProcessAlive
         $owned.data | Add-Member -NotePropertyName cancelPid `
-            -NotePropertyValue $(if ($cancel.PSObject.Properties['cancelPid']) {
-                $cancel.cancelPid
-            } else { $null }) -Force
+            -NotePropertyValue $retainedCancelPid -Force
         $owned.data | Add-Member -NotePropertyName cancelStartedUtc `
-            -NotePropertyValue $(if ($cancel.PSObject.Properties['cancelStartedUtc']) {
-                $cancel.cancelStartedUtc
-            } else { $null }) -Force
+            -NotePropertyValue $retainedCancelStartedUtc -Force
         $owned.data | Add-Member -NotePropertyName cancelState `
             -NotePropertyValue $stopOutcome.cancelState -Force
         if (($cancel.PSObject.Properties['monitorExited'] -and $cancel.monitorExited) -or
