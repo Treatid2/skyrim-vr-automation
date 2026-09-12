@@ -61,7 +61,8 @@ $frame = [pscustomobject]@{
   right=[pscustomobject]@{available=$true;connected=$true;valid=$true;index=2;trackingResult=200;matrix=@(1,0,0,0.2,0,1,0,1,0,0,1,-0.3);velocity=@(0,0,0);angularVelocity=@(0,0,0);controller=[pscustomobject]@{packetNumber=1;pressed=0;touched=0;axes=@(@(0,0),@(0,0),@(0,0),@(0,0),@(0,0))}}
 }
 if ($Tool -eq 'communityshaders.screenshot') {
-  if ($argsObject.action -in @('sequence_start','capture')) { $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='running';terminal=$false}} }
+  if ($argsObject.action -eq 'capabilities') { $value=[pscustomobject]@{schema='urn:csx:devbench:screenshot:1';limits=[pscustomobject]@{maximumSequenceFrames=10000;maximumSequenceDurationMs=3600000}} }
+  elseif ($argsObject.action -in @('sequence_start','capture')) { $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='running';terminal=$false}} }
   elseif ($argsObject.action -eq 'request_get') {
     $image=Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'frame-left.png'
     if (-not (Test-Path $image)) { [IO.File]::WriteAllBytes($image,[byte[]](1,2,3)) }
@@ -87,9 +88,13 @@ else { $value=[pscustomobject]@{ok=$true} }
     '{}' | Set-Content -LiteralPath $runtime -Encoding utf8
     $env:CAPTURE_INTERACTION_FAKE_ROOT = $root
     $entry = Join-Path $PSScriptRoot 'Invoke-CaptureInteraction.ps1'
+    $oversizedSession = Join-Path $root 'oversized-session'
+    $oversized = & $entry start -SessionDirectory $oversizedSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10000 -FrameIntervalMs 1000 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test (-not $oversized.ok -and $oversized.errors -match 'runtime limits are 10000 frames and 3600000 ms' -and $oversized.errors -match 'no greater than 3600') 'sequence preflight reports the exact runtime duration limit and compatible frame count'
+    Assert-Test (-not (Test-Path -LiteralPath $oversizedSession)) 'sequence preflight rejects an incompatible request before creating session state or starting recording'
     $session = Join-Path $root 'session'
     $started = & $entry start -SessionDirectory $session -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 500 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
-    Assert-Test ($started.ok -and $started.state -eq 'session-started' -and $started.data.screenshot.requestId -eq 'req-1') 'sequence session starts recording and screenshot capture under one session'
+    Assert-Test ($started.ok -and $started.state -eq 'session-started' -and $started.data.screenshot.requestId -eq 'req-1' -and $started.data.screenshot.preflight.maximumSequenceDurationMs -eq 3600000) 'sequence session starts recording and screenshot capture under one capability-bound session'
     $observed = & $entry observe -SessionDirectory $session -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
     Assert-Test ($observed.ok -and $observed.data.observation.latestFrame.ordinal -eq 4) 'observe composites runtime state and the latest committed frame'
     Assert-Test (Test-Path -LiteralPath $observed.data.observationPath -PathType Leaf) 'observe persists a latest-observation receipt'

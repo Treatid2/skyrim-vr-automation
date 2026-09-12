@@ -4,8 +4,12 @@
 DevBench recording, atomic OpenVR tracked-set input, and the CSX screenshot v1
 service. It does not encode video and does not invent missing game state.
 
-Every session has one UUID and one durable session document. State recording
-starts first. Optional stereo capture starts second and rolls recording back if
+Every session has one UUID and one durable session document. Sequence mode first
+reads the screenshot API capabilities and verifies the requested frame count and
+wall-clock duration against the runtime's exact positive integral limits. An
+incompatible request fails with the largest compatible frame count before a
+session directory is created or state recording starts. State recording then
+starts first; optional stereo capture starts second and rolls recording back if
 it cannot be accepted. Stop reverses that order so the state trace encloses all
 captured frames. `none`, `on-demand`, and `sequence` visual modes all retain the
 same interaction and state contract.

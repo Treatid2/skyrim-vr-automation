@@ -80,6 +80,10 @@ Structured responses from allowlisted read-only calls establish a successful
 read contract. `record start` has a separate adapter that requires
 `action=start`, `recording=true`, and the requested correlation ID before
 `-RequireSuccess` accepts the result.
+The allowlist includes the exact structured `communityshaders.renderscale`
+`status` response and the screenshot `capabilities` response. Screenshot
+capabilities require the version-1 schema plus positive integral frame and
+duration limits before clients may use them for mutation preflight.
 Replay completion receipts containing only scheduler facts such as `done`,
 `runId`, and `stepsRun` are classified as
 `scheduler-complete-unverified`, not semantic success. A replay response must
