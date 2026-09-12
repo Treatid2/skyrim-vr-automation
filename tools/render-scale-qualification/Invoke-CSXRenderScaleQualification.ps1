@@ -399,7 +399,12 @@ function Invoke-EmergencyCleanup {
     $script:cleanupAttempted = $true
     $cleanupConnection = $null
     try {
-        $cleanupConnection = New-CSXMcpConnection -Runtime $script:runtime -ClientName 'CSXRenderScaleQualificationCleanup'
+        if ((Get-CSXResultRemainingMilliseconds) -lt 1000) {
+            $Warnings.Add('Emergency cleanup could not establish a session because the shared result deadline has no remaining budget; task-owned runtime state remains explicitly unresolved.')
+            return
+        }
+        $cleanupConnection = New-CSXMcpConnection -Runtime $script:runtime -ClientName 'CSXRenderScaleQualificationCleanup' `
+            -DeadlineUtc $script:resultDeadlineUtc
         $cleanupHealth = Invoke-CSXMcpTool -Connection $cleanupConnection -Tool 'inspect' -Arguments ([ordered]@{
             kind = 'health'
         }) -TimeoutSeconds (Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000)
@@ -1137,6 +1142,10 @@ function Invoke-AutomatedVisualEvaluation($CandidateIndex, $BaselineIndex, $Prov
         }
         $execution = Invoke-CSXCodexVisualReviewProvider -WorkingDirectory $reviewRoot -Passes @($passes) `
             -CodexExecutable $CodexExecutable -Preflight $ProviderPreflight -DeadlineSeconds $DeadlineSeconds
+        $script:providerCustodyEvidence = New-CSXProviderCustodyEvidence $execution
+        if ($null -ne $assays.visual) {
+            $assays.visual | Add-Member -NotePropertyName providerCustody -NotePropertyValue $script:providerCustodyEvidence -Force
+        }
         $executionPath = Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot $executionRelative) -Value $execution
         $batchEvidence = [Collections.Generic.List[object]]::new()
         foreach ($providerBatch in @($execution.batches | Sort-Object presentationPass, replicate)) {
@@ -1619,6 +1628,7 @@ $script:evidenceLease = $null
 $script:evidenceLeasePath = $null
 $script:phase = 'preflight'
 $script:evidenceWritable = $false
+$script:providerCustodyEvidence = $null
 $protocolRecord = $null
 $visualProviderPreflight = $null
 
@@ -1703,7 +1713,11 @@ try {
     if (-not [bool]$visualProviderPreflight.ok) {
         throw "Codex visual-review provider preflight failed: $(@($visualProviderPreflight.errors) -join ' | ')"
     }
-    $script:connection = New-CSXMcpConnection -Runtime $script:runtime
+    $connectionDeadlineUtc = $script:resultDeadlineUtc.AddMilliseconds(-[double]$script:protocol.timeBudget.evidenceFinalizationMs)
+    if (($connectionDeadlineUtc - [DateTimeOffset]::UtcNow).TotalMilliseconds -lt 1000) {
+        throw 'The complete qualification result deadline cannot accommodate MCP session establishment and evidence finalization.'
+    }
+    $script:connection = New-CSXMcpConnection -Runtime $script:runtime -DeadlineUtc $connectionDeadlineUtc
     $health = Invoke-BoundTool -Tool 'inspect' -Arguments ([ordered]@{ kind = 'health' })
     $script:boundHealth = $health
     $rawSessionIdentity = Assert-AuthoritativeRuntimeBinding -BindingIdentity $script:bindingIdentity -Health $health
@@ -2136,12 +2150,18 @@ try {
         Write-CSXJsonFile -Path $completionPath -Value $completionReceipt | Out-Null
         throw 'The qualification completion receipt crossed its complete invocation or evidence-finalization deadline.'
     }
+    $terminal = Complete-CSXSealedQualification -EvidenceDirectory $script:evidenceRoot -CompletionPath $completionPath `
+        -CompletionReceipt $completionReceipt -InvocationWatch $script:invocationWatch -FinalizationWatch $finalizationWatch `
+        -ResultDeadlineUtc $script:resultDeadlineUtc -EndToEndBudgetMs ([double]$script:protocol.timeBudget.endToEndMs) `
+        -FinalizationBudgetMs ([double]$script:protocol.timeBudget.evidenceFinalizationMs)
+    $updated = $terminal.updated
+    $completionReceipt = $terminal.completionReceipt
     $finalizationWatch.Stop()
-    $updated = Update-CSXQualificationReport -EvidenceDirectory $script:evidenceRoot
     $result = [pscustomobject][ordered]@{
         ok = [string]$updated.report.status -in @('PASS', 'LOCAL_PASS'); status = $updated.report.status
         runPath = $updated.runPath; summaryPath = $updated.summaryPath; reviewPath = (Join-Path $script:evidenceRoot 'visual-review.json')
         completionPath = $completionPath; completionSha256 = Get-CSXFileSha256 $completionPath
+        providerCustody = $script:providerCustodyEvidence
         errors = @($updated.report.errors)
     }
 }
@@ -2166,6 +2186,7 @@ catch {
         $result = [pscustomobject][ordered]@{
             ok = $false; status = 'INFRASTRUCTURE_ERROR'; runPath = $null
             summaryPath = $null; reviewPath = $null
+            providerCustody = $script:providerCustodyEvidence
             errors = @($failures) + @($infrastructureFailures)
         }
     }
@@ -2184,9 +2205,9 @@ catch {
         }
         Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'run.raw.json') -Value $raw | Out-Null
         $updated = Update-CSXQualificationReport -EvidenceDirectory $script:evidenceRoot -AllowUnsealedSuccess
-        $result = [pscustomobject][ordered]@{ ok = $false; status = $updated.report.status; runPath = $updated.runPath; summaryPath = $updated.summaryPath; reviewPath = $null; errors = @($updated.report.errors) }
+        $result = [pscustomobject][ordered]@{ ok = $false; status = $updated.report.status; runPath = $updated.runPath; summaryPath = $updated.summaryPath; reviewPath = $null; providerCustody = $script:providerCustodyEvidence; errors = @($updated.report.errors) }
     }
-    catch { $result = [pscustomobject][ordered]@{ ok = $false; status = 'INFRASTRUCTURE_ERROR'; runPath = $null; summaryPath = $null; reviewPath = $null; errors = @($failures) + @($infrastructureFailures) + @("Evidence finalization failed: $($_.Exception.Message)") } } }
+    catch { $result = [pscustomobject][ordered]@{ ok = $false; status = 'INFRASTRUCTURE_ERROR'; runPath = $null; summaryPath = $null; reviewPath = $null; providerCustody = $script:providerCustodyEvidence; errors = @($failures) + @($infrastructureFailures) + @("Evidence finalization failed: $($_.Exception.Message)") } } }
 }
 
 $leaseWarning = Close-EvidenceDirectoryLease
