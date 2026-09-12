@@ -89,6 +89,40 @@ try {
     [ordered]@{ version = 1; external_drivers = @($installRoot) } | ConvertTo-Json | Set-Content -LiteralPath $openVrPaths -Encoding utf8
     $openVrBefore = [IO.File]::ReadAllBytes($openVrPaths)
     $evidence = Join-Path $fixture 'evidence'
+    # Fixture transactions must not depend on unrelated live SteamVR state;
+    # production process checks remain exercised outside this test scope.
+    $script:delegatedGetProcessCalls = [Collections.Generic.List[object]]::new()
+    function Get-Process {
+        [CmdletBinding(DefaultParameterSetName = 'Name')]
+        param(
+            [Parameter(ParameterSetName = 'Name')]
+            [string[]]$Name,
+            [Parameter(ParameterSetName = 'Id')]
+            [int[]]$Id
+        )
+        $fixtureSteamVrNames = @('vrserver', 'vrmonitor', 'vrcompositor', 'vrstartup')
+        if ($PSCmdlet.ParameterSetName -eq 'Name' -and @($Name).Count -gt 0 -and
+            @($Name | Where-Object { $_ -notin $fixtureSteamVrNames }).Count -eq 0) {
+            return
+        }
+        $script:delegatedGetProcessCalls.Add([pscustomobject]@{
+            parameterSet = $PSCmdlet.ParameterSetName
+            names = @($Name)
+            ids = @($Id)
+        })
+        return Microsoft.PowerShell.Management\Get-Process @PSBoundParameters
+    }
+    $delegationCount = $script:delegatedGetProcessCalls.Count
+    $null = Get-Process
+    Assert-Test ($script:delegatedGetProcessCalls.Count -eq ($delegationCount + 1)) 'parameterless process inventory delegates to the production cmdlet'
+    $null = Get-Process -Name 'fixture-process-that-does-not-exist' -ErrorAction SilentlyContinue
+    Assert-Test ($script:delegatedGetProcessCalls.Count -eq ($delegationCount + 2)) 'non-target name query delegates to the production cmdlet'
+    $null = Get-Process -Id $PID
+    Assert-Test ($script:delegatedGetProcessCalls.Count -eq ($delegationCount + 3) -and $script:delegatedGetProcessCalls[-1].parameterSet -eq 'Id') 'process Id query delegates to the production cmdlet'
+    $null = Get-Process -Name @('vrserver', 'fixture-process-that-does-not-exist') -ErrorAction SilentlyContinue
+    Assert-Test ($script:delegatedGetProcessCalls.Count -eq ($delegationCount + 4)) 'mixed target and non-target name query delegates to the production cmdlet'
+    $null = Get-Process -Name @('vrserver', 'vrmonitor')
+    Assert-Test ($script:delegatedGetProcessCalls.Count -eq ($delegationCount + 4)) 'only an explicit all-SteamVR name list is masked by the fixture'
     $failedUpgrade = & $entry install -DriverPackagePath $bundleRoot -InstallRoot $installRoot -VRPathRegPath $entry -OpenVRPathsPath $openVrPaths -EvidenceDirectory $evidence -Upgrade -InternalTestFailurePoint install-after-replacement -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $failedUpgrade.ok -and $failedUpgrade.errors[0] -match 'exact previous install.*restored') 'injected upgrade failure reports verified rollback'
     Assert-Test ((Get-FileHash -LiteralPath $oldDll -Algorithm SHA256).Hash -eq $oldHash) 'upgrade rollback restores the exact original driver DLL'

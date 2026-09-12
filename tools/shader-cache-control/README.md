@@ -48,7 +48,8 @@ than evidence copies.
 ```powershell
 .\Invoke-CSXShaderCacheTransaction.ps1 providers `
   -ProfilePath 'D:\MO2\profiles\Profile\modlist.txt' `
-  -ModsPath 'D:\MO2\mods' -DeepInventory
+  -ModsPath 'D:\MO2\mods' -DeepInventory `
+  -EvidenceDirectory 'D:\Evidence\provider-inventory'
 
 .\Invoke-CSXShaderCacheTransaction.ps1 snapshot `
   -CachePath 'D:\MO2\mods\Cache Mod\ShaderCache' `
@@ -86,8 +87,9 @@ tags, and—by default—exact shader-source SHA-256. Supply
 `-FeatureSetSha256` whenever an effective feature-set fingerprint is available;
 then an absent or different fingerprint is a hard exclusion. Among compatible
 candidates, exact source, feature-set, build, preset, and observed render-path
-matches rank first, followed by broader verified coverage and
-recency. `select` returns both the ranking and explicit exclusion reasons.
+matches rank first. Within one render family, the request's provenance class
+(`vr-steamvr-*` or legacy `steamvr-*`) ranks ahead of broader verified coverage
+and recency. `select` returns both the ranking and explicit exclusion reasons.
 
 The exact render path remains immutable provenance and an exact-match ranking
 signal. The default `skyrimvr-d3d11` class deliberately permits reuse across
@@ -174,7 +176,11 @@ silence an unknown ABI mismatch.
 `SKSE\Plugins\CommunityShaders.dll`). It enumerates every physical provider,
 marks the earliest enabled mod provider as the winner among enabled loose mods,
 and explicitly leaves overwrite, unmanaged-file, archive, and runtime
-deployment resolution to separate VFS evidence.
+deployment resolution to separate VFS evidence. `-DeepInventory` returns only
+the bounded file count, byte count, and tree hash inline. When
+`-EvidenceDirectory` is supplied, the complete entry list is written to
+`providers.inventory.json`; use `-IncludeInventoryEntries` only when a caller
+explicitly needs that potentially large list in the command response.
 
 Restore never silently discards the current tree: it copies the displaced
 contents into the evidence directory, verifies that copy, and only then removes

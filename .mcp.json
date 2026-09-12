@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "devbench_vr": {
+      "type": "http",
+      "url": "http://127.0.0.1:8921/mcp"
+    }
+  }
+}

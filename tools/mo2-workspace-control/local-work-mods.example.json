@@ -1,0 +1,31 @@
+{
+  "contractVersion": "1.0.0",
+  "candidates": [
+    {
+      "id": "csx-aio-local-release",
+      "label": "CSX AIO local (DevBench off)",
+      "description": "Release-equivalent local CSX build without development bridges.",
+      "modName": "[NoDelete] CSX AIO local head (DevBench off)",
+      "exclusionGroup": "csx-aio",
+      "variant": "devbench-off",
+      "capabilities": ["csx-aio"],
+      "metadata": {
+        "devBenchBridgeEnabled": false,
+        "releaseEquivalent": true
+      }
+    },
+    {
+      "id": "csx-aio-local-devbench",
+      "label": "CSX AIO local (DevBench on)",
+      "description": "Local CSX build with DevBench bridges for automation.",
+      "modName": "[NoDelete] CSX AIO local head (DevBench on)",
+      "exclusionGroup": "csx-aio",
+      "variant": "devbench-on",
+      "capabilities": ["csx-aio", "devbench-api"],
+      "metadata": {
+        "devBenchBridgeEnabled": true,
+        "releaseEquivalent": false
+      }
+    }
+  ]
+}

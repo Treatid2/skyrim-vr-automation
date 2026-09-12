@@ -44,6 +44,8 @@ param(
 
     [switch]$DeepInventory,
 
+    [switch]$IncludeInventoryEntries,
+
     [ValidateSet('', 'seed-before-displace', 'seed-after-activate', 'restore-before-displace', 'restore-after-activate')]
     [string]$InternalTestFailurePoint = '',
 
@@ -373,6 +375,32 @@ function Get-Providers {
     foreach ($provider in $providers) {
         $provider | Add-Member -NotePropertyName effectiveWinnerAmongEnabledMods -NotePropertyValue ($null -ne $winner -and $provider.lineNumber -eq $winner.lineNumber)
     }
+    $inventoryEvidencePath = $null
+    if ($DeepInventory -and -not [string]::IsNullOrWhiteSpace($EvidenceDirectory)) {
+        $inventoryEvidencePath = Join-Path ([IO.Path]::GetFullPath($EvidenceDirectory)) 'providers.inventory.json'
+        Write-JsonFile -Path $inventoryEvidencePath -Value ([pscustomobject][ordered]@{
+            profilePath = $resolvedProfile
+            profileSha256 = (Get-FileHash -LiteralPath $resolvedProfile -Algorithm SHA256).Hash
+            modsPath = $resolvedMods
+            relativeCachePath = $RelativeCachePath
+            providers = $providers
+            capturedUtc = [DateTime]::UtcNow.ToString('o')
+        })
+    }
+    if ($DeepInventory -and -not $IncludeInventoryEntries) {
+        foreach ($provider in $providers) {
+            if ($null -eq $provider.inventory) { continue }
+            $provider.inventory = [pscustomobject][ordered]@{
+                root = [string]$provider.inventory.root
+                files = [int]$provider.inventory.files
+                bytes = [long]$provider.inventory.bytes
+                treeSha256 = [string]$provider.inventory.treeSha256
+                elapsedMilliseconds = if ($provider.inventory.PSObject.Properties['elapsedMilliseconds']) { [long]$provider.inventory.elapsedMilliseconds } else { $null }
+                maximumDepthObserved = if ($provider.inventory.PSObject.Properties['maximumDepthObserved']) { [int]$provider.inventory.maximumDepthObserved } else { $null }
+                limits = if ($provider.inventory.PSObject.Properties['limits']) { $provider.inventory.limits } else { $null }
+            }
+        }
+    }
     return [pscustomobject][ordered]@{
         profilePath = $resolvedProfile
         profileSha256 = (Get-FileHash -LiteralPath $resolvedProfile -Algorithm SHA256).Hash
@@ -382,6 +410,8 @@ function Get-Providers {
         enabledProviders = @($providers | Where-Object enabled).Count
         disabledProviders = @($providers | Where-Object { -not $_.enabled }).Count
         effectiveWinnerAmongEnabledMods = $winner
+        inventoryEntriesIncluded = [bool]$IncludeInventoryEntries
+        inventoryEvidencePath = $inventoryEvidencePath
         priorityNote = 'Among enabled loose-file mod providers, the earliest modlist line wins. Overwrite, unmanaged game files, archives, and runtime deployment still require separate VFS evidence.'
     }
 }
@@ -409,6 +439,7 @@ $cacheControl = $null
 $cacheLock = $null
 try {
     if ($Command -eq 'providers') {
+        if ($IncludeInventoryEntries -and -not $DeepInventory) { throw '-IncludeInventoryEntries requires -DeepInventory.' }
         $result = [pscustomobject][ordered]@{ ok = $true; command = $Command; data = Get-Providers; errors = @() }
     }
     else {
