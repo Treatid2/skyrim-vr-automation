@@ -15,7 +15,7 @@ param(
     [ValidateRange(0, [int]::MaxValue)][int]$TargetPid = 0,
     [ValidateRange(1, 2048)][int]$MinimumFreeGiB = 100,
     [ValidateRange(10, 300)][int]$CaptureTimeoutSeconds = 120,
-    [ValidateSet('none', 'stop-before-termination')]
+    [ValidateSet('none', 'stop-before-termination', 'cancel-identity-unavailable')]
     [string]$InternalTestFailurePoint = 'none',
     [switch]$Compact,
     [switch]$NoExit
@@ -337,11 +337,60 @@ function Get-OwnedProcDumpCapture($State) {
 }
 
 function Get-OwnedCancellation($State) {
+    $resolution = Resolve-OwnedCancellation $State
+    if ($resolution.state -eq 'owned') { return $resolution.process }
+    return $null
+}
+
+function Resolve-OwnedCancellation($State) {
     if (-not $State.PSObject.Properties['cancelState'] -or
         [string]$State.cancelState -ne 'cleanup-incomplete') {
-        return $null
+        return [pscustomobject]@{ state = 'not-pending'; process = $null }
     }
-    return Get-OwnedProcess $State 'cancelPid' 'cancelStartedUtc'
+    $pidValue = $State.PSObject.Properties['cancelPid']
+    $startedValue = $State.PSObject.Properties['cancelStartedUtc']
+    $hasPid = $pidValue -and $null -ne $pidValue.Value
+    $hasStarted = $startedValue -and $null -ne $startedValue.Value
+    if (-not $hasPid -and -not $hasStarted) {
+        return [pscustomobject]@{ state = 'not-pending'; process = $null }
+    }
+    if (-not $hasPid -or -not $hasStarted) {
+        return [pscustomobject]@{ state = 'unresolved'; process = $null }
+    }
+    if ($InternalTestFailurePoint -eq 'cancel-identity-unavailable') {
+        return [pscustomobject]@{ state = 'unresolved'; process = $null }
+    }
+    try {
+        $process = Get-Process -Id ([int]$pidValue.Value) -ErrorAction SilentlyContinue
+    }
+    catch {
+        return [pscustomobject]@{ state = 'unresolved'; process = $null }
+    }
+    if (-not $process) {
+        return [pscustomobject]@{ state = 'absent'; process = $null }
+    }
+    try {
+        $expectedValue = $startedValue.Value
+        $expected = if ($expectedValue -is [DateTime]) {
+            $expectedValue.ToUniversalTime()
+        } elseif ($expectedValue -is [DateTimeOffset]) {
+            $expectedValue.UtcDateTime
+        } else {
+            [DateTimeOffset]::Parse(
+                [string]$expectedValue,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind
+            ).UtcDateTime
+        }
+        $actual = $process.StartTime.ToUniversalTime()
+    }
+    catch {
+        return [pscustomobject]@{ state = 'unresolved'; process = $null }
+    }
+    if ($actual.ToFileTimeUtc() -ne $expected.ToFileTimeUtc()) {
+        return [pscustomobject]@{ state = 'replaced'; process = $null }
+    }
+    return [pscustomobject]@{ state = 'owned'; process = $process }
 }
 
 function Get-OwnedTarget($State) {
@@ -657,7 +706,9 @@ try {
         $monitor = Get-OwnedMonitor $owned.data
         $capture = Get-OwnedHangCapture $owned.data
         $procDumpCapture = Get-OwnedProcDumpCapture $owned.data
-        $cancellation = Get-OwnedCancellation $owned.data
+        $cancellationResolution = Resolve-OwnedCancellation $owned.data
+        $cancellation = $cancellationResolution.process
+        $cancellationPending = $cancellationResolution.state -in @('owned', 'unresolved')
         $ownedTarget = Get-OwnedTarget $owned.data
         $targets = if ($ownedTarget) { @($ownedTarget) } else { @() }
         $dumps = @(Get-ChildItem -LiteralPath (
@@ -678,14 +729,14 @@ try {
             ok = ($null -ne $monitor -or $null -ne $capture -or
                 $null -ne $procDumpCapture -or
                 $null -ne $validatedCompletion
-            ) -and $null -eq $cancellation
+            ) -and -not $cancellationPending
             command = 'status'
             timestampUtc = [DateTime]::UtcNow.ToString('o')
             state = if ($capture -or $procDumpCapture) {
                 if ($persistedCaptureState -eq 'hash-pending') {
                     'hash-pending'
                 } else { 'capture-running' }
-            } elseif ($cancellation) {
+            } elseif ($cancellationPending) {
                 'cleanup-incomplete'
             } elseif ($validatedCompletion) {
                 'capture-complete'
@@ -693,13 +744,15 @@ try {
                 'capture-evidence-partial'
             } elseif (-not $monitor) {
                 'monitor-exited'
-            } elseif ($targets.Count -gt 0) {
+            } elseif (@($targets).Count -gt 0) {
                 'armed-attached'
             } else {
                 'armed-waiting'
             }
             checks = @()
-            errors = if ($cancellation) {
+            errors = if ($cancellationResolution.state -eq 'unresolved') {
+                @('The pending ProcDump cancellation helper identity cannot be verified; recovery remains blocked.')
+            } elseif ($cancellation) {
                 @('The owned ProcDump cancellation helper is still running.')
             } elseif ($monitor -or $capture -or $procDumpCapture -or
                 $validatedCompletion) {
@@ -727,11 +780,19 @@ try {
                 targetStartedUtc = if ($ownedTarget) {
                     $ownedTarget.StartTime.ToUniversalTime().ToString('o')
                 } else { $null }
-                cancelPid = if ($cancellation) { $cancellation.Id } else { $null }
+                cancelPid = if ($cancellationPending) {
+                    [int]$owned.data.cancelPid
+                } else { $null }
+                cancelStartedUtc = if ($cancellationPending) {
+                    [string]$owned.data.cancelStartedUtc
+                } else { $null }
+                cancellationIdentityState = $cancellationResolution.state
                 captureDirectory = [string]$owned.data.captureDirectory
                 coverageActive = $null -ne $monitor
                 captureActive = $null -ne $capture -or $null -ne $procDumpCapture
-                activeProcessKind = if ($cancellation) {
+                activeProcessKind = if ($cancellationResolution.state -eq 'unresolved') {
+                    'cancellation-helper-unresolved'
+                } elseif ($cancellation) {
                     'cancellation-helper'
                 } elseif ($capture) {
                     'hang-capture-worker'
@@ -765,14 +826,15 @@ try {
     }
     elseif ($Command -eq 'capture-hang') {
         $owned = Read-OwnedState
-        $existingCancellation = Get-OwnedCancellation $owned.data
-        if ($existingCancellation) {
+        $existingCancellationResolution = Resolve-OwnedCancellation $owned.data
+        $existingCancellation = $existingCancellationResolution.process
+        if ($existingCancellationResolution.state -in @('owned', 'unresolved')) {
             $failureData = [pscustomobject][ordered]@{
                 statePath = $owned.path
-                cancelPid = $existingCancellation.Id
-                cancelStartedUtc = $existingCancellation.StartTime.
-                    ToUniversalTime().ToString('o')
+                cancelPid = [int]$owned.data.cancelPid
+                cancelStartedUtc = [string]$owned.data.cancelStartedUtc
                 cancelState = 'cleanup-incomplete'
+                cancellationIdentityState = $existingCancellationResolution.state
             }
             throw 'An unresolved owned ProcDump cancellation helper must be stopped before capture-hang.'
         }
@@ -942,7 +1004,18 @@ try {
         $monitor = Get-OwnedMonitor $owned.data
         $capture = Get-OwnedHangCapture $owned.data
         $procDumpCapture = Get-OwnedProcDumpCapture $owned.data
-        $cancellation = Get-OwnedCancellation $owned.data
+        $cancellationResolution = Resolve-OwnedCancellation $owned.data
+        $cancellation = $cancellationResolution.process
+        if ($cancellationResolution.state -eq 'unresolved') {
+            $failureData = [pscustomobject][ordered]@{
+                statePath = $owned.path
+                cancelPid = [int]$owned.data.cancelPid
+                cancelStartedUtc = [string]$owned.data.cancelStartedUtc
+                cancelState = 'cleanup-incomplete'
+                cancellationIdentityState = 'unresolved'
+            }
+            throw 'The pending ProcDump cancellation helper identity cannot be verified; cleanup remains blocked.'
+        }
         $ownedProcess = if ($cancellation) {
             $cancellation
         } elseif ($capture) {
