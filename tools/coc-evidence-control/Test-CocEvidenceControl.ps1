@@ -245,6 +245,7 @@ $fixture = Join-Path ([IO.Path]::GetTempPath()) (
 $capture = $null
 $monitorFixture = $null
 $cancelFixture = $null
+$partialCancelFixture = $null
 try {
     New-Item -ItemType Directory -Path $fixture | Out-Null
     $pwsh = (Get-Process -Id $PID).Path
@@ -381,6 +382,34 @@ try {
         throw 'Confirmed cancellation-helper PID reuse did not release recovery admission.'
     }
 
+    $partialCancelFixture = [Diagnostics.Process]::Start($startInfo)
+    $state.cancelPid = $partialCancelFixture.Id
+    $state.cancelStartedUtc = $null
+    $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8
+    $partialStatus = & $scriptPath status -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    $partialCapture = & $scriptPath capture-hang -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    $partialStop = & $scriptPath stop -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if ($partialStatus.ok -or $partialStatus.state -ne 'cleanup-incomplete' -or
+        $partialStatus.data.cancellationIdentityState -ne 'unresolved' -or
+        $partialCapture.ok -or $partialStop.ok -or
+        $partialCapture.data.cancellationIdentityState -ne 'unresolved' -or
+        $partialStop.data.cancellationIdentityState -ne 'unresolved' -or
+        -not (Get-Process -Id $partialCancelFixture.Id -ErrorAction SilentlyContinue)) {
+        throw 'A live cancellation helper with a missing initial timestamp did not retain unresolved recovery authority.'
+    }
+    $partialCancelFixture.Kill()
+    $partialCancelFixture.WaitForExit()
+    $partialAbsentStatus = & $scriptPath status -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if (-not $partialAbsentStatus.ok -or
+        $partialAbsentStatus.data.cancellationIdentityState -ne 'absent' -or
+        $partialAbsentStatus.data.activeProcessKind -ne 'crash-monitor') {
+        throw 'Confirmed absence did not reconcile a cancellation record whose initial timestamp was unavailable.'
+    }
+
     $state.cancelPid = $cancelFixture.Id
     $state.cancelStartedUtc = $cancelFixture.StartTime.ToUniversalTime().ToString('o')
     $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8
@@ -449,6 +478,33 @@ try {
     if ([string]$afterCancellation.cancelState -ne 'exited' -or
         [int]$afterCancellation.monitorPid -ne $monitorFixture.Id) {
         throw 'Cancellation recovery overwrote unresolved monitor ownership.'
+    }
+
+    $cancelFixture = [Diagnostics.Process]::Start($startInfo)
+    $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $state.cancelPid = $cancelFixture.Id
+    $state.cancelStartedUtc = $cancelFixture.StartTime.ToUniversalTime().ToString('o')
+    $state.cancelState = 'cleanup-incomplete'
+    $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8
+    $uninspectableMonitorCleanup = & $scriptPath stop -StatePath $statePath `
+        -InternalTestFailurePoint monitor-identity-unavailable -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    $afterUninspectableMonitor = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    if ($uninspectableMonitorCleanup.ok -or
+        $uninspectableMonitorCleanup.state -ne 'cleanup-incomplete' -or
+        $uninspectableMonitorCleanup.data.processKind -ne 'cancellation-helper' -or
+        'crash-monitor' -notin @($uninspectableMonitorCleanup.data.unresolvedProcessKinds) -or
+        [string]$afterUninspectableMonitor.cancelState -ne 'exited' -or
+        (Get-Process -Id $cancelFixture.Id -ErrorAction SilentlyContinue) -or
+        -not (Get-Process -Id $monitorFixture.Id -ErrorAction SilentlyContinue)) {
+        throw 'Successful cancellation-helper stop hid an unresolved monitor obligation.'
+    }
+    $recoveredMonitor = & $scriptPath status -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if (-not $recoveredMonitor.ok -or
+        $recoveredMonitor.data.activeProcessKind -ne 'crash-monitor' -or
+        -not (Get-Process -Id $monitorFixture.Id -ErrorAction SilentlyContinue)) {
+        throw 'Restored monitor identity inspection did not recover exact lifetime authority.'
     }
     $monitorFixture.Kill()
     $monitorFixture.WaitForExit()
@@ -553,7 +609,7 @@ try {
     }
 }
 finally {
-    foreach ($process in @($cancelFixture, $monitorFixture)) {
+    foreach ($process in @($partialCancelFixture, $cancelFixture, $monitorFixture)) {
         if ($process -and -not $process.HasExited) {
             $process.Kill()
             $process.WaitForExit()
