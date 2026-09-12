@@ -27,6 +27,8 @@ param(
     [int]$PollMilliseconds = 250,
     [ValidateRange(0, 10)]
     [int]$MaxTransientRetries = 4,
+    [ValidateRange(1, 10)]
+    [int]$MaxSessionRebinds = 3,
     [ValidateRange(1, 3600)]
     [int]$RequestTimeoutSeconds = 15,
     [ValidateRange(50, 5000)]
@@ -67,6 +69,8 @@ $headers = $null
 $runtimeIdentity = $null
 $transportRetries = [Collections.Generic.List[object]]::new()
 $ownedMcpSessions = [Collections.Generic.List[object]]::new()
+$mcpSessionInvalidationCount = 0
+$lastSuccessfulWaitObservation = $null
 $invocationEvidencePath = $null
 $invocationRecord = $null
 $operationStartedUtc = [DateTime]::UtcNow
@@ -404,10 +408,19 @@ function Invoke-McpRequest {
                 throw $indeterminate
             }
             if ($Command -eq 'wait' -and $statusCode -eq 404 -and $Headers.ContainsKey('Mcp-Session-Id')) {
+                $script:mcpSessionInvalidationCount++
                 $transportRetries.Add([pscustomobject][ordered]@{
                     attempt = $attempt; statusCode = $statusCode; delayMilliseconds = 0
-                    recovery = 'mcp-session-reinitialized-full-runtime-rebind-required'; message = $_.Exception.Message; timestampUtc = [DateTime]::UtcNow.ToString('o')
+                    recovery = 'mcp-session-reinitialized-full-runtime-rebind-required'
+                    sessionInvalidationCount = $script:mcpSessionInvalidationCount
+                    message = $_.Exception.Message; timestampUtc = [DateTime]::UtcNow.ToString('o')
                 })
+                if ($script:mcpSessionInvalidationCount -ge $MaxSessionRebinds) {
+                    $persistent = [InvalidOperationException]::new("DevBench MCP session was invalidated $($script:mcpSessionInvalidationCount) times during one bounded wait; refusing to consume the remaining deadline through persistent session churn.", $_.Exception)
+                    $persistent.Data['DevBenchPersistentSessionInvalidation'] = $true
+                    $persistent.Data['DevBenchSessionInvalidationCount'] = $script:mcpSessionInvalidationCount
+                    throw $persistent
+                }
                 throw
             }
             if (-not $transient -or $attempt -gt $MaxTransientRetries) { throw }
@@ -753,7 +766,6 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
     if ($health -and $listenerPid -and [int]$health.pid -ne $listenerPid) { $errors.Add("DevBench health PID $($health.pid) differs from listener PID $listenerPid.") }
     if ($null -ne $expectations.pid -and $listenerPid -and $expectations.pid -ne $listenerPid) { $errors.Add("Runtime metadata PID $($expectations.pid) differs from listener PID $listenerPid.") }
     if ($null -ne $expectations.pid -and $health -and $expectations.pid -ne [int]$health.pid) { $errors.Add("Runtime metadata PID $($expectations.pid) differs from DevBench health PID $($health.pid).") }
-    if ($expectations.exe -and $health -and [string]$health.exe -ne $expectations.exe) { $errors.Add("Runtime metadata executable '$($expectations.exe)' differs from DevBench health executable '$($health.exe)'.") }
     $processIdentity = $null
     if ($listenerPid) {
         try {
@@ -767,6 +779,12 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
             }
         }
         catch { $errors.Add("Could not inspect DevBench listener process PID ${listenerPid}: $($_.Exception.Message)") }
+    }
+    if ($expectations.exe -and $health -and -not (Test-DevBenchExecutableIdentityMatch -Expected $expectations.exe -Actual ([string]$health.exe))) {
+        $errors.Add("Runtime metadata executable '$($expectations.exe)' differs from DevBench health executable '$($health.exe)'.")
+    }
+    if ($expectations.exe -and $processIdentity -and $processIdentity.path -and -not (Test-DevBenchExecutableIdentityMatch -Expected $expectations.exe -Actual ([string]$processIdentity.path))) {
+        $errors.Add("Runtime metadata executable '$($expectations.exe)' differs from listener process executable '$($processIdentity.path)'.")
     }
 
     $registrySources = [Collections.Generic.List[object]]::new()
@@ -1359,6 +1377,16 @@ try {
                 }
                 if ($service -and $service.terminalFailure) { break }
             }
+            $observationProbeError = if ($observation -and $observation.PSObject.Properties['probeError']) {
+                [string]$observation.probeError
+            }
+            elseif ($observation -and $observation.PSObject.Properties['service'] -and $observation.service -and $observation.service.PSObject.Properties['probeError']) {
+                [string]$observation.service.probeError
+            }
+            else { $null }
+            if ($observation -and [string]::IsNullOrWhiteSpace($observationProbeError)) {
+                $lastSuccessfulWaitObservation = $observation
+            }
             if ($observation.satisfied) { break }
             Start-OperationDelay -RequestedMilliseconds $currentDelay
             if ($Condition -in @('toolAvailable', 'serviceReady')) { $currentDelay = [Math]::Min($MaxPollMilliseconds, $currentDelay * 2) }
@@ -1418,15 +1446,19 @@ try {
     }
 }
 catch {
-    $failureMessage = $_.Exception.Message
-    $indeterminateMutation = [bool]$_.Exception.Data['DevBenchIndeterminateMutation']
+    $caughtException = $_.Exception
+    $failureMessage = $caughtException.Message
+    $indeterminateMutation = [bool]$caughtException.Data['DevBenchIndeterminateMutation']
+    $persistentSessionInvalidation = [bool]$caughtException.Data['DevBenchPersistentSessionInvalidation']
+    $failureState = if ($indeterminateMutation) { 'indeterminate' } elseif ($persistentSessionInvalidation) { 'persistent-session-invalidated' } else { 'failed' }
+    $failureData = if ($persistentSessionInvalidation) { [pscustomobject][ordered]@{ sessionInvalidationCount = [int]$caughtException.Data['DevBenchSessionInvalidationCount']; maxSessionRebinds = $MaxSessionRebinds; lastSuccessfulObservation = $lastSuccessfulWaitObservation } } else { $null }
     if ($invocationRecord -and $invocationRecord.state -ne 'guard-rejected') {
-        try { Update-InvocationEvidence -State $(if ($indeterminateMutation) { 'indeterminate' } else { 'failed' }) -Errors @($failureMessage) } catch { $failureMessage = "$failureMessage Evidence update also failed: $($_.Exception.Message)" }
+        try { Update-InvocationEvidence -State $failureState -Data $failureData -Errors @($failureMessage) } catch { $failureMessage = "$failureMessage Evidence update also failed: $($_.Exception.Message)" }
     }
     $result = [pscustomobject][ordered]@{
         ok = $false
         transportOk = $false
-        state = if ($indeterminateMutation) { 'indeterminate-mutation' } else { 'failed' }
+        state = if ($indeterminateMutation) { 'indeterminate-mutation' } elseif ($persistentSessionInvalidation) { 'persistent-session-invalidated' } else { 'failed' }
         indeterminate = $indeterminateMutation
         command = $Command
         endpoint = $endpoint
@@ -1440,7 +1472,7 @@ catch {
         requestTimeoutSeconds = $script:requestTimeoutSecondsForRpc
         operationTimeoutSeconds = $effectiveOperationTimeoutSeconds
         operationDeadlineUtc = $script:operationDeadlineUtc.ToString('o')
-        data = $null
+        data = $failureData
         errors = @($failureMessage)
     }
 }

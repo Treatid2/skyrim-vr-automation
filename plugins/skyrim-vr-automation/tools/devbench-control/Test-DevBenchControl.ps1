@@ -376,6 +376,10 @@ Assert-Test ($expectations.port -eq 8921 -and $expectations.pid -eq 123 -and $ex
 Assert-Test ($expectations.buildId -eq 'build-1' -and $expectations.artifactPath -like '*CommunityShaders.dll' -and $expectations.artifactSha256 -eq 'ABC') 'runtime expectations preserve build and deployed artifact identity'
 $legacy = Get-DevBenchRuntimeExpectations -Runtime ([pscustomobject]@{ port = 8921 })
 Assert-Test ($null -eq $legacy.pid -and $null -eq $legacy.exe) 'legacy port-only runtime metadata remains supported'
+Assert-Test (Test-DevBenchExecutableIdentityMatch -Expected 'D:\SteamLibrary\steamapps\common\SkyrimVR\SkyrimVR.exe' -Actual 'SkyrimVR.exe') 'canonical runtime executable paths match the health basename'
+Assert-Test (Test-DevBenchExecutableIdentityMatch -Expected 'SkyrimVR.exe' -Actual 'D:\SteamLibrary\steamapps\common\SkyrimVR\SkyrimVR.exe') 'health and process executable comparison is symmetric across path and basename forms'
+Assert-Test (-not (Test-DevBenchExecutableIdentityMatch -Expected 'D:\SteamLibrary\steamapps\common\SkyrimVR\SkyrimVR.exe' -Actual 'OtherGame.exe')) 'different executable basenames remain rejected'
+Assert-Test (-not (Test-DevBenchExecutableIdentityMatch -Expected 'D:\One\SkyrimVR.exe' -Actual 'E:\Two\SkyrimVR.exe')) 'two canonical executable paths must identify the same location'
 
 $versionedTool = [pscustomobject]@{
     name = 'communityshaders.profiler'
@@ -429,12 +433,14 @@ Assert-Test ($entryPointText -match '\$requestedAction -eq ''disable''[\s\S]{0,1
 Assert-Test ($entryPointText -match 'outcome = ''profiler-contract-satisfied''') 'accepted profiler responses report their contract-specific outcome'
 Assert-Test ($entryPointText -match 'Invoke-ToolRpc -Name \$Tool -Arguments \$arguments -Headers \$headers -Mutation:\(-not \$readOnlyCall\)') 'user calls carry their explicit retry-safety classification'
 Assert-Test ($entryPointText -match 'not-retried-indeterminate') 'ambiguous mutation transport failures are not replayed'
-Assert-Test ($entryPointText -match 'Update-InvocationEvidence -State \$\(if \(\$indeterminateMutation\) \{ ''indeterminate'' \}') 'indeterminate mutation outcomes are durably journaled'
+Assert-Test ($entryPointText -match 'failureState = if \(\$indeterminateMutation\) \{ ''indeterminate'' \}' -and $entryPointText -match 'Update-InvocationEvidence -State \$failureState') 'indeterminate mutation outcomes are durably journaled'
 Assert-Test ($entryPointText -match '\$headers = \$null[\s\S]{0,300}probeError') 'wait probe transport failures force full session and identity rebind'
 Assert-Test ($entryPointText -match '-TimeoutSec \(Get-RequestTimeoutSeconds\)') 'wait requests consume only their remaining operation budget'
 Assert-Test ($entryPointText -match '\$operationStartedUtc = \[DateTime\]::UtcNow' -and $entryPointText -match '\$operationDeadlineUtc = \$operationStartedUtc.AddSeconds\(\$TimeoutSeconds\)' -and $entryPointText -notmatch '\[Math\]::Min\(15,') 'blocking calls use the declared operation budget instead of a fixed 15-second transport cap'
 Assert-Test ($entryPointText -notmatch 'Start-Sleep -Milliseconds \$currentDelay') 'wait poll delays cannot exceed the operation deadline'
 Assert-Test ($entryPointText -match 'mcp-session-reinitialized') 'bounded waits reinitialize invalidated MCP sessions'
+Assert-Test ($entryPointText -match '\[int\]\$MaxSessionRebinds = 3' -and $entryPointText -match 'DevBenchPersistentSessionInvalidation') 'bounded waits terminate repeated MCP session churn before exhausting the full outer deadline'
+Assert-Test ($entryPointText -match "persistentSessionInvalidation\) \{ 'persistent-session-invalidated'" -and $entryPointText -match 'lastSuccessfulObservation = \$lastSuccessfulWaitObservation' -and $entryPointText -match 'Update-InvocationEvidence -State \$failureState -Data \$failureData') 'persistent session invalidation returns and journals a distinct state with the last successfully decoded observation'
 Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$Command -eq ''wait''\)') 'unsatisfied waits fail even without RequireSuccess'
 Assert-Test ($entryPointText -match 'function Close-McpSession') 'entry point defines deterministic MCP session cleanup'
 Assert-Test ($entryPointText -match '-Method Delete') 'owned MCP sessions are closed through the server lifecycle endpoint'

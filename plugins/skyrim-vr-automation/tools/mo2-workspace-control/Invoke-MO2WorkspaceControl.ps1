@@ -1211,34 +1211,30 @@ try {
         $sourceSnapshot = Get-ProfileSnapshot -Path $sourcePath
         $sourceSaveSnapshot = Get-SaveTreeSnapshot -ProfilePath $sourcePath
         $initialMods = @(Get-ChildItem -LiteralPath $modsRoot -Directory -Force | Select-Object -ExpandProperty Name | Sort-Object)
-        try {
-            # Every fresh clone must inherit one known-good route into the game
-            # world. SavePolicy controls later test authorization, not whether
-            # the maintained source has exact static integrity evidence to seed
-            # task profiles. Runtime world-entry qualification is a separate
-            # observation and is never inferred from hashes alone.
-            $worldEntryFixture = Resolve-VerifiedSaveFixture -Config $config -SourceName $sourceName -SourcePath $sourcePath -SourceSnapshot $sourceSnapshot -RequestedManifestPath $FixtureManifestPath -RequestedFixtureId ''
-        }
-        catch {
-            throw "Fresh workspace creation requires a valid default world-entry save in the maintained source profile. Run fixture-status and repair defaults.newGameFixtureManifest before cloning. $($_.Exception.Message)"
-        }
+        $worldEntryFixture = $null
         $fixture = $null
         if ($SavePolicy -eq 'VerifiedFixture') {
-            $fixture = if ([string]::IsNullOrWhiteSpace($FixtureId)) {
-                $worldEntryFixture
-            } else {
-                Resolve-VerifiedSaveFixture -Config $config -SourceName $sourceName -SourcePath $sourcePath -SourceSnapshot $sourceSnapshot -RequestedManifestPath $FixtureManifestPath -RequestedFixtureId $FixtureId
+            try {
+                $worldEntryFixture = Resolve-VerifiedSaveFixture -Config $config -SourceName $sourceName -SourcePath $sourcePath -SourceSnapshot $sourceSnapshot -RequestedManifestPath $FixtureManifestPath -RequestedFixtureId ''
+                $fixture = if ([string]::IsNullOrWhiteSpace($FixtureId)) {
+                    $worldEntryFixture
+                } else {
+                    Resolve-VerifiedSaveFixture -Config $config -SourceName $sourceName -SourcePath $sourcePath -SourceSnapshot $sourceSnapshot -RequestedManifestPath $FixtureManifestPath -RequestedFixtureId $FixtureId
+                }
+            }
+            catch {
+                throw "VerifiedFixture workspace creation requires a valid declared save in the maintained source profile. Run fixture-status and repair defaults.newGameFixtureManifest before cloning. $($_.Exception.Message)"
             }
         }
         $manifest = [pscustomobject][ordered]@{
-            contractVersion = '2.2.0'; workspaceId = $workspaceId; ownershipId = $ownershipId; ownerTaskId = $resolvedTaskId; accessId = $AccessId; status = 'creating'; acquisitionDisposition = 'fresh-clone'
+            contractVersion = '2.3.0'; workspaceId = $workspaceId; ownershipId = $ownershipId; ownerTaskId = $resolvedTaskId; accessId = $AccessId; status = 'creating'; acquisitionDisposition = 'fresh-clone'
             leaseHistory = @([pscustomobject][ordered]@{ accessId = $AccessId; acquiredForWorkspaceUtc = [DateTime]::UtcNow.ToString('o'); disposition = 'created' })
             label = $Label; createdUtc = [DateTime]::UtcNow.ToString('o'); sourceProfile = $sourceName
             sourceProfileName = $sourceName; sourceProfilePath = $sourcePath; sourceProfileDirectory = $sourcePath; sourceSnapshot = $sourceSnapshot
             profile = $profileName; profilePath = $profilePath; profileName = $profileName; profileDirectory = $profilePath; modListPath = (Join-Path $profilePath 'modlist.txt')
-            savePolicy = $SavePolicy; fixtureManifestPath = [string]$worldEntryFixture.manifestPath
+            savePolicy = $SavePolicy; fixtureManifestPath = $(if ($worldEntryFixture) { [string]$worldEntryFixture.manifestPath } else { $null })
             worldEntryFixture = $worldEntryFixture; sourceIntegrity = [pscustomobject][ordered]@{
-                integrityVerified = $true; runtimeQualified = $false; scope = 'fresh-clone-source'; fixtureId = [string]$worldEntryFixture.id
+                integrityVerified = $true; runtimeQualified = $false; scope = 'fresh-clone-source'; fixtureId = $(if ($worldEntryFixture) { [string]$worldEntryFixture.id } else { $null })
                 profileFingerprintSha256 = [string]$sourceSnapshot.sha256; cloneVerifiedUtc = [DateTime]::UtcNow.ToString('o')
                 runtimeQualificationEvidence = $null
                 warranty = 'Exact source and save bytes were verified at clone creation. This does not assert a live game load. Resumed task profiles are preserved as-is and are not reverified after task edits.'
@@ -1252,7 +1248,7 @@ try {
             }
             runtimeRoute = $runtimeRoute; runtimeRouteApplication = $null; runtimeRouteAdmission = $null
             creationJournalPath = $creationJournalPath
-            saveGuidance = 'Every fresh clone requires and copies an integrity-verified default world-entry fixture plus the complete source saves tree. Static integrity does not assert a successful live load. MainMenuOnly and FreshGame still describe test authorization; use VerifiedFixture for an exact declared load target. Resumed profiles are preserved without save reverification. See docs/BREEZEHOME-SAVE.md.'
+            saveGuidance = 'Every fresh clone copies and verifies the complete source saves tree. MainMenuOnly and FreshGame do not require or authorize a world-entry fixture; VerifiedFixture requires and verifies its exact declared load target. Static integrity does not assert a successful live load. Resumed profiles are preserved without save reverification. See docs/BREEZEHOME-SAVE.md.'
             ownershipRule = 'The workspace may change only its cloned profile and mods it created and registered. Existing shared mod directories are immutable; profile-local enable/disable markers are allowed.'
         }
         if ($PSCmdlet.ShouldProcess($profilePath, "clone stable MO2 profile '$sourceName' including its complete saves tree")) {
@@ -1304,8 +1300,8 @@ try {
                     $profileSaveSnapshot = Get-SaveTreeSnapshot -ProfilePath $profilePath
                     if ([string]$profileSaveSnapshot.sha256 -cne [string]$sourceSaveSnapshot.sha256 -or [int]$profileSaveSnapshot.fileCount -ne [int]$sourceSaveSnapshot.fileCount) { throw 'Complete source save-tree copy verification failed.' }
                     $manifest | Add-Member -NotePropertyName profileSaveSnapshot -NotePropertyValue $profileSaveSnapshot -Force
-                    $fixturesToVerify = @($worldEntryFixture)
-                    if ($fixture -and [string]$fixture.id -cne [string]$worldEntryFixture.id) { $fixturesToVerify += $fixture }
+                    $fixturesToVerify = if ($worldEntryFixture) { @($worldEntryFixture) } else { @() }
+                    if ($fixture -and $worldEntryFixture -and [string]$fixture.id -cne [string]$worldEntryFixture.id) { $fixturesToVerify += $fixture }
                     foreach ($copyFixture in $fixturesToVerify) {
                         $targetSaves = [IO.Path]::GetFullPath((Join-Path $profilePath 'saves'))
                         foreach ($file in @($copyFixture.files)) {
@@ -1317,7 +1313,7 @@ try {
                             Assert-TreeOperationBudget -Purpose 'Copied world-entry fixture verification'
                         }
                     }
-                    $manifest | Add-Member -NotePropertyName copiedWorldEntrySave -NotePropertyValue $true -Force
+                    $manifest | Add-Member -NotePropertyName copiedWorldEntrySave -NotePropertyValue ($null -ne $worldEntryFixture) -Force
                     if ($fixture) { $manifest | Add-Member -NotePropertyName copiedVerifiedSaves -NotePropertyValue $true -Force }
                     $manifest | Add-Member -NotePropertyName profileSnapshot -NotePropertyValue (Get-ProfileSnapshot -Path $profilePath) -Force
                     $selection = Set-MO2SelectedProfile -Config $config -TargetProfile $profileName -Operation 'select-created-task-workspace' -EvidenceRoot $selectionEvidence

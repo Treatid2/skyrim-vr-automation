@@ -184,6 +184,12 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test ($unlockDialogKind -eq 'unlock-required') 'Unlock dialog is classified structurally even when titled with a child executable'
     $failedRunDialogKind = & (Get-Module MO2Control) { Get-MO2KnownDialogKind -Title 'Mod Organizer' -Texts @('Failed to run SkyrimVR.exe') -Buttons @([pscustomobject]@{name='OK'}) }
     Assert-MO2Test ($failedRunDialogKind -eq 'failed-to-run') 'retained failed-to-run dialog is classified without matching the main window'
+    $preparingVfsKind = & (Get-Module MO2Control) { Get-MO2KnownDialogKind -Title 'Mod Organizer' -Texts @('Preparing vfs') -Buttons @([pscustomobject]@{name='Cancel'}) }
+    Assert-MO2Test ($preparingVfsKind -eq 'preparing-vfs') 'Preparing vfs is classified only with one exact Cancel control'
+    $preparingVfsWithoutCancel = & (Get-Module MO2Control) { Get-MO2KnownDialogKind -Title 'Mod Organizer' -Texts @('Preparing vfs') -Buttons @() }
+    Assert-MO2Test ($null -eq $preparingVfsWithoutCancel) 'Preparing vfs text without an exact Cancel control is not actioned'
+    $cancelWithoutPreparingVfs = & (Get-Module MO2Control) { Get-MO2KnownDialogKind -Title 'Mod Organizer' -Texts @('Ready') -Buttons @([pscustomobject]@{name='Cancel'}) }
+    Assert-MO2Test ($null -eq $cancelWithoutPreparingVfs) 'an unrelated Cancel control is not classified as a VFS stall'
     $transientWindow = [pscustomobject]@{ callCount = 0 }
     $transientWindow | Add-Member -MemberType ScriptMethod -Name FindAll -Value {
         param($scope, $condition)
@@ -509,6 +515,12 @@ selected_profile=@ByteArray(Codex)
     $releaseDryRun = Invoke-MO2Release -Config $config -SessionId $sessionId -WhatIf
     Assert-MO2Test ($releaseDryRun.ok -and $releaseDryRun.state -eq 'dry-run') 'release dry-run succeeds'
     Assert-MO2Test (Test-Path -LiteralPath $config.session.lockFile -PathType Leaf) 'release dry-run retains lock'
+    '{}' | Set-Content -LiteralPath $buildData -Encoding utf8
+    $closeWithStrandedBuildData = Invoke-MO2Close -Config $config -SessionId $sessionId
+    Assert-MO2Test (-not $closeWithStrandedBuildData.ok -and $closeWithStrandedBuildData.state -eq 'rootbuilder-recovery-required' -and $closeWithStrandedBuildData.data.activeBuildData.Count -eq 1) 'close does not report success for a closed owner with stranded RootBuilder BuildData'
+    $releaseWithStrandedBuildData = Invoke-MO2Release -Config $config -SessionId $sessionId -WhatIf
+    Assert-MO2Test (-not $releaseWithStrandedBuildData.ok -and $releaseWithStrandedBuildData.state -eq 'rootbuilder-recovery-required' -and $releaseWithStrandedBuildData.data.activeBuildData.Count -eq 1) 'release retains session ownership while RootBuilder BuildData remains active'
+    Remove-Item -LiteralPath $buildData -Force
     $released = Invoke-MO2Release -Config $config -SessionId $sessionId
     Assert-MO2Test ($released.ok -and $released.state -eq 'session-released-access-retained' -and $released.data.sessionRetained) 'release retires the session, retains evidence, and returns the explicit lease to access-only state'
     $releasedSessionAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $sessionAccessId
@@ -551,6 +563,9 @@ selected_profile=@ByteArray(Codex)
                 Set-Item -Path Function:script:Test-MO2InteractiveDesktop -Value { $true }
                 Set-Item -Path Function:script:Invoke-MO2CooperativeClose -Value {
                     param($Config, $InitialProcesses, $EvidenceDirectory, $TimeoutSeconds)
+                    foreach ($record in @($InitialProcesses)) {
+                        Stop-Process -Id ([int]$record.id) -Force -ErrorAction SilentlyContinue
+                    }
                     [pscustomobject][ordered]@{
                         closed = $true
                         initialProcesses = @($InitialProcesses)

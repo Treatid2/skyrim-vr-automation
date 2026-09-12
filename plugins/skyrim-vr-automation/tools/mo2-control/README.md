@@ -46,6 +46,13 @@ performs one recorded exact-profile launch; the caller then uses normal `stop`
 so RootBuilder can restore its deployment through the exact Unlock path. It
 never deletes deployment data.
 
+Cooperative `close`, `recover-close`, and `stop` also recognize a structurally
+matched `Preparing vfs` window with exactly one `Cancel` control. They invoke
+only that exact control, retain the action in the session receipt, and still
+require both owned-process shutdown and removal of active `BuildData.json`
+before reporting success or allowing release. A stranded transaction remains
+`rootbuilder-recovery-required`; the controller never deletes it directly.
+
 Validation also resolves a registered executable stored under MO2's `mods`
 directory back to its owning mod. Launch is blocked when that exact mod is
 disabled, missing, or ambiguous in the requested profile.

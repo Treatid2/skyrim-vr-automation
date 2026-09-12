@@ -46,10 +46,10 @@ are:
    `request-access`, retain its exact `accessId`, and respect `access-busy`.
    An estimated duration is advisory only and never permits lease stealing.
    Use workspace `list-task -TaskId` to discover retained state. On the first
-   request, run `prepare-source`, require `fixture-status` to report
-   `fixture-valid`, and then run `create -TaskId`; the primary profile, its
-   complete save tree, and the mandatory default world-entry save are cloned,
-   verified, and selected. On later requests, require an explicit
+   request, run `prepare-source`, then run `create -TaskId`; the primary profile
+   and its complete save tree are cloned and verified. Require `fixture-status`
+   to report `fixture-valid` only when creating with `VerifiedFixture`. On later
+   requests, require an explicit
    `resume -TaskId -WorkspaceId` or fresh `create -TaskId`. Never silently
    replace, refresh, or requalify a retained profile after task-local edits.
    Before fresh creation, run `list-local-work-mods`; pass
@@ -84,10 +84,9 @@ are:
    Pass the exact profile returned by the task workspace rather than accepting
    the ordinary configured session default.
    Every fresh task profile receives a verified copy of the stable source
-   profile's complete saves tree and mandatory default world-entry fixture.
-   This makes saves available but does not authorize their use: respect
-   `SavePolicy`, and use only a declared `VerifiedFixture` as a deterministic
-   automation baseline. A resumed task profile is preserved as-is; never claim
+   profile's complete saves tree. This makes saves available but does not
+   authorize their use: respect `SavePolicy`, and require/select a declared
+   fixture only for `VerifiedFixture`. A resumed task profile is preserved as-is; never claim
    its save remains working after the task has changed its profile.
    When the test requires a deterministic new-game baseline, create the
    workspace with `-SavePolicy VerifiedFixture`. Use the returned fixture ID
