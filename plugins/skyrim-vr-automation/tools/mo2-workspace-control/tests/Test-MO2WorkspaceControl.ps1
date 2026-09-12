@@ -124,6 +124,8 @@ try {
     if (-not $noLocalWorkStatus.ok -or $noLocalWorkStatus.state -ne 'catalog-not-configured' -or $noLocalWorkStatus.data.availableCount -ne 0) { throw 'A missing optional catalog did not preserve the modlist-only discovery contract.' }
     $boundedStatus = & $entry fixture-status -ConfigPath $configPath -MaxProfileFiles 2 -Compact -NoExit | ConvertFrom-Json
     if ($boundedStatus.ok -or $boundedStatus.errors[0] -notmatch 'maximum file count') { throw 'Profile traversal did not enforce its declared file-count bound.' }
+    $entryPointText = Get-Content -LiteralPath $entry -Raw
+    if ($entryPointText -notmatch '\[int\]\$MaxProfileFiles\s*=\s*100000') { throw 'Workspace traversal did not retain the representative maintained-profile file-count default.' }
     $deadlineStatus = & $entry fixture-status -ConfigPath $configPath -InternalTestFailurePoint tree-operation-deadline -Compact -NoExit | ConvertFrom-Json
     if ($deadlineStatus.ok -or $deadlineStatus.errors[0] -notmatch 'shared .*tree-operation deadline') { throw 'Profile traversal did not enforce its shared total deadline.' }
     if (-not $fixtureStatus.data.approval.reusableApprovalEligible -or @($fixtureStatus.data.approval.reusablePrefix).Count -ne 6 -or $fixtureStatus.data.approval.reusablePrefix[4] -ne [IO.Path]::GetFullPath($entry) -or $fixtureStatus.data.approval.reusablePrefix[5] -ne 'fixture-status') { throw 'Fixture status did not expose its exact reusable approval prefix.' }

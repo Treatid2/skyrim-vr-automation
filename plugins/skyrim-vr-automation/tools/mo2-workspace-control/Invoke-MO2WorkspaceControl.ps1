@@ -32,7 +32,7 @@ param(
     [ValidateRange(100, 60000)]
     [int]$TransactionLockTimeoutMilliseconds = 10000,
     [ValidateRange(1, 100000)]
-    [int]$MaxProfileFiles = 20000,
+    [int]$MaxProfileFiles = 100000,
     [ValidateRange(1, 20000)]
     [int]$MaxProfileDirectories = 4096,
     [ValidateRange(1, 64)]
