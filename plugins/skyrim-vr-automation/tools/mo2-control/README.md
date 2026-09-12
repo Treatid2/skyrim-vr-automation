@@ -252,8 +252,11 @@ The retained cycle is:
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <literal-controllerPath> launch -SessionId <literal-session-id> -Compact
 ```
 
-Resume is accepted only from a bounded stopped/failure state, with no game
-process and exactly one MO2 process matching the session's original owner PID.
+Resume is accepted only from a bounded stopped/failure state with no game
+process. It either reuses exactly one MO2 process whose PID, start time, and
+executable path match the retained owner record, or—when no MO2 process
+exists—reopens the same owned session, profile, and executable. An unrelated,
+reused-PID, or ambiguous MO2 process blocks the launch without being adopted.
 
 `terminate` is intentionally distinct from `stop`: it force-terminates only
 MO2 processes owned by the active session, and only after proving that no game

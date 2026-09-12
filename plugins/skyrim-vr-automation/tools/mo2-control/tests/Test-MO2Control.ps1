@@ -49,9 +49,13 @@ $detectedExitDisposition = & $mo2Module {
 }
 Assert-MO2Test ($detectedExitDisposition.ok -and $detectedExitDisposition.mode -eq 'reopen-exact-session') 'launch reopens an exact session when stop-game observed its MO2 owner exit'
 $retainedDisposition = & $mo2Module {
-    Get-MO2LaunchResumeDisposition -SessionStatus 'game-stopped' -GameProcesses @() -MO2Processes @([pscustomobject]@{ id = 4123 }) -OwnerPid 4123
+    Get-MO2LaunchResumeDisposition -SessionStatus 'game-stopped' -GameProcesses @() -MO2Processes @([pscustomobject]@{ id = 4123 }) -OwnerPid 4123 -OwnerIdentityMatched $true
 }
 Assert-MO2Test ($retainedDisposition.ok -and $retainedDisposition.mode -eq 'retained-owner') 'launch reuses the exact retained MO2 owner when it remains present'
+$reusedPidDisposition = & $mo2Module {
+    Get-MO2LaunchResumeDisposition -SessionStatus 'game-stopped' -GameProcesses @() -MO2Processes @([pscustomobject]@{ id = 4123 }) -OwnerPid 4123 -OwnerIdentityMatched $false
+}
+Assert-MO2Test (-not $reusedPidDisposition.ok -and $reusedPidDisposition.reason -eq 'owner-identity-mismatch') 'launch refuses a matching numeric PID when exact retained-owner identity is unproven'
 $ambiguousDisposition = & $mo2Module {
     Get-MO2LaunchResumeDisposition -SessionStatus 'game-stopped' -GameProcesses @() -MO2Processes @([pscustomobject]@{ id = 9001 }) -OwnerPid 4123
 }
@@ -375,6 +379,23 @@ selected_profile=@ByteArray(Codex)
     } | ConvertTo-Json | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
     $pidReuseInspection = Invoke-MO2Inspect -Config $config
     Assert-MO2Test (-not $pidReuseInspection.data.sessionLock.ownerRunning -and -not $pidReuseInspection.data.sessionLock.ownerIdentityMatched) 'session ownership rejects a reused PID with a different process start time'
+    $pidReuseLaunchAdmission = & $mo2Module {
+        param($inspection, $ownerProcessId)
+        Get-MO2LaunchResumeDisposition -SessionStatus 'game-stopped' -GameProcesses @() -MO2Processes @([pscustomobject]@{ id = $ownerProcessId }) -OwnerPid $ownerProcessId -OwnerIdentityMatched ([bool]$inspection.data.sessionLock.ownerIdentityMatched)
+    } $pidReuseInspection $PID
+    Assert-MO2Test (-not $pidReuseLaunchAdmission.ok -and $pidReuseLaunchAdmission.reason -eq 'owner-identity-mismatch') 'same-PID different-start-time evidence blocks launch admission before dispatch'
+    [ordered]@{
+        contractVersion = 'fixture'; sessionId = 'session-path-reuse'; status = 'game-stopped'; ownerPid = $PID
+        processStartTime = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+        processPath = (Join-Path $fixture 'unrelated-process.exe')
+    } | ConvertTo-Json | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    $pathMismatchInspection = Invoke-MO2Inspect -Config $config
+    Assert-MO2Test (-not $pathMismatchInspection.data.sessionLock.ownerIdentityMatched -and $pathMismatchInspection.data.sessionLock.ownerStartTimeMatched -and -not $pathMismatchInspection.data.sessionLock.ownerPathMatched) 'session ownership requires the recorded executable path as well as PID and start time'
+    [ordered]@{
+        contractVersion = 'fixture'; sessionId = 'session-legacy-owner'; status = 'game-stopped'; ownerPid = $PID
+    } | ConvertTo-Json | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    $legacyOwnerInspection = Invoke-MO2Inspect -Config $config
+    Assert-MO2Test (-not $legacyOwnerInspection.data.sessionLock.ownerIdentityEvidenceComplete -and -not $legacyOwnerInspection.data.sessionLock.ownerIdentityMatched) 'a legacy PID-only lock remains readable but cannot authorize live-process reuse'
     Remove-Item -LiteralPath $config.session.lockFile -Force
 
     $missingPrepareAccess = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -WhatIf

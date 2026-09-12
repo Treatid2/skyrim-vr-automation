@@ -569,6 +569,9 @@ function Get-MO2SessionLockRecord {
         ownerPid = $null
         ownerRunning = $false
         ownerIdentityMatched = $false
+        ownerIdentityEvidenceComplete = $false
+        ownerStartTimeMatched = $null
+        ownerPathMatched = $null
         sessionId = $null
         accessId = $null
         leaseId = $null
@@ -590,23 +593,37 @@ function Get-MO2SessionLockRecord {
             $record.ownerPid = [int]$data.ownerPid
             $ownerProcess = Get-Process -Id $record.ownerPid -ErrorAction SilentlyContinue
             if ($null -ne $ownerProcess) {
-                $record.ownerRunning = $true
-                if ($data.PSObject.Properties['processStartTime'] -and -not [string]::IsNullOrWhiteSpace([string]$data.processStartTime)) {
+                $startTimeEvidencePresent = $data.PSObject.Properties['processStartTime'] -and -not [string]::IsNullOrWhiteSpace([string]$data.processStartTime)
+                $pathEvidencePresent = $data.PSObject.Properties['processPath'] -and -not [string]::IsNullOrWhiteSpace([string]$data.processPath)
+                $identityMatched = $true
+                if ($startTimeEvidencePresent) {
                     try {
                         $expectedStart = [DateTimeOffset]::Parse([string]$data.processStartTime, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
                         $actualStart = $ownerProcess.StartTime.ToUniversalTime()
-                        $record.ownerIdentityMatched = [math]::Abs(($actualStart - $expectedStart).TotalMilliseconds) -lt 1.0
-                        $record.ownerRunning = $record.ownerIdentityMatched
+                        $record.ownerStartTimeMatched = [math]::Abs(($actualStart - $expectedStart).TotalMilliseconds) -lt 1.0
+                        $identityMatched = $identityMatched -and [bool]$record.ownerStartTimeMatched
                     }
                     catch {
-                        $record.ownerIdentityMatched = $false
-                        $record.ownerRunning = $false
+                        $record.ownerStartTimeMatched = $false
+                        $identityMatched = $false
                     }
                 }
-                else {
-                    # Compatibility for pre-identity locks. New session owners always persist start time.
-                    $record.ownerIdentityMatched = $true
+                if ($pathEvidencePresent) {
+                    try {
+                        $expectedPath = [IO.Path]::GetFullPath([string]$data.processPath)
+                        $actualPath = [IO.Path]::GetFullPath([string]$ownerProcess.Path)
+                        $record.ownerPathMatched = [string]::Equals($actualPath, $expectedPath, [StringComparison]::OrdinalIgnoreCase)
+                        $identityMatched = $identityMatched -and [bool]$record.ownerPathMatched
+                    }
+                    catch {
+                        $record.ownerPathMatched = $false
+                        $identityMatched = $false
+                    }
                 }
+                $record.ownerIdentityEvidenceComplete = [bool]$startTimeEvidencePresent -and [bool]$pathEvidencePresent
+                # Pre-identity locks remain readable, but do not prove authority over a live process.
+                $record.ownerIdentityMatched = $record.ownerIdentityEvidenceComplete -and $identityMatched
+                $record.ownerRunning = $record.ownerIdentityMatched
             }
         }
         if ($data.PSObject.Properties['sessionId']) {
@@ -2253,6 +2270,8 @@ function Set-MO2OwnedSessionOwner {
     else {
         $Owned.data | Add-Member -NotePropertyName ownerPid -NotePropertyValue ([int]$ProcessRecord.id)
     }
+    $Owned.data | Add-Member -NotePropertyName processPath -NotePropertyValue ([string]$ProcessRecord.path) -Force
+    $Owned.data | Add-Member -NotePropertyName processStartTime -NotePropertyValue ([string]$ProcessRecord.startTime) -Force
     [object[]]$adoptions = @()
     if ($Owned.data.PSObject.Properties['ownerAdoptions']) {
         $adoptions = @($Owned.data.ownerAdoptions)
@@ -2275,6 +2294,8 @@ function Set-MO2OwnedSessionOwner {
     else {
         $manifest | Add-Member -NotePropertyName ownerPid -NotePropertyValue ([int]$ProcessRecord.id)
     }
+    $manifest | Add-Member -NotePropertyName processPath -NotePropertyValue ([string]$ProcessRecord.path) -Force
+    $manifest | Add-Member -NotePropertyName processStartTime -NotePropertyValue ([string]$ProcessRecord.startTime) -Force
     [object[]]$manifestAdoptions = @()
     if ($manifest.PSObject.Properties['ownerAdoptions']) {
         $manifestAdoptions = @($manifest.ownerAdoptions)
@@ -2656,7 +2677,8 @@ function Get-MO2LaunchResumeDisposition {
         [Parameter(Mandatory)][string]$SessionStatus,
         [Parameter(Mandatory)]$GameProcesses,
         [Parameter(Mandatory)]$MO2Processes,
-        [int]$OwnerPid
+        [int]$OwnerPid,
+        [bool]$OwnerIdentityMatched = $false
     )
 
     if ($SessionStatus -notin @('game-stopped', 'mo2-exited-after-game-stop', 'stop-incomplete', 'mo2-open')) {
@@ -2671,6 +2693,9 @@ function Get-MO2LaunchResumeDisposition {
     }
     $ownedMO2 = @($mo2 | Where-Object { $OwnerPid -gt 0 -and [int]$_.id -eq $OwnerPid })
     if ($mo2.Count -eq 1 -and $ownedMO2.Count -eq 1) {
+        if (-not $OwnerIdentityMatched) {
+            return [pscustomobject][ordered]@{ ok = $false; mode = 'blocked'; ownerPid = $OwnerPid; reason = 'owner-identity-mismatch' }
+        }
         return [pscustomobject][ordered]@{ ok = $true; mode = 'retained-owner'; ownerPid = $OwnerPid; reason = $null }
     }
     return [pscustomobject][ordered]@{ ok = $false; mode = 'blocked'; ownerPid = $OwnerPid; reason = 'ambiguous-mo2-owner' }
@@ -2702,7 +2727,7 @@ function Invoke-MO2Launch {
         return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'blocked' -Data @{ validation = $validation; lock = $owned } -Warnings $validation.warnings -Errors $validation.errors
     }
     $ownerPid = if ($lockData.PSObject.Properties['ownerPid']) { [int]$lockData.ownerPid } else { 0 }
-    $resumeDisposition = Get-MO2LaunchResumeDisposition -SessionStatus ([string]$lockData.status) -GameProcesses @($validation.data.processes.game) -MO2Processes @($validation.data.processes.mo2) -OwnerPid $ownerPid
+    $resumeDisposition = Get-MO2LaunchResumeDisposition -SessionStatus ([string]$lockData.status) -GameProcesses @($validation.data.processes.game) -MO2Processes @($validation.data.processes.mo2) -OwnerPid $ownerPid -OwnerIdentityMatched ([bool]$validation.data.sessionLock.ownerIdentityMatched)
     if (-not $resumeDisposition.ok) {
         return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'blocked' -Data @{ processes = $validation.data.processes; lock = $owned; resumeDisposition = $resumeDisposition } -Errors @('Resume requires no game process and either the exact retained MO2 owner or no MO2 process so the same session and profile can be reopened safely.')
     }
@@ -2734,7 +2759,13 @@ function Invoke-MO2Launch {
     Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted
     $lockData.status = 'launching'
     if (-not $reuseRetainedMO2) {
-        if ($lockData.PSObject.Properties['ownerPid']) { $lockData.ownerPid = $process.Id } else { $lockData | Add-Member -NotePropertyName ownerPid -NotePropertyValue $process.Id }
+        $launchedOwner = [pscustomobject][ordered]@{
+            id = [int]$process.Id
+            path = $(try { [IO.Path]::GetFullPath($process.Path) } catch { $mo2Path })
+            startTime = $(try { $process.StartTime.ToUniversalTime().ToString('o') } catch { $null })
+        }
+        $null = Set-MO2OwnedSessionOwner -Owned $owned -ProcessRecord $launchedOwner -Reason 'exact MO2 launcher process started for this retained session'
+        $lockData = $owned.data
     }
     if ($lockData.PSObject.Properties['latestLauncherPid']) { $lockData.latestLauncherPid = $process.Id } else { $lockData | Add-Member -NotePropertyName latestLauncherPid -NotePropertyValue $process.Id }
     if ($lockData.PSObject.Properties['launchedUtc']) { $lockData.launchedUtc = [DateTime]::UtcNow.ToString('o') } else { $lockData | Add-Member -NotePropertyName launchedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) }
