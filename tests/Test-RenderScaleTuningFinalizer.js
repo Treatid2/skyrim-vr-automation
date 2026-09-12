@@ -184,18 +184,25 @@ function retained(boundary, violation, identity = {}, nonStable = false) {
     const buildId = identity.buildId || "e".repeat(64);
     const transitionId = identity.transitionId || 101;
     const ownerId = identity.ownerId || `${runId}-owner-${transitionId}`;
+    const cpuAcquisition = {
+        action: "qualification_dispatch",
+        accepted: true,
+        transitionId,
+        ownerId,
+        producer: { buildId },
+        performanceTelemetry: {
+            started: true,
+            cpuPerformance: { active: true, sessionId: 11 },
+        },
+    };
     return {
         variant: identity.variant || (runId.startsWith("amd-") ? "amd" : "nvidia"),
-        cpuAcquisition: {
-            action: "qualification_dispatch",
-            accepted: true,
-            transitionId,
-            ownerId,
-            producer: { buildId },
-            performanceTelemetry: {
-                started: true,
-                cpuPerformance: { active: true, sessionId: 11 },
-            },
+        cpuAcquisition,
+        cpuAcquisitionStep: {
+            label: "qualification-dispatch",
+            ok: true,
+            isError: false,
+            result: cpuAcquisition,
         },
         analysisSentinel: {
             falseValue: false,
@@ -664,6 +671,35 @@ function createPreBaselineEvidenceRoot() {
     return { root, runId, buildId };
 }
 
+function createTraceContaminatedPreBaselineEvidenceRoot(contamination) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(),
+        "rst-finalizer-trace-contamination-"));
+    const runId = "amd-trace-contamination-run";
+    const buildId = "c".repeat(64);
+    writeJson(path.join(root, "raw", "live-result.json"), {
+        ok: false,
+        status: "INTERRUPTED",
+        variant: "amd",
+        runId,
+        traceCapability: null,
+        lanes: [],
+        error: "amd_dlss_trace_not_empty",
+        failure: {
+            reason: "amd_dlss_trace_not_empty",
+            cleanup: {
+                status: "CONFIRMED_INACTIVE",
+                acquiredSessionId: 41,
+                stop: { present: true, id: 41, active: false },
+            },
+            contamination,
+            traceLifecycleReceiptKey:
+                "amd-trace-contamination-run:amd:dlss-trace-capability",
+        },
+    });
+    writeDeploymentVerification(root, buildId);
+    return { root, runId, buildId };
+}
+
 function testBaselineOnlyInterruptedFinalization() {
     for (const [variant, expectedRows] of [["nvidia", 66], ["amd", 186]]) {
         const evidence = createBaselineOnlyEvidenceRoot(variant);
@@ -727,6 +763,43 @@ function testPreBaselineInterruptedFinalization() {
             "Pre-baseline finalization is not deterministic.");
     } finally {
         fs.rmSync(evidence.root, { recursive: true, force: true });
+    }
+}
+
+function testTraceContaminatedPreBaselineFinalization() {
+    const cases = [
+        { records: 1, totalRecords: 1, setConstantsCalls: 0,
+            evaluateCalls: 0 },
+        { records: 0, totalRecords: 0, setConstantsCalls: 1,
+            evaluateCalls: 1 },
+    ];
+    for (const contamination of cases) {
+        const evidence =
+            createTraceContaminatedPreBaselineEvidenceRoot(contamination);
+        try {
+            const options = { ...evidence, variant: "amd", expectedRows: 186,
+                generatedUtc: "2026-08-31T01:00:00.000Z" };
+            let result = finalizeEvidence(options);
+            assert(result.summary.assayExecution.status === "INTERRUPTED" &&
+                result.summary.assayExecution.transitionsDispatched === 0 &&
+                result.summary.assayExecution.interruption.phase ===
+                    "pre_baseline" &&
+                result.summary.reporting.status === "INCOMPLETE" &&
+                result.summary.reporting.reasons.includes(
+                    "pre_baseline_interrupted"),
+            "A cleanup-qualified AMD trace-contamination interruption was not finalized.");
+            const outputs = ["report.md", "summary.json", "transitions.csv",
+                "evidence-values.csv", "receipt-index.json"];
+            const firstHashes = outputs.map((name) =>
+                sha(path.join(evidence.root, name)));
+            result = finalizeEvidence(options);
+            const secondHashes = outputs.map((name) =>
+                sha(path.join(evidence.root, name)));
+            assert(JSON.stringify(firstHashes) === JSON.stringify(secondHashes),
+                "Trace-contaminated pre-baseline finalization is not deterministic.");
+        } finally {
+            fs.rmSync(evidence.root, { recursive: true, force: true });
+        }
     }
 }
 
@@ -1682,6 +1755,37 @@ function testPassFinalizationControlsCompletion() {
             value.cpuAcquisition.action = "qualification_status";
             writeJson(file, value);
         }, "retained_cpu_acquisition_receipt_invalid"],
+        ["failed-cpu-acquisition-payload", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "01", "retained.json");
+            const value = readJson(file);
+            value.cpuAcquisition.ok = false;
+            value.cpuAcquisitionStep.result.ok = false;
+            writeJson(file, value);
+        }, "retained_cpu_acquisition_receipt_invalid"],
+        ["errored-cpu-acquisition-payload", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "01", "retained.json");
+            const value = readJson(file);
+            value.cpuAcquisition.isError = true;
+            value.cpuAcquisitionStep.result.isError = true;
+            writeJson(file, value);
+        }, "retained_cpu_acquisition_receipt_invalid"],
+        ["failed-cpu-acquisition-step", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "01", "retained.json");
+            const value = readJson(file);
+            value.cpuAcquisitionStep.ok = false;
+            writeJson(file, value);
+        }, "retained_cpu_acquisition_step_mismatch"],
+        ["contradicted-cpu-acquisition-copy", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "01", "retained.json");
+            const value = readJson(file);
+            value.cpuAcquisitionStep.result.performanceTelemetry
+                .cpuPerformance.sessionId = 12;
+            writeJson(file, value);
+        }, "retained_cpu_acquisition_step_mismatch"],
         ["foreign-cpu-acquisition-owner", (root) => {
             const file = path.join(root, "raw", "pass-1", "transitions",
                 "01", "retained.json");
@@ -1973,6 +2077,7 @@ Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testRecoveryIsReportedWithoutRewritingFailure)
     .then(testBaselineOnlyInterruptedFinalization)
     .then(testPreBaselineInterruptedFinalization)
+    .then(testTraceContaminatedPreBaselineFinalization)
     .then(testPartialInterruptedFinalization)
     .then(testValidationLeavesEvidenceUntouched)
     .then(testVariantAndSourceProfileValidation)

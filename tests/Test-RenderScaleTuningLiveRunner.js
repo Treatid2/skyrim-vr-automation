@@ -880,6 +880,48 @@ async function testAmdExposedTraceFailureStops() {
     `A failing exposed AMD trace action was treated as unsupported: ${JSON.stringify(result)}`);
 }
 
+async function testAmdTraceContaminationIsRestartable() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(repositoryRoot,
+        "skills", "renderscale-tuning-amd", "references", "matrix.v1.json")));
+    const mock = createMock(0, null, null, (args, controls) => {
+        if (args.action !== "dlss_trace_read") return undefined;
+        return {
+            action: "dlss_trace_read",
+            producer: { buildId },
+            capture: {
+                summary: { active: false,
+                    sessionID: controls.traceSession(), totalRecords: 1,
+                    setConstantsCalls: 1, evaluateCalls: 1 },
+                records: [{ sequence: 1 }],
+                afterSequence: 0,
+                limit: args.limit,
+                availableFromSequence: 1,
+                latestSequence: 1,
+                lastReturnedSequence: 1,
+                moreAvailable: false,
+                requestedSequenceOverwritten: false,
+            },
+        };
+    });
+    const runId = "amd-trace-contamination";
+    const result = await runRenderScaleTuningLive({
+        ...mock.context, variant: "amd", runId, buildId,
+        positioningRoot: positioningRoot({
+            supportedFSRRuntimeMask: 1,
+            fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }],
+        }), matrix,
+    });
+    const lifecycleKey = runId + ":amd:dlss-trace-capability";
+    assert(result.status === "INTERRUPTED" &&
+        result.error === "amd_dlss_trace_not_empty" &&
+        result.failure && result.failure.cleanup &&
+        result.failure.cleanup.status === "CONFIRMED_INACTIVE" &&
+        result.failure.contamination.records === 1 &&
+        mock.stores.get(lifecycleKey) &&
+        result.receiptKeys.includes(lifecycleKey),
+    "A nonempty AMD capability trace was not retained as a restartable interruption.");
+}
+
 async function testAdmissionRejectsMalformedInputs() {
     const nvidiaMatrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
@@ -1262,7 +1304,7 @@ async function testAmdForeignTraceOwnerNeverAuthorizesCleanupStop() {
         `${runId}:amd:dlss-trace-capability:cleanup:decision`);
     assert(result.status === "INTERRUPTED" && decision &&
         decision.status === "UNRESOLVED" &&
-        decision.reason === "trace_cleanup_owner_mismatch" &&
+        decision.reason === "trace_cleanup_owner_unproven" &&
         !mock.directCalls.some((call) => call.action === "dlss_trace_stop"),
     "A foreign AMD trace owner authorized a cleanup stop.");
 }
@@ -1425,6 +1467,216 @@ async function testCpuAcquisitionRequiresDispatchReceipt() {
     "The original CPU acquisition receipt was not retained independently.");
 }
 
+async function testCpuAcquisitionRejectsFailedEvidence() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const cases = [
+        ["payload-false", (entry) => { entry.result.ok = false; }],
+        ["payload-error", (entry) => { entry.result.isError = true; }],
+        ["wrapper-false", (entry) => { entry.ok = false; }],
+        ["wrapper-error", (entry) => { entry.isError = true; }],
+    ];
+    for (const [name, mutate] of cases) {
+        let injected = false;
+        const mock = createMock(0, null, (root, args) => {
+            const firstMeasured = args.steps.some((step) =>
+                step.label === "qualification-dispatch" &&
+                step.args.startPerformanceTelemetry === true);
+            if (!injected && firstMeasured) {
+                injected = true;
+                mutate(root.results.find((entry) =>
+                    entry.label === "qualification-dispatch"));
+            }
+            return root;
+        });
+        const runId = "cpu-acquisition-failed-" + name;
+        const result = await runRenderScaleTuningLive({
+            ...mock.context, variant: "nvidia", runId, buildId,
+            positioningRoot: positioningRoot(), matrix,
+        });
+        const pass = result.lanes[0].passes[0];
+        const retained = mock.stores.get(
+            runId + ":nvidia:pass-1:transition-1");
+        const cpuStops = mock.scenarioCalls.flatMap((call) => call.steps)
+            .filter((step) => step.args &&
+                step.args.action === "cpu_performance_stop");
+        assert(result.status === "INTERRUPTED" &&
+            pass.error === "cpu_owner_identity_unproven" &&
+            pass.cleanup && pass.cleanup.status === "UNRESOLVED" &&
+            cpuStops.length === 0 && retained &&
+            retained.cpuAcquisitionStep,
+        "Failed CPU acquisition evidence established ownership: " + name);
+    }
+}
+
+async function testValidCpuAcquisitionSurvivesLaterFailure() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    let injected = false;
+    const mock = createMock(0, null, (root, args) => {
+        const dispatchIndex = root.results.findIndex((entry) =>
+            entry.label === "qualification-dispatch");
+        const applyIndex = root.results.findIndex((entry) =>
+            entry.label === "profile-apply");
+        const firstMeasured = args.steps.some((step) =>
+            step.label === "qualification-dispatch" &&
+            step.args.startPerformanceTelemetry === true);
+        if (!injected && firstMeasured &&
+            dispatchIndex >= 0 && applyIndex > dispatchIndex) {
+            injected = true;
+            const results = root.results.slice(0, applyIndex + 1);
+            results[applyIndex] = {
+                label: "profile-apply", ok: false,
+                error: "synthetic_post_acquisition_failure",
+                result: { ok: false,
+                    error: "synthetic_post_acquisition_failure" },
+            };
+            return { ...root, ok: false, aborted: true,
+                stepsRun: results.length, results };
+        }
+        return root;
+    });
+    const runId = "cpu-acquisition-before-later-failure";
+    const result = await runRenderScaleTuningLive({
+        ...mock.context, variant: "nvidia", runId, buildId,
+        positioningRoot: positioningRoot(), matrix,
+    });
+    const pass = result.lanes[0].passes[0];
+    const retained = mock.stores.get(
+        runId + ":nvidia:pass-1:transition-1");
+    const cpuStop = mock.scenarioCalls.flatMap((call) => call.steps)
+        .find((step) => step.args &&
+            step.args.action === "cpu_performance_stop");
+    assert(result.status === "INTERRUPTED" &&
+        pass.error === "transition_scenario_failed" &&
+        pass.cleanup && pass.cleanup.status === "CONFIRMED_INACTIVE" &&
+        pass.ownership.cpu && pass.ownership.cpu.active === false &&
+        cpuStop && cpuStop.args.expectedSessionId ===
+            retained.cpuAcquisition.performanceTelemetry.cpuPerformance.sessionId &&
+        retained.cpuAcquisitionStep.ok !== false,
+    "A valid CPU acquisition was discarded after a later step failed.");
+}
+
+async function testTraceAcquisitionRejectsUnprovenStarts() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const cases = [
+        ["wrong-action", (entry) => {
+            entry.result.action = "dlss_trace_status";
+        }],
+        ["wrong-build", (entry) => {
+            entry.result.producer.buildId = "f".repeat(64);
+        }],
+        ["payload-failed", (entry) => { entry.result.ok = false; }],
+        ["wrapper-failed", (entry) => { entry.ok = false; }],
+    ];
+    for (const [name, mutate] of cases) {
+        let injected = false;
+        const mock = createMock(0, null, (root) => {
+            const start = root.results.find((entry) =>
+                entry.label === "dlss-trace-start");
+            if (!injected && start) {
+                injected = true;
+                mutate(start);
+                root.ok = false;
+                root.aborted = true;
+            }
+            return root;
+        });
+        const result = await runRenderScaleTuningLive({
+            ...mock.context, variant: "nvidia",
+            runId: "trace-acquisition-" + name, buildId,
+            positioningRoot: positioningRoot(), matrix,
+        });
+        const pass = result.lanes[0].passes[0];
+        assert(result.status === "INTERRUPTED" &&
+            pass.cleanup && pass.cleanup.status === "UNRESOLVED" &&
+            pass.cleanup.reason === "cleanup_trace_owner_mismatch" &&
+            !mock.directCalls.some((call) =>
+                call.action === "dlss_trace_stop"),
+        "An unproven NVIDIA trace start authorized a stop: " + name);
+    }
+}
+
+async function testAmdFailedTraceStartNeverAuthorizesStop() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-amd", "references",
+        "matrix.v1.json")));
+    let injected = false;
+    const mock = createMock(0, null, (root, args) => {
+        const start = root.results.find((entry) =>
+            entry.label === "amd-dlss-trace-start");
+        if (!injected && start) {
+            injected = true;
+            start.ok = false;
+            start.result.ok = false;
+            root.ok = false;
+            root.aborted = true;
+        }
+        return root;
+    });
+    const runId = "amd-failed-trace-start-current-owner";
+    const result = await runRenderScaleTuningLive({
+        ...mock.context, variant: "amd", runId, buildId,
+        positioningRoot: positioningRoot({
+            supportedFSRRuntimeMask: 1,
+            fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }],
+        }), matrix,
+    });
+    const decision = mock.stores.get(
+        runId + ":amd:dlss-trace-capability:cleanup:decision");
+    assert(result.status === "INTERRUPTED" && decision &&
+        decision.status === "UNRESOLVED" &&
+        decision.reason === "trace_cleanup_owner_unproven" &&
+        !mock.directCalls.some((call) => call.action === "dlss_trace_stop"),
+    "A failed AMD trace start authorized a stop through matching status.");
+}
+
+async function testAmdCleanupStatusMustBeQualified() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(repositoryRoot,
+        "skills", "renderscale-tuning-amd", "references", "matrix.v1.json")));
+    for (const rejectedStatusCall of [1, 2]) {
+        let failedStop = false;
+        let statusCalls = 0;
+        const mock = createMock(0, null, null, (args, controls) => {
+            if (!failedStop && args.action === "dlss_trace_stop") {
+                failedStop = true;
+                controls.setTraceActive(true);
+                return { ok: false, error: "synthetic close failure" };
+            }
+            if (failedStop && args.action === "dlss_trace_status") {
+                statusCalls += 1;
+                const value = {
+                    action: "dlss_trace_status",
+                    producer: { buildId },
+                    capture: { active: statusCalls === 1,
+                        sessionID: controls.traceSession() },
+                };
+                if (statusCalls === rejectedStatusCall) value.isError = true;
+                return value;
+            }
+            return undefined;
+        });
+        const runId = "amd-cleanup-status-" + rejectedStatusCall;
+        const result = await runRenderScaleTuningLive({
+            ...mock.context, variant: "amd", runId, buildId,
+            positioningRoot: positioningRoot({
+                supportedFSRRuntimeMask: 1,
+                fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }],
+            }), matrix,
+        });
+        const decision = mock.stores.get(
+            runId + ":amd:dlss-trace-capability:cleanup:decision");
+        assert(result.status === "INTERRUPTED" && decision &&
+            decision.status === "UNRESOLVED" &&
+            decision.reason === "trace_cleanup_status_unproven",
+        "A failed AMD cleanup status certified inactivity.");
+    }
+}
+
 async function testNvidiaRetainsMultiPageTrace() {
     const matrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
@@ -1570,6 +1822,49 @@ async function testBaselineOwnerAdmissionRejectsAmbiguity() {
             pass.cleanup.reason === "cleanup_stress_owner_mismatch",
         `Ambiguous baseline ownership '${name}' lost cleanup disposition.`);
     }
+}
+
+async function testBaselineOnlyCleanupRejectsForeignPostStatus() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(repositoryRoot,
+        "skills", "renderscale-tuning-nvidia", "references", "matrix.v1.json")));
+    let baselineFailed = false;
+    let cleanupRan = false;
+    let postStatusChanged = false;
+    const mock = createMock(0, null, (root, args) => {
+        if (!baselineFailed && args.steps.some((step) =>
+            step.label === "baseline-stress-start")) {
+            baselineFailed = true;
+            root.ok = false;
+            root.aborted = true;
+            return root;
+        }
+        if (args.steps.some((step) => step.label === "profiler-disable")) {
+            cleanupRan = true;
+            return root;
+        }
+        if (cleanupRan && !postStatusChanged && args.steps.some((step) =>
+            step.label === "render-status")) {
+            postStatusChanged = true;
+            const render = root.results.find((entry) =>
+                entry.label === "render-status");
+            render.result.status.session.id += 100;
+        }
+        return root;
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context, variant: "nvidia",
+        runId: "baseline-foreign-post-status", buildId,
+        positioningRoot: positioningRoot(), matrix,
+    });
+    const pass = result.lanes[0].passes[0];
+    assert(result.status === "INTERRUPTED" &&
+        pass.error === "baseline_failed" && pass.cleanup &&
+        pass.cleanup.status === "UNRESOLVED" &&
+        pass.cleanup.reason === "cleanup_post_owner_mismatch" &&
+        pass.ownership.baseline && pass.ownership.baseline.active === true &&
+        !mock.scenarioCalls.some((call) => call.steps.some((step) =>
+            step.label === "measured-stress-start")),
+    "Baseline-only cleanup accepted a foreign inactive post-status identity.");
 }
 
 async function testFailedHandoffRetainsAndCleansMeasuredOwner() {
@@ -2684,13 +2979,19 @@ async function testEvidenceVerdicts() {
 
 Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
     testAmdExposedTraceFailureStops(),
+    testAmdTraceContaminationIsRestartable(),
     testAmdPostStartTraceFailureClosesOwner(),
     testAmdMalformedTraceOwnersNeverAuthorizeStop(),
     testAmdForeignTraceOwnerNeverAuthorizesCleanupStop(),
+    testAmdFailedTraceStartNeverAuthorizesStop(),
+    testAmdCleanupStatusMustBeQualified(),
     testNvidiaPostStartTraceFailureClosesOwner(),
     testNvidiaNormalStopRejectsChangedOwner(),
+    testTraceAcquisitionRejectsUnprovenStarts(),
     testCpuCleanupRejectsUnownedStatus(),
     testCpuAcquisitionRequiresDispatchReceipt(),
+    testCpuAcquisitionRejectsFailedEvidence(),
+    testValidCpuAcquisitionSurvivesLaterFailure(),
     testNvidiaRetainsMultiPageTrace(),
     testNvidiaRejectsChangedOrMalformedTraceWindow(),
     testAdmissionRejectsMalformedInputs(), testEvidenceVerdicts(),
@@ -2699,6 +3000,7 @@ Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
     testFlatTerminalBoundary(), testPositionRenderScaleAdapterAdmission(),
     testMalformedMeasuredStressOwnershipIsRetained(),
     testBaselineOwnerAdmissionRejectsAmbiguity(),
+    testBaselineOnlyCleanupRejectsForeignPostStatus(),
     testFailedHandoffRetainsAndCleansMeasuredOwner(),
     testCleanupPostconditionsRemainAuthoritative(),
     testUnsafeTransitionRestoresBaselineAndContinues(),
