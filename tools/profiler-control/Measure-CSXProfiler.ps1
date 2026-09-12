@@ -111,6 +111,33 @@ function Acquire-ProfilerLease([string]$ControlRoot, [int]$TimeoutSeconds) {
     } while ($true)
 }
 
+function ConvertTo-ProfilerUtcRoundTrip($Value) {
+    if ($Value -is [DateTimeOffset]) {
+        return ([DateTimeOffset]$Value).UtcDateTime.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [DateTime]) {
+        $dateTime = [DateTime]$Value
+        $utc = if ($dateTime.Kind -eq [DateTimeKind]::Unspecified) {
+            [DateTime]::SpecifyKind($dateTime, [DateTimeKind]::Utc)
+        }
+        else {
+            $dateTime.ToUniversalTime()
+        }
+        return $utc.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw 'Profiler runtime identity is missing processStartTimeUtc.'
+    }
+    try {
+        $parsed = [DateTimeOffset]::Parse($text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+        return $parsed.UtcDateTime.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    catch {
+        throw "Profiler runtime identity has an invalid processStartTimeUtc '$text'."
+    }
+}
+
 function Get-StableRuntimeIdentity($Identity) {
     if ($null -eq $Identity -or -not $Identity.complete -or -not $Identity.verified) {
         throw 'Profiler capture requires a complete and verified DevBench runtime identity on every response.'
@@ -118,7 +145,7 @@ function Get-StableRuntimeIdentity($Identity) {
     return [ordered]@{
         listenerPid = [int]$Identity.listenerPid
         processPath = [string]$Identity.process.path
-        processStartTimeUtc = [string]$Identity.process.startTimeUtc
+        processStartTimeUtc = ConvertTo-ProfilerUtcRoundTrip $Identity.process.startTimeUtc
         buildId = [string]$Identity.build.buildId
         artifactPath = [string]$Identity.artifact.path
         artifactSha256 = [string]$Identity.artifact.sha256
@@ -149,7 +176,7 @@ $receipt = [ordered]@{
     label = $Label; runtimePath = [IO.Path]::GetFullPath($RuntimePath); context = $context
     preparedUtc = [DateTime]::UtcNow.ToString('o'); priorEnabled = $null; finalEnabled = $null
     totalTimeoutSeconds = $TotalTimeoutSeconds; restoreReserveSeconds = $RestoreReserveSeconds
-    stateRestored = $false; restoreErrors = @(); captureError = $null
+    stateRestored = $false; restoreErrors = @(); evidenceErrors = @(); captureError = $null
     runtimeIdentityObservations = @(); performanceObservations = @()
 }
 Write-JsonAtomic $receiptPath $receipt
@@ -219,10 +246,21 @@ function Test-OptionalRenderScaleUnavailable($Call) {
 function Invoke-ProfilerAction([string]$Action, [switch]$ForRestore) {
     $arguments = @{ action = $Action } | ConvertTo-Json -Compress
     $remainingSeconds = Get-RemainingProfilerSeconds -ForRestore:$ForRestore
-    $call = & $control call -Tool 'communityshaders.profiler' -ArgumentsJson $arguments -RuntimePath $RuntimePath -EvidenceDirectory $runDirectory -EvidenceLabel "profiler-$Action" -TimeoutSeconds $remainingSeconds -RequireSuccess -RequirePerformanceNeutral:(-not $ForRestore) -NoExit -Compact | ConvertFrom-Json -Depth 80
+    $actionEvidenceDirectory = if ($ForRestore) { Join-Path $controlRoot 'restore-evidence' } else { $runDirectory }
+    $actionEvidenceLabel = if ($ForRestore) { "profiler-restore-$transactionId-$Action" } else { "profiler-$Action" }
+    $controlArguments = @{
+        Tool = 'communityshaders.profiler'; ArgumentsJson = $arguments; RuntimePath = $RuntimePath
+        EvidenceDirectory = $actionEvidenceDirectory; EvidenceLabel = $actionEvidenceLabel
+        TimeoutSeconds = $remainingSeconds; RequireSuccess = $true; RequirePerformanceNeutral = (-not $ForRestore)
+        NoExit = $true; Compact = $true
+    }
+    if ($null -ne $script:expectedRuntimeIdentity) {
+        $controlArguments.ExpectedRuntimeIdentityJson = ($script:expectedRuntimeIdentity | ConvertTo-Json -Depth 20 -Compress)
+    }
+    $call = & $control call @controlArguments | ConvertFrom-Json -Depth 80
     $callCleanup = if ($call.PSObject.Properties['sessionCleanup']) { $call.sessionCleanup } else { $null }
-    if (-not $ForRestore) { Assert-CapturePerformanceObservation -Call $call -Action "profiler-$Action" -SessionCleanup $callCleanup }
     if (-not $call.ok) { throw "DevBench profiler '$Action' failed: $($call.errors -join '; ')" }
+    if (-not $ForRestore) { Assert-CapturePerformanceObservation -Call $call -Action "profiler-$Action" -SessionCleanup $callCleanup }
     $payload = @($call.data.content | Where-Object { $null -ne $_ } | Select-Object -First 1)
     if ($payload.Count -ne 1) { throw "DevBench profiler '$Action' returned no structured content." }
     $stableIdentity = Get-StableRuntimeIdentity -Identity $call.runtimeIdentity
@@ -463,12 +501,14 @@ catch {
 }
 finally {
     $restoreErrors = [Collections.Generic.List[string]]::new()
+    $evidenceErrors = [Collections.Generic.List[string]]::new()
     if ($null -ne $receipt.priorEnabled) {
+        if ($transactionJournal) {
+            $transactionJournal.phase = 'restore-uncommitted'
+            try { Write-ProfilerTransactionJournal -Journal $transactionJournal }
+            catch { $evidenceErrors.Add("Could not persist the pre-restore journal: $($_.Exception.Message)") }
+        }
         try {
-            if ($transactionJournal) {
-                $transactionJournal.phase = 'restore-uncommitted'
-                Write-ProfilerTransactionJournal -Journal $transactionJournal
-            }
             $finalStatus = Get-ProfilerStatus (Invoke-ProfilerAction 'status' -ForRestore)
             $finalEnabled = Get-ProfilerEnabled $finalStatus
             if ($finalEnabled -ne [bool]$receipt.priorEnabled) {
@@ -483,6 +523,7 @@ finally {
         catch { $restoreErrors.Add($_.Exception.Message) }
     }
     $receipt.restoreErrors = @($restoreErrors)
+    $receipt.evidenceErrors = @($evidenceErrors)
     $receipt.state = if ($restoreErrors.Count -gt 0) { 'recovery-required' } elseif ($captureFailure) { 'rolled-back' } else { 'completed' }
     if ($transactionJournal) {
         $transactionJournal.phase = [string]$receipt.state
@@ -490,15 +531,24 @@ finally {
         $transactionJournal.finalEnabled = $receipt.finalEnabled
         $transactionJournal.stateRestored = $receipt.stateRestored
         $transactionJournal.restoreErrors = @($restoreErrors)
-        Write-ProfilerTransactionJournal -Journal $transactionJournal
+        try { Write-ProfilerTransactionJournal -Journal $transactionJournal }
+        catch { $evidenceErrors.Add("Could not persist the terminal transaction journal: $($_.Exception.Message)") }
     }
     $receipt.completedUtc = [DateTime]::UtcNow.ToString('o')
-    $receipt.leaseReleasedUtc = [DateTime]::UtcNow.ToString('o')
-    if ($lease -and $lease.stream) { $lease.stream.Dispose() }
-    Write-JsonAtomic $receiptPath $receipt
+    try {
+        if ($lease -and $lease.stream) { $lease.stream.Dispose() }
+        $receipt.leaseReleasedUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    catch { $restoreErrors.Add("Could not release the profiler lease: $($_.Exception.Message)") }
+    $receipt.restoreErrors = @($restoreErrors)
+    $receipt.evidenceErrors = @($evidenceErrors)
+    if ($restoreErrors.Count -gt 0) { $receipt.state = 'recovery-required' }
+    try { Write-JsonAtomic $receiptPath $receipt }
+    catch { $evidenceErrors.Add("Could not persist the terminal capture receipt: $($_.Exception.Message)") }
 }
 
 if ($receipt.restoreErrors.Count -gt 0) { throw "Profiler capture requires state recovery: $($receipt.restoreErrors -join '; '). Receipt: $receiptPath" }
+if ($evidenceErrors.Count -gt 0) { throw "Profiler capture evidence is incomplete after state restoration: $($evidenceErrors -join '; '). Receipt: $receiptPath" }
 if ($captureFailure) { throw "$captureFailure Profiler state was restored. Receipt: $receiptPath" }
 if ($records.Count -ne $Samples -or @($records.frame | Sort-Object -Unique).Count -ne $Samples) { throw 'Profiler capture did not produce the requested number of unique fresh frames.' }
 

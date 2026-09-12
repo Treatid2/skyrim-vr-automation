@@ -135,19 +135,54 @@ try {
     [IO.File]::WriteAllText($runtimePath, '{}', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText($fakeControl, @'
-param([string]$Command,[string]$Tool,[string]$ArgumentsJson,[string]$RuntimePath,[string]$EvidenceDirectory,[string]$EvidenceLabel,[int]$TimeoutSeconds,[switch]$RequireSuccess,[switch]$RequirePerformanceNeutral,[switch]$NoExit,[switch]$Compact)
+param([string]$Command,[string]$Tool,[string]$ArgumentsJson,[string]$RuntimePath,[string]$EvidenceDirectory,[string]$EvidenceLabel,[int]$TimeoutSeconds,[switch]$RequireSuccess,[switch]$RequirePerformanceNeutral,[switch]$NoExit,[switch]$Compact,[string]$ExpectedRuntimeIdentityJson)
+$null = New-Item -ItemType Directory -Path $EvidenceDirectory -Force
+[IO.File]::WriteAllText((Join-Path $EvidenceDirectory "$EvidenceLabel.admission.json"), '{"admitted":true}', [Text.UTF8Encoding]::new($false))
 $state = Get-Content -LiteralPath $env:CSX_PROFILER_TEST_STATE -Raw | ConvertFrom-Json -AsHashtable
 $state.calls = [int]$state.calls + 1
 $isRenderScale = $Tool -eq 'communityshaders.renderscale'
 if ($isRenderScale) { $state.renderScaleCalls = [int]$state.renderScaleCalls + 1 }
 $action = ($ArgumentsJson | ConvertFrom-Json).action
+$driftNow = -not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DRIFT_AT_CALL) -and [int]$env:CSX_PROFILER_TEST_DRIFT_AT_CALL -eq [int]$state.calls
+$driftField = if ([string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DRIFT_FIELD)) { 'pid' } else { $env:CSX_PROFILER_TEST_DRIFT_FIELD.ToLowerInvariant() }
+$listenerPid = if ($driftNow -and $driftField -eq 'pid') { 456 } else { 123 }
+$processPath = if ($driftNow -and $driftField -eq 'path') { 'C:\Fixture\ReplacementSkyrimVR.exe' } else { 'C:\Fixture\SkyrimVR.exe' }
+$processStartTimeUtc = if ($driftNow -and $driftField -eq 'start') { '2026-08-28T00:00:00.7654321Z' } else { '2026-08-28T00:00:00.1234567Z' }
+$buildId = if ($driftNow -and $driftField -eq 'build') { 'replacement-build' } else { 'fixture' }
+$artifactPath = if ($driftNow -and $driftField -eq 'artifact') { 'C:\Fixture\ReplacementCommunityShaders.dll' } else { 'C:\Fixture\CommunityShaders.dll' }
+$artifactSha256 = if ($driftNow -and $driftField -eq 'artifact') { 'BB' } else { 'AA' }
+if (-not [string]::IsNullOrWhiteSpace($ExpectedRuntimeIdentityJson)) {
+    $expected = $ExpectedRuntimeIdentityJson | ConvertFrom-Json
+    $expectedStartTimeUtc = if ($expected.processStartTimeUtc -is [DateTime]) {
+        ([DateTime]$expected.processStartTimeUtc).ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    else {
+        ([DateTimeOffset]::Parse([string]$expected.processStartTimeUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)).UtcDateTime.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    $identityMatches = [int]$expected.listenerPid -eq $listenerPid -and
+        [string]::Equals([string]$expected.processPath, $processPath, [StringComparison]::OrdinalIgnoreCase) -and
+        [string]::Equals($expectedStartTimeUtc, $processStartTimeUtc, [StringComparison]::Ordinal) -and
+        [string]::Equals([string]$expected.buildId, $buildId, [StringComparison]::Ordinal) -and
+        [string]::Equals([string]$expected.artifactPath, $artifactPath, [StringComparison]::OrdinalIgnoreCase) -and
+        [string]::Equals([string]$expected.artifactSha256, $artifactSha256, [StringComparison]::OrdinalIgnoreCase)
+    if (-not $identityMatches) {
+        $state.rejectedBeforeMutation = $true
+        $state | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:CSX_PROFILER_TEST_STATE -Encoding utf8
+        [pscustomobject]@{ok=$false;errors=@('Expected runtime identity changed before dispatch.')} | ConvertTo-Json -Compress
+        return
+    }
+}
 if ($action -eq 'enable') { $state.enabled = $true }
 elseif ($action -eq 'disable') { $state.enabled = $false }
 elseif ($action -eq 'status' -and -not $isRenderScale) { $state.frame = [int]$state.frame + 1 }
 $state | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:CSX_PROFILER_TEST_STATE -Encoding utf8
+$mirrorPath = Join-Path $EvidenceDirectory 'transaction.journal.json'
+if ($action -eq 'enable' -and $env:CSX_PROFILER_TEST_BREAK_MIRROR -eq '1') {
+    if (Test-Path -LiteralPath $EvidenceDirectory -PathType Container) { Remove-Item -LiteralPath $EvidenceDirectory -Recurse -Force }
+    'blocked-evidence-directory' | Set-Content -LiteralPath $EvidenceDirectory -Encoding utf8
+}
 $timer = [pscustomobject]@{name='Synthetic';activeGpu=$true;activeCpu=$true;hasGpu=$true;hasCpu=$true;gpuMs=1.0;topLevelMs=1.0;cpuMs=0.1}
 $status = [pscustomobject]@{enabled=[bool]$state.enabled;frame_count=[long]$state.frame;capturedFrameCount=[long]$state.frame;resolvedTotalMs=1.0;resolvedCpuTotalMs=0.1;acquiredSlots=1;slotRefusals=0;timers=@($timer)}
-$listenerPid = if (-not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DRIFT_AT_CALL) -and [int]$env:CSX_PROFILER_TEST_DRIFT_AT_CALL -eq [int]$state.calls) { 456 } else { 123 }
 $data = [ordered]@{content=@([pscustomobject]@{ok=$true;status=$status})}
 if ($RequirePerformanceNeutral) {
     $distorted = (-not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DISTORT_ACTION) -and $env:CSX_PROFILER_TEST_DISTORT_ACTION -eq $action) -or (-not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DISTORT_LABEL) -and $env:CSX_PROFILER_TEST_DISTORT_LABEL -eq $EvidenceLabel)
@@ -159,7 +194,7 @@ if ($RequirePerformanceNeutral) {
 $optionalMode = [string]$env:CSX_PROFILER_TEST_RENDER_SCALE_OPTIONAL_MODE
 $optionalUnavailable = $isRenderScale -and $optionalMode -in @('absent', 'unsupported')
 $semantic = if ($optionalUnavailable) { [pscustomobject]@{known=$true;ok=$false;outcome=$(if ($optionalMode -eq 'absent') {'tool-unavailable'} else {'unsupported'});codes=@($(if ($optionalMode -eq 'absent') {'tool_unavailable'} else {'unsupported'}));states=@()} } else { $null }
-[pscustomobject]@{ok=(-not $optionalUnavailable);state=$(if ($optionalUnavailable -and $optionalMode -eq 'absent') {'tool-unavailable'} else {'completed'});semantic=$semantic;runtimeIdentity=[pscustomobject]@{complete=$true;verified=$true;listenerPid=$listenerPid;process=[pscustomobject]@{path='C:\Fixture\SkyrimVR.exe';startTimeUtc='2026-08-28T00:00:00Z'};build=[pscustomobject]@{buildId='fixture'};artifact=[pscustomobject]@{path='C:\Fixture\CommunityShaders.dll';sha256='AA'}};invocationEvidencePath=(Join-Path $EvidenceDirectory "$EvidenceLabel.json");sessionCleanup=[pscustomobject]@{attempted=$true;ok=$true;state='all_closed'};data=[pscustomobject]$data;errors=$(if ($optionalUnavailable) {@("render-scale $optionalMode")} else {@()})} | ConvertTo-Json -Depth 20 -Compress
+[pscustomobject]@{ok=(-not $optionalUnavailable);state=$(if ($optionalUnavailable -and $optionalMode -eq 'absent') {'tool-unavailable'} else {'completed'});semantic=$semantic;runtimeIdentity=[pscustomobject]@{complete=$true;verified=$true;listenerPid=$listenerPid;process=[pscustomobject]@{path=$processPath;startTimeUtc=$processStartTimeUtc};build=[pscustomobject]@{buildId=$buildId};artifact=[pscustomobject]@{path=$artifactPath;sha256=$artifactSha256}};invocationEvidencePath=(Join-Path $EvidenceDirectory "$EvidenceLabel.json");sessionCleanup=[pscustomobject]@{attempted=$true;ok=$true;state='all_closed'};data=[pscustomobject]$data;errors=$(if ($optionalUnavailable) {@("render-scale $optionalMode")} else {@()})} | ConvertTo-Json -Depth 20 -Compress
 '@, [Text.UTF8Encoding]::new($false))
     $env:CSX_PROFILER_TEST_STATE = $statePath
     $env:CSX_PROFILER_CONTROL_ROOT = Join-Path $resolvedTestRoot 'profiler-control'
@@ -171,7 +206,9 @@ $semantic = if ($optionalUnavailable) { [pscustomobject]@{known=$true;ok=$false;
     Assert-Test (-not $finalProfilerState.enabled) 'measurement restores the exact prior profiler enable state'
     $measuredRecords = @(Get-Content -LiteralPath $measurement.rawPath -Raw | ConvertFrom-Json)
     $measurementReceipt = Get-Content -LiteralPath $measurement.receiptPath -Raw | ConvertFrom-Json
+    $measurementReceiptText = Get-Content -LiteralPath $measurement.receiptPath -Raw
     Assert-Test (@($measuredRecords.runtimeIdentityFingerprint | Sort-Object -Unique).Count -eq 1 -and @($measurementReceipt.runtimeIdentityObservations).Count -ge 7) 'measurement binds every accepted response and sample to one verified runtime identity'
+    Assert-Test ($measurementReceiptText -match '"processStartTimeUtc"\s*:\s*"2026-08-28T00:00:00\.1234567Z"') 'profiler identity preserves fractional UTC precision through JSON date materialization and retained serialization'
     Assert-Test ($measurement.summary.schemaVersion -eq 3 -and @($measurement.summary.performanceObservations).Count -ge 7) 'measurement preserves performance-neutrality evidence in summary schema 3'
     Assert-Test (@($measurement.summary.performanceObservations | Where-Object { -not $_.window.valid -or $_.guard.performanceEpoch -ne 7 }).Count -eq 0) 'measurement retains one valid performance epoch across the capture'
     Assert-Test (@($measurement.summary.performanceObservations | Where-Object { $_.action -in @('renderscale-before', 'renderscale-after') }).Count -eq 2) 'capture-wide performance evidence includes both render-scale snapshots'
@@ -230,7 +267,31 @@ $semantic = if ($optionalUnavailable) { [pscustomobject]@{known=$true;ok=$false;
     catch { $driftError = $_.Exception.Message }
     Remove-Item Env:CSX_PROFILER_TEST_DRIFT_AT_CALL -ErrorAction SilentlyContinue
     $driftFinalState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
-    Assert-Test ($driftError -match 'runtime identity changed' -and -not $driftFinalState.enabled) 'measurement rejects a replacement runtime and restores state only through the original identity'
+    Assert-Test ($driftError -match 'Expected runtime identity changed before dispatch' -and $driftFinalState.rejectedBeforeMutation -and -not $driftFinalState.enabled) 'measurement rejects a replacement runtime before dispatching a profiler mutation'
+
+    foreach ($driftField in @('start', 'build', 'artifact')) {
+        [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
+        $env:CSX_PROFILER_TEST_DRIFT_AT_CALL = '4'
+        $env:CSX_PROFILER_TEST_DRIFT_FIELD = $driftField
+        $fieldDriftError = $null
+        try { & $measure -Label "identity-$driftField-drift" -EvidenceDirectory (Join-Path $resolvedTestRoot "drift-$driftField") -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | Out-Null }
+        catch { $fieldDriftError = $_.Exception.Message }
+        Remove-Item Env:CSX_PROFILER_TEST_DRIFT_AT_CALL -ErrorAction SilentlyContinue
+        Remove-Item Env:CSX_PROFILER_TEST_DRIFT_FIELD -ErrorAction SilentlyContinue
+        $fieldDriftFinalState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+        Assert-Test ($fieldDriftError -match 'Expected runtime identity changed before dispatch' -and $fieldDriftFinalState.rejectedBeforeMutation -and -not $fieldDriftFinalState.enabled) "measurement rejects same-PID $driftField identity drift before dispatch and restores prior state"
+    }
+
+    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0}', [Text.UTF8Encoding]::new($false))
+    $env:CSX_PROFILER_TEST_BREAK_MIRROR = '1'
+    $mirrorFailure = $null
+    try { & $measure -Label mirror-failure -EvidenceDirectory (Join-Path $resolvedTestRoot 'mirror-failure') -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | Out-Null }
+    catch { $mirrorFailure = $_.Exception.Message }
+    Remove-Item Env:CSX_PROFILER_TEST_BREAK_MIRROR -ErrorAction SilentlyContinue
+    $mirrorFailureState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $leaseProbe = [IO.File]::Open((Join-Path $env:CSX_PROFILER_CONTROL_ROOT 'capture.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $leaseProbe.Dispose()
+    Assert-Test ($mirrorFailure -match 'evidence is incomplete after state restoration' -and -not $mirrorFailureState.enabled) 'journal mirror failure cannot prevent exact profiler restoration or lease release'
 
     [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
     $env:CSX_PROFILER_TEST_DISTORT_ACTION = 'status'
@@ -262,7 +323,7 @@ $semantic = if ($optionalUnavailable) { [pscustomobject]@{known=$true;ok=$false;
     finally { $heldLease.Dispose() }
 
     $measureText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Measure-CSXProfiler.ps1') -Raw
-    Assert-Test ($measureText -match '-RequirePerformanceNeutral:\(-not \$ForRestore\)') 'capture guards measurement calls while preserving the restoration path'
+    Assert-Test ($measureText -match 'RequirePerformanceNeutral\s*=\s*\(-not \$ForRestore\)') 'capture guards measurement calls while preserving the restoration path'
     Assert-Test ($measureText -match '\$expectedPerformanceEpoch') 'capture pins the performance ownership epoch across samples'
     Assert-Test ($measureText -match 'schemaVersion = 3') 'capture stores performance guard evidence under schema 3'
     Assert-Test ($measureText.IndexOf(
@@ -292,6 +353,7 @@ $semantic = if ($optionalUnavailable) { [pscustomobject]@{known=$true;ok=$false;
 finally {
     Remove-Item Env:CSX_PROFILER_TEST_STATE -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_DRIFT_AT_CALL -ErrorAction SilentlyContinue
+    Remove-Item Env:CSX_PROFILER_TEST_BREAK_MIRROR -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_RENDER_SCALE_EPOCH_AFTER -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_RENDER_SCALE_OPTIONAL_MODE -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_DISTORT_LABEL -ErrorAction SilentlyContinue

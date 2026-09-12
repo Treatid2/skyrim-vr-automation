@@ -40,6 +40,11 @@ identity, transport retries, and terminal result. If the target exits during a
 synchronous call, the failed result returns `invocationEvidencePath` instead of
 discarding the last known request boundary. Without an explicit evidence
 directory these journals use the local Skyrim VR automation evidence root.
+If failure occurs after dispatch, the result also reports `dispatchReached`,
+`acceptedDataRetained`, and `indeterminate`. An accepted response retained
+before a later evidence-write failure remains in `data` and in any recoverable
+invocation journal; an unobserved mutation result remains explicitly
+indeterminate rather than being converted to an ordinary failure.
 Once a call has completed, a later journal-write failure never replaces its
 payload or semantic outcome. The returned result instead carries
 `evidenceWarnings` and `evidenceJournalFinalized: false`, alongside the final

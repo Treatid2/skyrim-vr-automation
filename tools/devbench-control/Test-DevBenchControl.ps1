@@ -404,6 +404,40 @@ $entryPointPath = Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1'
 $parseErrors = $null
 $tokens = $null
 $entryPointAst = [Management.Automation.Language.Parser]::ParseFile($entryPointPath, [ref]$tokens, [ref]$parseErrors)
+$identityUtcAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'ConvertTo-DevBenchRuntimeIdentityUtc' }, $true))[0]
+Invoke-Expression $identityUtcAst.Extent.Text
+$identityUtcText = ConvertTo-DevBenchRuntimeIdentityUtc '2026-09-11T00:00:41.0000000Z'
+$identityUtcParsed = ConvertTo-DevBenchRuntimeIdentityUtc ([DateTime]'2026-09-11T00:00:41Z')
+Assert-Test ($identityUtcText -ceq $identityUtcParsed) 'expected runtime start timestamps compare by normalized UTC instant after JSON parsing'
+$dispatchProvenanceAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-DevBenchDispatchProvenance' }, $true))[0]
+Invoke-Expression $dispatchProvenanceAst.Extent.Text
+$skippedDispatch = Get-DevBenchDispatchProvenance -InvocationRecord ([pscustomobject]@{ dispatchedUtc = $null }) -Data ([pscustomobject]@{ toolCallSkipped = $true }) -Semantic ([pscustomobject]@{ known = $true; ok = $false })
+$acceptedDispatch = Get-DevBenchDispatchProvenance -InvocationRecord ([pscustomobject]@{ dispatchedUtc = [DateTime]::UtcNow.ToString('o') }) -Data ([pscustomobject]@{ content = @([pscustomobject]@{ ok = $true }) }) -Semantic ([pscustomobject]@{ known = $true; ok = $true })
+$rejectedDispatch = Get-DevBenchDispatchProvenance -InvocationRecord ([pscustomobject]@{ dispatchedUtc = [DateTime]::UtcNow.ToString('o') }) -Data ([pscustomobject]@{ content = @([pscustomobject]@{ ok = $false }) }) -Semantic ([pscustomobject]@{ known = $true; ok = $false })
+Assert-Test (-not $skippedDispatch.dispatchReached -and -not $skippedDispatch.responseDataRetained -and -not $skippedDispatch.acceptedDataRetained) 'guard and tool-unavailable branches retain known target non-dispatch provenance'
+Assert-Test ($acceptedDispatch.dispatchReached -and $acceptedDispatch.responseDataRetained -and $acceptedDispatch.acceptedDataRetained -and -not $acceptedDispatch.semanticRejected) 'semantically accepted target data retains accepted dispatch authority'
+Assert-Test ($rejectedDispatch.dispatchReached -and $rejectedDispatch.responseDataRetained -and -not $rejectedDispatch.acceptedDataRetained -and $rejectedDispatch.semanticRejected) 'semantically rejected target data remains evidence without becoming accepted authority'
+$targetDispatchAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-DevBenchTargetDispatch' }, $true))[0]
+Invoke-Expression $targetDispatchAst.Extent.Text
+$preTargetRecord = [ordered]@{ dispatchIntentUtc = $null; dispatchedUtc = $null }
+$targetInvocations = 0
+try {
+    $null = Invoke-DevBenchTargetDispatch -InvocationRecord $preTargetRecord -PersistIntent { throw 'fixture dispatch-intent write failed' } -TargetAction { $script:targetInvocations++; 'unreachable' }
+}
+catch { $preTargetWriteError = $_.Exception.Message }
+$preTargetProvenance = Get-DevBenchDispatchProvenance -InvocationRecord ([pscustomobject]$preTargetRecord) -Data $null -Semantic $null
+Assert-Test ($preTargetWriteError -match 'dispatch-intent write failed' -and $targetInvocations -eq 0 -and
+    [string]::IsNullOrWhiteSpace([string]$preTargetRecord.dispatchedUtc) -and -not $preTargetProvenance.dispatchReached) 'failed dispatch-intent persistence proves definite pre-target non-dispatch'
+$attemptedRecord = [ordered]@{ dispatchIntentUtc = $null; dispatchedUtc = $null }
+$targetInvocations = 0
+try {
+    $null = Invoke-DevBenchTargetDispatch -InvocationRecord $attemptedRecord -PersistIntent { $attemptedRecord.dispatchIntentUtc = [DateTime]::UtcNow.ToString('o') } -TargetAction { $script:targetInvocations++; throw 'fixture target lost response' }
+}
+catch { $attemptedError = $_.Exception.Message }
+$attemptedProvenance = Get-DevBenchDispatchProvenance -InvocationRecord ([pscustomobject]$attemptedRecord) -Data $null -Semantic $null
+Assert-Test ($attemptedError -match 'target lost response' -and $targetInvocations -eq 1 -and
+    -not [string]::IsNullOrWhiteSpace([string]$attemptedRecord.dispatchIntentUtc) -and
+    -not [string]::IsNullOrWhiteSpace([string]$attemptedRecord.dispatchedUtc) -and $attemptedProvenance.dispatchReached) 'entered target with a lost response remains an attempted unknown mutation'
 $terminalWriterAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Write-TerminalInvocationEvidence' }, $true))[0]
 Invoke-Expression $terminalWriterAst.Extent.Text
 $headerReaderAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-McpSessionHeaderValue' }, $true))[0]
@@ -421,6 +455,8 @@ Assert-Test ($entryPointText -match 'full-runtime-rebind-required') 'bounded wai
 Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$RequirePerformanceNeutral\) -and -not \$semantic\.known') 'required semantic outcomes reject unknown responses'
 Assert-Test ($entryPointText -match 'ok = \[bool\]\$observation\.satisfied') 'wait semantics retain the observed unsatisfied condition'
 Assert-Test ($entryPointText -match '\$Command -eq ''call'' -and -not \$readOnlyCall -and -not \$runtimeIdentity\.complete') 'only mutation-capable calls require complete runtime identity'
+Assert-Test ($entryPointText -match '\[string\]\$ExpectedRuntimeIdentityJson') 'controller accepts an exact prior runtime identity for pre-dispatch continuity'
+Assert-Test ($entryPointText.IndexOf('Expected runtime identity is invalid:') -lt $entryPointText.IndexOf("Update-InvocationEvidence -State 'dispatching'")) 'runtime identity continuity is verified before mutation dispatch'
 Assert-Test ($entryPointText -match 'if \(\$Command -eq ''call''\) \{[\s\S]{0,100}-not \$semantic\.known -or -not \$semantic\.ok') 'mutation-capable calls fail closed on unknown semantic outcomes'
 Assert-Test ($entryPointText -match '\$Tool -eq ''communityshaders\.profiler''') 'profiler calls have an explicit semantic contract adapter'
 Assert-Test ($entryPointText -match '\$requestedAction -eq ''status''[\s\S]{0,180}\.status\.PSObject\.Properties\[''frame_count''\]') 'profiler status requires a frame-bearing status payload'
@@ -429,7 +465,13 @@ Assert-Test ($entryPointText -match '\$requestedAction -eq ''disable''[\s\S]{0,1
 Assert-Test ($entryPointText -match 'outcome = ''profiler-contract-satisfied''') 'accepted profiler responses report their contract-specific outcome'
 Assert-Test ($entryPointText -match 'Invoke-ToolRpc -Name \$Tool -Arguments \$arguments -Headers \$headers -Mutation:\(-not \$readOnlyCall\)') 'user calls carry their explicit retry-safety classification'
 Assert-Test ($entryPointText -match 'not-retried-indeterminate') 'ambiguous mutation transport failures are not replayed'
-Assert-Test ($entryPointText -match 'Update-InvocationEvidence -State \$\(if \(\$indeterminateMutation\) \{ ''indeterminate'' \}') 'indeterminate mutation outcomes are durably journaled'
+Assert-Test ($entryPointText -match 'Update-InvocationEvidence -State \$\(if \(\$outcomeIndeterminate\) \{ ''indeterminate'' \}') 'indeterminate mutation outcomes are durably journaled'
+Assert-Test ($entryPointText -match '-Semantic \$semantic -Data \$data -Errors') 'post-dispatch failures preserve accepted data in the invocation journal when possible'
+Assert-Test (
+    $entryPointText -match 'acceptedDataRetained = \[bool\]\$dispatch\.acceptedDataRetained' -and
+    $entryPointText -match 'responseDataRetained = \[bool\]\$dispatch\.responseDataRetained' -and
+    $entryPointText -match 'data = \$data'
+) 'post-dispatch failure envelopes retain accepted response data and expose its provenance'
 Assert-Test ($entryPointText -match '\$headers = \$null[\s\S]{0,300}probeError') 'wait probe transport failures force full session and identity rebind'
 Assert-Test ($entryPointText -match '-TimeoutSec \(Get-RequestTimeoutSeconds\)') 'wait requests consume only their remaining operation budget'
 Assert-Test ($entryPointText -match '\$operationStartedUtc = \[DateTime\]::UtcNow' -and $entryPointText -match '\$operationDeadlineUtc = \$operationStartedUtc.AddSeconds\(\$TimeoutSeconds\)' -and $entryPointText -notmatch '\[Math\]::Min\(15,') 'blocking calls use the declared operation budget instead of a fixed 15-second transport cap'
