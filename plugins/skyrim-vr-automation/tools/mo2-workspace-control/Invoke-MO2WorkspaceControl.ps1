@@ -751,8 +751,16 @@ function Complete-WorkspaceBackupOutput($Config, $Workspace, [switch]$WhatIf) {
                 [pscustomobject]@{ path = $_.FullName; receipt = $receipt }
             }
         })
-        if ($restoreMatches.Count -ne 1) { throw 'Restored backup lacks one exact committed restore receipt for its preserved working tree.' }
-        $restored = [pscustomobject]@{ data = [pscustomobject]@{ displacedPath = [string]$restoreMatches[0].receipt.displacedPath; baseline = [pscustomobject]@{ treeSha256 = [string]$restoreMatches[0].receipt.restoredTreeSha256 }; restoreReceiptPath = [string]$restoreMatches[0].path } }
+        if ($restoreMatches.Count -eq 1) {
+            $restored = [pscustomobject]@{ data = [pscustomobject]@{ displacedPath = [string]$restoreMatches[0].receipt.displacedPath; baseline = [pscustomobject]@{ treeSha256 = [string]$restoreMatches[0].receipt.restoredTreeSha256 }; restoreReceiptPath = [string]$restoreMatches[0].path } }
+        }
+        elseif ($restoreMatches.Count -eq 0 -and
+            [string]$current.data.treeSha256 -ceq [string]$backupPlan.workingTreeInventory.treeSha256) {
+            $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$output.overwritePath)
+            $restored = & $transactionTool restore -CachePath ([string]$output.backupPath) -RelativeCachePath 'backup' -EvidenceDirectory ([string]$output.backupEvidenceDirectory) -BlockingProcessNames $blockingProcessNames -NoExit -Confirm:$false | ConvertFrom-Json
+            if (-not $restored.ok) { throw "Could not durably complete the unchanged exact pre-task MO2 Overwrite backup: $($restored.errors -join '; ')" }
+        }
+        else { throw 'Restored backup lacks one exact committed restore receipt for its preserved working tree.' }
     }
     else {
         $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$output.overwritePath)
@@ -2561,9 +2569,17 @@ try {
                 elseif (-not (Test-Path -LiteralPath ([string]$current.data.runtimeOutput.backupCompletionPath) -PathType Leaf)) {
                     throw 'The task-owned MO2 Overwrite marker is missing before output completion.'
                 }
-                $isolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile ([string]$current.data.profile) -Executable ([string]$current.data.runtimeOutput.executable) -AccessId $AccessId -AllowPreparedCacheGrowth
-                if (-not $isolation.ok) { throw "Task runtime-output isolation changed before completion: $($isolation.errors -join '; ')" }
                 $null = Get-WorkspaceCacheCompletionEvidence -Config $config -Workspace $current -RequireOwnerMarker:$markerExists
+                $isolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile ([string]$current.data.profile) -Executable ([string]$current.data.runtimeOutput.executable) -AccessId $AccessId -AllowPreparedCacheGrowth
+                if (-not $isolation.ok) {
+                    $recoveryEligibleErrors = @($isolation.errors | Where-Object {
+                        [string]$_ -match '^MO2 Overwrite backup lacks \d+ enabled-provider path\(s\):'
+                    })
+                    if ($recoveryEligibleErrors.Count -eq 0 -or
+                        $recoveryEligibleErrors.Count -ne @($isolation.errors).Count) {
+                        throw "Task runtime-output isolation changed before completion: $($isolation.errors -join '; ')"
+                    }
+                }
                 Complete-WorkspaceBackupOutput -Config $config -Workspace $current
             }
         }

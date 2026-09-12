@@ -1109,9 +1109,16 @@ function Complete-TaskCache($Storage) {
                     if ([string]$candidate.cachePath -eq $resolvedCache -and [string]$candidate.restoredTreeSha256 -ieq [string]$plan.beforeTreeSha256 -and [string]$candidate.displacedTreeSha256 -ieq [string]$currentBeforeRestore.data.treeSha256) { [pscustomobject]@{ path = $_.FullName; receipt = $candidate } }
                 } catch { }
             })
-            if ($matchingReceipts.Count -ne 1) { throw 'Live cache is restored but no unique committed restore receipt proves the preserved working tree; recovery is required.' }
-            $match = $matchingReceipts[0]
-            $restore = [pscustomobject]@{ data = [pscustomobject]@{ displacedPath = [string]$match.receipt.displacedPath; baseline = [pscustomobject]@{ treeSha256 = [string]$match.receipt.restoredTreeSha256 }; restoreReceiptPath = [string]$match.path } }
+            if ($matchingReceipts.Count -eq 1) {
+                $match = $matchingReceipts[0]
+                $restore = [pscustomobject]@{ data = [pscustomobject]@{ displacedPath = [string]$match.receipt.displacedPath; baseline = [pscustomobject]@{ treeSha256 = [string]$match.receipt.restoredTreeSha256 }; restoreReceiptPath = [string]$match.path } }
+            }
+            elseif ($matchingReceipts.Count -eq 0 -and
+                [string]$liveNow.data.treeSha256 -ieq [string]$currentBeforeRestore.data.treeSha256) {
+                Assert-OverwriteOwnerBinding $cacheBinding
+                $restore = Invoke-Transaction 'restore' @{ CachePath = $resolvedCache; EvidenceDirectory = $evidence; BlockingProcessNames = $BlockingProcessNames; Confirm = $false }
+            }
+            else { throw 'Live cache is restored but no unique committed restore receipt proves the preserved working tree; recovery is required.' }
         }
         elseif ([string]$liveNow.data.treeSha256 -ieq [string]$currentBeforeRestore.data.treeSha256) {
             Assert-OverwriteOwnerBinding $cacheBinding

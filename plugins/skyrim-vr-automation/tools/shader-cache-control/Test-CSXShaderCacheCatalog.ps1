@@ -215,6 +215,64 @@ try {
     }
     Assert-Test ($completeAgain.ok -and $completeAgain.state -eq 'already-complete') 'task completion retry returns the immutable existing completion'
 
+    $unchangedCatalog = Join-Path $resolvedTestRoot 'unchanged-catalog'
+    $unchangedCache = Join-Path $resolvedTestRoot 'unchanged-live\ShaderCache'
+    $unchangedEvidence = Join-Path $resolvedTestRoot 'unchanged-evidence'
+    New-Item -ItemType Directory -Path $unchangedCache -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $unchangedCache 'Info.ini') -Value @('[Cache]', 'ShaderCacheABI = abi-unchanged') -Encoding utf8
+    [IO.File]::WriteAllBytes((Join-Path $unchangedCache 'unchanged.bin'), [byte[]](8, 6, 7, 5))
+    $unchangedPrepare = Invoke-Catalog @{
+        Command = 'prepare'; CatalogRoot = $unchangedCatalog
+        CachePath = $unchangedCache; EvidenceDirectory = $unchangedEvidence
+        ShaderCacheAbi = 'abi-unchanged'; ShaderSourceSha256 = ('1' * 64)
+        BlockingProcessNames = $blockers; Confirm = $false; Compact = $true
+        NoExit = $true
+    }
+    $unchangedBefore = & $transactionTool inspect -CachePath $unchangedCache -NoExit | ConvertFrom-Json -Depth 30
+    $unchangedComplete = Invoke-Catalog @{
+        Command = 'complete'; CatalogRoot = $unchangedCatalog
+        CachePath = $unchangedCache; EvidenceDirectory = $unchangedEvidence
+        WorkingSetStatus = 'unverified'; BlockingProcessNames = $blockers
+        Confirm = $false; Compact = $true; NoExit = $true
+    }
+    $unchangedAfter = & $transactionTool inspect -CachePath $unchangedCache -NoExit | ConvertFrom-Json -Depth 30
+    $unchangedPlan = Get-Content -LiteralPath (Join-Path $unchangedEvidence 'shader-cache-task.plan.json') -Raw | ConvertFrom-Json -Depth 40
+    Assert-Test ($unchangedPrepare.ok -and $unchangedComplete.ok -and
+        [string]$unchangedBefore.data.treeSha256 -ieq [string]$unchangedAfter.data.treeSha256 -and
+        (Test-Path -LiteralPath ([string]$unchangedPlan.restoreReceiptPath) -PathType Leaf)) 'first completion durably restores and completes an unchanged optional-output cache'
+
+    $recoveryCatalog = Join-Path $resolvedTestRoot 'post-restore-catalog'
+    $recoveryCache = Join-Path $resolvedTestRoot 'post-restore-live\ShaderCache'
+    $recoveryEvidence = Join-Path $resolvedTestRoot 'post-restore-evidence'
+    New-Item -ItemType Directory -Path $recoveryCache -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $recoveryCache 'Info.ini') -Value @('[Cache]', 'ShaderCacheABI = abi-recovery') -Encoding utf8
+    [IO.File]::WriteAllBytes((Join-Path $recoveryCache 'baseline.bin'), [byte[]](3, 1, 4, 1))
+    $recoveryPrepare = Invoke-Catalog @{
+        Command = 'prepare'; CatalogRoot = $recoveryCatalog
+        CachePath = $recoveryCache; EvidenceDirectory = $recoveryEvidence
+        ShaderCacheAbi = 'abi-recovery'; ShaderSourceSha256 = ('2' * 64)
+        BlockingProcessNames = $blockers; Confirm = $false; Compact = $true
+        NoExit = $true
+    }
+    [IO.File]::WriteAllBytes((Join-Path $recoveryCache 'generated.bin'), [byte[]](2, 7, 1, 8))
+    $recoveryWorking = & $transactionTool inspect -CachePath $recoveryCache -NoExit | ConvertFrom-Json -Depth 30
+    $recoveryPlanPath = Join-Path $recoveryEvidence 'shader-cache-task.plan.json'
+    $recoveryPlan = Get-Content -LiteralPath $recoveryPlanPath -Raw | ConvertFrom-Json -Depth 40
+    $recoveryPlan | Add-Member -NotePropertyName workingTreeInventory -NotePropertyValue $recoveryWorking.data -Force
+    $recoveryPlan.state = 'completing'
+    $recoveryPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $recoveryPlanPath -Encoding utf8
+    $committedRestore = & $transactionTool restore -CachePath $recoveryCache -EvidenceDirectory $recoveryEvidence -BlockingProcessNames $blockers -Confirm:$false -NoExit | ConvertFrom-Json -Depth 30
+    $recoveredComplete = Invoke-Catalog @{
+        Command = 'complete'; CatalogRoot = $recoveryCatalog
+        CachePath = $recoveryCache; EvidenceDirectory = $recoveryEvidence
+        WorkingSetStatus = 'unverified'; BlockingProcessNames = $blockers
+        Confirm = $false; Compact = $true; NoExit = $true
+    }
+    $recoveredPlan = Get-Content -LiteralPath $recoveryPlanPath -Raw | ConvertFrom-Json -Depth 40
+    Assert-Test ($recoveryPrepare.ok -and $committedRestore.ok -and
+        $recoveredComplete.ok -and
+        [IO.Path]::GetFullPath([string]$recoveredPlan.restoreReceiptPath) -eq [IO.Path]::GetFullPath([string]$committedRestore.data.restoreReceiptPath)) 'completion recovers the exact committed restore after interruption before plan persistence'
+
     $boundCatalogRoot = Join-Path $resolvedTestRoot 'bound-catalog'
     $boundEvidence = Join-Path $resolvedTestRoot 'bound-task-evidence'
     $modsRoot = Join-Path $resolvedTestRoot 'mo2\mods'
