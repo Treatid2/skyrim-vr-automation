@@ -100,6 +100,19 @@ function Get-DevBenchDispatchProvenance($InvocationRecord, $Data, $Semantic) {
     }
 }
 
+function Invoke-DevBenchTargetDispatch {
+    param(
+        $InvocationRecord,
+        [Parameter(Mandatory)][scriptblock]$PersistIntent,
+        [Parameter(Mandatory)][scriptblock]$TargetAction
+    )
+    & $PersistIntent | Out-Null
+    if ($null -ne $InvocationRecord) {
+        $InvocationRecord.dispatchedUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    return & $TargetAction
+}
+
 function Set-ServerWaitBudgetAtDispatch([hashtable]$Arguments) {
     if ($null -eq $Arguments -or -not $Arguments.ContainsKey('timeoutMs') -or $null -eq $Arguments.timeoutMs) { return }
     $serverTimeoutMilliseconds = [double]$Arguments.timeoutMs
@@ -179,6 +192,7 @@ function Initialize-InvocationEvidence {
         workspaceManifestPath = if ([string]::IsNullOrWhiteSpace($WorkspaceManifestPath)) { $null } else { [IO.Path]::GetFullPath($WorkspaceManifestPath) }
         workspaceManifestSha256 = if (-not [string]::IsNullOrWhiteSpace($WorkspaceManifestPath) -and (Test-Path -LiteralPath $WorkspaceManifestPath -PathType Leaf)) { (Get-FileHash -LiteralPath $WorkspaceManifestPath -Algorithm SHA256).Hash } else { $null }
         preparedUtc = [DateTime]::UtcNow.ToString('o')
+        dispatchIntentUtc = $null
         dispatchedUtc = $null
         completedUtc = $null
         runtimeIdentity = $runtimeIdentity
@@ -205,7 +219,7 @@ function Update-InvocationEvidence {
     $script:invocationRecord.semantic = $Semantic
     $script:invocationRecord.data = $Data
     $script:invocationRecord.errors = @($Errors)
-    if ($State -eq 'dispatching') { $script:invocationRecord.dispatchedUtc = [DateTime]::UtcNow.ToString('o') }
+    if ($State -eq 'dispatching') { $script:invocationRecord.dispatchIntentUtc = [DateTime]::UtcNow.ToString('o') }
     if ($State -in @('completed', 'failed', 'guard-rejected', 'indeterminate')) { $script:invocationRecord.completedUtc = [DateTime]::UtcNow.ToString('o') }
     Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord
 }
@@ -751,6 +765,14 @@ function Get-ListenerPid([int]$Port) {
     return [int]$records[0]
 }
 
+function ConvertTo-DevBenchRuntimeIdentityUtc($Value) {
+    if ($Value -is [DateTime]) { return ([DateTime]$Value).ToUniversalTime().ToString('o') }
+    return [DateTime]::Parse(
+        [string]$Value,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime().ToString('o')
+}
+
 function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [switch]$AllowDeferredBuildIdentity) {
     $expectations = Get-DevBenchRuntimeExpectations -Runtime $Runtime
     if (-not [string]::IsNullOrWhiteSpace($ArtifactPath)) { $expectations.artifactPath = [IO.Path]::GetFullPath($ArtifactPath) }
@@ -843,7 +865,11 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
             }
             if ($listenerPid -ne [int]$expectedIdentity.listenerPid) { $errors.Add("Expected listener PID $($expectedIdentity.listenerPid) differs from observed PID $listenerPid.") }
             if ($processIdentity -and -not [string]::Equals([string]$processIdentity.path, [string]$expectedIdentity.processPath, [StringComparison]::OrdinalIgnoreCase)) { $errors.Add('Expected listener process path differs from the observed process path.') }
-            if ($processIdentity -and [string]$processIdentity.startTimeUtc -cne [string]$expectedIdentity.processStartTimeUtc) { $errors.Add('Expected listener process start time differs from the observed process start time.') }
+            if ($processIdentity -and
+                (ConvertTo-DevBenchRuntimeIdentityUtc $processIdentity.startTimeUtc) -cne
+                (ConvertTo-DevBenchRuntimeIdentityUtc $expectedIdentity.processStartTimeUtc)) {
+                $errors.Add('Expected listener process start time differs from the observed process start time.')
+            }
             if ([string]$actualBuildId -cne [string]$expectedIdentity.buildId) { $errors.Add('Expected CSX build ID differs from the observed build ID.') }
             if ($artifact -and -not [string]::Equals([string]$artifact.path, [string]$expectedIdentity.artifactPath, [StringComparison]::OrdinalIgnoreCase)) { $errors.Add('Expected artifact path differs from the observed artifact path.') }
             if ($artifact -and [string]$artifact.sha256 -cne [string]$expectedIdentity.artifactSha256) { $errors.Add('Expected artifact SHA-256 differs from the observed artifact SHA-256.') }
@@ -1017,8 +1043,11 @@ try {
             }
         }
         else {
-            Update-InvocationEvidence -State 'dispatching'
-            $data = Invoke-ToolRpc -Name $Tool -Arguments $arguments -Headers $headers -Mutation:(-not $readOnlyCall)
+            $data = Invoke-DevBenchTargetDispatch -InvocationRecord $invocationRecord -PersistIntent {
+                Update-InvocationEvidence -State 'dispatching'
+            } -TargetAction {
+                Invoke-ToolRpc -Name $Tool -Arguments $arguments -Headers $headers -Mutation:(-not $readOnlyCall)
+            }
             if ($performanceGuard) {
                 $data | Add-Member -NotePropertyName performanceGuard -NotePropertyValue $performanceGuard -Force
             }
