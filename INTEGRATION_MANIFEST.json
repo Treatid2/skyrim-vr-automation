@@ -27,8 +27,9 @@
       {
         "number": 35,
         "url": "https://github.com/Treatid2/skyrim-vr-automation/pull/35",
-        "head": "3aec60d929e8de6052d5995937175c9761375a1d",
-        "order": 1
+        "head": "b26d8d04099378a9524d38571aad594d2f851879",
+        "order": 1,
+        "note": "Follow-up-03 corrections project the verified observed DevBench identity into the stable expected-runtime contract, distinguish dispatch intent from target entry, make terminal capture cleanup idempotent, and restore raw mirror parity."
       },
       {
         "number": 37,
