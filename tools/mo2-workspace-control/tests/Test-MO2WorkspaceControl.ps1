@@ -576,7 +576,8 @@ try {
     if (-not $verifiedPreparedCache.ok -or -not $verifiedCompletedCache.ok -or -not $verifiedCompletedOutput.ok) { throw 'Verified fixture workspace output transactions did not complete.' }
     if ((Test-Path -LiteralPath $verified.data.runtimeOutput.cachePath) -or (Test-Path -LiteralPath $verified.data.runtimeOutput.backupPath)) { throw 'Completion did not restore both originally absent Overwrite trees to absence.' }
     foreach ($mixedCase in @(
-        [pscustomobject]@{ label = 'backup-present'; cachePresent = $false; backupPresent = $true }
+        [pscustomobject]@{ label = 'backup-present'; cachePresent = $false; backupPresent = $true; invalidRestore = $false },
+        [pscustomobject]@{ label = 'backup-invalid-restore'; cachePresent = $false; backupPresent = $true; invalidRestore = $true }
     )) {
         $mixedCachePath = Join-Path $mo2 'overwrite\ShaderCache'
         $mixedBackupPath = Join-Path $mo2 'overwrite\backup'
@@ -608,6 +609,26 @@ try {
         $mixedBackupPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $mixedBackupPlanPath -Encoding utf8
         $mixedInterruptedRestore = & $transactionController restore -CachePath $mixedWorkspace.data.runtimeOutput.backupPath -RelativeCachePath 'backup' -EvidenceDirectory $mixedWorkspace.data.runtimeOutput.backupEvidenceDirectory -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json -Depth 30
         if (-not $mixedInterruptedRestore.ok) { throw 'Fixture could not establish a committed post-restore interruption.' }
+        $mixedBackupPlan = Get-Content -LiteralPath $mixedBackupPlanPath -Raw | ConvertFrom-Json -Depth 40
+        $mixedBackupPlan | Add-Member -NotePropertyName restoreReceiptPath -NotePropertyValue ([string]$mixedInterruptedRestore.data.restoreReceiptPath) -Force
+        $mixedBackupPlan | Add-Member -NotePropertyName restoredTreeSha256 -NotePropertyValue ([string]$mixedInterruptedRestore.data.baseline.treeSha256) -Force
+        $mixedBackupPlan.state = 'restored'
+        $mixedBackupPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $mixedBackupPlanPath -Encoding utf8
+        if ($mixedCase.invalidRestore) {
+            $invalidReceipt = Get-Content -LiteralPath ([string]$mixedInterruptedRestore.data.restoreReceiptPath) -Raw | ConvertFrom-Json -Depth 30
+            $invalidReceipt.operation = 'seed'
+            $invalidReceipt | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath ([string]$mixedInterruptedRestore.data.restoreReceiptPath) -Encoding utf8
+            $invalidCompletion = & $entry complete-output -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $mixedWorkspace.data.workspaceId -NoExit -Confirm:$false | ConvertFrom-Json
+            if ($invalidCompletion.ok -or $invalidCompletion.errors[0] -notmatch 'does not bind' -or
+                (Test-Path -LiteralPath ([string]$mixedWorkspace.data.runtimeOutput.backupCompletionPath)) -or
+                -not (Test-Path -LiteralPath ([string]$mixedWorkspace.data.runtimeOutput.ownerMarkerPath) -PathType Leaf)) {
+                throw 'Workspace backup recovery did not fail closed on a wrong-operation persisted restore receipt.'
+            }
+            Remove-Item -LiteralPath ([string]$mixedWorkspace.data.runtimeOutput.ownerMarkerPath) -Force
+            Remove-Item -LiteralPath ([string]$mixedWorkspace.data.profilePath) -Recurse -Force
+            Remove-Item -LiteralPath (Join-Path $workspaceControlRoot ([string]$mixedWorkspace.data.workspaceId + '.json')) -Force
+            continue
+        }
         $mixedCompletedOutput = & $entry complete-output -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $mixedWorkspace.data.workspaceId -Confirm:$false | ConvertFrom-Json
         if (-not $mixedPreparedCache.ok -or -not $mixedCompletedCache.ok -or -not $mixedCompletedOutput.ok) { throw "Mixed Overwrite completion failed for $($mixedCase.label). Cache=$($mixedCompletedCache | ConvertTo-Json -Depth 12 -Compress) Output=$($mixedCompletedOutput | ConvertTo-Json -Depth 12 -Compress)" }
         if ([IO.Path]::GetFullPath([string]$mixedCompletedOutput.data.completion.restoreReceiptPath) -ne [IO.Path]::GetFullPath([string]$mixedInterruptedRestore.data.restoreReceiptPath)) { throw 'Workspace completion did not recover the exact committed post-restore receipt.' }
