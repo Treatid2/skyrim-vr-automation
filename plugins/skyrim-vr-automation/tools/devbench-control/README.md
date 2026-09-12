@@ -196,17 +196,25 @@ the transient unloaded-to-loaded edge because that edge can occur between
 polls. The call adapter classifies an exact `action=load`, `queued=true`, and
 matching save name as `game-load-dispatch-queued` with
 `completionBasis=dispatch-only`; it does not claim that loading has completed.
+A generic positive status never substitutes for that exact receipt, and any
+contradictory error, extra payload, missing request identity, wrong action,
+non-Boolean queue state, or mismatched save remains rejected.
 A transport failure never causes the load mutation to be replayed.
 
 Before a `communityshaders.render_map` `start`, capture the live `registry`
 response and use `New-CSXRenderMapCapturePlan.ps1` with a workload JSON file.
-The workload states expected duration, frames, event count, event bytes, scope
-depth, and every catalogue observation family. The planner multiplies each by
-explicit headroom, adds the registry's fixed catalogue allocation to the byte
-budget, rejects any plan beyond the live service ceilings, and writes an
-immutable receipt containing the selected bounds and rationale. Pass only the
-receipt's `arguments` to `start`. Any limit hit makes the evidence incomplete
-unless saturation itself is the experiment.
+The retained registry must be a successful response bound to the exact
+`communityshaders.render_map` service, explicit contract major, producer build,
+and source snapshot hash. The workload states positive integer JSON numbers for
+expected duration, frames, event count, event bytes, scope depth, and every
+catalogue observation family. The planner multiplies each by explicit headroom,
+adds the registry's fixed catalogue allocation to the byte budget, rejects any
+plan beyond the live service ceilings, and writes an immutable receipt
+containing the selected bounds and rationale. Pass only a successful result's
+`arguments` to `start`. If final hashing fails after receipt publication, the
+failure result retains the committed path and withholds arguments so the exact
+receipt can be reconciled. Any limit hit makes the evidence incomplete unless
+saturation itself is the experiment.
 
 `upscalingStable` is the fail-closed barrier for paced cell-transition tests.
 It requires the exact `-ExpectedCell`, a loaded player, no blocking menu, and a

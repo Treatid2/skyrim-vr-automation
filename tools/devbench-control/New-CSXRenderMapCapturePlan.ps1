@@ -8,6 +8,7 @@ param(
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CommandId,
     [Parameter(Mandatory)][string]$OutputPath,
     [ValidateRange(1.0, 10.0)][double]$HeadroomFactor = 2.0,
+    [ValidateSet('none', 'receipt-hash')][string]$InternalTestFailurePoint = 'none',
     [switch]$NoExit,
     [switch]$Compact
 )
@@ -27,23 +28,111 @@ function Get-Property($Value, [string]$Name, $Default = $null) {
 }
 
 function Require-PositiveLong($Value, [string]$Path) {
-    if ($null -eq $Value -or [long]$Value -lt 1) { throw "$Path must be a positive integer." }
-    return [long]$Value
+    if ($null -eq $Value -or $Value -is [bool] -or $Value -is [char] -or $Value -is [string]) {
+        throw "$Path must be a positive integer JSON number."
+    }
+    $numericTypes = @(
+        [byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64],
+        [single], [double], [decimal]
+    )
+    if ($Value.GetType() -notin $numericTypes) {
+        throw "$Path must be a positive integer JSON number."
+    }
+    try { $number = [decimal]$Value }
+    catch { throw "$Path must be a representable positive integer." }
+    if ($number -lt 1 -or [decimal]::Truncate($number) -ne $number -or
+        $number -gt [decimal][long]::MaxValue) {
+        throw "$Path must be a representable positive integer."
+    }
+    return [long]$number
+}
+
+function Get-ScaledBound([long]$Value, [double]$Factor, [string]$Path) {
+    $scaled = [decimal]$Value * [decimal]$Factor
+    $ceiling = [decimal]::Ceiling($scaled)
+    if ($ceiling -gt [decimal][long]::MaxValue) {
+        throw "$Path exceeds the supported 64-bit capture bound."
+    }
+    return [long]$ceiling
+}
+
+function Assert-RegistryEnvelopeSuccess($Value, [string]$Path) {
+    if ($null -eq $Value -or $Value -is [string] -or $Value -is [ValueType]) { return }
+    foreach ($name in @('ok', 'success', 'passed')) {
+        $property = $Value.PSObject.Properties[$name]
+        if ($property -and ($property.Value -isnot [bool] -or -not [bool]$property.Value)) {
+            throw "$Path.$name does not establish a successful registry response."
+        }
+    }
+    foreach ($name in @('failed', 'aborted')) {
+        $property = $Value.PSObject.Properties[$name]
+        if ($property -and ($property.Value -isnot [bool] -or [bool]$property.Value)) {
+            throw "$Path.$name reports a failed registry response."
+        }
+    }
+    foreach ($name in @('error', 'errors')) {
+        $property = $Value.PSObject.Properties[$name]
+        if ($property -and $null -ne $property.Value -and @($property.Value).Count -gt 0 -and
+            -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            throw "$Path.$name contains registry failure evidence."
+        }
+    }
+    foreach ($name in @('status', 'resultStatus')) {
+        $property = $Value.PSObject.Properties[$name]
+        if (-not $property -or $null -eq $property.Value) { continue }
+        $statusName = Get-Property $property.Value 'name'
+        $statusValue = Get-Property $property.Value 'value'
+        if (($null -ne $statusValue -and [long]$statusValue -ne 0) -or
+            ([string]$statusName -match '^(?i:fail|failed|error|rejected|guard_rejected)$')) {
+            throw "$Path.$name reports a failed registry response."
+        }
+    }
 }
 
 function Resolve-Registry($Envelope) {
+    Assert-RegistryEnvelopeSuccess $Envelope 'registryEnvelope'
     $candidate = $Envelope
     $data = Get-Property $candidate 'data'
     if ($null -ne $data) {
+        Assert-RegistryEnvelopeSuccess $data 'registryEnvelope.data'
         $content = Get-Property $data 'content'
-        if ($null -ne $content) { $candidate = $content }
+        if ($null -ne $content) {
+            Assert-RegistryEnvelopeSuccess $content 'registryEnvelope.data.content'
+            $candidate = $content
+        }
     }
     $result = Get-Property $candidate 'result'
-    if ($null -ne $result) { return [pscustomobject]@{ envelope = $candidate; registry = $result } }
-    if ($null -ne (Get-Property $candidate 'defaults') -and $null -ne (Get-Property $candidate 'limits')) {
-        return [pscustomobject]@{ envelope = $candidate; registry = $candidate }
+    $registry = if ($null -ne $result) { $result } elseif (
+        $null -ne (Get-Property $candidate 'defaults') -and
+        $null -ne (Get-Property $candidate 'limits')) {
+        $candidate
+    } else { $null }
+    if ($null -eq $registry) {
+        throw 'RegistryPath does not contain a communityshaders.render_map registry result.'
     }
-    throw 'RegistryPath does not contain a communityshaders.render_map registry result.'
+    Assert-RegistryEnvelopeSuccess $registry 'registry'
+    $service = [string](Get-Property $registry 'service')
+    if ($service -cne 'communityshaders.render_map') {
+        throw 'Registry result is not bound to service communityshaders.render_map.'
+    }
+    $major = Require-PositiveLong (Get-Property $registry 'major') 'registry.major'
+    $producerBuildId = [string](Get-Property $registry 'producerBuildId')
+    if ([string]::IsNullOrWhiteSpace($producerBuildId)) {
+        $producerBuildId = [string](Get-Property (Get-Property $candidate 'server') 'buildId')
+    }
+    if ([string]::IsNullOrWhiteSpace($producerBuildId)) {
+        $producerBuildId = [string](Get-Property (Get-Property $Envelope 'server') 'buildId')
+    }
+    if ([string]::IsNullOrWhiteSpace($producerBuildId)) {
+        throw 'Registry result does not identify its producer build.'
+    }
+    return [pscustomobject]@{
+        envelope = $candidate
+        registry = $registry
+        service = $service
+        major = $major
+        producerBuildId = $producerBuildId
+    }
 }
 
 function Write-JsonAtomic([string]$Path, $Value) {
@@ -64,8 +153,18 @@ function Write-JsonAtomic([string]$Path, $Value) {
     return $resolved
 }
 
+$publishedReceiptPath = $null
 try {
-    $registryEnvelope = Get-Content -LiteralPath ([IO.Path]::GetFullPath($RegistryPath)) -Raw | ConvertFrom-Json -Depth 30
+    $resolvedRegistryPath = [IO.Path]::GetFullPath($RegistryPath)
+    $registryBytes = [IO.File]::ReadAllBytes($resolvedRegistryPath)
+    $registrySha256 = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData($registryBytes)
+    )
+    $registryText = [Text.UTF8Encoding]::new($false, $true).GetString($registryBytes)
+    if ($registryText.Length -gt 0 -and $registryText[0] -eq [char]0xFEFF) {
+        $registryText = $registryText.Substring(1)
+    }
+    $registryEnvelope = $registryText | ConvertFrom-Json -Depth 30
     $workload = Get-Content -LiteralPath ([IO.Path]::GetFullPath($WorkloadPath)) -Raw | ConvertFrom-Json -Depth 20
     $resolvedRegistry = Resolve-Registry $registryEnvelope
     $registry = $resolvedRegistry.registry
@@ -77,7 +176,7 @@ try {
     $expectedFrames = Require-PositiveLong (Get-Property $workload 'expectedFrames') 'workload.expectedFrames'
     $expectedEvents = Require-PositiveLong (Get-Property $workload 'expectedEvents') 'workload.expectedEvents'
     $expectedEventBytes = Require-PositiveLong (Get-Property $workload 'expectedEventBytes') 'workload.expectedEventBytes'
-    $expectedScopeDepth = Require-PositiveLong (Get-Property $workload 'expectedScopeDepth' 1) 'workload.expectedScopeDepth'
+    $expectedScopeDepth = Require-PositiveLong (Get-Property $workload 'expectedScopeDepth') 'workload.expectedScopeDepth'
     $observations = Get-Property $workload 'expectedObservations'
     if ($null -eq $observations) { throw 'workload.expectedObservations is required.' }
 
@@ -99,7 +198,7 @@ try {
     $selected = [ordered]@{}
     $exceeded = [Collections.Generic.List[object]]::new()
     foreach ($spec in $specs) {
-        $desired = [long][Math]::Ceiling([double]$spec.expected * $HeadroomFactor)
+        $desired = Get-ScaledBound $spec.expected $HeadroomFactor "workload bound $($spec.argument)"
         $ceiling = Require-PositiveLong (Get-Property $limits $spec.limit) "registry.limits.$($spec.limit)"
         $selected[$spec.argument] = $desired
         if ($desired -gt $ceiling) {
@@ -107,7 +206,12 @@ try {
         }
     }
     $fixedCatalogueBytes = Require-PositiveLong (Get-Property $defaults 'fixedCatalogueBytes') 'registry.defaults.fixedCatalogueBytes'
-    $desiredBytes = [long]($fixedCatalogueBytes + [Math]::Ceiling([double]$expectedEventBytes * $HeadroomFactor))
+    $eventBytesWithHeadroom = Get-ScaledBound $expectedEventBytes $HeadroomFactor 'workload.expectedEventBytes'
+    $desiredBytesDecimal = [decimal]$fixedCatalogueBytes + [decimal]$eventBytesWithHeadroom
+    if ($desiredBytesDecimal -gt [decimal][long]::MaxValue) {
+        throw 'registry.defaults.fixedCatalogueBytes plus the event-byte workload exceeds the supported 64-bit capture bound.'
+    }
+    $desiredBytes = [long]$desiredBytesDecimal
     $maximumBytes = Require-PositiveLong (Get-Property $limits 'maximumBytes') 'registry.limits.maximumBytes'
     $selected['maxBytes'] = $desiredBytes
     if ($desiredBytes -gt $maximumBytes) {
@@ -117,7 +221,7 @@ try {
     $admissible = $exceeded.Count -eq 0
     $arguments = if ($admissible) {
         [ordered]@{
-            contractMajor = [int](Get-Property $registry 'major' 1)
+            contractMajor = [int]$resolvedRegistry.major
             clientId = $ClientId
             commandId = $CommandId
             action = 'start'
@@ -127,10 +231,13 @@ try {
         schemaVersion = 1
         state = if ($admissible) { 'capture-plan-ready' } else { 'workload-exceeds-service-ceilings' }
         admissible = $admissible
-        service = 'communityshaders.render_map'
+        service = $resolvedRegistry.service
         commandId = $CommandId
         clientId = $ClientId
-        producerBuildId = Get-Property (Get-Property $resolvedRegistry.envelope 'server') 'buildId'
+        producerBuildId = $resolvedRegistry.producerBuildId
+        registryPath = $resolvedRegistryPath
+        registrySha256 = $registrySha256
+        registryContractMajor = $resolvedRegistry.major
         workload = $workload
         headroomFactor = $HeadroomFactor
         rationale = 'Every bound is the stated workload multiplied by explicit headroom; maxBytes additionally includes the registry fixedCatalogueBytes allocation.'
@@ -141,19 +248,33 @@ try {
         arguments = if ($arguments) { [pscustomobject]$arguments } else { $null }
         createdUtc = [DateTime]::UtcNow.ToString('o')
     }
-    $written = Write-JsonAtomic -Path $OutputPath -Value $receipt
+    $publishedReceiptPath = Write-JsonAtomic -Path $OutputPath -Value $receipt
+    if ($InternalTestFailurePoint -eq 'receipt-hash') {
+        throw 'Injected receipt hash failure after immutable publication.'
+    }
+    $receiptSha256 = (Get-FileHash -LiteralPath $publishedReceiptPath -Algorithm SHA256).Hash
     $result = [pscustomobject][ordered]@{
         ok = $admissible
         state = $receipt.state
-        receiptPath = $written
-        receiptSha256 = (Get-FileHash -LiteralPath $written -Algorithm SHA256).Hash
+        receiptPath = $publishedReceiptPath
+        receiptPublished = $true
+        receiptSha256 = $receiptSha256
         arguments = $receipt.arguments
         exceededCeilings = @($exceeded)
         errors = if ($admissible) { @() } else { @('The stated workload plus headroom exceeds one or more live service ceilings; no start arguments were issued.') }
     }
 }
 catch {
-    $result = [pscustomobject][ordered]@{ ok = $false; state = 'plan-error'; receiptPath = $null; arguments = $null; exceededCeilings = @(); errors = @($_.Exception.Message) }
+    $result = [pscustomobject][ordered]@{
+        ok = $false
+        state = if ($publishedReceiptPath) { 'plan-finalization-error' } else { 'plan-error' }
+        receiptPath = $publishedReceiptPath
+        receiptPublished = $null -ne $publishedReceiptPath
+        receiptSha256 = $null
+        arguments = $null
+        exceededCeilings = @()
+        errors = @($_.Exception.Message)
+    }
 }
 
 $result | ConvertTo-Json -Depth 20 -Compress:$Compact
