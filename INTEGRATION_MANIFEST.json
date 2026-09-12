@@ -33,8 +33,9 @@
       {
         "number": 37,
         "url": "https://github.com/Treatid2/skyrim-vr-automation/pull/37",
-        "head": "15b7e0b378fbea1f44c8b499038d641b0df7adb4",
-        "order": 2
+        "head": "5654cd840edc3324065b089b62a60b5c4a275f1d",
+        "order": 2,
+        "note": "Follow-up-04 corrections bind MCP setup to the shared deadline, retain provider custody before receipt publication, include terminal validation in the live budget, and preserve valid sealed negative results."
       },
       {
         "number": 36,
