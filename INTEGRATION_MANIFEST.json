@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "repository": "Treatid2/skyrim-vr-automation",
+  "generatedAt": "2026-09-12",
+  "curated": {
+    "branch": "main",
+    "upstream": "origin/main",
+    "baseCommit": "a7b25297df78fb26fac7c35658e708f0a806de6b",
+    "policy": "Only reviewed changes are merged to main. Work retained for live testing stays on the integration branch."
+  },
+  "integration": {
+    "branch": "codex/auto-tools-all-integrated",
+    "purpose": "Live-test aggregate; never merge this branch wholesale into main.",
+    "baseIncludesMergedPullRequests": [
+      {
+        "number": 39,
+        "url": "https://github.com/Treatid2/skyrim-vr-automation/pull/39",
+        "mergeCommit": "a7b25297df78fb26fac7c35658e708f0a806de6b"
+      },
+      {
+        "number": 40,
+        "url": "https://github.com/Treatid2/skyrim-vr-automation/pull/40",
+        "mergeCommit": "ef5be8a3abe81dd4ca2db8dab4061910f3551d00"
+      }
+    ],
+    "includedPullRequests": [
+      {
+        "number": 35,
+        "url": "https://github.com/Treatid2/skyrim-vr-automation/pull/35",
+        "head": "3aec60d929e8de6052d5995937175c9761375a1d",
+        "order": 1
+      },
+      {
+        "number": 37,
+        "url": "https://github.com/Treatid2/skyrim-vr-automation/pull/37",
+        "head": "15b7e0b378fbea1f44c8b499038d641b0df7adb4",
+        "order": 2
+      },
+      {
+        "number": 36,
+        "url": "https://github.com/Treatid2/skyrim-vr-automation/pull/36",
+        "head": "fc886779f752198368ebf15fc57ff6b250dd1257",
+        "order": 3
+      },
+      {
+        "number": 38,
+        "url": "https://github.com/Treatid2/skyrim-vr-automation/pull/38",
+        "head": "dd926210acb6f09b02bfa56891ccfe20a70259d1",
+        "order": 4
+      },
+      {
+        "number": 45,
+        "url": "https://github.com/Treatid2/skyrim-vr-automation/pull/45",
+        "head": "6d9d712c7c4c05d4f703a4b834866d508341a3b5",
+        "order": 5
+      }
+    ],
+    "excludedPullRequests": [
+      {
+        "number": 44,
+        "url": "https://github.com/Treatid2/skyrim-vr-automation/pull/44",
+        "head": "a4ab2cf6ea6c853926918e5626b8d17f15cf5d79",
+        "reason": "Explicitly excluded: its scope is too broad for effective review and it must not be resubmitted for automatic review."
+      }
+    ],
+    "resolutionNotes": [
+      "The PR 35/PR 45 overlap preserves prepared-cache isolation and exact-session MO2 resume behavior.",
+      "A resumed exact session may grow its prepared cache; unrelated retained environments remain isolated."
+    ]
+  }
+}
