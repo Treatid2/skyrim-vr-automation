@@ -31,6 +31,13 @@ function New-DoctorCheck([string]$Name, [string]$Status, [string]$Message, $Data
     [pscustomobject][ordered]@{ name = $Name; status = $Status; message = $Message; data = $Data }
 }
 
+function Get-DoctorAvailableProfiles($Validation) {
+    if ($null -eq $Validation -or -not $Validation.PSObject.Properties['data'] -or $null -eq $Validation.data -or -not $Validation.data.PSObject.Properties['profiles']) {
+        return @()
+    }
+    return @($Validation.data.profiles)
+}
+
 try {
     $targetPath = if ([string]::IsNullOrWhiteSpace($UserConfigPath)) { Get-MO2ControlUserConfigPath } else { [IO.Path]::GetFullPath($UserConfigPath) }
     if ($Command -eq 'init') {
@@ -78,6 +85,49 @@ try {
             $checks.Add((New-DoctorCheck 'mo2-validation' $(if ($mo2Validation.ok) { 'pass' } else { 'fail' }) $(if ($mo2Validation.ok) { 'MO2 configuration validates.' } else { 'MO2 configuration validation failed.' }) $mo2Validation))
             try {
                 $machineConfig = Get-Content -LiteralPath $resolution.path -Raw | ConvertFrom-Json
+                $primeProfile = if ($machineConfig.defaults.PSObject.Properties['testProfileSource']) { [string]$machineConfig.defaults.testProfileSource } else { '' }
+                if ([string]::IsNullOrWhiteSpace($primeProfile)) {
+                    $checks.Add((New-DoctorCheck 'prime-profile-launch-readiness' 'fail' 'The maintained source profile is not configured. Set defaults.testProfileSource to one exact launch-capable profile.' ([pscustomobject][ordered]@{
+                        configurationProperty = 'defaults.testProfileSource'
+                        configuredProfile = $null
+                        availableProfiles = @(Get-DoctorAvailableProfiles -Validation $mo2Validation)
+                    })))
+                }
+                else {
+                    $primeArguments = @('-NoProfile', '-File', (Join-Path $mo2Root 'Invoke-MO2Control.ps1'), 'validate', '-ConfigPath', [string]$resolution.path, '-Profile', $primeProfile, '-Compact', '-NoExit')
+                    if ($machineConfig.defaults.PSObject.Properties['executable'] -and -not [string]::IsNullOrWhiteSpace([string]$machineConfig.defaults.executable)) {
+                        $primeArguments += @('-Executable', [string]$machineConfig.defaults.executable)
+                    }
+                    $primeParameters = @{
+                        FilePath = (Get-Process -Id $PID).Path
+                        ArgumentList = $primeArguments
+                        WorkingDirectory = $repositoryRoot; TimeoutSeconds = $TimeoutSeconds; MaxAttempts = 1; NoExit = $true; Compact = $true
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($EvidenceDirectory)) { $primeParameters.EvidenceDirectory = $EvidenceDirectory }
+                    $boundedPrime = & $boundedProcessTool @primeParameters | ConvertFrom-Json -Depth 40
+                    $primeValidation = $null
+                    if ($boundedPrime.ok -and @($boundedPrime.attempts).Count -eq 1) {
+                        try { $primeValidation = ([string]$boundedPrime.attempts[0].stdout) | ConvertFrom-Json -Depth 30 } catch { $primeValidation = [pscustomobject]@{ ok = $false; raw = @($boundedPrime.attempts[0].stdout); boundedProcess = $boundedPrime } }
+                    }
+                    else { $primeValidation = [pscustomobject]@{ ok = $false; boundedProcess = $boundedPrime } }
+                    $profileChecks = @(if ($primeValidation.PSObject.Properties['checks']) { $primeValidation.checks | Where-Object name -in @('requested-profile', 'registered-executable', 'registered-binary', 'registered-binary-owner-mod') })
+                    $failedProfileChecks = @($profileChecks | Where-Object status -eq 'fail')
+                    $primeReady = $profileChecks.Count -ge 3 -and $failedProfileChecks.Count -eq 0
+                    $primeEvidence = [pscustomobject][ordered]@{
+                        configurationProperty = 'defaults.testProfileSource'
+                        configuredProfile = $primeProfile
+                        availableProfiles = @(Get-DoctorAvailableProfiles -Validation $primeValidation)
+                        profileChecks = $profileChecks
+                        validation = $primeValidation
+                    }
+                    $primeMessage = if ($primeReady) {
+                        "The maintained source profile '$primeProfile' exists and its registered executable provider is available."
+                    }
+                    else {
+                        "The profile configured by defaults.testProfileSource ('$primeProfile') is missing or not launch-capable. Update that field or use an exact profile from data.availableProfiles."
+                    }
+                    $checks.Add((New-DoctorCheck 'prime-profile-launch-readiness' $(if ($primeReady) { 'pass' } else { 'fail' }) $primeMessage $primeEvidence))
+                }
                 $fixtureInput = if ($machineConfig.defaults.PSObject.Properties['newGameFixtureManifest']) { [string]$machineConfig.defaults.newGameFixtureManifest } else { '' }
                 if ([string]::IsNullOrWhiteSpace($fixtureInput)) {
                     $checks.Add((New-DoctorCheck 'prime-profile-world-entry-integrity' 'fail' 'The maintained source profile has no configured world-entry save. Set defaults.newGameFixtureManifest and verify its default fixture before creating task profiles.' ([pscustomobject][ordered]@{

@@ -1,7 +1,9 @@
 # DevBench Control
 
-`Invoke-DevBenchControl.ps1` lists and calls the MCP tools exposed by a running
-CSX DevBench server. Supply runtime metadata with `-RuntimePath` or set
+`Invoke-DevBenchControl.ps1` lists and calls the tools exposed by a running
+CSX DevBench server. It prefers streamable-HTTP MCP and negotiates the REST
+`/api/tools` and `/api/tool/<name>` facade when an older host returns 404 for
+`/mcp`. Supply runtime metadata with `-RuntimePath` or set
 `CSX_DEVBENCH_RUNTIME_PATH`; no machine-specific path is compiled into the
 client.
 
@@ -33,7 +35,9 @@ off-thread `inspect health` identity before returning. Runtime metadata may add
 expectations. Pass `-EvidenceDirectory` to preserve this binding with the run.
 Each invocation writes a uniquely named binding receipt, so parallel calls do
 not overwrite one another. Use `-EvidenceLabel` to give that receipt a stable
-human-readable label within the unique filename.
+human-readable label within the unique filename. The receipt records whether
+the exact call used `mcp` or `rest`; a fallback mutation keeps the same
+indeterminate/no-replay safety rule as MCP.
 The controller also persists an invocation journal before dispatch. It records
 the requested tool and arguments, dispatch boundary, last verified runtime
 identity, transport retries, and terminal result. If the target exits during a
@@ -183,7 +187,10 @@ the short transport budget before the requested timeout begins.
 unloaded state before accepting loaded. This prevents the prior world's cached
 `true` from satisfying an asynchronous load. Use `-AcceptAlreadyLoaded` only
 when the caller intentionally wants a current-state check rather than proof of
-a new load transition.
+a new load transition. When a separate, successful mutation has already queued
+the load, pass `-LoadAlreadyQueued`. That explicit ownership assertion preserves
+freshness across a transient listener rebind without replaying the mutation;
+the first qualified loaded observation may then complete the wait.
 
 `upscalingStable` is the fail-closed barrier for paced cell-transition tests.
 It requires the exact `-ExpectedCell`, a loaded player, no blocking menu, and a

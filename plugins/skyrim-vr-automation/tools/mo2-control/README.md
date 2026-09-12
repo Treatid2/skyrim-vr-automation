@@ -236,7 +236,8 @@ allowing a delayed post-stop dialog to arrive. It then acknowledges only a
 structurally classified retained `Failed to run` dialog; an unknown modal returns
 `game-stopped-needs-attention` without touching it. If MO2 exits immediately
 after the game, `stop-game` returns `mo2-exited-after-game-stop`, sets
-`releaseRequired`, and refuses to represent the session as relaunchable. `close`
+`releaseRequired`, and records that MO2 must be reopened or the lease released
+before another task receives it. `close`
 refuses while a game/loader exists and cooperatively resolves
 MO2's structured `File` → `Exit` path and visible modal chain, including the VFS
 `Unlock` prompt. `stop` first closes the game and then uses the same MO2
@@ -246,6 +247,10 @@ explicit lease to access-only state. All mutation commands have `-WhatIf`.
 Evidence
 collection, archive verification, profile mutation, cache management, and
 recovery remain deferred until separately bounded.
+
+If the retained MO2 owner exits after the stability window, a later `launch`
+reopens the same owned session, exact profile, and executable when no MO2 or
+game process exists. It still refuses an unrelated or ambiguous MO2 owner.
 
 Use `-NoExit` when embedding the entry script in a larger PowerShell host; a
 failed command then returns structured JSON without terminating that host.
