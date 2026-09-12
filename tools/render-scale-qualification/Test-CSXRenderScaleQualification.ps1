@@ -1405,6 +1405,92 @@ try {
 
     $runner = Join-Path $PSScriptRoot 'Invoke-CSXRenderScaleQualification.ps1'
     $runnerSource = Get-Content -LiteralPath $runner -Raw
+    $connectionRuntime = [pscustomobject]@{ port = 54321 }
+    $expiredConnectionCalls = [Collections.Generic.List[object]]::new()
+    $expiredConnectionRejected = $false
+    try {
+        New-CSXMcpConnection -Runtime $connectionRuntime -DeadlineUtc ([DateTimeOffset]::UtcNow.AddMilliseconds(-1)) -RequestInvoker {
+            param($uri, $headers, $body, $timeoutSeconds)
+            $expiredConnectionCalls.Add([pscustomobject]@{ uri = $uri; timeoutSeconds = $timeoutSeconds })
+        } | Out-Null
+    }
+    catch { $expiredConnectionRejected = $_.Exception.Message -match 'shared result deadline' }
+    Assert-Test ($expiredConnectionRejected -and $expiredConnectionCalls.Count -eq 0) 'An expired shared deadline admitted an MCP initialize request.'
+
+    $timelyConnectionCalls = [Collections.Generic.List[object]]::new()
+    $timelyConnection = New-CSXMcpConnection -Runtime $connectionRuntime -DeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) -RequestInvoker {
+        param($uri, $headers, $body, $timeoutSeconds)
+        $timelyConnectionCalls.Add([pscustomobject]@{ body = $body; timeoutSeconds = $timeoutSeconds })
+        return [pscustomobject]@{ Headers = @{ 'Mcp-Session-Id' = 'test-session' } }
+    }
+    Assert-Test ($timelyConnection.sessionId -eq 'test-session' -and $timelyConnectionCalls.Count -eq 2) 'A timely MCP initialization did not complete both bounded setup exchanges.'
+
+    $notificationDeadlineCalls = [Collections.Generic.List[object]]::new()
+    $notificationDeadlineRejected = $false
+    try {
+        New-CSXMcpConnection -Runtime $connectionRuntime -DeadlineUtc ([DateTimeOffset]::UtcNow.AddMilliseconds(1600)) -RequestInvoker {
+            param($uri, $headers, $body, $timeoutSeconds)
+            $notificationDeadlineCalls.Add([pscustomobject]@{ body = $body; timeoutSeconds = $timeoutSeconds })
+            if ($notificationDeadlineCalls.Count -eq 1) { Start-Sleep -Milliseconds 750 }
+            return [pscustomobject]@{ Headers = @{ 'Mcp-Session-Id' = 'delayed-session' } }
+        } | Out-Null
+    }
+    catch { $notificationDeadlineRejected = $_.Exception.Message -match 'shared result deadline' }
+    Assert-Test ($notificationDeadlineRejected -and $notificationDeadlineCalls.Count -eq 1) 'MCP initialized notification received a fresh timeout after initialize consumed the shared budget.'
+
+    $custody = New-CSXProviderCustodyEvidence ([pscustomobject]@{
+        provider = 'codex_cli'; model = 'test-model'; deadlineReached = $true; errors = @('provider failure')
+        batches = @([pscustomobject]@{
+            presentationPass = 2; replicate = 3; launched = $true; processId = 4242; exitCode = $null
+            exitVerified = $false; terminationRequested = $true; terminationConfirmed = $false
+            unresolvedProcess = $true; streamDrainComplete = $false; inputCompleted = $true
+            terminationErrors = @('termination refused'); errors = @('unresolved child')
+        })
+    })
+    Assert-Test ($custody.batches.Count -eq 1 -and $custody.batches[0].processId -eq 4242 -and
+        $custody.batches[0].unresolvedProcess -and $custody.batches[0].terminationRequested -and
+        -not $custody.batches[0].terminationConfirmed) 'Provider custody projection lost an unresolved child identity or termination state.'
+
+    $terminalBudgetRoot = Join-Path $fixture 'terminal-budget'
+    New-Item -ItemType Directory -Path $terminalBudgetRoot -Force | Out-Null
+    $timelyReceiptPath = Join-Path $terminalBudgetRoot 'timely-completion.json'
+    $timelyReceipt = [pscustomobject][ordered]@{
+        within600Seconds = $true; completedUtc = $null; invocationElapsedMs = 0.0; evidenceFinalizationElapsedMs = 0.0
+    }
+    $timelyInvocationWatch = [Diagnostics.Stopwatch]::StartNew()
+    $timelyFinalizationWatch = [Diagnostics.Stopwatch]::StartNew()
+    $timelyTerminal = Complete-CSXSealedQualification -EvidenceDirectory $terminalBudgetRoot -CompletionPath $timelyReceiptPath `
+        -CompletionReceipt $timelyReceipt -InvocationWatch $timelyInvocationWatch -FinalizationWatch $timelyFinalizationWatch `
+        -ResultDeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) -EndToEndBudgetMs 5000 -FinalizationBudgetMs 5000 `
+        -Finalizer { param($root) [pscustomobject]@{ report = [pscustomobject]@{ status = 'PASS' }; runPath = (Join-Path $root 'run.json'); summaryPath = (Join-Path $root 'summary.md') } }
+    Assert-Test ($timelyTerminal.completionReceipt.within600Seconds -and
+        (Get-Content -LiteralPath $timelyReceiptPath -Raw | ConvertFrom-Json).within600Seconds) 'A timely mandatory terminal validation was not retained as complete.'
+
+    $lateReceiptPath = Join-Path $terminalBudgetRoot 'late-completion.json'
+    $lateReceipt = [pscustomobject][ordered]@{
+        within600Seconds = $true; completedUtc = $null; invocationElapsedMs = 0.0; evidenceFinalizationElapsedMs = 0.0
+    }
+    $lateInvocationWatch = [Diagnostics.Stopwatch]::StartNew()
+    $lateFinalizationWatch = [Diagnostics.Stopwatch]::StartNew()
+    $lateTerminalRejected = $false
+    try {
+        Complete-CSXSealedQualification -EvidenceDirectory $terminalBudgetRoot -CompletionPath $lateReceiptPath `
+            -CompletionReceipt $lateReceipt -InvocationWatch $lateInvocationWatch -FinalizationWatch $lateFinalizationWatch `
+            -ResultDeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) -EndToEndBudgetMs 5000 -FinalizationBudgetMs 25 `
+            -Finalizer { param($root) Start-Sleep -Milliseconds 75; [pscustomobject]@{ report = [pscustomobject]@{ status = 'PASS' }; runPath = (Join-Path $root 'run.json'); summaryPath = (Join-Path $root 'summary.md') } } | Out-Null
+    }
+    catch { $lateTerminalRejected = $_.Exception.Message -match 'mandatory sealed-result validation' }
+    $lateRecordedReceipt = Get-Content -LiteralPath $lateReceiptPath -Raw | ConvertFrom-Json
+    Assert-Test ($lateTerminalRejected -and -not $lateRecordedReceipt.within600Seconds -and
+        [double]$lateRecordedReceipt.evidenceFinalizationElapsedMs -gt 25) 'A delayed mandatory terminal validation returned or retained a timely-success claim.'
+
+    $providerCustodyOffset = $runnerSource.IndexOf('$script:providerCustodyEvidence = New-CSXProviderCustodyEvidence', [StringComparison]::Ordinal)
+    $providerReceiptOffset = $runnerSource.IndexOf('$executionPath = Write-CSXJsonFile', [StringComparison]::Ordinal)
+    Assert-Test ($providerCustodyOffset -ge 0 -and $providerReceiptOffset -gt $providerCustodyOffset -and
+        $runnerSource -match 'providerCustody = \$script:providerCustodyEvidence') 'Runner does not preserve provider custody before fallible execution-receipt publication.'
+    Assert-Test ($runnerSource.Contains('New-CSXMcpConnection -Runtime $script:runtime -DeadlineUtc $connectionDeadlineUtc') -and
+        $runnerSource.Contains("-ClientName 'CSXRenderScaleQualificationCleanup'") -and
+        $runnerSource.Contains('-DeadlineUtc $script:resultDeadlineUtc')) 'Runner does not bind normal and cleanup MCP session establishment to the shared result deadline.'
     Assert-Test ($runnerSource -match '(?s)cleanupHealth.*?Assert-AuthoritativeRuntimeBinding' -and
         $runnerSource -match '(?s)qualification\.ownerId.*?script:runId') 'Emergency cleanup is not bound to the runtime and transition owner.'
     $protectedEvidence = Join-Path $fixture 'protected-evidence'
@@ -1580,6 +1666,70 @@ try {
     Assert-Test ($sealedBaseline.report.status -eq 'LOCAL_PASS' -and
         (Get-CSXFileSha256 (Join-Path $baselineSourceRoot 'run.json')) -eq $baselineRunHash) `
         'Repeated finalization did not preserve an already sealed standalone projection byte for byte.'
+    $negativeRoot = Join-Path $fixture 'sealed-negative'
+    Copy-Item -LiteralPath $baselineSourceRoot -Destination $negativeRoot -Recurse
+    try {
+        Remove-Item -LiteralPath (Join-Path $negativeRoot 'qualification-completion.json') -Force
+        $negativeRaw = Get-Content -LiteralPath (Join-Path $negativeRoot 'run.raw.json') -Raw | ConvertFrom-Json -Depth 100
+        $negativeSourcePrefix = [IO.Path]::GetFullPath($baselineSourceRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)
+        $negativeRootPrefix = [IO.Path]::GetFullPath($negativeRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)
+        $negativeExecutionPath = Join-Path $negativeRoot $negativeRaw.assays.visual.automatedReview.executionPath
+        $negativeExecution = Get-Content -LiteralPath $negativeExecutionPath -Raw | ConvertFrom-Json -Depth 100
+        for ($batchOffset = 0; $batchOffset -lt 6; $batchOffset++) {
+            $negativeBatch = $negativeRaw.assays.visual.automatedReview.batches[$batchOffset]
+            $negativeReceiptPath = Join-Path $negativeRoot $negativeBatch.receiptPath
+            $negativeReceipt = Get-Content -LiteralPath $negativeReceiptPath -Raw | ConvertFrom-Json -Depth 100
+            for ($bindingOffset = 0; $bindingOffset -lt @($negativeReceipt.imageBindings).Count; $bindingOffset++) {
+                $aliasPath = [string]$negativeReceipt.imageBindings[$bindingOffset].aliasPath
+                Assert-Test ($aliasPath.StartsWith($negativeSourcePrefix, [StringComparison]::OrdinalIgnoreCase)) `
+                    'Copied negative-result receipt alias does not begin at its source evidence root.'
+                $rebasedAliasPath = $negativeRootPrefix + $aliasPath.Substring($negativeSourcePrefix.Length)
+                $negativeReceipt.imageBindings[$bindingOffset].aliasPath = $rebasedAliasPath
+                $negativeExecution.batches[$batchOffset].imageBindings[$bindingOffset].path = $rebasedAliasPath
+            }
+            foreach ($pathName in @('outputSchemaPath', 'responsePath', 'eventsPath')) {
+                $recordedPath = [string]$negativeExecution.batches[$batchOffset].$pathName
+                Assert-Test ($recordedPath.StartsWith($negativeSourcePrefix, [StringComparison]::OrdinalIgnoreCase)) `
+                    "Copied negative-result provider $pathName does not begin at its source evidence root."
+                $negativeExecution.batches[$batchOffset].$pathName = $negativeRootPrefix + $recordedPath.Substring($negativeSourcePrefix.Length)
+            }
+            Write-CSXJsonFile -Path $negativeReceiptPath -Value $negativeReceipt | Out-Null
+            $negativeBatch.receiptSha256 = Get-CSXFileSha256 $negativeReceiptPath
+        }
+        Write-CSXJsonFile -Path $negativeExecutionPath -Value $negativeExecution | Out-Null
+        $negativeRaw.assays.visual.automatedReview.executionSha256 = Get-CSXFileSha256 $negativeExecutionPath
+        Update-TestAutomatedResponseEvidence -Root $negativeRoot -Raw $negativeRaw -BatchOffset 0 -Mutation {
+            param($response)
+            $response.samples[0].categories.sharpness.confidence = 'low'
+        }
+        Set-TestArtifactInventory -Root $negativeRoot -Raw $negativeRaw | Out-Null
+        Write-CSXJsonFile -Path (Join-Path $negativeRoot 'run.raw.json') -Value $negativeRaw | Out-Null
+        $negativeIndex = Get-Content -LiteralPath (Join-Path $negativeRoot 'visual-index.json') -Raw | ConvertFrom-Json -Depth 100
+        $negativeReview = New-CSXAutomatedVisualReview -EvidenceDirectory $negativeRoot -RunRaw $negativeRaw -VisualIndex $negativeIndex
+        Write-CSXJsonFile -Path (Join-Path $negativeRoot 'visual-review.json') -Value $negativeReview | Out-Null
+        $negativeFinal = Update-CSXQualificationReport -EvidenceDirectory $negativeRoot -AllowUnsealedSuccess
+        Assert-Test ($negativeFinal.report.status -eq 'FAIL') 'A valid low-confidence visual result did not produce a truthful FAIL projection.'
+        $negativeCompletion = [pscustomobject][ordered]@{
+            schema = 'csx-render-scale-qualification-completion-v1'; runId = [string]$negativeRaw.runId
+            invocationStartedUtc = $negativeRaw.time.invocationStartedUtc; completedUtc = $negativeRaw.time.completedUtc
+            resultDeadlineUtc = $negativeRaw.time.resultDeadlineUtc; invocationElapsedMs = $negativeRaw.time.invocationElapsedMs
+            evidenceFinalizationElapsedMs = $negativeRaw.time.evidenceFinalizationElapsedMs; within600Seconds = $true
+            runPath = 'run.json'; runSha256 = Get-CSXFileSha256 $negativeFinal.runPath
+            rawPath = 'run.raw.json'; rawSha256 = Get-CSXFileSha256 (Join-Path $negativeRoot 'run.raw.json')
+            visualReviewPath = 'visual-review.json'; visualReviewSha256 = Get-CSXFileSha256 (Join-Path $negativeRoot 'visual-review.json')
+        }
+        Write-CSXJsonFile -Path (Join-Path $negativeRoot 'qualification-completion.json') -Value $negativeCompletion | Out-Null
+        $negativeRunHash = Get-CSXFileSha256 (Join-Path $negativeRoot 'run.json')
+        $sealedNegativeOne = Update-CSXQualificationReport -EvidenceDirectory $negativeRoot
+        $sealedNegativeTwo = Update-CSXQualificationReport -EvidenceDirectory $negativeRoot
+        $negativeCompletionCheck = Test-CSXQualificationCompletionReceipt -EvidenceRoot $negativeRoot -ExpectedRunId ([string]$negativeRaw.runId)
+        Assert-Test ($sealedNegativeOne.report.status -eq 'FAIL' -and $sealedNegativeTwo.report.status -eq 'FAIL' -and
+            (Get-CSXFileSha256 (Join-Path $negativeRoot 'run.json')) -eq $negativeRunHash -and $negativeCompletionCheck.ok) `
+            'Repeated finalization rewrote a valid sealed FAIL projection or invalidated its completion receipt.'
+    }
+    finally {
+        if (Test-Path -LiteralPath $negativeRoot) { Remove-Item -LiteralPath $negativeRoot -Recurse -Force }
+    }
     $standaloneAutomated = $baselineEnvelope.raw.assays.visual.automatedReview
     Assert-Test ($standaloneAutomated.schema -eq 'csx-render-scale-automated-review-v1' -and
         $standaloneAutomated.provider -eq 'codex_cli' -and $standaloneAutomated.model -eq 'gpt-5.6-sol' -and

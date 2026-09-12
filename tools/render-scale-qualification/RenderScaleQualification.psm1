@@ -569,14 +569,22 @@ function Invoke-CSXRetriedWebRequest {
         [Parameter(Mandatory)][string]$Uri,
         [Parameter(Mandatory)]$Headers,
         [Parameter(Mandatory)][string]$Body,
-        [Parameter(Mandatory)][ValidateRange(1, 600)][int]$TimeoutSeconds
+        [Parameter(Mandatory)][ValidateRange(1, 600)][int]$TimeoutSeconds,
+        [DateTimeOffset]$DeadlineUtc = [DateTimeOffset]::MaxValue,
+        [scriptblock]$RequestInvoker = {
+            param($RequestUri, $RequestHeaders, $RequestBody, $RequestTimeoutSeconds)
+            Invoke-WebRequest -UseBasicParsing -Method Post -Uri $RequestUri -Headers $RequestHeaders -Body $RequestBody -TimeoutSec $RequestTimeoutSeconds
+        }
     )
     $watch = [Diagnostics.Stopwatch]::StartNew()
     for ($attempt = 1; $attempt -le 3; $attempt++) {
-        $remaining = $TimeoutSeconds - [int][Math]::Ceiling($watch.Elapsed.TotalSeconds)
-        if ($remaining -lt 1) { throw 'DevBench HTTP retry budget expired.' }
+        $localRemainingMs = ($TimeoutSeconds * 1000.0) - $watch.Elapsed.TotalMilliseconds
+        $deadlineRemainingMs = ($DeadlineUtc - [DateTimeOffset]::UtcNow).TotalMilliseconds
+        $remainingMs = [Math]::Min($localRemainingMs, $deadlineRemainingMs)
+        if ($remainingMs -lt 1000) { throw 'DevBench HTTP retry or shared result deadline expired.' }
+        $remaining = [int][Math]::Max(1, [Math]::Floor(([Math]::Min($remainingMs, 600000.0)) / 1000.0))
         try {
-            return Invoke-WebRequest -UseBasicParsing -Method Post -Uri $Uri -Headers $Headers -Body $Body -TimeoutSec $remaining
+            return & $RequestInvoker $Uri $Headers $Body $remaining
         }
         catch {
             $statusCode = 0
@@ -584,7 +592,11 @@ function Invoke-CSXRetriedWebRequest {
             $retryable = $statusCode -in @(429, 502, 503, 504) -or
                 $_.Exception.Message -match '(?i)timed out|timeout|temporarily unavailable|connection (was )?(closed|reset|refused)|forcibly closed'
             if (-not $retryable -or $attempt -eq 3) { throw }
-            Start-Sleep -Milliseconds (100 * $attempt)
+            $retryDelayMs = 100 * $attempt
+            if (($DeadlineUtc - [DateTimeOffset]::UtcNow).TotalMilliseconds -le $retryDelayMs) {
+                throw 'DevBench HTTP retry shared result deadline expired.'
+            }
+            Start-Sleep -Milliseconds $retryDelayMs
         }
     }
 }
@@ -600,7 +612,15 @@ function New-CSXInfrastructureException {
 }
 
 function New-CSXMcpConnection {
-    param([Parameter(Mandatory)]$Runtime, [string]$ClientName = 'CSXRenderScaleQualification')
+    param(
+        [Parameter(Mandatory)]$Runtime,
+        [string]$ClientName = 'CSXRenderScaleQualification',
+        [DateTimeOffset]$DeadlineUtc = [DateTimeOffset]::MaxValue,
+        [scriptblock]$RequestInvoker = {
+            param($RequestUri, $RequestHeaders, $RequestBody, $RequestTimeoutSeconds)
+            Invoke-WebRequest -UseBasicParsing -Method Post -Uri $RequestUri -Headers $RequestHeaders -Body $RequestBody -TimeoutSec $RequestTimeoutSeconds
+        }
+    )
     $port = [int](Get-CSXPropertyValue $Runtime 'port')
     if ($port -lt 1 -or $port -gt 65535) { throw 'Runtime metadata has an invalid port.' }
     $endpoint = "http://127.0.0.1:$port/mcp"
@@ -609,12 +629,14 @@ function New-CSXMcpConnection {
         jsonrpc = '2.0'; id = 1; method = 'initialize'
         params = [ordered]@{ protocolVersion = '2025-03-26'; capabilities = @{}; clientInfo = [ordered]@{ name = $ClientName; version = '1.0' } }
     } | ConvertTo-Json -Depth 20 -Compress
-    $response = Invoke-CSXRetriedWebRequest -Uri $endpoint -Headers $baseHeaders -Body $body -TimeoutSeconds 15
+    $response = Invoke-CSXRetriedWebRequest -Uri $endpoint -Headers $baseHeaders -Body $body -TimeoutSeconds 15 `
+        -DeadlineUtc $DeadlineUtc -RequestInvoker $RequestInvoker
     $sessionHeader = $response.Headers['Mcp-Session-Id']
     $sessionId = if ($sessionHeader -is [array]) { [string]$sessionHeader[0] } else { [string]$sessionHeader }
     if ([string]::IsNullOrWhiteSpace($sessionId)) { throw 'DevBench did not return an MCP session ID.' }
     $headers = @{ Accept = 'application/json, text/event-stream'; 'Content-Type' = 'application/json'; 'Mcp-Session-Id' = $sessionId }
-    Invoke-CSXRetriedWebRequest -Uri $endpoint -Headers $headers -Body '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' -TimeoutSeconds 15 | Out-Null
+    Invoke-CSXRetriedWebRequest -Uri $endpoint -Headers $headers -Body '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' -TimeoutSeconds 15 `
+        -DeadlineUtc $DeadlineUtc -RequestInvoker $RequestInvoker | Out-Null
     return [pscustomobject][ordered]@{
         endpoint = $endpoint; headers = $headers; sessionId = $sessionId; requestId = 1L
         transcript = [Collections.Generic.List[object]]::new()
@@ -4811,7 +4833,10 @@ function Update-CSXQualificationReport {
     elseif ($errors.Count -gt 0) { 'FAIL' }
     elseif ($reviewState -eq 'PASS') { $(if ($prMode) { 'PASS' } else { 'LOCAL_PASS' }) }
     else { 'FAIL' }
-    if (-not $AllowUnsealedSuccess -and $status -in @('PASS', 'LOCAL_PASS')) {
+    $completionReceiptPath = Join-Path $root 'qualification-completion.json'
+    $requiresSealedProjection = $status -in @('PASS', 'LOCAL_PASS') -or
+        (Test-Path -LiteralPath $completionReceiptPath -PathType Leaf)
+    if (-not $AllowUnsealedSuccess -and $requiresSealedProjection) {
         $completion = Test-CSXQualificationCompletionReceipt -EvidenceRoot $root -ExpectedRunId ([string]$raw.runId)
         if ($completion.ok) {
             $existingRunPath = Join-Path $root 'run.json'
@@ -4828,7 +4853,7 @@ function Update-CSXQualificationReport {
             }
         }
         foreach ($completionError in @($completion.errors)) {
-            $infrastructureErrors.Add("Qualification success is not sealed: $completionError")
+            $infrastructureErrors.Add("Qualification terminal result is not sealed: $completionError")
         }
         $status = 'INFRASTRUCTURE_ERROR'
     }
@@ -4941,6 +4966,87 @@ function Update-CSXQualificationReport {
     return [pscustomobject][ordered]@{ report = $report; runPath = $runPath; summaryPath = $summaryPath }
 }
 
+function New-CSXProviderCustodyEvidence($Execution) {
+    return [pscustomobject][ordered]@{
+        schema = 'csx-render-scale-provider-custody-v1'
+        provider = [string](Get-CSXPropertyValue $Execution 'provider')
+        model = [string](Get-CSXPropertyValue $Execution 'model')
+        deadlineReached = [bool](Get-CSXPropertyValue $Execution 'deadlineReached' $false)
+        errors = @((Get-CSXPropertyValue $Execution 'errors' @()))
+        batches = @((Get-CSXPropertyValue $Execution 'batches' @()) | ForEach-Object {
+            [pscustomobject][ordered]@{
+                presentationPass = [int](Get-CSXPropertyValue $_ 'presentationPass' 0)
+                replicate = [int](Get-CSXPropertyValue $_ 'replicate' 0)
+                launched = [bool](Get-CSXPropertyValue $_ 'launched' $false)
+                processId = Get-CSXPropertyValue $_ 'processId'
+                exitCode = Get-CSXPropertyValue $_ 'exitCode'
+                exitVerified = [bool](Get-CSXPropertyValue $_ 'exitVerified' $false)
+                terminationRequested = [bool](Get-CSXPropertyValue $_ 'terminationRequested' $false)
+                terminationConfirmed = [bool](Get-CSXPropertyValue $_ 'terminationConfirmed' $false)
+                unresolvedProcess = [bool](Get-CSXPropertyValue $_ 'unresolvedProcess' $false)
+                streamDrainComplete = [bool](Get-CSXPropertyValue $_ 'streamDrainComplete' $false)
+                inputCompleted = [bool](Get-CSXPropertyValue $_ 'inputCompleted' $false)
+                terminationErrors = @((Get-CSXPropertyValue $_ 'terminationErrors' @()))
+                errors = @((Get-CSXPropertyValue $_ 'errors' @()))
+            }
+        })
+    }
+}
+
+function Complete-CSXSealedQualification {
+    param(
+        [Parameter(Mandatory)][string]$EvidenceDirectory,
+        [Parameter(Mandatory)][string]$CompletionPath,
+        [Parameter(Mandatory)]$CompletionReceipt,
+        [Parameter(Mandatory)][Diagnostics.Stopwatch]$InvocationWatch,
+        [Parameter(Mandatory)][Diagnostics.Stopwatch]$FinalizationWatch,
+        [Parameter(Mandatory)][DateTimeOffset]$ResultDeadlineUtc,
+        [Parameter(Mandatory)][double]$EndToEndBudgetMs,
+        [Parameter(Mandatory)][double]$FinalizationBudgetMs,
+        [scriptblock]$Finalizer = {
+            param($EvidenceRoot)
+            Update-CSXQualificationReport -EvidenceDirectory $EvidenceRoot
+        }
+    )
+    try {
+        $updated = & $Finalizer $EvidenceDirectory
+    }
+    catch {
+        $CompletionReceipt.within600Seconds = $false
+        $CompletionReceipt.completedUtc = [DateTimeOffset]::UtcNow.ToString('o')
+        $CompletionReceipt.invocationElapsedMs = [Math]::Round($InvocationWatch.Elapsed.TotalMilliseconds, 3)
+        $CompletionReceipt.evidenceFinalizationElapsedMs = [Math]::Round($FinalizationWatch.Elapsed.TotalMilliseconds, 3)
+        try { Write-CSXJsonFile -Path $CompletionPath -Value $CompletionReceipt | Out-Null } catch {}
+        throw
+    }
+
+    $CompletionReceipt.completedUtc = [DateTimeOffset]::UtcNow.ToString('o')
+    $CompletionReceipt.invocationElapsedMs = [Math]::Round($InvocationWatch.Elapsed.TotalMilliseconds, 3)
+    $CompletionReceipt.evidenceFinalizationElapsedMs = [Math]::Round($FinalizationWatch.Elapsed.TotalMilliseconds, 3)
+    $CompletionReceipt.within600Seconds = $CompletionReceipt.invocationElapsedMs -le $EndToEndBudgetMs -and
+        $CompletionReceipt.evidenceFinalizationElapsedMs -le $FinalizationBudgetMs -and
+        [DateTimeOffset]::UtcNow -le $ResultDeadlineUtc
+    Write-CSXJsonFile -Path $CompletionPath -Value $CompletionReceipt | Out-Null
+
+    $terminalFinalizationElapsedMs = [Math]::Round($FinalizationWatch.Elapsed.TotalMilliseconds, 3)
+    if (-not $CompletionReceipt.within600Seconds -or
+        $InvocationWatch.Elapsed.TotalMilliseconds -gt $EndToEndBudgetMs -or
+        $terminalFinalizationElapsedMs -gt $FinalizationBudgetMs -or
+        [DateTimeOffset]::UtcNow -gt $ResultDeadlineUtc) {
+        $CompletionReceipt.within600Seconds = $false
+        $CompletionReceipt.completedUtc = [DateTimeOffset]::UtcNow.ToString('o')
+        $CompletionReceipt.invocationElapsedMs = [Math]::Round($InvocationWatch.Elapsed.TotalMilliseconds, 3)
+        $CompletionReceipt.evidenceFinalizationElapsedMs = $terminalFinalizationElapsedMs
+        Write-CSXJsonFile -Path $CompletionPath -Value $CompletionReceipt | Out-Null
+        throw 'The mandatory sealed-result validation crossed its complete invocation or evidence-finalization deadline.'
+    }
+    return [pscustomobject][ordered]@{
+        updated = $updated
+        completionReceipt = $CompletionReceipt
+        finalizationElapsedMs = $terminalFinalizationElapsedMs
+    }
+}
+
 Export-ModuleMember -Function Assert-CSXProtocol, Get-CSXQualificationProtocol, Get-CSXFixtureManifest, Write-CSXJsonFile, Write-CSXTextFile, Get-CSXFileSha256,
     Get-CSXPropertyValue, Get-CSXPathValue, Get-CSXLiveGpuFixtureEvidence, ConvertTo-CSXHashtable, Add-CSXExactRuntimeToProfile, Get-CSXFoveationTarget,
     New-CSXCocScenario, New-CSXMenuScenario, New-CSXRecoveryScenario, New-CSXVisualSequenceRequest,
@@ -4951,4 +5057,4 @@ Export-ModuleMember -Function Assert-CSXProtocol, Get-CSXQualificationProtocol, 
     New-CSXAutomatedVisualPromptText, New-CSXAutomatedVisualReview, Test-CSXAutomatedVisualReviewEvidence,
     Test-CSXVisualReview, Test-CSXFlattenedBaselineVisualReview,
     Test-CSXJsonIdentity, Test-CSXAutomationArtifactInventory, Test-CSXProducerArtifactEvidence, Test-CSXVisualArtifactEvidence,
-    Test-CSXQualificationCompletionReceipt, Test-CSXFinalizerEnvelope, Update-CSXQualificationReport
+    Test-CSXQualificationCompletionReceipt, Test-CSXFinalizerEnvelope, Update-CSXQualificationReport, New-CSXProviderCustodyEvidence, Complete-CSXSealedQualification
