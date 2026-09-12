@@ -33,6 +33,9 @@ optional integration rather than the identity or boundary of the toolkit.
   and normalized semantic results.
 - `tools/profiler-control` — repeatable DevBench profiler capture and
   multi-state comparison reports.
+- `tools/render-scale-qualification` — one bounded, evidence-preserving
+  render-scale qualification that combines transition stability, performance,
+  stereo capture, and blinded visual assessment.
 - `tools/shader-cache-control` — provider discovery, physical cache
   snapshot/restore transactions, compatibility-ranked known-working cache
   catalogs, task seeding/restoration/promotion, and comparison reports.
@@ -51,7 +54,7 @@ versioned shared-memory pose contract, but it is not the bootstrap provider.
 
 ## Codex plugin
 
-The repository publishes a Codex marketplace plugin. Its seven skills connect a
+The repository publishes a Codex marketplace plugin. Its eight skills connect a
 new task to the bundled implementations and their operational contracts:
 
 - `$feedback-control` records unexpected automation behaviour and concrete
@@ -62,6 +65,8 @@ new task to the bundled implementations and their operational contracts:
   bounded runtime shutdown.
 - `$devbench-control` discovers and calls the exact loopback DevBench MCP API.
 - `$profiler-control` captures bounded GPU/CPU timer evidence and compares runs.
+- `$render-scale-qualification` runs the complete unattended CSX render-scale
+  qualification against one already-running, identity-bound DevBench session.
 - `$shader-cache-control` prepares tasks from compatible known-working compiled
   caches, restores prior state, promotes verified results, and compares trees
   by SHA-256.
