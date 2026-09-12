@@ -183,6 +183,40 @@ function Get-DevBenchCallSemanticStatus {
     }
     $payload = $payloads[0]
 
+    if ($ToolName -eq 'game' -and $Arguments.Contains('action') -and [string]$Arguments['action'] -eq 'load') {
+        $actionProperty = $payload.PSObject.Properties['action']
+        $queuedProperty = $payload.PSObject.Properties['queued']
+        if ($actionProperty -and $queuedProperty) {
+            $reasons = [Collections.Generic.List[string]]::new()
+            if ([string]$actionProperty.Value -cne 'load') {
+                $reasons.Add("content.action is '$($actionProperty.Value)', expected 'load'")
+            }
+            if ($queuedProperty.Value -isnot [bool] -or -not [bool]$queuedProperty.Value) {
+                $reasons.Add('content.queued is not true')
+            }
+            if ($Arguments.Contains('name')) {
+                $nameProperty = $payload.PSObject.Properties['name']
+                if (-not $nameProperty -or [string]$nameProperty.Value -cne [string]$Arguments['name']) {
+                    $reasons.Add('content.name does not match the requested save')
+                }
+            }
+            return [pscustomobject][ordered]@{
+                known = $true
+                ok = $reasons.Count -eq 0
+                outcome = if ($reasons.Count -eq 0) { 'game-load-dispatch-queued' } else { 'game-load-dispatch-rejected' }
+                completionBasis = 'dispatch-only'
+                guarded = $false
+                transient = $false
+                codes = @()
+                states = @()
+                reasons = @($reasons)
+                schedulerOnly = $false
+                schedulerReceiptPaths = @()
+                explicitOutcomeEvidence = @('content.action', 'content.queued', 'content.name')
+            }
+        }
+    }
+
     if ($ToolName -eq 'record' -and $Arguments.Contains('action') -and [string]$Arguments['action'] -eq 'start') {
         $actionProperty = $payload.PSObject.Properties['action']
         $recordingProperty = $payload.PSObject.Properties['recording']
