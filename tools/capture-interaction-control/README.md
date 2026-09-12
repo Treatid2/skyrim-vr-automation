@@ -48,6 +48,12 @@ returns, preventing a following action from colliding with an active owner.
 `-DirectArgumentsJson` is an explicit passthrough for operations not represented
 by the catalog; every action is appended to `actions.ndjson`.
 
+A direct `game load` is dispatched once. Require its receipt to report
+`queued: true`, then verify current `playerLoaded` and the exact target cell
+through read-only observations or the DevBench `playerLoaded` state barrier.
+Do not wait for a transient load lifecycle event or replay the load when that
+event was not observed.
+
 `wait-save` uses the session start timestamp by default, parses explicit
 `-SinceUtc` values as `DateTimeOffset`, compares only UTC values, and requires a
 matching `.ess` file to retain identical size and last-write time for the

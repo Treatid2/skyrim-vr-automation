@@ -20,6 +20,8 @@ client.
 .\Invoke-DevBenchControl.ps1 wait -Condition upscalingStable `
   -ExpectedCell WindhelmExterior01 -TimeoutSeconds 120 `
   -StableSamples 2 -MinimumStableFrameAdvance 5
+.\Invoke-DevBenchControl.ps1 wait -Condition playerLoaded `
+  -ExpectedCell WhiterunBreezehome -TimeoutSeconds 120
 .\Invoke-DevBenchControl.ps1 wait -Condition mainMenuReady -TimeoutSeconds 30
 .\Invoke-DevBenchControl.ps1 wait -Condition toolAvailable `
   -Tool communityshaders.profiler_api -TimeoutSeconds 600 `
@@ -186,14 +188,12 @@ three; reaching it returns `persistent-session-invalidated` with the count and
 last successfully decoded observation so callers can distinguish server churn
 from an ordinary unsatisfied predicate.
 
-`playerLoaded` is transition-fresh by default: the wait must observe an
-unloaded state before accepting loaded. This prevents the prior world's cached
-`true` from satisfying an asynchronous load. Use `-AcceptAlreadyLoaded` only
-when the caller intentionally wants a current-state check rather than proof of
-a new load transition. When a separate, successful mutation has already queued
-the load, pass `-LoadAlreadyQueued`. That explicit ownership assertion preserves
-freshness across a transient listener rebind without replaying the mutation;
-the first qualified loaded observation may then complete the wait.
+`playerLoaded` is a current-state post-load barrier. After one separately
+verified `game load` dispatch reports `queued: true`, call it with the exact
+`-ExpectedCell`. It polls both `inspect state` and `inspect scene` until the
+player is loaded in that cell. It does not wait for, or require observation of,
+the transient unloaded-to-loaded edge because that edge can occur between
+polls. A transport failure never causes the load mutation to be replayed.
 
 `upscalingStable` is the fail-closed barrier for paced cell-transition tests.
 It requires the exact `-ExpectedCell`, a loaded player, no blocking menu, and a
