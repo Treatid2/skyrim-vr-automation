@@ -999,6 +999,33 @@ function Get-DevBenchRuntimeExpectations {
     return [pscustomobject][ordered]@{ port = [int]$Runtime.port; pid = $pidValue; exe = $exeValue; buildId = $buildId; artifactPath = $artifactPath; artifactSha256 = $artifactSha256 }
 }
 
+function Test-DevBenchExecutableIdentityMatch {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][string]$Expected,
+        [AllowNull()][string]$Actual
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Expected) -or [string]::IsNullOrWhiteSpace($Actual)) { return $false }
+    $expectedValue = $Expected.Trim()
+    $actualValue = $Actual.Trim()
+    $expectedName = [IO.Path]::GetFileName($expectedValue)
+    $actualName = [IO.Path]::GetFileName($actualValue)
+    if (-not [string]::Equals($expectedName, $actualName, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $expectedIsPath = $expectedValue.IndexOfAny([char[]]@('\', '/')) -ge 0
+    $actualIsPath = $actualValue.IndexOfAny([char[]]@('\', '/')) -ge 0
+    if ($expectedIsPath -and $actualIsPath) {
+        try {
+            return [string]::Equals(
+                [IO.Path]::GetFullPath($expectedValue).TrimEnd([char[]]'\/'),
+                [IO.Path]::GetFullPath($actualValue).TrimEnd([char[]]'\/'),
+                [StringComparison]::OrdinalIgnoreCase)
+        }
+        catch { return $false }
+    }
+    return $true
+}
+
 function Test-DevBenchMainMenuReady {
     [CmdletBinding()]
     param(
@@ -1195,4 +1222,4 @@ function Test-DevBenchPerformanceWindow {
     }
 }
 
-Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow
+Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Test-DevBenchExecutableIdentityMatch, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow

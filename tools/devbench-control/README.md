@@ -32,7 +32,10 @@ The client communicates only with the loopback endpoint and reports structured
 JSON. By default it binds the endpoint to the owning listener PID and DevBench's
 off-thread `inspect health` identity before returning. Runtime metadata may add
 `pid`/`processId` and `exe`/`executable`; supplied values become strict
-expectations. Pass `-EvidenceDirectory` to preserve this binding with the run.
+expectations. An executable supplied as a canonical path is compared exactly
+with the listener process path and by filename with DevBench health, whose
+public contract reports a basename. Two supplied canonical paths must still
+match exactly. Pass `-EvidenceDirectory` to preserve this binding with the run.
 Each invocation writes a uniquely named binding receipt, so parallel calls do
 not overwrite one another. Use `-EvidenceLabel` to give that receipt a stable
 human-readable label within the unique filename. The receipt records whether
@@ -182,6 +185,11 @@ terminate immediately and the last transient error remains in the result.
 The initial MCP initialize/initialized/tools-list exchange is part of that same
 outer wait state machine, so a temporarily unavailable listener cannot exhaust
 the short transport budget before the requested timeout begins.
+An invalidated MCP session is fully rebound, but repeated invalidations are not
+allowed to consume the entire wait invisibly. `-MaxSessionRebinds` defaults to
+three; reaching it returns `persistent-session-invalidated` with the count and
+last successfully decoded observation so callers can distinguish server churn
+from an ordinary unsatisfied predicate.
 
 `playerLoaded` is transition-fresh by default: the wait must observe an
 unloaded state before accepting loaded. This prevents the prior world's cached

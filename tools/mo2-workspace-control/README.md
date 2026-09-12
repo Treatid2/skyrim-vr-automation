@@ -143,18 +143,16 @@ this release does not synthesize that action, and `coc APStartCell` is
 explicitly not equivalent. See `../../docs/BREEZEHOME-SAVE.md` for the current
 maintained fallback starting point.
 
-One default fixture is mandatory for every fresh clone, regardless of
-`SavePolicy`. The installer or list maintainer must first load that save in the
-maintained source profile, record it in `defaults.newGameFixtureManifest`, and
-obtain `fixture-valid`. Creation records static integrity as
-`data.sourceIntegrity`, reports the declaration as `data.worldEntryFixture`,
-verifies it again in the copied tree, and sets `data.copiedWorldEntrySave`.
-`integrityVerified` proves exact profile/save bytes; it does not imply
-`runtimeQualified`. This is a clone-time integrity guarantee only: `resume`
-preserves a task's prior profile exactly and does not claim its save still works
-after task-local edits.
+Every fresh clone receives and hashes the complete stable source save tree.
+`MainMenuOnly` and `FreshGame` do not require, select, or authorize a declared
+world-entry fixture: their result reports `worldEntryFixture: null` and
+`copiedWorldEntrySave: false`. Creation still records static source/copy
+integrity as `data.sourceIntegrity`. `integrityVerified` proves exact
+profile/save bytes; it does not imply `runtimeQualified`. This is a clone-time
+integrity guarantee only: `resume` preserves a task's prior profile exactly and
+does not claim its save still works after task-local edits.
 
-`VerifiedFixture` additionally authorizes that exact fixture as the
+`VerifiedFixture` requires and authorizes one exact fixture as the
 deterministic automation form of “new game”. It uses
 `-FixtureManifestPath`, or `defaults.newGameFixtureManifest`, and selects
 `-FixtureId` or the manifest's `defaultFixtureId`. The manifest fingerprint must
@@ -170,9 +168,11 @@ changing anything. When no manifest is configured, or the configured file is
 missing, `fixture-status` returns `fixture-not-configured` or
 `fixture-manifest-missing` with the exact configuration property, portable
 example path, current stable-profile fingerprint, and creation guidance; this
-discovery state is not a tool error for inspection, but it blocks fresh
-`create`. The doctor treats anything other than `fixture-valid` as a failed
-setup prerequisite. `refresh-fixture` is the separately authorized repair path:
+discovery state is not a tool error for inspection. It blocks only
+`VerifiedFixture` creation; `MainMenuOnly` and `FreshGame` remain available.
+The doctor reports fixture readiness separately rather than treating it as a
+prerequisite for every save policy. `refresh-fixture` is the separately
+authorized repair path:
 it requires the exact access lease and closed-state proof, preserves the prior
 manifest and a receipt, refreshes only the selected declared fixture, and
 verifies the postcondition. It never invents a replacement save path.
