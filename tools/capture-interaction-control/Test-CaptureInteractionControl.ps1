@@ -102,9 +102,16 @@ $frame = [pscustomobject]@{
   left=[pscustomobject]@{available=$true;connected=$true;valid=$true;index=1;trackingResult=200;matrix=@(1,0,0,-0.2,0,1,0,1,0,0,1,-0.3);velocity=@(0,0,0);angularVelocity=@(0,0,0);controller=[pscustomobject]@{packetNumber=1;pressed=0;touched=0;axes=@(@(0,0),@(0,0),@(0,0),@(0,0),@(0,0))}}
   right=[pscustomobject]@{available=$true;connected=$true;valid=$true;index=2;trackingResult=200;matrix=@(1,0,0,0.2,0,1,0,1,0,0,1,-0.3);velocity=@(0,0,0);angularVelocity=@(0,0,0);controller=[pscustomobject]@{packetNumber=1;pressed=0;touched=0;axes=@(@(0,0),@(0,0),@(0,0),@(0,0),@(0,0))}}
 }
+if ($env:CAPTURE_INTERACTION_FAIL_STOP -eq '1' -and
+    (($Tool -eq 'record' -and $argsObject.action -eq 'stop') -or
+     ($Tool -eq 'input' -and $argsObject.action -eq 'releaseAll'))) {
+  $outcome = if ($Tool -eq 'record') { 'record-stop-contract-failed' } else { 'vr-tracked-set-stop-contract-failed' }
+  [pscustomobject]@{ok=$false;state='completed';semantic=[pscustomobject]@{known=$true;ok=$false;outcome=$outcome;reasons=@()};data=[pscustomobject]@{content=@()};errors=@()} | ConvertTo-Json -Depth 100 -Compress
+  return
+}
 if ($Tool -eq 'communityshaders.screenshot') {
   if ($argsObject.action -eq 'capabilities') {
-    $value=[pscustomobject]@{schema='urn:csx:devbench:screenshot:1';limits=[pscustomobject]@{maximumSequenceFrames=10000;maximumSequenceDurationMs=3600000}}
+    $value=[pscustomobject]@{schema='urn:csx:devbench:screenshot:1';limits=[pscustomobject]@{maximumSequenceFrames=60000;maximumSequenceDurationMs=3600000}}
   }
   elseif ($argsObject.action -eq 'sequence_start' -and $env:CAPTURE_INTERACTION_FAIL_VISUAL_START -eq '1') {
     [pscustomobject]@{ok=$false;data=$null;errors=@('fixture visual start failure')} | ConvertTo-Json -Compress
@@ -152,12 +159,12 @@ else { $value=[pscustomobject]@{ok=$true} }
     $env:CAPTURE_INTERACTION_FAKE_ROOT = $root
     $entry = Join-Path $PSScriptRoot 'Invoke-CaptureInteraction.ps1'
     $oversizedSession = Join-Path $root 'oversized-session'
-    $oversized = & $entry start -SessionDirectory $oversizedSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10000 -FrameIntervalMs 1000 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
-    Assert-Test (-not $oversized.ok -and $oversized.errors -match 'runtime limits are 10000 frames and 3600000 ms' -and $oversized.errors -match 'no greater than 3600') "sequence preflight reports the exact runtime duration limit and compatible frame count: $($oversized | ConvertTo-Json -Depth 20 -Compress)"
+    $oversized = & $entry start -SessionDirectory $oversizedSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 60000 -FrameIntervalMs 1000 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test (-not $oversized.ok -and $oversized.errors -match 'runtime limits are 60000 frames and 3600000 ms' -and $oversized.errors -match 'no greater than 3600') 'sequence preflight reports the exact runtime duration limit and compatible frame count after accepting the server maximum at parameter binding'
     Assert-Test (-not (Test-Path -LiteralPath $oversizedSession)) 'sequence preflight rejects an incompatible request before creating session state or starting recording'
     $session = Join-Path $root 'session'
-    $started = & $entry start -SessionDirectory $session -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 500 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
-    Assert-Test ($started.ok -and $started.state -eq 'session-started' -and $started.data.screenshot.requestId -eq 'req-1' -and $started.data.screenshot.preflight.maximumSequenceDurationMs -eq 3600000) "sequence session starts recording and screenshot capture under one capability-bound session: $($started | ConvertTo-Json -Depth 20 -Compress)"
+    $started = & $entry start -SessionDirectory $session -RuntimePath $runtime -VisualMode sequence -MaximumFrames 60000 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
+    Assert-Test ($started.ok -and $started.state -eq 'session-started' -and $started.data.screenshot.requestId -eq 'req-1' -and $started.data.screenshot.preflight.maximumSequenceFrames -eq 60000) 'sequence session admits the DevBench-advertised 60000-frame limit when its requested duration also fits'
     $observed = & $entry observe -SessionDirectory $session -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
     Assert-Test ($observed.ok -and $observed.data.observation.latestFrame.ordinal -eq 4) 'observe composites runtime state and the latest committed frame'
     Assert-Test (Test-Path -LiteralPath $observed.data.observationPath -PathType Leaf) 'observe persists a latest-observation receipt'
@@ -238,6 +245,13 @@ else { $value=[pscustomobject]@{ok=$true} }
     $stopCountAfterReplacement = @((Get-Content -LiteralPath (Join-Path $root 'calls.log')) | Where-Object { $_ -eq 'record/stop' }).Count
     Assert-Test (-not $replacementStop.ok -and $replacementStop.state -eq 'stopped-with-errors' -and
         $replacementStop.data.runtimeIdentity.listenerPid -eq 101 -and $stopCountAfterReplacement -eq $stopCountBeforeReplacement) 'capture cleanup rejects a changed build identity at the same PID before target mutation'
+    $diagnosticSession = Join-Path $root 'diagnostic-session'
+    $diagnosticStarted = & $entry start -SessionDirectory $diagnosticSession -RuntimePath $runtime -VisualMode none -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
+    Assert-Test ($diagnosticStarted.ok) 'diagnostic stop fixture starts an owned recording'
+    $env:CAPTURE_INTERACTION_FAIL_STOP = '1'
+    $diagnosticStopped = & $entry stop -SessionDirectory $diagnosticSession -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_STOP -ErrorAction SilentlyContinue
+    Assert-Test (-not $diagnosticStopped.ok -and $diagnosticStopped.errors -match 'vr-tracked-set-stop-contract-failed' -and $diagnosticStopped.errors -match 'record-stop-contract-failed') 'stop preserves semantic outcomes when a failed controller envelope has an empty errors array'
 
     [pscustomobject]@{ ok=$true; sessionPath=$started.data.statePath; actionCount=(Get-CaptureInteractionActionCatalog).actions.Count } | ConvertTo-Json -Compress
 }
@@ -254,5 +268,6 @@ finally {
     Remove-Item Env:CAPTURE_INTERACTION_RUNTIME_START -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_RUNTIME_BUILD -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_RUNTIME_ARTIFACT_SHA -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_STOP -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
 }

@@ -21,6 +21,13 @@ the controller's final evidence write fails. A dispatched screenshot or
 recording without a retained identity remains `cleanup-uncertain`; stopping the
 other lane does not manufacture terminal proof for it.
 
+`-MaximumFrames` accepts up to 60,000 frames, matching the current DevBench
+recording ceiling. Sequence admission still uses the live screenshot capability
+receipt, so a lower server frame or duration limit fails before mutation. Stop
+accepts exact already-inactive tracked-input cleanup and persisted recording
+receipts; failed controller envelopes retain their semantic outcome even when
+the server supplied an empty error array.
+
 ```powershell
 pwsh -NoProfile -File .\Invoke-CaptureInteraction.ps1 start `
   -SessionDirectory D:\CodexScratch\...\interaction `

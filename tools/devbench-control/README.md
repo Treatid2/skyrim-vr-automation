@@ -84,7 +84,12 @@ without misclassifying a valid bridge response as unknown.
 Structured responses from allowlisted read-only calls establish a successful
 read contract. `record start` has a separate adapter that requires
 `action=start`, `recording=true`, and the requested correlation ID before
-`-RequireSuccess` accepts the result.
+`-RequireSuccess` accepts the result. `record stop` requires the exact stop
+action and a persisted recording path. Tracked-set `stop`/`releaseAll` requires
+either exact already-inactive evidence or owner-bound completed restoration.
+Weather `execute` treats top-level `ok` as envelope success only: the nested
+result must report `status=success` and Boolean `applied=true`; preflight and
+revision guards remain semantic failures.
 The allowlist includes the exact structured `communityshaders.renderscale`
 `status` response and the screenshot `capabilities` response. Screenshot
 capabilities require the version-1 schema plus positive integral frame and
@@ -191,11 +196,14 @@ terminate immediately and the last transient error remains in the result.
 The initial MCP initialize/initialized/tools-list exchange is part of that same
 outer wait state machine, so a temporarily unavailable listener cannot exhaust
 the short transport budget before the requested timeout begins.
-An invalidated MCP session is fully rebound, but repeated invalidations are not
-allowed to consume the entire wait invisibly. `-MaxSessionRebinds` defaults to
-three; reaching it returns `persistent-session-invalidated` with the count and
-last successfully decoded observation so callers can distinguish server churn
-from an ordinary unsatisfied predicate.
+An invalidated MCP session is fully rebound within the same absolute wait
+deadline. Periodic server session retirement is therefore not an independent
+failure limit: `-MaxSessionRebinds` defaults to zero (deadline-only). Callers
+may set a positive explicit churn cap when required; reaching it returns
+`persistent-session-invalidated` with the count and last successfully decoded
+observation. `-TimeoutSeconds` accepts explicit bounded waits up to one hour,
+and ordinary deadline expiry returns `timeout` with the last successful state
+observation rather than retrying a request that can no longer start.
 
 `playerLoaded` is a current-state post-load barrier. After one separately
 verified `game load` dispatch reports `queued: true`, call it with the exact

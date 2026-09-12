@@ -14,7 +14,7 @@ param(
     [string]$PreferredView = 'left_eye',
     [ValidateRange(10, 5000)][int]$RecordIntervalMs = 50,
     [ValidateRange(50, 60000)][int]$FrameIntervalMs = 500,
-    [ValidateRange(1, 10000)][int]$MaximumFrames = 7200,
+    [ValidateRange(1, 60000)][int]$MaximumFrames = 7200,
     [ValidateRange(1, 120)][int]$CaptureTimeoutSeconds = 20,
     [ValidateRange(1, 55)][int]$ActionTimeoutSeconds = 15,
     [switch]$AllowNoPlayer,
@@ -141,7 +141,23 @@ function Invoke-DevBench([string]$Tool, [hashtable]$Arguments, [string]$Runtime,
     $raw = & $DevBenchScriptPath call @parameters
     $response = $raw | ConvertFrom-Json -Depth 100
     if (-not $response.ok) {
-        $failure = [InvalidOperationException]::new("DevBench tool '$Tool' failed: $(@($response.errors) -join '; ')")
+        $details = [Collections.Generic.List[string]]::new()
+        foreach ($errorText in @($response.errors)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$errorText)) { $details.Add([string]$errorText) }
+        }
+        if ($details.Count -eq 0 -and $response.PSObject.Properties['semantic'] -and $response.semantic) {
+            foreach ($reason in @($response.semantic.reasons)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$reason)) { $details.Add([string]$reason) }
+            }
+            if ($details.Count -eq 0 -and $response.semantic.PSObject.Properties['outcome']) {
+                $details.Add("semantic outcome '$([string]$response.semantic.outcome)'")
+            }
+        }
+        if ($details.Count -eq 0) {
+            $state = if ($response.PSObject.Properties['state']) { [string]$response.state } else { 'unknown' }
+            $details.Add("controller returned ok=false with state '$state' and no diagnostic detail")
+        }
+        $failure = [InvalidOperationException]::new("DevBench tool '$Tool' failed: $($details -join '; ')")
         $failure.Data['DevBenchResponse'] = $response
         throw $failure
     }

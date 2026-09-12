@@ -238,6 +238,178 @@ function Get-DevBenchCallSemanticStatus {
             explicitOutcomeEvidence = @('content.action', 'content.queued', 'content.name')
         }
     }
+
+    if ($ToolName -eq 'communityshaders.weather_api' -and $Arguments.Contains('action') -and
+        [string]$Arguments['action'] -eq 'execute') {
+        $reasons = [Collections.Generic.List[string]]::new()
+        if ($semantic.known -and -not $semantic.ok) {
+            foreach ($reason in @($semantic.reasons)) { $reasons.Add([string]$reason) }
+        }
+        $payload = if ($payloads.Count -eq 1 -and $null -ne $payloads[0] -and
+            $payloads[0] -isnot [string] -and $payloads[0] -isnot [ValueType]) {
+            $payloads[0]
+        }
+        else {
+            $reasons.Add('content must contain exactly one structured weather execute receipt')
+            $null
+        }
+        $status = $null
+        $guardStatuses = @('preflight_required', 'preflight_expired', 'state_revision_mismatch', 'producer_mismatch', 'contract_mismatch', 'unsupported_contract_major', 'idempotency_conflict')
+        if ($payload) {
+            $commandProperty = $payload.PSObject.Properties['command']
+            $commandActionProperty = if ($commandProperty -and $null -ne $commandProperty.Value -and
+                $commandProperty.Value -isnot [string] -and $commandProperty.Value -isnot [ValueType]) {
+                $commandProperty.Value.PSObject.Properties['action']
+            } else { $null }
+            if (-not $commandActionProperty -or [string]$commandActionProperty.Value -cne 'execute') {
+                $reasons.Add('content.command.action is not the exact execute action')
+            }
+            $resultProperty = $payload.PSObject.Properties['result']
+            $result = if ($resultProperty -and $null -ne $resultProperty.Value -and
+                $resultProperty.Value -isnot [string] -and $resultProperty.Value -isnot [ValueType]) {
+                $resultProperty.Value
+            } else {
+                $reasons.Add('content.result is not a structured weather execute result')
+                $null
+            }
+            if ($result) {
+                $statusProperty = $result.PSObject.Properties['status']
+                $status = if ($statusProperty) { [string]$statusProperty.Value } else { $null }
+                if ([string]::IsNullOrWhiteSpace($status) -or $status -cne 'success') {
+                    $reasons.Add("content.result.status is '$status', expected 'success'")
+                }
+                $appliedProperty = $result.PSObject.Properties['applied']
+                if (-not $appliedProperty -or $appliedProperty.Value -isnot [bool] -or -not [bool]$appliedProperty.Value) {
+                    $reasons.Add('content.result.applied is not Boolean true')
+                }
+            }
+        }
+        $guarded = $status -in $guardStatuses
+        return [pscustomobject][ordered]@{
+            known = $true
+            ok = $reasons.Count -eq 0
+            outcome = if ($reasons.Count -eq 0) { 'weather-execute-contract-satisfied' } elseif ($guarded) { 'weather-execute-guard-rejected' } else { 'weather-execute-contract-failed' }
+            guarded = $guarded
+            transient = $status -in @('preflight_required', 'preflight_expired', 'state_revision_mismatch')
+            codes = $(if ([string]::IsNullOrWhiteSpace($status) -or $status -ceq 'success') { @() } else { @($status) })
+            states = @()
+            reasons = @($reasons | Select-Object -Unique)
+            schedulerOnly = $false
+            schedulerReceiptPaths = @()
+            explicitOutcomeEvidence = @('content.command.action', 'content.result.status', 'content.result.applied')
+        }
+    }
+
+    if ($ToolName -eq 'record' -and $Arguments.Contains('action') -and
+        [string]$Arguments['action'] -eq 'stop') {
+        $reasons = [Collections.Generic.List[string]]::new()
+        if ($semantic.known -and -not $semantic.ok) {
+            foreach ($reason in @($semantic.reasons)) { $reasons.Add([string]$reason) }
+        }
+        $payload = if ($payloads.Count -eq 1 -and $null -ne $payloads[0] -and
+            $payloads[0] -isnot [string] -and $payloads[0] -isnot [ValueType]) {
+            $payloads[0]
+        }
+        else {
+            $reasons.Add('content must contain exactly one structured record stop receipt')
+            $null
+        }
+        if ($payload) {
+            $errorProperty = $payload.PSObject.Properties['error']
+            if ($errorProperty -and -not [string]::IsNullOrWhiteSpace([string]$errorProperty.Value)) {
+                $reasons.Add("content.error is '$($errorProperty.Value)'")
+            }
+            $actionProperty = $payload.PSObject.Properties['action']
+            if (-not $actionProperty -or [string]$actionProperty.Value -cne 'stop') {
+                $reasons.Add('content.action is not the exact record stop action')
+            }
+            $pathProperty = $payload.PSObject.Properties['path']
+            if (-not $pathProperty -or [string]::IsNullOrWhiteSpace([string]$pathProperty.Value)) {
+                $reasons.Add('content.path is missing from the persisted recording receipt')
+            }
+        }
+        return [pscustomobject][ordered]@{
+            known = $true
+            ok = $reasons.Count -eq 0
+            outcome = if ($reasons.Count -eq 0) { 'record-stop-contract-satisfied' } else { 'record-stop-contract-failed' }
+            guarded = $false
+            transient = $false
+            codes = @()
+            states = @()
+            reasons = @($reasons | Select-Object -Unique)
+            schedulerOnly = $false
+            schedulerReceiptPaths = @()
+            explicitOutcomeEvidence = @('content.action', 'content.path')
+        }
+    }
+
+    if ($ToolName -eq 'input' -and $Arguments.Contains('action') -and
+        [string]$Arguments['action'] -in @('stop', 'releaseAll') -and
+        $Arguments.Contains('device') -and [string]$Arguments['device'] -ceq 'vrTrackedSet') {
+        $reasons = [Collections.Generic.List[string]]::new()
+        if ($semantic.known -and -not $semantic.ok) {
+            foreach ($reason in @($semantic.reasons)) { $reasons.Add([string]$reason) }
+        }
+        $payload = if ($payloads.Count -eq 1 -and $null -ne $payloads[0] -and
+            $payloads[0] -isnot [string] -and $payloads[0] -isnot [ValueType]) {
+            $payloads[0]
+        }
+        else {
+            $reasons.Add('content must contain exactly one structured VR tracked-set stop receipt')
+            $null
+        }
+        if ($payload) {
+            $actionProperty = $payload.PSObject.Properties['action']
+            $deviceProperty = $payload.PSObject.Properties['device']
+            $notActiveProperty = $payload.PSObject.Properties['notActive']
+            $alreadyInactive = $notActiveProperty -and $notActiveProperty.Value -is [bool] -and [bool]$notActiveProperty.Value
+            if (-not $actionProperty -or [string]$actionProperty.Value -cne 'stop') {
+                $reasons.Add('content.action is not the exact VR tracked-set stop action')
+            }
+            if (-not $deviceProperty -or [string]$deviceProperty.Value -cne 'vrTrackedSet') {
+                $reasons.Add('content.device is not the exact vrTrackedSet device')
+            }
+            if (-not $alreadyInactive) {
+                $stoppedProperty = $payload.PSObject.Properties['stopped']
+                $restoredProperty = $payload.PSObject.Properties['restored']
+                $pendingProperty = $payload.PSObject.Properties['restorationPending']
+                if (-not $stoppedProperty -or $stoppedProperty.Value -isnot [bool] -or -not [bool]$stoppedProperty.Value) {
+                    $reasons.Add('content.stopped is not Boolean true')
+                }
+                if (-not $restoredProperty -or $restoredProperty.Value -isnot [bool] -or -not [bool]$restoredProperty.Value) {
+                    $reasons.Add('content.restored is not Boolean true')
+                }
+                if (-not $pendingProperty -or $pendingProperty.Value -isnot [bool] -or [bool]$pendingProperty.Value) {
+                    $reasons.Add('content.restorationPending is not Boolean false')
+                }
+                if ($Arguments.Contains('owner')) {
+                    $ownerProperty = $payload.PSObject.Properties['owner']
+                    if (-not $ownerProperty -or [string]$ownerProperty.Value -cne [string]$Arguments['owner']) {
+                        $reasons.Add('content.owner does not match the requested VR tracked-set owner')
+                    }
+                }
+                $reasonProperty = $payload.PSObject.Properties['reason']
+                $expectedReason = if ([string]$Arguments['action'] -ceq 'releaseAll') { 'releaseAll' } else { 'request' }
+                if (-not $reasonProperty -or [string]$reasonProperty.Value -cne $expectedReason) {
+                    $reasons.Add("content.reason is not the exact '$expectedReason' stop reason")
+                }
+            }
+        }
+        return [pscustomobject][ordered]@{
+            known = $true
+            ok = $reasons.Count -eq 0
+            outcome = if ($reasons.Count -eq 0) { 'vr-tracked-set-stop-contract-satisfied' } else { 'vr-tracked-set-stop-contract-failed' }
+            guarded = $false
+            transient = $false
+            codes = @()
+            states = @()
+            reasons = @($reasons | Select-Object -Unique)
+            schedulerOnly = $false
+            schedulerReceiptPaths = @()
+            explicitOutcomeEvidence = @('content.action', 'content.device', 'content.notActive', 'content.stopped', 'content.restored', 'content.restorationPending', 'content.owner', 'content.reason')
+        }
+    }
+
     if ($semantic.known) { return $semantic }
     if ($payloads.Count -ne 1 -or $null -eq $payloads[0] -or $payloads[0] -is [string] -or $payloads[0] -is [ValueType]) {
         return $semantic
