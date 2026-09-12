@@ -46,6 +46,13 @@ performs one recorded exact-profile launch; the caller then uses normal `stop`
 so RootBuilder can restore its deployment through the exact Unlock path. It
 never deletes deployment data.
 
+Cooperative `close`, `recover-close`, and `stop` also recognize a structurally
+matched `Preparing vfs` window with exactly one `Cancel` control. They invoke
+only that exact control, retain the action in the session receipt, and still
+require both owned-process shutdown and removal of active `BuildData.json`
+before reporting success or allowing release. A stranded transaction remains
+`rootbuilder-recovery-required`; the controller never deletes it directly.
+
 Validation also resolves a registered executable stored under MO2's `mods`
 directory back to its owning mod. Launch is blocked when that exact mod is
 disabled, missing, or ambiguous in the requested profile.
@@ -219,7 +226,8 @@ allowing a delayed post-stop dialog to arrive. It then acknowledges only a
 structurally classified retained `Failed to run` dialog; an unknown modal returns
 `game-stopped-needs-attention` without touching it. If MO2 exits immediately
 after the game, `stop-game` returns `mo2-exited-after-game-stop`, sets
-`releaseRequired`, and refuses to represent the session as relaunchable. `close`
+`releaseRequired`, and records that MO2 must be reopened or the lease released
+before another task receives it. `close`
 refuses while a game/loader exists and cooperatively resolves
 MO2's structured `File` → `Exit` path and visible modal chain, including the VFS
 `Unlock` prompt. `stop` first closes the game and then uses the same MO2
@@ -229,6 +237,10 @@ explicit lease to access-only state. All mutation commands have `-WhatIf`.
 Evidence
 collection, archive verification, profile mutation, cache management, and
 recovery remain deferred until separately bounded.
+
+If the retained MO2 owner exits after the stability window, a later `launch`
+reopens the same owned session, exact profile, and executable when no MO2 or
+game process exists. It still refuses an unrelated or ambiguous MO2 owner.
 
 Use `-NoExit` when embedding the entry script in a larger PowerShell host; a
 failed command then returns structured JSON without terminating that host.
@@ -240,8 +252,11 @@ The retained cycle is:
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <literal-controllerPath> launch -SessionId <literal-session-id> -Compact
 ```
 
-Resume is accepted only from a bounded stopped/failure state, with no game
-process and exactly one MO2 process matching the session's original owner PID.
+Resume is accepted only from a bounded stopped/failure state with no game
+process. It either reuses exactly one MO2 process whose PID, start time, and
+executable path match the retained owner record, or—when no MO2 process
+exists—reopens the same owned session, profile, and executable. An unrelated,
+reused-PID, or ambiguous MO2 process blocks the launch without being adopted.
 
 `terminate` is intentionally distinct from `stop`: it force-terminates only
 MO2 processes owned by the active session, and only after proving that no game

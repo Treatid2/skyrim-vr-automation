@@ -26,11 +26,16 @@ only session orchestrator. Read its `README.md` before the first mutation.
    are already understood. Never approximate an unsupported input silently.
 6. Use `-ObserveAfterAction` when closed-loop feedback matters. The action
    receipt and subsequent observation have distinct IDs and timestamps.
-7. Use `stop` for normal completion. Use `abort` only for explicit partial
+7. For a direct `game load`, send it once and require the response to report
+   `queued: true`. Do not wait on the transient load lifecycle event. Use the
+   DevBench state barrier with the exact expected cell, or repeat read-only
+   `observe` calls until both `game.value.playerLoaded` and the target scene
+   cell are proven; never replay the load to recover a missed observation.
+8. Use `stop` for normal completion. Use `abort` only for explicit partial
    finalization. Both preserve receipts; neither deletes evidence.
-8. Use `wait-save` for a requested save boundary. Keep its bounded UTC receipt,
+9. Use `wait-save` for a requested save boundary. Keep its bounded UTC receipt,
    then call `stop` separately after the expected save is stable.
-9. Promote unique retained evidence to the configured authoritative permanent
+10. Promote unique retained evidence to the configured authoritative permanent
    store and verify it before releasing capture scratch as promoted. Do not keep
    using a released allocation.
 
