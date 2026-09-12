@@ -359,6 +359,51 @@ try {
         -NotePropertyValue $cancelFixture.StartTime.ToUniversalTime().ToString('o') -Force
     $state | Add-Member -NotePropertyName cancelState -NotePropertyValue 'cleanup-incomplete' -Force
     $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8
+    $state.cancelPid = [int]::MaxValue
+    $state.cancelStartedUtc = [DateTime]::UtcNow.ToString('o')
+    $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8
+    $absentCancellationStatus = & $scriptPath status -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if (-not $absentCancellationStatus.ok -or
+        $absentCancellationStatus.data.cancellationIdentityState -ne 'absent' -or
+        $absentCancellationStatus.data.activeProcessKind -ne 'crash-monitor') {
+        throw 'Confirmed cancellation-helper exit did not release recovery admission.'
+    }
+
+    $state.cancelPid = $monitorFixture.Id
+    $state.cancelStartedUtc = [DateTime]::UtcNow.AddHours(-1).ToString('o')
+    $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8
+    $replacedCancellationStatus = & $scriptPath status -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if (-not $replacedCancellationStatus.ok -or
+        $replacedCancellationStatus.data.cancellationIdentityState -ne 'replaced' -or
+        $replacedCancellationStatus.data.activeProcessKind -ne 'crash-monitor') {
+        throw 'Confirmed cancellation-helper PID reuse did not release recovery admission.'
+    }
+
+    $state.cancelPid = $cancelFixture.Id
+    $state.cancelStartedUtc = $cancelFixture.StartTime.ToUniversalTime().ToString('o')
+    $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8
+    $unresolvedStatus = & $scriptPath status -StatePath $statePath -InternalTestFailurePoint cancel-identity-unavailable -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    $unresolvedCapture = & $scriptPath capture-hang -StatePath $statePath -InternalTestFailurePoint cancel-identity-unavailable -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    $unresolvedStop = & $scriptPath stop -StatePath $statePath -InternalTestFailurePoint cancel-identity-unavailable -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    $afterUnresolvedCalls = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    if ($unresolvedStatus.ok -or $unresolvedStatus.state -ne 'cleanup-incomplete' -or
+        $unresolvedStatus.data.activeProcessKind -ne 'cancellation-helper-unresolved' -or
+        $unresolvedCapture.ok -or $unresolvedStop.ok -or
+        $unresolvedCapture.data.cancellationIdentityState -ne 'unresolved' -or
+        $unresolvedStop.data.cancellationIdentityState -ne 'unresolved' -or
+        [int]$afterUnresolvedCalls.cancelPid -ne $cancelFixture.Id -or
+        ([DateTime]$afterUnresolvedCalls.cancelStartedUtc).ToUniversalTime().ToString('o') -cne
+            $cancelFixture.StartTime.ToUniversalTime().ToString('o') -or
+        $afterUnresolvedCalls.cancelState -ne 'cleanup-incomplete' -or
+        -not (Get-Process -Id $cancelFixture.Id -ErrorAction SilentlyContinue) -or
+        -not (Get-Process -Id $monitorFixture.Id -ErrorAction SilentlyContinue)) {
+        throw 'Unverifiable cancellation identity did not fail closed without replacing recovery authority.'
+    }
     $blockedCapture = & $scriptPath capture-hang -StatePath $statePath `
         -Compact -NoExit | ConvertFrom-Json -Depth 20
     $afterBlockedCapture = Get-Content -LiteralPath $statePath -Raw |
