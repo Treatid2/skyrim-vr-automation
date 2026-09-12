@@ -1468,6 +1468,26 @@ try {
         -not $preflightCustody.preflightProcesses[0].inputCompleted -and
         @($preflightCustody.preflightErrors) -contains 'model probe left unresolved PID 4343') 'Preflight custody projection lost the child identity, stream/input state, or original failure.'
 
+    $runnerPreparationPasses = @(
+        foreach ($presentationPass in 1..2) {
+            [pscustomobject]@{
+                presentationPass = $presentationPass
+                batches = @(foreach ($replicate in 1..3) { [pscustomobject]@{ replicate = $replicate } })
+            }
+        }
+    )
+    $runnerPreparationReason = 'The unattended visual-evaluation deadline elapsed during request preparation.'
+    $runnerPreparationCustody = New-CSXProviderDeadlineCustodyEvidence `
+        -Passes $runnerPreparationPasses -Preflight ([pscustomobject]@{
+            model = 'test-model'; errors = @(); processes = [pscustomobject]@{}
+        }) -Reason $runnerPreparationReason
+    $runnerPreparationIdentities = @($runnerPreparationCustody.batches | ForEach-Object { "$($_.presentationPass):$($_.replicate)" } | Sort-Object -Unique)
+    Assert-Test ($runnerPreparationCustody.deadlineReached -and $runnerPreparationCustody.batches.Count -eq 6 -and
+        $runnerPreparationIdentities.Count -eq 6 -and
+        @($runnerPreparationCustody.batches | Where-Object { $_.status -eq 'not_started_deadline' -and -not $_.launched -and $_.timedOut }).Count -eq 6 -and
+        @($runnerPreparationCustody.batches | Where-Object { $runnerPreparationReason -in @($_.errors) }).Count -eq 6) `
+        'Runner-side request-preparation expiry did not retain six attributable not-started evaluation outcomes.'
+
     $terminalBudgetRoot = Join-Path $fixture 'terminal-budget'
     New-Item -ItemType Directory -Path $terminalBudgetRoot -Force | Out-Null
     function New-TerminalCommitFixture([string]$Root, [string]$RunId) {
@@ -1531,13 +1551,94 @@ try {
     Assert-Test ($failedCommitRejected -and -not (Test-Path -LiteralPath $failedCommitPath) -and
         -not $failedCommitValidation.ok) 'A failed terminal commit left an acceptance-valid completion receipt for an ordinary consumer.'
 
+    $delayedCommitRoot = Join-Path $terminalBudgetRoot 'delayed-commit'
+    $delayedCommitReceipt = New-TerminalCommitFixture -Root $delayedCommitRoot -RunId 'delayed-commit-run'
+    $delayedCommitPath = Join-Path $delayedCommitRoot 'qualification-completion.json'
+    $delayedCommitRejected = $false
+    try {
+        Complete-CSXSealedQualification -EvidenceDirectory $delayedCommitRoot -CompletionPath $delayedCommitPath `
+            -CompletionReceipt $delayedCommitReceipt -InvocationWatch ([Diagnostics.Stopwatch]::StartNew()) `
+            -FinalizationWatch ([Diagnostics.Stopwatch]::StartNew()) -ResultDeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) `
+            -EndToEndBudgetMs 5000 -FinalizationBudgetMs 250 `
+            -Finalizer { param($root) [pscustomobject]@{ report = [pscustomobject]@{ status = 'PASS' }; runPath = (Join-Path $root 'run.json'); summaryPath = (Join-Path $root 'summary.md') } } `
+            -CompletionCommitter { param($staged, $destination) Move-Item -LiteralPath $staged -Destination $destination; Start-Sleep -Milliseconds 350 } | Out-Null
+    }
+    catch { $delayedCommitRejected = $_.Exception.Message -match 'before public acceptance' }
+    $delayedCommitValidation = Test-CSXQualificationCompletionReceipt -EvidenceRoot $delayedCommitRoot -ExpectedRunId 'delayed-commit-run'
+    Assert-Test ($delayedCommitRejected -and -not $delayedCommitValidation.ok -and
+        -not (Test-Path -LiteralPath $delayedCommitPath) -and
+        @(Get-ChildItem -LiteralPath $delayedCommitRoot -Filter '.qualification-completion.*.json').Count -eq 0) `
+        'A successful but late private commit became public or left a reusable terminal receipt.'
+
+    $delayedValidationRoot = Join-Path $terminalBudgetRoot 'delayed-validation'
+    $delayedValidationReceipt = New-TerminalCommitFixture -Root $delayedValidationRoot -RunId 'delayed-validation-run'
+    $delayedValidationPath = Join-Path $delayedValidationRoot 'qualification-completion.json'
+    $script:delayedValidationCalls = 0
+    $delayedValidationRejected = $false
+    $delayedValidationArgs = @{
+        EvidenceDirectory = $delayedValidationRoot
+        CompletionPath = $delayedValidationPath
+        CompletionReceipt = $delayedValidationReceipt
+        InvocationWatch = [Diagnostics.Stopwatch]::StartNew()
+        FinalizationWatch = [Diagnostics.Stopwatch]::StartNew()
+        ResultDeadlineUtc = [DateTimeOffset]::UtcNow.AddSeconds(5)
+        EndToEndBudgetMs = 5000
+        FinalizationBudgetMs = 250
+        Finalizer = { param($root) [pscustomobject]@{ report = [pscustomobject]@{ status = 'PASS' }; runPath = (Join-Path $root 'run.json'); summaryPath = (Join-Path $root 'summary.md') } }
+        CompletionValidator = {
+            param($root, $runId, $receiptPath)
+            $script:delayedValidationCalls++
+            if ($script:delayedValidationCalls -eq 3) { Start-Sleep -Milliseconds 350 }
+            Test-CSXQualificationCompletionReceipt -EvidenceRoot $root -ExpectedRunId $runId -CompletionPath $receiptPath
+        }
+    }
+    try { Complete-CSXSealedQualification @delayedValidationArgs | Out-Null }
+    catch { $delayedValidationRejected = $_.Exception.Message -match 'before public acceptance' }
+    $delayedValidationResult = Test-CSXQualificationCompletionReceipt -EvidenceRoot $delayedValidationRoot -ExpectedRunId 'delayed-validation-run'
+    $delayedValidationSafe = $delayedValidationRejected -and -not $delayedValidationResult.ok -and -not (Test-Path -LiteralPath $delayedValidationPath) -and @(Get-ChildItem -LiteralPath $delayedValidationRoot -Filter '.qualification-completion.*.json').Count -eq 0
+    Assert-Test $delayedValidationSafe 'A delayed committed-receipt validation published or retained an acceptance-valid completion.'
+
+    $failedValidationRoot = Join-Path $terminalBudgetRoot 'failed-committed-validation'
+    $failedValidationReceipt = New-TerminalCommitFixture -Root $failedValidationRoot -RunId 'failed-validation-run'
+    $failedValidationPath = Join-Path $failedValidationRoot 'qualification-completion.json'
+    $script:failedValidationCalls = 0
+    $failedValidationRejected = $false
+    $failedValidationArgs = @{
+        EvidenceDirectory = $failedValidationRoot
+        CompletionPath = $failedValidationPath
+        CompletionReceipt = $failedValidationReceipt
+        InvocationWatch = [Diagnostics.Stopwatch]::StartNew()
+        FinalizationWatch = [Diagnostics.Stopwatch]::StartNew()
+        ResultDeadlineUtc = [DateTimeOffset]::UtcNow.AddSeconds(5)
+        EndToEndBudgetMs = 5000
+        FinalizationBudgetMs = 5000
+        Finalizer = { param($root) [pscustomobject]@{ report = [pscustomobject]@{ status = 'PASS' }; runPath = (Join-Path $root 'run.json'); summaryPath = (Join-Path $root 'summary.md') } }
+        CompletionValidator = {
+            param($root, $runId, $receiptPath)
+            $script:failedValidationCalls++
+            if ($script:failedValidationCalls -eq 3) {
+                return [pscustomobject]@{ ok = $false; errors = @('simulated transient committed-receipt read failure') }
+            }
+            Test-CSXQualificationCompletionReceipt -EvidenceRoot $root -ExpectedRunId $runId -CompletionPath $receiptPath
+        }
+    }
+    try { Complete-CSXSealedQualification @failedValidationArgs | Out-Null }
+    catch { $failedValidationRejected = $_.Exception.Message -match 'simulated transient committed-receipt read failure' }
+    $failedValidationResult = Test-CSXQualificationCompletionReceipt -EvidenceRoot $failedValidationRoot -ExpectedRunId 'failed-validation-run'
+    $failedValidationSafe = $failedValidationRejected -and -not $failedValidationResult.ok -and -not (Test-Path -LiteralPath $failedValidationPath) -and @(Get-ChildItem -LiteralPath $failedValidationRoot -Filter '.qualification-completion.*.json').Count -eq 0
+    Assert-Test $failedValidationSafe 'A post-commit validation failure left an ordinary-consumer-valid receipt when no later failure evidence was published.'
+
     $providerCustodyOffset = $runnerSource.IndexOf('$script:providerCustodyEvidence = New-CSXProviderCustodyEvidence $visualProviderPreflight', [StringComparison]::Ordinal)
     $providerBudgetOffset = $runnerSource.IndexOf("Assert-CSXResultBudget -Stage 'post-provider admission'", [StringComparison]::Ordinal)
     $executionCustodyOffset = $runnerSource.IndexOf('$script:providerCustodyEvidence = New-CSXProviderCustodyEvidence $execution', [StringComparison]::Ordinal)
     $providerReceiptOffset = $runnerSource.IndexOf('$executionPath = Write-CSXJsonFile', [StringComparison]::Ordinal)
+    $runnerPreparationCustodyOffset = $runnerSource.IndexOf('$script:providerCustodyEvidence = New-CSXProviderDeadlineCustodyEvidence', [StringComparison]::Ordinal)
+    $runnerPreparationThrowOffset = $runnerSource.IndexOf('throw $preparationDeadlineReason', [StringComparison]::Ordinal)
     Assert-Test ($providerCustodyOffset -ge 0 -and $providerBudgetOffset -gt $providerCustodyOffset -and
         $executionCustodyOffset -ge 0 -and $providerReceiptOffset -gt $executionCustodyOffset -and
         $runnerSource -match 'providerCustody = \$script:providerCustodyEvidence') 'Runner does not preserve provider custody before fallible execution-receipt publication.'
+    Assert-Test ($runnerPreparationCustodyOffset -ge 0 -and $runnerPreparationThrowOffset -gt $runnerPreparationCustodyOffset -and
+        ($runnerSource -match '(?s)providerCustody = \$script:providerCustodyEvidence.*?if \(-not \$script:evidenceWritable\).*?providerCustody = \$script:providerCustodyEvidence')) 'Runner-side preparation expiry does not retain its six not-started outcomes through unwritable failure evidence.'
     Assert-Test ($runnerSource.Contains('-DeadlineUtc $evaluationDeadlineUtc') -and
         $runnerSource.Contains('$completionPath = Join-Path $script:evidenceRoot ''qualification-completion.json''') -and
         -not $runnerSource.Contains('$completionPath = Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot ''qualification-completion.json'')')) 'Runner restarts the visual deadline or publishes acceptance before mandatory terminal validation.'

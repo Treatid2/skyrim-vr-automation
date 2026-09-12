@@ -5015,20 +5015,81 @@ function New-CSXProviderCustodyEvidence($Execution) {
             [pscustomobject][ordered]@{
                 presentationPass = [int](Get-CSXPropertyValue $_ 'presentationPass' 0)
                 replicate = [int](Get-CSXPropertyValue $_ 'replicate' 0)
+                status = [string](Get-CSXPropertyValue $_ 'status')
                 launched = [bool](Get-CSXPropertyValue $_ 'launched' $false)
                 processId = Get-CSXPropertyValue $_ 'processId'
                 exitCode = Get-CSXPropertyValue $_ 'exitCode'
+                timedOut = [bool](Get-CSXPropertyValue $_ 'timedOut' $false)
                 exitVerified = [bool](Get-CSXPropertyValue $_ 'exitVerified' $false)
                 terminationRequested = [bool](Get-CSXPropertyValue $_ 'terminationRequested' $false)
                 terminationConfirmed = [bool](Get-CSXPropertyValue $_ 'terminationConfirmed' $false)
                 unresolvedProcess = [bool](Get-CSXPropertyValue $_ 'unresolvedProcess' $false)
                 streamDrainComplete = [bool](Get-CSXPropertyValue $_ 'streamDrainComplete' $false)
                 inputCompleted = [bool](Get-CSXPropertyValue $_ 'inputCompleted' $false)
+                startedUtc = Get-CSXPropertyValue $_ 'startedUtc'
+                completedUtc = Get-CSXPropertyValue $_ 'completedUtc'
+                durationMs = Get-CSXPropertyValue $_ 'durationMs'
                 terminationErrors = @((Get-CSXPropertyValue $_ 'terminationErrors' @()))
                 errors = @((Get-CSXPropertyValue $_ 'errors' @()))
             }
         })
     }
+}
+
+function New-CSXProviderDeadlineCustodyEvidence {
+    param(
+        [Parameter(Mandatory)][object[]]$Passes,
+        [Parameter(Mandatory)]$Preflight,
+        [Parameter(Mandatory)][string]$Reason
+    )
+    $passList = @($Passes)
+    if ($passList.Count -ne 2) { throw 'Deadline custody projection requires exactly two presentation passes.' }
+    $completedUtc = [DateTimeOffset]::UtcNow.ToString('o')
+    $batches = [Collections.Generic.List[object]]::new()
+    foreach ($pass in $passList) {
+        $presentationPass = [int](Get-CSXPropertyValue $pass 'presentationPass' 0)
+        $passBatches = @(Get-CSXPropertyValue $pass 'batches' @())
+        if ($presentationPass -notin @(1, 2) -or $passBatches.Count -ne 3) {
+            throw 'Deadline custody projection requires three batches in each numbered presentation pass.'
+        }
+        foreach ($batch in $passBatches) {
+            $replicate = [int](Get-CSXPropertyValue $batch 'replicate' 0)
+            if ($replicate -notin @(1, 2, 3)) {
+                throw 'Deadline custody projection requires replicate identities 1 through 3.'
+            }
+            $batches.Add([pscustomobject][ordered]@{
+                presentationPass = $presentationPass
+                replicate = $replicate
+                ok = $false
+                status = 'not_started_deadline'
+                launched = $false
+                processId = $null
+                exitCode = $null
+                timedOut = $true
+                exitVerified = $false
+                terminationRequested = $false
+                terminationConfirmed = $false
+                unresolvedProcess = $false
+                streamDrainComplete = $false
+                inputCompleted = $false
+                terminationErrors = @()
+                startedUtc = $null
+                completedUtc = $completedUtc
+                durationMs = 0
+                errors = @($Reason)
+            })
+        }
+    }
+    $identities = @($batches | ForEach-Object { "$($_.presentationPass):$($_.replicate)" } | Sort-Object -Unique)
+    if ($identities.Count -ne 6) { throw 'Deadline custody projection batch identities are incomplete or duplicated.' }
+    return New-CSXProviderCustodyEvidence ([pscustomobject][ordered]@{
+        provider = 'codex_cli'
+        model = [string](Get-CSXPropertyValue $Preflight 'model')
+        preflight = $Preflight
+        deadlineReached = $true
+        errors = @($Reason)
+        batches = @($batches)
+    })
 }
 
 function Complete-CSXSealedQualification {
@@ -5048,6 +5109,11 @@ function Complete-CSXSealedQualification {
         [scriptblock]$CompletionCommitter = {
             param($StagedPath, $DestinationPath)
             Move-Item -LiteralPath $StagedPath -Destination $DestinationPath
+        },
+        [scriptblock]$CompletionValidator = {
+            param($EvidenceRoot, $ExpectedRunId, $ReceiptPath)
+            Test-CSXQualificationCompletionReceipt -EvidenceRoot $EvidenceRoot `
+                -ExpectedRunId $ExpectedRunId -CompletionPath $ReceiptPath
         }
     )
     $root = [IO.Path]::GetFullPath($EvidenceDirectory)
@@ -5082,11 +5148,12 @@ function Complete-CSXSealedQualification {
     $CompletionReceipt.rawSha256 = Get-CSXFileSha256 (Join-Path $root ([string]$CompletionReceipt.rawPath))
     $CompletionReceipt.visualReviewSha256 = Get-CSXFileSha256 (Join-Path $root ([string]$CompletionReceipt.visualReviewPath))
 
-    $stagedCompletionPath = Join-Path $root ".qualification-completion.pending-$([guid]::NewGuid().ToString('N')).json"
+    $terminalId = [guid]::NewGuid().ToString('N')
+    $stagedCompletionPath = Join-Path $root ".qualification-completion.pending-$terminalId.json"
+    $committedCompletionPath = Join-Path $root ".qualification-completion.committed-$terminalId.json"
     try {
         Write-CSXJsonFile -Path $stagedCompletionPath -Value $CompletionReceipt | Out-Null
-        $stagedValidation = Test-CSXQualificationCompletionReceipt -EvidenceRoot $root `
-            -ExpectedRunId ([string]$CompletionReceipt.runId) -CompletionPath $stagedCompletionPath
+        $stagedValidation = & $CompletionValidator $root ([string]$CompletionReceipt.runId) $stagedCompletionPath
         if (-not $stagedValidation.ok) {
             throw "The staged qualification completion receipt is invalid: $(@($stagedValidation.errors) -join ' | ')"
         }
@@ -5101,8 +5168,7 @@ function Complete-CSXSealedQualification {
             throw 'The mandatory sealed-result validation crossed its complete invocation or evidence-finalization deadline before terminal commit.'
         }
         Write-CSXJsonFile -Path $stagedCompletionPath -Value $CompletionReceipt | Out-Null
-        $stagedValidation = Test-CSXQualificationCompletionReceipt -EvidenceRoot $root `
-            -ExpectedRunId ([string]$CompletionReceipt.runId) -CompletionPath $stagedCompletionPath
+        $stagedValidation = & $CompletionValidator $root ([string]$CompletionReceipt.runId) $stagedCompletionPath
         if (-not $stagedValidation.ok) {
             throw "The final staged qualification completion receipt is invalid: $(@($stagedValidation.errors) -join ' | ')"
         }
@@ -5112,16 +5178,25 @@ function Complete-CSXSealedQualification {
             ($ResultDeadlineUtc - [DateTimeOffset]::UtcNow).TotalMilliseconds -lt $commitReserveMs) {
             throw 'The qualification completion receipt cannot be committed inside the reserved terminal-publication budget.'
         }
-        & $CompletionCommitter $stagedCompletionPath $completionFullPath
-        $committedValidation = Test-CSXQualificationCompletionReceipt -EvidenceRoot $root `
-            -ExpectedRunId ([string]$CompletionReceipt.runId) -CompletionPath $completionFullPath
+        & $CompletionCommitter $stagedCompletionPath $committedCompletionPath
+        $committedValidation = & $CompletionValidator $root ([string]$CompletionReceipt.runId) $committedCompletionPath
         if (-not $committedValidation.ok) {
             throw "The committed qualification completion receipt is invalid: $(@($committedValidation.errors) -join ' | ')"
         }
+        $terminalFinalizationElapsedMs = [Math]::Round($FinalizationWatch.Elapsed.TotalMilliseconds, 3)
+        if ($InvocationWatch.Elapsed.TotalMilliseconds -gt $EndToEndBudgetMs -or
+            $terminalFinalizationElapsedMs -gt $FinalizationBudgetMs -or
+            [DateTimeOffset]::UtcNow -gt $ResultDeadlineUtc) {
+            throw 'The committed qualification completion receipt crossed its complete invocation or evidence-finalization deadline before public acceptance.'
+        }
+        Move-Item -LiteralPath $committedCompletionPath -Destination $completionFullPath
     }
     finally {
         if (Test-Path -LiteralPath $stagedCompletionPath -PathType Leaf) {
             Remove-Item -LiteralPath $stagedCompletionPath -Force
+        }
+        if (Test-Path -LiteralPath $committedCompletionPath -PathType Leaf) {
+            Remove-Item -LiteralPath $committedCompletionPath -Force
         }
     }
     return [pscustomobject][ordered]@{
@@ -5141,4 +5216,4 @@ Export-ModuleMember -Function Assert-CSXProtocol, Get-CSXQualificationProtocol, 
     New-CSXAutomatedVisualPromptText, New-CSXAutomatedVisualReview, Test-CSXAutomatedVisualReviewEvidence,
     Test-CSXVisualReview, Test-CSXFlattenedBaselineVisualReview,
     Test-CSXJsonIdentity, Test-CSXAutomationArtifactInventory, Test-CSXProducerArtifactEvidence, Test-CSXVisualArtifactEvidence,
-    Test-CSXQualificationCompletionReceipt, Test-CSXFinalizerEnvelope, Update-CSXQualificationReport, New-CSXProviderCustodyEvidence, Complete-CSXSealedQualification
+    Test-CSXQualificationCompletionReceipt, Test-CSXFinalizerEnvelope, Update-CSXQualificationReport, New-CSXProviderCustodyEvidence, New-CSXProviderDeadlineCustodyEvidence, Complete-CSXSealedQualification
