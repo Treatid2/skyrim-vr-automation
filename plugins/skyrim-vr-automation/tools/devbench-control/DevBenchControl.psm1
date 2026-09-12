@@ -176,46 +176,69 @@ function Get-DevBenchCallSemanticStatus {
     )
 
     $semantic = Get-DevBenchSemanticStatus -Content $Content
-    if ($semantic.known) { return $semantic }
     $payloads = @($Content)
+    if ($ToolName -eq 'game' -and $Arguments.Contains('action') -and [string]$Arguments['action'] -eq 'load') {
+        $reasons = [Collections.Generic.List[string]]::new()
+        if ($semantic.known -and -not $semantic.ok) {
+            foreach ($reason in @($semantic.reasons)) { $reasons.Add([string]$reason) }
+        }
+        $requestedName = if ($Arguments.Contains('name')) {
+            [string]$Arguments['name']
+        } else { '' }
+        if ([string]::IsNullOrWhiteSpace($requestedName)) {
+            $reasons.Add('request.name is required for an exact load receipt')
+        }
+        $payload = if ($payloads.Count -eq 1 -and $null -ne $payloads[0] -and
+            $payloads[0] -isnot [string] -and $payloads[0] -isnot [ValueType]) {
+            $payloads[0]
+        } else {
+            $reasons.Add('content must contain exactly one structured load receipt')
+            $null
+        }
+        if ($payload) {
+            $actionProperty = $payload.PSObject.Properties['action']
+            $queuedProperty = $payload.PSObject.Properties['queued']
+            $nameProperty = $payload.PSObject.Properties['name']
+            if (-not $actionProperty -or [string]$actionProperty.Value -cne 'load') {
+                $reasons.Add('content.action is not the exact load action')
+            }
+            if (-not $queuedProperty -or $queuedProperty.Value -isnot [bool] -or
+                -not [bool]$queuedProperty.Value) {
+                $reasons.Add('content.queued is not Boolean true')
+            }
+            if (-not $nameProperty -or [string]::IsNullOrWhiteSpace([string]$nameProperty.Value) -or
+                [string]$nameProperty.Value -cne $requestedName) {
+                $reasons.Add('content.name does not match the requested save')
+            }
+            foreach ($errorName in @('error', 'errors')) {
+                $errorProperty = $payload.PSObject.Properties[$errorName]
+                if ($errorProperty -and $null -ne $errorProperty.Value -and
+                    @($errorProperty.Value).Count -gt 0 -and
+                    -not [string]::IsNullOrWhiteSpace([string]$errorProperty.Value)) {
+                    $reasons.Add("content.$errorName contains failure evidence")
+                }
+            }
+        }
+        return [pscustomobject][ordered]@{
+            known = $true
+            ok = $reasons.Count -eq 0
+            outcome = if ($reasons.Count -eq 0) { 'game-load-dispatch-queued' } else { 'game-load-dispatch-rejected' }
+            completionBasis = 'dispatch-only'
+            guarded = [bool]$semantic.guarded
+            transient = [bool]$semantic.transient
+            codes = @($semantic.codes)
+            states = @($semantic.states)
+            reasons = @($reasons | Select-Object -Unique)
+            schedulerOnly = $false
+            schedulerReceiptPaths = @()
+            explicitOutcomeEvidence = @('content.action', 'content.queued', 'content.name')
+        }
+    }
+    if ($semantic.known) { return $semantic }
     if ($payloads.Count -ne 1 -or $null -eq $payloads[0] -or $payloads[0] -is [string] -or $payloads[0] -is [ValueType]) {
         return $semantic
     }
     $payload = $payloads[0]
-
-    if ($ToolName -eq 'game' -and $Arguments.Contains('action') -and [string]$Arguments['action'] -eq 'load') {
-        $actionProperty = $payload.PSObject.Properties['action']
-        $queuedProperty = $payload.PSObject.Properties['queued']
-        if ($actionProperty -and $queuedProperty) {
-            $reasons = [Collections.Generic.List[string]]::new()
-            if ([string]$actionProperty.Value -cne 'load') {
-                $reasons.Add("content.action is '$($actionProperty.Value)', expected 'load'")
-            }
-            if ($queuedProperty.Value -isnot [bool] -or -not [bool]$queuedProperty.Value) {
-                $reasons.Add('content.queued is not true')
-            }
-            if ($Arguments.Contains('name')) {
-                $nameProperty = $payload.PSObject.Properties['name']
-                if (-not $nameProperty -or [string]$nameProperty.Value -cne [string]$Arguments['name']) {
-                    $reasons.Add('content.name does not match the requested save')
-                }
-            }
-            return [pscustomobject][ordered]@{
-                known = $true
-                ok = $reasons.Count -eq 0
-                outcome = if ($reasons.Count -eq 0) { 'game-load-dispatch-queued' } else { 'game-load-dispatch-rejected' }
-                completionBasis = 'dispatch-only'
-                guarded = $false
-                transient = $false
-                codes = @()
-                states = @()
-                reasons = @($reasons)
-                schedulerOnly = $false
-                schedulerReceiptPaths = @()
-                explicitOutcomeEvidence = @('content.action', 'content.queued', 'content.name')
-            }
-        }
-    }
 
     if ($ToolName -eq 'record' -and $Arguments.Contains('action') -and [string]$Arguments['action'] -eq 'start') {
         $actionProperty = $payload.PSObject.Properties['action']

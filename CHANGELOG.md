@@ -6,6 +6,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 - Raise the bounded MO2 workspace profile traversal default to 100,000 files
   so the maintained MGO profile no longer requires a per-call override.
+- Make DevBench game-load dispatch and render-map planning fail closed on
+  inexact receipts, failed or unbound registries, malformed numeric bounds,
+  missing scope estimates, and post-publication receipt-finalization faults.
 - Enforce MO2 `SteamVRNull` admission inside null-HMD `apply` and `start`, bind
   the exact lease, profile, and provider inventory into the transaction
   receipt, and route-shape fresh SteamVR task clones so inherited OCU providers

@@ -65,6 +65,20 @@ $loadMismatch = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ acti
 Assert-Test ($loadMismatch.known -and -not $loadMismatch.ok -and $loadMismatch.outcome -eq 'game-load-dispatch-rejected') 'game load rejects a queued receipt for a different save'
 $loadNotQueued = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ action = 'load'; name = 'Save-1'; queued = $false })
 Assert-Test ($loadNotQueued.known -and -not $loadNotQueued.ok) 'game load never promotes a non-queued receipt'
+$loadGenericSuccess = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ ok = $true; action = 'load'; name = 'Save-1'; queued = $true })
+Assert-Test ($loadGenericSuccess.ok -and $loadGenericSuccess.outcome -eq 'game-load-dispatch-queued' -and $loadGenericSuccess.completionBasis -eq 'dispatch-only') 'generic success metadata cannot bypass or replace the exact load receipt classification'
+$loadGenericMismatch = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ success = $true; action = 'load'; name = 'Save-2'; queued = $true })
+Assert-Test (-not $loadGenericMismatch.ok -and $loadGenericMismatch.outcome -eq 'game-load-dispatch-rejected') 'generic success metadata cannot promote a mismatched save receipt'
+$loadWrongAction = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ ok = $true; action = 'save'; name = 'Save-1'; queued = $true })
+Assert-Test (-not $loadWrongAction.ok) 'game load rejects a generic-success receipt for the wrong action'
+$loadTypedQueue = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ ok = $true; action = 'load'; name = 'Save-1'; queued = 1 })
+Assert-Test (-not $loadTypedQueue.ok) 'game load requires Boolean true queue evidence'
+$loadMissingRequestName = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load' } -Content @([pscustomobject]@{ ok = $true; action = 'load'; name = 'Save-1'; queued = $true })
+Assert-Test (-not $loadMissingRequestName.ok) 'game load requires a nonempty requested save identity'
+$loadScalarError = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ ok = $true; action = 'load'; name = 'Save-1'; queued = $true; error = 'queue rejected' })
+Assert-Test (-not $loadScalarError.ok) 'game load preserves contradictory scalar error evidence'
+$loadMultiple = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ ok = $true; action = 'load'; name = 'Save-1'; queued = $true }, [pscustomobject]@{ ok = $true })
+Assert-Test (-not $loadMultiple.ok) 'game load requires exactly one structured receipt even with generic success metadata'
 $readFailure = Get-DevBenchCallSemanticStatus -ToolName inspect -Arguments @{ kind = 'state' } -Content @([pscustomobject]@{ error = 'main thread busy' })
 Assert-Test ($readFailure.known -and -not $readFailure.ok -and $readFailure.outcome -eq 'read-contract-failed') 'read-only adapters never promote a structured error to success'
 $incompleteMenu = Get-DevBenchCallSemanticStatus -ToolName menu -Arguments @{ action = 'list' } -Content @([pscustomobject]@{ openMenus = @() })
@@ -77,7 +91,9 @@ try {
     $workloadPath = Join-Path $planFixture 'workload.json'
     $planPath = Join-Path $planFixture 'plan.json'
     [pscustomobject]@{
+        ok = $true
         result = [pscustomobject]@{
+            service = 'communityshaders.render_map'
             major = 1
             defaults = [pscustomobject]@{ fixedCatalogueBytes = 1000 }
             limits = [pscustomobject]@{
@@ -93,14 +109,145 @@ try {
         expectedDurationMs = 1000; expectedFrames = 4; expectedEvents = 100; expectedEventBytes = 10000; expectedScopeDepth = 3
         expectedObservations = [pscustomobject]@{ geometry = 10; materialState = 10; resource = 10; sceneObject = 10; shader = 10; stageShader = 10; targetBinding = 10; targetView = 10 }
     } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $workloadPath -Encoding utf8
-    $plan = & (Join-Path $PSScriptRoot 'New-CSXRenderMapCapturePlan.ps1') -RegistryPath $registryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId fixture-command -OutputPath $planPath -HeadroomFactor 2 -NoExit -Compact | ConvertFrom-Json
-    Assert-Test ($plan.ok -and $plan.arguments.maxEvents -eq 200 -and $plan.arguments.maxBytes -eq 21000 -and (Test-Path -LiteralPath $plan.receiptPath -PathType Leaf)) 'render-map planner sizes every bound from workload plus headroom and retains a receipt'
+    $plannerPath = Join-Path $PSScriptRoot 'New-CSXRenderMapCapturePlan.ps1'
+    $plan = & $plannerPath -RegistryPath $registryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId fixture-command -OutputPath $planPath -HeadroomFactor 2 -NoExit -Compact | ConvertFrom-Json
+    $planReceipt = Get-Content -LiteralPath $plan.receiptPath -Raw | ConvertFrom-Json
+    Assert-Test ($plan.ok -and $plan.arguments.maxEvents -eq 200 -and $plan.arguments.maxBytes -eq 21000 -and (Test-Path -LiteralPath $plan.receiptPath -PathType Leaf) -and $planReceipt.service -eq 'communityshaders.render_map' -and $planReceipt.producerBuildId -eq 'fixture-build' -and $planReceipt.registrySha256 -eq (Get-FileHash -LiteralPath $registryPath -Algorithm SHA256).Hash) 'render-map planner sizes every bound from workload plus headroom and retains an exact registry-bound receipt'
+    $rawRegistryPath = Join-Path $planFixture 'raw-registry.json'
+    $rawRegistry = (Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json).result
+    $rawRegistry | Add-Member -NotePropertyName producerBuildId -NotePropertyValue 'fixture-build'
+    $rawRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $rawRegistryPath -Encoding utf8
+    $rawPlan = & $plannerPath -RegistryPath $rawRegistryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId raw-registry -OutputPath (Join-Path $planFixture 'raw-registry-plan.json') -NoExit -Compact | ConvertFrom-Json
+    Assert-Test ($rawPlan.ok -and $rawPlan.arguments.contractMajor -eq 1) 'explicit raw-registry mode requires and preserves service, contract, and producer provenance'
     $oversizedPath = Join-Path $planFixture 'oversized.json'
     $oversizedWorkload = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
     $oversizedWorkload.expectedEvents = 6000
     $oversizedWorkload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $oversizedPath -Encoding utf8
-    $refused = & (Join-Path $PSScriptRoot 'New-CSXRenderMapCapturePlan.ps1') -RegistryPath $registryPath -WorkloadPath $oversizedPath -ClientId fixture-client -CommandId oversized-command -OutputPath (Join-Path $planFixture 'oversized-plan.json') -HeadroomFactor 2 -NoExit -Compact | ConvertFrom-Json
+    $refused = & $plannerPath -RegistryPath $registryPath -WorkloadPath $oversizedPath -ClientId fixture-client -CommandId oversized-command -OutputPath (Join-Path $planFixture 'oversized-plan.json') -HeadroomFactor 2 -NoExit -Compact | ConvertFrom-Json
     Assert-Test (-not $refused.ok -and $null -eq $refused.arguments -and $refused.exceededCeilings.Count -ge 1) 'render-map planner refuses workload bounds beyond the live service ceilings'
+
+    $failedRegistryPath = Join-Path $planFixture 'failed-registry.json'
+    $failedRegistry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+    $failedRegistry.ok = $false
+    $failedRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $failedRegistryPath -Encoding utf8
+    $failedRegistryPlan = & $plannerPath -RegistryPath $failedRegistryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId failed-registry -OutputPath (Join-Path $planFixture 'failed-registry-plan.json') -NoExit -Compact | ConvertFrom-Json
+    Assert-Test (-not $failedRegistryPlan.ok -and $null -eq $failedRegistryPlan.arguments -and -not $failedRegistryPlan.receiptPublished) 'render-map planner rejects explicit registry-envelope failure before issuing start arguments'
+    $innerFailurePath = Join-Path $planFixture 'inner-failed-registry.json'
+    $innerFailure = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+    $innerFailure.result | Add-Member -NotePropertyName failed -NotePropertyValue $true
+    $innerFailure | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $innerFailurePath -Encoding utf8
+    $innerFailurePlan = & $plannerPath -RegistryPath $innerFailurePath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId inner-failed-registry -OutputPath (Join-Path $planFixture 'inner-failed-registry-plan.json') -NoExit -Compact | ConvertFrom-Json
+    Assert-Test (-not $innerFailurePlan.ok -and $null -eq $innerFailurePlan.arguments -and -not $innerFailurePlan.receiptPublished) 'render-map planner preserves explicit inner registry failure before issuing start arguments'
+
+    foreach ($missingBinding in @('service', 'major', 'producerBuildId')) {
+        $bindingPath = Join-Path $planFixture "missing-$missingBinding-registry.json"
+        $bindingRegistry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+        if ($missingBinding -eq 'producerBuildId') {
+            $bindingRegistry.server.PSObject.Properties.Remove('buildId')
+        } else {
+            $bindingRegistry.result.PSObject.Properties.Remove($missingBinding)
+        }
+        $bindingRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $bindingPath -Encoding utf8
+        $bindingPlan = & $plannerPath -RegistryPath $bindingPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId "missing-$missingBinding" -OutputPath (Join-Path $planFixture "missing-$missingBinding-plan.json") -NoExit -Compact | ConvertFrom-Json
+        Assert-Test (-not $bindingPlan.ok -and $null -eq $bindingPlan.arguments) "render-map planner requires explicit registry $missingBinding binding"
+    }
+
+    foreach ($invalidScope in @($null, 0, -1, $true, 1.5)) {
+        $scopePath = Join-Path $planFixture "scope-$([guid]::NewGuid().ToString('N')).json"
+        $scopeWorkload = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
+        $scopeWorkload.expectedScopeDepth = $invalidScope
+        $scopeWorkload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $scopePath -Encoding utf8
+        $scopePlan = & $plannerPath -RegistryPath $registryPath -WorkloadPath $scopePath -ClientId fixture-client -CommandId invalid-scope -OutputPath "$scopePath.plan.json" -NoExit -Compact | ConvertFrom-Json
+        Assert-Test (-not $scopePlan.ok -and $null -eq $scopePlan.arguments) 'render-map planner rejects a missing or malformed explicit scope estimate'
+    }
+    $explicitOnePath = Join-Path $planFixture 'scope-one.json'
+    $explicitOne = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
+    $explicitOne.expectedScopeDepth = 1
+    $explicitOne | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $explicitOnePath -Encoding utf8
+    $explicitOnePlan = & $plannerPath -RegistryPath $registryPath -WorkloadPath $explicitOnePath -ClientId fixture-client -CommandId explicit-one -OutputPath (Join-Path $planFixture 'scope-one-plan.json') -NoExit -Compact | ConvertFrom-Json
+    Assert-Test ($explicitOnePlan.ok -and $explicitOnePlan.arguments.maxScopeDepth -eq 2) 'render-map planner accepts an explicitly stated scope depth of one'
+
+    foreach ($invalidCase in @(
+            [pscustomobject]@{ area = 'workload'; property = 'expectedEvents'; value = $true },
+            [pscustomobject]@{ area = 'workload'; property = 'expectedFrames'; value = 1.5 },
+            [pscustomobject]@{ area = 'limit'; property = 'maximumEvents'; value = $true },
+            [pscustomobject]@{ area = 'limit'; property = 'maximumFrames'; value = 1.5 },
+            [pscustomobject]@{ area = 'default'; property = 'fixedCatalogueBytes'; value = 1.5 }
+        )) {
+        $invalidRegistryPath = $registryPath
+        $invalidWorkloadPath = $workloadPath
+        if ($invalidCase.area -eq 'workload') {
+            $invalidWorkloadPath = Join-Path $planFixture "invalid-$($invalidCase.property).json"
+            $invalidWorkload = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
+            $invalidWorkload.($invalidCase.property) = $invalidCase.value
+            $invalidWorkload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $invalidWorkloadPath -Encoding utf8
+        } else {
+            $invalidRegistryPath = Join-Path $planFixture "invalid-$($invalidCase.property)-registry.json"
+            $invalidRegistry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+            if ($invalidCase.area -eq 'limit') {
+                $invalidRegistry.result.limits.($invalidCase.property) = $invalidCase.value
+            } else {
+                $invalidRegistry.result.defaults.($invalidCase.property) = $invalidCase.value
+            }
+            $invalidRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $invalidRegistryPath -Encoding utf8
+        }
+        $invalidPlan = & $plannerPath -RegistryPath $invalidRegistryPath -WorkloadPath $invalidWorkloadPath -ClientId fixture-client -CommandId "invalid-$($invalidCase.property)" -OutputPath (Join-Path $planFixture "invalid-$($invalidCase.property)-plan.json") -NoExit -Compact | ConvertFrom-Json
+        Assert-Test (-not $invalidPlan.ok -and $null -eq $invalidPlan.arguments) "render-map planner rejects malformed positive-integer field $($invalidCase.property)"
+    }
+
+    $allWorkloadNumbers = @('expectedDurationMs', 'expectedFrames', 'expectedEvents', 'expectedEventBytes', 'expectedScopeDepth')
+    $allObservationNumbers = @('geometry', 'materialState', 'resource', 'sceneObject', 'shader', 'stageShader', 'targetBinding', 'targetView')
+    foreach ($property in $allWorkloadNumbers + $allObservationNumbers) {
+        foreach ($badValue in @($true, 1.5)) {
+            $invalidWorkloadPath = Join-Path $planFixture "all-workload-$property-$([guid]::NewGuid().ToString('N')).json"
+            $invalidWorkload = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
+            if ($property -in $allObservationNumbers) {
+                $invalidWorkload.expectedObservations.$property = $badValue
+            } else {
+                $invalidWorkload.$property = $badValue
+            }
+            $invalidWorkload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $invalidWorkloadPath -Encoding utf8
+            $invalidPlan = & $plannerPath -RegistryPath $registryPath -WorkloadPath $invalidWorkloadPath -ClientId fixture-client -CommandId all-workload-invalid -OutputPath "$invalidWorkloadPath.plan.json" -NoExit -Compact | ConvertFrom-Json
+            Assert-Test (-not $invalidPlan.ok -and $null -eq $invalidPlan.arguments) "render-map planner rejects Boolean and fractional workload field $property"
+        }
+    }
+    $allLimitNumbers = @(
+        'maximumBytes', 'maximumDurationMs', 'maximumEvents', 'maximumFrames',
+        'maximumScopeDepth', 'maximumGeometryObservations',
+        'maximumMaterialStateObservations', 'maximumResourceObservations',
+        'maximumSceneObjectObservations', 'maximumShaderObservations',
+        'maximumStageShaderObservations', 'maximumTargetBindingObservations',
+        'maximumTargetViewObservations'
+    )
+    foreach ($property in $allLimitNumbers) {
+        foreach ($badValue in @($true, 1.5)) {
+            $invalidRegistryPath = Join-Path $planFixture "all-limit-$property-$([guid]::NewGuid().ToString('N')).json"
+            $invalidRegistry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+            $invalidRegistry.result.limits.$property = $badValue
+            $invalidRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $invalidRegistryPath -Encoding utf8
+            $invalidPlan = & $plannerPath -RegistryPath $invalidRegistryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId all-limit-invalid -OutputPath "$invalidRegistryPath.plan.json" -NoExit -Compact | ConvertFrom-Json
+            Assert-Test (-not $invalidPlan.ok -and $null -eq $invalidPlan.arguments) "render-map planner rejects Boolean and fractional registry ceiling $property"
+        }
+    }
+    foreach ($badValue in @($true, 1.5)) {
+        $invalidDefaultPath = Join-Path $planFixture "all-default-$([guid]::NewGuid().ToString('N')).json"
+        $invalidDefault = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+        $invalidDefault.result.defaults.fixedCatalogueBytes = $badValue
+        $invalidDefault | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $invalidDefaultPath -Encoding utf8
+        $invalidPlan = & $plannerPath -RegistryPath $invalidDefaultPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId all-default-invalid -OutputPath "$invalidDefaultPath.plan.json" -NoExit -Compact | ConvertFrom-Json
+        Assert-Test (-not $invalidPlan.ok -and $null -eq $invalidPlan.arguments) 'render-map planner rejects Boolean and fractional fixed catalogue allocation'
+    }
+
+    $overflowPath = Join-Path $planFixture 'overflow-workload.json'
+    $overflowWorkload = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
+    $overflowWorkload.expectedEvents = [long]::MaxValue
+    $overflowWorkload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $overflowPath -Encoding utf8
+    $overflowPlan = & $plannerPath -RegistryPath $registryPath -WorkloadPath $overflowPath -ClientId fixture-client -CommandId overflow -OutputPath (Join-Path $planFixture 'overflow-plan.json') -NoExit -Compact | ConvertFrom-Json
+    Assert-Test (-not $overflowPlan.ok -and $null -eq $overflowPlan.arguments) 'render-map planner rejects headroom arithmetic beyond its 64-bit bound'
+
+    $hashFailurePath = Join-Path $planFixture 'hash-failure-plan.json'
+    $hashFailure = & $plannerPath -RegistryPath $registryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId hash-failure -OutputPath $hashFailurePath -InternalTestFailurePoint receipt-hash -NoExit -Compact | ConvertFrom-Json
+    Assert-Test (-not $hashFailure.ok -and $hashFailure.state -eq 'plan-finalization-error' -and $hashFailure.receiptPublished -and $hashFailure.receiptPath -eq $hashFailurePath -and $null -eq $hashFailure.receiptSha256 -and $null -eq $hashFailure.arguments -and (Test-Path -LiteralPath $hashFailurePath -PathType Leaf)) 'post-publication hash failure preserves the immutable receipt path without issuing arguments'
 }
 finally {
     if (Test-Path -LiteralPath $planFixture) { Remove-Item -LiteralPath $planFixture -Recurse -Force }
