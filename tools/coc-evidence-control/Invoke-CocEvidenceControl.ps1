@@ -15,7 +15,7 @@ param(
     [ValidateRange(0, [int]::MaxValue)][int]$TargetPid = 0,
     [ValidateRange(1, 2048)][int]$MinimumFreeGiB = 100,
     [ValidateRange(10, 300)][int]$CaptureTimeoutSeconds = 120,
-    [ValidateSet('none', 'stop-before-termination', 'cancel-identity-unavailable')]
+    [ValidateSet('none', 'stop-before-termination', 'cancel-identity-unavailable', 'monitor-identity-unavailable')]
     [string]$InternalTestFailurePoint = 'none',
     [switch]$Compact,
     [switch]$NoExit
@@ -342,22 +342,24 @@ function Get-OwnedCancellation($State) {
     return $null
 }
 
-function Resolve-OwnedCancellation($State) {
-    if (-not $State.PSObject.Properties['cancelState'] -or
-        [string]$State.cancelState -ne 'cleanup-incomplete') {
-        return [pscustomobject]@{ state = 'not-pending'; process = $null }
-    }
-    $pidValue = $State.PSObject.Properties['cancelPid']
-    $startedValue = $State.PSObject.Properties['cancelStartedUtc']
+function Resolve-RecordedProcess(
+    $State,
+    [string]$PidProperty,
+    [string]$StartedProperty,
+    [string]$UnavailableFailurePoint = ''
+) {
+    $pidValue = $State.PSObject.Properties[$PidProperty]
+    $startedValue = $State.PSObject.Properties[$StartedProperty]
     $hasPid = $pidValue -and $null -ne $pidValue.Value
     $hasStarted = $startedValue -and $null -ne $startedValue.Value
     if (-not $hasPid -and -not $hasStarted) {
-        return [pscustomobject]@{ state = 'not-pending'; process = $null }
+        return [pscustomobject]@{ state = 'not-recorded'; process = $null }
     }
-    if (-not $hasPid -or -not $hasStarted) {
+    if (-not $hasPid) {
         return [pscustomobject]@{ state = 'unresolved'; process = $null }
     }
-    if ($InternalTestFailurePoint -eq 'cancel-identity-unavailable') {
+    if (-not [string]::IsNullOrWhiteSpace($UnavailableFailurePoint) -and
+        $InternalTestFailurePoint -eq $UnavailableFailurePoint) {
         return [pscustomobject]@{ state = 'unresolved'; process = $null }
     }
     try {
@@ -368,6 +370,9 @@ function Resolve-OwnedCancellation($State) {
     }
     if (-not $process) {
         return [pscustomobject]@{ state = 'absent'; process = $null }
+    }
+    if (-not $hasStarted) {
+        return [pscustomobject]@{ state = 'unresolved'; process = $null }
     }
     try {
         $expectedValue = $startedValue.Value
@@ -391,6 +396,19 @@ function Resolve-OwnedCancellation($State) {
         return [pscustomobject]@{ state = 'replaced'; process = $null }
     }
     return [pscustomobject]@{ state = 'owned'; process = $process }
+}
+
+function Resolve-OwnedCancellation($State) {
+    if (-not $State.PSObject.Properties['cancelState'] -or
+        [string]$State.cancelState -ne 'cleanup-incomplete') {
+        return [pscustomobject]@{ state = 'not-pending'; process = $null }
+    }
+    $resolution = Resolve-RecordedProcess $State 'cancelPid' 'cancelStartedUtc' `
+        'cancel-identity-unavailable'
+    if ($resolution.state -eq 'not-recorded') {
+        return [pscustomobject]@{ state = 'not-pending'; process = $null }
+    }
+    return $resolution
 }
 
 function Get-OwnedTarget($State) {
@@ -1001,9 +1019,28 @@ try {
     }
     else {
         $owned = Read-OwnedState
-        $monitor = Get-OwnedMonitor $owned.data
-        $capture = Get-OwnedHangCapture $owned.data
-        $procDumpCapture = Get-OwnedProcDumpCapture $owned.data
+        $monitorResolution = Resolve-RecordedProcess $owned.data 'monitorPid' `
+            'monitorStartedUtc' 'monitor-identity-unavailable'
+        $monitor = if ($monitorResolution.state -eq 'owned') {
+            $monitorResolution.process
+        } else { $null }
+        $capturePending = $owned.data.PSObject.Properties['captureState'] -and
+            [string]$owned.data.captureState -in @(
+                'capture-running', 'hash-pending', 'capture-cleanup-incomplete'
+            )
+        $captureResolution = if ($capturePending) {
+            Resolve-RecordedProcess $owned.data 'capturePid' 'captureStartedUtc'
+        } else { [pscustomobject]@{ state = 'not-pending'; process = $null } }
+        $capture = if ($captureResolution.state -eq 'owned') {
+            $captureResolution.process
+        } else { $null }
+        $procDumpCaptureResolution = if ($capturePending) {
+            Resolve-RecordedProcess $owned.data 'captureProcDumpPid' `
+                'captureProcDumpStartedUtc'
+        } else { [pscustomobject]@{ state = 'not-pending'; process = $null } }
+        $procDumpCapture = if ($procDumpCaptureResolution.state -eq 'owned') {
+            $procDumpCaptureResolution.process
+        } else { $null }
         $cancellationResolution = Resolve-OwnedCancellation $owned.data
         $cancellation = $cancellationResolution.process
         if ($cancellationResolution.state -eq 'unresolved') {
@@ -1069,10 +1106,19 @@ try {
         } elseif ($cancel.PSObject.Properties['cancelStartedUtc']) {
             $cancel.cancelStartedUtc
         } else { $null }
+        $unresolvedProcessKinds = if ($processKind -eq 'cancellation-helper') {
+            @(
+                if ($monitorResolution.state -eq 'unresolved') { 'crash-monitor' }
+                if ($captureResolution.state -eq 'unresolved') { 'hang-capture-worker' }
+                if ($procDumpCaptureResolution.state -eq 'unresolved') {
+                    'hang-capture-procdump'
+                }
+            )
+        } else { @() }
         $otherOwnedProcessAlive = if ($processKind -eq 'cancellation-helper') {
             @($monitor, $capture, $procDumpCapture | Where-Object {
                 $null -ne $_ -and -not $_.HasExited
-            }).Count -gt 0
+            }).Count -gt 0 -or @($unresolvedProcessKinds).Count -gt 0
         } else { $false }
         $stopped = $selectedStopped -and -not $otherOwnedProcessAlive
         $owned.data | Add-Member -NotePropertyName cancelPid `
@@ -1120,6 +1166,7 @@ try {
                 target = $stopOutcome.target
                 captureDirectory = [string]$owned.data.captureDirectory
                 cleanup = $cancel
+                unresolvedProcessKinds = @($unresolvedProcessKinds)
             }
         }
     }
