@@ -1608,7 +1608,8 @@ async function runRenderScaleTuningLive(context) {
 
     function updateTraceOwnership(entries, ownerState) {
         const started = traceSession(entries.get("dlss-trace-start"));
-        if (started.present && started.id !== null && started.active === true) {
+        if (started.present && Number.isSafeInteger(started.id) && started.id >= 1 &&
+            started.active === true) {
             ownerState.trace = {
                 proven: true,
                 sessionId: started.id,
@@ -1666,6 +1667,7 @@ async function runRenderScaleTuningLive(context) {
 
         const pages = [];
         let afterSequence = 0;
+        let latestSequence = null;
         for (let pageNumber = 1; pageNumber <= 4096; pageNumber += 1) {
             const readResult = await renderScale({
                 action: "dlss_trace_read",
@@ -1689,12 +1691,24 @@ async function runRenderScaleTuningLive(context) {
                 capture.limit > matrix.traceReadLimit ||
                 capture.records.length > capture.limit ||
                 typeof capture.moreAvailable !== "boolean" ||
+                !Number.isSafeInteger(capture.latestSequence) ||
+                capture.latestSequence < 0 ||
                 capture.requestedSequenceOverwritten !== false) {
                 throw diagnosticError("trace_page_invalid", {
+                    reason: "trace_page_invalid",
                     pageNumber, expectedSessionId: owner.sessionId,
                     afterSequence,
                 });
             }
+            if (latestSequence !== null &&
+                capture.latestSequence !== latestSequence) {
+                throw diagnosticError("trace_closed_window_changed", {
+                    reason: "trace_closed_window_changed",
+                    pageNumber, expectedLatestSequence: latestSequence,
+                    observedLatestSequence: capture.latestSequence,
+                });
+            }
+            latestSequence = capture.latestSequence;
             let expectedSequence = afterSequence + 1;
             for (const record of capture.records) {
                 if (traceRecordSequence(record) !== expectedSequence) {
@@ -1830,6 +1844,8 @@ async function runRenderScaleTuningLive(context) {
                         projection,
                         traceReset: entries.get("dlss-trace-reset") || null,
                         traceStart: entries.get("dlss-trace-start") || null,
+                        cpuAcquisition: row.ordinal === 1 ?
+                            entries.get("qualification-dispatch") || null : null,
                         traceCollectionFailure: error && error.diagnostic || {
                             reason: error.message || String(error),
                         },
@@ -1860,6 +1876,8 @@ async function runRenderScaleTuningLive(context) {
                 traceRead: traceEvidence && traceEvidence.traceRead ||
                     entries.get("dlss-trace-read") || null,
                 tracePages: traceEvidence && traceEvidence.tracePages || null,
+                cpuAcquisition: row.ordinal === 1 ?
+                    entries.get("qualification-dispatch") || null : null,
                 cpuOwnership,
             };
             retain(retainedKey, retained);
@@ -1947,9 +1965,16 @@ async function runRenderScaleTuningLive(context) {
             if (!evidence.before.present || evidence.before.active === null) {
                 throw new Error("trace_cleanup_status_missing");
             }
+            const startedIdentityValid = Boolean(startReceipt &&
+                startReceipt.action === "dlss_trace_start" &&
+                startReceipt.producer && startReceipt.producer.buildId === buildId &&
+                started.present && started.active === true &&
+                Number.isSafeInteger(started.id) && started.id >= 1);
+            if (startReceipt && !startedIdentityValid) {
+                throw new Error("trace_cleanup_owner_unproven");
+            }
             if (evidence.before.active === true) {
-                if (!started.present || started.active !== true ||
-                    started.id === null || evidence.before.id !== started.id) {
+                if (!startedIdentityValid || evidence.before.id !== started.id) {
                     throw new Error("trace_cleanup_owner_mismatch");
                 }
                 const stopResult = await renderScale({
@@ -1966,7 +1991,7 @@ async function runRenderScaleTuningLive(context) {
             retain(`${receiptKey}:status-after`, afterResult.envelope);
             evidence.after = traceSession(afterResult.root);
             if (!evidence.after.present || evidence.after.active !== false ||
-                (started.id !== null && evidence.after.id !== started.id)) {
+                (startedIdentityValid && evidence.after.id !== started.id)) {
                 throw new Error("trace_cleanup_postcondition_active");
             }
             evidence.status = "CONFIRMED_INACTIVE";
@@ -2042,7 +2067,8 @@ async function runRenderScaleTuningLive(context) {
             const startReceipt = resultMap(response.root)
                 .get("amd-dlss-trace-start");
             const started = traceSession(startReceipt);
-            if (diagnostic && !(started.present && started.id !== null &&
+            if (diagnostic && !(started.present &&
+                Number.isSafeInteger(started.id) && started.id >= 1 &&
                 started.active === true)) {
                 return { status: "unsupported", receiptKey, diagnostic };
             }
@@ -2065,10 +2091,20 @@ async function runRenderScaleTuningLive(context) {
         const started = traceSession(startReceipt);
         if (!startReceipt || startReceipt.action !== "dlss_trace_start" ||
             !startReceipt.producer || startReceipt.producer.buildId !== buildId ||
-            !started.present || started.id === null || started.active !== true) {
-            throw diagnosticError("amd_trace_capability_owner_unproven", {
-                started,
-            });
+            !started.present || !Number.isSafeInteger(started.id) || started.id < 1 ||
+            started.active !== true) {
+            try {
+                await closeTraceAfterCapabilityFailure(
+                    `${receiptKey}:cleanup`, startReceipt);
+            } catch (cleanupError) {
+                throw diagnosticError("amd_trace_capability_cleanup_unresolved", {
+                    original: { reason: "amd_trace_capability_owner_unproven",
+                        started },
+                    cleanup: cleanupError && cleanupError.diagnostic ||
+                        cleanupError.message || String(cleanupError),
+                });
+            }
+            throw diagnosticError("amd_trace_capability_owner_unproven", { started });
         }
         const ownerState = { trace: { proven: true, sessionId: started.id,
             active: true, source: "amd-dlss-trace-start" } };

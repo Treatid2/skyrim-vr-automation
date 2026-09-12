@@ -186,6 +186,17 @@ function retained(boundary, violation, identity = {}, nonStable = false) {
     const ownerId = identity.ownerId || `${runId}-owner-${transitionId}`;
     return {
         variant: identity.variant || (runId.startsWith("amd-") ? "amd" : "nvidia"),
+        cpuAcquisition: {
+            action: "qualification_dispatch",
+            accepted: true,
+            transitionId,
+            ownerId,
+            producer: { buildId },
+            performanceTelemetry: {
+                started: true,
+                cpuPerformance: { active: true, sessionId: 11 },
+            },
+        },
         analysisSentinel: {
             falseValue: false,
             zeroValue: 0,
@@ -631,6 +642,28 @@ function createBaselineOnlyEvidenceRoot(variant) {
     return { root, runId, buildId };
 }
 
+function createPreBaselineEvidenceRoot() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "rst-finalizer-pre-baseline-"));
+    const runId = "amd-pre-baseline-run";
+    const buildId = "c".repeat(64);
+    writeJson(path.join(root, "raw", "live-result.json"), {
+        ok: false,
+        status: "INTERRUPTED",
+        variant: "amd",
+        runId,
+        traceCapability: null,
+        lanes: [],
+        error: "amd_trace_capability_cleanup_unresolved",
+        failure: {
+            original: { reason: "amd_trace_capability_owner_unproven" },
+            cleanup: { status: "UNRESOLVED",
+                reason: "trace_cleanup_owner_unproven" },
+        },
+    });
+    writeDeploymentVerification(root, buildId);
+    return { root, runId, buildId };
+}
+
 function testBaselineOnlyInterruptedFinalization() {
     for (const [variant, expectedRows] of [["nvidia", 66], ["amd", 186]]) {
         const evidence = createBaselineOnlyEvidenceRoot(variant);
@@ -669,6 +702,31 @@ function testBaselineOnlyInterruptedFinalization() {
         } finally {
             fs.rmSync(evidence.root, { recursive: true, force: true });
         }
+    }
+}
+
+function testPreBaselineInterruptedFinalization() {
+    const evidence = createPreBaselineEvidenceRoot();
+    try {
+        const options = { ...evidence, variant: "amd", expectedRows: 186,
+            generatedUtc: "2026-08-31T01:00:00.000Z" };
+        let result = finalizeEvidence(options);
+        assert(result.summary.assayExecution.status === "INTERRUPTED" &&
+            result.summary.assayExecution.transitionsDispatched === 0 &&
+            result.summary.assayExecution.interruption.phase === "pre_baseline" &&
+            result.summary.reporting.status === "INCOMPLETE" &&
+            result.summary.reporting.reasons.includes("pre_baseline_interrupted") &&
+            !result.summary.reporting.reasons.includes("baseline_only_interrupted"),
+        "A pre-baseline AMD interruption was not finalized distinctly.");
+        const outputs = ["report.md", "summary.json", "transitions.csv",
+            "evidence-values.csv", "receipt-index.json"];
+        const firstHashes = outputs.map((name) => sha(path.join(evidence.root, name)));
+        result = finalizeEvidence(options);
+        const secondHashes = outputs.map((name) => sha(path.join(evidence.root, name)));
+        assert(JSON.stringify(firstHashes) === JSON.stringify(secondHashes),
+            "Pre-baseline finalization is not deterministic.");
+    } finally {
+        fs.rmSync(evidence.root, { recursive: true, force: true });
     }
 }
 
@@ -1610,6 +1668,55 @@ function testPassFinalizationControlsCompletion() {
             delete value.lanes[0].passes[0].ownership.cpu;
             writeJson(file, value);
         }, "cpu_owner_finalization_invalid"],
+        ["missing-cpu-acquisition", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "01", "retained.json");
+            const value = readJson(file);
+            delete value.cpuAcquisition;
+            writeJson(file, value);
+        }, "retained_cpu_acquisition_receipt_missing"],
+        ["invalid-cpu-acquisition-action", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "01", "retained.json");
+            const value = readJson(file);
+            value.cpuAcquisition.action = "qualification_status";
+            writeJson(file, value);
+        }, "retained_cpu_acquisition_receipt_invalid"],
+        ["foreign-cpu-acquisition-owner", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "01", "retained.json");
+            const value = readJson(file);
+            value.cpuAcquisition.ownerId = "foreign-owner";
+            writeJson(file, value);
+        }, "retained_cpu_acquisition_owner_mismatch"],
+        ["foreign-cpu-acquisition-build", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "01", "retained.json");
+            const value = readJson(file);
+            value.cpuAcquisition.producer.buildId = "d".repeat(64);
+            writeJson(file, value);
+        }, "retained_cpu_acquisition_build_mismatch"],
+        ["inactive-cpu-acquisition", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "01", "retained.json");
+            const value = readJson(file);
+            value.cpuAcquisition.performanceTelemetry.cpuPerformance.active = false;
+            writeJson(file, value);
+        }, "retained_cpu_acquisition_inactive"],
+        ["zero-cpu-acquisition-session", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "01", "retained.json");
+            const value = readJson(file);
+            value.cpuAcquisition.performanceTelemetry.cpuPerformance.sessionId = 0;
+            writeJson(file, value);
+        }, "retained_cpu_acquisition_session_invalid"],
+        ["different-cpu-acquisition-session", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "01", "retained.json");
+            const value = readJson(file);
+            value.cpuAcquisition.performanceTelemetry.cpuPerformance.sessionId = 12;
+            writeJson(file, value);
+        }, "retained_cpu_acquisition_session_mismatch"],
         ["still-active", (root) => {
             const file = path.join(root, "raw", "live-result.json");
             const value = readJson(file);
@@ -1865,6 +1972,7 @@ Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testAmdTraceCapabilityOnlyAffectsReporting)
     .then(testRecoveryIsReportedWithoutRewritingFailure)
     .then(testBaselineOnlyInterruptedFinalization)
+    .then(testPreBaselineInterruptedFinalization)
     .then(testPartialInterruptedFinalization)
     .then(testValidationLeavesEvidenceUntouched)
     .then(testVariantAndSourceProfileValidation)
