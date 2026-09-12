@@ -104,10 +104,13 @@ mappings, snapshots `backup`, and materializes its enabled-provider union.
 Shader-cache preparation does the same for `ShaderCache`. New paths and updates
 therefore resolve to Overwrite; shared mod directories remain immutable.
 
-Some applications write runtime data into an existing mod, notably CSX writing
-compiled shaders into the managed shader-cache mod. That known exception is
-accepted. Automatic cache reset on lease yield is intentionally not part of
-this contract; it can be added later as a separately evidenced policy.
+The task-workspace workflow has no exception that permits CSX to write compiled
+shaders into an existing shared mod. Legacy loose-mod cache workflows are
+separate from task workspaces and require their own explicitly bound
+shader-cache transaction. They do not relax the Overwrite output binding or
+authorize shared-mod mutation here. Yielding the lease retains the task-owned
+profile, while `complete-output` restores the owned transient Overwrite
+preimage after preserving the task result.
 
 Restoration of shared or global transient state is a separate lifecycle. For
 example, a requested SteamVR settings restoration may run after a test without
