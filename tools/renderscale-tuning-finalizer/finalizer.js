@@ -290,6 +290,20 @@ function validateBaselineOnlyInterruption(root, variant, runId, buildId) {
     }
 }
 
+function validatePreBaselineInterruption(root, variant, runId, liveResult) {
+    if (variant !== "amd" || !liveResult || liveResult.status !== "INTERRUPTED" ||
+        liveResult.variant !== variant || liveResult.runId !== runId ||
+        !Array.isArray(liveResult.lanes) || liveResult.lanes.length !== 0 ||
+        typeof liveResult.error !== "string" || liveResult.error.length === 0 ||
+        !liveResult.failure || typeof liveResult.failure !== "object") {
+        throw new Error("pre_baseline_interruption_evidence_invalid");
+    }
+    const cleanup = liveResult.failure.traceCleanup || liveResult.failure.cleanup;
+    if (!cleanup || !["CONFIRMED_INACTIVE", "UNRESOLVED"].includes(cleanup.status)) {
+        throw new Error("pre_baseline_interruption_cleanup_missing");
+    }
+}
+
 function baselineOnlyMemoryConfirmation() {
     return {
         passesCompleted: 0,
@@ -799,9 +813,12 @@ function producerBuildMatches(value, buildId) {
 
 function rawPassEvidence(root) {
     const rawRoot = path.join(root, "raw");
-    if (!fs.existsSync(rawRoot)) return { scenarios: [], cleanup: [] };
+    if (!fs.existsSync(rawRoot)) {
+        return { scenarios: [], cleanup: [], transitions: [] };
+    }
     const scenarios = [];
     const cleanup = [];
+    const transitions = [];
     for (const file of walk(rawRoot).filter((candidate) =>
         path.extname(candidate).toLowerCase() === ".json" &&
         path.basename(candidate) !== "live-result.json")) {
@@ -812,6 +829,9 @@ function rawPassEvidence(root) {
             continue;
         }
         const scope = retainedPassScope(root, file);
+        if (path.basename(file) === "retained.json" && rowIdentity(root, file)) {
+            transitions.push({ value, scope, identity: rowIdentity(root, file) });
+        }
         const rootValue = decodedScenarioRoot(value);
         if (rootValue) scenarios.push({ value: rootValue, scope });
         if (value && value.status === "CONFIRMED_INACTIVE" &&
@@ -819,7 +839,7 @@ function rawPassEvidence(root) {
             cleanup.push({ value, scope });
         }
     }
-    return { scenarios, cleanup };
+    return { scenarios, cleanup, transitions };
 }
 
 function scenarioResult(root, label) {
@@ -897,6 +917,37 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
         if (cpu.proven !== true || !positive(cpu.sessionId) ||
             cpu.active !== false) {
             passReasons.push("cpu_owner_finalization_invalid");
+        }
+        const acquisitionPlan = plannedPass.find((entry) => entry.ordinal === 1);
+        const acquisitionRecord = acquisitionPlan && raw.transitions.find((candidate) =>
+            identityKey(candidate.identity) === identityKey(acquisitionPlan));
+        const acquisition = acquisitionRecord && acquisitionRecord.value.cpuAcquisition;
+        const telemetry = acquisition && acquisition.performanceTelemetry;
+        const acquiredCpu = telemetry && telemetry.cpuPerformance;
+        if (!acquisition) {
+            passReasons.push("retained_cpu_acquisition_receipt_missing");
+        } else {
+            if (acquisition.action !== "qualification_dispatch" ||
+                acquisition.accepted !== true) {
+                passReasons.push("retained_cpu_acquisition_receipt_invalid");
+            }
+            if (!acquisitionPlan || acquisition.transitionId !==
+                acquisitionPlan.transitionId || acquisition.ownerId !==
+                acquisitionPlan.ownerId) {
+                passReasons.push("retained_cpu_acquisition_owner_mismatch");
+            }
+            if (!producerBuildMatches(acquisition, buildId)) {
+                passReasons.push("retained_cpu_acquisition_build_mismatch");
+            }
+            if (!telemetry || telemetry.started !== true || !acquiredCpu ||
+                acquiredCpu.active !== true) {
+                passReasons.push("retained_cpu_acquisition_inactive");
+            }
+            if (!acquiredCpu || !positive(acquiredCpu.sessionId)) {
+                passReasons.push("retained_cpu_acquisition_session_invalid");
+            } else if (acquiredCpu.sessionId !== cpu.sessionId) {
+                passReasons.push("retained_cpu_acquisition_session_mismatch");
+            }
         }
         if (cleanup.status !== "CONFIRMED_INACTIVE" ||
             !Array.isArray(cleanup.knownSessionIds) ||
@@ -1703,8 +1754,17 @@ function finalizeEvidence(options) {
         duplicateTerminalOwnerIds.length === 0 &&
         uniqueExecutionPlanConflicts.length === 0;
     const baselineOnlyInterrupted = rows.length === 0;
+    let preBaselineInterrupted = false;
     if (baselineOnlyInterrupted) {
-        validateBaselineOnlyInterruption(root, variant, runIds[0], buildIds[0]);
+        const baselineFiles = walk(path.join(root, "raw")).filter((file) =>
+            path.basename(file) === "baseline.json" &&
+            relative(root, file).split("/").includes("baseline"));
+        preBaselineInterrupted = baselineFiles.length === 0;
+        if (preBaselineInterrupted) {
+            validatePreBaselineInterruption(root, variant, runIds[0], liveResult);
+        } else {
+            validateBaselineOnlyInterruption(root, variant, runIds[0], buildIds[0]);
+        }
     }
     for (const entry of retained) {
         const waiter = entry.value.waiter || {};
@@ -1751,7 +1811,8 @@ function finalizeEvidence(options) {
     if (uniqueExecutionPlanConflicts.length > 0) {
         reportingReasons.push("execution_plan_mismatch");
     }
-    if (baselineOnlyInterrupted) reportingReasons.push("baseline_only_interrupted");
+    if (preBaselineInterrupted) reportingReasons.push("pre_baseline_interrupted");
+    else if (baselineOnlyInterrupted) reportingReasons.push("baseline_only_interrupted");
     if (interrupted && !baselineOnlyInterrupted) {
         reportingReasons.push("assay_interrupted");
     }
@@ -1818,6 +1879,8 @@ function finalizeEvidence(options) {
                 conflicts: uniqueExecutionPlanConflicts,
             },
             interruption: interrupted ? {
+                phase: preBaselineInterrupted ? "pre_baseline" :
+                    baselineOnlyInterrupted ? "baseline" : "assay",
                 error: interrupted.error || interruptedPass &&
                     interruptedPass.error || null,
                 failure: interrupted.failure ||

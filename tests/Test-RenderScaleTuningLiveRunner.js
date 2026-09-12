@@ -1189,6 +1189,84 @@ async function testAmdPostStartTraceFailureClosesOwner() {
     "An unsupported AMD post-start trace stop left its owner unresolved.");
 }
 
+async function testAmdMalformedTraceOwnersNeverAuthorizeStop() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-amd", "references",
+        "matrix.v1.json")));
+    const cases = [
+        ["zero", (start) => { start.capture.sessionID = 0; }],
+        ["negative", (start) => { start.capture.sessionID = -1; }],
+        ["missing", (start) => { delete start.capture.sessionID; }],
+        ["wrong-type", (start) => { start.capture.sessionID = "1"; }],
+        ["inactive", (start) => { start.capture.active = false; }],
+        ["wrong-build", (start) => { start.producer.buildId = "f".repeat(64); }],
+    ];
+    for (const [name, mutate] of cases) {
+        let injected = false;
+        const mock = createMock(0, null, (root, args) => {
+            if (!injected && args.steps.some((step) =>
+                step.label === "amd-dlss-trace-start")) {
+                injected = true;
+                mutate(root.results.find((entry) =>
+                    entry.label === "amd-dlss-trace-start").result);
+            }
+            return root;
+        });
+        const runId = `amd-malformed-trace-owner-${name}`;
+        const result = await runRenderScaleTuningLive({
+            ...mock.context, variant: "amd", runId, buildId,
+            positioningRoot: positioningRoot({
+                supportedFSRRuntimeMask: 1,
+                fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }],
+            }), matrix,
+        });
+        const decision = mock.stores.get(
+            `${runId}:amd:dlss-trace-capability:cleanup:decision`);
+        const stops = mock.directCalls.filter((call) =>
+            call.action === "dlss_trace_stop");
+        assert(result.status === "INTERRUPTED" &&
+            result.error === "amd_trace_capability_cleanup_unresolved" &&
+            decision && decision.status === "UNRESOLVED" &&
+            decision.reason === "trace_cleanup_owner_unproven" && stops.length === 0,
+        `Malformed AMD trace owner '${name}' authorized a stop.`);
+    }
+}
+
+async function testAmdForeignTraceOwnerNeverAuthorizesCleanupStop() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-amd", "references",
+        "matrix.v1.json")));
+    let injected = false;
+    const mock = createMock(0, null, (root, args) => {
+        if (!injected && args.steps.some((step) =>
+            step.label === "amd-dlss-trace-start")) {
+            injected = true;
+            const entry = root.results.find((candidate) =>
+                candidate.label === "amd-dlss-trace-start");
+            entry.result.capture.sessionID += 100;
+            entry.ok = false;
+            entry.error = "synthetic trace start failure";
+            root.ok = false;
+            root.aborted = true;
+        }
+        return root;
+    });
+    const runId = "amd-foreign-trace-owner";
+    const result = await runRenderScaleTuningLive({
+        ...mock.context, variant: "amd", runId, buildId,
+        positioningRoot: positioningRoot({ supportedFSRRuntimeMask: 1,
+            fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }] }),
+        matrix,
+    });
+    const decision = mock.stores.get(
+        `${runId}:amd:dlss-trace-capability:cleanup:decision`);
+    assert(result.status === "INTERRUPTED" && decision &&
+        decision.status === "UNRESOLVED" &&
+        decision.reason === "trace_cleanup_owner_mismatch" &&
+        !mock.directCalls.some((call) => call.action === "dlss_trace_stop"),
+    "A foreign AMD trace owner authorized a cleanup stop.");
+}
+
 async function testNvidiaPostStartTraceFailureClosesOwner() {
     const matrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
@@ -1340,6 +1418,11 @@ async function testCpuAcquisitionRequiresDispatchReceipt() {
         pass.cleanup && pass.cleanup.status === "UNRESOLVED" &&
         cpuStops.length === 0,
     "An invalid CPU acquisition receipt authorized cleanup.");
+    const retained = mock.stores.get(
+        "cpu-acquisition-unproven:nvidia:pass-1:transition-1");
+    assert(retained && retained.cpuAcquisition &&
+        retained.cpuAcquisition.performanceTelemetry.cpuPerformance.sessionId === 0,
+    "The original CPU acquisition receipt was not retained independently.");
 }
 
 async function testNvidiaRetainsMultiPageTrace() {
@@ -1390,6 +1473,60 @@ async function testNvidiaRetainsMultiPageTrace() {
         paged.tracePages[1].capture.moreAvailable === false &&
         paged.tracePages.flatMap((page) => page.capture.records).length === 20,
     "The live runner did not retain a complete multi-page trace window.");
+}
+
+async function testNvidiaRejectsChangedOrMalformedTraceWindow() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const cases = [
+        ["shrinking", 19, "trace_closed_window_changed"],
+        ["growing", 21, "trace_closed_window_changed"],
+        ["missing", undefined, "trace_page_invalid"],
+        ["noninteger", 20.5, "trace_page_invalid"],
+    ];
+    for (const [name, secondLatest, expectedReason] of cases) {
+        let page = 0;
+        const mock = createMock(0, null, null, (args, controls) => {
+            if (args.action !== "dlss_trace_read" || page >= 2) return undefined;
+            page += 1;
+            const after = args.afterSequence;
+            const count = page === 1 ? 16 : 4;
+            const last = after + count;
+            const capture = {
+                summary: { active: false, sessionID: controls.traceSession(),
+                    totalRecords: 20, setConstantsCalls: 1, evaluateCalls: 1 },
+                records: Array.from({ length: count }, (_, index) => ({
+                    current: { sequence: after + index + 1 },
+                })),
+                afterSequence: after,
+                limit: args.limit,
+                availableFromSequence: 1,
+                latestSequence: page === 1 ? 20 : secondLatest,
+                lastReturnedSequence: last,
+                moreAvailable: page === 1,
+                requestedSequenceOverwritten: false,
+            };
+            if (page === 2 && secondLatest === undefined) {
+                delete capture.latestSequence;
+            }
+            return { action: "dlss_trace_read", producer: { buildId }, capture };
+        });
+        const runId = `nvidia-trace-window-${name}`;
+        const result = await runRenderScaleTuningLive({
+            ...mock.context, variant: "nvidia", runId, buildId,
+            positioningRoot: positioningRoot(), matrix,
+        });
+        const retained = [...mock.stores.values()].find((value) =>
+            value && value.traceCollectionFailure);
+        const rejectedPage = [...mock.stores.entries()].find(([key]) =>
+            key.startsWith(`${runId}:nvidia:pass-1:transition-`) &&
+            key.endsWith(":trace-page-2"));
+        assert(result.status === "INTERRUPTED" && retained && rejectedPage &&
+            retained.traceCollectionFailure &&
+            retained.traceCollectionFailure.reason === expectedReason,
+        `Trace window case '${name}' was accepted or not retained.`);
+    }
 }
 
 async function testBaselineOwnerAdmissionRejectsAmbiguity() {
@@ -2548,11 +2685,14 @@ async function testEvidenceVerdicts() {
 Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
     testAmdExposedTraceFailureStops(),
     testAmdPostStartTraceFailureClosesOwner(),
+    testAmdMalformedTraceOwnersNeverAuthorizeStop(),
+    testAmdForeignTraceOwnerNeverAuthorizesCleanupStop(),
     testNvidiaPostStartTraceFailureClosesOwner(),
     testNvidiaNormalStopRejectsChangedOwner(),
     testCpuCleanupRejectsUnownedStatus(),
     testCpuAcquisitionRequiresDispatchReceipt(),
     testNvidiaRetainsMultiPageTrace(),
+    testNvidiaRejectsChangedOrMalformedTraceWindow(),
     testAdmissionRejectsMalformedInputs(), testEvidenceVerdicts(),
     testScenarioFailureRetention(), testInformationalReasonIsNotFailure(),
     testOptionalTerminalFacts(), testSafeUnstableBaselineContinues(),
