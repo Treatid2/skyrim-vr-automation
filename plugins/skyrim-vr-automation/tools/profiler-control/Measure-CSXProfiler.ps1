@@ -111,6 +111,33 @@ function Acquire-ProfilerLease([string]$ControlRoot, [int]$TimeoutSeconds) {
     } while ($true)
 }
 
+function ConvertTo-ProfilerUtcRoundTrip($Value) {
+    if ($Value -is [DateTimeOffset]) {
+        return ([DateTimeOffset]$Value).UtcDateTime.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [DateTime]) {
+        $dateTime = [DateTime]$Value
+        $utc = if ($dateTime.Kind -eq [DateTimeKind]::Unspecified) {
+            [DateTime]::SpecifyKind($dateTime, [DateTimeKind]::Utc)
+        }
+        else {
+            $dateTime.ToUniversalTime()
+        }
+        return $utc.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw 'Profiler runtime identity is missing processStartTimeUtc.'
+    }
+    try {
+        $parsed = [DateTimeOffset]::Parse($text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+        return $parsed.UtcDateTime.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    catch {
+        throw "Profiler runtime identity has an invalid processStartTimeUtc '$text'."
+    }
+}
+
 function Get-StableRuntimeIdentity($Identity) {
     if ($null -eq $Identity -or -not $Identity.complete -or -not $Identity.verified) {
         throw 'Profiler capture requires a complete and verified DevBench runtime identity on every response.'
@@ -118,7 +145,7 @@ function Get-StableRuntimeIdentity($Identity) {
     return [ordered]@{
         listenerPid = [int]$Identity.listenerPid
         processPath = [string]$Identity.process.path
-        processStartTimeUtc = [string]$Identity.process.startTimeUtc
+        processStartTimeUtc = ConvertTo-ProfilerUtcRoundTrip $Identity.process.startTimeUtc
         buildId = [string]$Identity.build.buildId
         artifactPath = [string]$Identity.artifact.path
         artifactSha256 = [string]$Identity.artifact.sha256
