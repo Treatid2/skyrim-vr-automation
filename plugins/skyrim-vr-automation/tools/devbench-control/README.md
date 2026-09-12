@@ -79,7 +79,16 @@ without misclassifying a valid bridge response as unknown.
 Structured responses from allowlisted read-only calls establish a successful
 read contract. `record start` has a separate adapter that requires
 `action=start`, `recording=true`, and the requested correlation ID before
-`-RequireSuccess` accepts the result.
+`-RequireSuccess` accepts the result. `record stop` requires the exact stop
+action and a persisted recording path. Tracked-set `stop`/`releaseAll` requires
+either exact already-inactive evidence or owner-bound completed restoration.
+Weather `execute` treats top-level `ok` as envelope success only: the nested
+result must report `status=success` and Boolean `applied=true`; preflight and
+revision guards remain semantic failures.
+The allowlist includes the exact structured `communityshaders.renderscale`
+`status` response and the screenshot `capabilities` response. Screenshot
+capabilities require the version-1 schema plus positive integral frame and
+duration limits before clients may use them for mutation preflight.
 Replay completion receipts containing only scheduler facts such as `done`,
 `runId`, and `stepsRun` are classified as
 `scheduler-complete-unverified`, not semantic success. A replay response must
@@ -182,18 +191,42 @@ terminate immediately and the last transient error remains in the result.
 The initial MCP initialize/initialized/tools-list exchange is part of that same
 outer wait state machine, so a temporarily unavailable listener cannot exhaust
 the short transport budget before the requested timeout begins.
-An invalidated MCP session is fully rebound, but repeated invalidations are not
-allowed to consume the entire wait invisibly. `-MaxSessionRebinds` defaults to
-three; reaching it returns `persistent-session-invalidated` with the count and
-last successfully decoded observation so callers can distinguish server churn
-from an ordinary unsatisfied predicate.
+An invalidated MCP session is fully rebound within the same absolute wait
+deadline. Periodic server session retirement is therefore not an independent
+failure limit: `-MaxSessionRebinds` defaults to zero (deadline-only). Callers
+may set a positive explicit churn cap when required; reaching it returns
+`persistent-session-invalidated` with the count and last successfully decoded
+observation. `-TimeoutSeconds` accepts explicit bounded waits up to one hour,
+and ordinary deadline expiry returns `timeout` with the last successful state
+observation rather than retrying a request that can no longer start.
 
 `playerLoaded` is a current-state post-load barrier. After one separately
 verified `game load` dispatch reports `queued: true`, call it with the exact
 `-ExpectedCell`. It polls both `inspect state` and `inspect scene` until the
 player is loaded in that cell. It does not wait for, or require observation of,
 the transient unloaded-to-loaded edge because that edge can occur between
-polls. A transport failure never causes the load mutation to be replayed.
+polls. The call adapter classifies an exact `action=load`, `queued=true`, and
+matching save name as `game-load-dispatch-queued` with
+`completionBasis=dispatch-only`; it does not claim that loading has completed.
+A generic positive status never substitutes for that exact receipt, and any
+contradictory error, extra payload, missing request identity, wrong action,
+non-Boolean queue state, or mismatched save remains rejected.
+A transport failure never causes the load mutation to be replayed.
+
+Before a `communityshaders.render_map` `start`, capture the live `registry`
+response and use `New-CSXRenderMapCapturePlan.ps1` with a workload JSON file.
+The retained registry must be a successful response bound to the exact
+`communityshaders.render_map` service, explicit contract major, producer build,
+and source snapshot hash. The workload states positive integer JSON numbers for
+expected duration, frames, event count, event bytes, scope depth, and every
+catalogue observation family. The planner multiplies each by explicit headroom,
+adds the registry's fixed catalogue allocation to the byte budget, rejects any
+plan beyond the live service ceilings, and writes an immutable receipt
+containing the selected bounds and rationale. Pass only a successful result's
+`arguments` to `start`. If final hashing fails after receipt publication, the
+failure result retains the committed path and withholds arguments so the exact
+receipt can be reconciled. Any limit hit makes the evidence incomplete unless
+saturation itself is the experiment.
 
 `upscalingStable` is the fail-closed barrier for paced cell-transition tests.
 It requires the exact `-ExpectedCell`, a loaded player, no blocking menu, and a

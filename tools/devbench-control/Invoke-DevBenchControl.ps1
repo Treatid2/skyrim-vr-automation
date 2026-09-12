@@ -21,14 +21,14 @@ param(
     [string]$ExpectedArtifactSha256,
     [ValidateSet('noBlockingMenu', 'mainMenuReady', 'playerLoaded', 'upscalingStable', 'toolAvailable', 'serviceReady')]
     [string]$Condition = 'noBlockingMenu',
-    [ValidateRange(1, 600)]
+    [ValidateRange(1, 3600)]
     [int]$TimeoutSeconds = 30,
     [ValidateRange(50, 5000)]
     [int]$PollMilliseconds = 250,
     [ValidateRange(0, 10)]
     [int]$MaxTransientRetries = 4,
-    [ValidateRange(1, 10)]
-    [int]$MaxSessionRebinds = 3,
+    [ValidateRange(0, 1000)]
+    [int]$MaxSessionRebinds = 0,
     [ValidateRange(1, 3600)]
     [int]$RequestTimeoutSeconds = 15,
     [ValidateRange(50, 5000)]
@@ -394,6 +394,8 @@ function Invoke-McpRequest {
         catch {
             $statusCode = $null
             try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = $null }
+            $operationDeadlineExpired = $_.Exception.Message -eq 'The DevBench operation deadline expired before another request could start.'
+            if ($operationDeadlineExpired) { throw }
             $transient = $statusCode -in @(408, 429, 500, 502, 503, 504) -or
                 ($Command -eq 'wait' -and $statusCode -eq 404 -and -not $Probe) -or
                 $_.Exception -is [System.TimeoutException] -or
@@ -415,7 +417,7 @@ function Invoke-McpRequest {
                     sessionInvalidationCount = $script:mcpSessionInvalidationCount
                     message = $_.Exception.Message; timestampUtc = [DateTime]::UtcNow.ToString('o')
                 })
-                if ($script:mcpSessionInvalidationCount -ge $MaxSessionRebinds) {
+                if ($MaxSessionRebinds -gt 0 -and $script:mcpSessionInvalidationCount -ge $MaxSessionRebinds) {
                     $persistent = [InvalidOperationException]::new("DevBench MCP session was invalidated $($script:mcpSessionInvalidationCount) times during one bounded wait; refusing to consume the remaining deadline through persistent session churn.", $_.Exception)
                     $persistent.Data['DevBenchPersistentSessionInvalidation'] = $true
                     $persistent.Data['DevBenchSessionInvalidationCount'] = $script:mcpSessionInvalidationCount
@@ -575,6 +577,9 @@ function Test-WaitRetryableException {
         return $false
     }
     $message = [string]$Exception.Message
+    if ($message -eq 'The DevBench operation deadline expired before another request could start.') {
+        return $false
+    }
     $statusCode = $null
     try { $statusCode = [int]$Exception.Response.StatusCode } catch { $statusCode = $null }
     return $statusCode -in @(404, 429, 502, 503, 504) -or
@@ -1472,15 +1477,43 @@ catch {
     $failureMessage = $caughtException.Message
     $indeterminateMutation = [bool]$caughtException.Data['DevBenchIndeterminateMutation']
     $persistentSessionInvalidation = [bool]$caughtException.Data['DevBenchPersistentSessionInvalidation']
-    $failureState = if ($indeterminateMutation) { 'indeterminate' } elseif ($persistentSessionInvalidation) { 'persistent-session-invalidated' } else { 'failed' }
-    $failureData = if ($persistentSessionInvalidation) { [pscustomobject][ordered]@{ sessionInvalidationCount = [int]$caughtException.Data['DevBenchSessionInvalidationCount']; maxSessionRebinds = $MaxSessionRebinds; lastSuccessfulObservation = $lastSuccessfulWaitObservation } } else { $null }
+    $waitDeadlineExpired = $Command -eq 'wait' -and $failureMessage -eq 'The DevBench operation deadline expired before another request could start.'
+    $failureState = if ($indeterminateMutation) { 'indeterminate' } elseif ($persistentSessionInvalidation) { 'persistent-session-invalidated' } elseif ($waitDeadlineExpired) { 'timeout' } else { 'failed' }
+    $failureData = if ($persistentSessionInvalidation) {
+        [pscustomobject][ordered]@{ sessionInvalidationCount = [int]$caughtException.Data['DevBenchSessionInvalidationCount']; maxSessionRebinds = $MaxSessionRebinds; lastSuccessfulObservation = $lastSuccessfulWaitObservation }
+    }
+    elseif ($waitDeadlineExpired) {
+        [pscustomobject][ordered]@{
+            condition = $Condition
+            satisfied = $false
+            timeoutSeconds = $TimeoutSeconds
+            sessionInvalidationCount = $mcpSessionInvalidationCount
+            lastSuccessfulObservation = $lastSuccessfulWaitObservation
+            deadlineCause = $failureMessage
+        }
+    }
+    else { $null }
+    $failureSemantic = if ($waitDeadlineExpired) {
+        [pscustomobject][ordered]@{
+            known = $true
+            ok = $false
+            outcome = 'wait-timeout'
+            guarded = $false
+            transient = $false
+            codes = @('wait_timeout')
+            states = @('timeout')
+            reasons = @("Condition '$Condition' was not satisfied within $TimeoutSeconds seconds.")
+        }
+    }
+    else { $null }
+    if ($waitDeadlineExpired) { $failureMessage = [string]$failureSemantic.reasons[0] }
     if ($invocationRecord -and $invocationRecord.state -ne 'guard-rejected') {
-        try { Update-InvocationEvidence -State $failureState -Data $failureData -Errors @($failureMessage) } catch { $failureMessage = "$failureMessage Evidence update also failed: $($_.Exception.Message)" }
+        try { Update-InvocationEvidence -State $failureState -Semantic $failureSemantic -Data $failureData -Errors @($failureMessage) } catch { $failureMessage = "$failureMessage Evidence update also failed: $($_.Exception.Message)" }
     }
     $result = [pscustomobject][ordered]@{
         ok = $false
-        transportOk = $false
-        state = if ($indeterminateMutation) { 'indeterminate-mutation' } elseif ($persistentSessionInvalidation) { 'persistent-session-invalidated' } else { 'failed' }
+        transportOk = $waitDeadlineExpired
+        state = if ($indeterminateMutation) { 'indeterminate-mutation' } elseif ($persistentSessionInvalidation) { 'persistent-session-invalidated' } elseif ($waitDeadlineExpired) { 'timeout' } else { 'failed' }
         indeterminate = $indeterminateMutation
         command = $Command
         endpoint = $endpoint
@@ -1489,7 +1522,7 @@ catch {
         runtimeIdentity = $runtimeIdentity
         evidencePath = $invocationEvidencePath
         invocationEvidencePath = $invocationEvidencePath
-        semantic = $null
+        semantic = $failureSemantic
         transportRetries = @($transportRetries)
         requestTimeoutSeconds = $script:requestTimeoutSecondsForRpc
         operationTimeoutSeconds = $effectiveOperationTimeoutSeconds

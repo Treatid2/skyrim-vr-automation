@@ -14,7 +14,7 @@ param(
     [string]$PreferredView = 'left_eye',
     [ValidateRange(10, 5000)][int]$RecordIntervalMs = 50,
     [ValidateRange(50, 60000)][int]$FrameIntervalMs = 500,
-    [ValidateRange(1, 10000)][int]$MaximumFrames = 7200,
+    [ValidateRange(1, 60000)][int]$MaximumFrames = 7200,
     [ValidateRange(1, 120)][int]$CaptureTimeoutSeconds = 20,
     [ValidateRange(1, 55)][int]$ActionTimeoutSeconds = 15,
     [switch]$AllowNoPlayer,
@@ -85,7 +85,25 @@ function Invoke-DevBench([string]$Tool, [hashtable]$Arguments, [string]$Runtime,
     if ($SkipRuntimeIdentityVerification) { $parameters['SkipRuntimeIdentityVerification'] = $true }
     $raw = & $DevBenchScriptPath call @parameters
     $response = $raw | ConvertFrom-Json -Depth 100
-    if (-not $response.ok) { throw "DevBench tool '$Tool' failed: $(@($response.errors) -join '; ')" }
+    if (-not $response.ok) {
+        $details = [Collections.Generic.List[string]]::new()
+        foreach ($errorText in @($response.errors)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$errorText)) { $details.Add([string]$errorText) }
+        }
+        if ($details.Count -eq 0 -and $response.PSObject.Properties['semantic'] -and $response.semantic) {
+            foreach ($reason in @($response.semantic.reasons)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$reason)) { $details.Add([string]$reason) }
+            }
+            if ($details.Count -eq 0 -and $response.semantic.PSObject.Properties['outcome']) {
+                $details.Add("semantic outcome '$([string]$response.semantic.outcome)'")
+            }
+        }
+        if ($details.Count -eq 0) {
+            $state = if ($response.PSObject.Properties['state']) { [string]$response.state } else { 'unknown' }
+            $details.Add("controller returned ok=false with state '$state' and no diagnostic detail")
+        }
+        throw "DevBench tool '$Tool' failed: $($details -join '; ')"
+    }
     $content = @($response.data.content)
     if ($content.Count -lt 1) { throw "DevBench tool '$Tool' returned no content." }
     return [pscustomobject][ordered]@{ value = $content[0]; envelope = $response }
@@ -122,6 +140,43 @@ function New-ScreenshotCommand([string]$SessionId, [string]$Action) {
         action = $Action
         clientId = "capture-interaction/$SessionId"
         commandId = [guid]::NewGuid().ToString('N')
+    }
+}
+
+function Get-ScreenshotSequencePreflight([string]$SessionId, [string]$Runtime, [int]$FrameCount, [int]$IntervalMs) {
+    $call = Invoke-DevBench -Tool $screenshotTool -Arguments (New-ScreenshotCommand $SessionId 'capabilities') -Runtime $Runtime -RequireSuccess
+    $capabilities = $call.value
+    $limitsProperty = if ($capabilities -and $capabilities.PSObject.Properties['limits']) { $capabilities.PSObject.Properties['limits'] } else { $null }
+    if (-not $limitsProperty -or $null -eq $limitsProperty.Value -or
+        $limitsProperty.Value -is [string] -or $limitsProperty.Value -is [ValueType]) {
+        throw 'Screenshot sequence preflight did not return structured runtime limits.'
+    }
+    $integralTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
+    $maximumFramesProperty = $limitsProperty.Value.PSObject.Properties['maximumSequenceFrames']
+    $maximumDurationProperty = $limitsProperty.Value.PSObject.Properties['maximumSequenceDurationMs']
+    if (-not $maximumFramesProperty -or $null -eq $maximumFramesProperty.Value -or
+        $maximumFramesProperty.Value.GetType() -notin $integralTypes -or
+        [uint64]$maximumFramesProperty.Value -eq 0) {
+        throw 'Screenshot sequence preflight returned an invalid maximumSequenceFrames limit.'
+    }
+    if (-not $maximumDurationProperty -or $null -eq $maximumDurationProperty.Value -or
+        $maximumDurationProperty.Value.GetType() -notin $integralTypes -or
+        [uint64]$maximumDurationProperty.Value -eq 0) {
+        throw 'Screenshot sequence preflight returned an invalid maximumSequenceDurationMs limit.'
+    }
+    $maximumFrames = [uint64]$maximumFramesProperty.Value
+    $maximumDurationMs = [uint64]$maximumDurationProperty.Value
+    $requestedDurationMs = [uint64]$FrameCount * [uint64]$IntervalMs
+    $maximumCompatibleFrames = [Math]::Min($maximumFrames, [uint64][Math]::Floor($maximumDurationMs / [double]$IntervalMs))
+    if ([uint64]$FrameCount -gt $maximumFrames -or $requestedDurationMs -gt $maximumDurationMs) {
+        throw "Screenshot sequence preflight rejected $FrameCount frames at ${IntervalMs}ms ($requestedDurationMs ms): runtime limits are $maximumFrames frames and $maximumDurationMs ms. Choose -MaximumFrames no greater than $maximumCompatibleFrames for this interval."
+    }
+    return [pscustomobject][ordered]@{
+        schema = [string]$capabilities.schema
+        maximumSequenceFrames = $maximumFrames
+        maximumSequenceDurationMs = $maximumDurationMs
+        requestedFrames = $FrameCount
+        requestedDurationMs = $requestedDurationMs
     }
 }
 
@@ -230,12 +285,15 @@ try {
         $resolvedStatePath = Resolve-StatePath -ForCreate
         $resolvedSessionDirectory = Split-Path -Parent $resolvedStatePath
         if (Test-Path -LiteralPath $resolvedStatePath -PathType Leaf) { throw "Refusing to overwrite an existing session: $resolvedStatePath" }
+        $sessionId = [guid]::NewGuid().ToString()
+        $sequencePreflight = if ($VisualMode -eq 'sequence') {
+            Get-ScreenshotSequencePreflight -SessionId $sessionId -Runtime $RuntimePath -FrameCount $MaximumFrames -IntervalMs $FrameIntervalMs
+        } else { $null }
         New-Item -ItemType Directory -Path $resolvedSessionDirectory -Force | Out-Null
         $framesDirectory = Join-Path $resolvedSessionDirectory 'frames'
         if ($VisualMode -ne 'none') { New-Item -ItemType Directory -Path $framesDirectory -Force | Out-Null }
-        $sessionId = [guid]::NewGuid().ToString()
         $recordCall = Invoke-DevBench -Tool 'record' -Arguments @{ action = 'start'; intervalMs = $RecordIntervalMs; allowNoPlayer = [bool]$AllowNoPlayer; correlationId = $sessionId } -Runtime $RuntimePath -RequireSuccess
-        $screenshotState = [pscustomobject][ordered]@{ requestId = $null; startReceipt = $null }
+        $screenshotState = [pscustomobject][ordered]@{ requestId = $null; startReceipt = $null; preflight = $sequencePreflight }
         try {
             if ($VisualMode -eq 'sequence') {
                 $arguments = New-ScreenshotCommand $sessionId 'sequence_start'

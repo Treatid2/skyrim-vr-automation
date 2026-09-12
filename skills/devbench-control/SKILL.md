@@ -106,6 +106,18 @@ or construct HTTP or MCP requests ad hoc.
     unloaded-to-loaded edge; either can be missed between polls. On the bundled
     lane, follow it with `wait -Condition playerLoaded -ExpectedCell <exact>`.
     That barrier polls current player and scene state and never replays the load.
+    The wrapper reports the accepted mutation as `game-load-dispatch-queued`
+    with `completionBasis=dispatch-only`; only the later state barrier proves
+    load completion.
+18. Before `communityshaders.render_map start`, call the bundled
+    `New-CSXRenderMapCapturePlan.ps1` with the retained live registry response
+    and an explicit positive-integer workload estimate. Require a successful
+    registry envelope bound to the exact service, contract major, producer
+    build, and retained snapshot hash. Use only a successful planner result's
+    headroom-sized arguments and retain its immutable plan receipt. Do not use
+    conservative defaults for a broad evidence run. Treat any limit hit as
+    incomplete evidence unless the experiment is specifically measuring
+    saturation.
 
 The bundled fallback entry point is:
 
