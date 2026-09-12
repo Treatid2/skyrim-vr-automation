@@ -56,13 +56,24 @@ param(
 )
 $argsObject = $ArgumentsJson | ConvertFrom-Json -Depth 80
 $listenerPid = if ($env:CAPTURE_INTERACTION_RUNTIME_PID) { [int]$env:CAPTURE_INTERACTION_RUNTIME_PID } else { 101 }
+$processStartTimeUtc = if ($env:CAPTURE_INTERACTION_RUNTIME_START) { [string]$env:CAPTURE_INTERACTION_RUNTIME_START } else { "2026-09-11T00:00:$('{0:d2}' -f ($listenerPid % 60)).0000000Z" }
+$buildId = if ($env:CAPTURE_INTERACTION_RUNTIME_BUILD) { [string]$env:CAPTURE_INTERACTION_RUNTIME_BUILD } else { ('a' * 64) -join '' }
+$artifactSha256 = if ($env:CAPTURE_INTERACTION_RUNTIME_ARTIFACT_SHA) { [string]$env:CAPTURE_INTERACTION_RUNTIME_ARTIFACT_SHA } else { ('b' * 64) -join '' }
 $runtimeIdentity = [pscustomobject]@{
-  listenerPid=$listenerPid; processPath='C:\fixture\SkyrimVR.exe'; processStartTimeUtc="2026-09-11T00:00:$('{0:d2}' -f ($listenerPid % 60)).0000000Z"
-  buildId=('a' * 64); artifactPath='C:\fixture\CommunityShaders.dll'; artifactSha256=('b' * 64)
+  complete=$true; verified=$true; listenerPid=$listenerPid
+  process=[pscustomobject]@{path='C:\fixture\SkyrimVR.exe';startTimeUtc=$processStartTimeUtc}
+  build=[pscustomobject]@{buildId=$buildId}
+  artifact=[pscustomobject]@{path='C:\fixture\CommunityShaders.dll';sha256=$artifactSha256}
 }
 if ($ExpectedRuntimeIdentityJson) {
   $expectedIdentity = $ExpectedRuntimeIdentityJson | ConvertFrom-Json -Depth 20
-  if ([int]$expectedIdentity.listenerPid -ne $runtimeIdentity.listenerPid) {
+  $identityMatches = [int]$expectedIdentity.listenerPid -eq $runtimeIdentity.listenerPid -and
+    [string]$expectedIdentity.processPath -ceq [string]$runtimeIdentity.process.path -and
+    ([DateTime]$expectedIdentity.processStartTimeUtc).ToUniversalTime() -eq ([DateTime]$runtimeIdentity.process.startTimeUtc).ToUniversalTime() -and
+    [string]$expectedIdentity.buildId -ceq [string]$runtimeIdentity.build.buildId -and
+    [string]$expectedIdentity.artifactPath -ceq [string]$runtimeIdentity.artifact.path -and
+    [string]$expectedIdentity.artifactSha256 -ceq [string]$runtimeIdentity.artifact.sha256
+  if (-not $identityMatches) {
     [pscustomobject]@{ok=$false;transportOk=$false;state='failed';indeterminate=$false;dispatchReached=$false;acceptedDataRetained=$false;runtimeIdentity=$runtimeIdentity;data=$null;errors=@('fixture expected runtime identity mismatch')} | ConvertTo-Json -Depth 20 -Compress
     return
   }
@@ -148,6 +159,14 @@ else { $value=[pscustomobject]@{ok=$true} }
     $stopped = & $entry stop -SessionDirectory $session -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
     Assert-Test ($stopped.ok -and $stopped.state -eq 'stopped' -and $stopped.data.recording.stopReceipt.path -eq 'recording.json') 'stop finalizes visual capture before state recording and persists receipts'
 
+    $laterSession = Join-Path $root 'later-session'
+    $laterStarted = & $entry start -SessionDirectory $laterSession -RuntimePath $runtime -VisualMode none -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
+    $stopCountBeforeRepeat = @((Get-Content -LiteralPath (Join-Path $root 'calls.log')) | Where-Object { $_ -eq 'record/stop' }).Count
+    $repeatedStop = & $entry stop -SessionDirectory $session -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
+    $stopCountAfterRepeat = @((Get-Content -LiteralPath (Join-Path $root 'calls.log')) | Where-Object { $_ -eq 'record/stop' }).Count
+    Assert-Test ($laterStarted.ok -and $repeatedStop.ok -and $repeatedStop.state -eq 'stopped' -and $stopCountAfterRepeat -eq $stopCountBeforeRepeat) 'repeated terminal cleanup is idempotent and cannot stop a later recording on the same runtime'
+    $null = & $entry stop -SessionDirectory $laterSession -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
+
     $env:CAPTURE_INTERACTION_FAIL_VISUAL_START = '1'
     $env:CAPTURE_INTERACTION_FAIL_CLEANUP = '1'
     $failedVisualSession = Join-Path $root 'failed-visual-session'
@@ -190,15 +209,28 @@ else { $value=[pscustomobject]@{ok=$true} }
     Remove-Item Env:CAPTURE_INTERACTION_REJECT_RECORD_RECEIPT -ErrorAction SilentlyContinue
 
     $env:CAPTURE_INTERACTION_RUNTIME_PID = '101'
+    $verifiedFailureSession = Join-Path $root 'verified-failure-session'
+    $env:CAPTURE_INTERACTION_FAIL_VISUAL_START = '1'
+    $verifiedFailure = & $entry start -SessionDirectory $verifiedFailureSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 500 -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test (-not $verifiedFailure.ok -and $verifiedFailure.data.recordAccepted -and
+        $verifiedFailure.data.runtimeIdentity.listenerPid -eq 101 -and $verifiedFailure.data.runtimeIdentityObservation.complete -and
+        $verifiedFailure.data.cleanup.state -eq 'verified' -and $verifiedFailure.data.cleanup.recordStop.action -eq 'stop') 'producer-shaped accepted-start failure retains a stable identity and performs same-runtime recovery cleanup'
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_VISUAL_START -ErrorAction SilentlyContinue
+
+    $sameRuntimeSession = Join-Path $root 'same-runtime-session'
+    $sameRuntimeStart = & $entry start -SessionDirectory $sameRuntimeSession -RuntimePath $runtime -VisualMode none -DevBenchScriptPath $fake -Compact | ConvertFrom-Json -Depth 100
+    $sameRuntimeStop = & $entry stop -SessionDirectory $sameRuntimeSession -DevBenchScriptPath $fake -Compact | ConvertFrom-Json -Depth 100
+    Assert-Test ($sameRuntimeStart.ok -and $sameRuntimeStop.ok -and $sameRuntimeStop.state -eq 'stopped') 'producer-shaped identity survives persistence and authorizes same-runtime cleanup'
+
     $identitySession = Join-Path $root 'identity-session'
     $identityStart = & $entry start -SessionDirectory $identitySession -RuntimePath $runtime -VisualMode none -DevBenchScriptPath $fake -Compact | ConvertFrom-Json -Depth 100
     Assert-Test ($identityStart.ok -and $identityStart.data.runtimeIdentity.listenerPid -eq 101) 'capture state retains the complete identity of its accepting runtime'
     $stopCountBeforeReplacement = @((Get-Content -LiteralPath (Join-Path $root 'calls.log')) | Where-Object { $_ -eq 'record/stop' }).Count
-    $env:CAPTURE_INTERACTION_RUNTIME_PID = '202'
+    $env:CAPTURE_INTERACTION_RUNTIME_BUILD = ('c' * 64) -join ''
     $replacementStop = & $entry stop -SessionDirectory $identitySession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
     $stopCountAfterReplacement = @((Get-Content -LiteralPath (Join-Path $root 'calls.log')) | Where-Object { $_ -eq 'record/stop' }).Count
     Assert-Test (-not $replacementStop.ok -and $replacementStop.state -eq 'stopped-with-errors' -and
-        $replacementStop.data.runtimeIdentity.listenerPid -eq 101 -and $stopCountAfterReplacement -eq $stopCountBeforeReplacement) 'capture cleanup refuses a qualified replacement runtime before target mutation'
+        $replacementStop.data.runtimeIdentity.listenerPid -eq 101 -and $stopCountAfterReplacement -eq $stopCountBeforeReplacement) 'capture cleanup rejects a changed build identity at the same PID before target mutation'
 
     [pscustomobject]@{ ok=$true; sessionPath=$started.data.statePath; actionCount=(Get-CaptureInteractionActionCatalog).actions.Count } | ConvertTo-Json -Compress
 }
@@ -212,5 +244,8 @@ finally {
     Remove-Item Env:CAPTURE_INTERACTION_LOSE_RECORD_RESULT -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_REJECT_RECORD_RECEIPT -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_RUNTIME_PID -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_RUNTIME_START -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_RUNTIME_BUILD -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_RUNTIME_ARTIFACT_SHA -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
 }

@@ -76,6 +76,42 @@ function Test-CaptureRuntimeIdentity($Identity) {
     return [int]$Identity.listenerPid -gt 0
 }
 
+function ConvertTo-CaptureRuntimeIdentityUtc($Value) {
+    if ($Value -is [DateTime]) { return ([DateTime]$Value).ToUniversalTime().ToString('o') }
+    return [string]$Value
+}
+
+function ConvertTo-CaptureRuntimeIdentity($Identity) {
+    if ($null -eq $Identity) { return $null }
+    if (Test-CaptureRuntimeIdentity -Identity $Identity) {
+        return [pscustomobject][ordered]@{
+            listenerPid = [int]$Identity.listenerPid
+            processPath = [string]$Identity.processPath
+            processStartTimeUtc = ConvertTo-CaptureRuntimeIdentityUtc $Identity.processStartTimeUtc
+            buildId = [string]$Identity.buildId
+            artifactPath = [string]$Identity.artifactPath
+            artifactSha256 = [string]$Identity.artifactSha256
+        }
+    }
+    if (-not $Identity.PSObject.Properties['complete'] -or -not [bool]$Identity.complete -or
+        -not $Identity.PSObject.Properties['verified'] -or -not [bool]$Identity.verified -or
+        -not $Identity.PSObject.Properties['process'] -or -not $Identity.process -or
+        -not $Identity.PSObject.Properties['build'] -or -not $Identity.build -or
+        -not $Identity.PSObject.Properties['artifact'] -or -not $Identity.artifact) {
+        return $null
+    }
+    $projected = [pscustomobject][ordered]@{
+        listenerPid = [int]$Identity.listenerPid
+        processPath = [string]$Identity.process.path
+        processStartTimeUtc = ConvertTo-CaptureRuntimeIdentityUtc $Identity.process.startTimeUtc
+        buildId = [string]$Identity.build.buildId
+        artifactPath = [string]$Identity.artifact.path
+        artifactSha256 = [string]$Identity.artifact.sha256
+    }
+    if (-not (Test-CaptureRuntimeIdentity -Identity $projected)) { return $null }
+    return $projected
+}
+
 function Test-CaptureRecordingStartReceipt($Receipt, [string]$SessionId) {
     return $null -ne $Receipt -and
         $Receipt.PSObject.Properties['action'] -and [string]$Receipt.action -ceq 'start' -and
@@ -314,14 +350,17 @@ try {
             contractVersion = '1.0.0'; operation = 'capture-start-recovery'; sessionId = $sessionId
             runtimePath = [IO.Path]::GetFullPath($RuntimePath); sessionDirectory = $resolvedSessionDirectory
             intendedStatePath = $resolvedStatePath; receiptPath = (Join-Path $resolvedSessionDirectory 'capture-start-recovery.json')
-            runtimeIdentity = $null
+            runtimeIdentity = $null; runtimeIdentityObservation = $null
             recordAccepted = $false; recordOutcomeUncertain = $false; recordStartReceipt = $null; recordRejectedReceipt = $null; recordInvocationEvidencePath = $null
             screenshotRequestId = $null; screenshotOutcomeUncertain = $false; screenshotStartReceipt = $null; screenshotRejectedReceipt = $null; screenshotInvocationEvidencePath = $null
             cleanup = $null
         }
         try {
             $recordCall = Invoke-DevBench -Tool 'record' -Arguments @{ action = 'start'; intervalMs = $RecordIntervalMs; allowNoPlayer = [bool]$AllowNoPlayer; correlationId = $sessionId } -Runtime $RuntimePath -RequireSuccess
-            if ($recordCall.envelope.PSObject.Properties['runtimeIdentity']) { $failureData.runtimeIdentity = $recordCall.envelope.runtimeIdentity }
+            if ($recordCall.envelope.PSObject.Properties['runtimeIdentity']) {
+                $failureData.runtimeIdentityObservation = $recordCall.envelope.runtimeIdentity
+                $failureData.runtimeIdentity = ConvertTo-CaptureRuntimeIdentity -Identity $recordCall.envelope.runtimeIdentity
+            }
             $failureData.recordAccepted = $true
             $failureData.recordStartReceipt = $recordCall.value
             if (-not (Test-CaptureRecordingStartReceipt -Receipt $recordCall.value -SessionId $sessionId)) {
@@ -338,7 +377,10 @@ try {
             $recordFailure = $_.Exception.Message
             $failedResponse = $_.Exception.Data['DevBenchResponse']
             if ($failedResponse) {
-                if ($failedResponse.PSObject.Properties['runtimeIdentity']) { $failureData.runtimeIdentity = $failedResponse.runtimeIdentity }
+                if ($failedResponse.PSObject.Properties['runtimeIdentity']) {
+                    $failureData.runtimeIdentityObservation = $failedResponse.runtimeIdentity
+                    $failureData.runtimeIdentity = ConvertTo-CaptureRuntimeIdentity -Identity $failedResponse.runtimeIdentity
+                }
                 if ($failedResponse.PSObject.Properties['invocationEvidencePath']) {
                     $failureData.recordInvocationEvidencePath = [string]$failedResponse.invocationEvidencePath
                 }
@@ -440,12 +482,17 @@ try {
     else {
         $resolvedStatePath = Resolve-StatePath
         $state = Read-State $resolvedStatePath
+        $terminalCleanupRepeat = $Command -in @('stop', 'abort') -and [string]$state.status -in @('stopped', 'aborted')
         if ($Command -ne 'status' -and -not $SkipRuntimeIdentityVerification -and -not (
+            $terminalCleanupRepeat -or
             $state.PSObject.Properties['runtimeIdentity'] -and (Test-CaptureRuntimeIdentity -Identity $state.runtimeIdentity)
         )) {
             throw 'Capture session lacks the complete identity of its accepting runtime; refusing to mutate the currently available runtime.'
         }
-        if ($Command -eq 'status') {
+        if ($terminalCleanupRepeat) {
+            $result = [pscustomobject][ordered]@{ ok = $true; command = $Command; state = [string]$state.status; data = $state; errors = @() }
+        }
+        elseif ($Command -eq 'status') {
             $data = $state
             $result = [pscustomobject][ordered]@{ ok = $true; command = $Command; state = [string]$state.status; data = $data; errors = @() }
         }

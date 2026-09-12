@@ -404,6 +404,11 @@ $entryPointPath = Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1'
 $parseErrors = $null
 $tokens = $null
 $entryPointAst = [Management.Automation.Language.Parser]::ParseFile($entryPointPath, [ref]$tokens, [ref]$parseErrors)
+$identityUtcAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'ConvertTo-DevBenchRuntimeIdentityUtc' }, $true))[0]
+Invoke-Expression $identityUtcAst.Extent.Text
+$identityUtcText = ConvertTo-DevBenchRuntimeIdentityUtc '2026-09-11T00:00:41.0000000Z'
+$identityUtcParsed = ConvertTo-DevBenchRuntimeIdentityUtc ([DateTime]'2026-09-11T00:00:41Z')
+Assert-Test ($identityUtcText -ceq $identityUtcParsed) 'expected runtime start timestamps compare by normalized UTC instant after JSON parsing'
 $dispatchProvenanceAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-DevBenchDispatchProvenance' }, $true))[0]
 Invoke-Expression $dispatchProvenanceAst.Extent.Text
 $skippedDispatch = Get-DevBenchDispatchProvenance -InvocationRecord ([pscustomobject]@{ dispatchedUtc = $null }) -Data ([pscustomobject]@{ toolCallSkipped = $true }) -Semantic ([pscustomobject]@{ known = $true; ok = $false })
@@ -412,6 +417,27 @@ $rejectedDispatch = Get-DevBenchDispatchProvenance -InvocationRecord ([pscustomo
 Assert-Test (-not $skippedDispatch.dispatchReached -and -not $skippedDispatch.responseDataRetained -and -not $skippedDispatch.acceptedDataRetained) 'guard and tool-unavailable branches retain known target non-dispatch provenance'
 Assert-Test ($acceptedDispatch.dispatchReached -and $acceptedDispatch.responseDataRetained -and $acceptedDispatch.acceptedDataRetained -and -not $acceptedDispatch.semanticRejected) 'semantically accepted target data retains accepted dispatch authority'
 Assert-Test ($rejectedDispatch.dispatchReached -and $rejectedDispatch.responseDataRetained -and -not $rejectedDispatch.acceptedDataRetained -and $rejectedDispatch.semanticRejected) 'semantically rejected target data remains evidence without becoming accepted authority'
+$targetDispatchAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-DevBenchTargetDispatch' }, $true))[0]
+Invoke-Expression $targetDispatchAst.Extent.Text
+$preTargetRecord = [ordered]@{ dispatchIntentUtc = $null; dispatchedUtc = $null }
+$targetInvocations = 0
+try {
+    $null = Invoke-DevBenchTargetDispatch -InvocationRecord $preTargetRecord -PersistIntent { throw 'fixture dispatch-intent write failed' } -TargetAction { $script:targetInvocations++; 'unreachable' }
+}
+catch { $preTargetWriteError = $_.Exception.Message }
+$preTargetProvenance = Get-DevBenchDispatchProvenance -InvocationRecord ([pscustomobject]$preTargetRecord) -Data $null -Semantic $null
+Assert-Test ($preTargetWriteError -match 'dispatch-intent write failed' -and $targetInvocations -eq 0 -and
+    [string]::IsNullOrWhiteSpace([string]$preTargetRecord.dispatchedUtc) -and -not $preTargetProvenance.dispatchReached) 'failed dispatch-intent persistence proves definite pre-target non-dispatch'
+$attemptedRecord = [ordered]@{ dispatchIntentUtc = $null; dispatchedUtc = $null }
+$targetInvocations = 0
+try {
+    $null = Invoke-DevBenchTargetDispatch -InvocationRecord $attemptedRecord -PersistIntent { $attemptedRecord.dispatchIntentUtc = [DateTime]::UtcNow.ToString('o') } -TargetAction { $script:targetInvocations++; throw 'fixture target lost response' }
+}
+catch { $attemptedError = $_.Exception.Message }
+$attemptedProvenance = Get-DevBenchDispatchProvenance -InvocationRecord ([pscustomobject]$attemptedRecord) -Data $null -Semantic $null
+Assert-Test ($attemptedError -match 'target lost response' -and $targetInvocations -eq 1 -and
+    -not [string]::IsNullOrWhiteSpace([string]$attemptedRecord.dispatchIntentUtc) -and
+    -not [string]::IsNullOrWhiteSpace([string]$attemptedRecord.dispatchedUtc) -and $attemptedProvenance.dispatchReached) 'entered target with a lost response remains an attempted unknown mutation'
 $terminalWriterAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Write-TerminalInvocationEvidence' }, $true))[0]
 Invoke-Expression $terminalWriterAst.Extent.Text
 $headerReaderAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-McpSessionHeaderValue' }, $true))[0]
