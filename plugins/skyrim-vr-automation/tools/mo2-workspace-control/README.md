@@ -200,6 +200,11 @@ After the game and MO2 close, catalog `complete` preserves generated
 `complete-output` preserves the generated `backup` tree, restores its pre-task
 tree, and releases the Overwrite owner marker. `retire` requires both exact
 completion receipts and never deletes the Overwrite directory.
+Backup completion and interrupted-completion recovery revalidate the committed
+restore's immutable transaction identity, committed journal, and snapshot lineage, the live
+baseline, and the physical preserved task output before publishing completion
+or releasing ownership. Conflicting or malformed restore evidence remains
+nonterminal and retains the task's recovery authority.
 Restoring shared runtime state is independent and must not rewrite or retire
 the retained workspace. Virtual Desktop and `VirtualDesktop.Streamer` never
 block profile mutation or SteamVR null-HMD; an enabled profile-local

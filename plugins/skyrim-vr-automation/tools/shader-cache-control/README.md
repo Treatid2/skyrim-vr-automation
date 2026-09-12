@@ -186,7 +186,11 @@ this exception does not bypass ABI, runtime, bytecode-class, feature-set, status
 or tag gates.
 Repeated `complete` calls return the immutable existing completion. A retry
 after restoration but before completion publication accepts only one committed
-restore receipt proving both the baseline and preserved working tree.
+restore receipt and committed journal proving the exact snapshot lineage, restore transaction
+identity, cache path, live baseline, and physical preserved working tree. A
+stored receipt pointer is revalidated to the same standard. Malformed, foreign,
+missing, drifted, or ambiguous receipt-shaped evidence leaves the plan pending
+for recovery and never triggers a replacement restore.
 
 `prepare` and `complete` return bounded output by default: cache identities,
 file and byte counts, tree hashes, state, and receipt paths remain inline, while
