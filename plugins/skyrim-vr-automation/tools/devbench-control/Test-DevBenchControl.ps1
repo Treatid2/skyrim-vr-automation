@@ -95,6 +95,18 @@ Assert-Test (-not $mixedDismissal.permitted -and $mixedDismissal.retainedMenus[0
 $modalDismissal = Get-DevBenchMenuDismissalPlan -MenuObservation $modal -DismissBlockingMenus @('InventoryMenu')
 Assert-Test (-not $modalDismissal.permitted -and $modalDismissal.reason -eq 'message-box-requires-explicit-answer') 'message boxes are never auto-dismissed'
 
+Assert-Test (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $false -IssuedSessionId '' -StatusCode 404) 'only an initial sessionless MCP 404 proves capability absence'
+Assert-Test (-not (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $true -IssuedSessionId 'session-1' -StatusCode 404)) 'a post-initialization MCP 404 cannot authorize REST fallback'
+Assert-Test (-not (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $false -IssuedSessionId '' -StatusCode 503)) 'a non-404 MCP initialization failure cannot authorize REST fallback'
+$restDecodeFailure = Get-DevBenchRestMutationFailureDisposition -Mutation $true -RequestAttempted $true -ResponseReceived $true -StatusCode $null -Transient $false
+Assert-Test ($restDecodeFailure.indeterminate -and $restDecodeFailure.reason -eq 'response-outcome-undecodable') 'an undecodable REST mutation response remains indeterminate after one dispatch'
+$restConnectionFailure = Get-DevBenchRestMutationFailureDisposition -Mutation $true -RequestAttempted $true -ResponseReceived $false -StatusCode $null -Transient $false
+Assert-Test ($restConnectionFailure.indeterminate -and $restConnectionFailure.reason -eq 'dispatch-outcome-unknown') 'an unclassified post-dispatch REST mutation failure remains indeterminate'
+$restPreDispatchFailure = Get-DevBenchRestMutationFailureDisposition -Mutation $true -RequestAttempted $false -ResponseReceived $false -StatusCode $null -Transient $false
+Assert-Test (-not $restPreDispatchFailure.indeterminate -and $restPreDispatchFailure.reason -eq 'pre-dispatch-failure') 'a pre-dispatch REST serialization failure is not falsely classified as possibly committed'
+$restRejectedMutation = Get-DevBenchRestMutationFailureDisposition -Mutation $true -RequestAttempted $true -ResponseReceived $false -StatusCode 400 -Transient $false
+Assert-Test (-not $restRejectedMutation.indeterminate -and $restRejectedMutation.definitiveHttpRejection) 'an observed non-transient HTTP rejection remains a definite failed mutation'
+
 function New-TestUpscalingProfile([string]$Method = 'dlss', [bool]$RenderScale = $true) {
     [pscustomobject]@{
         method = [pscustomobject]@{ name = $Method; value = $(if ($Method -eq 'dlss') { 3 } elseif ($Method -eq 'fsr') { 2 } else { 1 }) }
@@ -515,7 +527,7 @@ Assert-Test ($entryPointText -match "state = 'transport_retry'") 'serviceReady c
 Assert-Test ($entryPointText -match 'probeError = \$_.Exception.Message') 'wait observations preserve the transient probe error'
 Assert-Test ($entryPointText -match "phase = 'initialize'; recovery = 'outer-wait-retry'") 'wait initialization failures remain inside the outer timeout state machine'
 Assert-Test ($entryPointText -match '\$null -eq \$headers') 'bounded waits establish or re-establish the MCP session inside the polling loop'
-Assert-Test ($entryPointText -match 'function Open-DevBenchSession' -and $entryPointText -match "recovery = 'rest-capability-negotiation'") 'transport negotiation falls back only after an explicit MCP capability miss'
+Assert-Test ($entryPointText -match 'function Open-DevBenchSession' -and $entryPointText -match "DevBenchMcpCapabilityAbsent" -and $entryPointText -match "recovery = 'rest-capability-negotiation'") 'transport negotiation falls back only after an explicitly classified initial MCP capability miss'
 Assert-Test ($entryPointText -match '/api/tools' -and $entryPointText -match '/api/tool/\$escapedName') 'REST fallback uses DevBench discovery and exact tool endpoints'
 Assert-Test ($entryPointText -match 'DevBench REST mutation transport failed after dispatch' -and $entryPointText -match 'DevBenchIndeterminateMutation') 'REST mutations preserve the no-replay indeterminate contract'
 Assert-Test ($entryPointText -match 'transport = \$transport') 'runtime and invocation evidence identify the negotiated transport'

@@ -1222,4 +1222,47 @@ function Test-DevBenchPerformanceWindow {
     }
 }
 
-Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Test-DevBenchExecutableIdentityMatch, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow
+function Test-DevBenchInitialMcpCapabilityMiss {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][bool]$InitializeCompleted,
+        [AllowEmptyString()][string]$IssuedSessionId,
+        [Nullable[int]]$StatusCode
+    )
+
+    return -not $InitializeCompleted -and
+        [string]::IsNullOrWhiteSpace($IssuedSessionId) -and
+        $null -ne $StatusCode -and
+        [int]$StatusCode -eq 404
+}
+
+function Get-DevBenchRestMutationFailureDisposition {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][bool]$Mutation,
+        [Parameter(Mandatory)][bool]$RequestAttempted,
+        [Parameter(Mandatory)][bool]$ResponseReceived,
+        [Nullable[int]]$StatusCode,
+        [Parameter(Mandatory)][bool]$Transient
+    )
+
+    $definitiveHttpRejection = $RequestAttempted -and
+        -not $ResponseReceived -and
+        $null -ne $StatusCode -and
+        -not $Transient
+    $indeterminate = $Mutation -and $RequestAttempted -and
+        ($ResponseReceived -or $Transient -or $null -eq $StatusCode) -and
+        -not $definitiveHttpRejection
+    return [pscustomobject][ordered]@{
+        indeterminate = $indeterminate
+        definitiveHttpRejection = $definitiveHttpRejection
+        reason = if ($indeterminate) {
+            if ($ResponseReceived) { 'response-outcome-undecodable' } else { 'dispatch-outcome-unknown' }
+        }
+        elseif (-not $RequestAttempted) { 'pre-dispatch-failure' }
+        elseif ($definitiveHttpRejection) { 'http-rejection-observed' }
+        else { 'read-or-nonmutation-failure' }
+    }
+}
+
+Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Test-DevBenchExecutableIdentityMatch, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow, Test-DevBenchInitialMcpCapabilityMiss, Get-DevBenchRestMutationFailureDisposition

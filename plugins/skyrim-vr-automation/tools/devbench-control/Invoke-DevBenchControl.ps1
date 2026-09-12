@@ -478,6 +478,8 @@ function Invoke-RestRequest {
     $delay = [Math]::Max(50, $PollMilliseconds)
     while ($true) {
         $attempt++
+        $requestAttempted = $false
+        $responseReceived = $false
         try {
             $request = @{
                 UseBasicParsing = $true
@@ -490,8 +492,14 @@ function Invoke-RestRequest {
                 $request['ContentType'] = 'application/json'
                 $request['Body'] = $Payload | ConvertTo-Json -Depth 30 -Compress
             }
+            $requestAttempted = $true
             $response = Invoke-WebRequest @request
-            return [pscustomobject]@{ response = $response; json = ($response.Content | ConvertFrom-Json -Depth 50); attempts = $attempt }
+            $responseReceived = $true
+            $json = $response.Content | ConvertFrom-Json -Depth 50
+            if ($Mutation -and $null -eq $json) {
+                throw 'DevBench REST mutation returned an empty JSON outcome after dispatch.'
+            }
+            return [pscustomobject]@{ response = $response; json = $json; attempts = $attempt }
         }
         catch {
             $statusCode = $null
@@ -499,10 +507,12 @@ function Invoke-RestRequest {
             $transient = $statusCode -in @(408, 429, 500, 502, 503, 504) -or
                 $_.Exception -is [System.TimeoutException] -or
                 $_.Exception.Message -match 'timed out|temporarily unavailable|connection.*closed'
-            if ($Mutation -and $transient) {
+            $mutationDisposition = Get-DevBenchRestMutationFailureDisposition -Mutation ([bool]$Mutation) -RequestAttempted $requestAttempted -ResponseReceived $responseReceived -StatusCode $statusCode -Transient $transient
+            if ($mutationDisposition.indeterminate) {
                 $transportRetries.Add([pscustomobject][ordered]@{
                     attempt = $attempt; statusCode = $statusCode; delayMilliseconds = 0
-                    recovery = 'not-retried-indeterminate'; transport = 'rest'; message = $_.Exception.Message; timestampUtc = [DateTime]::UtcNow.ToString('o')
+                    recovery = 'not-retried-indeterminate'; transport = 'rest'; classification = $mutationDisposition.reason
+                    message = $_.Exception.Message; timestampUtc = [DateTime]::UtcNow.ToString('o')
                 })
                 $indeterminate = [InvalidOperationException]::new('DevBench REST mutation transport failed after dispatch; the command may already have committed and was not replayed. Reconcile by commandId and runtime state before any retry.', $_.Exception)
                 $indeterminate.Data['DevBenchIndeterminateMutation'] = $true
@@ -676,12 +686,14 @@ function Close-McpSessionForRebind {
 function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
     $baseHeaders = @{ Accept = 'application/json, text/event-stream'; 'Content-Type' = 'application/json' }
     $sessionHeaders = $null
+    $initializeCompleted = $false
     try {
         $initialize = Invoke-McpRequest -Endpoint $endpoint -Headers $baseHeaders -Payload @{
             jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'initialize'; params = @{
                 protocolVersion = '2025-03-26'; capabilities = @{}; clientInfo = @{ name = 'DevBenchControl'; version = '1.5' }
             }
         } -Probe
+        $initializeCompleted = $true
         $sessionId = Get-McpSessionHeaderValue -Response $initialize.response
         if ([string]::IsNullOrWhiteSpace($sessionId)) { throw 'DevBench did not return an MCP session ID.' }
         $sessionHeaders = @{ Accept = 'application/json, text/event-stream'; 'Content-Type' = 'application/json'; 'Mcp-Session-Id' = $sessionId }
@@ -703,8 +715,13 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
         return [pscustomobject][ordered]@{ headers = $sessionHeaders; tools = $sessionTools; runtimeIdentity = $identity; sessionId = $sessionId }
     }
     catch {
+        $statusCode = $null
+        try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = $null }
+        $returnedSessionId = [string]$_.Exception.Data['DevBenchMcpSessionId']
+        if (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $initializeCompleted -IssuedSessionId $returnedSessionId -StatusCode $statusCode) {
+            $_.Exception.Data['DevBenchMcpCapabilityAbsent'] = $true
+        }
         if ($null -eq $sessionHeaders) {
-            $returnedSessionId = [string]$_.Exception.Data['DevBenchMcpSessionId']
             if (-not [string]::IsNullOrWhiteSpace($returnedSessionId)) {
                 $sessionHeaders = @{
                     Accept = 'application/json, text/event-stream'
@@ -744,7 +761,7 @@ function Open-DevBenchSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
     catch {
         $statusCode = $null
         try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = $null }
-        if ($statusCode -ne 404) { throw }
+        if (-not [bool]$_.Exception.Data['DevBenchMcpCapabilityAbsent']) { throw }
         $transportRetries.Add([pscustomobject][ordered]@{
             attempt = 1; statusCode = 404; delayMilliseconds = 0; recovery = 'rest-capability-negotiation'
             transport = 'mcp'; message = $_.Exception.Message; timestampUtc = [DateTime]::UtcNow.ToString('o')
