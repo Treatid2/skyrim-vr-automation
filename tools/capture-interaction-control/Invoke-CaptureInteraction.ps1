@@ -184,6 +184,43 @@ function New-ScreenshotCommand([string]$SessionId, [string]$Action) {
     }
 }
 
+function Get-ScreenshotSequencePreflight([string]$SessionId, [string]$Runtime, [int]$FrameCount, [int]$IntervalMs) {
+    $call = Invoke-DevBench -Tool $screenshotTool -Arguments (New-ScreenshotCommand $SessionId 'capabilities') -Runtime $Runtime -RequireSuccess
+    $capabilities = $call.value
+    $limitsProperty = if ($capabilities -and $capabilities.PSObject.Properties['limits']) { $capabilities.PSObject.Properties['limits'] } else { $null }
+    if (-not $limitsProperty -or $null -eq $limitsProperty.Value -or
+        $limitsProperty.Value -is [string] -or $limitsProperty.Value -is [ValueType]) {
+        throw 'Screenshot sequence preflight did not return structured runtime limits.'
+    }
+    $integralTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
+    $maximumFramesProperty = $limitsProperty.Value.PSObject.Properties['maximumSequenceFrames']
+    $maximumDurationProperty = $limitsProperty.Value.PSObject.Properties['maximumSequenceDurationMs']
+    if (-not $maximumFramesProperty -or $null -eq $maximumFramesProperty.Value -or
+        $maximumFramesProperty.Value.GetType() -notin $integralTypes -or
+        [uint64]$maximumFramesProperty.Value -eq 0) {
+        throw 'Screenshot sequence preflight returned an invalid maximumSequenceFrames limit.'
+    }
+    if (-not $maximumDurationProperty -or $null -eq $maximumDurationProperty.Value -or
+        $maximumDurationProperty.Value.GetType() -notin $integralTypes -or
+        [uint64]$maximumDurationProperty.Value -eq 0) {
+        throw 'Screenshot sequence preflight returned an invalid maximumSequenceDurationMs limit.'
+    }
+    $maximumFrames = [uint64]$maximumFramesProperty.Value
+    $maximumDurationMs = [uint64]$maximumDurationProperty.Value
+    $requestedDurationMs = [uint64]$FrameCount * [uint64]$IntervalMs
+    $maximumCompatibleFrames = [Math]::Min($maximumFrames, [uint64][Math]::Floor($maximumDurationMs / [double]$IntervalMs))
+    if ([uint64]$FrameCount -gt $maximumFrames -or $requestedDurationMs -gt $maximumDurationMs) {
+        throw "Screenshot sequence preflight rejected $FrameCount frames at ${IntervalMs}ms ($requestedDurationMs ms): runtime limits are $maximumFrames frames and $maximumDurationMs ms. Choose -MaximumFrames no greater than $maximumCompatibleFrames for this interval."
+    }
+    return [pscustomobject][ordered]@{
+        schema = [string]$capabilities.schema
+        maximumSequenceFrames = $maximumFrames
+        maximumSequenceDurationMs = $maximumDurationMs
+        requestedFrames = $FrameCount
+        requestedDurationMs = $requestedDurationMs
+    }
+}
+
 function New-CaptureDescriptor([string]$Directory, [string]$BaseName, [string]$SessionId) {
     return [ordered]@{
         source = [ordered]@{ kind = 'hmd_submission'; fallback = 'reject' }
@@ -342,10 +379,13 @@ try {
         $resolvedStatePath = Resolve-StatePath -ForCreate
         $resolvedSessionDirectory = Split-Path -Parent $resolvedStatePath
         if (Test-Path -LiteralPath $resolvedStatePath -PathType Leaf) { throw "Refusing to overwrite an existing session: $resolvedStatePath" }
+        $sessionId = [guid]::NewGuid().ToString()
+        $sequencePreflight = if ($VisualMode -eq 'sequence') {
+            Get-ScreenshotSequencePreflight -SessionId $sessionId -Runtime $RuntimePath -FrameCount $MaximumFrames -IntervalMs $FrameIntervalMs
+        } else { $null }
         New-Item -ItemType Directory -Path $resolvedSessionDirectory -Force | Out-Null
         $framesDirectory = Join-Path $resolvedSessionDirectory 'frames'
         if ($VisualMode -ne 'none') { New-Item -ItemType Directory -Path $framesDirectory -Force | Out-Null }
-        $sessionId = [guid]::NewGuid().ToString()
         $failureData = [pscustomobject][ordered]@{
             contractVersion = '1.0.0'; operation = 'capture-start-recovery'; sessionId = $sessionId
             runtimePath = [IO.Path]::GetFullPath($RuntimePath); sessionDirectory = $resolvedSessionDirectory
@@ -407,7 +447,7 @@ try {
             $failureData = Invoke-CaptureStartupCleanup -Recovery $failureData
             throw "Recording start failed; cleanup is '$($failureData.cleanup.state)'. $recordFailure"
         }
-        $screenshotState = [pscustomobject][ordered]@{ requestId = $null; startReceipt = $null }
+        $screenshotState = [pscustomobject][ordered]@{ requestId = $null; startReceipt = $null; preflight = $sequencePreflight }
         try {
             if ($VisualMode -eq 'sequence') {
                 $arguments = New-ScreenshotCommand $sessionId 'sequence_start'

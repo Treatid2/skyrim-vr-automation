@@ -164,6 +164,10 @@ function Test-DevBenchReadOnlyRequest {
     if ($ToolName -eq 'menu') { return $action -eq 'list' }
     if ($ToolName -eq 'record') { return $action -eq 'status' }
     if ($ToolName -eq 'input') { return $action -in @('observe', 'status') }
+    if ($ToolName -eq 'communityshaders.renderscale') { return $action -eq 'status' }
+    if ($ToolName -eq 'communityshaders.screenshot') {
+        return $action -in @('capabilities', 'status', 'settings_get', 'request_get', 'request_list', 'events_poll')
+    }
     return $false
 }
 
@@ -280,12 +284,35 @@ function Get-DevBenchCallSemanticStatus {
             return $semantic
         }
         $action = if ($Arguments.Contains('action')) { [string]$Arguments['action'] } else { '' }
+        $renderScaleStatus = $payload.PSObject.Properties['status']
+        $screenshotLimits = $payload.PSObject.Properties['limits']
+        $maximumSequenceFrames = if ($screenshotLimits -and $null -ne $screenshotLimits.Value -and
+            $screenshotLimits.Value -isnot [string] -and $screenshotLimits.Value -isnot [ValueType]) {
+            $screenshotLimits.Value.PSObject.Properties['maximumSequenceFrames']
+        } else { $null }
+        $maximumSequenceDurationMs = if ($screenshotLimits -and $null -ne $screenshotLimits.Value -and
+            $screenshotLimits.Value -isnot [string] -and $screenshotLimits.Value -isnot [ValueType]) {
+            $screenshotLimits.Value.PSObject.Properties['maximumSequenceDurationMs']
+        } else { $null }
+        $integralTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
         $contractSatisfied =
             ($ToolName -eq 'inspect' -and $properties.Count -gt 0) -or
             ($ToolName -eq 'menu' -and $payload.PSObject.Properties['openMenus'] -and $payload.PSObject.Properties['messageBoxOpen']) -or
             ($ToolName -eq 'record' -and $payload.PSObject.Properties['recording'] -and $payload.PSObject.Properties['state']) -or
             ($ToolName -eq 'input' -and $action -eq 'observe' -and $payload.PSObject.Properties['frame']) -or
-            ($ToolName -eq 'input' -and $action -eq 'status' -and $payload.PSObject.Properties['device'])
+            ($ToolName -eq 'input' -and $action -eq 'status' -and $payload.PSObject.Properties['device']) -or
+            ($ToolName -eq 'communityshaders.renderscale' -and $action -eq 'status' -and
+                $payload.PSObject.Properties['action'] -and [string]$payload.action -ceq 'status' -and
+                $renderScaleStatus -and $null -ne $renderScaleStatus.Value -and
+                $renderScaleStatus.Value -isnot [string] -and $renderScaleStatus.Value -isnot [ValueType]) -or
+            ($ToolName -eq 'communityshaders.screenshot' -and $action -eq 'capabilities' -and
+                $payload.PSObject.Properties['schema'] -and [string]$payload.schema -ceq 'urn:csx:devbench:screenshot:1' -and
+                $maximumSequenceFrames -and $null -ne $maximumSequenceFrames.Value -and
+                $maximumSequenceFrames.Value.GetType() -in $integralTypes -and
+                [uint64]$maximumSequenceFrames.Value -gt 0 -and
+                $maximumSequenceDurationMs -and $null -ne $maximumSequenceDurationMs.Value -and
+                $maximumSequenceDurationMs.Value.GetType() -in $integralTypes -and
+                [uint64]$maximumSequenceDurationMs.Value -gt 0)
         if ($contractSatisfied) {
             $semantic.known = $true
             $semantic.ok = $true
