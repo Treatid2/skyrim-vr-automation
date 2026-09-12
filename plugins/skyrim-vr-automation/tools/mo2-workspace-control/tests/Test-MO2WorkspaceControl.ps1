@@ -55,6 +55,9 @@ try {
     }
     New-Item -ItemType Directory -Path (Join-Path $mo2 'overwrite\backup') -Force | Out-Null
     'pre-task-overwrite-backup' | Set-Content -LiteralPath (Join-Path $mo2 'overwrite\backup\preexisting.bin') -Encoding utf8
+    New-Item -ItemType Directory -Path (Join-Path $mo2 'overwrite\backup\previous') -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $synthesisMod 'backup\hashes') -Destination (Join-Path $mo2 'overwrite\backup\hashes')
+    Copy-Item -LiteralPath (Join-Path $synthesisMod 'backup\previous\shader.bin') -Destination (Join-Path $mo2 'overwrite\backup\previous\shader.bin')
     $mo2Exe = Join-Path $mo2 'ModOrganizer.exe'; $loader = Join-Path $loaderMod 'loader.exe'
     New-Item -ItemType File -Path $mo2Exe -Force | Out-Null; New-Item -ItemType File -Path $loader -Force | Out-Null
     $communityShadersPluginPath = Join-Path $loaderMod 'SKSE\Plugins\CommunityShaders.dll'
@@ -247,7 +250,7 @@ try {
         $sourceBackup = Join-Path (Join-Path $synthesisMod 'backup') $relativeBackup
         if (-not (Test-Path -LiteralPath $runtimeBackup -PathType Leaf) -or (Get-FileHash -LiteralPath $runtimeBackup -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath $sourceBackup -Algorithm SHA256).Hash) { throw "Workspace did not shadow generated backup file '$relativeBackup'." }
     }
-    if ([int]$created.data.runtimeOutput.shadowReceipt.requiredProviderFiles -ne 2 -or [int]$created.data.runtimeOutput.shadowReceipt.copiedFiles -ne 2) { throw 'Workspace did not receipt the complete generated backup provider tree in Overwrite.' }
+    if ([int]$created.data.runtimeOutput.shadowReceipt.requiredProviderFiles -ne 2 -or [int]$created.data.runtimeOutput.shadowReceipt.copiedFiles -ne 0) { throw 'Workspace did not receipt the already materialized generated backup provider tree in Overwrite.' }
     if (-not (Test-Path -LiteralPath (Join-Path $runtimeBackupRoot 'preexisting.bin') -PathType Leaf)) { throw 'Workspace did not preserve the pre-task Overwrite backup file.' }
     $taskSettings = Get-Content -LiteralPath (Join-Path $created.data.profilePath 'settings.ini') -Raw
     if ($taskSettings -match '(?im)^(Test|Synthesis)=') { throw 'Workspace retained a custom-overwrite mapping that diverts generated output away from MO2 Overwrite.' }
@@ -391,12 +394,13 @@ try {
     $rejectedCompletion = & $entry complete-output -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -Confirm:$false -NoExit | ConvertFrom-Json
     if ($rejectedCompletion.ok -or -not (Test-Path -LiteralPath $created.data.runtimeOutput.ownerMarkerPath -PathType Leaf)) { throw 'Stale cache completion evidence did not fail closed while retaining Overwrite ownership.' }
     [IO.File]::WriteAllBytes($cacheCompletionPath, $cacheCompletionBytes)
-    $taskGeneratedBackup = Join-Path $runtimeBackupRoot 'latest-build\generated-in-game.bin'
-    New-Item -ItemType Directory -Path (Split-Path -Parent $taskGeneratedBackup) -Force | Out-Null
-    'generated-in-game' | Set-Content -LiteralPath $taskGeneratedBackup -Encoding utf8
     $completedOutput = & $entry complete-output -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -Confirm:$false | ConvertFrom-Json
     if (-not $completedOutput.ok -or $completedOutput.state -ne 'complete' -or (Test-Path -LiteralPath $created.data.runtimeOutput.ownerMarkerPath -PathType Leaf)) { throw "Workspace Overwrite output did not complete and release its owner marker: $($completedOutput | ConvertTo-Json -Depth 16 -Compress)" }
-    if (-not (Test-Path -LiteralPath (Join-Path $runtimeBackupRoot 'preexisting.bin') -PathType Leaf) -or (Test-Path -LiteralPath (Join-Path $runtimeBackupRoot 'hashes') -PathType Leaf)) { throw 'Backup completion did not restore the exact pre-task MO2 Overwrite tree.' }
+    if (-not (Test-Path -LiteralPath ([string]$completedOutput.data.completion.restoreReceiptPath) -PathType Leaf) -or
+        -not (Test-Path -LiteralPath ([string]$completedOutput.data.completion.preservedPath) -PathType Container)) { throw 'Unchanged first backup completion did not create durable restore and preservation evidence.' }
+    if (-not (Test-Path -LiteralPath (Join-Path $runtimeBackupRoot 'preexisting.bin') -PathType Leaf) -or
+        (Get-FileHash -LiteralPath (Join-Path $runtimeBackupRoot 'hashes') -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath (Join-Path $synthesisMod 'backup\hashes') -Algorithm SHA256).Hash -or
+        (Get-FileHash -LiteralPath (Join-Path $runtimeBackupRoot 'previous\shader.bin') -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath (Join-Path $synthesisMod 'backup\previous\shader.bin') -Algorithm SHA256).Hash) { throw 'Backup completion did not restore the exact pre-task MO2 Overwrite tree.' }
     if (Test-Path -LiteralPath $created.data.runtimeOutput.cachePath -PathType Container) { throw 'Cache completion did not restore the migrated ShaderCache tree to an absent Overwrite state.' }
     $createdModList = Get-Content -LiteralPath $created.data.modListPath -Raw
     if ($created.data.runtimeRoute.id -ne 'SteamVRNull' -or $created.data.runtimeRouteApplication.state -ne 'incompatible-providers-disabled' -or $created.data.runtimeRouteAdmission.state -ne 'qualified' -or $createdModList -notmatch '(?m)^-OpenComposite Runtime Provider\r?$') { throw 'Fresh SteamVRNull workspace did not disable and qualify the inherited OCU provider.' }
@@ -596,8 +600,17 @@ try {
         'mixed-generated-cache' | Set-Content -LiteralPath (Join-Path $mixedWorkspace.data.runtimeOutput.cachePath 'mixed-generated.pso') -Encoding utf8
         'mixed-generated-backup' | Set-Content -LiteralPath (Join-Path $mixedWorkspace.data.runtimeOutput.backupPath 'mixed-generated.bin') -Encoding utf8
         $mixedCompletedCache = & $catalogEntry complete -CatalogRoot $catalogRoot -CachePath $mixedWorkspace.data.runtimeOutput.cachePath -EvidenceDirectory $mixedWorkspace.data.runtimeOutput.cacheEvidenceDirectory -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json
+        $mixedBackupPlanPath = [string]$mixedWorkspace.data.runtimeOutput.backupPlanPath
+        $mixedBackupPlan = Get-Content -LiteralPath $mixedBackupPlanPath -Raw | ConvertFrom-Json -Depth 40
+        $mixedWorkingBackup = & $transactionController inspect -CachePath $mixedWorkspace.data.runtimeOutput.backupPath -RelativeCachePath 'backup' -NoExit -Confirm:$false | ConvertFrom-Json -Depth 30
+        $mixedBackupPlan | Add-Member -NotePropertyName workingTreeInventory -NotePropertyValue $mixedWorkingBackup.data -Force
+        $mixedBackupPlan.state = 'completing'
+        $mixedBackupPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $mixedBackupPlanPath -Encoding utf8
+        $mixedInterruptedRestore = & $transactionController restore -CachePath $mixedWorkspace.data.runtimeOutput.backupPath -RelativeCachePath 'backup' -EvidenceDirectory $mixedWorkspace.data.runtimeOutput.backupEvidenceDirectory -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json -Depth 30
+        if (-not $mixedInterruptedRestore.ok) { throw 'Fixture could not establish a committed post-restore interruption.' }
         $mixedCompletedOutput = & $entry complete-output -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $mixedWorkspace.data.workspaceId -Confirm:$false | ConvertFrom-Json
-        if (-not $mixedPreparedCache.ok -or -not $mixedCompletedCache.ok -or -not $mixedCompletedOutput.ok) { throw "Mixed Overwrite completion failed for $($mixedCase.label)." }
+        if (-not $mixedPreparedCache.ok -or -not $mixedCompletedCache.ok -or -not $mixedCompletedOutput.ok) { throw "Mixed Overwrite completion failed for $($mixedCase.label). Cache=$($mixedCompletedCache | ConvertTo-Json -Depth 12 -Compress) Output=$($mixedCompletedOutput | ConvertTo-Json -Depth 12 -Compress)" }
+        if ([IO.Path]::GetFullPath([string]$mixedCompletedOutput.data.completion.restoreReceiptPath) -ne [IO.Path]::GetFullPath([string]$mixedInterruptedRestore.data.restoreReceiptPath)) { throw 'Workspace completion did not recover the exact committed post-restore receipt.' }
         if ([bool](Test-Path -LiteralPath $mixedCachePath -PathType Container) -ne [bool]$mixedCase.cachePresent -or
             [bool](Test-Path -LiteralPath $mixedBackupPath -PathType Container) -ne [bool]$mixedCase.backupPresent) {
             throw "Mixed Overwrite completion did not restore path existence for $($mixedCase.label)."
