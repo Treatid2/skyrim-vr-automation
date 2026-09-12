@@ -1408,6 +1408,41 @@ async function runRenderScaleTuningLive(context) {
         };
     }
 
+    function cpuDispatchOwnership(dispatch, identifiers, receiptKey) {
+        const telemetry = dispatch && dispatch.performanceTelemetry;
+        const cpu = telemetry && telemetry.cpuPerformance;
+        const reasons = [];
+        if (!dispatch || dispatch.action !== "qualification_dispatch" ||
+            dispatch.accepted !== true) {
+            reasons.push("dispatch_receipt_invalid");
+        }
+        if (!dispatch || dispatch.transitionId !== identifiers.transitionId ||
+            dispatch.ownerId !== identifiers.ownerId) {
+            reasons.push("dispatch_owner_identity_mismatch");
+        }
+        if (!dispatch || !dispatch.producer || dispatch.producer.buildId !== buildId) {
+            reasons.push("dispatch_build_identity_mismatch");
+        }
+        if (!telemetry || telemetry.started !== true) {
+            reasons.push("performance_telemetry_start_unproven");
+        }
+        if (!cpu || cpu.active !== true ||
+            !Number.isSafeInteger(cpu.sessionId) || cpu.sessionId < 1) {
+            reasons.push("cpu_session_identity_unproven");
+        }
+        return {
+            status: reasons.length === 0 ? "MATCHED_ACTIVE" : "UNPROVEN",
+            sessionId: cpu && Number.isSafeInteger(cpu.sessionId) ?
+                cpu.sessionId : null,
+            active: cpu && typeof cpu.active === "boolean" ? cpu.active : null,
+            transitionId: dispatch && dispatch.transitionId || null,
+            ownerId: dispatch && dispatch.ownerId || null,
+            receiptKey,
+            source: "qualification-dispatch",
+            reasons,
+        };
+    }
+
     async function baseline(boundary, lane, laneIndex, pass, ownerState) {
         const target = targetFor(
             boundary, matrix.destinations[matrix.initialDestination], lane.configuredFsrRuntime);
@@ -1713,6 +1748,16 @@ async function runRenderScaleTuningLive(context) {
         let projection;
         let diagnostic;
         let entries = new Map();
+        let cpuOwnership = row.ordinal === 1 ? {
+            status: "UNPROVEN",
+            sessionId: null,
+            active: null,
+            transitionId: identifiers.transitionId,
+            ownerId: identifiers.ownerId,
+            receiptKey,
+            source: "qualification-dispatch",
+            reasons: ["dispatch_receipt_unavailable"],
+        } : null;
         const retainedKey =
             `${runId}:${lane.id}:pass-${pass}:transition-${row.ordinal}`;
         let retained;
@@ -1728,6 +1773,7 @@ async function runRenderScaleTuningLive(context) {
                     scenario: scenarioFailure && scenarioFailure.diagnostic || null,
                     waiter: null,
                     projection: null,
+                    cpuOwnership,
                 });
                 throw diagnosticError("transition_receipt_unavailable",
                     scenarioFailure && scenarioFailure.diagnostic || null);
@@ -1744,11 +1790,27 @@ async function runRenderScaleTuningLive(context) {
                 projection,
                 replacementTimeline: waiter.replacementTimeline || null,
                 presentationCycleAudit: waiter.presentationCycleAudit || null,
+                cpuOwnership,
             };
         }
         if (response) {
             entries = resultMap(response.root);
             updateTraceOwnership(entries, ownerState);
+            if (row.ordinal === 1) {
+                cpuOwnership = cpuDispatchOwnership(entries.get(
+                    "qualification-dispatch"), identifiers, receiptKey);
+                if (cpuOwnership.status === "MATCHED_ACTIVE") {
+                    ownerState.cpu = {
+                        proven: true,
+                        sessionId: cpuOwnership.sessionId,
+                        active: true,
+                        transitionId: cpuOwnership.transitionId,
+                        ownerId: cpuOwnership.ownerId,
+                        receiptKey: cpuOwnership.receiptKey,
+                        source: cpuOwnership.source,
+                    };
+                }
+            }
             waiter = entries.get("qualification-wait");
             projection = waiter ? transitionProjection(waiter, target) : null;
             diagnostic = scenarioDiagnostic(response.root, steps, receiptKey);
@@ -1798,6 +1860,7 @@ async function runRenderScaleTuningLive(context) {
                 traceRead: traceEvidence && traceEvidence.traceRead ||
                     entries.get("dlss-trace-read") || null,
                 tracePages: traceEvidence && traceEvidence.tracePages || null,
+                cpuOwnership,
             };
             retain(retainedKey, retained);
             if (!waiter || (response.root.ok !== true &&
@@ -1807,6 +1870,9 @@ async function runRenderScaleTuningLive(context) {
             }
         }
         retain(retainedKey, retained);
+        if (cpuOwnership && cpuOwnership.status !== "MATCHED_ACTIVE") {
+            throw diagnosticError("cpu_owner_identity_unproven", cpuOwnership);
+        }
         let recovery = null;
         let nextBoundary;
         if (safeTerminal(waiter, identifiers)) {
@@ -2093,6 +2159,9 @@ async function runRenderScaleTuningLive(context) {
             !Object.hasOwn(session, "id")) missing.push("render_session_status_missing");
         if (!cpu || typeof cpu.active !== "boolean") {
             missing.push("cpu_status_missing");
+        } else if (cpu.active === true &&
+            (!Number.isSafeInteger(cpu.sessionId) || cpu.sessionId < 1)) {
+            missing.push("cpu_session_status_missing");
         }
         if (!gpu || typeof gpu.active !== "boolean") {
             missing.push("gpu_status_missing");
@@ -2127,15 +2196,21 @@ async function runRenderScaleTuningLive(context) {
             ownerState.trace && ownerState.trace.proven ?
                 ownerState.trace.sessionId : null,
         ]);
+        const knownCpuSessionIds = unique([
+            ownerState.cpu && ownerState.cpu.proven ?
+                ownerState.cpu.sessionId : null,
+        ]);
         const evidence = {
             status: "PENDING",
             cleanupAttempted: false,
             knownSessionIds,
             knownTraceSessionIds,
+            knownCpuSessionIds,
             before: {
                 stressSessionId: observed.session ? observed.session.id : null,
                 stressActive: observed.session ? observed.session.active : null,
                 cpuActive: observed.cpu ? observed.cpu.active : null,
+                cpuSessionId: observed.cpu ? observed.cpu.sessionId : null,
                 gpuActive: observed.gpu ? observed.gpu.active : null,
                 textureActive: observed.texture ? observed.texture.active : null,
                 probeActive: observed.probe ? observed.probe.active : null,
@@ -2164,6 +2239,15 @@ async function runRenderScaleTuningLive(context) {
             retain(`${receiptKey}:decision`, evidence);
             throw diagnosticError("cleanup_trace_owner_mismatch", evidence);
         }
+        if ((observed.cpu.active === true &&
+            !knownCpuSessionIds.includes(observed.cpu.sessionId)) ||
+            (knownCpuSessionIds.length > 0 &&
+                observed.cpu.sessionId !== knownCpuSessionIds[0])) {
+            evidence.status = "UNRESOLVED";
+            evidence.reason = "cleanup_cpu_owner_mismatch";
+            retain(`${receiptKey}:decision`, evidence);
+            throw diagnosticError("cleanup_cpu_owner_mismatch", evidence);
+        }
         const steps = [];
         if (observed.session.active) {
             steps.push(toolStep("measured-stress-stop", "communityshaders.renderscale", {
@@ -2172,8 +2256,8 @@ async function runRenderScaleTuningLive(context) {
             }));
         }
         if (observed.cpu.active) {
-            const args = { action: "cpu_performance_stop", expectedBuildId: buildId };
-            if (observed.cpu.sessionId) args.expectedSessionId = observed.cpu.sessionId;
+            const args = { action: "cpu_performance_stop",
+                expectedSessionId: knownCpuSessionIds[0], expectedBuildId: buildId };
             steps.push(toolStep("cpu-performance-stop", "communityshaders.renderscale", args));
         }
         if (observed.gpu.active) {
@@ -2215,6 +2299,7 @@ async function runRenderScaleTuningLive(context) {
             stressSessionId: after.session ? after.session.id : null,
             stressActive: after.session ? after.session.active : null,
             cpuActive: after.cpu ? after.cpu.active : null,
+            cpuSessionId: after.cpu ? after.cpu.sessionId : null,
             gpuActive: after.gpu ? after.gpu.active : null,
             textureActive: after.texture ? after.texture.active : null,
             probeActive: after.probe ? after.probe.active : null,
@@ -2222,20 +2307,34 @@ async function runRenderScaleTuningLive(context) {
             traceActive: after.trace ? after.trace.active : null,
             missing: after.missing,
         };
-        const stillActive = after.missing.length > 0 ||
+        const expectedStressSessionId = ownerState.measured &&
+            ownerState.measured.proven ? ownerState.measured.sessionId : null;
+        const expectedCpuSessionId = ownerState.cpu && ownerState.cpu.proven ?
+            ownerState.cpu.sessionId : null;
+        const expectedTraceSessionId = ownerState.trace && ownerState.trace.proven ?
+            ownerState.trace.sessionId : null;
+        const postOwnerMismatch = (expectedStressSessionId !== null &&
+            after.session.id !== expectedStressSessionId) ||
+            (expectedCpuSessionId !== null &&
+                after.cpu.sessionId !== expectedCpuSessionId) ||
+            (expectedTraceSessionId !== null &&
+                after.trace.id !== expectedTraceSessionId);
+        const stillActive = after.missing.length > 0 || postOwnerMismatch ||
             after.session.active !== false || after.cpu.active !== false ||
             after.gpu.active !== false || after.texture.active !== false ||
             after.probe.active !== false || after.trace.active !== false;
         if (stillActive) {
             evidence.status = "UNRESOLVED";
             evidence.reason = after.missing.length > 0 ?
-                "cleanup_post_status_incomplete" : "cleanup_postcondition_active";
+                "cleanup_post_status_incomplete" : postOwnerMismatch ?
+                    "cleanup_post_owner_mismatch" : "cleanup_postcondition_active";
             retain(`${receiptKey}:decision`, evidence);
             throw diagnosticError(evidence.reason, evidence);
         }
         if (ownerState.baseline) ownerState.baseline.active = false;
         if (ownerState.measured) ownerState.measured.active = false;
         if (ownerState.trace) ownerState.trace.active = false;
+        if (ownerState.cpu) ownerState.cpu.active = false;
         evidence.status = "CONFIRMED_INACTIVE";
         evidence.reason = null;
         retain(`${receiptKey}:decision`, evidence);
@@ -2363,7 +2462,7 @@ async function runRenderScaleTuningLive(context) {
         if (!lane.runnable) continue;
         for (let pass = 1; pass <= 2; pass += 1) {
             passSequence += 1;
-            const ownerState = { baseline: null, measured: null };
+            const ownerState = { baseline: null, measured: null, cpu: null };
             let cleanupAttempted = false;
             const passSummary = { pass, status: "RUNNING", rows: [] };
             laneSummary.passes.push(passSummary);

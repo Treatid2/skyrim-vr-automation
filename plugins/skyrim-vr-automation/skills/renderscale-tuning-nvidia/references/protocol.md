@@ -671,6 +671,20 @@ trace inactivity. Missing, contradictory, wrong-owner, still-active, or
 unresolved pass evidence leaves the observations intact but makes finalization
 `INCOMPLETE`.
 
+The first measured `qualification_dispatch` in each pass returns
+`performanceTelemetry.cpuPerformance.sessionId`; retain that exact positive
+session as the pass-owned CPU capture. Cleanup may stop CPU telemetry only when
+the current status still names that acquired session, and it must pass the same
+ID as `expectedSessionId`. A missing, invalid, or different CPU identity leaves
+cleanup `UNRESOLVED` and must not produce an unguarded stop.
+
+Offline pass corroboration uses the original pass-scoped baseline, handoff,
+cleanup, and `final-status-after-cleanup` receipts. The baseline and handoff
+scenario envelopes must have completed successfully, relevant tool results must
+name the exact Build ID, and the original post-cleanup status must confirm the
+measured stress, CPU, and trace identities inactive. A derived cleanup decision
+cannot override a failed, foreign, missing, or contradictory original receipt.
+
 If the live runner stops at baseline before any measured row, retain
 `raw/live-result.json` and the exact baseline waiter receipt. Run the same
 offline finalizer with the exact run ID, Build ID, and expected row count. It
