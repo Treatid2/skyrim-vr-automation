@@ -944,12 +944,6 @@ function Write-RuntimeEvidence($Binding) {
 
 try {
     Initialize-InvocationEvidence
-    if ($LoadAlreadyQueued -and ($Command -ne 'wait' -or $Condition -ne 'playerLoaded')) {
-        throw '-LoadAlreadyQueued is valid only with wait -Condition playerLoaded.'
-    }
-    if ($LoadAlreadyQueued -and $AcceptAlreadyLoaded) {
-        throw '-LoadAlreadyQueued and -AcceptAlreadyLoaded describe different freshness contracts and cannot be combined.'
-    }
     if ([string]::IsNullOrWhiteSpace($RuntimePath)) { throw 'RuntimePath is required. Pass -RuntimePath or set CSX_DEVBENCH_RUNTIME_PATH.' }
     if (-not (Test-Path -LiteralPath $RuntimePath -PathType Leaf)) { throw "DevBench runtime metadata does not exist: $RuntimePath" }
     $runtime = Get-Content -LiteralPath $RuntimePath -Raw | ConvertFrom-Json
@@ -1119,7 +1113,9 @@ try {
         if ($Condition -in @('toolAvailable', 'serviceReady') -and [string]::IsNullOrWhiteSpace($Tool)) { throw "Condition '$Condition' requires -Tool." }
         if ($DismissBlockingMenus.Count -gt 0 -and $Condition -ne 'noBlockingMenu') { throw '-DismissBlockingMenus is valid only with -Condition noBlockingMenu.' }
         if ($MinimumMenuStableSeconds -gt 0 -and $Condition -ne 'noBlockingMenu') { throw '-MinimumMenuStableSeconds is valid only with -Condition noBlockingMenu.' }
+        if ($Condition -eq 'playerLoaded' -and [string]::IsNullOrWhiteSpace($ExpectedCell)) { throw "Condition 'playerLoaded' requires -ExpectedCell so the prior scene cannot satisfy the post-load barrier." }
         if ($Condition -eq 'upscalingStable' -and [string]::IsNullOrWhiteSpace($ExpectedCell)) { throw "Condition 'upscalingStable' requires -ExpectedCell so the prior scene cannot satisfy the barrier." }
+        if ($Condition -notin @('playerLoaded', 'upscalingStable') -and -not [string]::IsNullOrWhiteSpace($ExpectedCell)) { throw '-ExpectedCell is valid only with Condition playerLoaded or upscalingStable.' }
         if ($Condition -ne 'upscalingStable' -and -not [string]::IsNullOrWhiteSpace($ExpectedProfileJson)) { throw '-ExpectedProfileJson is valid only with Condition upscalingStable.' }
         $expectedUpscalingProfile = $null
         if (-not [string]::IsNullOrWhiteSpace($ExpectedProfileJson)) {
@@ -1160,8 +1156,6 @@ try {
         $lastProgressUtc = [DateTime]::MinValue
         $firstCpu = $null
         $lastCpu = $null
-        $playerTransitionObserved = [bool]$LoadAlreadyQueued
-        $playerInitialState = $null
         $menuDismissals = [Collections.Generic.List[object]]::new()
         $menuStableSinceUtc = $null
         $stableCandidateCount = 0
@@ -1265,22 +1259,33 @@ try {
             elseif ($Condition -eq 'playerLoaded') {
                 try {
                     $state = @(Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'state' } -Headers $headers).content | Select-Object -First 1
-                    $loaded = [bool]$state.playerLoaded
-                    if ($null -eq $playerInitialState) { $playerInitialState = $loaded }
-                    if (-not $loaded) { $playerTransitionObserved = $true }
-                    $fresh = [bool]$AcceptAlreadyLoaded -or $playerTransitionObserved
+                    $scene = @(Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'scene' } -Headers $headers).content | Select-Object -First 1
+                    $actualCell = if ($scene.cell -is [string]) {
+                        [string]$scene.cell
+                    }
+                    elseif ($scene.cell -and $scene.cell.PSObject.Properties['editorId']) {
+                        [string]$scene.cell.editorId
+                    }
+                    else { $null }
+                    $cellMatches = [string]::Equals($actualCell, $ExpectedCell, [StringComparison]::OrdinalIgnoreCase)
                     $observation = [pscustomobject][ordered]@{
-                        satisfied = $loaded -and $fresh; state = $state; retryable = $false; probeError = $null
-                        initialPlayerLoaded = $playerInitialState; freshTransitionObserved = $playerTransitionObserved
-                        acceptAlreadyLoaded = [bool]$AcceptAlreadyLoaded
-                        loadAlreadyQueued = [bool]$LoadAlreadyQueued
+                        satisfied = [bool]$state.playerLoaded -and $cellMatches
+                        state = $state
+                        scene = $scene
+                        playerLoaded = [bool]$state.playerLoaded
+                        expectedCell = $ExpectedCell
+                        actualCell = $actualCell
+                        cellMatches = $cellMatches
+                        completionBasis = 'current-state'
+                        retryable = $false
+                        probeError = $null
                     }
                 }
                 catch {
                     if (-not (Test-WaitRetryableException -Exception $_.Exception)) { throw }
                     Close-McpSessionForRebind -Headers $headers | Out-Null
                     $headers = $null
-                    $observation = [pscustomobject][ordered]@{ satisfied = $false; state = $null; retryable = $true; probeError = $_.Exception.Message }
+                    $observation = [pscustomobject][ordered]@{ satisfied = $false; state = $null; scene = $null; expectedCell = $ExpectedCell; retryable = $true; probeError = $_.Exception.Message }
                 }
             }
             elseif ($Condition -eq 'upscalingStable') {
