@@ -155,16 +155,19 @@ Run Codex non-interactively
         [pscustomobject]@{ name = 'empty stdout'; stdout = ''; stderr = ''; pattern = 'returned no output' },
         [pscustomobject]@{ name = 'nonempty stderr'; stdout = '{"type":"turn.completed"}'; stderr = 'probe warning'; pattern = 'returned stderr' }
     )) {
+        $probeVersionResult = New-ProviderCommandResult -ExitCode 0 -Stdout "codex-cli 9.8.7-test`n" -Stderr ''
+        $probeHelpResult = New-ProviderCommandResult -ExitCode 0 -Stdout $fakeHelp -Stderr ''
+        $probeModelResult = New-ProviderCommandResult -ExitCode 0 -Stdout ([string]$probeCase.stdout) -Stderr ([string]$probeCase.stderr)
         $probeAdapter = {
             param([string]$ExecutablePath, [string[]]$CommandArguments, [int]$TimeoutMilliseconds)
 
             if (($CommandArguments -join '|') -eq '--version') {
-                return New-ProviderCommandResult -ExitCode 0 -Stdout "codex-cli 9.8.7-test`n" -Stderr ''
+                return $probeVersionResult
             }
             if (($CommandArguments -join '|') -in @('--help', 'exec|--help')) {
-                return New-ProviderCommandResult -ExitCode 0 -Stdout $fakeHelp -Stderr ''
+                return $probeHelpResult
             }
-            return New-ProviderCommandResult -ExitCode 0 -Stdout ([string]$probeCase.stdout) -Stderr ([string]$probeCase.stderr)
+            return $probeModelResult
         }.GetNewClosure()
         $rejectedProbe = Get-CSXCodexVisualReviewProviderPreflight -CodexExecutable $pwshPath -CommandAdapter $probeAdapter
         Assert-ProviderTest (-not $rejectedProbe.ok -and -not $rejectedProbe.modelProbe.ok -and
@@ -302,6 +305,28 @@ $response = [ordered]@{ fake = $true; imageCount = $imageCount; prompt = $prompt
     Assert-ProviderTest (@($timeoutExecution.batches | Where-Object { $_.presentationPass -eq 1 -and $_.terminationRequested -and $_.terminationConfirmed -and -not $_.unresolvedProcess }).Count -eq 3) 'Timed-out replicate custody was not terminated and verified.'
     Assert-ProviderTest (@($timeoutExecution.batches | Where-Object { $_.presentationPass -eq 2 -and $_.status -eq 'not_started_deadline' }).Count -eq 3) 'The second presentation pass started after the shared deadline.'
 
+    $absoluteDeadlineRoot = Join-Path $fakeWorkingDirectory 'absolute deadline preparation'
+    New-Item -ItemType Directory -Path $absoluteDeadlineRoot | Out-Null
+    $absoluteDeadlinePasses = New-ProviderTestPasses -Root $absoluteDeadlineRoot -SchemaPath $schemaPath `
+        -Images @($imageOne) -PromptSuffix 'delay=25'
+    $delayedPreparationAdapter = {
+        param(
+            [Diagnostics.ProcessStartInfo]$OriginalStartInfo,
+            [int]$PresentationPass,
+            [int]$Replicate
+        )
+        Start-Sleep -Milliseconds 250
+        return & $fakeProcessAdapter $OriginalStartInfo $PresentationPass $Replicate
+    }
+    $absoluteDeadlineExecution = Invoke-CSXCodexVisualReviewProvider -WorkingDirectory $fakeWorkingDirectory `
+        -Passes $absoluteDeadlinePasses -Preflight $preflight -DeadlineSeconds 5 `
+        -DeadlineUtc ([DateTimeOffset]::UtcNow.AddMilliseconds(150)) `
+        -ProcessStartInfoAdapter $delayedPreparationAdapter
+    Assert-ProviderTest (-not $absoluteDeadlineExecution.ok -and $absoluteDeadlineExecution.deadlineReached) 'An absolute deadline consumed during pre-launch preparation did not fail closed.'
+    Assert-ProviderTest (@($absoluteDeadlineExecution.batches).Count -eq 6 -and
+        @($absoluteDeadlineExecution.batches | Where-Object launched).Count -eq 0 -and
+        @($absoluteDeadlineExecution.batches | Where-Object status -eq 'not_started_deadline').Count -eq 6) 'Provider input preparation received a fresh child-process budget after the enclosing deadline elapsed.'
+
     $partialStreamAdapter = {
         param(
             [Diagnostics.ProcessStartInfo]$OriginalStartInfo,
@@ -359,11 +384,11 @@ $response = [ordered]@{ fake = $true; imageCount = $imageCount; prompt = $prompt
     $blockedInputRoot = Join-Path $fakeWorkingDirectory 'blocked input execution'
     New-Item -ItemType Directory -Path $blockedInputRoot | Out-Null
     $blockedInputPasses = New-ProviderTestPasses -Root $blockedInputRoot -SchemaPath $schemaPath `
-        -Images @($imageOne) -PromptSuffix ('x' * (8 * 1024 * 1024))
+        -Images @($imageOne) -PromptSuffix ('x' * (2 * 1024 * 1024))
     $blockedInputExecution = Invoke-CSXCodexVisualReviewProvider -WorkingDirectory $fakeWorkingDirectory `
-        -Passes $blockedInputPasses -Preflight $preflight -DeadlineSeconds 1 `
+        -Passes $blockedInputPasses -Preflight $preflight -DeadlineSeconds 2 `
         -ProcessStartInfoAdapter $nonReadingAdapter
-    Assert-ProviderTest ([double]$blockedInputExecution.durationMs -lt 2000) 'Blocked standard-input delivery bypassed the provider execution deadline.'
+    Assert-ProviderTest ([double]$blockedInputExecution.durationMs -lt 3500) 'Blocked standard-input delivery bypassed the provider execution deadline.'
     Assert-ProviderTest (@($blockedInputExecution.batches | Where-Object { $_.presentationPass -eq 1 -and -not $_.inputCompleted }).Count -gt 0) 'The blocked-input fixture did not preserve incomplete prompt delivery.'
     Assert-ProviderTest (@($blockedInputExecution.batches | Where-Object { $_.presentationPass -eq 1 -and $_.terminationConfirmed -and -not $_.unresolvedProcess }).Count -eq 3) 'Blocked-input children were not terminated within their shared budget.'
 

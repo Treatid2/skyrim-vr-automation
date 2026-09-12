@@ -1450,44 +1450,97 @@ try {
     Assert-Test ($custody.batches.Count -eq 1 -and $custody.batches[0].processId -eq 4242 -and
         $custody.batches[0].unresolvedProcess -and $custody.batches[0].terminationRequested -and
         -not $custody.batches[0].terminationConfirmed) 'Provider custody projection lost an unresolved child identity or termination state.'
+    $preflightCustody = New-CSXProviderCustodyEvidence ([pscustomobject]@{
+        model = 'test-model'; errors = @('model probe left unresolved PID 4343')
+        processes = [pscustomobject]@{
+            modelProbe = [pscustomobject]@{
+                launched = $true; processId = 4343; exitCode = $null; timedOut = $true; setupError = 'stream setup failed'
+                exitVerified = $false; terminationRequested = $true; terminationConfirmed = $false
+                unresolvedProcess = $true; streamDrainComplete = $false; inputCompleted = $false
+                terminationErrors = @('termination refused')
+            }
+        }
+    })
+    Assert-Test ($preflightCustody.preflightProcesses.Count -eq 1 -and
+        $preflightCustody.preflightProcesses[0].processId -eq 4343 -and
+        $preflightCustody.preflightProcesses[0].unresolvedProcess -and
+        -not $preflightCustody.preflightProcesses[0].streamDrainComplete -and
+        -not $preflightCustody.preflightProcesses[0].inputCompleted -and
+        @($preflightCustody.preflightErrors) -contains 'model probe left unresolved PID 4343') 'Preflight custody projection lost the child identity, stream/input state, or original failure.'
 
     $terminalBudgetRoot = Join-Path $fixture 'terminal-budget'
     New-Item -ItemType Directory -Path $terminalBudgetRoot -Force | Out-Null
-    $timelyReceiptPath = Join-Path $terminalBudgetRoot 'timely-completion.json'
-    $timelyReceipt = [pscustomobject][ordered]@{
-        within600Seconds = $true; completedUtc = $null; invocationElapsedMs = 0.0; evidenceFinalizationElapsedMs = 0.0
+    function New-TerminalCommitFixture([string]$Root, [string]$RunId) {
+        New-Item -ItemType Directory -Path $Root -Force | Out-Null
+        foreach ($name in @('run.json', 'run.raw.json', 'visual-review.json')) {
+            Write-CSXJsonFile -Path (Join-Path $Root $name) -Value ([pscustomobject]@{ runId = $RunId; artifact = $name }) | Out-Null
+        }
+        [IO.File]::WriteAllText((Join-Path $Root 'summary.md'), 'summary', [Text.UTF8Encoding]::new($false))
+        $startedUtc = [DateTimeOffset]::UtcNow.AddSeconds(-1)
+        return [pscustomobject][ordered]@{
+            schema = 'csx-render-scale-qualification-completion-v1'; runId = $RunId
+            invocationStartedUtc = $startedUtc.ToString('o'); completedUtc = $null
+            resultDeadlineUtc = [DateTimeOffset]::UtcNow.AddSeconds(5).ToString('o')
+            invocationElapsedMs = 0.0; evidenceFinalizationElapsedMs = 0.0; within600Seconds = $false
+            runPath = 'run.json'; runSha256 = Get-CSXFileSha256 (Join-Path $Root 'run.json')
+            rawPath = 'run.raw.json'; rawSha256 = Get-CSXFileSha256 (Join-Path $Root 'run.raw.json')
+            visualReviewPath = 'visual-review.json'; visualReviewSha256 = Get-CSXFileSha256 (Join-Path $Root 'visual-review.json')
+        }
     }
+    $timelyRoot = Join-Path $terminalBudgetRoot 'timely'
+    $timelyReceipt = New-TerminalCommitFixture -Root $timelyRoot -RunId 'timely-run'
+    $timelyReceiptPath = Join-Path $timelyRoot 'qualification-completion.json'
     $timelyInvocationWatch = [Diagnostics.Stopwatch]::StartNew()
     $timelyFinalizationWatch = [Diagnostics.Stopwatch]::StartNew()
-    $timelyTerminal = Complete-CSXSealedQualification -EvidenceDirectory $terminalBudgetRoot -CompletionPath $timelyReceiptPath `
+    $timelyTerminal = Complete-CSXSealedQualification -EvidenceDirectory $timelyRoot -CompletionPath $timelyReceiptPath `
         -CompletionReceipt $timelyReceipt -InvocationWatch $timelyInvocationWatch -FinalizationWatch $timelyFinalizationWatch `
         -ResultDeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) -EndToEndBudgetMs 5000 -FinalizationBudgetMs 5000 `
         -Finalizer { param($root) [pscustomobject]@{ report = [pscustomobject]@{ status = 'PASS' }; runPath = (Join-Path $root 'run.json'); summaryPath = (Join-Path $root 'summary.md') } }
     Assert-Test ($timelyTerminal.completionReceipt.within600Seconds -and
         (Get-Content -LiteralPath $timelyReceiptPath -Raw | ConvertFrom-Json).within600Seconds) 'A timely mandatory terminal validation was not retained as complete.'
 
-    $lateReceiptPath = Join-Path $terminalBudgetRoot 'late-completion.json'
-    $lateReceipt = [pscustomobject][ordered]@{
-        within600Seconds = $true; completedUtc = $null; invocationElapsedMs = 0.0; evidenceFinalizationElapsedMs = 0.0
-    }
+    $lateRoot = Join-Path $terminalBudgetRoot 'late'
+    $lateReceipt = New-TerminalCommitFixture -Root $lateRoot -RunId 'late-run'
+    $lateReceiptPath = Join-Path $lateRoot 'qualification-completion.json'
     $lateInvocationWatch = [Diagnostics.Stopwatch]::StartNew()
     $lateFinalizationWatch = [Diagnostics.Stopwatch]::StartNew()
     $lateTerminalRejected = $false
     try {
-        Complete-CSXSealedQualification -EvidenceDirectory $terminalBudgetRoot -CompletionPath $lateReceiptPath `
+        Complete-CSXSealedQualification -EvidenceDirectory $lateRoot -CompletionPath $lateReceiptPath `
             -CompletionReceipt $lateReceipt -InvocationWatch $lateInvocationWatch -FinalizationWatch $lateFinalizationWatch `
             -ResultDeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) -EndToEndBudgetMs 5000 -FinalizationBudgetMs 25 `
             -Finalizer { param($root) Start-Sleep -Milliseconds 75; [pscustomobject]@{ report = [pscustomobject]@{ status = 'PASS' }; runPath = (Join-Path $root 'run.json'); summaryPath = (Join-Path $root 'summary.md') } } | Out-Null
     }
     catch { $lateTerminalRejected = $_.Exception.Message -match 'mandatory sealed-result validation' }
-    $lateRecordedReceipt = Get-Content -LiteralPath $lateReceiptPath -Raw | ConvertFrom-Json
-    Assert-Test ($lateTerminalRejected -and -not $lateRecordedReceipt.within600Seconds -and
-        [double]$lateRecordedReceipt.evidenceFinalizationElapsedMs -gt 25) 'A delayed mandatory terminal validation returned or retained a timely-success claim.'
+    Assert-Test ($lateTerminalRejected -and -not (Test-Path -LiteralPath $lateReceiptPath)) 'A delayed mandatory terminal validation published an acceptance-valid completion receipt.'
 
-    $providerCustodyOffset = $runnerSource.IndexOf('$script:providerCustodyEvidence = New-CSXProviderCustodyEvidence', [StringComparison]::Ordinal)
+    $failedCommitRoot = Join-Path $terminalBudgetRoot 'failed-commit'
+    $failedCommitReceipt = New-TerminalCommitFixture -Root $failedCommitRoot -RunId 'failed-commit-run'
+    $failedCommitPath = Join-Path $failedCommitRoot 'qualification-completion.json'
+    $failedCommitRejected = $false
+    try {
+        Complete-CSXSealedQualification -EvidenceDirectory $failedCommitRoot -CompletionPath $failedCommitPath `
+            -CompletionReceipt $failedCommitReceipt -InvocationWatch ([Diagnostics.Stopwatch]::StartNew()) `
+            -FinalizationWatch ([Diagnostics.Stopwatch]::StartNew()) -ResultDeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) `
+            -EndToEndBudgetMs 5000 -FinalizationBudgetMs 5000 `
+            -Finalizer { param($root) [pscustomobject]@{ report = [pscustomobject]@{ status = 'PASS' }; runPath = (Join-Path $root 'run.json'); summaryPath = (Join-Path $root 'summary.md') } } `
+            -CompletionCommitter { param($staged, $destination) throw 'simulated terminal publication failure' } | Out-Null
+    }
+    catch { $failedCommitRejected = $_.Exception.Message -match 'simulated terminal publication failure' }
+    $failedCommitValidation = Test-CSXQualificationCompletionReceipt -EvidenceRoot $failedCommitRoot -ExpectedRunId 'failed-commit-run'
+    Assert-Test ($failedCommitRejected -and -not (Test-Path -LiteralPath $failedCommitPath) -and
+        -not $failedCommitValidation.ok) 'A failed terminal commit left an acceptance-valid completion receipt for an ordinary consumer.'
+
+    $providerCustodyOffset = $runnerSource.IndexOf('$script:providerCustodyEvidence = New-CSXProviderCustodyEvidence $visualProviderPreflight', [StringComparison]::Ordinal)
+    $providerBudgetOffset = $runnerSource.IndexOf("Assert-CSXResultBudget -Stage 'post-provider admission'", [StringComparison]::Ordinal)
+    $executionCustodyOffset = $runnerSource.IndexOf('$script:providerCustodyEvidence = New-CSXProviderCustodyEvidence $execution', [StringComparison]::Ordinal)
     $providerReceiptOffset = $runnerSource.IndexOf('$executionPath = Write-CSXJsonFile', [StringComparison]::Ordinal)
-    Assert-Test ($providerCustodyOffset -ge 0 -and $providerReceiptOffset -gt $providerCustodyOffset -and
+    Assert-Test ($providerCustodyOffset -ge 0 -and $providerBudgetOffset -gt $providerCustodyOffset -and
+        $executionCustodyOffset -ge 0 -and $providerReceiptOffset -gt $executionCustodyOffset -and
         $runnerSource -match 'providerCustody = \$script:providerCustodyEvidence') 'Runner does not preserve provider custody before fallible execution-receipt publication.'
+    Assert-Test ($runnerSource.Contains('-DeadlineUtc $evaluationDeadlineUtc') -and
+        $runnerSource.Contains('$completionPath = Join-Path $script:evidenceRoot ''qualification-completion.json''') -and
+        -not $runnerSource.Contains('$completionPath = Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot ''qualification-completion.json'')')) 'Runner restarts the visual deadline or publishes acceptance before mandatory terminal validation.'
     Assert-Test ($runnerSource.Contains('New-CSXMcpConnection -Runtime $script:runtime -DeadlineUtc $connectionDeadlineUtc') -and
         $runnerSource.Contains("-ClientName 'CSXRenderScaleQualificationCleanup'") -and
         $runnerSource.Contains('-DeadlineUtc $script:resultDeadlineUtc')) 'Runner does not bind normal and cleanup MCP session establishment to the shared result deadline.'

@@ -1029,7 +1029,7 @@ function New-VisualReviewAlias([string]$SourcePath, [string]$AliasPath) {
     if ((Get-CSXFileSha256 $AliasPath) -ne (Get-CSXFileSha256 $SourcePath)) { throw 'Visual-review alias hash differs from its source image.' }
 }
 
-function Invoke-AutomatedVisualEvaluation($CandidateIndex, $BaselineIndex, $ProviderPreflight, [int]$DeadlineSeconds) {
+function Invoke-AutomatedVisualEvaluation($CandidateIndex, $BaselineIndex, $ProviderPreflight, [int]$DeadlineSeconds, [DateTimeOffset]$DeadlineUtc) {
     $evaluation = $script:protocol.visualAssay.evaluation
     $reviewRoot = Join-Path $script:evidenceRoot 'visual-review'
     $promptRelative = 'visual-review/prompt.v1.md'
@@ -1140,8 +1140,12 @@ function Invoke-AutomatedVisualEvaluation($CandidateIndex, $BaselineIndex, $Prov
             }
             $passes.Add([pscustomobject][ordered]@{ presentationPass = $presentationPass; batches = @($providerBatches) })
         }
+        if ([DateTimeOffset]::UtcNow -ge $DeadlineUtc) {
+            throw 'The unattended visual-evaluation deadline elapsed during request preparation.'
+        }
         $execution = Invoke-CSXCodexVisualReviewProvider -WorkingDirectory $reviewRoot -Passes @($passes) `
-            -CodexExecutable $CodexExecutable -Preflight $ProviderPreflight -DeadlineSeconds $DeadlineSeconds
+            -CodexExecutable $CodexExecutable -Preflight $ProviderPreflight -DeadlineSeconds $DeadlineSeconds `
+            -DeadlineUtc $DeadlineUtc
         $script:providerCustodyEvidence = New-CSXProviderCustodyEvidence $execution
         if ($null -ne $assays.visual) {
             $assays.visual | Add-Member -NotePropertyName providerCustody -NotePropertyValue $script:providerCustodyEvidence -Force
@@ -1708,6 +1712,7 @@ try {
     $providerProbeTimeoutMs = [int][Math]::Min(30000, [Math]::Max(1000, $providerBudgetMs - (3 * $providerCommandTimeoutMs)))
     $visualProviderPreflight = Get-CSXCodexVisualReviewProviderPreflight -CodexExecutable $CodexExecutable `
         -CommandTimeoutMilliseconds $providerCommandTimeoutMs -ModelProbeTimeoutMilliseconds $providerProbeTimeoutMs
+    $script:providerCustodyEvidence = New-CSXProviderCustodyEvidence $visualProviderPreflight
     Assert-CSXResultBudget -Stage 'post-provider admission' -ReserveMs ([int]$script:protocol.timeBudget.evidenceFinalizationMs)
     Write-CSXJsonFile -Path (Join-Path $reviewRoot 'preflight.json') -Value $visualProviderPreflight | Out-Null
     if (-not [bool]$visualProviderPreflight.ok) {
@@ -2074,9 +2079,10 @@ try {
     $evaluationBudgetMs = [int]$script:protocol.timeBudget.visualEvaluationMs
     if ($remainingOrchestrationMs -lt $evaluationBudgetMs) { throw 'The exact 90-second unattended visual-evaluation allocation no longer fits inside the orchestration deadline.' }
     $evaluationDeadlineSeconds = [int]($evaluationBudgetMs / 1000)
+    $evaluationDeadlineUtc = [DateTimeOffset]::UtcNow.AddMilliseconds($evaluationBudgetMs)
     $evaluationWatch = [Diagnostics.Stopwatch]::StartNew()
     $automatedReview = Invoke-AutomatedVisualEvaluation -CandidateIndex $visualIndex -BaselineIndex $baselineIndex `
-        -ProviderPreflight $visualProviderPreflight -DeadlineSeconds $evaluationDeadlineSeconds
+        -ProviderPreflight $visualProviderPreflight -DeadlineSeconds $evaluationDeadlineSeconds -DeadlineUtc $evaluationDeadlineUtc
     $evaluationWatch.Stop()
     $timeEvidence.visualEvaluationElapsedMs = [Math]::Round($evaluationWatch.Elapsed.TotalMilliseconds, 3)
     if ($timeEvidence.visualEvaluationElapsedMs -gt [int]$script:protocol.timeBudget.visualEvaluationMs) {
@@ -2140,14 +2146,11 @@ try {
         rawPath = 'run.raw.json'; rawSha256 = Get-CSXFileSha256 $rawPath
         visualReviewPath = 'visual-review.json'; visualReviewSha256 = Get-CSXFileSha256 (Join-Path $script:evidenceRoot 'visual-review.json')
     }
-    $completionPath = Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'qualification-completion.json') -Value $completionReceipt
+    $completionPath = Join-Path $script:evidenceRoot 'qualification-completion.json'
     $sealedFinalizationElapsedMs = [Math]::Round($finalizationWatch.Elapsed.TotalMilliseconds, 3)
     if ($script:invocationWatch.Elapsed.TotalMilliseconds -gt [double]$script:protocol.timeBudget.endToEndMs -or
         $sealedFinalizationElapsedMs -gt [double]$script:protocol.timeBudget.evidenceFinalizationMs -or
         [DateTimeOffset]::UtcNow -gt $script:resultDeadlineUtc) {
-        $completionReceipt.within600Seconds = $false
-        $completionReceipt.evidenceFinalizationElapsedMs = $sealedFinalizationElapsedMs
-        Write-CSXJsonFile -Path $completionPath -Value $completionReceipt | Out-Null
         throw 'The qualification completion receipt crossed its complete invocation or evidence-finalization deadline.'
     }
     $terminal = Complete-CSXSealedQualification -EvidenceDirectory $script:evidenceRoot -CompletionPath $completionPath `
@@ -2182,6 +2185,14 @@ catch {
         $script:invocationWatch.Elapsed.TotalMilliseconds -le $(if ($script:protocol) { [double]$script:protocol.timeBudget.endToEndMs } else { 600000 }) -and
         [DateTimeOffset]::UtcNow -le $script:resultDeadlineUtc
     $timeEvidence.performanceElapsedMs = [Math]::Round($performanceWatch.Elapsed.TotalMilliseconds, 3)
+    if ($null -ne $script:providerCustodyEvidence) {
+        if ($null -eq $assays.visual) {
+            $assays.visual = [pscustomobject][ordered]@{ providerCustody = $script:providerCustodyEvidence }
+        }
+        else {
+            $assays.visual | Add-Member -NotePropertyName providerCustody -NotePropertyValue $script:providerCustodyEvidence -Force
+        }
+    }
     if (-not $script:evidenceWritable) {
         $result = [pscustomobject][ordered]@{
             ok = $false; status = 'INFRASTRUCTURE_ERROR'; runPath = $null
