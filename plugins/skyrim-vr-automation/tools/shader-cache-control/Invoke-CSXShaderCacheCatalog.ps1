@@ -63,6 +63,7 @@ param(
     [ValidateRange(1, 3600)]
     [int]$InventoryTimeoutSeconds = 120,
     [switch]$NoExit,
+    [switch]$IncludeInventoryEntries,
     [switch]$Compact
 )
 
@@ -93,6 +94,30 @@ function Get-SafeName([string]$Value) {
     $safe = ($Value -replace '[^A-Za-z0-9._-]+', '-').Trim('-', '.')
     if ([string]::IsNullOrWhiteSpace($safe)) { return 'snapshot' }
     return $safe.Substring(0, [Math]::Min(64, $safe.Length))
+}
+
+function ConvertTo-BoundedCatalogOutput($Value) {
+    if ($null -eq $Value -or $Value -is [string] -or $Value -is [ValueType]) { return $Value }
+    if ($Value -is [Collections.IDictionary]) {
+        $properties = @($Value.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Key; Value = $_.Value } })
+    }
+    elseif ($Value -is [Collections.IEnumerable] -and $Value -isnot [pscustomobject]) {
+        return ,@($Value | ForEach-Object { ConvertTo-BoundedCatalogOutput $_ })
+    }
+    else {
+        $properties = @($Value.PSObject.Properties)
+    }
+    $bounded = [ordered]@{}
+    foreach ($property in $properties) {
+        $name = [string]$property.Name
+        if ($name -eq 'entries' -and $null -ne $property.Value) {
+            $bounded['inventoryEntryCount'] = @($property.Value).Count
+            $bounded['inventoryEntriesOmitted'] = $true
+            continue
+        }
+        $bounded[$name] = ConvertTo-BoundedCatalogOutput $property.Value
+    }
+    return [pscustomobject]$bounded
 }
 
 function Assert-SafeDirectory([string]$Path, [string]$Purpose, [switch]$MustExist) {
@@ -1159,5 +1184,15 @@ catch {
     $result = [pscustomobject][ordered]@{ contractVersion = $contractVersion; ok = $false; command = $Command; state = 'tool-error'; data = $null; errors = @($_.Exception.Message) }
 }
 
-$result | ConvertTo-Json -Depth 40 -Compress:$Compact
+$outputResult = if ($Command -in @('prepare', 'complete') -and -not $IncludeInventoryEntries) {
+    $bounded = ConvertTo-BoundedCatalogOutput $result
+    $bounded | Add-Member -NotePropertyName output -NotePropertyValue ([pscustomobject][ordered]@{
+        mode = 'bounded'
+        inventoryEntries = 'retained-in-durable-receipts'
+        includeInventoryEntries = $false
+    })
+    $bounded
+}
+else { $result }
+$outputResult | ConvertTo-Json -Depth 40 -Compress:$Compact
 if (-not $result.ok -and -not $NoExit) { exit 2 }
