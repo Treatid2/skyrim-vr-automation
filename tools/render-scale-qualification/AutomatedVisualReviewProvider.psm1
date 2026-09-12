@@ -744,10 +744,20 @@ function Invoke-CSXCodexVisualReviewProvider {
         [string]$CodexExecutable = 'codex',
         $Preflight,
         [ValidateRange(1, 90)][int]$DeadlineSeconds = 90,
+        [DateTimeOffset]$DeadlineUtc = [DateTimeOffset]::MinValue,
         [scriptblock]$PreflightCommandAdapter,
         [scriptblock]$ProcessStartInfoAdapter,
         [scriptblock]$ProcessTerminationAdapter
     )
+
+    $executionStartedUtc = [DateTimeOffset]::UtcNow
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $relativeDeadlineUtc = $executionStartedUtc.AddSeconds($DeadlineSeconds)
+    $effectiveDeadlineUtc = if ($DeadlineUtc -eq [DateTimeOffset]::MinValue -or $DeadlineUtc -gt $relativeDeadlineUtc) {
+        $relativeDeadlineUtc
+    }
+    else { $DeadlineUtc }
+    $budgetMilliseconds = [int64][Math]::Max(0, [Math]::Floor(($effectiveDeadlineUtc - $executionStartedUtc).TotalMilliseconds))
 
     if (-not [IO.Path]::IsPathFullyQualified($WorkingDirectory)) {
         throw 'WorkingDirectory must be absolute.'
@@ -825,11 +835,8 @@ function Invoke-CSXCodexVisualReviewProvider {
         })
     }
 
-    $executionStartedUtc = [DateTimeOffset]::UtcNow
-    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
-    $budgetMilliseconds = [int64]$DeadlineSeconds * 1000
     $terminationReserveMilliseconds = [int64][Math]::Min(1000, [Math]::Max(100, $budgetMilliseconds / 10))
-    $processDeadlineMilliseconds = $budgetMilliseconds - $terminationReserveMilliseconds
+    $processDeadlineMilliseconds = [int64][Math]::Max(0, $budgetMilliseconds - $terminationReserveMilliseconds)
     $results = [Collections.Generic.List[object]]::new()
     $deadlineReached = $false
 
@@ -853,8 +860,6 @@ function Invoke-CSXCodexVisualReviewProvider {
                     -CompletedUtc ([DateTimeOffset]::UtcNow)))
                 continue
             }
-            $startedUtc = [DateTimeOffset]::UtcNow
-            $startedElapsedMs = $stopwatch.Elapsed.TotalMilliseconds
             $process = [Diagnostics.Process]::new()
             $effectiveStartInfo = $batch.startInfo
             if ($ProcessStartInfoAdapter) {
@@ -863,6 +868,16 @@ function Invoke-CSXCodexVisualReviewProvider {
                     throw 'ProcessStartInfoAdapter must return System.Diagnostics.ProcessStartInfo.'
                 }
             }
+            if ($stopwatch.ElapsedMilliseconds -ge $processDeadlineMilliseconds) {
+                $process.Dispose()
+                $deadlineReached = $true
+                $results.Add((New-CSXProviderUnstartedResult -Batch $batch `
+                    -PresentationPass $pass.presentationPass -Reason 'The shared provider deadline elapsed during pre-launch preparation.' `
+                    -CompletedUtc ([DateTimeOffset]::UtcNow)))
+                continue
+            }
+            $startedUtc = [DateTimeOffset]::UtcNow
+            $startedElapsedMs = $stopwatch.Elapsed.TotalMilliseconds
             $process.StartInfo = $effectiveStartInfo
             $context = [pscustomobject][ordered]@{
                 batch = $batch

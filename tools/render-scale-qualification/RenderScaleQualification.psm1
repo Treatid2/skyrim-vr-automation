@@ -3693,13 +3693,21 @@ function Test-CSXSha256Text {
 function Test-CSXQualificationCompletionReceipt {
     param(
         [Parameter(Mandatory)][string]$EvidenceRoot,
-        [Parameter(Mandatory)][string]$ExpectedRunId
+        [Parameter(Mandatory)][string]$ExpectedRunId,
+        [string]$CompletionPath
     )
     $errors = [Collections.Generic.List[string]]::new()
     $root = [IO.Path]::GetFullPath($EvidenceRoot)
-    $path = Join-Path $root 'qualification-completion.json'
+    $path = if ([string]::IsNullOrWhiteSpace($CompletionPath)) {
+        Join-Path $root 'qualification-completion.json'
+    }
+    else { [IO.Path]::GetFullPath($CompletionPath) }
     $receipt = $null
     try {
+        $rootPrefix = $root.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+        if (-not $path.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The qualification completion receipt path is outside the evidence root.'
+        }
         if (Test-Path -LiteralPath (Join-Path $root 'qualification-package-rejection.json') -PathType Leaf) {
             throw 'The qualification was rejected by its outer package deadline.'
         }
@@ -4967,11 +4975,41 @@ function Update-CSXQualificationReport {
 }
 
 function New-CSXProviderCustodyEvidence($Execution) {
+    $preflight = Get-CSXPropertyValue $Execution 'preflight'
+    if ($null -eq $preflight -and $null -ne (Get-CSXPropertyValue $Execution 'processes')) { $preflight = $Execution }
+    $preflightProcesses = [Collections.Generic.List[object]]::new()
+    $processEvidence = Get-CSXPropertyValue $preflight 'processes'
+    foreach ($definition in @(
+        [pscustomobject]@{ name = 'version'; label = 'Codex --version' },
+        [pscustomobject]@{ name = 'rootHelp'; label = 'Codex --help' },
+        [pscustomobject]@{ name = 'execHelp'; label = 'Codex exec --help' },
+        [pscustomobject]@{ name = 'modelProbe'; label = 'Codex model capability probe' }
+    )) {
+        $process = Get-CSXPropertyValue $processEvidence $definition.name
+        if ($null -eq $process) { continue }
+        $preflightProcesses.Add([pscustomobject][ordered]@{
+            label = $definition.label
+            launched = [bool](Get-CSXPropertyValue $process 'launched' $false)
+            processId = Get-CSXPropertyValue $process 'processId'
+            exitCode = Get-CSXPropertyValue $process 'exitCode'
+            timedOut = [bool](Get-CSXPropertyValue $process 'timedOut' $false)
+            setupError = Get-CSXPropertyValue $process 'setupError'
+            exitVerified = [bool](Get-CSXPropertyValue $process 'exitVerified' $false)
+            terminationRequested = [bool](Get-CSXPropertyValue $process 'terminationRequested' $false)
+            terminationConfirmed = [bool](Get-CSXPropertyValue $process 'terminationConfirmed' $false)
+            unresolvedProcess = [bool](Get-CSXPropertyValue $process 'unresolvedProcess' $false)
+            streamDrainComplete = [bool](Get-CSXPropertyValue $process 'streamDrainComplete' $false)
+            inputCompleted = [bool](Get-CSXPropertyValue $process 'inputCompleted' $false)
+            terminationErrors = @((Get-CSXPropertyValue $process 'terminationErrors' @()))
+        })
+    }
     return [pscustomobject][ordered]@{
         schema = 'csx-render-scale-provider-custody-v1'
-        provider = [string](Get-CSXPropertyValue $Execution 'provider')
+        provider = [string](Get-CSXPropertyValue $Execution 'provider' 'codex_cli')
         model = [string](Get-CSXPropertyValue $Execution 'model')
         deadlineReached = [bool](Get-CSXPropertyValue $Execution 'deadlineReached' $false)
+        preflightErrors = @((Get-CSXPropertyValue $preflight 'errors' @()))
+        preflightProcesses = @($preflightProcesses)
         errors = @((Get-CSXPropertyValue $Execution 'errors' @()))
         batches = @((Get-CSXPropertyValue $Execution 'batches' @()) | ForEach-Object {
             [pscustomobject][ordered]@{
@@ -5005,18 +5043,26 @@ function Complete-CSXSealedQualification {
         [Parameter(Mandatory)][double]$FinalizationBudgetMs,
         [scriptblock]$Finalizer = {
             param($EvidenceRoot)
-            Update-CSXQualificationReport -EvidenceDirectory $EvidenceRoot
+            Update-CSXQualificationReport -EvidenceDirectory $EvidenceRoot -AllowUnsealedSuccess
+        },
+        [scriptblock]$CompletionCommitter = {
+            param($StagedPath, $DestinationPath)
+            Move-Item -LiteralPath $StagedPath -Destination $DestinationPath
         }
     )
+    $root = [IO.Path]::GetFullPath($EvidenceDirectory)
+    $completionFullPath = [IO.Path]::GetFullPath($CompletionPath)
+    $rootPrefix = $root.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    if (-not $completionFullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The qualification completion path is outside the evidence root.'
+    }
+    if (Test-Path -LiteralPath $completionFullPath) {
+        throw 'The qualification completion path already exists before terminal commit.'
+    }
     try {
         $updated = & $Finalizer $EvidenceDirectory
     }
     catch {
-        $CompletionReceipt.within600Seconds = $false
-        $CompletionReceipt.completedUtc = [DateTimeOffset]::UtcNow.ToString('o')
-        $CompletionReceipt.invocationElapsedMs = [Math]::Round($InvocationWatch.Elapsed.TotalMilliseconds, 3)
-        $CompletionReceipt.evidenceFinalizationElapsedMs = [Math]::Round($FinalizationWatch.Elapsed.TotalMilliseconds, 3)
-        try { Write-CSXJsonFile -Path $CompletionPath -Value $CompletionReceipt | Out-Null } catch {}
         throw
     }
 
@@ -5026,19 +5072,57 @@ function Complete-CSXSealedQualification {
     $CompletionReceipt.within600Seconds = $CompletionReceipt.invocationElapsedMs -le $EndToEndBudgetMs -and
         $CompletionReceipt.evidenceFinalizationElapsedMs -le $FinalizationBudgetMs -and
         [DateTimeOffset]::UtcNow -le $ResultDeadlineUtc
-    Write-CSXJsonFile -Path $CompletionPath -Value $CompletionReceipt | Out-Null
-
-    $terminalFinalizationElapsedMs = [Math]::Round($FinalizationWatch.Elapsed.TotalMilliseconds, 3)
     if (-not $CompletionReceipt.within600Seconds -or
         $InvocationWatch.Elapsed.TotalMilliseconds -gt $EndToEndBudgetMs -or
-        $terminalFinalizationElapsedMs -gt $FinalizationBudgetMs -or
+        $FinalizationWatch.Elapsed.TotalMilliseconds -gt $FinalizationBudgetMs -or
         [DateTimeOffset]::UtcNow -gt $ResultDeadlineUtc) {
-        $CompletionReceipt.within600Seconds = $false
+        throw 'The mandatory sealed-result validation crossed its complete invocation or evidence-finalization deadline.'
+    }
+    $CompletionReceipt.runSha256 = Get-CSXFileSha256 $updated.runPath
+    $CompletionReceipt.rawSha256 = Get-CSXFileSha256 (Join-Path $root ([string]$CompletionReceipt.rawPath))
+    $CompletionReceipt.visualReviewSha256 = Get-CSXFileSha256 (Join-Path $root ([string]$CompletionReceipt.visualReviewPath))
+
+    $stagedCompletionPath = Join-Path $root ".qualification-completion.pending-$([guid]::NewGuid().ToString('N')).json"
+    try {
+        Write-CSXJsonFile -Path $stagedCompletionPath -Value $CompletionReceipt | Out-Null
+        $stagedValidation = Test-CSXQualificationCompletionReceipt -EvidenceRoot $root `
+            -ExpectedRunId ([string]$CompletionReceipt.runId) -CompletionPath $stagedCompletionPath
+        if (-not $stagedValidation.ok) {
+            throw "The staged qualification completion receipt is invalid: $(@($stagedValidation.errors) -join ' | ')"
+        }
+        $terminalFinalizationElapsedMs = [Math]::Round($FinalizationWatch.Elapsed.TotalMilliseconds, 3)
         $CompletionReceipt.completedUtc = [DateTimeOffset]::UtcNow.ToString('o')
         $CompletionReceipt.invocationElapsedMs = [Math]::Round($InvocationWatch.Elapsed.TotalMilliseconds, 3)
         $CompletionReceipt.evidenceFinalizationElapsedMs = $terminalFinalizationElapsedMs
-        Write-CSXJsonFile -Path $CompletionPath -Value $CompletionReceipt | Out-Null
-        throw 'The mandatory sealed-result validation crossed its complete invocation or evidence-finalization deadline.'
+        $CompletionReceipt.within600Seconds = $CompletionReceipt.invocationElapsedMs -le $EndToEndBudgetMs -and
+            $terminalFinalizationElapsedMs -le $FinalizationBudgetMs -and
+            [DateTimeOffset]::UtcNow -le $ResultDeadlineUtc
+        if (-not $CompletionReceipt.within600Seconds) {
+            throw 'The mandatory sealed-result validation crossed its complete invocation or evidence-finalization deadline before terminal commit.'
+        }
+        Write-CSXJsonFile -Path $stagedCompletionPath -Value $CompletionReceipt | Out-Null
+        $stagedValidation = Test-CSXQualificationCompletionReceipt -EvidenceRoot $root `
+            -ExpectedRunId ([string]$CompletionReceipt.runId) -CompletionPath $stagedCompletionPath
+        if (-not $stagedValidation.ok) {
+            throw "The final staged qualification completion receipt is invalid: $(@($stagedValidation.errors) -join ' | ')"
+        }
+        $commitReserveMs = 100.0
+        if (($EndToEndBudgetMs - $InvocationWatch.Elapsed.TotalMilliseconds) -lt $commitReserveMs -or
+            ($FinalizationBudgetMs - $FinalizationWatch.Elapsed.TotalMilliseconds) -lt $commitReserveMs -or
+            ($ResultDeadlineUtc - [DateTimeOffset]::UtcNow).TotalMilliseconds -lt $commitReserveMs) {
+            throw 'The qualification completion receipt cannot be committed inside the reserved terminal-publication budget.'
+        }
+        & $CompletionCommitter $stagedCompletionPath $completionFullPath
+        $committedValidation = Test-CSXQualificationCompletionReceipt -EvidenceRoot $root `
+            -ExpectedRunId ([string]$CompletionReceipt.runId) -CompletionPath $completionFullPath
+        if (-not $committedValidation.ok) {
+            throw "The committed qualification completion receipt is invalid: $(@($committedValidation.errors) -join ' | ')"
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $stagedCompletionPath -PathType Leaf) {
+            Remove-Item -LiteralPath $stagedCompletionPath -Force
+        }
     }
     return [pscustomobject][ordered]@{
         updated = $updated
