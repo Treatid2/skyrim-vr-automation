@@ -302,6 +302,22 @@ function validatePreBaselineInterruption(root, variant, runId, liveResult) {
     if (!cleanup || !["CONFIRMED_INACTIVE", "UNRESOLVED"].includes(cleanup.status)) {
         throw new Error("pre_baseline_interruption_cleanup_missing");
     }
+    if (liveResult.error === "amd_dlss_trace_not_empty") {
+        const contamination = liveResult.failure.contamination;
+        if (liveResult.failure.reason !== "amd_dlss_trace_not_empty" ||
+            cleanup.status !== "CONFIRMED_INACTIVE" ||
+            !Number.isSafeInteger(cleanup.acquiredSessionId) ||
+            cleanup.acquiredSessionId < 1 || !cleanup.stop ||
+            cleanup.stop.id !== cleanup.acquiredSessionId ||
+            cleanup.stop.active !== false || !contamination ||
+            !["records", "totalRecords", "setConstantsCalls", "evaluateCalls"]
+                .every((name) => Number.isSafeInteger(contamination[name]) &&
+                    contamination[name] >= 0) ||
+            typeof liveResult.failure.traceLifecycleReceiptKey !== "string" ||
+            liveResult.failure.traceLifecycleReceiptKey.length === 0) {
+            throw new Error("pre_baseline_trace_contamination_evidence_invalid");
+        }
+    }
 }
 
 function baselineOnlyMemoryConfirmation() {
@@ -922,14 +938,26 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
         const acquisitionRecord = acquisitionPlan && raw.transitions.find((candidate) =>
             identityKey(candidate.identity) === identityKey(acquisitionPlan));
         const acquisition = acquisitionRecord && acquisitionRecord.value.cpuAcquisition;
+        const acquisitionStep = acquisitionRecord &&
+            acquisitionRecord.value.cpuAcquisitionStep;
         const telemetry = acquisition && acquisition.performanceTelemetry;
         const acquiredCpu = telemetry && telemetry.cpuPerformance;
         if (!acquisition) {
             passReasons.push("retained_cpu_acquisition_receipt_missing");
         } else {
-            if (acquisition.action !== "qualification_dispatch" ||
+            if (acquisition.ok === false || acquisition.isError === true ||
+                acquisition.action !== "qualification_dispatch" ||
                 acquisition.accepted !== true) {
                 passReasons.push("retained_cpu_acquisition_receipt_invalid");
+            }
+            if (!acquisitionStep ||
+                acquisitionStep.label !== "qualification-dispatch" ||
+                acquisitionStep.ok === false ||
+                acquisitionStep.isError === true ||
+                !acquisitionStep.result ||
+                JSON.stringify(acquisitionStep.result) !==
+                    JSON.stringify(acquisition)) {
+                passReasons.push("retained_cpu_acquisition_step_mismatch");
             }
             if (!acquisitionPlan || acquisition.transitionId !==
                 acquisitionPlan.transitionId || acquisition.ownerId !==

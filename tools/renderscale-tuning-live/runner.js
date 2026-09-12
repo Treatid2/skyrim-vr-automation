@@ -65,6 +65,17 @@ async function runRenderScaleTuningLive(context) {
             .map((entry) => [entry.label, entry.result]));
     }
 
+    function resultEntry(root, label) {
+        return root && Array.isArray(root.results) ? root.results.find(
+            (entry) => entry && entry.label === label) || null : null;
+    }
+
+    function resultSucceeded(value, entry = null) {
+        return Boolean(value && value.ok !== false && value.isError !== true &&
+            (!entry || (entry.ok !== false && entry.isError !== true &&
+                entry.result === value)));
+    }
+
     function reportedError(value) {
         if (!value || typeof value !== "object") return null;
         for (const name of ["error", "message", "reason"]) {
@@ -1408,11 +1419,13 @@ async function runRenderScaleTuningLive(context) {
         };
     }
 
-    function cpuDispatchOwnership(dispatch, identifiers, receiptKey) {
+    function cpuDispatchOwnership(dispatch, identifiers, receiptKey,
+        dispatchEntry = null) {
         const telemetry = dispatch && dispatch.performanceTelemetry;
         const cpu = telemetry && telemetry.cpuPerformance;
         const reasons = [];
-        if (!dispatch || dispatch.action !== "qualification_dispatch" ||
+        if (!resultSucceeded(dispatch, dispatchEntry) ||
+            dispatch.action !== "qualification_dispatch" ||
             dispatch.accepted !== true) {
             reasons.push("dispatch_receipt_invalid");
         }
@@ -1606,10 +1619,21 @@ async function runRenderScaleTuningLive(context) {
         };
     }
 
-    function updateTraceOwnership(entries, ownerState) {
-        const started = traceSession(entries.get("dlss-trace-start"));
-        if (started.present && Number.isSafeInteger(started.id) && started.id >= 1 &&
-            started.active === true) {
+    function traceResultQualified(value, action, sessionId, active,
+        entry = null) {
+        const state = traceSession(value);
+        return resultSucceeded(value, entry) && value.action === action &&
+            value.producer && value.producer.buildId === buildId &&
+            state.present && state.id === sessionId && state.active === active;
+    }
+
+    function updateTraceOwnership(entries, ownerState, scenarioRoot = null) {
+        const startValue = entries.get("dlss-trace-start");
+        const startEntry = resultEntry(scenarioRoot, "dlss-trace-start");
+        const started = traceSession(startValue);
+        if (Number.isSafeInteger(started.id) && started.id >= 1 &&
+            traceResultQualified(startValue, "dlss_trace_start",
+                started.id, true, startEntry)) {
             ownerState.trace = {
                 proven: true,
                 sessionId: started.id,
@@ -1617,9 +1641,12 @@ async function runRenderScaleTuningLive(context) {
                 source: "dlss-trace-start",
             };
         }
-        const stopped = traceSession(entries.get("dlss-trace-stop"));
-        if (stopped.present && ownerState.trace && ownerState.trace.proven &&
-            stopped.id === ownerState.trace.sessionId && stopped.active === false) {
+        const stopValue = entries.get("dlss-trace-stop");
+        const stopEntry = resultEntry(scenarioRoot, "dlss-trace-stop");
+        const stopped = traceSession(stopValue);
+        if (ownerState.trace && ownerState.trace.proven &&
+            traceResultQualified(stopValue, "dlss_trace_stop",
+                ownerState.trace.sessionId, false, stopEntry)) {
             ownerState.trace.active = false;
             ownerState.trace.stopSource = "dlss-trace-stop";
         }
@@ -1809,10 +1836,13 @@ async function runRenderScaleTuningLive(context) {
         }
         if (response) {
             entries = resultMap(response.root);
-            updateTraceOwnership(entries, ownerState);
+            updateTraceOwnership(entries, ownerState, response.root);
+            const cpuAcquisitionStep = row.ordinal === 1 ?
+                resultEntry(response.root, "qualification-dispatch") : null;
             if (row.ordinal === 1) {
                 cpuOwnership = cpuDispatchOwnership(entries.get(
-                    "qualification-dispatch"), identifiers, receiptKey);
+                    "qualification-dispatch"), identifiers, receiptKey,
+                    cpuAcquisitionStep);
                 if (cpuOwnership.status === "MATCHED_ACTIVE") {
                     ownerState.cpu = {
                         proven: true,
@@ -1846,6 +1876,7 @@ async function runRenderScaleTuningLive(context) {
                         traceStart: entries.get("dlss-trace-start") || null,
                         cpuAcquisition: row.ordinal === 1 ?
                             entries.get("qualification-dispatch") || null : null,
+                        cpuAcquisitionStep,
                         traceCollectionFailure: error && error.diagnostic || {
                             reason: error.message || String(error),
                         },
@@ -1878,6 +1909,7 @@ async function runRenderScaleTuningLive(context) {
                 tracePages: traceEvidence && traceEvidence.tracePages || null,
                 cpuAcquisition: row.ordinal === 1 ?
                     entries.get("qualification-dispatch") || null : null,
+                cpuAcquisitionStep,
                 cpuOwnership,
             };
             retain(retainedKey, retained);
@@ -1947,7 +1979,27 @@ async function runRenderScaleTuningLive(context) {
             sourceRecoveryReceiptKey: retained.sourceRecoveryReceiptKey };
     }
 
-    async function closeTraceAfterCapabilityFailure(receiptKey, startReceipt) {
+    function requireTraceStatus(result, expectedSessionId, active) {
+        const state = traceSession(result);
+        if (typeof active !== "boolean" || !resultSucceeded(result) ||
+            result.action !== "dlss_trace_status" ||
+            !result.producer || result.producer.buildId !== buildId ||
+            !state.present || state.active !== active ||
+            (expectedSessionId !== null && state.id !== expectedSessionId) ||
+            (active === true &&
+                (!Number.isSafeInteger(state.id) || state.id < 1))) {
+            throw diagnosticError("trace_cleanup_status_unproven", {
+                expectedSessionId, expectedActive: active, observed: state,
+                action: result && result.action || null,
+                producer: result && result.producer || null,
+                reportedError: reportedError(result),
+            });
+        }
+        return state;
+    }
+
+    async function closeTraceAfterCapabilityFailure(receiptKey, startReceipt,
+        startEntry = null) {
         const started = traceSession(startReceipt);
         const evidence = {
             status: "PENDING",
@@ -1961,15 +2013,12 @@ async function runRenderScaleTuningLive(context) {
                 action: "dlss_trace_status", expectedBuildId: buildId,
             });
             retain(`${receiptKey}:status-before`, beforeResult.envelope);
-            evidence.before = traceSession(beforeResult.root);
-            if (!evidence.before.present || evidence.before.active === null) {
-                throw new Error("trace_cleanup_status_missing");
-            }
-            const startedIdentityValid = Boolean(startReceipt &&
-                startReceipt.action === "dlss_trace_start" &&
-                startReceipt.producer && startReceipt.producer.buildId === buildId &&
-                started.present && started.active === true &&
-                Number.isSafeInteger(started.id) && started.id >= 1);
+            const beforeState = traceSession(beforeResult.root);
+            evidence.before = requireTraceStatus(beforeResult.root,
+                null, beforeState.active);
+            const startedIdentityValid = Number.isSafeInteger(started.id) &&
+                started.id >= 1 && traceResultQualified(startReceipt,
+                    "dlss_trace_start", started.id, true, startEntry);
             if (startReceipt && !startedIdentityValid) {
                 throw new Error("trace_cleanup_owner_unproven");
             }
@@ -1983,17 +2032,15 @@ async function runRenderScaleTuningLive(context) {
                     expectedBuildId: buildId,
                 });
                 retain(`${receiptKey}:stop`, stopResult.envelope);
-                evidence.stop = traceSession(stopResult.root);
+                evidence.stop = requireOwnedTraceState(stopResult.root,
+                    "dlss_trace_stop", started.id, false);
             }
             const afterResult = await renderScale({
                 action: "dlss_trace_status", expectedBuildId: buildId,
             });
             retain(`${receiptKey}:status-after`, afterResult.envelope);
-            evidence.after = traceSession(afterResult.root);
-            if (!evidence.after.present || evidence.after.active !== false ||
-                (startedIdentityValid && evidence.after.id !== started.id)) {
-                throw new Error("trace_cleanup_postcondition_active");
-            }
+            evidence.after = requireTraceStatus(afterResult.root,
+                startedIdentityValid ? started.id : null, false);
             evidence.status = "CONFIRMED_INACTIVE";
             retain(`${receiptKey}:decision`, evidence);
             return evidence;
@@ -2066,6 +2113,8 @@ async function runRenderScaleTuningLive(context) {
             const diagnostic = unavailableTraceAction(error);
             const startReceipt = resultMap(response.root)
                 .get("amd-dlss-trace-start");
+            const startEntry = resultEntry(response.root,
+                "amd-dlss-trace-start");
             const started = traceSession(startReceipt);
             if (diagnostic && !(started.present &&
                 Number.isSafeInteger(started.id) && started.id >= 1 &&
@@ -2075,7 +2124,7 @@ async function runRenderScaleTuningLive(context) {
             let cleanup;
             try {
                 cleanup = await closeTraceAfterCapabilityFailure(
-                    `${receiptKey}:cleanup`, startReceipt);
+                    `${receiptKey}:cleanup`, startReceipt, startEntry);
             } catch (cleanupError) {
                 throw diagnosticError("amd_trace_capability_cleanup_unresolved", {
                     original: error && error.diagnostic || error.message || String(error),
@@ -2088,14 +2137,14 @@ async function runRenderScaleTuningLive(context) {
             });
         }
         const startReceipt = entries.get("amd-dlss-trace-start");
+        const startEntry = resultEntry(response.root, "amd-dlss-trace-start");
         const started = traceSession(startReceipt);
-        if (!startReceipt || startReceipt.action !== "dlss_trace_start" ||
-            !startReceipt.producer || startReceipt.producer.buildId !== buildId ||
-            !started.present || !Number.isSafeInteger(started.id) || started.id < 1 ||
-            started.active !== true) {
+        if (!Number.isSafeInteger(started.id) || started.id < 1 ||
+            !traceResultQualified(startReceipt, "dlss_trace_start",
+                started.id, true, startEntry)) {
             try {
                 await closeTraceAfterCapabilityFailure(
-                    `${receiptKey}:cleanup`, startReceipt);
+                    `${receiptKey}:cleanup`, startReceipt, startEntry);
             } catch (cleanupError) {
                 throw diagnosticError("amd_trace_capability_cleanup_unresolved", {
                     original: { reason: "amd_trace_capability_owner_unproven",
@@ -2115,7 +2164,7 @@ async function runRenderScaleTuningLive(context) {
             let cleanup;
             try {
                 cleanup = await closeTraceAfterCapabilityFailure(
-                    `${receiptKey}:cleanup`, startReceipt);
+                    `${receiptKey}:cleanup`, startReceipt, startEntry);
             } catch (cleanupError) {
                 throw diagnosticError("amd_trace_capability_cleanup_unresolved", {
                     original: error && error.diagnostic ||
@@ -2133,11 +2182,6 @@ async function runRenderScaleTuningLive(context) {
         const summary = capture && capture.summary;
         const records = traceEvidence.tracePages.flatMap((page) =>
             page.capture.records);
-        if (!capture || !summary || records.length !== 0 ||
-            summary.totalRecords !== 0 ||
-            summary.setConstantsCalls !== 0 || summary.evaluateCalls !== 0) {
-            throw new Error("amd_dlss_trace_not_empty");
-        }
         const lifecycle = {
             traceReset: entries.get("amd-dlss-trace-reset"),
             traceStart: startReceipt,
@@ -2146,6 +2190,26 @@ async function runRenderScaleTuningLive(context) {
             tracePages: traceEvidence.tracePages,
         };
         retain(receiptKey, lifecycle);
+        if (!capture || !summary || records.length !== 0 ||
+            summary.totalRecords !== 0 ||
+            summary.setConstantsCalls !== 0 || summary.evaluateCalls !== 0) {
+            throw diagnosticError("amd_dlss_trace_not_empty", {
+                reason: "amd_dlss_trace_not_empty",
+                cleanup: {
+                    status: "CONFIRMED_INACTIVE",
+                    acquiredSessionId: started.id,
+                    stop: traceSession(traceEvidence.traceStop),
+                },
+                contamination: {
+                    records: records.length,
+                    totalRecords: (summary && summary.totalRecords) ?? null,
+                    setConstantsCalls:
+                        (summary && summary.setConstantsCalls) ?? null,
+                    evaluateCalls: (summary && summary.evaluateCalls) ?? null,
+                },
+                traceLifecycleReceiptKey: receiptKey,
+            });
+        }
         return { status: "supported", receiptKey, lifecycle };
     }
 
@@ -2344,7 +2408,9 @@ async function runRenderScaleTuningLive(context) {
             missing: after.missing,
         };
         const expectedStressSessionId = ownerState.measured &&
-            ownerState.measured.proven ? ownerState.measured.sessionId : null;
+            ownerState.measured.proven ? ownerState.measured.sessionId :
+            ownerState.baseline && ownerState.baseline.proven ?
+                ownerState.baseline.startSessionId : null;
         const expectedCpuSessionId = ownerState.cpu && ownerState.cpu.proven ?
             ownerState.cpu.sessionId : null;
         const expectedTraceSessionId = ownerState.trace && ownerState.trace.proven ?
