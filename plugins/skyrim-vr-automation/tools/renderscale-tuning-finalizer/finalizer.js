@@ -39,7 +39,8 @@ function validateTracePage(rawPage, state) {
     const page = unwrapTraceRead(rawPage);
     const capture = page && page.capture;
     const producer = page && page.producer;
-    if (!page || page.action !== "dlss_trace_read" || !capture ||
+    if (!page || page.action !== "dlss_trace_read" || page.ok === false ||
+        page.isError === true || !capture ||
         !Array.isArray(capture.records)) {
         throw new Error("invalid_trace_page");
     }
@@ -102,7 +103,12 @@ function validateTracePage(rawPage, state) {
     if (capture.moreAvailable === true && capture.records.length === 0) {
         throw new Error("trace_empty_continuation_page");
     }
-    return { page, sessionId, lastSequence };
+    if (state.latestSequence !== null &&
+        capture.latestSequence !== state.latestSequence) {
+        throw new Error("trace_closed_window_changed");
+    }
+    return { page, sessionId, lastSequence,
+        latestSequence: capture.latestSequence };
 }
 
 async function collectTracePages(options) {
@@ -119,18 +125,27 @@ async function collectTracePages(options) {
         buildId: expectedBuildId,
         sessionId: expectedSessionId,
         afterSequence: 0,
+        latestSequence: null,
         maximum,
     };
     const pages = [];
     const records = [];
 
-    for (const rawPage of existingPages) {
+    for (let index = 0; index < existingPages.length; index += 1) {
+        const rawPage = existingPages[index];
+        if (index > 0 && pages[index - 1].capture.moreAvailable !== true) {
+            throw new Error("trace_page_after_terminal");
+        }
         const checked = validateTracePage(rawPage, state);
         state.sessionId = checked.sessionId;
         state.afterSequence = checked.lastSequence;
+        state.latestSequence = checked.latestSequence;
         pages.push(checked.page);
         records.push(...checked.page.capture.records);
         if (checked.page.capture.moreAvailable !== true) {
+            if (index < existingPages.length - 1) {
+                throw new Error("trace_page_after_terminal");
+            }
             return { pages, records, sessionId: state.sessionId, maximum };
         }
     }
@@ -148,6 +163,7 @@ async function collectTracePages(options) {
         const checked = validateTracePage(rawPage, state);
         state.sessionId = checked.sessionId;
         state.afterSequence = checked.lastSequence;
+        state.latestSequence = checked.latestSequence;
         pages.push(checked.page);
         records.push(...checked.page.capture.records);
     }
@@ -754,6 +770,33 @@ function targetsMatch(actual, expected) {
     return true;
 }
 
+function retainedPassScope(root, file) {
+    const relativePath = relative(root, file);
+    const parts = relativePath.split("/");
+    const passPart = parts.find((part) => /^pass-\d+$/.test(part));
+    const lanePart = parts.find((part) => /^lane-/.test(part));
+    return {
+        relativePath,
+        lane: lanePart ? lanePart.slice(5) : "default",
+        pass: passPart ? Number(passPart.slice(5)) : null,
+    };
+}
+
+function scenarioSucceeded(value) {
+    if (!value || value.ok !== true || value.aborted !== false ||
+        !Number.isSafeInteger(value.stepsRun) || !Array.isArray(value.results) ||
+        value.stepsRun !== value.results.length) {
+        return false;
+    }
+    return !value.results.some((entry) => entry && (entry.ok === false ||
+        entry.isError === true || entry.result &&
+        (entry.result.ok === false || entry.result.isError === true)));
+}
+
+function producerBuildMatches(value, buildId) {
+    return Boolean(value && value.producer && value.producer.buildId === buildId);
+}
+
 function rawPassEvidence(root) {
     const rawRoot = path.join(root, "raw");
     if (!fs.existsSync(rawRoot)) return { scenarios: [], cleanup: [] };
@@ -768,11 +811,12 @@ function rawPassEvidence(root) {
         } catch {
             continue;
         }
+        const scope = retainedPassScope(root, file);
         const rootValue = decodedScenarioRoot(value);
-        if (rootValue) scenarios.push(rootValue);
+        if (rootValue) scenarios.push({ value: rootValue, scope });
         if (value && value.status === "CONFIRMED_INACTIVE" &&
             Array.isArray(value.knownSessionIds) && value.after) {
-            cleanup.push(value);
+            cleanup.push({ value, scope });
         }
     }
     return { scenarios, cleanup };
@@ -793,7 +837,8 @@ function stressSession(value) {
     };
 }
 
-function passFinalizationEvidence(root, liveResult, planEntries, rows, variant) {
+function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
+    buildId) {
     const reasons = [];
     if (!liveResult || liveResult.ok !== true ||
         liveResult.status !== "COMPLETE" || !Array.isArray(liveResult.lanes)) {
@@ -808,8 +853,13 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant) 
     for (const key of passKeys) {
         const [laneId, passText] = key.split("|");
         const passNumber = Number(passText);
+        const plannedPass = planEntries.filter((entry) =>
+            `${entry.lane || "default"}|${entry.pass}` === key);
+        const liveLaneIds = unique(plannedPass.map((entry) =>
+            entry.laneContract && entry.laneContract.id || entry.lane || "default"));
+        const liveLaneId = liveLaneIds.length === 1 ? liveLaneIds[0] : null;
         const lane = liveResult.lanes.find((candidate) => candidate &&
-            (candidate.id || "default") === laneId);
+            (candidate.id || "default") === liveLaneId);
         const pass = lane && Array.isArray(lane.passes) ? lane.passes.find(
             (candidate) => candidate && candidate.pass === passNumber) : null;
         const passReasons = [];
@@ -817,8 +867,8 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant) 
         const baseline = ownership.baseline || {};
         const measured = ownership.measured || {};
         const trace = ownership.trace || {};
-        const traceRequired = variant === "nvidia" && planEntries.some((entry) =>
-            `${entry.lane || "default"}|${entry.pass}` === key &&
+        const cpu = ownership.cpu || {};
+        const traceRequired = variant === "nvidia" && plannedPass.some((entry) =>
             entry.target && entry.target.method === "dlss");
         const cleanup = pass && pass.cleanup || {};
         const after = cleanup.after || {};
@@ -833,6 +883,9 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant) 
         if (!pass || pass.status !== "COMPLETE") {
             passReasons.push("pass_complete_missing");
         }
+        if (liveLaneId === null) {
+            passReasons.push("planned_lane_contract_ambiguous");
+        }
         if (baseline.proven !== true || !positive(baseline.startSessionId) ||
             baseline.active !== false) {
             passReasons.push("baseline_owner_finalization_invalid");
@@ -841,10 +894,16 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant) 
             measured.active !== false) {
             passReasons.push("measured_owner_finalization_invalid");
         }
+        if (cpu.proven !== true || !positive(cpu.sessionId) ||
+            cpu.active !== false) {
+            passReasons.push("cpu_owner_finalization_invalid");
+        }
         if (cleanup.status !== "CONFIRMED_INACTIVE" ||
             !Array.isArray(cleanup.knownSessionIds) ||
             !cleanup.knownSessionIds.includes(baseline.startSessionId) ||
-            !cleanup.knownSessionIds.includes(measured.sessionId)) {
+            !cleanup.knownSessionIds.includes(measured.sessionId) ||
+            !Array.isArray(cleanup.knownCpuSessionIds) ||
+            !cleanup.knownCpuSessionIds.includes(cpu.sessionId)) {
             passReasons.push("cleanup_owner_certificate_invalid");
         }
         const activeNames = ["stressActive", "cpuActive", "gpuActive",
@@ -853,43 +912,102 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant) 
             activeNames.some((name) => after[name] !== false)) {
             passReasons.push("cleanup_inactivity_unproven");
         }
+        const scopeMatches = (candidate, phase) => candidate.scope.pass === passNumber &&
+            candidate.scope.lane === laneId &&
+            candidate.scope.relativePath.toLowerCase().includes(`/${phase}/`);
         const baselineReceipt = raw.scenarios.find((candidate) => {
-            const start = stressSession(scenarioResult(candidate,
-                "baseline-stress-start"));
-            const waiter = scenarioResult(candidate, "qualification-wait");
-            return start.id === baseline.startSessionId &&
-                start.active === true && waiter && waiter.baseline &&
+            const startResult = scenarioResult(candidate.value,
+                "baseline-stress-start");
+            const start = stressSession(startResult);
+            const waiter = scenarioResult(candidate.value, "qualification-wait");
+            return scopeMatches(candidate, "baseline") &&
+                scenarioSucceeded(candidate.value) &&
+                producerBuildMatches(startResult, buildId) &&
+                producerBuildMatches(waiter, buildId) &&
+                startResult.action === "start" &&
+                waiter.action === "qualification_wait" &&
+                start.id === baseline.startSessionId &&
+                start.active === true && waiter.baseline &&
                 waiter.baseline.stressSessionId === baseline.startSessionId;
         });
         if (!baselineReceipt) {
             passReasons.push("retained_baseline_owner_receipt_missing");
         }
         const handoffReceipt = raw.scenarios.find((candidate) => {
-            const stopped = stressSession(scenarioResult(candidate,
-                "baseline-stress-stop"));
-            const started = stressSession(scenarioResult(candidate,
-                "measured-stress-start"));
-            return stopped.id === baseline.startSessionId &&
+            const stopResult = scenarioResult(candidate.value,
+                "baseline-stress-stop");
+            const startResult = scenarioResult(candidate.value,
+                "measured-stress-start");
+            const stopped = stressSession(stopResult);
+            const started = stressSession(startResult);
+            return scopeMatches(candidate, "handoff") &&
+                scenarioSucceeded(candidate.value) &&
+                producerBuildMatches(stopResult, buildId) &&
+                producerBuildMatches(startResult, buildId) &&
+                stopResult.action === "stop" && startResult.action === "start" &&
+                stopped.id === baseline.startSessionId &&
                 stopped.active === false && started.id === measured.sessionId &&
                 started.active === true;
         });
         if (!handoffReceipt) {
             passReasons.push("retained_handoff_owner_receipt_missing");
         }
-        const cleanupReceipt = raw.cleanup.find((candidate) =>
-            candidate.knownSessionIds.includes(baseline.startSessionId) &&
-            candidate.knownSessionIds.includes(measured.sessionId) &&
-            (!traceRequired ||
-                Array.isArray(candidate.knownTraceSessionIds) &&
-                candidate.knownTraceSessionIds.includes(trace.sessionId) &&
-                candidate.after.traceSessionId === trace.sessionId) &&
-            Array.isArray(candidate.after.missing) &&
-            candidate.after.missing.length === 0 &&
-            ["stressActive", "cpuActive", "gpuActive", "textureActive",
-                "probeActive", "traceActive"].every((name) =>
-                candidate.after[name] === false));
+        const cleanupReceipt = raw.cleanup.find((candidate) => {
+            const value = candidate.value;
+            return scopeMatches(candidate, "cleanup") &&
+                value.knownSessionIds.includes(baseline.startSessionId) &&
+                value.knownSessionIds.includes(measured.sessionId) &&
+                Array.isArray(value.knownCpuSessionIds) &&
+                value.knownCpuSessionIds.includes(cpu.sessionId) &&
+                value.after.stressSessionId === measured.sessionId &&
+                value.after.cpuSessionId === cpu.sessionId &&
+                (!traceRequired ||
+                    Array.isArray(value.knownTraceSessionIds) &&
+                    value.knownTraceSessionIds.includes(trace.sessionId) &&
+                    value.after.traceSessionId === trace.sessionId) &&
+                Array.isArray(value.after.missing) &&
+                value.after.missing.length === 0 &&
+                ["stressActive", "cpuActive", "gpuActive", "textureActive",
+                    "probeActive", "traceActive"].every((name) =>
+                    value.after[name] === false);
+        });
         if (!cleanupReceipt) {
             passReasons.push("retained_cleanup_receipt_missing");
+        }
+        const statusReceipt = raw.scenarios.find((candidate) => {
+            if (!scopeMatches(candidate, "cleanup") ||
+                !candidate.scope.relativePath.toLowerCase().includes(
+                    "final-status-after-cleanup") ||
+                !scenarioSucceeded(candidate.value)) {
+                return false;
+            }
+            const renderResult = scenarioResult(candidate.value, "render-status");
+            const cpuResult = scenarioResult(candidate.value, "cpu-status");
+            const gpuResult = scenarioResult(candidate.value, "gpu-status");
+            const textureResult = scenarioResult(candidate.value, "texture-status");
+            const traceResult = scenarioResult(candidate.value,
+                "dlss-trace-status");
+            const stress = stressSession(renderResult);
+            const cpuStatus = cpuResult && cpuResult.cpuPerformance;
+            const gpu = gpuResult && gpuResult.capture;
+            const texture = textureResult && textureResult.capture;
+            const probe = renderResult && renderResult.status &&
+                renderResult.status.loadPresentationProbe;
+            const traceStatus = traceResult && traceResult.capture &&
+                (traceResult.capture.summary || traceResult.capture);
+            return [renderResult, cpuResult, gpuResult, textureResult]
+                .every((value) => producerBuildMatches(value, buildId)) &&
+                (!traceRequired || producerBuildMatches(traceResult, buildId)) &&
+                stress.id === measured.sessionId && stress.active === false &&
+                cpuStatus && cpuStatus.sessionId === cpu.sessionId &&
+                cpuStatus.active === false && gpu && gpu.active === false &&
+                texture && texture.active === false && probe &&
+                probe.active === false && (!traceRequired || traceStatus &&
+                    traceStatus.sessionID === trace.sessionId &&
+                    traceStatus.active === false);
+        });
+        if (!statusReceipt) {
+            passReasons.push("retained_cleanup_status_receipt_missing");
         }
         const ownedRows = rows.filter((row) =>
             `${row.lane || "default"}|${row.pass}` === key);
@@ -1127,13 +1245,20 @@ function traceLifecycleEvidence(retained, buildId, requireDispatch) {
                 buildId,
                 sessionId: sessions[0],
                 afterSequence: 0,
+                latestSequence: null,
                 maximum: Number.isSafeInteger(firstLimit) && firstLimit > 0 ?
                     firstLimit : 256,
             };
-            for (const rawPage of rawPages) {
+            for (let index = 0; index < rawPages.length; index += 1) {
+                const rawPage = rawPages[index];
+                if (index > 0 &&
+                    rawPages[index - 1].capture.moreAvailable !== true) {
+                    throw new Error("trace_page_after_terminal");
+                }
                 const checked = validateTracePage(rawPage, state);
                 state.sessionId = checked.sessionId;
                 state.afterSequence = checked.lastSequence;
+                state.latestSequence = checked.latestSequence;
                 records.push(...checked.page.capture.records);
             }
             if (rawPages[rawPages.length - 1].capture.moreAvailable !== false) {
@@ -1598,7 +1723,7 @@ function finalizeEvidence(options) {
         }
     }
     const passFinalization = passFinalizationEvidence(
-        root, liveResult, planEntries, rows, variant);
+        root, liveResult, planEntries, rows, variant, buildIds[0]);
     const assayStatus = interrupted ? "INTERRUPTED" :
         executionScopeComplete && rows.length === declaredExpectedRows &&
             passFinalization.complete ?

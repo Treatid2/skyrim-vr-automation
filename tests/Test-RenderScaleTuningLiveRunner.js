@@ -103,6 +103,8 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
     let stressSession = 0;
     let stressActive = false;
     let cpuActive = false;
+    let cpuSession = 0;
+    let nextCpuSession = 10;
     let gpuActive = false;
     let textureActive = false;
     let probeActive = false;
@@ -127,6 +129,24 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
 
     function toolResult(step) {
         const args = step.args || {};
+        if (args.action === "qualification_dispatch") {
+            const result = {
+                action: args.action,
+                transitionId: args.transitionId,
+                ownerId: args.ownerId,
+                accepted: true,
+                producer: { buildId },
+            };
+            if (args.startPerformanceTelemetry === true) {
+                result.performanceTelemetry = {
+                    started: true,
+                    dispatchFrame: 10,
+                    cpuPerformance: { active: true, sessionId: cpuSession },
+                    gpuPerformance: { active: true },
+                };
+            }
+            return result;
+        }
         if (step.label === "baseline-stress-start" || step.label === "measured-stress-start") {
             stressSession += 1;
             stressActive = true;
@@ -141,6 +161,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
         if (args.action === "probe_start") probeActive = true;
         if (args.action === "probe_stop") probeActive = false;
         if (args.action === "cpu_performance_stop") cpuActive = false;
+        if (args.action === "cpu_performance_reset" && !cpuActive) cpuSession = 0;
         if (args.action === "gpu_performance_stop") gpuActive = false;
         if (args.action === "dlss_trace_status") {
             return { action: args.action, producer: { buildId },
@@ -194,7 +215,8 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
             };
         }
         if (args.action === "cpu_performance_status") {
-            return { cpuPerformance: { active: cpuActive, sessionId: cpuActive ? 11 : 0 } };
+            return { producer: { buildId },
+                cpuPerformance: { active: cpuActive, sessionId: cpuSession } };
         }
         if (args.action === "gpu_performance_status") return { capture: { active: gpuActive } };
         if (args.action === "texture_lifetime_status") return { capture: { active: textureActive } };
@@ -216,6 +238,8 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
             step.label === "qualification-dispatch" && step.args.startPerformanceTelemetry === true);
         if (firstMeasured) {
             cpuActive = true;
+            nextCpuSession += 1;
+            cpuSession = nextCpuSession;
             gpuActive = true;
         }
         if (applyStep && !args.steps.some((step) => step.label === "baseline-stress-start")) {
@@ -683,6 +707,12 @@ async function testNvidia() {
         traceReads.length === expectedTraceRows &&
         traceReads.every((call) => call.limit === matrix.traceReadLimit),
     "NVIDIA normal trace closure was not session-guarded and bounded.");
+    const cpuStops = mock.scenarioCalls.flatMap((call) => call.steps).filter((step) =>
+        step.args && step.args.action === "cpu_performance_stop");
+    assert(cpuStops.length === 2 && cpuStops.every((step) =>
+        Number.isSafeInteger(step.args.expectedSessionId) &&
+        step.args.expectedSessionId > 0),
+    "CPU cleanup did not use each pass's acquired dispatch session identity.");
     for (const [, retained] of retainedTraceRows) {
         assert(retained.traceReset.action === "dlss_trace_reset",
             "NVIDIA trace reset receipt was not retained.");
@@ -1232,6 +1262,84 @@ async function testNvidiaNormalStopRejectsChangedOwner() {
         pass.cleanup && pass.cleanup.status === "UNRESOLVED" &&
         pass.cleanup.reason === "cleanup_trace_owner_mismatch",
     "A changed trace owner was not refused by the normal guarded stop path.");
+}
+
+async function testCpuCleanupRejectsUnownedStatus() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const cases = [
+        ["changed", (cpu) => { cpu.sessionId += 1; },
+            "cleanup_cpu_owner_mismatch"],
+        ["missing", (cpu) => { cpu.sessionId = 0; },
+            "cleanup_status_incomplete"],
+    ];
+    for (const [name, mutate, expectedReason] of cases) {
+        let injected = false;
+        const mock = createMock(0, null, (root, args) => {
+            if (!injected && args.steps.some((step) =>
+                step.label === "cpu-status") && args.steps.some((step) =>
+                step.label === "render-status")) {
+                injected = true;
+                const cpu = root.results.find((entry) =>
+                    entry.label === "cpu-status").result.cpuPerformance;
+                mutate(cpu);
+            }
+            return root;
+        });
+        const result = await runRenderScaleTuningLive({
+            ...mock.context,
+            variant: "nvidia",
+            runId: `cpu-owner-${name}`,
+            buildId,
+            positioningRoot: positioningRoot(),
+            matrix,
+        });
+        const pass = result.lanes[0].passes[0];
+        const cpuStops = mock.scenarioCalls.flatMap((call) => call.steps)
+            .filter((step) => step.args &&
+                step.args.action === "cpu_performance_stop");
+        assert(result.status === "INTERRUPTED" && pass.cleanup &&
+            pass.cleanup.status === "UNRESOLVED" &&
+            pass.cleanup.reason === expectedReason && cpuStops.length === 0,
+        `CPU cleanup accepted '${name}' ownership: ${JSON.stringify(pass)}`);
+    }
+}
+
+async function testCpuAcquisitionRequiresDispatchReceipt() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    let injected = false;
+    const mock = createMock(0, null, (root, args) => {
+        const dispatchStep = args.steps.find((step) =>
+            step.label === "qualification-dispatch" &&
+            step.args.startPerformanceTelemetry === true);
+        if (!injected && dispatchStep) {
+            injected = true;
+            const dispatch = root.results.find((entry) =>
+                entry.label === "qualification-dispatch").result;
+            dispatch.performanceTelemetry.cpuPerformance.sessionId = 0;
+        }
+        return root;
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context,
+        variant: "nvidia",
+        runId: "cpu-acquisition-unproven",
+        buildId,
+        positioningRoot: positioningRoot(),
+        matrix,
+    });
+    const pass = result.lanes[0].passes[0];
+    const cpuStops = mock.scenarioCalls.flatMap((call) => call.steps)
+        .filter((step) => step.args &&
+            step.args.action === "cpu_performance_stop");
+    assert(result.status === "INTERRUPTED" &&
+        pass.error === "cpu_owner_identity_unproven" &&
+        pass.cleanup && pass.cleanup.status === "UNRESOLVED" &&
+        cpuStops.length === 0,
+    "An invalid CPU acquisition receipt authorized cleanup.");
 }
 
 async function testNvidiaRetainsMultiPageTrace() {
@@ -2442,6 +2550,8 @@ Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
     testAmdPostStartTraceFailureClosesOwner(),
     testNvidiaPostStartTraceFailureClosesOwner(),
     testNvidiaNormalStopRejectsChangedOwner(),
+    testCpuCleanupRejectsUnownedStatus(),
+    testCpuAcquisitionRequiresDispatchReceipt(),
     testNvidiaRetainsMultiPageTrace(),
     testAdmissionRejectsMalformedInputs(), testEvidenceVerdicts(),
     testScenarioFailureRetention(), testInformationalReasonIsNotFailure(),

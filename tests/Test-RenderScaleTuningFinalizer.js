@@ -145,6 +145,7 @@ async function testPagingValidation() {
 async function testPagingResume() {
     const buildId = "d".repeat(64);
     const first = tracePage(buildId, 22, 0, records(1, 256), true);
+    first.capture.latestSequence = 300;
     const preserved = [];
     try {
         await collectTracePages({
@@ -443,7 +444,7 @@ function completedLiveResult(variant, runId) {
         traceCapability: variant === "amd" ? { status: "supported" } :
             { status: "not_applicable" },
         lanes: [{
-            id: "default",
+            id: variant === "nvidia" ? "nvidia" : "default",
             status: "COMPLETE",
             passes: [{
                 pass: 1,
@@ -451,11 +452,13 @@ function completedLiveResult(variant, runId) {
                 cleanup: {
                     status: "CONFIRMED_INACTIVE",
                     knownSessionIds: [6, 7],
+                    knownCpuSessionIds: [11],
                     knownTraceSessionIds: trace ? [trace.sessionId] : [],
                     after: {
                         stressSessionId: 7,
                         stressActive: false,
                         cpuActive: false,
+                        cpuSessionId: 11,
                         gpuActive: false,
                         textureActive: false,
                         probeActive: false,
@@ -468,6 +471,8 @@ function completedLiveResult(variant, runId) {
                     baseline: { proven: true, startSessionId: 6,
                         active: false },
                     measured: { proven: true, sessionId: 7, active: false },
+                    cpu: { proven: true, sessionId: 11, active: false,
+                        source: "qualification-dispatch" },
                     ...(trace ? { trace } : {}),
                 },
             }],
@@ -495,11 +500,14 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
     writeJson(path.join(root, "raw", "pass-1", "baseline", "baseline.json"), {
         ok: true,
         aborted: false,
+        stepsRun: 2,
         results: [
             { label: "baseline-stress-start", result: {
+                action: "start", producer: { buildId },
                 status: { session: { id: 6, active: true } },
             } },
             { label: "qualification-wait", result: {
+                action: "qualification_wait", producer: { buildId },
                 baseline: { stressSessionId: 6 },
             } },
         ],
@@ -507,11 +515,14 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
     writeJson(path.join(root, "raw", "pass-1", "handoff", "handoff.json"), {
         ok: true,
         aborted: false,
+        stepsRun: 2,
         results: [
             { label: "baseline-stress-stop", result: {
+                action: "stop", producer: { buildId },
                 status: { session: { id: 6, active: false } },
             } },
             { label: "measured-stress-start", result: {
+                action: "start", producer: { buildId },
                 status: { session: { id: 7, active: true } },
             } },
         ],
@@ -519,11 +530,13 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
     writeJson(path.join(root, "raw", "pass-1", "cleanup", "decision.json"), {
         status: "CONFIRMED_INACTIVE",
         knownSessionIds: [6, 7],
+        knownCpuSessionIds: [11],
         knownTraceSessionIds: variant === "nvidia" ? [55] : [],
         after: {
             stressSessionId: 7,
             stressActive: false,
             cpuActive: false,
+            cpuSessionId: 11,
             gpuActive: false,
             textureActive: false,
             probeActive: false,
@@ -531,6 +544,34 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
             traceActive: false,
             missing: [],
         },
+    });
+    const finalStatusResults = [
+        { label: "render-status", result: {
+            producer: { buildId }, status: {
+                session: { id: 7, active: false },
+                loadPresentationProbe: { active: false },
+            },
+        } },
+        { label: "cpu-status", result: { producer: { buildId },
+            cpuPerformance: { sessionId: 11, active: false } } },
+        { label: "gpu-status", result: { producer: { buildId },
+            capture: { active: false } } },
+        { label: "texture-status", result: { producer: { buildId },
+            capture: { active: false } } },
+    ];
+    if (variant === "nvidia") {
+        finalStatusResults.push({ label: "dlss-trace-status", result: {
+            producer: { buildId }, capture: {
+                summary: { sessionID: 55, active: false },
+            },
+        } });
+    }
+    writeJson(path.join(root, "raw", "pass-1", "cleanup",
+        "final-status-after-cleanup.json"), {
+        ok: true,
+        aborted: false,
+        stepsRun: finalStatusResults.length,
+        results: finalStatusResults,
     });
     if (variant === "amd") {
         const lifecycle = traceLifecycle(buildId, 41, []);
@@ -1563,6 +1604,12 @@ function testPassFinalizationControlsCompletion() {
             value.lanes[0].passes[0].ownership.measured.sessionId = 99;
             writeJson(file, value);
         }, "measured_row_owner_mismatch"],
+        ["missing-cpu-owner", (root) => {
+            const file = path.join(root, "raw", "live-result.json");
+            const value = readJson(file);
+            delete value.lanes[0].passes[0].ownership.cpu;
+            writeJson(file, value);
+        }, "cpu_owner_finalization_invalid"],
         ["still-active", (root) => {
             const file = path.join(root, "raw", "live-result.json");
             const value = readJson(file);
@@ -1600,6 +1647,68 @@ function testPassFinalizationControlsCompletion() {
                 result.summary.assayExecution.passFinalization.reasons.some(
                     (entry) => entry.includes(reason)),
             `Pass-finalization case '${name}' was accepted.`);
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    }
+}
+
+function testOriginalLifecycleEvidenceControlsCompletion() {
+    const cases = [
+        ["failed-baseline-envelope", (root) => {
+            const file = path.join(root, "raw", "pass-1", "baseline",
+                "baseline.json");
+            const value = readJson(file);
+            value.ok = false;
+            writeJson(file, value);
+        }, "retained_baseline_owner_receipt_missing"],
+        ["failed-handoff-envelope", (root) => {
+            const file = path.join(root, "raw", "pass-1", "handoff",
+                "handoff.json");
+            const value = readJson(file);
+            value.ok = false;
+            value.aborted = true;
+            writeJson(file, value);
+        }, "retained_handoff_owner_receipt_missing"],
+        ["foreign-baseline-build", (root) => {
+            const file = path.join(root, "raw", "pass-1", "baseline",
+                "baseline.json");
+            const value = readJson(file);
+            value.results[0].result.producer.buildId = "d".repeat(64);
+            writeJson(file, value);
+        }, "retained_baseline_owner_receipt_missing"],
+        ["foreign-cleanup-owner", (root) => {
+            const file = path.join(root, "raw", "pass-1", "cleanup",
+                "decision.json");
+            const value = readJson(file);
+            value.after.stressSessionId = 99;
+            writeJson(file, value);
+        }, "retained_cleanup_receipt_missing"],
+        ["active-original-post-status", (root) => {
+            const file = path.join(root, "raw", "pass-1", "cleanup",
+                "final-status-after-cleanup.json");
+            const value = readJson(file);
+            value.results.find((entry) => entry.label === "cpu-status")
+                .result.cpuPerformance.active = true;
+            writeJson(file, value);
+        }, "retained_cleanup_status_receipt_missing"],
+        ["missing-original-post-status", (root) => fs.unlinkSync(path.join(root,
+            "raw", "pass-1", "cleanup", "final-status-after-cleanup.json")),
+        "retained_cleanup_status_receipt_missing"],
+    ];
+    for (const [name, mutate, reason] of cases) {
+        const root = createEvidenceRoot();
+        try {
+            mutate(root);
+            const result = finalizeEvidence({ root, variant: "nvidia",
+                runId: "nvidia-test-run", buildId: "e".repeat(64),
+                expectedRows: 2 });
+            assert(result.summary.assayExecution.status === "INCOMPLETE" &&
+                result.summary.render.verdict === "PASS" &&
+                result.summary.reporting.status === "INCOMPLETE" &&
+                result.summary.assayExecution.passFinalization.reasons.some(
+                    (entry) => entry.includes(reason)),
+            `Original lifecycle case '${name}' was accepted.`);
         } finally {
             fs.rmSync(root, { recursive: true, force: true });
         }
@@ -1702,6 +1811,46 @@ function testMultiPageTraceFinalization() {
                 "trace_page_cursor_mismatch") &&
             result.summary.reporting.status === "INCOMPLETE",
         "A missing middle trace page completed reporting.");
+
+        const failedPages = pages.map((page) => structuredClone(page));
+        failedPages[1].ok = false;
+        receipt.tracePages = failedPages;
+        writeJson(file, receipt);
+        result = finalizeEvidence(options);
+        assert(result.summary.transitions[0].traceComplete === false &&
+            result.summary.transitions[0].traceValidationReasons.includes(
+                "invalid_trace_page") &&
+            result.summary.reporting.status === "INCOMPLETE",
+        "A failed trace read with plausible capture data completed reporting.");
+
+        const terminalThenMore = [
+            tracePage("e".repeat(64), 55, 0, records(1, 2), false, 256),
+            tracePage("e".repeat(64), 55, 2, records(3, 2), false, 256),
+        ];
+        for (const page of terminalThenMore) {
+            page.capture.summary.totalRecords = 4;
+            page.capture.summary.setConstantsCalls = 1;
+            page.capture.summary.evaluateCalls = 1;
+        }
+        receipt.tracePages = terminalThenMore;
+        writeJson(file, receipt);
+        result = finalizeEvidence(options);
+        assert(result.summary.transitions[0].traceComplete === false &&
+            result.summary.transitions[0].traceValidationReasons.includes(
+                "trace_page_after_terminal") &&
+            result.summary.reporting.status === "INCOMPLETE",
+        "A trace page after a terminal page completed reporting.");
+
+        const changedWindow = pages.map((page) => structuredClone(page));
+        changedWindow[1].capture.latestSequence = 550;
+        receipt.tracePages = changedWindow;
+        writeJson(file, receipt);
+        result = finalizeEvidence(options);
+        assert(result.summary.transitions[0].traceComplete === false &&
+            result.summary.transitions[0].traceValidationReasons.includes(
+                "trace_closed_window_changed") &&
+            result.summary.reporting.status === "INCOMPLETE",
+        "An inconsistent stopped trace-window bound completed reporting.");
     } finally {
         fs.rmSync(root, { recursive: true, force: true });
     }
@@ -1727,6 +1876,7 @@ Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testFinalProfileAndExecutionScopeGateCompletion)
     .then(testAmdSupportedClaimRequiresRetainedLifecycle)
     .then(testPassFinalizationControlsCompletion)
+    .then(testOriginalLifecycleEvidenceControlsCompletion)
     .then(testInvalidRawTask2OwnersOverrideCachedAuthority)
     .then(testMultiPageTraceFinalization)
     .then(testUnsafeEvidenceNumberFailsClosed).then(() => {
