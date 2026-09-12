@@ -1141,7 +1141,14 @@ function Invoke-AutomatedVisualEvaluation($CandidateIndex, $BaselineIndex, $Prov
             $passes.Add([pscustomobject][ordered]@{ presentationPass = $presentationPass; batches = @($providerBatches) })
         }
         if ([DateTimeOffset]::UtcNow -ge $DeadlineUtc) {
-            throw 'The unattended visual-evaluation deadline elapsed during request preparation.'
+            $preparationDeadlineReason = 'The unattended visual-evaluation deadline elapsed during request preparation.'
+            $script:providerCustodyEvidence = New-CSXProviderDeadlineCustodyEvidence `
+                -Passes @($passes) -Preflight $ProviderPreflight -Reason $preparationDeadlineReason
+            if ($null -ne $assays.visual) {
+                $assays.visual | Add-Member -NotePropertyName providerCustody `
+                    -NotePropertyValue $script:providerCustodyEvidence -Force
+            }
+            throw $preparationDeadlineReason
         }
         $execution = Invoke-CSXCodexVisualReviewProvider -WorkingDirectory $reviewRoot -Passes @($passes) `
             -CodexExecutable $CodexExecutable -Preflight $ProviderPreflight -DeadlineSeconds $DeadlineSeconds `

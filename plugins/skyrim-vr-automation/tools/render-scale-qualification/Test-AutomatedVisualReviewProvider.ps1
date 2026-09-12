@@ -327,6 +327,23 @@ $response = [ordered]@{ fake = $true; imageCount = $imageCount; prompt = $prompt
         @($absoluteDeadlineExecution.batches | Where-Object launched).Count -eq 0 -and
         @($absoluteDeadlineExecution.batches | Where-Object status -eq 'not_started_deadline').Count -eq 6) 'Provider input preparation received a fresh child-process budget after the enclosing deadline elapsed.'
 
+    foreach ($missingPreflightDeadline in @([DateTimeOffset]::UtcNow.AddMilliseconds(-1), [DateTimeOffset]::UtcNow.AddMilliseconds(250))) {
+        $implicitPreflightAdmissions = [Collections.Generic.List[object]]::new()
+        $implicitPreflightRejected = $false
+        try {
+            Invoke-CSXCodexVisualReviewProvider -WorkingDirectory $fakeWorkingDirectory `
+                -Passes $absoluteDeadlinePasses -DeadlineSeconds 5 -DeadlineUtc $missingPreflightDeadline `
+                -PreflightCommandAdapter {
+                    param($executable, $arguments, $timeoutMilliseconds)
+                    $implicitPreflightAdmissions.Add([pscustomobject]@{ executable = $executable; arguments = @($arguments); timeoutMilliseconds = $timeoutMilliseconds })
+                    return New-ProviderCommandResult -ExitCode 0 -Stdout '' -Stderr ''
+                } | Out-Null
+        }
+        catch { $implicitPreflightRejected = $_.Exception.Message -match 'Preflight is required' }
+        Assert-ProviderTest ($implicitPreflightRejected -and $implicitPreflightAdmissions.Count -eq 0) `
+            'Bounded provider execution admitted implicit preflight subprocess work without an explicitly acquired preflight.'
+    }
+
     $partialStreamAdapter = {
         param(
             [Diagnostics.ProcessStartInfo]$OriginalStartInfo,

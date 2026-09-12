@@ -767,8 +767,7 @@ function Invoke-CSXCodexVisualReviewProvider {
         throw "WorkingDirectory does not exist: $workingDirectoryPath"
     }
     if ($null -eq $Preflight) {
-        $Preflight = Get-CSXCodexVisualReviewProviderPreflight -CodexExecutable $CodexExecutable `
-            -CommandAdapter $PreflightCommandAdapter
+        throw 'Preflight is required for bounded provider execution; acquire it explicitly before starting the shared absolute-deadline window.'
     }
     if (-not [bool](Get-CSXProviderPropertyValue $Preflight 'ok' $false)) {
         throw "Codex visual-review provider preflight failed: $(@(Get-CSXProviderPropertyValue $Preflight 'errors' @()) -join ' | ')"
