@@ -187,6 +187,13 @@ Repeated `complete` calls return the immutable existing completion. A retry
 after restoration but before completion publication accepts only one committed
 restore receipt proving both the baseline and preserved working tree.
 
+`prepare` and `complete` return bounded output by default: cache identities,
+file and byte counts, tree hashes, state, and receipt paths remain inline, while
+per-file `entries` arrays remain only in the durable plan, provider-shadow,
+transaction, and completion receipts. `-Compact` additionally removes JSON
+whitespace. Use `-IncludeInventoryEntries` only for a caller that explicitly
+needs the potentially very large per-file arrays in the command response.
+
 `seed` requires the existing snapshot receipt for the same live cache and
 evidence directory, verifies the exact source tree, stages it, swaps it into
 place, and preserves the displaced live tree. A deliberately compatible

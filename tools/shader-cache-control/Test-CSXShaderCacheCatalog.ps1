@@ -140,6 +140,7 @@ try {
     $prepareArgs.Confirm = $false
     $prepare = Invoke-Catalog $prepareArgs
     Assert-Test ($prepare.ok -and $prepare.data.task.action -eq 'seed-selected') 'task preparation snapshots the current tree and seeds the best known-working cache'
+    Assert-Test ($prepare.output.mode -eq 'bounded' -and $prepare.data.task.before.inventoryEntriesOmitted -and -not $prepare.data.task.before.PSObject.Properties['entries']) 'prepare output omits per-file inventory entries while durable receipts retain them'
     $seeded = & $transactionTool inspect -CachePath $liveCache -NoExit | ConvertFrom-Json -Depth 30
     Assert-Test ([string]$seeded.data.treeSha256 -ieq [string]$baselineTransaction.data.inventory.treeSha256) 'task preparation verifies the seeded live tree'
     $prepareAgain = Invoke-Catalog $prepareArgs
@@ -175,6 +176,7 @@ try {
         NoExit = $true
     }
     Assert-Test ($complete.ok -and $complete.state -eq 'complete') 'task completion restores the caller-owned cache and publishes an explicitly verified result'
+    Assert-Test ($complete.output.mode -eq 'bounded' -and $complete.data.task.workingTree.inventory.inventoryEntriesOmitted -and -not $complete.data.task.workingTree.inventory.PSObject.Properties['entries']) 'complete output remains bounded independently of cache file count'
     $afterComplete = & $transactionTool inspect -CachePath $liveCache -NoExit | ConvertFrom-Json -Depth 30
     Assert-Test ([string]$afterComplete.data.treeSha256 -ieq [string]$beforeTask.data.treeSha256) 'task completion restores the exact pre-task live cache'
     Assert-Test ([string]$complete.data.task.workingTree.inventory.treeSha256 -ieq [string]$taskResult.data.treeSha256) 'task completion records the exact compiled result before restoration'
