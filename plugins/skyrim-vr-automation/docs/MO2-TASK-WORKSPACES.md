@@ -48,9 +48,11 @@ OCU/OpenComposite provider is the blocker for the `SteamVRNull` route.
   lease release and resume, and `list-task` reports that choice.
 - `resume` verifies stable task ownership, requires the newly owned access
   lease, rebinds the workspace to that lease, and selects the retained profile.
-  It does not refresh the profile from the primary profile or requalify a save
-  after task-local edits. A task that needs the current known-good baseline must
-  explicitly request a fresh clone.
+  When the prior lease completed its output transaction, resume creates a fresh
+  owner marker, evidence directories, snapshots, and completion paths for the
+  new lease before returning ready. It does not refresh the profile from the
+  primary profile or requalify a save after task-local edits. A task that needs
+  the current known-good baseline must explicitly request a fresh clone.
 
 Success results identify the exact workspace, profile directory, selected
 profile transaction, save policy, and current lease. Missing profiles, wrong
@@ -68,6 +70,11 @@ This retained environment is the default end state. Do not restore it to the
 source profile, remove its task-local changes, or retire it merely because a
 run, turn, or task has completed. Reacquire access and resume the exact
 workspace when work continues.
+
+After the game and MO2 close, run shader-cache catalog `complete` and workspace
+`complete-output`. These preserve generated `ShaderCache` and `backup` trees,
+restore the exact pre-task MO2 Overwrite state, and release the output owner
+marker without reverting the retained task profile.
 
 Use workspace `retire` only after explicit direction to discard or replace that
 exact environment, or when a separately stated retention policy proves it
@@ -90,6 +97,12 @@ Primary-profile package updates are additive. Install an update under a new mod
 name, then disable the old mod and enable the new mod in the maintained primary
 profile. Existing task profiles retain their prior mod selections and shared
 mod references until the owning task explicitly requests a fresh clone.
+
+CSX runtime output is bound to MO2 Overwrite, not an existing mod. Workspace
+creation removes the cloned profile's game and `Synthesis` custom-overwrite
+mappings, snapshots `backup`, and materializes its enabled-provider union.
+Shader-cache preparation does the same for `ShaderCache`. New paths and updates
+therefore resolve to Overwrite; shared mod directories remain immutable.
 
 Some applications write runtime data into an existing mod, notably CSX writing
 compiled shaders into the managed shader-cache mod. That known exception is

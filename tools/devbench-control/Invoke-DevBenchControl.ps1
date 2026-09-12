@@ -19,6 +19,7 @@ param(
     [string]$WorkspaceManifestPath,
     [string]$ExpectedBuildId,
     [string]$ExpectedArtifactSha256,
+    [string]$ExpectedRuntimeIdentityJson,
     [ValidateSet('noBlockingMenu', 'mainMenuReady', 'playerLoaded', 'upscalingStable', 'toolAvailable', 'serviceReady')]
     [string]$Condition = 'noBlockingMenu',
     [ValidateRange(1, 600)]
@@ -66,6 +67,8 @@ $transportRetries = [Collections.Generic.List[object]]::new()
 $ownedMcpSessions = [Collections.Generic.List[object]]::new()
 $invocationEvidencePath = $null
 $invocationRecord = $null
+$data = $null
+$semantic = $null
 $operationStartedUtc = [DateTime]::UtcNow
 $operationDeadlineUtc = $operationStartedUtc.AddSeconds($TimeoutSeconds)
 $effectiveOperationTimeoutSeconds = $TimeoutSeconds
@@ -79,6 +82,19 @@ function Get-RequestTimeoutSeconds {
     $remainingSeconds = ($script:operationDeadlineUtc - [DateTime]::UtcNow).TotalSeconds
     if ($remainingSeconds -lt 1) { throw [TimeoutException]::new('The DevBench operation deadline expired before another request could start.') }
     return [int][Math]::Max(1, [Math]::Min($script:requestTimeoutSecondsForRpc, [Math]::Ceiling($remainingSeconds)))
+}
+
+function Get-DevBenchDispatchProvenance($InvocationRecord, $Data, $Semantic) {
+    $dispatchReached = [bool]($InvocationRecord -and -not [string]::IsNullOrWhiteSpace([string]$InvocationRecord.dispatchedUtc))
+    $responseDataRetained = [bool]($dispatchReached -and $null -ne $Data)
+    $semanticKnown = [bool]($Semantic -and $Semantic.PSObject.Properties['known'] -and [bool]$Semantic.known)
+    $semanticAccepted = [bool]($semanticKnown -and $Semantic.PSObject.Properties['ok'] -and [bool]$Semantic.ok)
+    return [pscustomobject][ordered]@{
+        dispatchReached = $dispatchReached
+        responseDataRetained = $responseDataRetained
+        acceptedDataRetained = [bool]($responseDataRetained -and $semanticAccepted)
+        semanticRejected = [bool]($responseDataRetained -and $semanticKnown -and -not $semanticAccepted)
+    }
 }
 
 function Set-ServerWaitBudgetAtDispatch([hashtable]$Arguments) {
@@ -723,6 +739,25 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
         }
     }
     elseif ($expectations.artifactSha256) { $errors.Add('An artifact SHA-256 expectation requires artifactPath/dllPath or -ArtifactPath.') }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedRuntimeIdentityJson)) {
+        try {
+            $expectedIdentity = $ExpectedRuntimeIdentityJson | ConvertFrom-Json -Depth 20
+            foreach ($required in @('listenerPid', 'processPath', 'processStartTimeUtc', 'buildId', 'artifactPath', 'artifactSha256')) {
+                if (-not $expectedIdentity.PSObject.Properties[$required] -or [string]::IsNullOrWhiteSpace([string]$expectedIdentity.$required)) {
+                    throw "ExpectedRuntimeIdentityJson requires '$required'."
+                }
+            }
+            if ($listenerPid -ne [int]$expectedIdentity.listenerPid) { $errors.Add("Expected listener PID $($expectedIdentity.listenerPid) differs from observed PID $listenerPid.") }
+            if ($processIdentity -and -not [string]::Equals([string]$processIdentity.path, [string]$expectedIdentity.processPath, [StringComparison]::OrdinalIgnoreCase)) { $errors.Add('Expected listener process path differs from the observed process path.') }
+            if ($processIdentity -and [string]$processIdentity.startTimeUtc -cne [string]$expectedIdentity.processStartTimeUtc) { $errors.Add('Expected listener process start time differs from the observed process start time.') }
+            if ([string]$actualBuildId -cne [string]$expectedIdentity.buildId) { $errors.Add('Expected CSX build ID differs from the observed build ID.') }
+            if ($artifact -and -not [string]::Equals([string]$artifact.path, [string]$expectedIdentity.artifactPath, [StringComparison]::OrdinalIgnoreCase)) { $errors.Add('Expected artifact path differs from the observed artifact path.') }
+            if ($artifact -and [string]$artifact.sha256 -cne [string]$expectedIdentity.artifactSha256) { $errors.Add('Expected artifact SHA-256 differs from the observed artifact SHA-256.') }
+        }
+        catch {
+            $errors.Add("Expected runtime identity is invalid: $($_.Exception.Message)")
+        }
+    }
     $missing = [Collections.Generic.List[string]]::new()
     if (-not $listenerPid) { $missing.Add('pid') }
     if (-not $processIdentity -or -not $processIdentity.path) { $missing.Add('process.path') }
@@ -1294,9 +1329,15 @@ try {
         -not $semantic.known -or -not $semantic.ok
     }
     else { $false }
+    $dispatch = Get-DevBenchDispatchProvenance -InvocationRecord $invocationRecord -Data $data -Semantic $semantic
     $result = [pscustomobject][ordered]@{
         ok = -not $semanticFailure
         transportOk = $true
+        state = $(if ($semanticFailure) { 'semantic-failed' } else { 'completed' })
+        indeterminate = $false
+        dispatchReached = [bool]$dispatch.dispatchReached
+        responseDataRetained = [bool]$dispatch.responseDataRetained
+        acceptedDataRetained = [bool]$dispatch.acceptedDataRetained
         command = $Command
         endpoint = $endpoint
         timestampUtc = [DateTime]::UtcNow.ToString('o')
@@ -1320,26 +1361,31 @@ try {
 catch {
     $failureMessage = $_.Exception.Message
     $indeterminateMutation = [bool]$_.Exception.Data['DevBenchIndeterminateMutation']
+    $dispatch = Get-DevBenchDispatchProvenance -InvocationRecord $invocationRecord -Data $data -Semantic $semantic
+    $outcomeIndeterminate = [bool]($indeterminateMutation -or ((-not $readOnlyCall) -and $dispatch.dispatchReached -and -not $dispatch.acceptedDataRetained -and -not $dispatch.semanticRejected))
     if ($invocationRecord -and $invocationRecord.state -ne 'guard-rejected') {
-        try { Update-InvocationEvidence -State $(if ($indeterminateMutation) { 'indeterminate' } else { 'failed' }) -Errors @($failureMessage) } catch { $failureMessage = "$failureMessage Evidence update also failed: $($_.Exception.Message)" }
+        try { Update-InvocationEvidence -State $(if ($outcomeIndeterminate) { 'indeterminate' } else { 'failed' }) -Semantic $semantic -Data $data -Errors @($failureMessage) } catch { $failureMessage = "$failureMessage Evidence update also failed: $($_.Exception.Message)" }
     }
     $result = [pscustomobject][ordered]@{
         ok = $false
-        transportOk = $false
-        state = if ($indeterminateMutation) { 'indeterminate-mutation' } else { 'failed' }
-        indeterminate = $indeterminateMutation
+        transportOk = [bool]$dispatch.responseDataRetained
+        state = if ($outcomeIndeterminate) { 'indeterminate-mutation' } elseif ($dispatch.acceptedDataRetained) { 'post-dispatch-evidence-failed' } elseif ($dispatch.semanticRejected) { 'semantic-failed' } else { 'failed' }
+        indeterminate = $outcomeIndeterminate
+        dispatchReached = [bool]$dispatch.dispatchReached
+        responseDataRetained = [bool]$dispatch.responseDataRetained
+        acceptedDataRetained = [bool]$dispatch.acceptedDataRetained
         command = $Command
         endpoint = $endpoint
         timestampUtc = [DateTime]::UtcNow.ToString('o')
         runtimeIdentity = $runtimeIdentity
         evidencePath = $invocationEvidencePath
         invocationEvidencePath = $invocationEvidencePath
-        semantic = $null
+        semantic = $semantic
         transportRetries = @($transportRetries)
         requestTimeoutSeconds = $script:requestTimeoutSecondsForRpc
         operationTimeoutSeconds = $effectiveOperationTimeoutSeconds
         operationDeadlineUtc = $script:operationDeadlineUtc.ToString('o')
-        data = $null
+        data = $data
         errors = @($failureMessage)
     }
 }
