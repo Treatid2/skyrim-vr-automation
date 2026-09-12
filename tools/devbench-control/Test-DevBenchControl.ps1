@@ -59,10 +59,52 @@ $recordSemantic = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ 
 Assert-Test ($recordSemantic.known -and $recordSemantic.ok -and $recordSemantic.outcome -eq 'record-start-contract-satisfied') 'record start validates the running receipt and correlation identity'
 $recordMismatch = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ action = 'start'; recording = $true; correlationId = 'other' })
 Assert-Test ($recordMismatch.known -and -not $recordMismatch.ok) 'record start rejects a mismatched correlation identity'
+$loadSemantic = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ action = 'load'; name = 'Save-1'; queued = $true })
+Assert-Test ($loadSemantic.known -and $loadSemantic.ok -and $loadSemantic.outcome -eq 'game-load-dispatch-queued' -and $loadSemantic.completionBasis -eq 'dispatch-only') 'game load recognizes an exact queued dispatch without claiming current-state completion'
+$loadMismatch = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ action = 'load'; name = 'Save-2'; queued = $true })
+Assert-Test ($loadMismatch.known -and -not $loadMismatch.ok -and $loadMismatch.outcome -eq 'game-load-dispatch-rejected') 'game load rejects a queued receipt for a different save'
+$loadNotQueued = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ action = 'load'; name = 'Save-1'; queued = $false })
+Assert-Test ($loadNotQueued.known -and -not $loadNotQueued.ok) 'game load never promotes a non-queued receipt'
 $readFailure = Get-DevBenchCallSemanticStatus -ToolName inspect -Arguments @{ kind = 'state' } -Content @([pscustomobject]@{ error = 'main thread busy' })
 Assert-Test ($readFailure.known -and -not $readFailure.ok -and $readFailure.outcome -eq 'read-contract-failed') 'read-only adapters never promote a structured error to success'
 $incompleteMenu = Get-DevBenchCallSemanticStatus -ToolName menu -Arguments @{ action = 'list' } -Content @([pscustomobject]@{ openMenus = @() })
 Assert-Test (-not $incompleteMenu.known) 'read-only adapters require the tool-specific response shape'
+
+$planFixture = Join-Path ([IO.Path]::GetTempPath()) "csx-render-map-plan-test-$([guid]::NewGuid().ToString('N'))"
+try {
+    New-Item -ItemType Directory -Path $planFixture | Out-Null
+    $registryPath = Join-Path $planFixture 'registry.json'
+    $workloadPath = Join-Path $planFixture 'workload.json'
+    $planPath = Join-Path $planFixture 'plan.json'
+    [pscustomobject]@{
+        result = [pscustomobject]@{
+            major = 1
+            defaults = [pscustomobject]@{ fixedCatalogueBytes = 1000 }
+            limits = [pscustomobject]@{
+                maximumBytes = 100000; maximumDurationMs = 10000; maximumEvents = 10000; maximumFrames = 100
+                maximumScopeDepth = 32; maximumGeometryObservations = 1000; maximumMaterialStateObservations = 1000
+                maximumResourceObservations = 1000; maximumSceneObjectObservations = 1000; maximumShaderObservations = 1000
+                maximumStageShaderObservations = 1000; maximumTargetBindingObservations = 1000; maximumTargetViewObservations = 1000
+            }
+        }
+        server = [pscustomobject]@{ buildId = 'fixture-build' }
+    } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $registryPath -Encoding utf8
+    [pscustomobject]@{
+        expectedDurationMs = 1000; expectedFrames = 4; expectedEvents = 100; expectedEventBytes = 10000; expectedScopeDepth = 3
+        expectedObservations = [pscustomobject]@{ geometry = 10; materialState = 10; resource = 10; sceneObject = 10; shader = 10; stageShader = 10; targetBinding = 10; targetView = 10 }
+    } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $workloadPath -Encoding utf8
+    $plan = & (Join-Path $PSScriptRoot 'New-CSXRenderMapCapturePlan.ps1') -RegistryPath $registryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId fixture-command -OutputPath $planPath -HeadroomFactor 2 -NoExit -Compact | ConvertFrom-Json
+    Assert-Test ($plan.ok -and $plan.arguments.maxEvents -eq 200 -and $plan.arguments.maxBytes -eq 21000 -and (Test-Path -LiteralPath $plan.receiptPath -PathType Leaf)) 'render-map planner sizes every bound from workload plus headroom and retains a receipt'
+    $oversizedPath = Join-Path $planFixture 'oversized.json'
+    $oversizedWorkload = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
+    $oversizedWorkload.expectedEvents = 6000
+    $oversizedWorkload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $oversizedPath -Encoding utf8
+    $refused = & (Join-Path $PSScriptRoot 'New-CSXRenderMapCapturePlan.ps1') -RegistryPath $registryPath -WorkloadPath $oversizedPath -ClientId fixture-client -CommandId oversized-command -OutputPath (Join-Path $planFixture 'oversized-plan.json') -HeadroomFactor 2 -NoExit -Compact | ConvertFrom-Json
+    Assert-Test (-not $refused.ok -and $null -eq $refused.arguments -and $refused.exceededCeilings.Count -ge 1) 'render-map planner refuses workload bounds beyond the live service ceilings'
+}
+finally {
+    if (Test-Path -LiteralPath $planFixture) { Remove-Item -LiteralPath $planFixture -Recurse -Force }
+}
 
 $ready = Test-DevBenchServiceReady -Content @([pscustomobject]@{ ok = $true; result = [pscustomobject]@{ state = 'ready' } })
 Assert-Test ($ready.ready -and -not $ready.retryable -and $ready.statePath -eq 'content.result.state') 'service readiness prefers result.state'
