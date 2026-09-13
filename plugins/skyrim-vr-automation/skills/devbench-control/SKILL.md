@@ -78,8 +78,11 @@ or construct HTTP or MCP requests ad hoc.
    only the unresolved read-only health or action call within its explicit
    bounded deadline and return on its first success. On the controller fallback
    lane, use `wait -Condition toolAvailable -Tool <exact-name>` or
-   `serviceReady` with a read-only `-ArgumentsJson` action and an explicit
-   bounded timeout. Never cross transports to perform a readiness wait.
+   `wait -Condition serviceReady -Tool <exact-name>` with an explicit bounded
+   timeout. Do not pass `-ArgumentsJson` to `serviceReady`: the controller
+   derives its qualified read-only probe from the authoritative input schema
+   and rejects caller-supplied probe actions. Never cross transports to perform
+   a readiness wait.
 9. On the selected controller lane, use `-ExpectedErrorCode` for deliberate
    guard tests such as `producer_mismatch`; do not reinterpret an unrequested
    API failure as a pass on either lane.

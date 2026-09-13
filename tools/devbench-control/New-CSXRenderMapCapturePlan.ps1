@@ -80,10 +80,19 @@ function Assert-RegistryEnvelopeSuccess($Value, [string]$Path) {
     foreach ($name in @('status', 'resultStatus')) {
         $property = $Value.PSObject.Properties[$name]
         if (-not $property -or $null -eq $property.Value) { continue }
-        $statusName = Get-Property $property.Value 'name'
-        $statusValue = Get-Property $property.Value 'value'
-        if (($null -ne $statusValue -and [long]$statusValue -ne 0) -or
-            ([string]$statusName -match '^(?i:fail|failed|error|rejected|guard_rejected)$')) {
+        $statusName = if ($property.Value -is [string] -or $property.Value -is [ValueType]) {
+            [string]$property.Value
+        } else {
+            [string](Get-Property $property.Value 'name')
+        }
+        $statusValue = if ($property.Value -is [string] -or $property.Value -is [ValueType]) {
+            $null
+        } else {
+            Get-Property $property.Value 'value'
+        }
+        $supportedSuccessNames = @('success', 'ok', 'ready', 'completed', 'accepted', 'idle', 'available')
+        if (($null -ne $statusValue -and ([string]$statusValue -notmatch '^-?\d+$' -or [long]$statusValue -ne 0)) -or
+            [string]::IsNullOrWhiteSpace($statusName) -or $statusName -notin $supportedSuccessNames) {
             throw "$Path.$name reports a failed registry response."
         }
     }

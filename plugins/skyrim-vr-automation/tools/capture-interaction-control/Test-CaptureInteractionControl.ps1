@@ -117,6 +117,9 @@ if ($Tool -eq 'communityshaders.screenshot') {
     [pscustomobject]@{ok=$false;data=$null;errors=@('fixture visual start failure')} | ConvertTo-Json -Compress
     return
   }
+  elseif ($argsObject.action -eq 'sequence_start' -and $env:CAPTURE_INTERACTION_FAIL_SEQUENCE_QUALIFICATION -eq '1') {
+    $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{state='running';terminal=$false}}
+  }
   elseif ($argsObject.action -in @('sequence_start','capture')) {
     $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='running';terminal=$false}}
     if ($argsObject.action -eq 'sequence_start' -and $env:CAPTURE_INTERACTION_LOSE_VISUAL_ACCEPTED -eq '1') {
@@ -162,6 +165,7 @@ else { $value=[pscustomobject]@{ok=$true} }
     $oversized = & $entry start -SessionDirectory $oversizedSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 60000 -FrameIntervalMs 1000 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test (-not $oversized.ok -and $oversized.errors -match 'runtime limits are 60000 frames and 3600000 ms' -and $oversized.errors -match 'no greater than 3600') 'sequence preflight reports the exact runtime duration limit and compatible frame count after accepting the server maximum at parameter binding'
     Assert-Test (-not (Test-Path -LiteralPath $oversizedSession)) 'sequence preflight rejects an incompatible request before creating session state or starting recording'
+
     $session = Join-Path $root 'session'
     $started = & $entry start -SessionDirectory $session -RuntimePath $runtime -VisualMode sequence -MaximumFrames 60000 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
     Assert-Test ($started.ok -and $started.state -eq 'session-started' -and $started.data.screenshot.requestId -eq 'req-1' -and $started.data.screenshot.preflight.maximumSequenceFrames -eq 60000) 'sequence session admits the DevBench-advertised 60000-frame limit when its requested duration also fits'
@@ -206,6 +210,12 @@ else { $value=[pscustomobject]@{ok=$true} }
     $lostVisual = & $entry start -SessionDirectory $lostVisualSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 500 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test (-not $lostVisual.ok -and $lostVisual.state -eq 'cleanup-uncertain' -and $lostVisual.data.screenshotOutcomeUncertain -and $lostVisual.data.screenshotInvocationEvidencePath -eq 'screenshot-start-indeterminate.json' -and $lostVisual.data.cleanup.errors.Count -eq 0 -and $lostVisual.data.cleanup.uncertainties.Count -eq 1) 'dispatched screenshot with no accepted receipt remains explicitly uncertain after recording cleanup'
     Remove-Item Env:CAPTURE_INTERACTION_LOSE_VISUAL_RESULT -ErrorAction SilentlyContinue
+
+    $env:CAPTURE_INTERACTION_FAIL_SEQUENCE_QUALIFICATION = '1'
+    $unqualifiedVisualSession = Join-Path $root 'unqualified-visual-session'
+    $unqualifiedVisual = & $entry start -SessionDirectory $unqualifiedVisualSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 500 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test (-not $unqualifiedVisual.ok -and $unqualifiedVisual.state -eq 'cleanup-uncertain' -and $unqualifiedVisual.data.screenshotOutcomeUncertain -and $unqualifiedVisual.data.screenshotAttemptReceipt.result.state -eq 'running' -and $unqualifiedVisual.data.cleanup.recordStop.path -eq 'recording.json' -and $unqualifiedVisual.data.cleanup.uncertainties.Count -eq 1) 'unqualified screenshot-start content is retained and cannot be reported as fully rolled back without a request identity'
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_QUALIFICATION -ErrorAction SilentlyContinue
 
     $env:CAPTURE_INTERACTION_LOSE_RECORD_RESULT = '1'
     $lostRecordSession = Join-Path $root 'lost-record-session'
@@ -269,5 +279,6 @@ finally {
     Remove-Item Env:CAPTURE_INTERACTION_RUNTIME_BUILD -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_RUNTIME_ARTIFACT_SHA -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_FAIL_STOP -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_QUALIFICATION -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
 }

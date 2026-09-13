@@ -74,6 +74,16 @@ function Get-DevBenchSemanticStatus {
             $name = [string]$property.Name
             $childPath = if ([string]::IsNullOrWhiteSpace($Path)) { $name } else { "$Path.$name" }
             $child = $property.Value
+            if ($name -in @('error', 'errors') -and $null -ne $child) {
+                $failureItems = @($child | Where-Object {
+                    $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_)
+                })
+                if ($failureItems.Count -gt 0) {
+                    $script:semanticKnown = $true
+                    $failureSummary = @($failureItems | ForEach-Object { [string]$_ }) -join '; '
+                    $reasons.Add("$childPath contains failure evidence: '$failureSummary'")
+                }
+            }
             if ($name -eq 'ok' -and $null -ne $child) {
                 $script:semanticKnown = $true
                 if (-not [bool]$child) { $reasons.Add("$childPath is false") }
@@ -315,10 +325,6 @@ function Get-DevBenchCallSemanticStatus {
             $null
         }
         if ($payload) {
-            $errorProperty = $payload.PSObject.Properties['error']
-            if ($errorProperty -and -not [string]::IsNullOrWhiteSpace([string]$errorProperty.Value)) {
-                $reasons.Add("content.error is '$($errorProperty.Value)'")
-            }
             $actionProperty = $payload.PSObject.Properties['action']
             if (-not $actionProperty -or [string]$actionProperty.Value -cne 'stop') {
                 $reasons.Add('content.action is not the exact record stop action')
@@ -369,17 +375,20 @@ function Get-DevBenchCallSemanticStatus {
             if (-not $deviceProperty -or [string]$deviceProperty.Value -cne 'vrTrackedSet') {
                 $reasons.Add('content.device is not the exact vrTrackedSet device')
             }
+            $pendingProperty = $payload.PSObject.Properties['restorationPending']
+            if ($pendingProperty -and ($pendingProperty.Value -isnot [bool] -or [bool]$pendingProperty.Value)) {
+                $reasons.Add('content.restorationPending is not Boolean false')
+            }
             if (-not $alreadyInactive) {
                 $stoppedProperty = $payload.PSObject.Properties['stopped']
                 $restoredProperty = $payload.PSObject.Properties['restored']
-                $pendingProperty = $payload.PSObject.Properties['restorationPending']
                 if (-not $stoppedProperty -or $stoppedProperty.Value -isnot [bool] -or -not [bool]$stoppedProperty.Value) {
                     $reasons.Add('content.stopped is not Boolean true')
                 }
                 if (-not $restoredProperty -or $restoredProperty.Value -isnot [bool] -or -not [bool]$restoredProperty.Value) {
                     $reasons.Add('content.restored is not Boolean true')
                 }
-                if (-not $pendingProperty -or $pendingProperty.Value -isnot [bool] -or [bool]$pendingProperty.Value) {
+                if (-not $pendingProperty) {
                     $reasons.Add('content.restorationPending is not Boolean false')
                 }
                 if ($Arguments.Contains('owner')) {
@@ -410,43 +419,90 @@ function Get-DevBenchCallSemanticStatus {
         }
     }
 
-    if ($semantic.known) { return $semantic }
-    if ($payloads.Count -ne 1 -or $null -eq $payloads[0] -or $payloads[0] -is [string] -or $payloads[0] -is [ValueType]) {
-        return $semantic
-    }
-    $payload = $payloads[0]
-
     if ($ToolName -eq 'record' -and $Arguments.Contains('action') -and [string]$Arguments['action'] -eq 'start') {
-        $actionProperty = $payload.PSObject.Properties['action']
-        $recordingProperty = $payload.PSObject.Properties['recording']
-        if ($actionProperty -and $recordingProperty) {
-            $reasons = [Collections.Generic.List[string]]::new()
-            if ([string]$actionProperty.Value -ne 'start') { $reasons.Add("content.action is '$($actionProperty.Value)', expected 'start'") }
-            if (-not [bool]$recordingProperty.Value) { $reasons.Add('content.recording is false after record start') }
+        $reasons = [Collections.Generic.List[string]]::new()
+        if ($semantic.known -and -not $semantic.ok) {
+            foreach ($reason in @($semantic.reasons)) { $reasons.Add([string]$reason) }
+        }
+        $payload = if ($payloads.Count -eq 1 -and $null -ne $payloads[0] -and
+            $payloads[0] -isnot [string] -and $payloads[0] -isnot [ValueType]) { $payloads[0] } else {
+            $reasons.Add('content must contain exactly one structured record start receipt')
+            $null
+        }
+        if ($payload) {
+            $actionProperty = $payload.PSObject.Properties['action']
+            $recordingProperty = $payload.PSObject.Properties['recording']
+            if (-not $actionProperty -or [string]$actionProperty.Value -cne 'start') { $reasons.Add('content.action is not the exact record start action') }
+            if (-not $recordingProperty -or $recordingProperty.Value -isnot [bool] -or -not [bool]$recordingProperty.Value) { $reasons.Add('content.recording is not Boolean true after record start') }
             if ($Arguments.Contains('correlationId')) {
                 $correlationProperty = $payload.PSObject.Properties['correlationId']
                 if (-not $correlationProperty -or [string]$correlationProperty.Value -cne [string]$Arguments['correlationId']) {
                     $reasons.Add('content.correlationId does not match the requested recording correlation')
                 }
             }
-            return [pscustomobject][ordered]@{
-                known = $true
-                ok = $reasons.Count -eq 0
-                outcome = if ($reasons.Count -eq 0) { 'record-start-contract-satisfied' } else { 'record-start-contract-failed' }
-                guarded = $false
-                transient = $false
-                codes = @()
-                states = @()
-                reasons = @($reasons)
-                schedulerOnly = $false
-                schedulerReceiptPaths = @()
-                explicitOutcomeEvidence = @('content.action', 'content.recording', 'content.correlationId')
-            }
+        }
+        return [pscustomobject][ordered]@{
+            known = $true
+            ok = $reasons.Count -eq 0
+            outcome = if ($reasons.Count -eq 0) { 'record-start-contract-satisfied' } else { 'record-start-contract-failed' }
+            guarded = [bool]$semantic.guarded
+            transient = [bool]$semantic.transient
+            codes = @($semantic.codes)
+            states = @($semantic.states)
+            reasons = @($reasons | Select-Object -Unique)
+            schedulerOnly = $false
+            schedulerReceiptPaths = @()
+            explicitOutcomeEvidence = @('content.action', 'content.recording', 'content.correlationId')
         }
     }
 
+    if ($ToolName -eq 'communityshaders.screenshot' -and $Arguments.Contains('action') -and
+        [string]$Arguments['action'] -eq 'capabilities') {
+        $reasons = [Collections.Generic.List[string]]::new()
+        if ($semantic.known -and -not $semantic.ok) {
+            foreach ($reason in @($semantic.reasons)) { $reasons.Add([string]$reason) }
+        }
+        $payload = if ($payloads.Count -eq 1 -and $null -ne $payloads[0] -and
+            $payloads[0] -isnot [string] -and $payloads[0] -isnot [ValueType]) { $payloads[0] } else {
+            $reasons.Add('content must contain exactly one structured screenshot capabilities receipt')
+            $null
+        }
+        if ($payload) {
+            if (-not $payload.PSObject.Properties['schema'] -or [string]$payload.schema -cne 'urn:csx:devbench:screenshot:1') {
+                $reasons.Add('content.schema is not the screenshot contract schema')
+            }
+            $limits = $payload.PSObject.Properties['limits']
+            $frames = if ($limits -and $null -ne $limits.Value -and $limits.Value -isnot [string] -and $limits.Value -isnot [ValueType]) { $limits.Value.PSObject.Properties['maximumSequenceFrames'] } else { $null }
+            $duration = if ($limits -and $null -ne $limits.Value -and $limits.Value -isnot [string] -and $limits.Value -isnot [ValueType]) { $limits.Value.PSObject.Properties['maximumSequenceDurationMs'] } else { $null }
+            $integralTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
+            if (-not $frames -or $null -eq $frames.Value -or $frames.Value.GetType() -notin $integralTypes -or [uint64]$frames.Value -eq 0) {
+                $reasons.Add('content.limits.maximumSequenceFrames is not a positive integer')
+            }
+            if (-not $duration -or $null -eq $duration.Value -or $duration.Value.GetType() -notin $integralTypes -or [uint64]$duration.Value -eq 0) {
+                $reasons.Add('content.limits.maximumSequenceDurationMs is not a positive integer')
+            }
+        }
+        return [pscustomobject][ordered]@{
+            known = $true; ok = $reasons.Count -eq 0
+            outcome = if ($reasons.Count -eq 0) { 'read-contract-satisfied' } else { 'read-contract-failed' }
+            guarded = [bool]$semantic.guarded; transient = [bool]$semantic.transient
+            codes = @($semantic.codes); states = @($semantic.states)
+            reasons = @($reasons | Select-Object -Unique); schedulerOnly = $false
+            schedulerReceiptPaths = @(); explicitOutcomeEvidence = @('content.schema', 'content.limits.maximumSequenceFrames', 'content.limits.maximumSequenceDurationMs')
+        }
+    }
+
+    if ($payloads.Count -ne 1 -or $null -eq $payloads[0] -or $payloads[0] -is [string] -or $payloads[0] -is [ValueType]) {
+        return $semantic
+    }
+    $payload = $payloads[0]
+
     if (Test-DevBenchReadOnlyRequest -ToolName $ToolName -Arguments $Arguments) {
         $properties = @($payload.PSObject.Properties)
+        if ($semantic.known -and -not $semantic.ok) {
+            $semantic.outcome = 'read-contract-failed'
+            return $semantic
+        }
         $errorProperty = $payload.PSObject.Properties['error']
         if ($errorProperty -and $null -ne $errorProperty.Value) {
             $semantic.known = $true
@@ -477,21 +533,21 @@ function Get-DevBenchCallSemanticStatus {
                 $payload.PSObject.Properties['action'] -and [string]$payload.action -ceq 'status' -and
                 $renderScaleStatus -and $null -ne $renderScaleStatus.Value -and
                 $renderScaleStatus.Value -isnot [string] -and $renderScaleStatus.Value -isnot [ValueType]) -or
-            ($ToolName -eq 'communityshaders.screenshot' -and $action -eq 'capabilities' -and
-                $payload.PSObject.Properties['schema'] -and [string]$payload.schema -ceq 'urn:csx:devbench:screenshot:1' -and
-                $maximumSequenceFrames -and $null -ne $maximumSequenceFrames.Value -and
-                $maximumSequenceFrames.Value.GetType() -in $integralTypes -and
-                [uint64]$maximumSequenceFrames.Value -gt 0 -and
-                $maximumSequenceDurationMs -and $null -ne $maximumSequenceDurationMs.Value -and
-                $maximumSequenceDurationMs.Value.GetType() -in $integralTypes -and
-                [uint64]$maximumSequenceDurationMs.Value -gt 0)
+            $false
         if ($contractSatisfied) {
             $semantic.known = $true
             $semantic.ok = $true
             $semantic.outcome = 'read-contract-satisfied'
             $semantic.explicitOutcomeEvidence = @($semantic.explicitOutcomeEvidence) + "tool:$ToolName"
         }
+        elseif ($semantic.known -and $semantic.ok) {
+            $semantic.ok = $false
+            $semantic.outcome = 'read-contract-failed'
+            $semantic.reasons = @($semantic.reasons) + "The response did not satisfy the '$ToolName' read contract."
+        }
+        return $semantic
     }
+    if ($semantic.known) { return $semantic }
     return $semantic
 }
 
@@ -539,7 +595,7 @@ function Test-DevBenchServiceReady {
     # tool answered. Readiness requires a recognized positive contract state;
     # otherwise polling an unknown payload could repeatedly dispatch work and
     # then promote the unclassified response to ready.
-    $ready = if ($state) { $state -in $AcceptedStates } elseif ($semantic.known) { $semantic.ok -and -not $retryable } else { $false }
+    $ready = if ($terminalFailure) { $false } elseif ($state) { $state -in $AcceptedStates } elseif ($semantic.known) { $semantic.ok -and -not $retryable } else { $false }
     return [pscustomobject][ordered]@{
         ready = $ready
         retryable = $retryable

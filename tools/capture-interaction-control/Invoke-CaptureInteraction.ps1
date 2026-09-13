@@ -408,7 +408,7 @@ try {
             intendedStatePath = $resolvedStatePath; receiptPath = (Join-Path $resolvedSessionDirectory 'capture-start-recovery.json')
             runtimeIdentity = $null; runtimeIdentityObservation = $null
             recordAccepted = $false; recordOutcomeUncertain = $false; recordStartReceipt = $null; recordRejectedReceipt = $null; recordInvocationEvidencePath = $null
-            screenshotRequestId = $null; screenshotOutcomeUncertain = $false; screenshotStartReceipt = $null; screenshotRejectedReceipt = $null; screenshotInvocationEvidencePath = $null
+            screenshotRequestId = $null; screenshotOutcomeUncertain = $false; screenshotStartReceipt = $null; screenshotAttemptReceipt = $null; screenshotRejectedReceipt = $null; screenshotInvocationEvidencePath = $null
             cleanup = $null
         }
         try {
@@ -464,6 +464,7 @@ try {
             throw "Recording start failed; cleanup is '$($failureData.cleanup.state)'. $recordFailure"
         }
         $screenshotState = [pscustomobject][ordered]@{ requestId = $null; startReceipt = $null; preflight = $sequencePreflight }
+        $screenshotAttemptReceipt = $null
         try {
             if ($VisualMode -eq 'sequence') {
                 $arguments = New-ScreenshotCommand $sessionId 'sequence_start'
@@ -477,6 +478,8 @@ try {
                     packaging = [ordered]@{ frameManifest = $true; previewVideo = [ordered]@{ requested = $false; required = $false; framesPerSecond = [Math]::Max(1, [int](1000 / $FrameIntervalMs)) } }
                 }
                 $started = Invoke-DevBench -Tool $screenshotTool -Arguments $arguments -Runtime $RuntimePath -ExpectedRuntimeIdentity $failureData.runtimeIdentity -RequireSuccess
+                $screenshotAttemptReceipt = $started.value
+                $failureData.screenshotAttemptReceipt = $started.value
                 $receipt = @(Find-CaptureInteractionScreenshotReceipt -Value $started.value | Select-Object -First 1)
                 if ($receipt.Count -ne 1) { throw 'Screenshot sequence did not expose an accepted request receipt.' }
                 $screenshotState.requestId = [string]$receipt[0].requestId
@@ -513,6 +516,9 @@ try {
                 elseif ($failedResponse.PSObject.Properties['dispatchReached'] -and [bool]$failedResponse.dispatchReached) {
                     $failureData.screenshotOutcomeUncertain = $true
                 }
+            }
+            elseif ($null -ne $screenshotAttemptReceipt -and [string]::IsNullOrWhiteSpace([string]$failureData.screenshotRequestId)) {
+                $failureData.screenshotOutcomeUncertain = $true
             }
             $failureData = Invoke-CaptureStartupCleanup -Recovery $failureData
             throw "Visual capture start failed after recording began; cleanup is '$($failureData.cleanup.state)'. $startupFailure"
