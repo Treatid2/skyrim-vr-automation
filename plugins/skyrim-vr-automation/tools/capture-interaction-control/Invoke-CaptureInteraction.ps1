@@ -126,6 +126,15 @@ function Convert-Arguments([string]$Json, [string]$Label) {
 
 function Invoke-DevBench([string]$Tool, [hashtable]$Arguments, [string]$Runtime, $ExpectedRuntimeIdentity, [switch]$RequireSuccess) {
     if (-not (Test-Path -LiteralPath $DevBenchScriptPath -PathType Leaf)) { throw "DevBench controller does not exist: $DevBenchScriptPath" }
+    $attempt = [pscustomobject][ordered]@{
+        tool = $Tool
+        action = if ($Arguments.ContainsKey('action')) { [string]$Arguments.action } else { $null }
+        commandId = if ($Arguments.ContainsKey('commandId')) { [string]$Arguments.commandId } else { $null }
+        correlationId = if ($Arguments.ContainsKey('correlationId')) { [string]$Arguments.correlationId } else { $null }
+        requestId = if ($Arguments.ContainsKey('requestId')) { [string]$Arguments.requestId } else { $null }
+        runtimePath = [IO.Path]::GetFullPath($Runtime)
+        dispatchAttempted = $false
+    }
     $parameters = @{
         Tool = $Tool
         ArgumentsJson = ($Arguments | ConvertTo-Json -Depth 80 -Compress)
@@ -138,32 +147,53 @@ function Invoke-DevBench([string]$Tool, [hashtable]$Arguments, [string]$Runtime,
         $parameters['ExpectedRuntimeIdentityJson'] = $ExpectedRuntimeIdentity | ConvertTo-Json -Depth 20 -Compress
     }
     if ($SkipRuntimeIdentityVerification) { $parameters['SkipRuntimeIdentityVerification'] = $true }
-    $raw = & $DevBenchScriptPath call @parameters
-    $response = $raw | ConvertFrom-Json -Depth 100
-    if (-not $response.ok) {
-        $details = [Collections.Generic.List[string]]::new()
-        foreach ($errorText in @($response.errors)) {
-            if (-not [string]::IsNullOrWhiteSpace([string]$errorText)) { $details.Add([string]$errorText) }
-        }
-        if ($details.Count -eq 0 -and $response.PSObject.Properties['semantic'] -and $response.semantic) {
-            foreach ($reason in @($response.semantic.reasons)) {
-                if (-not [string]::IsNullOrWhiteSpace([string]$reason)) { $details.Add([string]$reason) }
+    try {
+        $attempt.dispatchAttempted = $true
+        $raw = & $DevBenchScriptPath call @parameters
+        $response = $raw | ConvertFrom-Json -Depth 100
+        if (-not $response.ok) {
+            $details = [Collections.Generic.List[string]]::new()
+            foreach ($errorText in @($response.errors)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$errorText)) { $details.Add([string]$errorText) }
             }
-            if ($details.Count -eq 0 -and $response.semantic.PSObject.Properties['outcome']) {
-                $details.Add("semantic outcome '$([string]$response.semantic.outcome)'")
+            if ($details.Count -eq 0 -and $response.PSObject.Properties['semantic'] -and $response.semantic) {
+                foreach ($reason in @($response.semantic.reasons)) {
+                    if (-not [string]::IsNullOrWhiteSpace([string]$reason)) { $details.Add([string]$reason) }
+                }
+                if ($details.Count -eq 0 -and $response.semantic.PSObject.Properties['outcome']) {
+                    $details.Add("semantic outcome '$([string]$response.semantic.outcome)'")
+                }
             }
+            if ($details.Count -eq 0) {
+                $state = if ($response.PSObject.Properties['state']) { [string]$response.state } else { 'unknown' }
+                $details.Add("controller returned ok=false with state '$state' and no diagnostic detail")
+            }
+            $failure = [InvalidOperationException]::new("DevBench tool '$Tool' failed: $($details -join '; ')")
+            $failure.Data['DevBenchResponse'] = $response
+            $failure.Data['DevBenchFailureEnvelope'] = $response
+            $failure.Data['DevBenchAttempt'] = $attempt
+            throw $failure
         }
-        if ($details.Count -eq 0) {
-            $state = if ($response.PSObject.Properties['state']) { [string]$response.state } else { 'unknown' }
-            $details.Add("controller returned ok=false with state '$state' and no diagnostic detail")
-        }
-        $failure = [InvalidOperationException]::new("DevBench tool '$Tool' failed: $($details -join '; ')")
-        $failure.Data['DevBenchResponse'] = $response
-        throw $failure
+        $content = @($response.data.content)
+        if ($content.Count -lt 1) { throw "DevBench tool '$Tool' returned no content." }
+        return [pscustomobject][ordered]@{ value = $content[0]; envelope = $response; attempt = $attempt }
     }
-    $content = @($response.data.content)
-    if ($content.Count -lt 1) { throw "DevBench tool '$Tool' returned no content." }
-    return [pscustomobject][ordered]@{ value = $content[0]; envelope = $response }
+    catch {
+        if (-not $_.Exception.Data.Contains('DevBenchAttempt')) { $_.Exception.Data['DevBenchAttempt'] = $attempt }
+        throw
+    }
+}
+
+function Test-DefiniteDevBenchMutationRejection($FailureEnvelope) {
+    if ($null -eq $FailureEnvelope -or -not $FailureEnvelope.PSObject.Properties['ok'] -or [bool]$FailureEnvelope.ok) { return $false }
+    if ($FailureEnvelope.PSObject.Properties['indeterminate'] -and [bool]$FailureEnvelope.indeterminate) { return $false }
+    if (-not $FailureEnvelope.PSObject.Properties['transportOk'] -or -not [bool]$FailureEnvelope.transportOk) { return $false }
+    $semantic = if ($FailureEnvelope.PSObject.Properties['semantic']) { $FailureEnvelope.semantic } else { $null }
+    if ($null -eq $semantic -or -not $semantic.PSObject.Properties['known'] -or -not [bool]$semantic.known -or
+        -not $semantic.PSObject.Properties['ok'] -or [bool]$semantic.ok) { return $false }
+    $outcome = if ($semantic.PSObject.Properties['outcome']) { [string]$semantic.outcome } else { '' }
+    $guarded = $semantic.PSObject.Properties['guarded'] -and [bool]$semantic.guarded
+    return $guarded -or $outcome -match 'rejected$'
 }
 
 function Invoke-Probe([string]$Tool, [hashtable]$Arguments, [string]$Runtime, $ExpectedRuntimeIdentity) {
@@ -407,12 +437,13 @@ try {
             runtimePath = [IO.Path]::GetFullPath($RuntimePath); sessionDirectory = $resolvedSessionDirectory
             intendedStatePath = $resolvedStatePath; receiptPath = (Join-Path $resolvedSessionDirectory 'capture-start-recovery.json')
             runtimeIdentity = $null; runtimeIdentityObservation = $null
-            recordAccepted = $false; recordOutcomeUncertain = $false; recordStartReceipt = $null; recordRejectedReceipt = $null; recordInvocationEvidencePath = $null
-            screenshotRequestId = $null; screenshotOutcomeUncertain = $false; screenshotStartReceipt = $null; screenshotAttemptReceipt = $null; screenshotRejectedReceipt = $null; screenshotInvocationEvidencePath = $null
+            recordAccepted = $false; recordOutcomeUncertain = $false; recordStartReceipt = $null; recordStartAttempt = $null; recordRejectedReceipt = $null; recordFailureEnvelope = $null; recordInvocationEvidencePath = $null
+            screenshotRequestId = $null; screenshotOutcomeUncertain = $false; screenshotStartReceipt = $null; screenshotStartAttempt = $null; screenshotAttemptReceipt = $null; screenshotRejectedReceipt = $null; screenshotFailureEnvelope = $null; screenshotInvocationEvidencePath = $null
             cleanup = $null
         }
         try {
             $recordCall = Invoke-DevBench -Tool 'record' -Arguments @{ action = 'start'; intervalMs = $RecordIntervalMs; allowNoPlayer = [bool]$AllowNoPlayer; correlationId = $sessionId } -Runtime $RuntimePath -RequireSuccess
+            $failureData.recordStartAttempt = $recordCall.attempt
             if ($recordCall.envelope.PSObject.Properties['runtimeIdentity']) {
                 $failureData.runtimeIdentityObservation = $recordCall.envelope.runtimeIdentity
                 $failureData.runtimeIdentity = ConvertTo-CaptureRuntimeIdentity -Identity $recordCall.envelope.runtimeIdentity
@@ -432,6 +463,8 @@ try {
         catch {
             $recordFailure = $_.Exception.Message
             $failedResponse = $_.Exception.Data['DevBenchResponse']
+            $failureData.recordStartAttempt = $_.Exception.Data['DevBenchAttempt']
+            $failureData.recordFailureEnvelope = $failedResponse
             if ($failedResponse) {
                 if ($failedResponse.PSObject.Properties['runtimeIdentity']) {
                     $failureData.runtimeIdentityObservation = $failedResponse.runtimeIdentity
@@ -451,14 +484,17 @@ try {
                     $failureData.recordAccepted = $true
                     $failureData.recordStartReceipt = $retainedRecordContent[0]
                 }
-                elseif ($retainedRecordContent.Count -gt 0 -and $failedResponse.PSObject.Properties['semantic'] -and
-                    $failedResponse.semantic.PSObject.Properties['known'] -and [bool]$failedResponse.semantic.known -and
-                    $failedResponse.semantic.PSObject.Properties['ok'] -and -not [bool]$failedResponse.semantic.ok) {
+                elseif ($retainedRecordContent.Count -gt 0 -and
+                    (Test-DefiniteDevBenchMutationRejection -FailureEnvelope $failedResponse)) {
                     $failureData.recordRejectedReceipt = $retainedRecordContent[0]
                 }
-                elseif ($failedResponse.PSObject.Properties['dispatchReached'] -and [bool]$failedResponse.dispatchReached) {
+                elseif (($failedResponse.PSObject.Properties['dispatchReached'] -and [bool]$failedResponse.dispatchReached) -or
+                    ($failureData.recordStartAttempt -and [bool]$failureData.recordStartAttempt.dispatchAttempted)) {
                     $failureData.recordOutcomeUncertain = $true
                 }
+            }
+            elseif ($failureData.recordStartAttempt -and [bool]$failureData.recordStartAttempt.dispatchAttempted) {
+                $failureData.recordOutcomeUncertain = $true
             }
             $failureData = Invoke-CaptureStartupCleanup -Recovery $failureData
             throw "Recording start failed; cleanup is '$($failureData.cleanup.state)'. $recordFailure"
@@ -478,6 +514,7 @@ try {
                     packaging = [ordered]@{ frameManifest = $true; previewVideo = [ordered]@{ requested = $false; required = $false; framesPerSecond = [Math]::Max(1, [int](1000 / $FrameIntervalMs)) } }
                 }
                 $started = Invoke-DevBench -Tool $screenshotTool -Arguments $arguments -Runtime $RuntimePath -ExpectedRuntimeIdentity $failureData.runtimeIdentity -RequireSuccess
+                $failureData.screenshotStartAttempt = $started.attempt
                 $screenshotAttemptReceipt = $started.value
                 $failureData.screenshotAttemptReceipt = $started.value
                 $receipt = @(Find-CaptureInteractionScreenshotReceipt -Value $started.value | Select-Object -First 1)
@@ -491,6 +528,8 @@ try {
         catch {
             $startupFailure = $_.Exception.Message
             $failedResponse = $_.Exception.Data['DevBenchResponse']
+            $failureData.screenshotStartAttempt = $_.Exception.Data['DevBenchAttempt']
+            $failureData.screenshotFailureEnvelope = $failedResponse
             if ($failedResponse) {
                 if ($failedResponse.PSObject.Properties['invocationEvidencePath']) {
                     $failureData.screenshotInvocationEvidencePath = [string]$failedResponse.invocationEvidencePath
@@ -508,16 +547,18 @@ try {
                     $failureData.screenshotRequestId = [string]$retainedReceipt[0].requestId
                     $failureData.screenshotStartReceipt = $retainedReceipt[0]
                 }
-                elseif ($retainedReceipt.Count -eq 1 -and $failedResponse.PSObject.Properties['semantic'] -and $failedResponse.semantic -and
-                    $failedResponse.semantic.PSObject.Properties['known'] -and [bool]$failedResponse.semantic.known -and
-                    $failedResponse.semantic.PSObject.Properties['ok'] -and -not [bool]$failedResponse.semantic.ok) {
+                elseif ($retainedReceipt.Count -eq 1 -and
+                    (Test-DefiniteDevBenchMutationRejection -FailureEnvelope $failedResponse)) {
                     $failureData.screenshotRejectedReceipt = $retainedReceipt[0]
                 }
-                elseif ($failedResponse.PSObject.Properties['dispatchReached'] -and [bool]$failedResponse.dispatchReached) {
+                elseif (($failedResponse.PSObject.Properties['dispatchReached'] -and [bool]$failedResponse.dispatchReached) -or
+                    ($failureData.screenshotStartAttempt -and [bool]$failureData.screenshotStartAttempt.dispatchAttempted)) {
                     $failureData.screenshotOutcomeUncertain = $true
                 }
             }
-            elseif ($null -ne $screenshotAttemptReceipt -and [string]::IsNullOrWhiteSpace([string]$failureData.screenshotRequestId)) {
+            elseif (($null -ne $screenshotAttemptReceipt -or
+                ($failureData.screenshotStartAttempt -and [bool]$failureData.screenshotStartAttempt.dispatchAttempted)) -and
+                [string]::IsNullOrWhiteSpace([string]$failureData.screenshotRequestId)) {
                 $failureData.screenshotOutcomeUncertain = $true
             }
             $failureData = Invoke-CaptureStartupCleanup -Recovery $failureData

@@ -84,46 +84,81 @@ function Get-DevBenchSemanticStatus {
                     $reasons.Add("$childPath contains failure evidence: '$failureSummary'")
                 }
             }
-            if ($name -eq 'ok' -and $null -ne $child) {
+            if ($name -in @('ok', 'success', 'passed', 'failed', 'aborted', 'retryable')) {
                 $script:semanticKnown = $true
-                if (-not [bool]$child) { $reasons.Add("$childPath is false") }
-            }
-            elseif ($name -in @('success', 'passed') -and $child -is [bool]) {
-                $script:semanticKnown = $true
-                if (-not [bool]$child) { $reasons.Add("$childPath is false") }
-            }
-            elseif ($name -eq 'failed' -and $child -is [bool]) {
-                $script:semanticKnown = $true
-                if ([bool]$child) { $reasons.Add("$childPath is true") }
-            }
-            elseif ($name -eq 'aborted' -and [bool]$child) {
-                $script:semanticKnown = $true
-                $reasons.Add("$childPath is true")
-            }
-            elseif ($name -eq 'retryable' -and $null -ne $child) {
-                $script:semanticKnown = $true
-                if ([bool]$child) { $retryableHints.Add($true) }
-            }
-            elseif ($name -eq 'code' -and $child -is [string] -and -not [string]::IsNullOrWhiteSpace($child)) {
-                $script:semanticKnown = $true
-                if (-not $codes.Contains([string]$child)) { $codes.Add([string]$child) }
-                if ([string]$child -notin $successNames) { $reasons.Add("$childPath is '$child'") }
-            }
-            elseif ($name -eq 'state' -and $child -is [string] -and -not [string]::IsNullOrWhiteSpace($child)) {
-                if (-not $states.Contains([string]$child)) { $states.Add([string]$child) }
-            }
-            elseif ($name -in @('status', 'resultStatus') -and $null -ne $child) {
-                $nameProperty = $child.PSObject.Properties['name']
-                $valueProperty = $child.PSObject.Properties['value']
-                if ($nameProperty) {
-                    $script:semanticKnown = $true
-                    $statusName = [string]$nameProperty.Value
-                    if (-not $codes.Contains($statusName)) { $codes.Add($statusName) }
-                    if ($statusName -notin $successNames) { $reasons.Add("$childPath.name is '$statusName'") }
+                if ($child -isnot [bool]) {
+                    $reasons.Add("$childPath is present but is not Boolean")
                 }
-                if ($valueProperty) {
+                elseif ($name -in @('ok', 'success', 'passed') -and -not $child) {
+                    $reasons.Add("$childPath is false")
+                }
+                elseif ($name -in @('failed', 'aborted') -and $child) {
+                    $reasons.Add("$childPath is true")
+                }
+                elseif ($name -eq 'retryable' -and $child) {
+                    $retryableHints.Add($true)
+                }
+            }
+            elseif ($name -eq 'code') {
+                $script:semanticKnown = $true
+                if ($child -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$child)) {
+                    $reasons.Add("$childPath is present but is not a non-empty string")
+                }
+                else {
+                    if (-not $codes.Contains([string]$child)) { $codes.Add([string]$child) }
+                    if ([string]$child -notin $successNames) { $reasons.Add("$childPath is '$child'") }
+                }
+            }
+            elseif ($name -eq 'state') {
+                if ($child -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$child)) {
+                    if (-not $states.Contains([string]$child)) { $states.Add([string]$child) }
+                }
+                elseif ($null -eq $child -or $child -is [string] -or $child -is [ValueType]) {
                     $script:semanticKnown = $true
-                    if ([int64]$valueProperty.Value -ne 0) { $reasons.Add("$childPath.value is $($valueProperty.Value)") }
+                    $reasons.Add("$childPath is present but is not a non-empty string")
+                }
+            }
+            elseif ($name -in @('status', 'resultStatus')) {
+                if ($child -is [string]) {
+                    $script:semanticKnown = $true
+                    if ([string]::IsNullOrWhiteSpace($child)) {
+                        $reasons.Add("$childPath is present but is not a non-empty status string")
+                    }
+                    else {
+                        $statusName = [string]$child
+                        if (-not $codes.Contains($statusName)) { $codes.Add($statusName) }
+                        if ($statusName -notin $successNames) { $reasons.Add("$childPath is '$statusName'") }
+                    }
+                }
+                elseif ($null -eq $child -or $child -is [ValueType] -or
+                    ($child -is [Collections.IEnumerable] -and $child -isnot [pscustomobject] -and $child -isnot [Collections.IDictionary])) {
+                    $script:semanticKnown = $true
+                    $reasons.Add("$childPath is present but is not a supported status value")
+                }
+                else {
+                    $nameProperty = $child.PSObject.Properties['name']
+                    $valueProperty = $child.PSObject.Properties['value']
+                    if ($nameProperty) {
+                        $script:semanticKnown = $true
+                        if ($nameProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$nameProperty.Value)) {
+                            $reasons.Add("$childPath.name is not a non-empty string")
+                        }
+                        else {
+                            $statusName = [string]$nameProperty.Value
+                            if (-not $codes.Contains($statusName)) { $codes.Add($statusName) }
+                            if ($statusName -notin $successNames) { $reasons.Add("$childPath.name is '$statusName'") }
+                        }
+                    }
+                    if ($valueProperty) {
+                        $script:semanticKnown = $true
+                        $integralStatusTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
+                        if ($null -eq $valueProperty.Value -or $valueProperty.Value.GetType() -notin $integralStatusTypes) {
+                            $reasons.Add("$childPath.value is not an integer status code")
+                        }
+                        elseif ([int64]$valueProperty.Value -ne 0) {
+                            $reasons.Add("$childPath.value is $($valueProperty.Value)")
+                        }
+                    }
                 }
             }
             Visit-Value $child $childPath
@@ -492,6 +527,104 @@ function Get-DevBenchCallSemanticStatus {
         }
     }
 
+    if ($ToolName -eq 'communityshaders.screenshot' -and $Arguments.Contains('action') -and
+        [string]$Arguments['action'] -in @('status', 'settings_get', 'request_get', 'request_list', 'events_poll')) {
+        $action = [string]$Arguments['action']
+        $reasons = [Collections.Generic.List[string]]::new()
+        if ($semantic.known -and -not $semantic.ok) {
+            foreach ($reason in @($semantic.reasons)) { $reasons.Add([string]$reason) }
+        }
+        $outerPayload = if ($payloads.Count -eq 1 -and $null -ne $payloads[0] -and
+            $payloads[0] -isnot [string] -and $payloads[0] -isnot [ValueType]) { $payloads[0] } else {
+            $reasons.Add("content must contain exactly one structured screenshot $action response")
+            $null
+        }
+        $payload = $outerPayload
+        if ($outerPayload -and $outerPayload.PSObject.Properties['result']) {
+            $resultValue = $outerPayload.PSObject.Properties['result'].Value
+            if ($null -ne $resultValue -and $resultValue -isnot [string] -and $resultValue -isnot [ValueType]) {
+                $payload = $resultValue
+            }
+            else {
+                $reasons.Add("content.result is not a structured screenshot $action payload")
+                $payload = $null
+            }
+        }
+        $integralTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
+        if ($payload) {
+            if ($action -eq 'request_get') {
+                $requestedId = if ($Arguments.Contains('requestId')) { [string]$Arguments['requestId'] } else { '' }
+                $requestId = $payload.PSObject.Properties['requestId']
+                $state = $payload.PSObject.Properties['state']
+                $terminal = $payload.PSObject.Properties['terminal']
+                if ([string]::IsNullOrWhiteSpace($requestedId)) { $reasons.Add('request.requestId is required for screenshot request_get') }
+                if (-not $requestId -or [string]::IsNullOrWhiteSpace([string]$requestId.Value) -or
+                    [string]$requestId.Value -cne $requestedId) { $reasons.Add('content.requestId does not match the requested screenshot request') }
+                if (-not $state -or $state.Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$state.Value)) {
+                    $reasons.Add('content.state is not a non-empty screenshot request state')
+                }
+                if (-not $terminal -or $terminal.Value -isnot [bool]) {
+                    $reasons.Add('content.terminal is not Boolean')
+                }
+            }
+            elseif ($action -eq 'status') {
+                foreach ($name in @('feature', 'dispatcher', 'journal')) {
+                    $property = $payload.PSObject.Properties[$name]
+                    if (-not $property -or $null -eq $property.Value -or $property.Value -is [string] -or $property.Value -is [ValueType]) {
+                        $reasons.Add("content.$name is not a structured screenshot status section")
+                    }
+                }
+            }
+            elseif ($action -eq 'settings_get') {
+                $schemaVersion = $payload.PSObject.Properties['settingsSchemaVersion']
+                foreach ($name in @('effective', 'persisted')) {
+                    $property = $payload.PSObject.Properties[$name]
+                    if (-not $property -or $null -eq $property.Value -or $property.Value -is [string] -or $property.Value -is [ValueType]) {
+                        $reasons.Add("content.$name is not a structured screenshot settings section")
+                    }
+                }
+                if (-not $schemaVersion -or $null -eq $schemaVersion.Value -or
+                    $schemaVersion.Value.GetType() -notin $integralTypes -or [uint64]$schemaVersion.Value -eq 0) {
+                    $reasons.Add('content.settingsSchemaVersion is not a positive integer')
+                }
+            }
+            elseif ($action -eq 'request_list') {
+                $requests = $payload.PSObject.Properties['requests']
+                $retained = $payload.PSObject.Properties['retained']
+                if (-not $requests -or $null -eq $requests.Value -or $requests.Value -is [string] -or
+                    $requests.Value -isnot [Collections.IEnumerable]) { $reasons.Add('content.requests is not a screenshot request collection') }
+                if (-not $retained -or $null -eq $retained.Value -or $retained.Value.GetType() -notin $integralTypes) {
+                    $reasons.Add('content.retained is not a non-negative integer')
+                }
+            }
+            elseif ($action -eq 'events_poll') {
+                $events = $payload.PSObject.Properties['events']
+                if (-not $events -or $null -eq $events.Value -or $events.Value -is [string] -or
+                    $events.Value -isnot [Collections.IEnumerable]) { $reasons.Add('content.events is not a screenshot event collection') }
+                foreach ($name in @('oldestRetainedEventId', 'latestEventId', 'nextEventId')) {
+                    $property = $payload.PSObject.Properties[$name]
+                    if (-not $property -or $null -eq $property.Value -or $property.Value.GetType() -notin $integralTypes) {
+                        $reasons.Add("content.$name is not a non-negative integer")
+                    }
+                }
+                foreach ($name in @('cursorExpired', 'moreAvailable')) {
+                    $property = $payload.PSObject.Properties[$name]
+                    if (-not $property -or $property.Value -isnot [bool]) {
+                        $reasons.Add("content.$name is not Boolean")
+                    }
+                }
+            }
+        }
+        return [pscustomobject][ordered]@{
+            known = $true; ok = $reasons.Count -eq 0
+            outcome = if ($reasons.Count -eq 0) { 'read-contract-satisfied' } else { 'read-contract-failed' }
+            guarded = [bool]$semantic.guarded; transient = [bool]$semantic.transient
+            codes = @($semantic.codes); states = @($semantic.states)
+            reasons = @($reasons | Select-Object -Unique); schedulerOnly = $false
+            schedulerReceiptPaths = @(); explicitOutcomeEvidence = @("content:screenshot:$action")
+        }
+    }
+
     if ($payloads.Count -ne 1 -or $null -eq $payloads[0] -or $payloads[0] -is [string] -or $payloads[0] -is [ValueType]) {
         return $semantic
     }
@@ -595,7 +728,7 @@ function Test-DevBenchServiceReady {
     # tool answered. Readiness requires a recognized positive contract state;
     # otherwise polling an unknown payload could repeatedly dispatch work and
     # then promote the unclassified response to ready.
-    $ready = if ($terminalFailure) { $false } elseif ($state) { $state -in $AcceptedStates } elseif ($semantic.known) { $semantic.ok -and -not $retryable } else { $false }
+    $ready = if (-not $semantic.ok) { $false } elseif ($state) { $state -in $AcceptedStates } elseif ($semantic.known) { -not $retryable } else { $false }
     return [pscustomobject][ordered]@{
         ready = $ready
         retryable = $retryable
@@ -605,6 +738,16 @@ function Test-DevBenchServiceReady {
         probeReturnedContent = $probeReturnedContent
         semantic = $semantic
     }
+}
+
+function Test-DevBenchWaitDeadlineAcceptance {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][bool]$Satisfied,
+        [Parameter(Mandatory)][DateTime]$ObservedUtc,
+        [Parameter(Mandatory)][DateTime]$DeadlineUtc
+    )
+    return $Satisfied -and $ObservedUtc -lt $DeadlineUtc
 }
 
 function Test-DevBenchNoBlockingMenu {
@@ -1577,4 +1720,4 @@ function Get-DevBenchRestMutationFailureDisposition {
     }
 }
 
-Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Test-DevBenchExecutableIdentityMatch, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow, Test-DevBenchInitialMcpCapabilityMiss, Get-DevBenchRestMutationFailureDisposition
+Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchWaitDeadlineAcceptance, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Test-DevBenchExecutableIdentityMatch, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow, Test-DevBenchInitialMcpCapabilityMiss, Get-DevBenchRestMutationFailureDisposition

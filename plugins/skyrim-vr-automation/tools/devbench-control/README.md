@@ -93,7 +93,12 @@ revision guards remain semantic failures.
 The allowlist includes the exact structured `communityshaders.renderscale`
 `status` response and the screenshot `capabilities` response. Screenshot
 capabilities require the version-1 schema plus positive integral frame and
-duration limits before clients may use them for mutation preflight.
+duration limits before clients may use them for mutation preflight. Screenshot
+`status`, `settings_get`, `request_get`, `request_list`, and `events_poll` each
+have an action-specific structured read contract. In particular, `request_get`
+requires the exact requested ID, a non-empty state, and a Boolean terminal flag;
+this admits both valid running and terminal receipts without accepting a foreign
+or malformed receipt.
 Replay completion receipts containing only scheduler facts such as `done`,
 `runId`, and `stepsRun` are classified as
 `scheduler-complete-unverified`, not semantic success. A replay response must
@@ -167,7 +172,9 @@ closed.
 `toolAvailable` repeatedly refreshes the authoritative tool inventory rather
 than freezing the initial list. `serviceReady` additionally calls a controller-
 qualified read-only probe and understands accepted and retryable service states,
-including structured errors that explicitly declare `retryable: true`. The
+including structured errors that explicitly declare `retryable: true`.
+Retryability controls whether an unsatisfied observation may be polled again; it
+never converts negative semantic evidence into readiness. The
 controller inspects the authoritative
 `inputSchema`: an empty object is used only when the schema permits it, while a
 versioned service requiring `contractMajor`, `clientId`, `commandId`, and
@@ -203,7 +210,11 @@ may set a positive explicit churn cap when required; reaching it returns
 `persistent-session-invalidated` with the count and last successfully decoded
 observation. `-TimeoutSeconds` accepts explicit bounded waits up to one hour,
 and ordinary deadline expiry returns `timeout` with the last successful state
-observation rather than retrying a request that can no longer start.
+observation rather than retrying a request that can no longer start. Transport
+classification from health, registry, or capabilities identity probes is
+preserved into that shared cleanup-qualified rebind boundary. A positive probe
+that arrives at or after the absolute deadline is retained as a late diagnostic
+observation and cannot satisfy the expired wait.
 
 Codex can retain a direct MCP tool schema across replacement of the game and
 DevBench runtime at the same loopback endpoint. If a tool that remains visible

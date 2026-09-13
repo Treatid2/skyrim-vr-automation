@@ -19,7 +19,10 @@ accepted receipt, and a dispatched request whose result was lost. Accepted
 screenshot receipts remain available for exact cancel-and-wait cleanup even if
 the controller's final evidence write fails. A dispatched screenshot or
 recording without a retained identity remains `cleanup-uncertain`; stopping the
-other lane does not manufacture terminal proof for it.
+other lane does not manufacture terminal proof for it. Each attempted start
+retains its command or correlation identity plus the complete failed controller
+envelope and journal path. An ambiguous recording start never triggers an
+unscoped stop against potentially unrelated recording work.
 
 `-MaximumFrames` accepts up to 60,000 frames, matching the current DevBench
 recording ceiling. Sequence admission still uses the live screenshot capability
