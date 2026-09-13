@@ -14,6 +14,14 @@ it cannot be accepted. Stop reverses that order so the state trace encloses all
 captured frames. `none`, `on-demand`, and `sequence` visual modes all retain the
 same interaction and state contract.
 
+Every recording and screenshot start records its attempted command identity
+before dispatch. Failed controller envelopes, indeterminate flags, and journal
+paths survive the wrapper boundary. A definite qualified rejection may release
+that service, but an accepted or indeterminate start remains
+`cleanup-uncertain` until its exact ownership is reconciled; successful cleanup
+of the other service is not proof of full rollback, and an unscoped recording
+stop is not issued for an ambiguous start.
+
 `-MaximumFrames` accepts up to 60,000 frames, matching the current DevBench
 recording ceiling. Sequence admission still uses the live screenshot capability
 receipt, so a lower server frame or duration limit fails before mutation. Stop

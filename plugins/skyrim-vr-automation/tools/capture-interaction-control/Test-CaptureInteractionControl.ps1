@@ -53,6 +53,7 @@ param(
     [switch]$NoExit,
     [switch]$SkipRuntimeIdentityVerification
 )
+Import-Module $env:CAPTURE_INTERACTION_SEMANTIC_MODULE -Force
 $argsObject = $ArgumentsJson | ConvertFrom-Json -Depth 80
 $frame = [pscustomobject]@{
   tMs=0; seq=1; originCode=1
@@ -69,7 +70,23 @@ if ($env:CAPTURE_INTERACTION_FAIL_STOP -eq '1' -and
 }
 if ($env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START -eq '1' -and
     $Tool -eq 'communityshaders.screenshot' -and $argsObject.action -eq 'sequence_start') {
-  [pscustomobject]@{ok=$false;state='completed';semantic=[pscustomobject]@{known=$true;ok=$false;outcome='screenshot-start-rejected';reasons=@('definite rejection')};data=[pscustomobject]@{content=@()};errors=@('definite rejection')} | ConvertTo-Json -Depth 100 -Compress
+  [pscustomobject]@{ok=$false;transportOk=$true;indeterminate=$false;state='completed';semantic=[pscustomobject]@{known=$true;ok=$false;guarded=$false;outcome='screenshot-start-rejected';reasons=@('definite rejection')};data=[pscustomobject]@{content=@()};errors=@('definite rejection')} | ConvertTo-Json -Depth 100 -Compress
+  return
+}
+if ($env:CAPTURE_INTERACTION_INDETERMINATE_SEQUENCE_START -eq '1' -and
+    $Tool -eq 'communityshaders.screenshot' -and $argsObject.action -eq 'sequence_start') {
+  [pscustomobject]@{ok=$false;transportOk=$false;indeterminate=$true;state='indeterminate-mutation';semantic=$null;invocationEvidencePath='screenshot-indeterminate.json';data=[pscustomobject]@{content=@()};errors=@('response lost after dispatch')} | ConvertTo-Json -Depth 100 -Compress
+  return
+}
+if ($env:CAPTURE_INTERACTION_ACCEPTED_FAILURE_SEQUENCE_START -eq '1' -and
+    $Tool -eq 'communityshaders.screenshot' -and $argsObject.action -eq 'sequence_start') {
+  $accepted=[pscustomobject]@{requestId='req-accepted';state='accepted';terminal=$false}
+  [pscustomobject]@{ok=$false;transportOk=$true;indeterminate=$false;state='completed';semantic=[pscustomobject]@{known=$true;ok=$false;guarded=$false;outcome='screenshot-start-contract-failed';reasons=@('unqualified accepted receipt')};invocationEvidencePath='screenshot-accepted-failure.json';data=[pscustomobject]@{content=@($accepted)};errors=@('unqualified accepted receipt')} | ConvertTo-Json -Depth 100 -Compress
+  return
+}
+if ($env:CAPTURE_INTERACTION_INDETERMINATE_RECORD_START -eq '1' -and
+    $Tool -eq 'record' -and $argsObject.action -eq 'start') {
+  [pscustomobject]@{ok=$false;transportOk=$false;indeterminate=$true;state='indeterminate-mutation';semantic=$null;invocationEvidencePath='record-indeterminate.json';data=[pscustomobject]@{content=@()};errors=@('record response lost after dispatch')} | ConvertTo-Json -Depth 100 -Compress
   return
 }
 if ($Tool -eq 'communityshaders.screenshot') {
@@ -89,17 +106,24 @@ if ($Tool -eq 'communityshaders.screenshot') {
   $value=[pscustomobject]@{action='observe';source='physical_openvr';frame=$frame}
 } elseif ($Tool -eq 'input' -and $argsObject.action -eq 'status' -and $argsObject.device -eq 'vrTrackedSet') {
   $value=[pscustomobject]@{device='vrTrackedSet';ready=$true;active=$false;generation=1;lastCompletion=[pscustomobject]@{generation=1;completed=$true}}
+} elseif ($Tool -eq 'input' -and $argsObject.action -eq 'releaseAll' -and $argsObject.device -eq 'vrTrackedSet') {
+  $value=[pscustomobject]@{action='stop';device='vrTrackedSet';stopped=$true;restored=$true;restorationPending=$false;owner=$argsObject.owner;reason='releaseAll'}
 } elseif ($Tool -eq 'input') {
   $value=[pscustomobject]@{ok=$true;action=$argsObject.action;queued=($argsObject.action -eq 'sequence');generation=1}
 } elseif ($Tool -eq 'menu') { $value=[pscustomobject]@{openMenus=@('HUD Menu');messageBoxOpen=$false} }
 elseif ($Tool -eq 'inspect') { $value=[pscustomobject]@{playerLoaded=$true;frame=40} }
 else { $value=[pscustomobject]@{ok=$true} }
-[pscustomobject]@{ok=$true;data=[pscustomobject]@{content=@($value)};errors=@()} | ConvertTo-Json -Depth 100 -Compress
+$argumentTable = @{}
+foreach ($property in $argsObject.PSObject.Properties) { $argumentTable[[string]$property.Name] = $property.Value }
+$semantic = Get-DevBenchCallSemanticStatus -ToolName $Tool -Arguments $argumentTable -Content @($value)
+$ok = [bool]$semantic.known -and [bool]$semantic.ok
+[pscustomobject]@{ok=$ok;transportOk=$true;indeterminate=$false;state='completed';semantic=$semantic;data=[pscustomobject]@{content=@($value)};errors=$(if($ok){@()}else{@($semantic.reasons)})} | ConvertTo-Json -Depth 100 -Compress
 '@
     Set-Content -LiteralPath $fake -Value $fakeText -Encoding utf8
     $runtime = Join-Path $root 'runtime.json'
     '{}' | Set-Content -LiteralPath $runtime -Encoding utf8
     $env:CAPTURE_INTERACTION_FAKE_ROOT = $root
+    $env:CAPTURE_INTERACTION_SEMANTIC_MODULE = Join-Path (Split-Path -Parent $PSScriptRoot) 'devbench-control\DevBenchControl.psm1'
     $entry = Join-Path $PSScriptRoot 'Invoke-CaptureInteraction.ps1'
     $oversizedSession = Join-Path $root 'oversized-session'
     $oversized = & $entry start -SessionDirectory $oversizedSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 60000 -FrameIntervalMs 1000 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
@@ -111,6 +135,24 @@ else { $value=[pscustomobject]@{ok=$true} }
     $rollback = & $entry start -SessionDirectory $rollbackSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
     Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START -ErrorAction SilentlyContinue
     Assert-Test (-not $rollback.ok -and $rollback.state -eq 'start-failed-rolled-back' -and $rollback.data.rolledBack -and $rollback.data.sessionId -and $rollback.data.recording.startReceipt.correlationId -eq $rollback.data.sessionId -and $rollback.data.recording.stopReceipt.path -eq 'recording.json' -and (Test-Path -LiteralPath $rollback.data.recoveryReceiptPath -PathType Leaf)) 'definite visual-start rejection reports qualified recording rollback and retains startup identity and receipts'
+
+    $env:CAPTURE_INTERACTION_INDETERMINATE_SEQUENCE_START = '1'
+    $indeterminateScreenshotSession = Join-Path $root 'indeterminate-screenshot-session'
+    $indeterminateScreenshot = & $entry start -SessionDirectory $indeterminateScreenshotSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_INDETERMINATE_SEQUENCE_START -ErrorAction SilentlyContinue
+    Assert-Test (-not $indeterminateScreenshot.ok -and $indeterminateScreenshot.state -eq 'start-failed-cleanup-uncertain' -and -not $indeterminateScreenshot.data.rolledBack -and $indeterminateScreenshot.data.recording.stopReceipt.path -eq 'recording.json' -and $indeterminateScreenshot.data.screenshot.startAttempt.commandId -and $indeterminateScreenshot.data.screenshot.failureEnvelope.indeterminate -and $indeterminateScreenshot.data.screenshot.failureEnvelope.invocationEvidencePath -eq 'screenshot-indeterminate.json') 'lost screenshot-start response remains ownership-uncertain even when recording cleanup succeeds and retains command plus journal identity'
+
+    $env:CAPTURE_INTERACTION_ACCEPTED_FAILURE_SEQUENCE_START = '1'
+    $acceptedFailureSession = Join-Path $root 'accepted-failure-session'
+    $acceptedFailure = & $entry start -SessionDirectory $acceptedFailureSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_ACCEPTED_FAILURE_SEQUENCE_START -ErrorAction SilentlyContinue
+    Assert-Test (-not $acceptedFailure.ok -and $acceptedFailure.state -eq 'start-failed-cleanup-uncertain' -and $acceptedFailure.data.screenshot.failureEnvelope.data.content[0].requestId -eq 'req-accepted' -and $acceptedFailure.data.recording.stopReceipt.path -eq 'recording.json') 'an ok-false envelope carrying an accepted screenshot receipt is retained and cannot be treated as definite non-dispatch'
+
+    $env:CAPTURE_INTERACTION_INDETERMINATE_RECORD_START = '1'
+    $indeterminateRecordSession = Join-Path $root 'indeterminate-record-session'
+    $indeterminateRecord = & $entry start -SessionDirectory $indeterminateRecordSession -RuntimePath $runtime -VisualMode none -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_INDETERMINATE_RECORD_START -ErrorAction SilentlyContinue
+    Assert-Test (-not $indeterminateRecord.ok -and $indeterminateRecord.state -eq 'start-failed-cleanup-uncertain' -and $indeterminateRecord.data.phase -eq 'record-start' -and $indeterminateRecord.data.recording.startAttempt.correlationId -eq $indeterminateRecord.data.sessionId -and $indeterminateRecord.data.recording.failureEnvelope.indeterminate -and $null -eq $indeterminateRecord.data.recording.stopReceipt) 'indeterminate recording start retains correlation and invocation evidence without issuing an unscoped stop'
 
     $env:CAPTURE_INTERACTION_FAIL_SEQUENCE_QUALIFICATION = '1'
     $env:CAPTURE_INTERACTION_FAIL_STOP = '1'
@@ -150,8 +192,12 @@ else { $value=[pscustomobject]@{ok=$true} }
 }
 finally {
     Remove-Item Env:CAPTURE_INTERACTION_FAKE_ROOT -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_SEMANTIC_MODULE -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_FAIL_STOP -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_QUALIFICATION -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_INDETERMINATE_SEQUENCE_START -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_ACCEPTED_FAILURE_SEQUENCE_START -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_INDETERMINATE_RECORD_START -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
 }

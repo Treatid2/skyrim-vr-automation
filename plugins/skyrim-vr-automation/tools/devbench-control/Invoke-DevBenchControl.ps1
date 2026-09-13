@@ -781,7 +781,10 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
     $errors = [Collections.Generic.List[string]]::new()
     if ($inspectAvailable) {
         try { $health = @(Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'health' } -Headers $Headers).content | Select-Object -First 1 }
-        catch { $errors.Add($_.Exception.Message) }
+        catch {
+            if (Test-WaitRetryableException -Exception $_.Exception) { throw }
+            $errors.Add($_.Exception.Message)
+        }
     }
     else { $errors.Add("The authoritative tool list does not expose 'inspect' for process identity verification.") }
     if ($null -eq $listenerPid) { $errors.Add("Could not prove one loopback listener owner for port $($expectations.port).") }
@@ -826,7 +829,10 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
                 }
                 if ($producer) { break }
             }
-            catch { $candidateError = $_.Exception.Message }
+            catch {
+                if (Test-WaitRetryableException -Exception $_.Exception) { throw }
+                $candidateError = $_.Exception.Message
+            }
         }
         if ($producer) { $producers.Add($producer) }
         $registrySources.Add([pscustomobject][ordered]@{ tool = [string]$candidate.name; producer = $producer; error = $candidateError })
@@ -1420,7 +1426,22 @@ try {
             if ($observation -and [string]::IsNullOrWhiteSpace($observationProbeError)) {
                 $lastSuccessfulWaitObservation = $observation
             }
-            if ($observation.satisfied) { break }
+            if ($observation.satisfied) {
+                $observationCompletedUtc = [DateTime]::UtcNow
+                if (-not (Test-DevBenchWaitDeadlineAcceptance -Satisfied $true -ObservedUtc $observationCompletedUtc -DeadlineUtc $deadline)) {
+                    $lateObservation = $observation
+                    $observation = [pscustomobject][ordered]@{
+                        satisfied = $false
+                        classification = 'late-positive-observation'
+                        observedUtc = $observationCompletedUtc.ToString('o')
+                        deadlineUtc = $deadline.ToString('o')
+                        lateObservation = $lateObservation
+                    }
+                    $lastSuccessfulWaitObservation = $observation
+                    throw [TimeoutException]::new('The DevBench operation deadline expired before another request could start.')
+                }
+                break
+            }
             Start-OperationDelay -RequestedMilliseconds $currentDelay
             if ($Condition -in @('toolAvailable', 'serviceReady')) { $currentDelay = [Math]::Min($MaxPollMilliseconds, $currentDelay * 2) }
         } while ([DateTime]::UtcNow -lt $deadline)

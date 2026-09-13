@@ -9,6 +9,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   readiness, restoration, recording, screenshot, and render-map receipts; and
   preserve capture-start identity and cleanup evidence when rollback is
   incomplete.
+- Qualify every screenshot read action explicitly, preserve retryable identity
+  probe failures for rebind, reject malformed outcome types and retryable
+  negative readiness, enforce the post-response wait deadline, and retain
+  indeterminate recording/screenshot start ownership without unscoped cleanup.
 - Recognize the structured render-scale status read contract before profiler
   sampling, and reject screenshot sequences that exceed runtime-advertised
   frame or duration limits before session creation or recording mutation.

@@ -19,6 +19,11 @@ only session orchestrator. Read its `README.md` before the first mutation.
    duration bounds against the live screenshot capabilities before it creates
    session state or starts recording; reduce `-MaximumFrames` to the reported
    compatible bound when that preflight rejects a request.
+   If either start returns an indeterminate or accepted-but-unqualified result,
+   retain the command/correlation identity and controller journal reference and
+   reconcile that exact owner. Do not report full rollback merely because the
+   other service stopped, and do not issue an unscoped recording stop for an
+   ambiguous recording start.
 4. Call `observe` and inspect `data.observation`. When a frame is present, use
    the image-viewing tool on `frameSubmission.path`; do not infer the current
    screen from an earlier frame or an uncommitted artifact.

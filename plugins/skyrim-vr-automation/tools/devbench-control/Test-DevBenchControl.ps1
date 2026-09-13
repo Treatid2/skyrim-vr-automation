@@ -71,18 +71,40 @@ $screenshotGenericWrongSchema = Get-DevBenchCallSemanticStatus -ToolName 'commun
 Assert-Test ($screenshotGenericWrongSchema.known -and -not $screenshotGenericWrongSchema.ok) 'generic success cannot bypass the screenshot capabilities schema'
 $screenshotGenericValid = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ ok = $true; schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = 3600000 } })
 Assert-Test ($screenshotGenericValid.known -and $screenshotGenericValid.ok) 'generic success remains compatible with a valid screenshot capabilities contract'
+$screenshotRequest = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_get'; requestId = 'req-1' } -Content @([pscustomobject]@{ ok = $true; result = [pscustomobject]@{ requestId = 'req-1'; state = 'completed'; terminal = $true } })
+Assert-Test ($screenshotRequest.known -and $screenshotRequest.ok -and $screenshotRequest.outcome -eq 'read-contract-satisfied') 'screenshot request_get accepts one exact terminal request receipt through the real semantic classifier'
+$screenshotRunningRequest = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_get'; requestId = 'req-1' } -Content @([pscustomobject]@{ requestId = 'req-1'; state = 'running'; terminal = $false })
+Assert-Test ($screenshotRunningRequest.known -and $screenshotRunningRequest.ok) 'screenshot request_get accepts an exact nonterminal receipt for continued polling'
+$screenshotMismatchedRequest = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_get'; requestId = 'req-1' } -Content @([pscustomobject]@{ ok = $true; result = [pscustomobject]@{ requestId = 'foreign'; state = 'completed'; terminal = $true } })
+Assert-Test ($screenshotMismatchedRequest.known -and -not $screenshotMismatchedRequest.ok -and $screenshotMismatchedRequest.reasons -match 'does not match') 'screenshot request_get rejects a foreign request identity despite generic success'
+$screenshotFailedRequest = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_get'; requestId = 'req-1' } -Content @([pscustomobject]@{ ok = $false; retryable = $true; result = [pscustomobject]@{ requestId = 'req-1'; state = 'completed'; terminal = $true } })
+Assert-Test ($screenshotFailedRequest.known -and -not $screenshotFailedRequest.ok -and $screenshotFailedRequest.transient) 'screenshot request_get never promotes retryable negative evidence to a valid receipt'
+$screenshotStatus = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'status' } -Content @([pscustomobject]@{ feature = [pscustomobject]@{}; dispatcher = [pscustomobject]@{}; journal = [pscustomobject]@{} })
+Assert-Test ($screenshotStatus.known -and $screenshotStatus.ok) 'screenshot status accepts its exact structured sections'
+$screenshotSettings = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'settings_get' } -Content @([pscustomobject]@{ settingsSchemaVersion = 2; effective = [pscustomobject]@{}; persisted = [pscustomobject]@{} })
+Assert-Test ($screenshotSettings.known -and $screenshotSettings.ok) 'screenshot settings_get accepts its versioned settings receipt'
+$screenshotList = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_list' } -Content @([pscustomobject]@{ requests = [object[]]@(); retained = 0 })
+Assert-Test ($screenshotList.known -and $screenshotList.ok) 'screenshot request_list accepts an empty bounded collection receipt'
+$screenshotEvents = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'events_poll' } -Content @([pscustomobject]@{ events = [object[]]@(); oldestRetainedEventId = 1; latestEventId = 0; nextEventId = 0; cursorExpired = $false; moreAvailable = $false })
+Assert-Test ($screenshotEvents.known -and $screenshotEvents.ok) 'screenshot events_poll accepts its exact cursor and collection receipt'
 $recordSemantic = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ action = 'start'; recording = $true; correlationId = 'capture-1' })
 Assert-Test ($recordSemantic.known -and $recordSemantic.ok -and $recordSemantic.outcome -eq 'record-start-contract-satisfied') 'record start validates the running receipt and correlation identity'
 $recordMismatch = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ action = 'start'; recording = $true; correlationId = 'other' })
 Assert-Test ($recordMismatch.known -and -not $recordMismatch.ok) 'record start rejects a mismatched correlation identity'
 $recordGenericMismatch = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ ok = $true; action = 'start'; recording = $true; correlationId = 'other' })
 Assert-Test ($recordGenericMismatch.known -and -not $recordGenericMismatch.ok) 'generic success cannot bypass the record-start correlation contract'
+foreach ($malformedOk in @('false', 0, $null, [pscustomobject]@{ value = $false })) {
+    $malformedRecord = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ ok = $malformedOk; action = 'start'; recording = $true; correlationId = 'capture-1' })
+    Assert-Test ($malformedRecord.known -and -not $malformedRecord.ok -and $malformedRecord.reasons -match 'not Boolean') 'record start rejects a present malformed generic outcome indicator'
+}
 $recordStop = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ action = 'stop'; sampleCount = 12; path = 'recording.json' })
 Assert-Test ($recordStop.known -and $recordStop.ok -and $recordStop.outcome -eq 'record-stop-contract-satisfied') 'record stop recognizes its exact persisted recording receipt without a generic ok field'
 $recordStopError = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ error = 'not recording'; state = 'idle' })
 Assert-Test ($recordStopError.known -and -not $recordStopError.ok -and $recordStopError.reasons -match 'not recording') 'record stop preserves its structured not-recording diagnostic'
 $recordStopErrors = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ action = 'stop'; path = 'recording.json'; errors = @('flush failed') })
 Assert-Test ($recordStopErrors.known -and -not $recordStopErrors.ok -and $recordStopErrors.reasons -match 'flush failed') 'record stop rejects a non-empty errors array despite an exact stop path'
+$recordStopFailedStatus = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ action = 'stop'; path = 'recording.json'; status = 'failed' })
+Assert-Test ($recordStopFailedStatus.known -and -not $recordStopFailedStatus.ok -and $recordStopFailedStatus.reasons -match 'failed') 'record stop rejects a scalar failed status despite an exact persisted path'
 $vrReleaseInactive = Get-DevBenchCallSemanticStatus -ToolName input -Arguments @{ action = 'releaseAll'; device = 'vrTrackedSet'; owner = 'capture:1' } -Content @([pscustomobject]@{ action = 'stop'; device = 'vrTrackedSet'; stopped = $false; notActive = $true })
 Assert-Test ($vrReleaseInactive.known -and $vrReleaseInactive.ok -and $vrReleaseInactive.outcome -eq 'vr-tracked-set-stop-contract-satisfied') 'VR releaseAll accepts an exact already-inactive receipt'
 $vrReleaseInactivePending = Get-DevBenchCallSemanticStatus -ToolName input -Arguments @{ action = 'releaseAll'; device = 'vrTrackedSet'; owner = 'capture:1' } -Content @([pscustomobject]@{ action = 'stop'; device = 'vrTrackedSet'; notActive = $true; restorationPending = $true })
@@ -316,6 +338,14 @@ $guarded = Test-DevBenchServiceReady -Content @([pscustomobject]@{ error = [pscu
 Assert-Test (-not $guarded.ready -and $guarded.terminalFailure) 'guard rejection terminates readiness wait'
 $contradictoryReady = Test-DevBenchServiceReady -Content @([pscustomobject]@{ ok = $false; result = [pscustomobject]@{ state = 'ready' } })
 Assert-Test (-not $contradictoryReady.ready -and $contradictoryReady.terminalFailure) 'negative semantic evidence vetoes a simultaneously ready service state'
+$retryableContradictoryReady = Test-DevBenchServiceReady -Content @([pscustomobject]@{ ok = $false; retryable = $true; result = [pscustomobject]@{ state = 'ready' } })
+Assert-Test (-not $retryableContradictoryReady.ready -and $retryableContradictoryReady.retryable -and -not $retryableContradictoryReady.terminalFailure) 'retryability controls continued polling but never converts negative semantic evidence into readiness'
+$nestedRetryableContradictoryReady = Test-DevBenchServiceReady -Content @([pscustomobject]@{ result = [pscustomobject]@{ state = 'ready'; error = [pscustomobject]@{ code = 'service_unavailable'; retryable = $true } } })
+Assert-Test (-not $nestedRetryableContradictoryReady.ready -and $nestedRetryableContradictoryReady.retryable) 'nested retryable failure evidence vetoes an otherwise accepted readiness state'
+$deadline = [DateTime]'2026-09-13T04:00:00Z'
+Assert-Test (Test-DevBenchWaitDeadlineAcceptance -Satisfied $true -ObservedUtc $deadline.AddTicks(-1) -DeadlineUtc $deadline) 'a valid observation immediately before the absolute deadline may satisfy a wait'
+Assert-Test (-not (Test-DevBenchWaitDeadlineAcceptance -Satisfied $true -ObservedUtc $deadline -DeadlineUtc $deadline)) 'an observation exactly at the absolute deadline cannot satisfy a wait'
+Assert-Test (-not (Test-DevBenchWaitDeadlineAcceptance -Satisfied $true -ObservedUtc $deadline.AddTicks(1) -DeadlineUtc $deadline)) 'a late positive observation remains diagnostic evidence rather than wait success'
 $inspectReady = Test-DevBenchServiceReady -Content @([pscustomobject]@{ playerLoaded = $true; cell = 'Whiterun' })
 Assert-Test (-not $inspectReady.ready -and $inspectReady.probeReturnedContent -and -not $inspectReady.semantic.known) 'a successful unclassified response never proves service readiness'
 $textUnknown = Test-DevBenchServiceReady -Content @('answered')
@@ -737,7 +767,9 @@ $fullWaitRecoveryTry = @($entryPointAst.FindAll({
     @($node.CatchClauses | Where-Object { $_.Body.Extent.Text -match 'Close-McpSessionForRebind -Headers \$headers' }).Count -eq 1
 }, $true))
 Assert-Test ($fullWaitRecoveryTry.Count -eq 1) 'tool discovery, post-registration identity, and the read-only readiness probe share one cleanup-qualified rebind boundary'
+Assert-Test ($entryPointText -match 'Get-RuntimeIdentity[\s\S]+?catch \{\s*if \(Test-WaitRetryableException -Exception \$_\.Exception\) \{ throw \}') 'runtime identity preserves retryable health and producer-probe transport exceptions for the shared rebind state machine'
 Assert-Test ($entryPointText -match 'probeError = \$_.Exception.Message') 'wait observations preserve the transient probe error'
+Assert-Test ($entryPointText -match "classification = 'late-positive-observation'" -and $entryPointText -match 'lateObservation = \$lateObservation' -and $entryPointText -match 'Test-DevBenchWaitDeadlineAcceptance') 'late positive observations are retained but cannot cross the absolute wait deadline as success'
 Assert-Test ($entryPointText -match "phase = 'initialize'; recovery = 'outer-wait-retry'") 'wait initialization failures remain inside the outer timeout state machine'
 Assert-Test ($entryPointText -match '\$null -eq \$headers') 'bounded waits establish or re-establish the MCP session inside the polling loop'
 Assert-Test ($entryPointText -match 'function Open-DevBenchSession' -and $entryPointText -match "DevBenchMcpCapabilityAbsent" -and $entryPointText -match "recovery = 'rest-capability-negotiation'") 'transport negotiation falls back only after an explicitly classified initial MCP capability miss'
