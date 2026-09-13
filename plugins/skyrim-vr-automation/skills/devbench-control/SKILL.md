@@ -66,8 +66,9 @@ or construct HTTP or MCP requests ad hoc.
    `wait -Condition serviceReady -Tool <exact-name>` with an explicit bounded
    timeout. Do not pass `-ArgumentsJson` to `serviceReady`: the controller
    derives its qualified read-only probe from the authoritative input schema
-   and rejects caller-supplied probe actions. Never cross transports to perform
-   a readiness wait. A retryable failure remains unsatisfied, and a positive
+   and rejects caller-supplied probe actions.
+   Never cross transports to perform a readiness wait. A retryable failure
+   remains unsatisfied, and a positive
    response received at or after the absolute deadline remains timeout evidence,
    never readiness success.
 9. On the selected controller lane, use `-ExpectedErrorCode` for deliberate
