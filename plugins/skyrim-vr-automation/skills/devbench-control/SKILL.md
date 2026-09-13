@@ -9,10 +9,12 @@ Choose exactly one live transport before the first live call. When the
 plugin-provided direct MCP tools are callable, they are the mandatory and
 exclusive lane for live discovery, calls, waits, screenshots, and performance
 capture. Treat their exposed tool descriptions as the live callable action and
-input-schema inventory, not as an output schema. Validate result fields in the
+input-schema inventory for that runtime connection, not as an output schema.
+Validate result fields in the
 structured action response that owns them;
 do not run the bundled controller's `list`, open another loopback MCP session,
-or switch transport lanes during that run. A generic scenario dispatcher does
+or switch transport lanes during that run except for the exact stale-catalog
+rejection below. A generic scenario dispatcher does
 not prove that an ownership-bearing or intrusive custom action is callable. If
 the exact typed action is
 absent, report that protocol action unavailable; do not send it through the
@@ -26,7 +28,17 @@ always wins.
 
 Use the bundled client as the sole live lane only when direct MCP is unavailable
 before the first live call. It also remains available for offline validation or
-a required durable receipt that direct MCP cannot expose. Never choose the
+a required durable receipt that direct MCP cannot expose. A direct invocation
+that returns exact MCP error `-32602 Tool not found: <requested-name>` proves
+that the currently answering server rejected the name before entering any tool
+handler, even though the task still exposes an older direct schema. Preserve
+that rejection, make no direct retry, and treat the direct lane as invalidated.
+The bundled client may then become the sole lane for the rest of the run: bind
+it to the explicit runtime path, call `list`, verify runtime/build identity, and
+continue only if that fresh list contains the exact action. This is the only
+post-call lane-switch exception. Invalid arguments, semantic failures,
+timeouts, lost responses, or any error other than that exact pre-dispatch name
+rejection do not authorize switching. Never choose the
 loopback HTTP path merely for convenience, mix it with a healthy direct lane,
 or construct HTTP or MCP requests ad hoc.
 
@@ -42,7 +54,10 @@ or construct HTTP or MCP requests ad hoc.
    direct lane, use its bound tools and do not create or resolve a controller
    runtime file.
 4. On the direct lane, use the exposed direct tool definitions as authoritative
-   action and input-schema inventory. They do not prove output-field presence.
+   action and input-schema inventory for the connected runtime. They do not
+   prove output-field presence, and after a runtime replacement they are stale
+   if the answering server returns the exact pre-dispatch `-32602 Tool not
+   found: <requested-name>` rejection described above.
    On the selected controller lane, call `list` before using a tool whose
    current name or input schema has not been established.
 5. On the direct lane, call the exact exposed tool with structured arguments.

@@ -174,6 +174,17 @@ The initial MCP initialize/initialized/tools-list exchange is part of that same
 outer wait state machine, so a temporarily unavailable listener cannot exhaust
 the short transport budget before the requested timeout begins.
 
+Codex can retain a direct MCP tool schema across replacement of the game and
+DevBench runtime at the same loopback endpoint. If a tool that remains visible
+to the task returns exact MCP error `-32602 Tool not found: <requested-name>`,
+the answering server rejected the name before a handler ran; this is stale
+task-catalog evidence, not an ambiguous mutation result. Preserve the error and
+do not retry through the direct tool. The task may select this bundled
+controller as the sole replacement lane, but it must use the explicit runtime
+file, run `list`, verify the expected process/build identity, and proceed only
+when that fresh registry contains the exact tool. No other error permits a
+transport-lane switch.
+
 `playerLoaded` is transition-fresh by default: the wait must observe an
 unloaded state before accepting loaded. This prevents the prior world's cached
 `true` from satisfying an asynchronous load. Use `-AcceptAlreadyLoaded` only

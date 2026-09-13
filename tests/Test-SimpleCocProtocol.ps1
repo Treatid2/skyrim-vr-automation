@@ -52,7 +52,10 @@ foreach ($required in @(
     'do not run the bundled controller''s `list`',
     'do not create or resolve a controller',
     'Never cross transports to perform a readiness wait',
-    'do not start a controller availability'
+    'do not start a controller availability',
+    '`-32602 Tool not found: <requested-name>`',
+    'This is the only',
+    'post-call lane-switch exception'
 )) {
     if (-not $devBench.Contains($required, [StringComparison]::Ordinal)) {
         throw "DevBench one-lane contract is missing: $required"
