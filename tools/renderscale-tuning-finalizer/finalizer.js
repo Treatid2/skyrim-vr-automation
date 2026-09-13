@@ -864,6 +864,17 @@ function scenarioResult(root, label) {
     return entry && entry.result;
 }
 
+function scenarioEntry(root, label) {
+    return root && Array.isArray(root.results) ? root.results.find(
+        (candidate) => candidate && candidate.label === label) || null : null;
+}
+
+function successfulScenarioEntry(entry) {
+    const value = entry && entry.result;
+    return Boolean(value && entry.ok !== false && entry.isError !== true &&
+        value.ok !== false && value.isError !== true);
+}
+
 function stressSession(value) {
     const session = value && value.status && value.status.session;
     return {
@@ -940,6 +951,24 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
         const acquisition = acquisitionRecord && acquisitionRecord.value.cpuAcquisition;
         const acquisitionStep = acquisitionRecord &&
             acquisitionRecord.value.cpuAcquisitionStep;
+        const expectedAcquisitionScenarioKey = acquisitionPlan && liveLaneId ?
+            `${liveResult.runId}:${liveLaneId}:pass-${passNumber}:transition-${acquisitionPlan.ordinal}:scenario` :
+            null;
+        const acquisitionScenarioKey = acquisitionRecord &&
+            acquisitionRecord.value.scenarioReceiptKey;
+        const transitionPathPattern = acquisitionPlan ? new RegExp(
+            `/transitions/(?:0*${acquisitionPlan.ordinal}|transition-${acquisitionPlan.ordinal})(?:/|$)`, "i") : null;
+        const acquisitionScenarios = acquisitionPlan ? raw.scenarios.filter(
+            (candidate) => candidate.scope.pass === passNumber &&
+                candidate.scope.lane === laneId && transitionPathPattern.test(
+                    candidate.scope.relativePath) &&
+                /\/scenario\.json$/i.test(candidate.scope.relativePath)) : [];
+        const acquisitionScenario = acquisitionScenarios.length === 1 ?
+            acquisitionScenarios[0] : null;
+        const originalAcquisitionStep = acquisitionScenario && scenarioEntry(
+            acquisitionScenario.value, "qualification-dispatch");
+        const originalAcquisition = originalAcquisitionStep &&
+            originalAcquisitionStep.result;
         const telemetry = acquisition && acquisition.performanceTelemetry;
         const acquiredCpu = telemetry && telemetry.cpuPerformance;
         if (!acquisition) {
@@ -975,6 +1004,46 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
                 passReasons.push("retained_cpu_acquisition_session_invalid");
             } else if (acquiredCpu.sessionId !== cpu.sessionId) {
                 passReasons.push("retained_cpu_acquisition_session_mismatch");
+            }
+        }
+        if (!expectedAcquisitionScenarioKey ||
+            acquisitionScenarioKey !== expectedAcquisitionScenarioKey) {
+            passReasons.push("retained_cpu_acquisition_scenario_link_invalid");
+        }
+        if (acquisitionScenarios.length !== 1 || !originalAcquisitionStep) {
+            passReasons.push("retained_cpu_acquisition_original_missing");
+        } else {
+            const originalResults = acquisitionScenario.value.results;
+            const originalStepIndex = originalResults.indexOf(
+                originalAcquisitionStep);
+            const originalStructureValid =
+                typeof acquisitionScenario.value.ok === "boolean" &&
+                typeof acquisitionScenario.value.aborted === "boolean" &&
+                Number.isSafeInteger(acquisitionScenario.value.stepsRun) &&
+                acquisitionScenario.value.stepsRun === originalResults.length &&
+                originalStepIndex >= 0 &&
+                originalStepIndex < acquisitionScenario.value.stepsRun &&
+                originalResults.filter((entry) => entry &&
+                    entry.label === "qualification-dispatch").length === 1;
+            const originalTelemetry = originalAcquisition &&
+                originalAcquisition.performanceTelemetry;
+            const originalCpu = originalTelemetry &&
+                originalTelemetry.cpuPerformance;
+            if (!originalStructureValid ||
+                !successfulScenarioEntry(originalAcquisitionStep) ||
+                originalAcquisition.action !== "qualification_dispatch" ||
+                originalAcquisition.accepted !== true ||
+                !producerBuildMatches(originalAcquisition, buildId) ||
+                !originalTelemetry || originalTelemetry.started !== true ||
+                !originalCpu || originalCpu.active !== true ||
+                !positive(originalCpu.sessionId)) {
+                passReasons.push("retained_cpu_acquisition_original_invalid");
+            }
+            if (!acquisition || JSON.stringify(originalAcquisition) !==
+                JSON.stringify(acquisition) || !acquisitionPlan ||
+                originalAcquisition.transitionId !== acquisitionPlan.transitionId ||
+                originalAcquisition.ownerId !== acquisitionPlan.ownerId) {
+                passReasons.push("retained_cpu_acquisition_original_mismatch");
             }
         }
         if (cleanup.status !== "CONFIRMED_INACTIVE" ||
@@ -1077,6 +1146,11 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
             return [renderResult, cpuResult, gpuResult, textureResult]
                 .every((value) => producerBuildMatches(value, buildId)) &&
                 (!traceRequired || producerBuildMatches(traceResult, buildId)) &&
+                renderResult.action === "status" &&
+                cpuResult.action === "cpu_performance_status" &&
+                gpuResult.action === "gpu_performance_status" &&
+                textureResult.action === "texture_lifetime_status" &&
+                (!traceRequired || traceResult.action === "dlss_trace_status") &&
                 stress.id === measured.sessionId && stress.active === false &&
                 cpuStatus && cpuStatus.sessionId === cpu.sessionId &&
                 cpuStatus.active === false && gpu && gpu.active === false &&
