@@ -118,7 +118,14 @@ Prepare a closed task cache immediately before launching MO2:
 
 ```powershell
 .\Invoke-CSXShaderCacheCatalog.ps1 prepare `
-  -CachePath 'D:\MO2\mods\Task Cache\ShaderCache' `
+  -CachePath 'D:\MO2\overwrite\ShaderCache' `
+  -ProfilePath 'D:\MO2\profiles\Codex Task - Example\modlist.txt' `
+  -ModsPath 'D:\MO2\mods' `
+  -BindToOverwrite `
+  -WorkspaceId '<workspace identity>' `
+  -OwnershipId '<ownership identity>' `
+  -OwnerMarkerPath 'D:\MO2\overwrite\.codex-workspace-output-owner.json' `
+  -OwnerMarkerSha256 '<exact owner-marker SHA-256>' `
   -EvidenceDirectory 'D:\Evidence\task-id\shader-cache' `
   -ShaderCacheAbi '<exact ABI>' `
   -ShaderSourceSha256 '<exact source-tree SHA-256>' `
@@ -126,6 +133,7 @@ Prepare a closed task cache immediately before launching MO2:
   -BuildId '<build identity>' `
   -PresetSha256 '<preset SHA-256>' `
   -RequiredTags quality,full-render `
+  -RequireMaterializedOutput `
   -Confirm:$false
 ```
 
@@ -136,11 +144,32 @@ different. With no match it safely leaves the current tree in use; add
 Repeating `prepare` with the same immutable cache, evidence, and catalog
 identities reconciles and returns the existing prepared plan.
 
+With `-BindToOverwrite`, `prepare` binds the exact profile hash, mods root, and
+physical `overwrite\ShaderCache` path. After optional seeding it inventories
+all enabled providers in exact modlist priority order and copies every missing
+provider path into Overwrite. Existing Overwrite or seed files remain
+authoritative. Every copied source is checked for stability and the target is
+SHA-256 verified; complete path coverage and the final `preparedInventory` are
+then written to `shader-cache-provider-shadow.receipt.json`. The task plan
+records the corresponding `preparedTreeSha256`; consumers must validate both
+artifacts and require their hashes to agree. This full shadow is required
+because MO2
+writes modifications to the original provider of an existing virtual path;
+new paths naturally use Overwrite, but existing mod paths must first be made
+Overwrite winners. `-CacheModName` remains available for older explicitly
+bound loose-mod workflows and cannot be combined with `-BindToOverwrite`.
+
+MO2 session authorization reads this receipt and independently inventories the
+current providers. Before the first launch, the live Overwrite cache must match
+`preparedTreeSha256` exactly. A retained game cycle may add or update files in
+Overwrite, but every relaunch still requires all current provider paths to
+remain shadowed.
+
 After the game and MO2 are closed, complete the cache transaction:
 
 ```powershell
 .\Invoke-CSXShaderCacheCatalog.ps1 complete `
-  -CachePath 'D:\MO2\mods\Task Cache\ShaderCache' `
+  -CachePath 'D:\MO2\overwrite\ShaderCache' `
   -EvidenceDirectory 'D:\Evidence\task-id\shader-cache' `
   -WorkingSetStatus known-working `
   -Promote -Label 'verified task result' `
@@ -157,7 +186,11 @@ this exception does not bypass ABI, runtime, bytecode-class, feature-set, status
 or tag gates.
 Repeated `complete` calls return the immutable existing completion. A retry
 after restoration but before completion publication accepts only one committed
-restore receipt proving both the baseline and preserved working tree.
+restore receipt and committed journal proving the exact snapshot lineage, restore transaction
+identity, cache path, live baseline, and physical preserved working tree. A
+stored receipt pointer is revalidated to the same standard. Malformed, foreign,
+missing, drifted, or ambiguous receipt-shaped evidence leaves the plan pending
+for recovery and never triggers a replacement restore.
 
 `seed` requires the existing snapshot receipt for the same live cache and
 evidence directory, verifies the exact source tree, stages it, swaps it into
