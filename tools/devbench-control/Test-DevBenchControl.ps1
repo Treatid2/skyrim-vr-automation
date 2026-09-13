@@ -62,21 +62,31 @@ Assert-Test (-not $renderScaleMissingStatus.known) 'render-scale status rejects 
 $screenshotCapabilities = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = 3600000 } })
 Assert-Test ($screenshotCapabilities.known -and $screenshotCapabilities.ok -and $screenshotCapabilities.outcome -eq 'read-contract-satisfied') 'screenshot capabilities recognize exact sequence limits as a read contract'
 $screenshotFractionalLimit = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = 3600000.5 } })
-Assert-Test (-not $screenshotFractionalLimit.known) 'screenshot capabilities reject a fractional sequence limit'
+Assert-Test ($screenshotFractionalLimit.known -and -not $screenshotFractionalLimit.ok) 'screenshot capabilities reject a fractional sequence limit'
 $screenshotBooleanLimit = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = $true; maximumSequenceDurationMs = 3600000 } })
-Assert-Test (-not $screenshotBooleanLimit.known) 'screenshot capabilities reject a Boolean sequence limit'
+Assert-Test ($screenshotBooleanLimit.known -and -not $screenshotBooleanLimit.ok) 'screenshot capabilities reject a Boolean sequence limit'
 $screenshotNullLimit = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = $null } })
-Assert-Test (-not $screenshotNullLimit.known) 'screenshot capabilities reject a null sequence limit without a strict-mode exception'
+Assert-Test ($screenshotNullLimit.known -and -not $screenshotNullLimit.ok) 'screenshot capabilities reject a null sequence limit without a strict-mode exception'
+$screenshotGenericWrongSchema = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ ok = $true; schema = 'wrong'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = 3600000 } })
+Assert-Test ($screenshotGenericWrongSchema.known -and -not $screenshotGenericWrongSchema.ok) 'generic success cannot bypass the screenshot capabilities schema'
+$screenshotGenericValid = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ ok = $true; schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = 3600000 } })
+Assert-Test ($screenshotGenericValid.known -and $screenshotGenericValid.ok) 'generic success remains compatible with a valid screenshot capabilities contract'
 $recordSemantic = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ action = 'start'; recording = $true; correlationId = 'capture-1' })
 Assert-Test ($recordSemantic.known -and $recordSemantic.ok -and $recordSemantic.outcome -eq 'record-start-contract-satisfied') 'record start validates the running receipt and correlation identity'
 $recordMismatch = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ action = 'start'; recording = $true; correlationId = 'other' })
 Assert-Test ($recordMismatch.known -and -not $recordMismatch.ok) 'record start rejects a mismatched correlation identity'
+$recordGenericMismatch = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ ok = $true; action = 'start'; recording = $true; correlationId = 'other' })
+Assert-Test ($recordGenericMismatch.known -and -not $recordGenericMismatch.ok) 'generic success cannot bypass the record-start correlation contract'
 $recordStop = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ action = 'stop'; sampleCount = 12; path = 'recording.json' })
 Assert-Test ($recordStop.known -and $recordStop.ok -and $recordStop.outcome -eq 'record-stop-contract-satisfied') 'record stop recognizes its exact persisted recording receipt without a generic ok field'
 $recordStopError = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ error = 'not recording'; state = 'idle' })
 Assert-Test ($recordStopError.known -and -not $recordStopError.ok -and $recordStopError.reasons -match 'not recording') 'record stop preserves its structured not-recording diagnostic'
+$recordStopErrors = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ action = 'stop'; path = 'recording.json'; errors = @('flush failed') })
+Assert-Test ($recordStopErrors.known -and -not $recordStopErrors.ok -and $recordStopErrors.reasons -match 'flush failed') 'record stop rejects a non-empty errors array despite an exact stop path'
 $vrReleaseInactive = Get-DevBenchCallSemanticStatus -ToolName input -Arguments @{ action = 'releaseAll'; device = 'vrTrackedSet'; owner = 'capture:1' } -Content @([pscustomobject]@{ action = 'stop'; device = 'vrTrackedSet'; stopped = $false; notActive = $true })
 Assert-Test ($vrReleaseInactive.known -and $vrReleaseInactive.ok -and $vrReleaseInactive.outcome -eq 'vr-tracked-set-stop-contract-satisfied') 'VR releaseAll accepts an exact already-inactive receipt'
+$vrReleaseInactivePending = Get-DevBenchCallSemanticStatus -ToolName input -Arguments @{ action = 'releaseAll'; device = 'vrTrackedSet'; owner = 'capture:1' } -Content @([pscustomobject]@{ action = 'stop'; device = 'vrTrackedSet'; notActive = $true; restorationPending = $true })
+Assert-Test ($vrReleaseInactivePending.known -and -not $vrReleaseInactivePending.ok) 'VR releaseAll cannot use notActive to bypass pending restoration'
 $vrReleaseRestored = Get-DevBenchCallSemanticStatus -ToolName input -Arguments @{ action = 'releaseAll'; device = 'vrTrackedSet'; owner = 'capture:1' } -Content @([pscustomobject]@{ action = 'stop'; device = 'vrTrackedSet'; stopped = $true; restored = $true; restorationPending = $false; owner = 'capture:1'; reason = 'releaseAll' })
 Assert-Test ($vrReleaseRestored.known -and $vrReleaseRestored.ok) 'VR releaseAll accepts exact completed restoration evidence'
 $vrReleasePending = Get-DevBenchCallSemanticStatus -ToolName input -Arguments @{ action = 'releaseAll'; device = 'vrTrackedSet'; owner = 'capture:1' } -Content @([pscustomobject]@{ action = 'stop'; device = 'vrTrackedSet'; stopped = $false; restored = $false; restorationPending = $true; owner = 'capture:1'; reason = 'releaseAll' })
@@ -91,6 +101,8 @@ foreach ($guardStatus in @('preflight_required', 'preflight_expired', 'state_rev
 }
 $weatherNotApplied = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.weather_api' -Arguments @{ action = 'execute' } -Content @([pscustomobject]@{ ok = $true; command = [pscustomobject]@{ action = 'execute' }; result = [pscustomobject]@{ status = 'success'; applied = $false; changed = $false } })
 Assert-Test ($weatherNotApplied.known -and -not $weatherNotApplied.ok -and $weatherNotApplied.outcome -eq 'weather-execute-contract-failed') 'weather execute never promotes status success without Boolean applied success'
+$weatherNestedError = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.weather_api' -Arguments @{ action = 'execute' } -Content @([pscustomobject]@{ ok = $true; command = [pscustomobject]@{ action = 'execute' }; result = [pscustomobject]@{ status = 'success'; applied = $true; error = 'commit failed' } })
+Assert-Test ($weatherNestedError.known -and -not $weatherNestedError.ok -and $weatherNestedError.reasons -match 'commit failed') 'weather execute rejects nested scalar failure evidence despite success and applied fields'
 $loadSemantic = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ action = 'load'; name = 'Save-1'; queued = $true })
 Assert-Test ($loadSemantic.known -and $loadSemantic.ok -and $loadSemantic.outcome -eq 'game-load-dispatch-queued' -and $loadSemantic.completionBasis -eq 'dispatch-only') 'game load recognizes an exact queued dispatch without claiming current-state completion'
 $loadMismatch = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ action = 'load'; name = 'Save-2'; queued = $true })
@@ -170,6 +182,15 @@ try {
     $innerFailure | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $innerFailurePath -Encoding utf8
     $innerFailurePlan = & $plannerPath -RegistryPath $innerFailurePath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId inner-failed-registry -OutputPath (Join-Path $planFixture 'inner-failed-registry-plan.json') -NoExit -Compact | ConvertFrom-Json
     Assert-Test (-not $innerFailurePlan.ok -and $null -eq $innerFailurePlan.arguments -and -not $innerFailurePlan.receiptPublished) 'render-map planner preserves explicit inner registry failure before issuing start arguments'
+
+    foreach ($negativeStatus in @('producer_mismatch', 'idempotency_conflict')) {
+        $negativeStatusPath = Join-Path $planFixture "$negativeStatus-registry.json"
+        $negativeStatusRegistry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+        $negativeStatusRegistry.result | Add-Member -NotePropertyName status -NotePropertyValue ([pscustomobject]@{ name = $negativeStatus; value = 0 })
+        $negativeStatusRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $negativeStatusPath -Encoding utf8
+        $negativeStatusPlan = & $plannerPath -RegistryPath $negativeStatusPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId $negativeStatus -OutputPath (Join-Path $planFixture "$negativeStatus-plan.json") -NoExit -Compact | ConvertFrom-Json
+        Assert-Test (-not $negativeStatusPlan.ok -and $null -eq $negativeStatusPlan.arguments -and -not $negativeStatusPlan.receiptPublished) "render-map planner rejects named negative status $negativeStatus"
+    }
 
     foreach ($missingBinding in @('service', 'major', 'producerBuildId')) {
         $bindingPath = Join-Path $planFixture "missing-$missingBinding-registry.json"
@@ -293,6 +314,8 @@ $dispatchWaiting = Test-DevBenchServiceReady -Content @([pscustomobject]@{ error
 Assert-Test (-not $dispatchWaiting.ready -and $dispatchWaiting.retryable -and -not $dispatchWaiting.terminalFailure) 'explicitly retryable dispatch failure remains retryable'
 $guarded = Test-DevBenchServiceReady -Content @([pscustomobject]@{ error = [pscustomobject]@{ code = 'producer_mismatch' } })
 Assert-Test (-not $guarded.ready -and $guarded.terminalFailure) 'guard rejection terminates readiness wait'
+$contradictoryReady = Test-DevBenchServiceReady -Content @([pscustomobject]@{ ok = $false; result = [pscustomobject]@{ state = 'ready' } })
+Assert-Test (-not $contradictoryReady.ready -and $contradictoryReady.terminalFailure) 'negative semantic evidence vetoes a simultaneously ready service state'
 $inspectReady = Test-DevBenchServiceReady -Content @([pscustomobject]@{ playerLoaded = $true; cell = 'Whiterun' })
 Assert-Test (-not $inspectReady.ready -and $inspectReady.probeReturnedContent -and -not $inspectReady.semantic.known) 'a successful unclassified response never proves service readiness'
 $textUnknown = Test-DevBenchServiceReady -Content @('answered')
@@ -704,7 +727,16 @@ Assert-Test ($entryPointText -match 'requestTimeoutSeconds = \$script:requestTim
 Assert-Test ($entryPointText -match '\[string\]\$EvidenceLabel') 'runtime binding evidence accepts an explicit invocation label'
 Assert-Test ($entryPointText -match 'devbench-runtime-binding\.\$safeLabel\.\$stamp\.\$PID\.json') 'parallel runtime bindings use invocation-unique filenames'
 Assert-Test ($entryPointText -match 'function Test-WaitRetryableException') 'bounded waits classify exhausted transient probe failures'
-Assert-Test ($entryPointText -match "state = 'transport_retry'") 'serviceReady carries transient probe exhaustion into the outer wait'
+Assert-Test ($entryPointText -match "classification = 'session-rebind-required'" -and $entryPointText -match "phase = 'discovery-identity-or-probe'") 'serviceReady carries transient discovery, identity, or probe exhaustion into the outer wait'
+$fullWaitRecoveryTry = @($entryPointAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.TryStatementAst] -and
+    $node.Body.Extent.Text -match 'Get-ToolDescriptors -Headers \$headers' -and
+    $node.Body.Extent.Text -match 'Get-RuntimeIdentity -Runtime \$runtime' -and
+    $node.Body.Extent.Text -match 'Invoke-ToolRpc -Name \$Tool' -and
+    @($node.CatchClauses | Where-Object { $_.Body.Extent.Text -match 'Close-McpSessionForRebind -Headers \$headers' }).Count -eq 1
+}, $true))
+Assert-Test ($fullWaitRecoveryTry.Count -eq 1) 'tool discovery, post-registration identity, and the read-only readiness probe share one cleanup-qualified rebind boundary'
 Assert-Test ($entryPointText -match 'probeError = \$_.Exception.Message') 'wait observations preserve the transient probe error'
 Assert-Test ($entryPointText -match "phase = 'initialize'; recovery = 'outer-wait-retry'") 'wait initialization failures remain inside the outer timeout state machine'
 Assert-Test ($entryPointText -match '\$null -eq \$headers') 'bounded waits establish or re-establish the MCP session inside the polling loop'

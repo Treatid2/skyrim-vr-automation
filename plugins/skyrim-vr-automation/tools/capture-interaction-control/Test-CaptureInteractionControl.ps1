@@ -67,8 +67,14 @@ if ($env:CAPTURE_INTERACTION_FAIL_STOP -eq '1' -and
   [pscustomobject]@{ok=$false;state='completed';semantic=[pscustomobject]@{known=$true;ok=$false;outcome=$outcome;reasons=@()};data=[pscustomobject]@{content=@()};errors=@()} | ConvertTo-Json -Depth 100 -Compress
   return
 }
+if ($env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START -eq '1' -and
+    $Tool -eq 'communityshaders.screenshot' -and $argsObject.action -eq 'sequence_start') {
+  [pscustomobject]@{ok=$false;state='completed';semantic=[pscustomobject]@{known=$true;ok=$false;outcome='screenshot-start-rejected';reasons=@('definite rejection')};data=[pscustomobject]@{content=@()};errors=@('definite rejection')} | ConvertTo-Json -Depth 100 -Compress
+  return
+}
 if ($Tool -eq 'communityshaders.screenshot') {
   if ($argsObject.action -eq 'capabilities') { $value=[pscustomobject]@{schema='urn:csx:devbench:screenshot:1';limits=[pscustomobject]@{maximumSequenceFrames=60000;maximumSequenceDurationMs=3600000}} }
+  elseif ($argsObject.action -eq 'sequence_start' -and $env:CAPTURE_INTERACTION_FAIL_SEQUENCE_QUALIFICATION -eq '1') { $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{state='running';terminal=$false}} }
   elseif ($argsObject.action -in @('sequence_start','capture')) { $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='running';terminal=$false}} }
   elseif ($argsObject.action -eq 'request_get') {
     $image=Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'frame-left.png'
@@ -99,6 +105,28 @@ else { $value=[pscustomobject]@{ok=$true} }
     $oversized = & $entry start -SessionDirectory $oversizedSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 60000 -FrameIntervalMs 1000 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test (-not $oversized.ok -and $oversized.errors -match 'runtime limits are 60000 frames and 3600000 ms' -and $oversized.errors -match 'no greater than 3600') 'sequence preflight reports the exact runtime duration limit and compatible frame count after accepting the server maximum at parameter binding'
     Assert-Test (-not (Test-Path -LiteralPath $oversizedSession)) 'sequence preflight rejects an incompatible request before creating session state or starting recording'
+
+    $env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START = '1'
+    $rollbackSession = Join-Path $root 'rollback-session'
+    $rollback = & $entry start -SessionDirectory $rollbackSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START -ErrorAction SilentlyContinue
+    Assert-Test (-not $rollback.ok -and $rollback.state -eq 'start-failed-rolled-back' -and $rollback.data.rolledBack -and $rollback.data.sessionId -and $rollback.data.recording.startReceipt.correlationId -eq $rollback.data.sessionId -and $rollback.data.recording.stopReceipt.path -eq 'recording.json' -and (Test-Path -LiteralPath $rollback.data.recoveryReceiptPath -PathType Leaf)) 'definite visual-start rejection reports qualified recording rollback and retains startup identity and receipts'
+
+    $env:CAPTURE_INTERACTION_FAIL_SEQUENCE_QUALIFICATION = '1'
+    $env:CAPTURE_INTERACTION_FAIL_STOP = '1'
+    $uncertainSession = Join-Path $root 'uncertain-session'
+    $uncertain = & $entry start -SessionDirectory $uncertainSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_QUALIFICATION -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_STOP -ErrorAction SilentlyContinue
+    Assert-Test (-not $uncertain.ok -and $uncertain.state -eq 'start-failed-cleanup-uncertain' -and -not $uncertain.data.rolledBack -and $uncertain.data.ownership -eq 'cleanup-uncertain' -and $uncertain.data.screenshot.attemptReceipt.result.state -eq 'running' -and $uncertain.data.cleanupErrors.Count -eq 2) 'unqualified visual start plus failed recording cleanup retains evidence and reports uncertain ownership'
+
+    $publicationTarget = Join-Path $root 'state-path-is-directory'
+    New-Item -ItemType Directory -Path $publicationTarget -Force | Out-Null
+    $env:CAPTURE_INTERACTION_FAIL_STOP = '1'
+    $publicationFailure = & $entry start -SessionPath $publicationTarget -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_STOP -ErrorAction SilentlyContinue
+    Assert-Test (-not $publicationFailure.ok -and $publicationFailure.state -eq 'start-failed-cleanup-uncertain' -and $publicationFailure.data.phase -eq 'state-publication' -and $publicationFailure.data.screenshot.requestId -eq 'req-1' -and $publicationFailure.data.screenshot.terminalReceipt.terminal -and $publicationFailure.data.recording.startReceipt -and $publicationFailure.data.cleanupErrors -match 'Recording cleanup failed') 'state-publication failure retains session identity and both cleanup receipts while exposing unresolved recording ownership'
+
     $session = Join-Path $root 'session'
     $started = & $entry start -SessionDirectory $session -RuntimePath $runtime -VisualMode sequence -MaximumFrames 60000 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
     Assert-Test ($started.ok -and $started.state -eq 'session-started' -and $started.data.screenshot.requestId -eq 'req-1' -and $started.data.screenshot.preflight.maximumSequenceFrames -eq 60000) 'sequence session admits the DevBench-advertised 60000-frame limit when its requested duration also fits'
@@ -123,5 +151,7 @@ else { $value=[pscustomobject]@{ok=$true} }
 finally {
     Remove-Item Env:CAPTURE_INTERACTION_FAKE_ROOT -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_FAIL_STOP -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_QUALIFICATION -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
 }

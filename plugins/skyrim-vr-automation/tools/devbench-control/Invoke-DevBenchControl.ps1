@@ -1330,16 +1330,16 @@ try {
                 }
             }
             else {
-                $currentTools = @(Get-ToolDescriptors -Headers $headers)
-                $toolPresent = @($currentTools | Where-Object name -eq $Tool).Count -eq 1
-                if ($toolPresent -and -not $SkipRuntimeIdentityVerification) {
-                    $refreshedIdentity = Get-RuntimeIdentity -Runtime $runtime -Headers $headers -Tools $currentTools
-                    if ($refreshedIdentity.errors.Count -gt 0) { throw "DevBench runtime identity verification failed after target registration: $($refreshedIdentity.errors -join ' ')" }
-                    $runtimeIdentity = $refreshedIdentity
-                }
-                $service = $null
-                if ($Condition -eq 'serviceReady' -and $toolPresent) {
-                    try {
+                try {
+                    $currentTools = @(Get-ToolDescriptors -Headers $headers)
+                    $toolPresent = @($currentTools | Where-Object name -eq $Tool).Count -eq 1
+                    if ($toolPresent -and -not $SkipRuntimeIdentityVerification) {
+                        $refreshedIdentity = Get-RuntimeIdentity -Runtime $runtime -Headers $headers -Tools $currentTools
+                        if ($refreshedIdentity.errors.Count -gt 0) { throw "DevBench runtime identity verification failed after target registration: $($refreshedIdentity.errors -join ' ')" }
+                        $runtimeIdentity = $refreshedIdentity
+                    }
+                    $service = $null
+                    if ($Condition -eq 'serviceReady' -and $toolPresent) {
                         if (-not $waitArgumentsResolved) {
                             $targetDefinition = @($currentTools | Where-Object name -eq $Tool | Select-Object -First 1)[0]
                             $serviceProbe = Resolve-DevBenchServiceProbeArguments -ToolDefinition $targetDefinition -Arguments $waitArguments -ArgumentsSupplied:$argumentsJsonSupplied -ToolName $Tool
@@ -1349,60 +1349,66 @@ try {
                         $toolResult = Invoke-ToolRpc -Name $Tool -Arguments $waitArguments -Headers $headers
                         $service = Test-DevBenchServiceReady -Content @($toolResult.content) -AcceptedStates $AcceptedState -RetryableStates $RetryableState
                     }
-                    catch {
-                        if (-not (Test-WaitRetryableException -Exception $_.Exception)) { throw }
-                        Close-McpSessionForRebind -Headers $headers | Out-Null
-                        $headers = $null
-                        $service = [pscustomobject][ordered]@{
-                            ready = $false
-                            retryable = $true
-                            terminalFailure = $false
-                            state = 'transport_retry'
-                            statePath = $null
-                            probeError = $_.Exception.Message
-                            semantic = $null
-                        }
-                    }
-                }
 
-                $now = [DateTime]::UtcNow
-                if (($now - $lastProgressUtc).TotalSeconds -ge 5 -or $progress.Count -eq 0) {
-                    $listenerProcessId = if ($runtimeIdentity -and $runtimeIdentity.listenerPid) { [int]$runtimeIdentity.listenerPid } else { Get-ListenerPid ([int]$runtime.port) }
-                    $processSample = $null
-                    if ($listenerProcessId) {
-                        $process = Get-Process -Id $listenerProcessId -ErrorAction SilentlyContinue
-                        if ($process) {
-                            $lastCpu = [double]$process.CPU
-                            if ($null -eq $firstCpu) { $firstCpu = $lastCpu }
-                            $processSample = [pscustomobject][ordered]@{ pid = $listenerProcessId; responding = $(try { [bool]$process.Responding } catch { $null }); cpuSeconds = $lastCpu; workingSetBytes = [long]$process.WorkingSet64 }
+                    $now = [DateTime]::UtcNow
+                    if (($now - $lastProgressUtc).TotalSeconds -ge 5 -or $progress.Count -eq 0) {
+                        $listenerProcessId = if ($runtimeIdentity -and $runtimeIdentity.listenerPid) { [int]$runtimeIdentity.listenerPid } else { Get-ListenerPid ([int]$runtime.port) }
+                        $processSample = $null
+                        if ($listenerProcessId) {
+                            $process = Get-Process -Id $listenerProcessId -ErrorAction SilentlyContinue
+                            if ($process) {
+                                $lastCpu = [double]$process.CPU
+                                if ($null -eq $firstCpu) { $firstCpu = $lastCpu }
+                                $processSample = [pscustomobject][ordered]@{ pid = $listenerProcessId; responding = $(try { [bool]$process.Responding } catch { $null }); cpuSeconds = $lastCpu; workingSetBytes = [long]$process.WorkingSet64 }
+                            }
                         }
-                    }
-                    $logSample = $null
-                    if (-not [string]::IsNullOrWhiteSpace($ProgressLogPath)) {
-                        $resolvedLog = [IO.Path]::GetFullPath($ProgressLogPath)
-                        if (Test-Path -LiteralPath $resolvedLog -PathType Leaf) {
-                            $item = Get-Item -LiteralPath $resolvedLog
-                            $logSample = [pscustomobject][ordered]@{ path = $resolvedLog; bytes = [long]$item.Length; lastWriteTimeUtc = $item.LastWriteTimeUtc.ToString('o'); tail = @(Get-Content -LiteralPath $resolvedLog -Tail 5) }
+                        $logSample = $null
+                        if (-not [string]::IsNullOrWhiteSpace($ProgressLogPath)) {
+                            $resolvedLog = [IO.Path]::GetFullPath($ProgressLogPath)
+                            if (Test-Path -LiteralPath $resolvedLog -PathType Leaf) {
+                                $item = Get-Item -LiteralPath $resolvedLog
+                                $logSample = [pscustomobject][ordered]@{ path = $resolvedLog; bytes = [long]$item.Length; lastWriteTimeUtc = $item.LastWriteTimeUtc.ToString('o'); tail = @(Get-Content -LiteralPath $resolvedLog -Tail 5) }
+                            }
                         }
+                        $progress.Add([pscustomobject][ordered]@{ timestampUtc = $now.ToString('o'); toolCount = $currentTools.Count; targetPresent = $toolPresent; process = $processSample; log = $logSample })
+                        while ($progress.Count -gt 120) { $progress.RemoveAt(0) }
+                        $lastProgressUtc = $now
                     }
-                    $progress.Add([pscustomobject][ordered]@{ timestampUtc = $now.ToString('o'); toolCount = $currentTools.Count; targetPresent = $toolPresent; process = $processSample; log = $logSample })
-                    while ($progress.Count -gt 120) { $progress.RemoveAt(0) }
-                    $lastProgressUtc = $now
+                    $cpuDelta = if ($null -ne $firstCpu -and $null -ne $lastCpu) { [Math]::Round($lastCpu - $firstCpu, 3) } else { $null }
+                    $classification = if ($toolPresent) { if ($Condition -eq 'serviceReady' -and -not $service.ready) { 'service-registered-not-ready' } else { 'service-ready' } } elseif ($null -ne $cpuDelta -and $cpuDelta -gt 1) { 'api-waiting-behind-initialization' } else { 'api-absent-or-not-registered' }
+                    $observation = [pscustomobject][ordered]@{
+                        satisfied = if ($Condition -eq 'toolAvailable') { $toolPresent } else { $toolPresent -and $service.ready }
+                        tool = $Tool
+                        toolPresent = $toolPresent
+                        service = $service
+                        serviceProbe = $serviceProbe
+                        classification = $classification
+                        cpuDeltaSeconds = $cpuDelta
+                        authoritativeToolCount = $currentTools.Count
+                        progress = @($progress)
+                    }
+                    if ($service -and $service.terminalFailure) { break }
                 }
-                $cpuDelta = if ($null -ne $firstCpu -and $null -ne $lastCpu) { [Math]::Round($lastCpu - $firstCpu, 3) } else { $null }
-                $classification = if ($toolPresent) { if ($Condition -eq 'serviceReady' -and -not $service.ready) { 'service-registered-not-ready' } else { 'service-ready' } } elseif ($null -ne $cpuDelta -and $cpuDelta -gt 1) { 'api-waiting-behind-initialization' } else { 'api-absent-or-not-registered' }
-                $observation = [pscustomobject][ordered]@{
-                    satisfied = if ($Condition -eq 'toolAvailable') { $toolPresent } else { $toolPresent -and $service.ready }
-                    tool = $Tool
-                    toolPresent = $toolPresent
-                    service = $service
-                    serviceProbe = $serviceProbe
-                    classification = $classification
-                    cpuDeltaSeconds = $cpuDelta
-                    authoritativeToolCount = $currentTools.Count
-                    progress = @($progress)
+                catch {
+                    if (-not (Test-WaitRetryableException -Exception $_.Exception)) { throw }
+                    $rebindCause = $_.Exception.Message
+                    Close-McpSessionForRebind -Headers $headers | Out-Null
+                    $headers = $null
+                    if ($Condition -eq 'serviceReady') {
+                        $waitArguments = @{}
+                        $waitArgumentsResolved = $false
+                        $serviceProbe = $null
+                    }
+                    $transportRetries.Add([pscustomobject][ordered]@{
+                        attempt = $attempts; phase = 'discovery-identity-or-probe'; recovery = 'outer-wait-rebind'
+                        delayMilliseconds = $currentDelay; message = $rebindCause; timestampUtc = [DateTime]::UtcNow.ToString('o')
+                    })
+                    $observation = [pscustomobject][ordered]@{
+                        satisfied = $false; retryable = $true; phase = 'discovery-identity-or-probe'
+                        classification = 'session-rebind-required'; probeError = $rebindCause
+                        lastSuccessfulObservation = $lastSuccessfulWaitObservation
+                    }
                 }
-                if ($service -and $service.terminalFailure) { break }
             }
             $observationProbeError = if ($observation -and $observation.PSObject.Properties['probeError']) {
                 [string]$observation.probeError
@@ -1490,6 +1496,14 @@ catch {
             sessionInvalidationCount = $mcpSessionInvalidationCount
             lastSuccessfulObservation = $lastSuccessfulWaitObservation
             deadlineCause = $failureMessage
+        }
+    }
+    elseif ($Command -eq 'wait') {
+        [pscustomobject][ordered]@{
+            condition = $Condition
+            satisfied = $false
+            lastSuccessfulObservation = $lastSuccessfulWaitObservation
+            cause = $failureMessage
         }
     }
     else { $null }
