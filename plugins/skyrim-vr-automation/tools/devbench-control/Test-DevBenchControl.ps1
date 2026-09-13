@@ -49,6 +49,10 @@ $nullEvidenceReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ d
 Assert-Test (-not $nullEvidenceReplay.known -and $nullEvidenceReplay.schedulerOnly) 'null or empty outcome fields do not verify replay semantics'
 $failedAssertionReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 5; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; assertions = @([pscustomobject]@{ passed = $false }) })
 Assert-Test ($failedAssertionReplay.known -and -not $failedAssertionReplay.ok -and -not $failedAssertionReplay.schedulerOnly) 'explicit failed assertions reject replay semantics'
+$falseOutcomeReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 6; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; postconditions = $false })
+Assert-Test (-not $falseOutcomeReplay.known -and $falseOutcomeReplay.schedulerOnly -and $falseOutcomeReplay.outcome -eq 'scheduler-complete-unverified') 'a false Boolean postcondition never verifies replay semantics'
+$falseOutcomeArrayReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 7; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; outcomeChecks = @($false) })
+Assert-Test (-not $falseOutcomeArrayReplay.known -and $falseOutcomeArrayReplay.schedulerOnly) 'an array containing only false outcomes never verifies replay semantics'
 $readOnlyInspect = Test-DevBenchReadOnlyRequest -ToolName inspect -Arguments @{ kind = 'scene' }
 $readOnlyMenu = Test-DevBenchReadOnlyRequest -ToolName menu -Arguments @{ action = 'list' }
 $mutatingMenu = Test-DevBenchReadOnlyRequest -ToolName menu -Arguments @{ action = 'open'; name = 'InventoryMenu' }
@@ -87,6 +91,31 @@ $screenshotList = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.scr
 Assert-Test ($screenshotList.known -and $screenshotList.ok) 'screenshot request_list accepts an empty bounded collection receipt'
 $screenshotEvents = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'events_poll' } -Content @([pscustomobject]@{ events = [object[]]@(); oldestRetainedEventId = 1; latestEventId = 0; nextEventId = 0; cursorExpired = $false; moreAvailable = $false })
 Assert-Test ($screenshotEvents.known -and $screenshotEvents.ok) 'screenshot events_poll accepts its exact cursor and collection receipt'
+foreach ($readAction in @('status', 'settings_get', 'request_get', 'request_list', 'events_poll')) {
+    $arguments = @{ action = $readAction }
+    if ($readAction -eq 'request_get') { $arguments.requestId = 'req-1' }
+    $emptyResult = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments $arguments -Content @([pscustomobject]@{ result = [object[]]@() })
+    Assert-Test ($emptyResult.known -and -not $emptyResult.ok -and $emptyResult.reasons -match 'not a structured') "screenshot $readAction rejects an array replacing its result object"
+}
+$screenshotArraySection = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'status' } -Content @([pscustomobject]@{ feature = [object[]]@(); dispatcher = [pscustomobject]@{}; journal = [pscustomobject]@{} })
+Assert-Test (-not $screenshotArraySection.ok) 'screenshot status rejects an array replacing a required section object'
+foreach ($pair in @(
+    @{ state = 'running'; terminal = $true },
+    @{ state = 'queued'; terminal = $true },
+    @{ state = 'completed'; terminal = $false },
+    @{ state = 'invented'; terminal = $false }
+)) {
+    $contradictory = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_get'; requestId = 'req-1' } -Content @([pscustomobject]@{ requestId = 'req-1'; state = $pair.state; terminal = $pair.terminal })
+    Assert-Test ($contradictory.known -and -not $contradictory.ok) "screenshot request_get rejects unsupported or contradictory state '$($pair.state)' / terminal '$($pair.terminal)'"
+}
+$negativeRetained = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_list' } -Content @([pscustomobject]@{ requests = [object[]]@(); retained = -1 })
+Assert-Test (-not $negativeRetained.ok) 'screenshot request_list rejects a negative retained count'
+foreach ($cursorName in @('oldestRetainedEventId', 'latestEventId', 'nextEventId')) {
+    $cursorPayload = [ordered]@{ events = [object[]]@(); oldestRetainedEventId = 0; latestEventId = 0; nextEventId = 0; cursorExpired = $false; moreAvailable = $false }
+    $cursorPayload[$cursorName] = -1
+    $negativeCursor = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'events_poll' } -Content @([pscustomobject]$cursorPayload)
+    Assert-Test (-not $negativeCursor.ok) "screenshot events_poll rejects negative $cursorName"
+}
 $recordSemantic = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ action = 'start'; recording = $true; correlationId = 'capture-1' })
 Assert-Test ($recordSemantic.known -and $recordSemantic.ok -and $recordSemantic.outcome -eq 'record-start-contract-satisfied') 'record start validates the running receipt and correlation identity'
 $recordMismatch = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ action = 'start'; recording = $true; correlationId = 'other' })
@@ -342,6 +371,17 @@ $retryableContradictoryReady = Test-DevBenchServiceReady -Content @([pscustomobj
 Assert-Test (-not $retryableContradictoryReady.ready -and $retryableContradictoryReady.retryable -and -not $retryableContradictoryReady.terminalFailure) 'retryability controls continued polling but never converts negative semantic evidence into readiness'
 $nestedRetryableContradictoryReady = Test-DevBenchServiceReady -Content @([pscustomobject]@{ result = [pscustomobject]@{ state = 'ready'; error = [pscustomobject]@{ code = 'service_unavailable'; retryable = $true } } })
 Assert-Test (-not $nestedRetryableContradictoryReady.ready -and $nestedRetryableContradictoryReady.retryable) 'nested retryable failure evidence vetoes an otherwise accepted readiness state'
+foreach ($neutral in @(
+    [pscustomobject]@{ retryable = $false },
+    [pscustomobject]@{ failed = $false },
+    [pscustomobject]@{ aborted = $false }
+)) {
+    $neutralReady = Test-DevBenchServiceReady -Content @($neutral)
+    Assert-Test (-not $neutralReady.ready -and $neutralReady.semantic.known -and
+        -not $neutralReady.semantic.affirmative) 'a negative-control flag alone never establishes service readiness'
+}
+$affirmativeReady = Test-DevBenchServiceReady -Content @([pscustomobject]@{ ok = $true })
+Assert-Test ($affirmativeReady.ready -and $affirmativeReady.semantic.affirmative) 'an explicitly successful probe remains affirmative readiness evidence'
 $deadline = [DateTime]'2026-09-13T04:00:00Z'
 Assert-Test (Test-DevBenchWaitDeadlineAcceptance -Satisfied $true -ObservedUtc $deadline.AddTicks(-1) -DeadlineUtc $deadline) 'a valid observation immediately before the absolute deadline may satisfy a wait'
 Assert-Test (-not (Test-DevBenchWaitDeadlineAcceptance -Satisfied $true -ObservedUtc $deadline -DeadlineUtc $deadline)) 'an observation exactly at the absolute deadline cannot satisfy a wait'

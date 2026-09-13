@@ -96,7 +96,8 @@ if ($Tool -eq 'communityshaders.screenshot') {
   elseif ($argsObject.action -eq 'request_get') {
     $image=Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'frame-left.png'
     if (-not (Test-Path $image)) { [IO.File]::WriteAllBytes($image,[byte[]](1,2,3)) }
-    $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='completed';terminal=$true;children=@([pscustomobject]@{ordinal=4;scheduledEngineFrame=44;artifacts=@([pscustomobject]@{view='left_eye';path=$image;format='png';bytes=3;committed=$true})})}}
+    $terminalState = if ($env:CAPTURE_INTERACTION_CONTRADICT_TERMINAL -eq '1') { 'running' } else { 'completed' }
+    $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state=$terminalState;terminal=$true;children=@([pscustomobject]@{ordinal=4;scheduledEngineFrame=44;artifacts=@([pscustomobject]@{view='left_eye';path=$image;format='png';bytes=3;committed=$true})})}}
   }
   else { $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='stop_requested'}} }
 } elseif ($Tool -eq 'record') {
@@ -180,6 +181,16 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     $stopped = & $entry stop -SessionDirectory $session -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
     Assert-Test ($stopped.ok -and $stopped.state -eq 'stopped' -and $stopped.data.recording.stopReceipt.path -eq 'recording.json') 'stop finalizes visual capture before state recording and persists receipts'
 
+    $contradictorySession = Join-Path $root 'contradictory-terminal-session'
+    $contradictoryStarted = & $entry start -SessionDirectory $contradictorySession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
+    $env:CAPTURE_INTERACTION_CONTRADICT_TERMINAL = '1'
+    $contradictoryStopped = & $entry stop -SessionDirectory $contradictorySession -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_CONTRADICT_TERMINAL -ErrorAction SilentlyContinue
+    Assert-Test ($contradictoryStarted.ok -and -not $contradictoryStopped.ok -and
+        $contradictoryStopped.state -eq 'stopped-with-errors' -and
+        $null -eq $contradictoryStopped.data.screenshot.terminalReceipt -and
+        $contradictoryStopped.errors -match '(state and content\.terminal contradict|contradictory or unsupported terminal evidence)') 'contradictory screenshot terminal evidence cannot produce a successful stop'
+
     $diagnosticSession = Join-Path $root 'diagnostic-session'
     $diagnosticStarted = & $entry start -SessionDirectory $diagnosticSession -RuntimePath $runtime -VisualMode none -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
     Assert-Test ($diagnosticStarted.ok) 'diagnostic stop fixture starts an owned recording'
@@ -199,5 +210,6 @@ finally {
     Remove-Item Env:CAPTURE_INTERACTION_INDETERMINATE_SEQUENCE_START -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_ACCEPTED_FAILURE_SEQUENCE_START -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_INDETERMINATE_RECORD_START -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_CONTRADICT_TERMINAL -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
 }
