@@ -36,6 +36,9 @@ optional integration rather than the identity or boundary of the toolkit.
 - `tools/render-scale-qualification` — one bounded, evidence-preserving
   render-scale qualification that combines transition stability, performance,
   stereo capture, and blinded visual assessment.
+- `tools/renderscale-tuning-live` and `tools/renderscale-tuning-finalizer` —
+  identity-bound NVIDIA or AMD render-scale assay execution and restartable,
+  lossless evidence finalization.
 - `tools/shader-cache-control` — provider discovery, physical cache
   snapshot/restore transactions, compatibility-ranked known-working cache
   catalogs, task seeding/restoration/promotion, and comparison reports.
@@ -54,7 +57,7 @@ versioned shared-memory pose contract, but it is not the bootstrap provider.
 
 ## Codex plugin
 
-The repository publishes a Codex marketplace plugin. Its eight skills connect a
+The repository publishes a Codex marketplace plugin. Its skills connect a
 new task to the bundled implementations and their operational contracts:
 
 - `$feedback-control` records unexpected automation behaviour and concrete
@@ -67,6 +70,9 @@ new task to the bundled implementations and their operational contracts:
 - `$profiler-control` captures bounded GPU/CPU timer evidence and compares runs.
 - `$render-scale-qualification` runs the complete unattended CSX render-scale
   qualification against one already-running, identity-bound DevBench session.
+- `$renderscale-tuning-nvidia` runs the NVIDIA-only 33-transition tuning assay.
+- `$renderscale-tuning-amd` runs three AMD-only 31-transition FSR lanes and
+  preserves their results for cross-machine comparison.
 - `$shader-cache-control` prepares tasks from compatible known-working compiled
   caches, restores prior state, promotes verified results, and compares trees
   by SHA-256.

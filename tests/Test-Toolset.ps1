@@ -29,6 +29,8 @@ $tests = @(
     @{ Name = 'render-scale-visual-provider'; Path = 'tools\render-scale-qualification\Test-AutomatedVisualReviewProvider.ps1'; Arguments = @() },
     @{ Name = 'render-scale-entrypoint'; Path = 'tools\render-scale-qualification\Test-RenderScaleQualificationEntrypoint.ps1'; Arguments = @() },
     @{ Name = 'render-scale-qualification'; Path = 'tools\render-scale-qualification\Test-CSXRenderScaleQualification.ps1'; Arguments = @() },
+    @{ Name = 'render-scale-tuning-protocol'; Path = 'tests\Test-RenderScaleTuningProtocol.ps1'; Arguments = @() },
+    @{ Name = 'render-scale-ledger-contract'; Path = 'tests\Test-RenderScaleLedgerContract.ps1'; Arguments = @() },
     @{ Name = 'shader-cache-control'; Path = 'tools\shader-cache-control\Test-CSXShaderCacheControl.ps1'; Arguments = @() },
     @{ Name = 'shader-cache-catalog'; Path = 'tools\shader-cache-control\Test-CSXShaderCacheCatalog.ps1'; Arguments = @() },
     @{ Name = 'process-control'; Path = 'tools\process-control\Test-BoundedProcess.ps1'; Arguments = @() },
