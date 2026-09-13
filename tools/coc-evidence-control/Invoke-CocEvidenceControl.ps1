@@ -15,7 +15,7 @@ param(
     [ValidateRange(0, [int]::MaxValue)][int]$TargetPid = 0,
     [ValidateRange(1, 2048)][int]$MinimumFreeGiB = 100,
     [ValidateRange(10, 300)][int]$CaptureTimeoutSeconds = 120,
-    [ValidateSet('none', 'stop-before-termination', 'cancel-identity-unavailable', 'monitor-identity-unavailable')]
+    [ValidateSet('none', 'stop-before-termination', 'cancel-identity-unavailable', 'monitor-identity-unavailable', 'capture-identity-unavailable')]
     [string]$InternalTestFailurePoint = 'none',
     [switch]$Compact,
     [switch]$NoExit
@@ -1029,7 +1029,8 @@ try {
                 'capture-running', 'hash-pending', 'capture-cleanup-incomplete'
             )
         $captureResolution = if ($capturePending) {
-            Resolve-RecordedProcess $owned.data 'capturePid' 'captureStartedUtc'
+            Resolve-RecordedProcess $owned.data 'capturePid' 'captureStartedUtc' `
+                'capture-identity-unavailable'
         } else { [pscustomobject]@{ state = 'not-pending'; process = $null } }
         $capture = if ($captureResolution.state -eq 'owned') {
             $captureResolution.process
@@ -1106,20 +1107,19 @@ try {
         } elseif ($cancel.PSObject.Properties['cancelStartedUtc']) {
             $cancel.cancelStartedUtc
         } else { $null }
-        $unresolvedProcessKinds = if ($processKind -eq 'cancellation-helper') {
-            @(
-                if ($monitorResolution.state -eq 'unresolved') { 'crash-monitor' }
-                if ($captureResolution.state -eq 'unresolved') { 'hang-capture-worker' }
-                if ($procDumpCaptureResolution.state -eq 'unresolved') {
-                    'hang-capture-procdump'
-                }
-            )
-        } else { @() }
-        $otherOwnedProcessAlive = if ($processKind -eq 'cancellation-helper') {
-            @($monitor, $capture, $procDumpCapture | Where-Object {
-                $null -ne $_ -and -not $_.HasExited
-            }).Count -gt 0 -or @($unresolvedProcessKinds).Count -gt 0
-        } else { $false }
+        $unresolvedProcessKinds = @(
+            if ($monitorResolution.state -eq 'unresolved') { 'crash-monitor' }
+            if ($captureResolution.state -eq 'unresolved') { 'hang-capture-worker' }
+            if ($procDumpCaptureResolution.state -eq 'unresolved') {
+                'hang-capture-procdump'
+            }
+        )
+        $otherOwnedProcessAlive = @(
+            if ($processKind -ne 'crash-monitor') { $monitor }
+            if ($processKind -ne 'hang-capture-worker') { $capture }
+            if ($processKind -ne 'hang-capture-procdump') { $procDumpCapture }
+        ).Where({ $null -ne $_ -and -not $_.HasExited }).Count -gt 0 -or
+            @($unresolvedProcessKinds).Count -gt 0
         $stopped = $selectedStopped -and -not $otherOwnedProcessAlive
         $owned.data | Add-Member -NotePropertyName cancelPid `
             -NotePropertyValue $retainedCancelPid -Force
