@@ -230,24 +230,90 @@ function amdTraceCapabilityEvidence(root, liveResult, buildId) {
         return { complete: false,
             reasons: ["amd_trace_capability_not_supported_or_missing"] };
     }
-    if (liveResult.traceCapability.lifecycle) {
-        return traceLifecycleEvidence(
-            liveResult.traceCapability.lifecycle, buildId, false);
-    }
     const rawRoot = path.join(root, "raw");
     const files = fs.existsSync(rawRoot) ? walk(rawRoot).filter((file) =>
         path.extname(file).toLowerCase() === ".json") : [];
+    const retainedRecords = [];
     for (const file of files) {
-        let scenarioRoot;
+        if (path.basename(file) === "live-result.json") continue;
         try {
-            scenarioRoot = decodedScenarioRoot(readJson(file));
+            retainedRecords.push({ file, value: readJson(file) });
         } catch {
-            continue;
+            // A malformed candidate cannot substantiate the declared links.
         }
+    }
+    if (liveResult.traceCapability.lifecycle) {
+        const capability = liveResult.traceCapability;
+        const reasons = [];
+        const expectedReceiptKey = `${liveResult.runId}:amd:dlss-trace-capability`;
+        const expectedLifecycleKey = `${expectedReceiptKey}:lifecycle`;
+        if (capability.receiptKey !== expectedReceiptKey ||
+            capability.lifecycleReceiptKey !== expectedLifecycleKey ||
+            !Array.isArray(liveResult.receiptKeys) ||
+            !liveResult.receiptKeys.includes(capability.receiptKey) ||
+            !liveResult.receiptKeys.includes(capability.lifecycleReceiptKey)) {
+            reasons.push("amd_trace_capability_links_invalid");
+        }
+        const lifecycleRecords = retainedRecords.filter((candidate) =>
+            candidate.value &&
+            candidate.value.scenarioReceiptKey === capability.receiptKey &&
+            candidate.value.lifecycle &&
+            JSON.stringify(candidate.value.lifecycle) ===
+                JSON.stringify(capability.lifecycle));
+        if (lifecycleRecords.length !== 1) {
+            reasons.push("amd_trace_capability_lifecycle_original_missing");
+        }
+        const expectedLabels = ["amd-dlss-trace-status",
+            "amd-dlss-trace-reset", "amd-dlss-trace-start"];
+        const scenarioRecords = retainedRecords.map((candidate) => ({
+            ...candidate,
+            scenario: decodedScenarioRoot(candidate.value),
+        })).filter((candidate) => candidate.scenario &&
+            candidate.scenario.stepsRun === expectedLabels.length &&
+            candidate.scenario.results.length === expectedLabels.length &&
+            expectedLabels.every((label, index) =>
+                candidate.scenario.results[index] &&
+                candidate.scenario.results[index].label === label));
+        if (scenarioRecords.length !== 1 ||
+            !scenarioSucceeded(scenarioRecords[0].scenario)) {
+            reasons.push("amd_trace_capability_scenario_original_invalid");
+        } else {
+            const scenarioRoot = scenarioRecords[0].scenario;
+            const statusEntry = scenarioEntry(scenarioRoot,
+                "amd-dlss-trace-status");
+            const resetEntry = scenarioEntry(scenarioRoot,
+                "amd-dlss-trace-reset");
+            const startEntry = scenarioEntry(scenarioRoot,
+                "amd-dlss-trace-start");
+            const status = statusEntry && statusEntry.result;
+            const reset = resetEntry && resetEntry.result;
+            const start = startEntry && startEntry.result;
+            if (!successfulScenarioEntry(statusEntry) ||
+                !successfulScenarioEntry(resetEntry) ||
+                !successfulScenarioEntry(startEntry) ||
+                !producerBuildMatches(status, buildId) ||
+                status.action !== "dlss_trace_status" ||
+                JSON.stringify(reset) !==
+                    JSON.stringify(capability.lifecycle.traceReset) ||
+                JSON.stringify(start) !==
+                    JSON.stringify(capability.lifecycle.traceStart)) {
+                reasons.push("amd_trace_capability_scenario_original_mismatch");
+            }
+        }
+        const lifecycleEvidence = traceLifecycleEvidence(
+            capability.lifecycle, buildId, false);
+        return { ...lifecycleEvidence,
+            complete: reasons.length === 0 && lifecycleEvidence.complete,
+            reasons: unique([...reasons, ...lifecycleEvidence.reasons]) };
+    }
+    for (const candidate of retainedRecords) {
+        const scenarioRoot = decodedScenarioRoot(candidate.value);
         if (!scenarioRoot) continue;
-        const entries = new Map(scenarioRoot.results
-            .filter((entry) => entry && typeof entry.label === "string")
-            .map((entry) => [entry.label, entry.result]));
+        if (!scenarioSucceeded(scenarioRoot)) continue;
+        const entries = new Map(scenarioRoot.results.filter((entry) =>
+            entry && typeof entry.label === "string" &&
+            successfulScenarioEntry(entry)).map((entry) =>
+            [entry.label, entry.result]));
         const retained = {
             traceReset: entries.get("amd-dlss-trace-reset"),
             traceStart: entries.get("amd-dlss-trace-start"),
@@ -255,7 +321,8 @@ function amdTraceCapabilityEvidence(root, liveResult, buildId) {
             traceRead: entries.get("amd-dlss-trace-read"),
         };
         if (Object.values(retained).every(Boolean)) {
-            return traceLifecycleEvidence(retained, buildId, false);
+            const evidence = traceLifecycleEvidence(retained, buildId, false);
+            if (evidence.complete) return evidence;
         }
     }
     return { complete: false,
@@ -1055,7 +1122,7 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
             passReasons.push("cleanup_owner_certificate_invalid");
         }
         const activeNames = ["stressActive", "cpuActive", "gpuActive",
-            "textureActive", "probeActive", "traceActive"];
+            "textureActive", "profilerActive", "probeActive", "traceActive"];
         if (!Array.isArray(after.missing) || after.missing.length > 0 ||
             activeNames.some((name) => after[name] !== false)) {
             passReasons.push("cleanup_inactivity_unproven");
@@ -1116,7 +1183,7 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
                 Array.isArray(value.after.missing) &&
                 value.after.missing.length === 0 &&
                 ["stressActive", "cpuActive", "gpuActive", "textureActive",
-                    "probeActive", "traceActive"].every((name) =>
+                    "profilerActive", "probeActive", "traceActive"].every((name) =>
                     value.after[name] === false);
         });
         if (!cleanupReceipt) {
@@ -1133,6 +1200,8 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
             const cpuResult = scenarioResult(candidate.value, "cpu-status");
             const gpuResult = scenarioResult(candidate.value, "gpu-status");
             const textureResult = scenarioResult(candidate.value, "texture-status");
+            const profilerResult = scenarioResult(candidate.value,
+                "profiler-status");
             const traceResult = scenarioResult(candidate.value,
                 "dlss-trace-status");
             const stress = stressSession(renderResult);
@@ -1143,13 +1212,16 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
                 renderResult.status.loadPresentationProbe;
             const traceStatus = traceResult && traceResult.capture &&
                 (traceResult.capture.summary || traceResult.capture);
-            return [renderResult, cpuResult, gpuResult, textureResult]
+            return [renderResult, cpuResult, gpuResult, textureResult,
+                profilerResult]
                 .every((value) => producerBuildMatches(value, buildId)) &&
                 (!traceRequired || producerBuildMatches(traceResult, buildId)) &&
                 renderResult.action === "status" &&
                 cpuResult.action === "cpu_performance_status" &&
                 gpuResult.action === "gpu_performance_status" &&
                 textureResult.action === "texture_lifetime_status" &&
+                profilerResult.action === "status" &&
+                profilerResult.enabled === false &&
                 (!traceRequired || traceResult.action === "dlss_trace_status") &&
                 stress.id === measured.sessionId && stress.active === false &&
                 cpuStatus && cpuStatus.sessionId === cpu.sessionId &&

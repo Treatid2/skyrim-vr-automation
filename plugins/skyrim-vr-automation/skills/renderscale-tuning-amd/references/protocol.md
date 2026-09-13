@@ -103,6 +103,11 @@ When that labeled waiter subreceipt is terminal and safe, use the shared
 contract's one synchronous handoff scenario to stop the
 baseline-only stress owner and arm the fresh measured stress, texture lifetime,
 load presentation, and profiler owners in its short ownership sequence.
+Before handoff, independently require that waiter label's wrapper and payload
+to succeed for `qualification_wait` from the exact Build ID and correlated
+owner, transition, and stress session. A valid negative stability observation
+may remain unsatisfied; failed or foreign waiter evidence cannot authorize
+handoff.
 An unsatisfied receipt records its non-stable presentation state before the
 handoff. A missing or unsafe waiter subreceipt bypasses handoff and permits
 only the baseline stress owner's guarded stop.
@@ -566,8 +571,13 @@ or fidelity violates this protocol.
 Perform one bounded DLSS trace capability lifecycle before the first AMD lane:
 status, reset, start, stop, and read. Require zero DLSS dispatch records. A
 missing trace action is `unsupported`; an exposed action that fails is a
-control failure. Retain the complete lifecycle envelope so its action receipts
-and empty raw read can be materialized during finalization. Do not start a DLSS
+control failure. Retain the complete lifecycle envelope: preserve the original
+status/reset/start scenario and the
+separately keyed derived lifecycle record so both can be materialized during
+finalization. The offline finalizer must reconcile the live-result copy and
+both declared receipt keys against those independent records, including
+wrapper/payload success, action, Build ID, session, original link, and exact
+lifecycle agreement. Do not start a DLSS
 trace during AMD matrix transitions. Missing lifecycle evidence forbids a
 ledger append but does not change completed AMD row classifications.
 Once the capability trace start succeeds, every failure path must close that
@@ -672,14 +682,16 @@ Offline pass corroboration uses the original pass-scoped baseline, handoff,
 cleanup, and `final-status-after-cleanup` receipts. The baseline and handoff
 scenario envelopes must have completed successfully, relevant tool results must
 name the exact Build ID, and the original post-cleanup status must confirm the
-measured stress and CPU identities inactive. A derived cleanup decision cannot
+measured stress and CPU identities inactive and the task profiler disabled. A derived cleanup decision cannot
 override a failed, foreign, missing, or contradictory original receipt.
 
 Every stress start/stop and cleanup status used as ownership or inactivity proof
 must also be a successful labeled result for the requested action from the exact
 Build ID. Cleanup continues to the post-status boundary after an operation
 failure when possible: a separately qualified post-status may prove inactivity,
-but an errored, wrong-action, or foreign-build status never can.
+but an errored, wrong-action, or foreign-build status never can. In particular,
+a failed or unqualified profiler-disable is reconciled only by a successful
+exact-build profiler status that explicitly reports `enabled: false`.
 
 If the live runner stops at baseline before any measured row, retain
 `raw/live-result.json` and the exact baseline waiter receipt. Run the same
