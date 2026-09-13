@@ -279,6 +279,8 @@ try {
     $pointerPlan | Add-Member -NotePropertyName restoreReceiptPath -NotePropertyValue ([string]$pointerFixture.restore.data.restoreReceiptPath) -Force
     $pointerPlan.state = 'restored'
     $pointerPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $pointerFixture.planPath -Encoding utf8
+    $pointerReceiptPath = [string]$pointerFixture.restore.data.restoreReceiptPath
+    [IO.File]::SetAttributes($pointerReceiptPath, ([IO.File]::GetAttributes($pointerReceiptPath) -bor [IO.FileAttributes]::Hidden))
     $pointerComplete = Invoke-Catalog @{ Command='complete';CatalogRoot=$pointerFixture.catalog;CachePath=$pointerFixture.cache;EvidenceDirectory=$pointerFixture.evidence;WorkingSetStatus='unverified';BlockingProcessNames=$blockers;Confirm=$false;Compact=$true;NoExit=$true }
     Assert-Test ($pointerComplete.ok -and $pointerComplete.state -eq 'complete' -and [IO.Path]::GetFullPath([string]$pointerComplete.data.task.workingTree.preservedPath) -eq [IO.Path]::GetFullPath([string]$pointerFixture.restore.data.displacedPath)) 'completion revalidates and accepts an exact persisted restore pointer after interruption'
 
@@ -302,6 +304,7 @@ try {
             $extraReceipt.transactionId = 'conflicting-evidence'
             $extraReceipt | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $extraReceiptPath -Encoding utf8
         }
+        [IO.File]::SetAttributes($extraReceiptPath, ([IO.File]::GetAttributes($extraReceiptPath) -bor [IO.FileAttributes]::Hidden))
         $beforeConflictCatalog = Invoke-Catalog @{ Command='list';CatalogRoot=$conflictFixture.catalog;Compact=$true;NoExit=$true }
         $pointerConflict = Invoke-Catalog @{ Command='complete';CatalogRoot=$conflictFixture.catalog;CachePath=$conflictFixture.cache;EvidenceDirectory=$conflictFixture.evidence;WorkingSetStatus='known-working';Promote=$pointerConflictCase.promote;BlockingProcessNames=$blockers;Confirm=$false;Compact=$true;NoExit=$true }
         $afterConflictCatalog = Invoke-Catalog @{ Command='list';CatalogRoot=$conflictFixture.catalog;Compact=$true;NoExit=$true }
@@ -309,7 +312,29 @@ try {
             -not (Test-Path -LiteralPath (Join-Path $conflictFixture.evidence 'shader-cache-task.completion.json')) -and
             (Test-Path -LiteralPath ([string]$conflictFixture.restore.data.restoreReceiptPath) -PathType Leaf) -and
             (Test-Path -LiteralPath ([string]$conflictFixture.restore.data.displacedPath) -PathType Container) -and
-            @($afterConflictCatalog.data.snapshots).Count -eq @($beforeConflictCatalog.data.snapshots).Count) "saved-pointer recovery rejects $($pointerConflictCase.label) conflict without completion, promotion, replay, or evidence loss"
+            @($afterConflictCatalog.data.snapshots).Count -eq @($beforeConflictCatalog.data.snapshots).Count) "saved-pointer recovery rejects hidden $($pointerConflictCase.label) conflict without completion, promotion, replay, or evidence loss"
+    }
+
+    foreach ($discoveryConflictCase in @(
+        [pscustomobject]@{ label='discovery-hidden-malformed'; malformed=$true },
+        [pscustomobject]@{ label='discovery-hidden-foreign'; malformed=$false }
+    )) {
+        $discoveryFixture = New-CatalogRestoreRecoveryFixture $discoveryConflictCase.label
+        $extraReceiptPath = Join-Path $discoveryFixture.evidence 'shader-cache-restore.hidden-conflict.receipt.json'
+        if ($discoveryConflictCase.malformed) {
+            Set-Content -LiteralPath $extraReceiptPath -Value '{' -Encoding utf8
+        }
+        else {
+            $extraReceipt = Get-Content -LiteralPath ([string]$discoveryFixture.restore.data.restoreReceiptPath) -Raw | ConvertFrom-Json -Depth 30
+            $extraReceipt.transactionId = 'hidden-conflict'
+            $extraReceipt | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $extraReceiptPath -Encoding utf8
+        }
+        [IO.File]::SetAttributes($extraReceiptPath, ([IO.File]::GetAttributes($extraReceiptPath) -bor [IO.FileAttributes]::Hidden))
+        $discoveryConflict = Invoke-Catalog @{ Command='complete';CatalogRoot=$discoveryFixture.catalog;CachePath=$discoveryFixture.cache;EvidenceDirectory=$discoveryFixture.evidence;WorkingSetStatus='unverified';BlockingProcessNames=$blockers;Confirm=$false;Compact=$true;NoExit=$true }
+        Assert-Test (-not $discoveryConflict.ok -and $discoveryConflict.errors[0] -match 'no unique committed restore receipt' -and
+            -not (Test-Path -LiteralPath (Join-Path $discoveryFixture.evidence 'shader-cache-task.completion.json')) -and
+            (Test-Path -LiteralPath ([string]$discoveryFixture.restore.data.restoreReceiptPath) -PathType Leaf) -and
+            (Test-Path -LiteralPath ([string]$discoveryFixture.restore.data.displacedPath) -PathType Container)) "receipt discovery rejects $($discoveryConflictCase.label) without completion, replay, or evidence loss"
     }
 
     $liveDriftFixture = New-CatalogRestoreRecoveryFixture 'live-drift'

@@ -599,7 +599,7 @@ function Get-UniqueCommittedRestoreProof(
     [string]$BaselineTreeSha256,
     [string]$WorkingTreeSha256,
     [string]$SnapshotTransactionId) {
-    $receiptCandidates = @(Get-ChildItem -LiteralPath $EvidenceRoot -Filter 'shader-cache-restore.*.receipt.json' -File)
+    $receiptCandidates = @(Get-ChildItem -LiteralPath $EvidenceRoot -Filter 'shader-cache-restore.*.receipt.json' -File -Force)
     if ($receiptCandidates.Count -ne 1 -or -not (Test-SamePath $receiptCandidates[0].FullName $ReceiptPath)) {
         throw 'Stored restore receipt is missing or conflicts with other recovery evidence; recovery remains required.'
     }
@@ -1156,7 +1156,7 @@ function Complete-TaskCache($Storage) {
     }
     else {
         $liveNow = Invoke-Transaction 'inspect' @{ CachePath = $resolvedCache }
-        $receiptCandidates = @(Get-ChildItem -LiteralPath $evidence -Filter 'shader-cache-restore.*.receipt.json' -File | Sort-Object LastWriteTimeUtc -Descending)
+        $receiptCandidates = @(Get-ChildItem -LiteralPath $evidence -Filter 'shader-cache-restore.*.receipt.json' -File -Force | Sort-Object LastWriteTimeUtc -Descending)
         if ([string]$liveNow.data.treeSha256 -ieq [string]$plan.beforeTreeSha256) {
             if ($receiptCandidates.Count -eq 1) {
                 $restore = Get-CommittedRestoreProof -ReceiptPath $receiptCandidates[0].FullName -EvidenceRoot $evidence -CachePath $resolvedCache -BaselineTreeSha256 ([string]$plan.beforeTreeSha256) -WorkingTreeSha256 ([string]$currentBeforeRestore.data.treeSha256) -SnapshotTransactionId $snapshotTransactionId

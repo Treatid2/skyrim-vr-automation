@@ -810,7 +810,7 @@ function Complete-WorkspaceBackupOutput($Config, $Workspace, [switch]$WhatIf) {
         throw 'Live backup matches neither the recorded working tree nor the preserved baseline.'
     }
     $restored = $null
-    $restoreCandidates = @(Get-ChildItem -LiteralPath ([string]$output.backupEvidenceDirectory) -Filter 'shader-cache-restore.*.receipt.json' -File)
+    $restoreCandidates = @(Get-ChildItem -LiteralPath ([string]$output.backupEvidenceDirectory) -Filter 'shader-cache-restore.*.receipt.json' -File -Force)
     if ($backupPlan.PSObject.Properties['restoreReceiptPath'] -and -not [string]::IsNullOrWhiteSpace([string]$backupPlan.restoreReceiptPath)) {
         if ($restoreCandidates.Count -ne 1 -or -not (Test-WorkspaceSamePath $restoreCandidates[0].FullName ([string]$backupPlan.restoreReceiptPath))) {
             throw 'Stored backup restore receipt is missing or conflicts with other recovery evidence.'
