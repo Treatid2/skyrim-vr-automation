@@ -345,6 +345,40 @@ try {
         throw 'A later authorized stop did not resolve the retained ProcDump lifetime.'
     }
 
+    $captureWorker = [Diagnostics.Process]::Start($startInfo)
+    $captureChild = [Diagnostics.Process]::Start($startInfo)
+    $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $state.capturePid = $captureWorker.Id
+    $state.captureStartedUtc = $captureWorker.StartTime.ToUniversalTime().ToString('o')
+    $state.captureProcDumpPid = $captureChild.Id
+    $state.captureProcDumpStartedUtc = $captureChild.StartTime.ToUniversalTime().ToString('o')
+    $state.captureState = 'capture-running'
+    $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $statePath -Encoding utf8
+    $childOnlyCleanup = & $scriptPath stop -StatePath $statePath `
+        -InternalTestFailurePoint capture-identity-unavailable -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    $afterChildOnlyCleanup = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    if ($childOnlyCleanup.ok -or $childOnlyCleanup.state -ne 'cleanup-incomplete' -or
+        $childOnlyCleanup.data.processKind -ne 'hang-capture-procdump' -or
+        'hang-capture-worker' -notin @($childOnlyCleanup.data.unresolvedProcessKinds) -or
+        [string]$afterChildOnlyCleanup.captureState -ne 'capture-cleanup-incomplete' -or
+        (Get-Process -Id $captureChild.Id -ErrorAction SilentlyContinue) -or
+        -not (Get-Process -Id $captureWorker.Id -ErrorAction SilentlyContinue)) {
+        throw 'Successful ProcDump-child stop hid an unresolved capture-worker obligation.'
+    }
+    $restoredWorker = & $scriptPath status -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if (-not $restoredWorker.ok -or -not $restoredWorker.data.captureActive -or
+        $restoredWorker.data.activeProcessKind -ne 'hang-capture-worker') {
+        throw 'Restored worker identity inspection did not recover exact lifetime authority.'
+    }
+    $recoveredMixedCapture = & $scriptPath stop -StatePath $statePath -Compact -NoExit |
+        ConvertFrom-Json -Depth 20
+    if (-not $recoveredMixedCapture.ok -or $recoveredMixedCapture.state -ne 'stopped' -or
+        (Get-Process -Id $captureWorker.Id -ErrorAction SilentlyContinue)) {
+        throw 'A later authorized stop did not resolve the retained mixed capture worker.'
+    }
+
     $monitorFixture = [Diagnostics.Process]::Start($startInfo)
     $cancelFixture = [Diagnostics.Process]::Start($startInfo)
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
