@@ -484,6 +484,7 @@ function completedLiveResult(variant, runId) {
                         cpuSessionId: 11,
                         gpuActive: false,
                         textureActive: false,
+                        profilerActive: false,
                         probeActive: false,
                         traceSessionId: trace ? trace.sessionId : null,
                         traceActive: false,
@@ -562,6 +563,7 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
             cpuSessionId: 11,
             gpuActive: false,
             textureActive: false,
+            profilerActive: false,
             probeActive: false,
             traceSessionId: variant === "nvidia" ? 55 : null,
             traceActive: false,
@@ -584,6 +586,8 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
         { label: "texture-status", result: { action: "texture_lifetime_status",
             producer: { buildId },
             capture: { active: false } } },
+        { label: "profiler-status", result: { action: "status",
+            producer: { buildId }, enabled: false, frame_count: 1 } },
     ];
     if (variant === "nvidia") {
         finalStatusResults.push({ label: "dlss-trace-status", result: {
@@ -601,21 +605,33 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
     });
     if (variant === "amd") {
         const lifecycle = traceLifecycle(buildId, 41, []);
+        const receiptKey = `${runId}:amd:dlss-trace-capability`;
+        const lifecycleReceiptKey = `${receiptKey}:lifecycle`;
         writeJson(path.join(root, "raw", "amd-trace-capability.json"), {
             ok: true,
             aborted: false,
-            stepsRun: 4,
+            stepsRun: 3,
             results: [
+                { label: "amd-dlss-trace-status", result: {
+                    action: "dlss_trace_status", producer: { buildId },
+                    capture: { active: false, sessionID: 40 },
+                } },
                 { label: "amd-dlss-trace-reset",
                     result: lifecycle.traceReset },
                 { label: "amd-dlss-trace-start",
                     result: lifecycle.traceStart },
-                { label: "amd-dlss-trace-stop",
-                    result: lifecycle.traceStop },
-                { label: "amd-dlss-trace-read",
-                    result: lifecycle.traceRead },
             ],
         });
+        writeJson(path.join(root, "raw", "amd-trace-capability-lifecycle.json"), {
+            scenarioReceiptKey: receiptKey,
+            lifecycle,
+        });
+        const liveResultPath = path.join(root, "raw", "live-result.json");
+        const liveResult = readJson(liveResultPath);
+        liveResult.traceCapability = { status: "supported", receiptKey,
+            lifecycleReceiptKey, lifecycle };
+        liveResult.receiptKeys = [receiptKey, lifecycleReceiptKey];
+        writeJson(liveResultPath, liveResult);
     }
     const firstRetained = retained(false, true, { runId, buildId, variant,
         ordinal: 1, transitionId: 101 });
@@ -1719,22 +1735,78 @@ function testFinalProfileAndExecutionScopeGateCompletion() {
 }
 
 function testAmdSupportedClaimRequiresRetainedLifecycle() {
-    const root = createEvidenceRoot("amd");
+    const validRoot = createEvidenceRoot("amd");
     try {
-        let result = finalizeEvidence({ root, variant: "amd",
+        const result = finalizeEvidence({ root: validRoot, variant: "amd",
             runId: "amd-test-run", buildId: "e".repeat(64), expectedRows: 2 });
         assert(result.summary.traceCapabilityEvidence.complete === true,
-            "Valid AMD capability lifecycle evidence was rejected.");
-        fs.unlinkSync(path.join(root, "raw", "amd-trace-capability.json"));
-        result = finalizeEvidence({ root, variant: "amd",
-            runId: "amd-test-run", buildId: "e".repeat(64), expectedRows: 2 });
-        assert(result.summary.traceCapability.status === "supported" &&
-            result.summary.traceCapabilityEvidence.complete === false &&
-            result.summary.reporting.reasons.includes(
-                "amd_trace_capability_evidence_incomplete"),
-        "An AMD supported label completed without retained lifecycle evidence.");
+            "Valid current-shape AMD capability originals were rejected.");
     } finally {
-        fs.rmSync(root, { recursive: true, force: true });
+        fs.rmSync(validRoot, { recursive: true, force: true });
+    }
+
+    const cases = [
+        ["missing-scenario", (root) => fs.unlinkSync(path.join(root, "raw",
+            "amd-trace-capability.json"))],
+        ["missing-lifecycle", (root) => fs.unlinkSync(path.join(root, "raw",
+            "amd-trace-capability-lifecycle.json"))],
+        ["broken-original-link", (root) => {
+            const file = path.join(root, "raw",
+                "amd-trace-capability-lifecycle.json");
+            const value = readJson(file);
+            value.scenarioReceiptKey = "foreign-capability-scenario";
+            writeJson(file, value);
+        }],
+        ["failed-original-wrapper", (root) => {
+            const file = path.join(root, "raw", "amd-trace-capability.json");
+            const value = readJson(file);
+            value.results[2].ok = false;
+            writeJson(file, value);
+        }],
+        ["failed-original-payload", (root) => {
+            const file = path.join(root, "raw", "amd-trace-capability.json");
+            const value = readJson(file);
+            value.results[1].result.isError = true;
+            writeJson(file, value);
+        }],
+        ["foreign-original-build", (root) => {
+            const file = path.join(root, "raw", "amd-trace-capability.json");
+            const value = readJson(file);
+            value.results[2].result.producer.buildId = "f".repeat(64);
+            writeJson(file, value);
+        }],
+        ["original-session-disagreement", (root) => {
+            const file = path.join(root, "raw", "amd-trace-capability.json");
+            const value = readJson(file);
+            value.results[2].result.capture.sessionID += 1;
+            writeJson(file, value);
+        }],
+        ["altered-inline-copy", (root) => {
+            const file = path.join(root, "raw", "live-result.json");
+            const value = readJson(file);
+            value.traceCapability.lifecycle.traceStart.capture.sessionID += 1;
+            writeJson(file, value);
+        }],
+    ];
+    for (const [name, mutate] of cases) {
+        const root = createEvidenceRoot("amd");
+        try {
+            mutate(root);
+            const first = finalizeEvidence({ root, variant: "amd",
+                runId: "amd-test-run", buildId: "e".repeat(64),
+                expectedRows: 2 });
+            const second = finalizeEvidence({ root, variant: "amd",
+                runId: "amd-test-run", buildId: "e".repeat(64),
+                expectedRows: 2 });
+            assert(first.summary.traceCapability.status === "supported" &&
+                first.summary.traceCapabilityEvidence.complete === false &&
+                first.summary.reporting.reasons.includes(
+                    "amd_trace_capability_evidence_incomplete") &&
+                second.summary.traceCapabilityEvidence.complete === false,
+            `AMD current-shape originals were not required: ${name}`);
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
     }
 }
 
