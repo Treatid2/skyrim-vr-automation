@@ -74,3 +74,8 @@ replacement is never implied by a request to compare caches.
    requires a larger explicit bound. A limit or deadline failure is a safety
    result, not permission to switch to an unbounded recursive scan. Reparse
    points are never valid cache contents.
+7. Catalog `prepare` and `complete` output is bounded by default. Use the inline
+   identities, counts, byte totals, tree hashes, states, and receipt paths;
+   inspect the durable receipts when individual file entries are needed. Pass
+   `-IncludeInventoryEntries` only when the caller explicitly needs the large
+   entry arrays in the command response.
