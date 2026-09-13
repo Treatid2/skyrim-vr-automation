@@ -76,6 +76,11 @@ async function runRenderScaleTuningLive(context) {
                 entry.result === value)));
     }
 
+    function resultQualified(value, entry, action) {
+        return resultSucceeded(value, entry) && value.action === action &&
+            value.producer && value.producer.buildId === buildId;
+    }
+
     function reportedError(value) {
         if (!value || typeof value !== "object") return null;
         for (const name of ["error", "message", "reason"]) {
@@ -136,6 +141,15 @@ async function runRenderScaleTuningLive(context) {
             root.stepsRun !== steps.length || !Array.isArray(root.results)) {
             throw diagnosticError("scenario_failed",
                 scenarioDiagnostic(root, steps, receiptKey));
+        }
+        for (const step of steps) {
+            if (!step || typeof step.label !== "string" ||
+                typeof step.tool !== "string") continue;
+            const entry = resultEntry(root, step.label);
+            if (!entry || !resultSucceeded(entry.result, entry)) {
+                throw diagnosticError("scenario_failed",
+                    scenarioDiagnostic(root, steps, receiptKey));
+            }
         }
         return resultMap(root);
     }
@@ -1393,11 +1407,14 @@ async function runRenderScaleTuningLive(context) {
         };
     }
 
-    function baselineOwnership(start, waiter) {
+    function baselineOwnership(start, waiter, startEntry = null) {
         const started = sessionSnapshot(start);
         const waiterId = waiter && waiter.baseline &&
             waiter.baseline.stressSessionId;
         const reasons = [];
+        if (!resultQualified(start, startEntry, "start")) {
+            reasons.push("start_receipt_invalid");
+        }
         if (!started.present) reasons.push("start_session_missing");
         if (!Number.isSafeInteger(started.id) || started.id < 1) {
             reasons.push("start_session_id_invalid");
@@ -1492,7 +1509,8 @@ async function runRenderScaleTuningLive(context) {
         const entries = resultMap(response.root);
         const start = entries.get("baseline-stress-start");
         const waiter = entries.get("qualification-wait");
-        const ownership = baselineOwnership(start, waiter);
+        const ownership = baselineOwnership(start, waiter,
+            resultEntry(response.root, "baseline-stress-start"));
         ownerState.baseline = {
             ...ownership,
             active: ownership.startActive === true,
@@ -1558,15 +1576,26 @@ async function runRenderScaleTuningLive(context) {
         }));
         const response = await scenario(steps, receiptKey);
         const entries = resultMap(response.root);
-        const baselineStop = sessionSnapshot(entries.get("baseline-stress-stop"));
+        const baselineStopValue = entries.get("baseline-stress-stop");
+        const baselineStopEntry = resultEntry(response.root,
+            "baseline-stress-stop");
+        const baselineStop = sessionSnapshot(baselineStopValue);
         const start = entries.get("measured-stress-start");
+        const startEntry = resultEntry(response.root, "measured-stress-start");
         const measured = sessionSnapshot(start);
-        if (baselineStop.present && baselineStop.active === false &&
+        const baselineStopQualified = resultQualified(baselineStopValue,
+            baselineStopEntry, "stop") && baselineStop.present &&
+            baselineStop.active === false &&
+            baselineStop.id === baselineResult.stressSessionId;
+        const measuredStartQualified = resultQualified(start, startEntry, "start") &&
+            measured.present && measured.active === true &&
+            Number.isSafeInteger(measured.id) && measured.id > 0;
+        ownerState.baseline.stopProven = baselineStopQualified;
+        if (baselineStopQualified &&
             baselineStop.id === baselineResult.stressSessionId) {
             ownerState.baseline.active = false;
         }
-        if (measured.present && measured.active === true &&
-            Number.isSafeInteger(measured.id) && measured.id > 0) {
+        if (measuredStartQualified) {
             ownerState.measured = { sessionId: measured.id, active: true,
                 proven: true, source: "measured-stress-start" };
         }
@@ -1577,6 +1606,8 @@ async function runRenderScaleTuningLive(context) {
             baselineStopActive: baselineStop.active,
             measuredSessionId: measured.id,
             measuredActive: measured.active,
+            baselineStopQualified,
+            measuredStartQualified,
             cleanupAttempted: false,
         };
         let scenarioError = null;
@@ -1585,21 +1616,20 @@ async function runRenderScaleTuningLive(context) {
         } catch (error) {
             scenarioError = error;
         }
-        if (scenarioError || baselineStop.active !== false ||
-            baselineStop.id !== baselineResult.stressSessionId ||
+        if (scenarioError || !baselineStopQualified ||
             !ownerState.measured) {
             const diagnostic = scenarioDiagnostic(
                 response.root, steps, receiptKey, "ownership");
             diagnostic.ownership = ownership;
             diagnostic.ownership.reason = !ownerState.measured ?
-                "measured_stress_session_identity_missing" :
+                "measured_stress_acquisition_unproven" :
                 baselineStop.id !== baselineResult.stressSessionId ?
                     "baseline_stop_owner_mismatch" :
-                    baselineStop.active !== false ?
-                        "baseline_stop_not_confirmed" :
+                    !baselineStopQualified ?
+                        "baseline_stop_receipt_unproven" :
                         "handoff_step_failed_after_measured_start";
             throw diagnosticError(!ownerState.measured ?
-                "measured_stress_session_identity_missing" :
+                "measured_stress_acquisition_unproven" :
                 scenarioError ? "measured_owner_handoff_failed" :
                     "baseline_owner_stop_unconfirmed", diagnostic);
         }
@@ -2054,6 +2084,7 @@ async function runRenderScaleTuningLive(context) {
 
     async function retainAmdTraceCapability() {
         const receiptKey = `${runId}:amd:dlss-trace-capability`;
+        const lifecycleReceiptKey = `${receiptKey}:lifecycle`;
         const steps = [
             toolStep("amd-dlss-trace-status", "communityshaders.renderscale", {
                 action: "dlss_trace_status", expectedBuildId: buildId,
@@ -2189,7 +2220,10 @@ async function runRenderScaleTuningLive(context) {
             traceRead: traceEvidence.traceRead,
             tracePages: traceEvidence.tracePages,
         };
-        retain(receiptKey, lifecycle);
+        retain(lifecycleReceiptKey, {
+            scenarioReceiptKey: receiptKey,
+            lifecycle,
+        });
         if (!capture || !summary || records.length !== 0 ||
             summary.totalRecords !== 0 ||
             summary.setConstantsCalls !== 0 || summary.evaluateCalls !== 0) {
@@ -2207,13 +2241,14 @@ async function runRenderScaleTuningLive(context) {
                         (summary && summary.setConstantsCalls) ?? null,
                     evaluateCalls: (summary && summary.evaluateCalls) ?? null,
                 },
-                traceLifecycleReceiptKey: receiptKey,
+                traceLifecycleReceiptKey: lifecycleReceiptKey,
             });
         }
-        return { status: "supported", receiptKey, lifecycle };
+        return { status: "supported", receiptKey, lifecycleReceiptKey, lifecycle };
     }
 
-    async function status(lane, pass, suffix, includeTrace = false) {
+    async function status(lane, pass, suffix, includeTrace = false,
+        preserveFailure = false) {
         const receiptKey = `${runId}:${lane.id}:pass-${pass}:${suffix}`;
         const steps = [
             toolStep("render-status", "communityshaders.renderscale", {
@@ -2235,12 +2270,36 @@ async function runRenderScaleTuningLive(context) {
                     action: "dlss_trace_status", expectedBuildId: buildId,
                 }));
         }
-        const response = await scenario(steps, receiptKey);
-        const entries = requireScenario(response.root, steps, receiptKey);
-        return entries;
+        let response;
+        try {
+            response = await scenario(steps, receiptKey);
+        } catch (error) {
+            if (!preserveFailure) throw error;
+            return {
+                entries: new Map(),
+                root: null,
+                receiptKey,
+                scenarioFailure: error && error.diagnostic || {
+                    reason: error && error.message || String(error),
+                },
+            };
+        }
+        let entries = resultMap(response.root);
+        let scenarioFailure = null;
+        try {
+            entries = requireScenario(response.root, steps, receiptKey);
+        } catch (error) {
+            scenarioFailure = error && error.diagnostic || {
+                reason: error && error.message || String(error),
+            };
+            if (!preserveFailure) throw error;
+        }
+        return { entries, root: response.root, receiptKey, scenarioFailure };
     }
 
-    function cleanupState(entries) {
+    function cleanupState(statusResponse) {
+        const entries = statusResponse && statusResponse.entries;
+        const root = statusResponse && statusResponse.root;
         const renderResult = entries && entries.get("render-status");
         const render = renderResult && renderResult.status;
         const session = render && render.session;
@@ -2255,6 +2314,31 @@ async function runRenderScaleTuningLive(context) {
         const trace = variant === "nvidia" ? traceSession(traceResult) :
             { present: true, id: null, active: false };
         const missing = [];
+        const qualifications = [
+            ["render-status", renderResult, "status"],
+            ["cpu-status", cpuResult, "cpu_performance_status"],
+            ["gpu-status", gpuResult, "gpu_performance_status"],
+            ["texture-status", textureResult, "texture_lifetime_status"],
+        ];
+        if (variant === "nvidia") {
+            qualifications.push(["dlss-trace-status", traceResult,
+                "dlss_trace_status"]);
+        }
+        const unqualified = qualifications.filter(([label, value, action]) =>
+            !resultQualified(value, resultEntry(root, label), action)).map(
+            ([label, value]) => ({
+                label,
+                action: value && value.action || null,
+                producerBuildId: value && value.producer &&
+                    value.producer.buildId || null,
+                reportedError: reportedError(value) || reportedError(
+                    resultEntry(root, label)),
+            }));
+        if (statusResponse && statusResponse.scenarioFailure) {
+            missing.push("cleanup_status_scenario_unqualified");
+        }
+        missing.push(...unqualified.map((entry) =>
+            `${entry.label.replaceAll("-", "_")}_receipt_unproven`));
         if (!session || typeof session.active !== "boolean" ||
             !Object.hasOwn(session, "id")) missing.push("render_session_status_missing");
         if (!cpu || typeof cpu.active !== "boolean") {
@@ -2278,12 +2362,14 @@ async function runRenderScaleTuningLive(context) {
                 (!Number.isSafeInteger(trace.id) || trace.id < 1)))) {
             missing.push("trace_status_missing");
         }
-        return { render, session, cpu, gpu, texture, probe, trace, missing };
+        return { render, session, cpu, gpu, texture, probe, trace, missing,
+            unqualified, scenarioFailure: statusResponse &&
+                statusResponse.scenarioFailure || null };
     }
 
     async function cleanup(lane, pass, ownerState) {
         const before = await status(
-            lane, pass, "final-status-before-cleanup", true);
+            lane, pass, "final-status-before-cleanup", true, true);
         const observed = cleanupState(before);
         const receiptKey = `${runId}:${lane.id}:pass-${pass}:cleanup`;
         const knownSessionIds = unique([
@@ -2317,6 +2403,8 @@ async function runRenderScaleTuningLive(context) {
                 traceSessionId: observed.trace ? observed.trace.id : null,
                 traceActive: observed.trace ? observed.trace.active : null,
                 missing: observed.missing,
+                unqualified: observed.unqualified,
+                scenarioFailure: observed.scenarioFailure,
             },
         };
         if (observed.missing.length > 0) {
@@ -2391,10 +2479,24 @@ async function runRenderScaleTuningLive(context) {
             expectedBuildId: buildId,
         }));
         evidence.cleanupAttempted = true;
-        const response = await scenario(steps, receiptKey);
-        requireScenario(response.root, steps, receiptKey);
+        let cleanupScenarioFailure = null;
+        try {
+            const response = await scenario(steps, receiptKey);
+            try {
+                requireScenario(response.root, steps, receiptKey);
+            } catch (error) {
+                cleanupScenarioFailure = error && error.diagnostic || {
+                    reason: error && error.message || String(error),
+                };
+            }
+        } catch (error) {
+            cleanupScenarioFailure = error && error.diagnostic || {
+                reason: error && error.message || String(error),
+            };
+        }
         const after = cleanupState(await status(
-            lane, pass, "final-status-after-cleanup", true));
+            lane, pass, "final-status-after-cleanup", true, true));
+        evidence.cleanupScenarioFailure = cleanupScenarioFailure;
         evidence.after = {
             stressSessionId: after.session ? after.session.id : null,
             stressActive: after.session ? after.session.active : null,
@@ -2406,6 +2508,8 @@ async function runRenderScaleTuningLive(context) {
             traceSessionId: after.trace ? after.trace.id : null,
             traceActive: after.trace ? after.trace.active : null,
             missing: after.missing,
+            unqualified: after.unqualified,
+            scenarioFailure: after.scenarioFailure,
         };
         const expectedStressSessionId = ownerState.measured &&
             ownerState.measured.proven ? ownerState.measured.sessionId :
@@ -2433,12 +2537,27 @@ async function runRenderScaleTuningLive(context) {
             retain(`${receiptKey}:decision`, evidence);
             throw diagnosticError(evidence.reason, evidence);
         }
+        const baselineStopUnproven = ownerState.baseline &&
+            ownerState.baseline.stopProven === false;
+        const baselinePostProvenInactive = baselineStopUnproven &&
+            after.session.id === ownerState.baseline.startSessionId &&
+            after.session.active === false;
+        if (baselineStopUnproven && !baselinePostProvenInactive) {
+            if (ownerState.measured) ownerState.measured.active = false;
+            if (ownerState.trace) ownerState.trace.active = false;
+            if (ownerState.cpu) ownerState.cpu.active = false;
+            evidence.status = "UNRESOLVED";
+            evidence.reason = "cleanup_baseline_stop_unproven";
+            retain(`${receiptKey}:decision`, evidence);
+            throw diagnosticError(evidence.reason, evidence);
+        }
         if (ownerState.baseline) ownerState.baseline.active = false;
         if (ownerState.measured) ownerState.measured.active = false;
         if (ownerState.trace) ownerState.trace.active = false;
         if (ownerState.cpu) ownerState.cpu.active = false;
         evidence.status = "CONFIRMED_INACTIVE";
-        evidence.reason = null;
+        evidence.reason = cleanupScenarioFailure ?
+            "cleanup_operation_failed_but_status_confirmed_inactive" : null;
         retain(`${receiptKey}:decision`, evidence);
         return evidence;
     }

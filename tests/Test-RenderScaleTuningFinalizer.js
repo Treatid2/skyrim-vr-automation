@@ -184,6 +184,9 @@ function retained(boundary, violation, identity = {}, nonStable = false) {
     const buildId = identity.buildId || "e".repeat(64);
     const transitionId = identity.transitionId || 101;
     const ownerId = identity.ownerId || `${runId}-owner-${transitionId}`;
+    const laneId = identity.lane ||
+        ((identity.variant || (runId.startsWith("amd-") ? "amd" : "nvidia")) ===
+            "amd" ? "default" : "nvidia");
     const cpuAcquisition = {
         action: "qualification_dispatch",
         accepted: true,
@@ -197,6 +200,8 @@ function retained(boundary, violation, identity = {}, nonStable = false) {
     };
     return {
         variant: identity.variant || (runId.startsWith("amd-") ? "amd" : "nvidia"),
+        scenarioReceiptKey:
+            `${runId}:${laneId}:pass-${identity.pass || 1}:transition-${identity.ordinal || 1}:scenario`,
         cpuAcquisition,
         cpuAcquisitionStep: {
             label: "qualification-dispatch",
@@ -565,21 +570,24 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
     });
     const finalStatusResults = [
         { label: "render-status", result: {
-            producer: { buildId }, status: {
+            action: "status", producer: { buildId }, status: {
                 session: { id: 7, active: false },
                 loadPresentationProbe: { active: false },
             },
         } },
-        { label: "cpu-status", result: { producer: { buildId },
+        { label: "cpu-status", result: { action: "cpu_performance_status",
+            producer: { buildId },
             cpuPerformance: { sessionId: 11, active: false } } },
-        { label: "gpu-status", result: { producer: { buildId },
+        { label: "gpu-status", result: { action: "gpu_performance_status",
+            producer: { buildId },
             capture: { active: false } } },
-        { label: "texture-status", result: { producer: { buildId },
+        { label: "texture-status", result: { action: "texture_lifetime_status",
+            producer: { buildId },
             capture: { active: false } } },
     ];
     if (variant === "nvidia") {
         finalStatusResults.push({ label: "dlss-trace-status", result: {
-            producer: { buildId }, capture: {
+            action: "dlss_trace_status", producer: { buildId }, capture: {
                 summary: { sessionID: 55, active: false },
             },
         } });
@@ -609,12 +617,23 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
             ],
         });
     }
+    const firstRetained = retained(false, true, { runId, buildId, variant,
+        ordinal: 1, transitionId: 101 });
     writeJson(path.join(root, "raw", "pass-1", "transitions", "01",
-        "retained.json"), retained(false, true, { runId, buildId, variant,
-            transitionId: 101 }));
+        "scenario.json"), {
+        ok: true,
+        aborted: false,
+        stepsRun: 2,
+        results: [firstRetained.cpuAcquisitionStep, {
+            label: "qualification-wait",
+            result: firstRetained.waiter,
+        }],
+    });
+    writeJson(path.join(root, "raw", "pass-1", "transitions", "01",
+        "retained.json"), firstRetained);
     writeJson(path.join(root, "raw", "pass-1", "transitions", "02",
         "retained.json"), retained(true, true, { runId, buildId, variant,
-            transitionId: 102 }, nonStable));
+            ordinal: 2, transitionId: 102 }, nonStable));
     return root;
 }
 
@@ -1821,6 +1840,39 @@ function testPassFinalizationControlsCompletion() {
             value.cpuAcquisition.performanceTelemetry.cpuPerformance.sessionId = 12;
             writeJson(file, value);
         }, "retained_cpu_acquisition_session_mismatch"],
+        ["missing-original-cpu-acquisition-scenario", (root) => {
+            fs.unlinkSync(path.join(root, "raw", "pass-1", "transitions",
+                "01", "scenario.json"));
+        }, "retained_cpu_acquisition_original_missing"],
+        ["invalid-cpu-acquisition-scenario-link", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "01", "retained.json");
+            const value = readJson(file);
+            value.scenarioReceiptKey =
+                "nvidia-test-run:nvidia:pass-1:transition-2:scenario";
+            writeJson(file, value);
+        }, "retained_cpu_acquisition_scenario_link_invalid"],
+        ["failed-original-cpu-acquisition-wrapper", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "01", "scenario.json");
+            const value = readJson(file);
+            value.results[0].ok = false;
+            writeJson(file, value);
+        }, "retained_cpu_acquisition_original_invalid"],
+        ["failed-original-cpu-acquisition-payload", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "01", "scenario.json");
+            const value = readJson(file);
+            value.results[0].result.isError = true;
+            writeJson(file, value);
+        }, "retained_cpu_acquisition_original_invalid"],
+        ["foreign-original-cpu-acquisition", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions",
+                "01", "scenario.json");
+            const value = readJson(file);
+            value.results[0].result.ownerId = "foreign-owner";
+            writeJson(file, value);
+        }, "retained_cpu_acquisition_original_mismatch"],
         ["still-active", (root) => {
             const file = path.join(root, "raw", "live-result.json");
             const value = readJson(file);
@@ -1901,6 +1953,29 @@ function testOriginalLifecycleEvidenceControlsCompletion() {
             const value = readJson(file);
             value.results.find((entry) => entry.label === "cpu-status")
                 .result.cpuPerformance.active = true;
+            writeJson(file, value);
+        }, "retained_cleanup_status_receipt_missing"],
+        ["wrong-action-original-post-status", (root) => {
+            const file = path.join(root, "raw", "pass-1", "cleanup",
+                "final-status-after-cleanup.json");
+            const value = readJson(file);
+            value.results.find((entry) => entry.label === "cpu-status")
+                .result.action = "cpu_performance_start";
+            writeJson(file, value);
+        }, "retained_cleanup_status_receipt_missing"],
+        ["failed-wrapper-original-post-status", (root) => {
+            const file = path.join(root, "raw", "pass-1", "cleanup",
+                "final-status-after-cleanup.json");
+            const value = readJson(file);
+            value.results.find((entry) => entry.label === "gpu-status").ok = false;
+            writeJson(file, value);
+        }, "retained_cleanup_status_receipt_missing"],
+        ["failed-payload-original-post-status", (root) => {
+            const file = path.join(root, "raw", "pass-1", "cleanup",
+                "final-status-after-cleanup.json");
+            const value = readJson(file);
+            value.results.find((entry) => entry.label === "texture-status")
+                .result.isError = true;
             writeJson(file, value);
         }, "retained_cleanup_status_receipt_missing"],
         ["missing-original-post-status", (root) => fs.unlinkSync(path.join(root,

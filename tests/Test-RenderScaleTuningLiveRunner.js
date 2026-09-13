@@ -150,11 +150,13 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
         if (step.label === "baseline-stress-start" || step.label === "measured-stress-start") {
             stressSession += 1;
             stressActive = true;
-            return { status: { session: { id: stressSession, active: true } } };
+            return { action: "start", producer: { buildId },
+                status: { session: { id: stressSession, active: true } } };
         }
         if (args.action === "stop") {
             stressActive = false;
-            return { status: { session: { id: stressSession, active: false } } };
+            return { action: args.action, producer: { buildId },
+                status: { session: { id: stressSession, active: false } } };
         }
         if (args.action === "texture_lifetime_start") textureActive = true;
         if (args.action === "texture_lifetime_stop") textureActive = false;
@@ -208,6 +210,8 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
         }
         if (args.action === "status") {
             return {
+                action: args.action,
+                producer: { buildId },
                 status: {
                     session: { id: stressSession, active: stressActive },
                     loadPresentationProbe: { active: probeActive },
@@ -215,11 +219,17 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
             };
         }
         if (args.action === "cpu_performance_status") {
-            return { producer: { buildId },
+            return { action: args.action, producer: { buildId },
                 cpuPerformance: { active: cpuActive, sessionId: cpuSession } };
         }
-        if (args.action === "gpu_performance_status") return { capture: { active: gpuActive } };
-        if (args.action === "texture_lifetime_status") return { capture: { active: textureActive } };
+        if (args.action === "gpu_performance_status") {
+            return { action: args.action, producer: { buildId },
+                capture: { active: gpuActive } };
+        }
+        if (args.action === "texture_lifetime_status") {
+            return { action: args.action, producer: { buildId },
+                capture: { active: textureActive } };
+        }
         if (step.label === "profile-apply") return { apply: { disposition: { name: "queued" } } };
         if (step.label === "recovery-profile-apply") {
             return { action: "apply", accepted: true, disposition: "queued" };
@@ -769,8 +779,14 @@ async function testAmd() {
     assert(transitionNotifications.every((row) => row.evidenceVerdict === "PASS" &&
         row.dispatch_ && row.first_new_generation_proven_),
     "AMD did not receive the shared Task 2 evidence projection.");
-    const capability = mock.stores.get("amd-test:amd:dlss-trace-capability");
-    assert(capability, "AMD DLSS trace capability lifecycle was not retained.");
+    const capabilityScenarioKey = "amd-test:amd:dlss-trace-capability";
+    const capabilityScenario = mock.stores.get(capabilityScenarioKey);
+    const capabilityRecord = mock.stores.get(capabilityScenarioKey + ":lifecycle");
+    const capability = capabilityRecord && capabilityRecord.lifecycle;
+    assert(capabilityScenario && Array.isArray(capabilityScenario.content) &&
+        capabilityRecord &&
+        capabilityRecord.scenarioReceiptKey === capabilityScenarioKey && capability,
+    "AMD raw scenario and linked lifecycle were not retained independently.");
     assert(capability.traceReset.action === "dlss_trace_reset",
         "AMD trace reset receipt was not retained.");
     assert(capability.traceStart.action === "dlss_trace_start",
@@ -837,7 +853,7 @@ async function testAmdUnsupportedTraceContinues() {
     });
     assert(result.ok === true && result.status === "COMPLETE" &&
         result.traceCapability.status === "unsupported",
-    "An unavailable optional AMD trace action aborted runnable FSR lanes.");
+    `An unavailable optional AMD trace action aborted runnable FSR lanes: ${JSON.stringify(result)}`);
     assert(result.lanes.filter((lane) => lane.status === "COMPLETE")
         .every((lane) => lane.passes.length === 2),
     "AMD lanes did not finish after optional trace classification.");
@@ -911,13 +927,17 @@ async function testAmdTraceContaminationIsRestartable() {
             fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }],
         }), matrix,
     });
-    const lifecycleKey = runId + ":amd:dlss-trace-capability";
+    const scenarioKey = runId + ":amd:dlss-trace-capability";
+    const lifecycleKey = scenarioKey + ":lifecycle";
     assert(result.status === "INTERRUPTED" &&
         result.error === "amd_dlss_trace_not_empty" &&
         result.failure && result.failure.cleanup &&
         result.failure.cleanup.status === "CONFIRMED_INACTIVE" &&
         result.failure.contamination.records === 1 &&
+        mock.stores.get(scenarioKey) &&
+        Array.isArray(mock.stores.get(scenarioKey).content) &&
         mock.stores.get(lifecycleKey) &&
+        mock.stores.get(lifecycleKey).scenarioReceiptKey === scenarioKey &&
         result.receiptKeys.includes(lifecycleKey),
     "A nonempty AMD capability trace was not retained as a restartable interruption.");
 }
@@ -1187,7 +1207,7 @@ async function testMalformedMeasuredStressOwnershipIsRetained() {
     const failure = result.lanes[0].passes[0].failure;
     assert(result.ok === false && result.status === "INTERRUPTED" &&
         result.lanes[0].passes[0].error ===
-            "measured_stress_session_identity_missing" &&
+            "measured_stress_acquisition_unproven" &&
         failure && failure.phase === "ownership" &&
         failure.ownership.status === "uncertain" &&
         failure.ownership.cleanupAttempted === false &&
@@ -1867,6 +1887,89 @@ async function testBaselineOnlyCleanupRejectsForeignPostStatus() {
     "Baseline-only cleanup accepted a foreign inactive post-status identity.");
 }
 
+async function testStressAcquisitionRequiresQualifiedReceipts() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const cases = [
+        ["wrong-action", (entry) => { entry.result.action = "status"; }],
+        ["wrong-build", (entry) => {
+            entry.result.producer.buildId = "f".repeat(64);
+        }],
+        ["payload-failed", (entry) => { entry.result.ok = false; }],
+        ["wrapper-failed", (entry) => { entry.ok = false; }],
+    ];
+    for (const phase of ["baseline-stress-start", "measured-stress-start"]) {
+        for (const [name, mutate] of cases) {
+            let injected = false;
+            const mock = createMock(0, null, (root) => {
+                const entry = root.results.find((candidate) =>
+                    candidate.label === phase);
+                if (!injected && entry) {
+                    injected = true;
+                    mutate(entry);
+                }
+                return root;
+            });
+            const runId = `stress-${phase}-${name}`;
+            const result = await runRenderScaleTuningLive({
+                ...mock.context, variant: "nvidia", runId, buildId,
+                positioningRoot: positioningRoot(), matrix,
+            });
+            const pass = result.lanes[0].passes[0];
+            const expected = phase === "baseline-stress-start" ?
+                "baseline_owner_identity_unproven" :
+                "measured_stress_acquisition_unproven";
+            assert(result.status === "INTERRUPTED" && pass.error === expected &&
+                pass.cleanup && pass.cleanup.status === "UNRESOLVED" &&
+                !mock.scenarioCalls.some((call) => call.steps.some((step) =>
+                    step.label === "cleanup-stress-stop" &&
+                    step.args.expectedSessionId === 2)),
+            `Unqualified ${phase} receipt authorized ownership: ${name}`);
+        }
+    }
+}
+
+async function testStressStopRequiresQualifiedReceipt() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const cases = [
+        ["wrong-action", (entry) => { entry.result.action = "status"; }],
+        ["wrong-build", (entry) => {
+            entry.result.producer.buildId = "f".repeat(64);
+        }],
+        ["payload-failed", (entry) => { entry.result.ok = false; }],
+        ["wrapper-failed", (entry) => { entry.isError = true; }],
+    ];
+    for (const [name, mutate] of cases) {
+        let injected = false;
+        const mock = createMock(0, null, (root) => {
+            const entry = root.results.find((candidate) =>
+                candidate.label === "baseline-stress-stop");
+            if (!injected && entry) {
+                injected = true;
+                mutate(entry);
+            }
+            return root;
+        });
+        const result = await runRenderScaleTuningLive({
+            ...mock.context, variant: "nvidia",
+            runId: `stress-stop-${name}`, buildId,
+            positioningRoot: positioningRoot(), matrix,
+        });
+        const pass = result.lanes[0].passes[0];
+        const expectedError = name === "wrong-action" || name === "wrong-build" ?
+            "baseline_owner_stop_unconfirmed" : "measured_owner_handoff_failed";
+        assert(result.status === "INTERRUPTED" &&
+            pass.error === expectedError &&
+            pass.ownership.baseline.active === true &&
+            pass.cleanup && pass.cleanup.status === "UNRESOLVED" &&
+            pass.cleanup.reason === "cleanup_baseline_stop_unproven",
+        `Unqualified baseline stop released ownership: ${name}`);
+    }
+}
+
 async function testFailedHandoffRetainsAndCleansMeasuredOwner() {
     const matrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
@@ -1934,6 +2037,79 @@ async function testCleanupPostconditionsRemainAuthoritative() {
         pass.cleanup && pass.cleanup.status === "UNRESOLVED" &&
         pass.cleanup.reason === "cleanup_postcondition_active",
     "An active post-cleanup owner was reported as a completed pass.");
+}
+
+async function testCleanupStatusesRequireQualifiedReceipts() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const cases = [
+        ["wrong-action", (entry) => { entry.result.action = "start"; }],
+        ["wrong-build", (entry) => {
+            entry.result.producer.buildId = "f".repeat(64);
+        }],
+        ["payload-failed", (entry) => { entry.result.isError = true; }],
+        ["wrapper-failed", (entry) => { entry.ok = false; }],
+    ];
+    for (const [name, mutate] of cases) {
+        let cleanupRan = false;
+        let injected = false;
+        const mock = createMock(0, null, (root, args) => {
+            if (args.steps.some((step) => step.label === "profiler-disable")) {
+                cleanupRan = true;
+                return root;
+            }
+            if (cleanupRan && !injected && args.steps.some((step) =>
+                step.label === "render-status")) {
+                injected = true;
+                mutate(root.results.find((entry) =>
+                    entry.label === "cpu-status"));
+            }
+            return root;
+        });
+        const result = await runRenderScaleTuningLive({
+            ...mock.context, variant: "nvidia",
+            runId: `cleanup-status-${name}`, buildId,
+            positioningRoot: positioningRoot(), matrix,
+        });
+        const pass = result.lanes[0].passes[0];
+        assert(result.status === "INTERRUPTED" && pass.cleanup &&
+            pass.cleanup.status === "UNRESOLVED" &&
+            pass.cleanup.reason === "cleanup_post_status_incomplete",
+        `Unqualified post-cleanup status certified inactivity: ${name}`);
+    }
+}
+
+async function testCleanupFailureCanBeConfirmedByQualifiedStatus() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    let injected = false;
+    const mock = createMock(0, null, (root, args) => {
+        if (!injected && args.steps.some((step) =>
+            step.label === "profiler-disable")) {
+            injected = true;
+            const entry = root.results.find((candidate) =>
+                candidate.label === "profiler-disable");
+            entry.ok = false;
+            entry.error = "synthetic_cleanup_operation_failure";
+            root.ok = false;
+            root.aborted = true;
+        }
+        return root;
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context, variant: "nvidia",
+        runId: "cleanup-operation-failed-status-proved", buildId,
+        positioningRoot: positioningRoot(), matrix,
+    });
+    const pass = result.lanes[0].passes[0];
+    assert(result.status === "COMPLETE" && pass.status === "COMPLETE" &&
+        pass.cleanup.status === "CONFIRMED_INACTIVE" &&
+        pass.cleanup.reason ===
+            "cleanup_operation_failed_but_status_confirmed_inactive" &&
+        pass.cleanup.cleanupScenarioFailure,
+    "Qualified post-cleanup status did not independently prove inactivity.");
 }
 
 async function testUnsafeTransitionRestoresBaselineAndContinues() {
@@ -3000,9 +3176,13 @@ Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
     testFlatTerminalBoundary(), testPositionRenderScaleAdapterAdmission(),
     testMalformedMeasuredStressOwnershipIsRetained(),
     testBaselineOwnerAdmissionRejectsAmbiguity(),
+    testStressAcquisitionRequiresQualifiedReceipts(),
+    testStressStopRequiresQualifiedReceipt(),
     testBaselineOnlyCleanupRejectsForeignPostStatus(),
     testFailedHandoffRetainsAndCleansMeasuredOwner(),
     testCleanupPostconditionsRemainAuthoritative(),
+    testCleanupStatusesRequireQualifiedReceipts(),
+    testCleanupFailureCanBeConfirmedByQualifiedStatus(),
     testUnsafeTransitionRestoresBaselineAndContinues(),
     testAmdUnsafeTransitionUsesLaneBaseline(),
     testFailedRecoveryStopsLaterTransitions(),

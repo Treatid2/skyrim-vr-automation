@@ -661,12 +661,25 @@ the current status still names that acquired session, and it must pass the same
 ID as `expectedSessionId`. A missing, invalid, or different CPU identity leaves
 cleanup `UNRESOLVED` and must not produce an unguarded stop.
 
+The derived transition receipt must link that CPU acquisition to the immutable
+original scenario with its exact `scenarioReceiptKey`. Offline finalization
+corroborates the copied dispatch against the original labeled step, including
+wrapper and payload success, action, Build ID, transition owner, telemetry
+start, and CPU session. A missing, failed, foreign, or contradictory original
+dispatch cannot certify pass ownership even when the derived copy looks valid.
+
 Offline pass corroboration uses the original pass-scoped baseline, handoff,
 cleanup, and `final-status-after-cleanup` receipts. The baseline and handoff
 scenario envelopes must have completed successfully, relevant tool results must
 name the exact Build ID, and the original post-cleanup status must confirm the
 measured stress and CPU identities inactive. A derived cleanup decision cannot
 override a failed, foreign, missing, or contradictory original receipt.
+
+Every stress start/stop and cleanup status used as ownership or inactivity proof
+must also be a successful labeled result for the requested action from the exact
+Build ID. Cleanup continues to the post-status boundary after an operation
+failure when possible: a separately qualified post-status may prove inactivity,
+but an errored, wrong-action, or foreign-build status never can.
 
 If the live runner stops at baseline before any measured row, retain
 `raw/live-result.json` and the exact baseline waiter receipt. Run the same
