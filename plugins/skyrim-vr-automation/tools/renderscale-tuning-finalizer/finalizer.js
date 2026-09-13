@@ -345,6 +345,14 @@ function validateBaselineOnlyInterruption(root, variant, runId, buildId) {
     if (baselineFiles.length === 0) {
         throw new Error("baseline_interruption_receipt_missing");
     }
+    const interruptedPasses = (liveResult.lanes || []).flatMap((lane) =>
+        (lane.passes || []).filter((pass) => pass && pass.status === "INTERRUPTED"));
+    const linked = interruptedPasses.some((pass) => pass.failure &&
+        typeof pass.failure.receiptKey === "string" &&
+        pass.failure.receiptKey.startsWith(`${runId}:`) &&
+        pass.failure.receiptKey.endsWith(":baseline"));
+    if (!linked) throw new Error("baseline_interruption_identity_mismatch");
+    const reasons = [];
     for (const file of baselineFiles) {
         const waiter = qualificationWait(readJson(file));
         if (!waiter || !waiter.producer || waiter.producer.buildId !== buildId ||
@@ -352,9 +360,11 @@ function validateBaselineOnlyInterruption(root, variant, runId, buildId) {
             !waiter.ownerId.startsWith(`${runId}-`) || !waiter.baseline ||
             !Number.isSafeInteger(waiter.baseline.stressSessionId) ||
             waiter.baseline.stressSessionId < 1) {
-            throw new Error("baseline_interruption_receipt_mismatch");
+            reasons.push("baseline_interruption_receipt_unqualified");
         }
     }
+    return { complete: reasons.length === 0, reasons: unique(reasons),
+        receiptCount: baselineFiles.length };
 }
 
 function validatePreBaselineInterruption(root, variant, runId, liveResult) {
@@ -942,6 +952,96 @@ function successfulScenarioEntry(entry) {
         value.ok !== false && value.isError !== true);
 }
 
+function decodedEnvelopePayload(value) {
+    if (value && Array.isArray(value.content) && value.content[0] &&
+        typeof value.content[0].text === "string") {
+        if (value.isError === true) return null;
+        try {
+            return decodedEnvelopePayload(JSON.parse(value.content[0].text));
+        } catch {
+            return null;
+        }
+    }
+    return value && typeof value === "object" ? value : null;
+}
+
+function terminalSourceEvidence(root, file, retained, planned, buildId) {
+    const waiter = retained && retained.waiter;
+    const reasons = [];
+    if (!waiter || waiter.ok === false || waiter.isError === true ||
+        waiter.action !== "qualification_wait") {
+        reasons.push("terminal_waiter_payload_invalid");
+    }
+    if (!producerBuildMatches(waiter, buildId)) {
+        reasons.push("terminal_waiter_build_mismatch");
+    }
+    if (!planned || waiter && (waiter.transitionId !== planned.transitionId ||
+        waiter.ownerId !== planned.ownerId)) {
+        reasons.push("terminal_waiter_owner_mismatch");
+    }
+    if (planned && !targetsMatch(waiter && waiter.target, planned.target)) {
+        reasons.push("terminal_waiter_target_mismatch");
+    }
+
+    let source = "scenario";
+    let candidates = [];
+    if (retained && retained.recoveredTerminal === true) {
+        source = "qualification_status";
+        const rawRoot = path.join(root, "raw");
+        candidates = fs.existsSync(rawRoot) ? walk(rawRoot).filter((candidate) =>
+            path.extname(candidate).toLowerCase() === ".json" &&
+            path.basename(candidate) !== "live-result.json" &&
+            path.resolve(candidate) !== path.resolve(file)).map((candidate) => {
+            try {
+                return { file: candidate,
+                    value: decodedEnvelopePayload(readJson(candidate)) };
+            } catch {
+                return null;
+            }
+        }).filter((candidate) => {
+            const value = candidate && candidate.value;
+            const qualification = value && value.qualification;
+            return value && value.ok !== false && value.isError !== true &&
+                value.action === "qualification_status" &&
+                producerBuildMatches(value, buildId) && qualification &&
+                qualification.active === false && qualification.lastEvidence &&
+                JSON.stringify(qualification.lastEvidence) === JSON.stringify(waiter);
+        }) : [];
+    } else {
+        const scenarioFile = path.join(path.dirname(file), "scenario.json");
+        if (fs.existsSync(scenarioFile)) {
+            try {
+                const value = readJson(scenarioFile);
+                const scenarioRoot = decodedScenarioRoot(value);
+                if (value && value.isError !== true && scenarioRoot) {
+                    candidates.push({ file: scenarioFile, value: scenarioRoot });
+                }
+            } catch {
+                // A malformed original remains an attributable incomplete source.
+            }
+        }
+        candidates = candidates.filter((candidate) => {
+            const scenarioRoot = candidate.value;
+            const waiters = scenarioRoot.results.filter((entry) => entry &&
+                entry.label === "qualification-wait");
+            return scenarioSucceeded(scenarioRoot) && waiters.length === 1 &&
+                successfulScenarioEntry(waiters[0]) &&
+                JSON.stringify(waiters[0].result) === JSON.stringify(waiter);
+        });
+    }
+    if (candidates.length !== 1) {
+        reasons.push(candidates.length === 0 ?
+            "terminal_source_original_missing_or_invalid" :
+            "terminal_source_original_ambiguous");
+    }
+    return {
+        complete: reasons.length === 0,
+        source,
+        path: candidates.length === 1 ? relative(root, candidates[0].file) : null,
+        reasons: unique(reasons),
+    };
+}
+
 function stressSession(value) {
     const session = value && value.status && value.status.session;
     return {
@@ -1516,7 +1616,7 @@ function traceLifecycleEvidence(retained, buildId, requireDispatch) {
         pages: rawPages.length, records: records.length };
 }
 
-function transitionRow(root, file, retained, planned) {
+function transitionRow(root, file, retained, planned, buildId) {
     const identity = rowIdentity(root, file);
     const waiter = retained.waiter || {};
     const projection = retained.projection || {};
@@ -1537,6 +1637,8 @@ function transitionRow(root, file, retained, planned) {
     const backend = actualBackendEvidence(waiter, target,
         planned && planned.laneContract);
     const recovery = retained.recovery || null;
+    const terminalEvidence = terminalSourceEvidence(
+        root, file, retained, planned, buildId);
     return {
         ...identity,
         terminalTransitionId: waiter.transitionId ?? null,
@@ -1589,6 +1691,8 @@ function transitionRow(root, file, retained, planned) {
         recoveryReceiptKey: retained.recoveryReceiptKey ||
             recovery && recovery.receiptKey || null,
         sourceRecoveryReceiptKey: retained.sourceRecoveryReceiptKey || null,
+        terminalSourceEvidenceComplete: terminalEvidence.complete,
+        terminalSourceEvidence: terminalEvidence,
         rawRetained: relative(root, file),
     };
 }
@@ -1854,7 +1958,7 @@ function finalizeEvidence(options) {
     const rows = retained.map(({ file, value }) => {
         const identity = rowIdentity(root, file);
         return transitionRow(root, file, value,
-            planByIdentity.get(identityKey(identity)) || null);
+            planByIdentity.get(identityKey(identity)) || null, buildIds[0]);
     })
         .sort((left, right) => (left.lane || "").localeCompare(right.lane || "") ||
             left.pass - right.pass || left.ordinal - right.ordinal);
@@ -1920,6 +2024,13 @@ function finalizeEvidence(options) {
         if (!targetsMatch(row.target, planned.target)) {
             executionPlanConflicts.push("terminal_receipt_target_mismatch");
         }
+        if (!row.terminalSourceEvidenceComplete) {
+            executionPlanConflicts.push(...row.terminalSourceEvidence.reasons);
+        }
+        if (!Number.isSafeInteger(row.terminalStressSessionId) ||
+            row.terminalStressSessionId < 1) {
+            executionPlanConflicts.push("terminal_receipt_session_missing");
+        }
     }
     const uniqueExecutionPlanConflicts = unique(executionPlanConflicts);
     const executionScopeComplete = declaredExpectedRows !== null &&
@@ -1929,6 +2040,7 @@ function finalizeEvidence(options) {
         uniqueExecutionPlanConflicts.length === 0;
     const baselineOnlyInterrupted = rows.length === 0;
     let preBaselineInterrupted = false;
+    let baselineInterruptionEvidence = null;
     if (baselineOnlyInterrupted) {
         const baselineFiles = walk(path.join(root, "raw")).filter((file) =>
             path.basename(file) === "baseline.json" &&
@@ -1937,23 +2049,8 @@ function finalizeEvidence(options) {
         if (preBaselineInterrupted) {
             validatePreBaselineInterruption(root, variant, runIds[0], liveResult);
         } else {
-            validateBaselineOnlyInterruption(root, variant, runIds[0], buildIds[0]);
-        }
-    }
-    for (const entry of retained) {
-        const waiter = entry.value.waiter || {};
-        const producerBuild = waiter.producer && waiter.producer.buildId;
-        if (producerBuild !== buildIds[0]) {
-            throw new Error("terminal_receipt_build_mismatch");
-        }
-        if (typeof waiter.ownerId !== "string" ||
-            !waiter.ownerId.startsWith(`${runIds[0]}-`)) {
-            throw new Error("terminal_receipt_run_mismatch");
-        }
-        if (!waiter.baseline ||
-            !Number.isSafeInteger(waiter.baseline.stressSessionId) ||
-            waiter.baseline.stressSessionId < 1) {
-            throw new Error("terminal_receipt_session_missing");
+            baselineInterruptionEvidence = validateBaselineOnlyInterruption(
+                root, variant, runIds[0], buildIds[0]);
         }
     }
     const passFinalization = passFinalizationEvidence(
@@ -1985,8 +2082,14 @@ function finalizeEvidence(options) {
     if (uniqueExecutionPlanConflicts.length > 0) {
         reportingReasons.push("execution_plan_mismatch");
     }
+    if (rows.some((row) => !row.terminalSourceEvidenceComplete)) {
+        reportingReasons.push("terminal_source_evidence_incomplete");
+    }
     if (preBaselineInterrupted) reportingReasons.push("pre_baseline_interrupted");
     else if (baselineOnlyInterrupted) reportingReasons.push("baseline_only_interrupted");
+    if (baselineInterruptionEvidence && !baselineInterruptionEvidence.complete) {
+        reportingReasons.push("baseline_interruption_receipt_unqualified");
+    }
     if (interrupted && !baselineOnlyInterrupted) {
         reportingReasons.push("assay_interrupted");
     }
@@ -2080,6 +2183,7 @@ function finalizeEvidence(options) {
         deploymentVerification: deployment,
         memoryConfirmation: baselineOnlyInterrupted ?
             baselineOnlyMemoryConfirmation() : existing.memoryConfirmation,
+        baselineInterruptionEvidence,
         evidenceExtraction: { complete: true,
             path: "evidence-values.csv",
             format: "rfc6901-json-pointer-long-form-csv",
