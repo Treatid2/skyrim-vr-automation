@@ -11,6 +11,7 @@ function Get-DevBenchSemanticStatus {
     $codes = [Collections.Generic.List[string]]::new()
     $states = [Collections.Generic.List[string]]::new()
     $retryableHints = [Collections.Generic.List[bool]]::new()
+    $affirmativeSignals = [Collections.Generic.List[string]]::new()
     $replaySchedulerReceipts = [Collections.Generic.List[string]]::new()
     $explicitOutcomeEvidence = [Collections.Generic.List[string]]::new()
     $guardCodes = @('producer_mismatch', 'contract_mismatch', 'unsupported_contract_major', 'idempotency_conflict')
@@ -19,7 +20,7 @@ function Get-DevBenchSemanticStatus {
 
     function Test-ExplicitOutcomeValue($Value) {
         if ($null -eq $Value) { return $false }
-        if ($Value -is [bool]) { return $true }
+        if ($Value -is [bool]) { return $Value }
         if ($Value -is [string] -or $Value -is [ValueType]) { return $false }
         if ($Value -is [Collections.IDictionary]) {
             $evidenceProperties = @($Value.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Key; Value = $_.Value } })
@@ -92,6 +93,9 @@ function Get-DevBenchSemanticStatus {
                 elseif ($name -in @('ok', 'success', 'passed') -and -not $child) {
                     $reasons.Add("$childPath is false")
                 }
+                elseif ($name -in @('ok', 'success', 'passed') -and $child) {
+                    $affirmativeSignals.Add($childPath)
+                }
                 elseif ($name -in @('failed', 'aborted') -and $child) {
                     $reasons.Add("$childPath is true")
                 }
@@ -107,6 +111,7 @@ function Get-DevBenchSemanticStatus {
                 else {
                     if (-not $codes.Contains([string]$child)) { $codes.Add([string]$child) }
                     if ([string]$child -notin $successNames) { $reasons.Add("$childPath is '$child'") }
+                    else { $affirmativeSignals.Add($childPath) }
                 }
             }
             elseif ($name -eq 'state') {
@@ -128,6 +133,7 @@ function Get-DevBenchSemanticStatus {
                         $statusName = [string]$child
                         if (-not $codes.Contains($statusName)) { $codes.Add($statusName) }
                         if ($statusName -notin $successNames) { $reasons.Add("$childPath is '$statusName'") }
+                        else { $affirmativeSignals.Add($childPath) }
                     }
                 }
                 elseif ($null -eq $child -or $child -is [ValueType] -or
@@ -147,6 +153,7 @@ function Get-DevBenchSemanticStatus {
                             $statusName = [string]$nameProperty.Value
                             if (-not $codes.Contains($statusName)) { $codes.Add($statusName) }
                             if ($statusName -notin $successNames) { $reasons.Add("$childPath.name is '$statusName'") }
+                            else { $affirmativeSignals.Add("$childPath.name") }
                         }
                     }
                     if ($valueProperty) {
@@ -191,6 +198,8 @@ function Get-DevBenchSemanticStatus {
         schedulerOnly = $schedulerOnly
         schedulerReceiptPaths = @($replaySchedulerReceipts)
         explicitOutcomeEvidence = @($explicitOutcomeEvidence)
+        affirmative = $affirmativeSignals.Count -gt 0
+        affirmativePaths = @($affirmativeSignals | Select-Object -Unique)
     }
 }
 
@@ -534,15 +543,17 @@ function Get-DevBenchCallSemanticStatus {
         if ($semantic.known -and -not $semantic.ok) {
             foreach ($reason in @($semantic.reasons)) { $reasons.Add([string]$reason) }
         }
-        $outerPayload = if ($payloads.Count -eq 1 -and $null -ne $payloads[0] -and
-            $payloads[0] -isnot [string] -and $payloads[0] -isnot [ValueType]) { $payloads[0] } else {
+        $outerPayload = if ($payloads.Count -eq 1 -and
+            ($payloads[0] -is [pscustomobject] -or
+                $payloads[0] -is [Collections.IDictionary])) { $payloads[0] } else {
             $reasons.Add("content must contain exactly one structured screenshot $action response")
             $null
         }
         $payload = $outerPayload
         if ($outerPayload -and $outerPayload.PSObject.Properties['result']) {
             $resultValue = $outerPayload.PSObject.Properties['result'].Value
-            if ($null -ne $resultValue -and $resultValue -isnot [string] -and $resultValue -isnot [ValueType]) {
+            if ($resultValue -is [pscustomobject] -or
+                $resultValue -is [Collections.IDictionary]) {
                 $payload = $resultValue
             }
             else {
@@ -566,11 +577,27 @@ function Get-DevBenchCallSemanticStatus {
                 if (-not $terminal -or $terminal.Value -isnot [bool]) {
                     $reasons.Add('content.terminal is not Boolean')
                 }
+                if ($state -and $state.Value -is [string] -and
+                    $terminal -and $terminal.Value -is [bool]) {
+                    $terminalStates = @('completed', 'completed_with_warnings',
+                        'stopped', 'cancelled', 'cancelled_partial', 'failed',
+                        'failed_partial', 'rejected')
+                    $nonterminalStates = @('accepted', 'queued', 'pending', 'running')
+                    if ([string]$state.Value -notin @($terminalStates +
+                        $nonterminalStates)) {
+                        $reasons.Add('content.state is not a supported screenshot request state')
+                    }
+                    elseif (([string]$state.Value -in $terminalStates) -ne
+                        [bool]$terminal.Value) {
+                        $reasons.Add('content.state and content.terminal contradict')
+                    }
+                }
             }
             elseif ($action -eq 'status') {
                 foreach ($name in @('feature', 'dispatcher', 'journal')) {
                     $property = $payload.PSObject.Properties[$name]
-                    if (-not $property -or $null -eq $property.Value -or $property.Value -is [string] -or $property.Value -is [ValueType]) {
+                    if (-not $property -or -not ($property.Value -is [pscustomobject] -or
+                        $property.Value -is [Collections.IDictionary])) {
                         $reasons.Add("content.$name is not a structured screenshot status section")
                     }
                 }
@@ -579,7 +606,8 @@ function Get-DevBenchCallSemanticStatus {
                 $schemaVersion = $payload.PSObject.Properties['settingsSchemaVersion']
                 foreach ($name in @('effective', 'persisted')) {
                     $property = $payload.PSObject.Properties[$name]
-                    if (-not $property -or $null -eq $property.Value -or $property.Value -is [string] -or $property.Value -is [ValueType]) {
+                    if (-not $property -or -not ($property.Value -is [pscustomobject] -or
+                        $property.Value -is [Collections.IDictionary])) {
                         $reasons.Add("content.$name is not a structured screenshot settings section")
                     }
                 }
@@ -593,7 +621,9 @@ function Get-DevBenchCallSemanticStatus {
                 $retained = $payload.PSObject.Properties['retained']
                 if (-not $requests -or $null -eq $requests.Value -or $requests.Value -is [string] -or
                     $requests.Value -isnot [Collections.IEnumerable]) { $reasons.Add('content.requests is not a screenshot request collection') }
-                if (-not $retained -or $null -eq $retained.Value -or $retained.Value.GetType() -notin $integralTypes) {
+                if (-not $retained -or $null -eq $retained.Value -or
+                    $retained.Value.GetType() -notin $integralTypes -or
+                    $retained.Value -lt 0) {
                     $reasons.Add('content.retained is not a non-negative integer')
                 }
             }
@@ -603,7 +633,9 @@ function Get-DevBenchCallSemanticStatus {
                     $events.Value -isnot [Collections.IEnumerable]) { $reasons.Add('content.events is not a screenshot event collection') }
                 foreach ($name in @('oldestRetainedEventId', 'latestEventId', 'nextEventId')) {
                     $property = $payload.PSObject.Properties[$name]
-                    if (-not $property -or $null -eq $property.Value -or $property.Value.GetType() -notin $integralTypes) {
+                    if (-not $property -or $null -eq $property.Value -or
+                        $property.Value.GetType() -notin $integralTypes -or
+                        $property.Value -lt 0) {
                         $reasons.Add("content.$name is not a non-negative integer")
                     }
                 }
@@ -728,7 +760,11 @@ function Test-DevBenchServiceReady {
     # tool answered. Readiness requires a recognized positive contract state;
     # otherwise polling an unknown payload could repeatedly dispatch work and
     # then promote the unclassified response to ready.
-    $ready = if (-not $semantic.ok) { $false } elseif ($state) { $state -in $AcceptedStates } elseif ($semantic.known) { -not $retryable } else { $false }
+    $ready = if (-not $semantic.ok) { $false } elseif ($state) {
+        $state -in $AcceptedStates
+    } elseif ($semantic.known -and $semantic.affirmative) {
+        -not $retryable
+    } else { $false }
     return [pscustomobject][ordered]@{
         ready = $ready
         retryable = $retryable

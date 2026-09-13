@@ -291,10 +291,19 @@ function Get-ScreenshotReceipt([string]$RequestId, $State) {
 
 function Wait-ScreenshotTerminal([string]$RequestId, $State) {
     $deadline = [DateTime]::UtcNow.AddSeconds($CaptureTimeoutSeconds)
+    $terminalStates = @('completed', 'completed_with_warnings', 'stopped',
+        'cancelled', 'cancelled_partial', 'failed', 'failed_partial', 'rejected')
+    $nonterminalStates = @('accepted', 'queued', 'pending', 'running')
     do {
         $receipt = Get-ScreenshotReceipt -RequestId $RequestId -State $State
-        if ($receipt.PSObject.Properties['terminal'] -and [bool]$receipt.terminal) { return $receipt }
-        if ([string]$receipt.state -in @('completed', 'completed_with_warnings', 'stopped', 'cancelled', 'cancelled_partial', 'failed', 'failed_partial', 'rejected')) { return $receipt }
+        $stateName = [string]$receipt.state
+        $terminalProperty = $receipt.PSObject.Properties['terminal']
+        if (-not $terminalProperty -or $terminalProperty.Value -isnot [bool] -or
+            $stateName -notin @($terminalStates + $nonterminalStates) -or
+            (($stateName -in $terminalStates) -ne [bool]$terminalProperty.Value)) {
+            throw "Screenshot request '$RequestId' returned contradictory or unsupported terminal evidence."
+        }
+        if ($stateName -in $terminalStates) { return $receipt }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Screenshot request '$RequestId' did not become terminal within $CaptureTimeoutSeconds seconds."
