@@ -205,6 +205,17 @@ observation. `-TimeoutSeconds` accepts explicit bounded waits up to one hour,
 and ordinary deadline expiry returns `timeout` with the last successful state
 observation rather than retrying a request that can no longer start.
 
+Codex can retain a direct MCP tool schema across replacement of the game and
+DevBench runtime at the same loopback endpoint. If a tool that remains visible
+to the task returns exact MCP error `-32602 Tool not found: <requested-name>`,
+the answering server rejected the name before a handler ran; this is stale
+task-catalog evidence, not an ambiguous mutation result. Preserve the error and
+do not retry through the direct tool. The task may select this bundled
+controller as the sole replacement lane, but it must use the explicit runtime
+file, run `list`, verify the expected process/build identity, and proceed only
+when that fresh registry contains the exact tool. No other error permits a
+transport-lane switch.
+
 `playerLoaded` is a current-state post-load barrier. After one separately
 verified `game load` dispatch reports `queued: true`, call it with the exact
 `-ExpectedCell`. It polls both `inspect state` and `inspect scene` until the
