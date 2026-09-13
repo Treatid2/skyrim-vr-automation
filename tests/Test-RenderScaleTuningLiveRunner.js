@@ -108,6 +108,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
     let gpuActive = false;
     let textureActive = false;
     let probeActive = false;
+    let profilerEnabled = false;
     let transitionOrdinal = 0;
     let traceSession = 0;
     let traceActive = false;
@@ -129,6 +130,15 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
 
     function toolResult(step) {
         const args = step.args || {};
+        if (step.label === "profiler-status") {
+            return { action: "status", producer: { buildId },
+                enabled: profilerEnabled, frame_count: 1 };
+        }
+        if (args.action === "set_enabled") {
+            profilerEnabled = args.enabled === true;
+            return { action: args.action, producer: { buildId },
+                enabled: profilerEnabled };
+        }
         if (args.action === "qualification_dispatch") {
             const result = {
                 action: args.action,
@@ -350,6 +360,7 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
                 result: {
                     schemaRevision: 14,
                     action: "qualification_wait",
+                    producer: { buildId },
                     transitionId: waitStep.args.transitionId,
                     ownerId: waitStep.args.ownerId,
                     satisfied: !semanticFailure,
@@ -1887,6 +1898,45 @@ async function testBaselineOnlyCleanupRejectsForeignPostStatus() {
     "Baseline-only cleanup accepted a foreign inactive post-status identity.");
 }
 
+async function testBaselineWaiterRequiresQualifiedReceipt() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const cases = [
+        ["missing-producer", (entry) => { delete entry.result.producer; }],
+        ["wrong-build", (entry) => {
+            entry.result.producer.buildId = "f".repeat(64);
+        }],
+        ["payload-failed", (entry) => { entry.result.ok = false; }],
+        ["wrapper-failed", (entry) => { entry.ok = false; }],
+    ];
+    for (const [name, mutate] of cases) {
+        let injected = false;
+        const mock = createMock(0, null, (root, args) => {
+            if (!injected && args.steps.some((step) =>
+                step.label === "baseline-stress-start")) {
+                injected = true;
+                mutate(root.results.find((entry) =>
+                    entry.label === "qualification-wait"));
+            }
+            return root;
+        });
+        const result = await runRenderScaleTuningLive({
+            ...mock.context, variant: "nvidia",
+            runId: `baseline-waiter-${name}`, buildId,
+            positioningRoot: positioningRoot(), matrix,
+        });
+        const pass = result.lanes[0].passes[0];
+        assert(result.status === "INTERRUPTED" &&
+            pass.error === "baseline_owner_identity_unproven" &&
+            pass.failure && pass.failure.ownership &&
+            pass.failure.ownership.reasons.includes("waiter_receipt_invalid") &&
+            !mock.scenarioCalls.some((call) => call.steps.some((step) =>
+                step.label === "measured-stress-start")),
+        `Unqualified baseline waiter authorized measured handoff: ${name}`);
+    }
+}
+
 async function testStressAcquisitionRequiresQualifiedReceipts() {
     const matrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
@@ -2110,6 +2160,144 @@ async function testCleanupFailureCanBeConfirmedByQualifiedStatus() {
             "cleanup_operation_failed_but_status_confirmed_inactive" &&
         pass.cleanup.cleanupScenarioFailure,
     "Qualified post-cleanup status did not independently prove inactivity.");
+}
+
+async function testFailedProfilerDisableRequiresProfilerInactivity() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    let cleanupFailed = false;
+    let postStatusChanged = false;
+    const mock = createMock(0, null, (root, args) => {
+        if (!cleanupFailed && args.steps.some((step) =>
+            step.label === "profiler-disable")) {
+            cleanupFailed = true;
+            const entry = root.results.find((candidate) =>
+                candidate.label === "profiler-disable");
+            entry.ok = false;
+            entry.error = "synthetic_profiler_disable_failure";
+            root.ok = false;
+            root.aborted = true;
+        } else if (cleanupFailed && !postStatusChanged && args.steps.some(
+            (step) => step.label === "profiler-status")) {
+            postStatusChanged = true;
+            root.results.find((entry) =>
+                entry.label === "profiler-status").result.enabled = true;
+        }
+        return root;
+    });
+    const result = await runRenderScaleTuningLive({
+        ...mock.context, variant: "nvidia",
+        runId: "profiler-disable-unresolved", buildId,
+        positioningRoot: positioningRoot(), matrix,
+    });
+    const pass = result.lanes[0].passes[0];
+    assert(result.status === "INTERRUPTED" &&
+        pass.error === "cleanup_postcondition_active" &&
+        pass.cleanup && pass.cleanup.status === "UNRESOLVED" &&
+        pass.cleanup.after.profilerActive === true &&
+        result.lanes[0].passes.length === 1,
+    "Failed profiler disable was reconciled without profiler inactivity proof.");
+}
+
+async function testProfilerStatusRequiresQualifiedProof() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const cases = [
+        ["missing", (root, entry) => {
+            root.results = root.results.filter((candidate) =>
+                candidate !== entry);
+        }],
+        ["wrong-action", (_root, entry) => {
+            entry.result.action = "set_enabled";
+        }],
+        ["wrong-build", (_root, entry) => {
+            entry.result.producer.buildId = "f".repeat(64);
+        }],
+        ["payload-failed", (_root, entry) => {
+            entry.result.isError = true;
+        }],
+        ["wrapper-failed", (_root, entry) => { entry.ok = false; }],
+    ];
+    for (const [name, mutate] of cases) {
+        let cleanupRan = false;
+        let injected = false;
+        const mock = createMock(0, null, (root, args) => {
+            if (args.steps.some((step) => step.label === "profiler-disable")) {
+                cleanupRan = true;
+            } else if (cleanupRan && !injected && args.steps.some((step) =>
+                step.label === "profiler-status")) {
+                injected = true;
+                mutate(root, root.results.find((entry) =>
+                    entry.label === "profiler-status"));
+            }
+            return root;
+        });
+        const result = await runRenderScaleTuningLive({
+            ...mock.context, variant: "nvidia",
+            runId: `profiler-status-${name}`, buildId,
+            positioningRoot: positioningRoot(), matrix,
+        });
+        const pass = result.lanes[0].passes[0];
+        assert(result.status === "INTERRUPTED" && pass.cleanup &&
+            pass.cleanup.status === "UNRESOLVED" &&
+            pass.cleanup.reason === "cleanup_post_status_incomplete",
+        `Unqualified profiler status certified cleanup: ${name}`);
+    }
+}
+
+async function testMissingCleanupPostStatusRetainsDecision() {
+    const matrix = JSON.parse(fs.readFileSync(path.join(
+        repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
+        "matrix.v1.json")));
+    const cases = [
+        ["missing-render-session", (root) => {
+            delete root.results.find((entry) =>
+                entry.label === "render-status").result.status.session;
+        }],
+        ["missing-cpu-status", (root) => {
+            delete root.results.find((entry) =>
+                entry.label === "cpu-status").result.cpuPerformance;
+        }],
+        ["failed-status-scenario", (root) => {
+            root.ok = false;
+            root.aborted = true;
+        }],
+        ["status-transport-failure", () => {
+            throw new Error("synthetic_status_transport_failure");
+        }],
+    ];
+    for (const [name, mutate] of cases) {
+        let cleanupRan = false;
+        let injected = false;
+        const runId = `cleanup-missing-${name}`;
+        const mock = createMock(0, null, (root, args) => {
+            if (args.steps.some((step) => step.label === "profiler-disable")) {
+                cleanupRan = true;
+            } else if (cleanupRan && !injected && args.steps.some((step) =>
+                step.label === "profiler-status")) {
+                injected = true;
+                mutate(root);
+            }
+            return root;
+        });
+        const result = await runRenderScaleTuningLive({
+            ...mock.context, variant: "nvidia", runId, buildId,
+            positioningRoot: positioningRoot(), matrix,
+        });
+        const pass = result.lanes[0].passes[0];
+        const retained = mock.stores.get(
+            `${runId}:nvidia:pass-1:cleanup:decision`);
+        assert(result.status === "INTERRUPTED" &&
+            pass.error === "cleanup_post_status_incomplete" &&
+            pass.cleanup && pass.cleanup.status === "UNRESOLVED" &&
+            retained && retained.status === "UNRESOLVED" &&
+            retained.reason === "cleanup_post_status_incomplete" &&
+            Array.isArray(retained.knownSessionIds) &&
+            retained.knownSessionIds.length > 0,
+        `Missing cleanup post-status lost its structured decision: ${name}`);
+    }
 }
 
 async function testUnsafeTransitionRestoresBaselineAndContinues() {
@@ -3176,6 +3364,7 @@ Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
     testFlatTerminalBoundary(), testPositionRenderScaleAdapterAdmission(),
     testMalformedMeasuredStressOwnershipIsRetained(),
     testBaselineOwnerAdmissionRejectsAmbiguity(),
+    testBaselineWaiterRequiresQualifiedReceipt(),
     testStressAcquisitionRequiresQualifiedReceipts(),
     testStressStopRequiresQualifiedReceipt(),
     testBaselineOnlyCleanupRejectsForeignPostStatus(),
@@ -3183,6 +3372,9 @@ Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
     testCleanupPostconditionsRemainAuthoritative(),
     testCleanupStatusesRequireQualifiedReceipts(),
     testCleanupFailureCanBeConfirmedByQualifiedStatus(),
+    testFailedProfilerDisableRequiresProfilerInactivity(),
+    testProfilerStatusRequiresQualifiedProof(),
+    testMissingCleanupPostStatusRetainsDecision(),
     testUnsafeTransitionRestoresBaselineAndContinues(),
     testAmdUnsafeTransitionUsesLaneBaseline(),
     testFailedRecoveryStopsLaterTransitions(),

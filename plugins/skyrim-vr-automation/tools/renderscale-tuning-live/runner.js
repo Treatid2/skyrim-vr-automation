@@ -1407,13 +1407,17 @@ async function runRenderScaleTuningLive(context) {
         };
     }
 
-    function baselineOwnership(start, waiter, startEntry = null) {
+    function baselineOwnership(start, waiter, startEntry = null,
+        waiterEntry = null) {
         const started = sessionSnapshot(start);
         const waiterId = waiter && waiter.baseline &&
             waiter.baseline.stressSessionId;
         const reasons = [];
         if (!resultQualified(start, startEntry, "start")) {
             reasons.push("start_receipt_invalid");
+        }
+        if (!resultQualified(waiter, waiterEntry, "qualification_wait")) {
+            reasons.push("waiter_receipt_invalid");
         }
         if (!started.present) reasons.push("start_session_missing");
         if (!Number.isSafeInteger(started.id) || started.id < 1) {
@@ -1510,7 +1514,8 @@ async function runRenderScaleTuningLive(context) {
         const start = entries.get("baseline-stress-start");
         const waiter = entries.get("qualification-wait");
         const ownership = baselineOwnership(start, waiter,
-            resultEntry(response.root, "baseline-stress-start"));
+            resultEntry(response.root, "baseline-stress-start"),
+            resultEntry(response.root, "qualification-wait"));
         ownerState.baseline = {
             ...ownership,
             active: ownership.startActive === true,
@@ -2263,6 +2268,13 @@ async function runRenderScaleTuningLive(context) {
             toolStep("texture-status", "communityshaders.renderscale", {
                 action: "texture_lifetime_status", expectedBuildId: buildId,
             }),
+            toolStep("profiler-status", "communityshaders.profiler_api", {
+                contractMajor: 1,
+                clientId: `${runId}-${lane.id}-${pass}-${suffix}-profiler-client`,
+                commandId: `${runId}-${lane.id}-${pass}-${suffix}-profiler-status`,
+                action: "status",
+                expectedBuildId: buildId,
+            }),
         ];
         if (variant === "nvidia" && includeTrace) {
             steps.push(toolStep("dlss-trace-status",
@@ -2306,10 +2318,12 @@ async function runRenderScaleTuningLive(context) {
         const cpuResult = entries && entries.get("cpu-status");
         const gpuResult = entries && entries.get("gpu-status");
         const textureResult = entries && entries.get("texture-status");
+        const profilerResult = entries && entries.get("profiler-status");
         const traceResult = entries && entries.get("dlss-trace-status");
         const cpu = cpuResult && cpuResult.cpuPerformance;
         const gpu = gpuResult && gpuResult.capture;
         const texture = textureResult && textureResult.capture;
+        const profiler = profilerResult;
         const probe = render && render.loadPresentationProbe;
         const trace = variant === "nvidia" ? traceSession(traceResult) :
             { present: true, id: null, active: false };
@@ -2319,6 +2333,7 @@ async function runRenderScaleTuningLive(context) {
             ["cpu-status", cpuResult, "cpu_performance_status"],
             ["gpu-status", gpuResult, "gpu_performance_status"],
             ["texture-status", textureResult, "texture_lifetime_status"],
+            ["profiler-status", profilerResult, "status"],
         ];
         if (variant === "nvidia") {
             qualifications.push(["dlss-trace-status", traceResult,
@@ -2353,6 +2368,9 @@ async function runRenderScaleTuningLive(context) {
         if (!texture || typeof texture.active !== "boolean") {
             missing.push("texture_status_missing");
         }
+        if (!profiler || typeof profiler.enabled !== "boolean") {
+            missing.push("profiler_status_missing");
+        }
         if (!probe || typeof probe.active !== "boolean") {
             missing.push("probe_status_missing");
         }
@@ -2362,7 +2380,7 @@ async function runRenderScaleTuningLive(context) {
                 (!Number.isSafeInteger(trace.id) || trace.id < 1)))) {
             missing.push("trace_status_missing");
         }
-        return { render, session, cpu, gpu, texture, probe, trace, missing,
+        return { render, session, cpu, gpu, texture, profiler, probe, trace, missing,
             unqualified, scenarioFailure: statusResponse &&
                 statusResponse.scenarioFailure || null };
     }
@@ -2399,6 +2417,7 @@ async function runRenderScaleTuningLive(context) {
                 cpuSessionId: observed.cpu ? observed.cpu.sessionId : null,
                 gpuActive: observed.gpu ? observed.gpu.active : null,
                 textureActive: observed.texture ? observed.texture.active : null,
+                profilerActive: observed.profiler ? observed.profiler.enabled : null,
                 probeActive: observed.probe ? observed.probe.active : null,
                 traceSessionId: observed.trace ? observed.trace.id : null,
                 traceActive: observed.trace ? observed.trace.active : null,
@@ -2504,6 +2523,7 @@ async function runRenderScaleTuningLive(context) {
             cpuSessionId: after.cpu ? after.cpu.sessionId : null,
             gpuActive: after.gpu ? after.gpu.active : null,
             textureActive: after.texture ? after.texture.active : null,
+            profilerActive: after.profiler ? after.profiler.enabled : null,
             probeActive: after.probe ? after.probe.active : null,
             traceSessionId: after.trace ? after.trace.id : null,
             traceActive: after.trace ? after.trace.active : null,
@@ -2520,15 +2540,16 @@ async function runRenderScaleTuningLive(context) {
         const expectedTraceSessionId = ownerState.trace && ownerState.trace.proven ?
             ownerState.trace.sessionId : null;
         const postOwnerMismatch = (expectedStressSessionId !== null &&
-            after.session.id !== expectedStressSessionId) ||
+            (!after.session || after.session.id !== expectedStressSessionId)) ||
             (expectedCpuSessionId !== null &&
-                after.cpu.sessionId !== expectedCpuSessionId) ||
+                (!after.cpu || after.cpu.sessionId !== expectedCpuSessionId)) ||
             (expectedTraceSessionId !== null &&
-                after.trace.id !== expectedTraceSessionId);
+                (!after.trace || after.trace.id !== expectedTraceSessionId));
         const stillActive = after.missing.length > 0 || postOwnerMismatch ||
             after.session.active !== false || after.cpu.active !== false ||
             after.gpu.active !== false || after.texture.active !== false ||
-            after.probe.active !== false || after.trace.active !== false;
+            after.profiler.enabled !== false || after.probe.active !== false ||
+            after.trace.active !== false;
         if (stillActive) {
             evidence.status = "UNRESOLVED";
             evidence.reason = after.missing.length > 0 ?
