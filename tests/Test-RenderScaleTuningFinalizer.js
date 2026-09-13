@@ -219,6 +219,7 @@ function retained(boundary, violation, identity = {}, nonStable = false) {
         },
         waiter: {
             schemaRevision: 14,
+            action: "qualification_wait",
             transitionId,
             satisfied: !nonStable,
             ownerId,
@@ -359,9 +360,24 @@ function retained(boundary, violation, identity = {}, nonStable = false) {
     };
 }
 
-function writeJson(file, value) {
+function writeJson(file, value, synchronizeScenario = true) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+    if (synchronizeScenario && path.basename(file) === "retained.json" &&
+        value && value.waiter) {
+        const scenarioFile = path.join(path.dirname(file), "scenario.json");
+        if (fs.existsSync(scenarioFile)) {
+            const scenario = JSON.parse(fs.readFileSync(scenarioFile, "utf8"));
+            const entry = scenario && Array.isArray(scenario.results) &&
+                scenario.results.find((candidate) => candidate &&
+                    candidate.label === "qualification-wait");
+            if (entry) {
+                entry.result = value.waiter;
+                fs.writeFileSync(scenarioFile,
+                    `${JSON.stringify(scenario, null, 2)}\n`);
+            }
+        }
+    }
 }
 
 function readJson(file) {
@@ -647,9 +663,18 @@ function createEvidenceRoot(variant = "nvidia", nonStable = false) {
     });
     writeJson(path.join(root, "raw", "pass-1", "transitions", "01",
         "retained.json"), firstRetained);
+    const secondRetained = retained(true, true, { runId, buildId, variant,
+        ordinal: 2, transitionId: 102 }, nonStable);
     writeJson(path.join(root, "raw", "pass-1", "transitions", "02",
-        "retained.json"), retained(true, true, { runId, buildId, variant,
-            ordinal: 2, transitionId: 102 }, nonStable));
+        "scenario.json"), {
+        ok: true,
+        aborted: false,
+        stepsRun: 1,
+        results: [{ label: "qualification-wait",
+            result: secondRetained.waiter }],
+    });
+    writeJson(path.join(root, "raw", "pass-1", "transitions", "02",
+        "retained.json"), secondRetained);
     return root;
 }
 
@@ -664,7 +689,9 @@ function createBaselineOnlyEvidenceRoot(variant) {
         runId,
         lanes: [{ id: variant, status: "INTERRUPTED",
             passes: [{ pass: 1, status: "INTERRUPTED",
-                error: "baseline_failed" }] }],
+                error: "baseline_failed", failure: {
+                    receiptKey: `${runId}:${variant}:pass-1:baseline`,
+                } }] }],
     });
     writeDeploymentVerification(root, buildId);
     writeJson(path.join(root, "raw", "pass-1", "baseline", "baseline.json"), {
@@ -770,9 +797,105 @@ function testBaselineOnlyInterruptedFinalization() {
                 sha(path.join(evidence.root, name)));
             assert(JSON.stringify(firstHashes) === JSON.stringify(secondHashes),
                 `${variant} baseline-only finalization is not deterministic.`);
+
+            const baselineFile = path.join(evidence.root, "raw", "pass-1",
+                "baseline", "baseline.json");
+            const rejected = readJson(baselineFile);
+            delete rejected.results[0].result.producer;
+            writeJson(baselineFile, rejected);
+            result = finalizeEvidence(options);
+            assert(result.summary.assayExecution.status === "INTERRUPTED" &&
+                result.summary.reporting.status === "INCOMPLETE" &&
+                result.summary.reporting.reasons.includes(
+                    "baseline_interruption_receipt_unqualified") &&
+                result.summary.baselineInterruptionEvidence.complete === false &&
+                result.summary.memoryConfirmation.verdict === "repeat_not_completed",
+            `${variant} rejected baseline receipt prevented diagnostic reporting.`);
+            const rejectedHashes = outputs.map((name) =>
+                sha(path.join(evidence.root, name)));
+            result = finalizeEvidence(options);
+            assert(JSON.stringify(rejectedHashes) === JSON.stringify(outputs.map(
+                (name) => sha(path.join(evidence.root, name)))),
+            `${variant} rejected baseline finalization is not deterministic.`);
         } finally {
             fs.rmSync(evidence.root, { recursive: true, force: true });
         }
+    }
+}
+
+function testTerminalOriginalsControlCompletion() {
+    const options = { variant: "nvidia", runId: "nvidia-test-run",
+        buildId: "e".repeat(64), expectedRows: 2,
+        generatedUtc: "2026-08-30T20:00:00.000Z" };
+    const cases = [
+        ["missing", (root) => fs.unlinkSync(path.join(root, "raw", "pass-1",
+            "transitions", "02", "scenario.json"))],
+        ["failed-wrapper", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions", "01",
+                "scenario.json");
+            const value = readJson(file);
+            value.results.find((entry) =>
+                entry.label === "qualification-wait").ok = false;
+            writeJson(file, value);
+        }],
+        ["foreign-owner", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions", "02",
+                "scenario.json");
+            const value = readJson(file);
+            value.results[0].result.ownerId = "foreign-owner";
+            writeJson(file, value);
+        }],
+        ["duplicate-terminal", (root) => {
+            const file = path.join(root, "raw", "pass-1", "transitions", "02",
+                "scenario.json");
+            const value = readJson(file);
+            value.results.push(JSON.parse(JSON.stringify(value.results[0])));
+            value.stepsRun += 1;
+            writeJson(file, value);
+        }],
+    ];
+    for (const [name, mutate] of cases) {
+        const root = createEvidenceRoot();
+        try {
+            mutate(root);
+            const first = finalizeEvidence({ root, ...options });
+            assert(first.summary.assayExecution.status === "INCOMPLETE" &&
+                first.summary.reporting.reasons.includes(
+                    "terminal_source_evidence_incomplete") &&
+                first.summary.transitions.length === 2,
+            `Contradictory terminal original completed reporting: ${name}`);
+            const outputs = ["report.md", "summary.json", "transitions.csv",
+                "evidence-values.csv", "receipt-index.json"];
+            const hashes = outputs.map((output) => sha(path.join(root, output)));
+            finalizeEvidence({ root, ...options });
+            assert(JSON.stringify(hashes) === JSON.stringify(outputs.map(
+                (output) => sha(path.join(root, output)))),
+            `Incomplete terminal-source report was not repeatable: ${name}`);
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    }
+
+    const recoveredRoot = createEvidenceRoot();
+    try {
+        const retainedFile = path.join(recoveredRoot, "raw", "pass-1",
+            "transitions", "02", "retained.json");
+        const value = readJson(retainedFile);
+        value.recoveredTerminal = true;
+        writeJson(retainedFile, value, false);
+        fs.unlinkSync(path.join(path.dirname(retainedFile), "scenario.json"));
+        writeJson(path.join(recoveredRoot, "raw", "recovery", "102.json"), {
+            action: "qualification_status", producer: { buildId: options.buildId },
+            qualification: { active: false, lastEvidence: value.waiter },
+        });
+        const result = finalizeEvidence({ root: recoveredRoot, ...options });
+        assert(result.summary.assayExecution.status === "COMPLETE" &&
+            result.summary.transitions[1].terminalSourceEvidence.source ===
+                "qualification_status" &&
+            result.summary.transitions[1].terminalSourceEvidenceComplete === true,
+        "A uniquely qualified recovered terminal did not complete reporting.");
+    } finally {
+        fs.rmSync(recoveredRoot, { recursive: true, force: true });
     }
 }
 
@@ -940,7 +1063,7 @@ function testOfflineFinalization() {
             generatedUtc: "2026-08-30T20:00:00.000Z" };
         let result = finalizeEvidence(options);
         assert(result.summary.assayExecution.status === "COMPLETE",
-            "Completed assay execution was rewritten.");
+            `Completed assay execution was rewritten: ${JSON.stringify(result.summary.assayExecution.executionScope)}`);
         assert(result.summary.render.verdict === "FAIL",
             "The non-stable transition was not retained as a render failure.");
         assert(result.summary.task2Evidence.mode === "per_transition" &&
@@ -2223,6 +2346,7 @@ Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testAmdTraceCapabilityOnlyAffectsReporting)
     .then(testRecoveryIsReportedWithoutRewritingFailure)
     .then(testBaselineOnlyInterruptedFinalization)
+    .then(testTerminalOriginalsControlCompletion)
     .then(testPreBaselineInterruptedFinalization)
     .then(testTraceContaminatedPreBaselineFinalization)
     .then(testPartialInterruptedFinalization)

@@ -81,6 +81,12 @@ async function runRenderScaleTuningLive(context) {
             value.producer && value.producer.buildId === buildId;
     }
 
+    function directResultQualified(response, action) {
+        return Boolean(response && response.envelope &&
+            response.envelope.isError !== true &&
+            resultQualified(response.root, null, action));
+    }
+
     function reportedError(value) {
         if (!value || typeof value !== "object") return null;
         for (const name of ["error", "message", "reason"]) {
@@ -465,10 +471,12 @@ async function runRenderScaleTuningLive(context) {
             facts[name] === true;
     }
 
-    function safeTerminalAssessment(waiter, identifiers) {
+    function safeTerminalAssessment(waiter, identifiers, entry = null) {
         if (!waiter) return { satisfied: false, reasons: ["waiter_missing"] };
         const reasons = [];
-        if (waiter.action !== "qualification_wait") reasons.push("action_mismatch");
+        if (!resultQualified(waiter, entry, "qualification_wait")) {
+            reasons.push("waiter_receipt_unqualified");
+        }
         if (waiter.transitionId !== identifiers.transitionId) {
             reasons.push("transition_id_mismatch");
         }
@@ -495,8 +503,8 @@ async function runRenderScaleTuningLive(context) {
         return { satisfied: reasons.length === 0, reasons };
     }
 
-    function safeTerminal(waiter, identifiers) {
-        return safeTerminalAssessment(waiter, identifiers).satisfied;
+    function safeTerminal(waiter, identifiers, entry = null) {
+        return safeTerminalAssessment(waiter, identifiers, entry).satisfied;
     }
 
     function scalar(value) {
@@ -536,15 +544,21 @@ async function runRenderScaleTuningLive(context) {
         };
     }
 
-    function recoveryAssessment(root, apply, waiter, identifiers) {
-        const safety = safeTerminalAssessment(waiter, identifiers);
+    function recoveryAssessment(root, apply, waiter, identifiers,
+        applyEntry = null, waiterEntry = null) {
+        const safety = safeTerminalAssessment(waiter, identifiers, waiterEntry);
         const timeline = waiter && waiter.replacementTimeline;
         const terminal = timeline && timeline.terminal;
         const proof = terminal && terminal.presentationProof;
         const reasons = [];
         if (!root || root.ok !== true) reasons.push("scenario_not_ok");
         if (!apply) reasons.push("apply_missing");
-        else if (apply.accepted !== true) reasons.push("apply_not_accepted");
+        else {
+            if (!resultQualified(apply, applyEntry, "apply")) {
+                reasons.push("apply_receipt_unqualified");
+            }
+            if (apply.accepted !== true) reasons.push("apply_not_accepted");
+        }
         if (!waiter) reasons.push("waiter_missing");
         else if (waiter.satisfied !== true) reasons.push("waiter_not_satisfied");
         reasons.push(...safety.reasons.map((reason) => `safe_terminal:${reason}`));
@@ -642,8 +656,8 @@ async function runRenderScaleTuningLive(context) {
         };
     }
 
-    function recoverableTerminal(waiter, identifiers) {
-        if (!waiter || waiter.action !== "qualification_wait" ||
+    function recoverableTerminal(waiter, identifiers, entry = null) {
+        if (!resultQualified(waiter, entry, "qualification_wait") ||
             waiter.transitionId !== identifiers.transitionId ||
             waiter.ownerId !== identifiers.ownerId ||
             !waiter.upscalingSnapshot ||
@@ -1253,9 +1267,13 @@ async function runRenderScaleTuningLive(context) {
             expectedBuildId: buildId,
         });
         retain(`${runId}:recovery:${identifiers.transitionId}`, status.envelope);
+        if (!directResultQualified(status, "qualification_status")) {
+            throw new Error("terminal_status_receipt_unqualified");
+        }
         const qualification = status.root.qualification;
         const waiter = qualification && qualification.lastEvidence;
         if (qualification && qualification.active === false && waiter &&
+            resultQualified(waiter, null, "qualification_wait") &&
             waiter.transitionId === identifiers.transitionId &&
             waiter.ownerId === identifiers.ownerId) {
             return waiter;
@@ -1270,6 +1288,7 @@ async function runRenderScaleTuningLive(context) {
         });
         retain(`${runId}:recovery:${identifiers.transitionId}:close-status`,
             status.envelope);
+        if (!directResultQualified(status, "qualification_status")) return;
         const qualification = status.root.qualification;
         if (qualification && qualification.active === true &&
             qualification.transitionId === identifiers.transitionId &&
@@ -1360,7 +1379,9 @@ async function runRenderScaleTuningLive(context) {
         const diagnostic = scenarioDiagnostic(
             response.root, steps, `${receiptKey}:scenario`);
         const assessment = recoveryAssessment(
-            response.root, apply, waiter, identifiers);
+            response.root, apply, waiter, identifiers,
+            resultEntry(response.root, "recovery-profile-apply"),
+            resultEntry(response.root, "qualification-wait"));
         const recovered = assessment.decision.satisfied;
         const evidence = {
             status: recovered ? "RECOVERED" : "FAILED",
@@ -1824,6 +1845,7 @@ async function runRenderScaleTuningLive(context) {
         let projection;
         let diagnostic;
         let entries = new Map();
+        let waiterEntry = null;
         let cpuOwnership = row.ordinal === 1 ? {
             status: "UNPROVEN",
             sessionId: null,
@@ -1891,6 +1913,7 @@ async function runRenderScaleTuningLive(context) {
                 }
             }
             waiter = entries.get("qualification-wait");
+            waiterEntry = resultEntry(response.root, "qualification-wait");
             projection = waiter ? transitionProjection(waiter, target) : null;
             diagnostic = scenarioDiagnostic(response.root, steps, receiptKey);
             let traceEvidence = null;
@@ -1958,12 +1981,20 @@ async function runRenderScaleTuningLive(context) {
         if (cpuOwnership && cpuOwnership.status !== "MATCHED_ACTIVE") {
             throw diagnosticError("cpu_owner_identity_unproven", cpuOwnership);
         }
+        const terminalQualification = safeTerminalAssessment(
+            waiter, identifiers, waiterEntry);
+        if (terminalQualification.reasons.includes("waiter_receipt_unqualified")) {
+            throw diagnosticError("transition_terminal_receipt_unqualified", {
+                ...diagnostic,
+                terminalQualification,
+            });
+        }
         let recovery = null;
         let nextBoundary;
-        if (safeTerminal(waiter, identifiers)) {
+        if (terminalQualification.satisfied) {
             nextBoundary = terminalBoundary(waiter);
         } else {
-            if (!recoverableTerminal(waiter, identifiers)) {
+            if (!recoverableTerminal(waiter, identifiers, waiterEntry)) {
                 throw new Error("transition_unsafe");
             }
             try {

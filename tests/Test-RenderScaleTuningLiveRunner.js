@@ -242,7 +242,8 @@ function createMock(semanticFailureOrdinal, receiptTransform = null,
         }
         if (step.label === "profile-apply") return { apply: { disposition: { name: "queued" } } };
         if (step.label === "recovery-profile-apply") {
-            return { action: "apply", accepted: true, disposition: "queued" };
+            return { action: "apply", accepted: true, disposition: "queued",
+                producer: { buildId } };
         }
         return {};
     }
@@ -2089,6 +2090,59 @@ async function testCleanupPostconditionsRemainAuthoritative() {
     "An active post-cleanup owner was reported as a completed pass.");
 }
 
+async function testMeasuredTerminalRequiresQualifiedReceiptBeforeNextMutation() {
+    const cases = [
+        ["missing-producer", (entry) => { delete entry.result.producer; }],
+        ["wrong-build", (entry) => {
+            entry.result.producer.buildId = "f".repeat(64);
+        }],
+        ["payload-failed", (entry) => { entry.result.ok = false; }],
+        ["wrapper-failed", (entry) => { entry.ok = false; }],
+        ["wrong-action", (entry) => { entry.result.action = "qualification_status"; }],
+        ["foreign-owner", (entry) => { entry.result.ownerId = "foreign-owner"; }],
+    ];
+    for (const variant of ["nvidia", "amd"]) {
+        const matrix = JSON.parse(fs.readFileSync(path.join(repositoryRoot,
+            "skills", `renderscale-tuning-${variant}`, "references",
+            "matrix.v1.json")));
+        for (const [name, mutate] of cases) {
+            let injected = false;
+            const mock = createMock(0, null, (root, args, state) => {
+                if (!injected && !state.recovery && state.transitionOrdinal === 2 &&
+                    !args.steps.some((step) =>
+                        step.label === "baseline-stress-start")) {
+                    injected = true;
+                    mutate(root.results.find((entry) =>
+                        entry.label === "qualification-wait"));
+                }
+                return root;
+            });
+            const runId = `${variant}-terminal-${name}`;
+            const result = await runRenderScaleTuningLive({
+                ...mock.context, variant, runId, buildId,
+                positioningRoot: variant === "amd" ? positioningRoot({
+                    supportedFSRRuntimeMask: 1,
+                    fsrRuntimeUnavailableConditions: [{ mask: 0 }, { mask: 1 }],
+                }) : positioningRoot(),
+                matrix,
+            });
+            const measuredApplies = mock.scenarioCalls.flatMap((call) => call.steps)
+                .filter((step) => step.label === "profile-apply");
+            const recoveryApplies = mock.scenarioCalls.flatMap((call) => call.steps)
+                .filter((step) => step.label === "recovery-profile-apply");
+            const interruptedLane = result.lanes.find((lane) =>
+                lane.status === "INTERRUPTED");
+            const retainedReceipt = interruptedLane && mock.stores.get(
+                `${runId}:${interruptedLane.id}:pass-1:transition-2`);
+            const pass = interruptedLane && interruptedLane.passes[0];
+            assert(result.status === "INTERRUPTED" && measuredApplies.length === 3 &&
+                recoveryApplies.length === 0 && retainedReceipt &&
+                pass.ownership.cpu && pass.ownership.cpu.active === false,
+            `Unqualified ${variant} terminal authorized a later mutation or lost custody: ${name}`);
+        }
+    }
+}
+
 async function testCleanupStatusesRequireQualifiedReceipts() {
     const matrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",
@@ -2308,8 +2362,6 @@ async function testUnsafeTransitionRestoresBaselineAndContinues() {
     const mock = createMock(0, (receipt, context) => {
         if (!context.baseline && !context.recovery &&
             ((context.transitionOrdinal - 1) % 33) + 1 === failOrdinal) {
-            receipt.ok = false;
-            receipt.error = "qualification reached a terminal state";
             receipt.satisfied = false;
             receipt.outcome = "terminal_failure";
             receipt.failureReasons = [
@@ -2384,8 +2436,6 @@ async function testAmdUnsafeTransitionUsesLaneBaseline() {
     const mock = createMock(0, (receipt, context) => {
         if (!injected && !context.baseline && !context.recovery) {
             injected = true;
-            receipt.ok = false;
-            receipt.error = "qualification reached a terminal state";
             receipt.satisfied = false;
             receipt.outcome = "terminal_failure";
             receipt.failureReasons = [
@@ -2465,8 +2515,6 @@ async function testFailedRecoveryStopsLaterTransitions() {
         }
         if (!injected && !context.baseline && !context.recovery) {
             injected = true;
-            receipt.ok = false;
-            receipt.error = "qualification reached a terminal state";
             receipt.satisfied = false;
             receipt.outcome = "terminal_failure";
             receipt.cleanupDrained = false;
@@ -3372,6 +3420,7 @@ Promise.all([testNvidia(), testAmd(), testAmdUnsupportedTraceContinues(),
     testCleanupPostconditionsRemainAuthoritative(),
     testCleanupStatusesRequireQualifiedReceipts(),
     testCleanupFailureCanBeConfirmedByQualifiedStatus(),
+    testMeasuredTerminalRequiresQualifiedReceiptBeforeNextMutation(),
     testFailedProfilerDisableRequiresProfilerInactivity(),
     testProfilerStatusRequiresQualifiedProof(),
     testMissingCleanupPostStatusRetainsDecision(),
