@@ -34,7 +34,7 @@ $differentShaderSource = 'B' * 64
 $preset = 'C' * 64
 $featureSet = 'D' * 64
 
-function New-CatalogRestoreRecoveryFixture([string]$Label) {
+function New-CatalogRestoreRecoveryFixture([string]$Label, [switch]$Unchanged) {
     $fixtureCatalog = Join-Path $resolvedTestRoot ($Label + '-catalog')
     $fixtureCache = Join-Path $resolvedTestRoot (Join-Path ($Label + '-live') 'ShaderCache')
     $fixtureEvidence = Join-Path $resolvedTestRoot ($Label + '-evidence')
@@ -46,7 +46,9 @@ function New-CatalogRestoreRecoveryFixture([string]$Label) {
         ShaderCacheAbi = "abi-$Label"; ShaderSourceSha256 = ('E' * 64); BlockingProcessNames = $blockers
         Confirm = $false; Compact = $true; NoExit = $true
     }
-    [IO.File]::WriteAllBytes((Join-Path $fixtureCache 'generated.bin'), [Text.Encoding]::UTF8.GetBytes("generated-$Label"))
+    if (-not $Unchanged) {
+        [IO.File]::WriteAllBytes((Join-Path $fixtureCache 'generated.bin'), [Text.Encoding]::UTF8.GetBytes("generated-$Label"))
+    }
     $working = & $transactionTool inspect -CachePath $fixtureCache -NoExit | ConvertFrom-Json -Depth 30
     $planPath = Join-Path $fixtureEvidence 'shader-cache-task.plan.json'
     $plan = Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json -Depth 40
@@ -307,6 +309,36 @@ try {
     $pointerPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $pointerFixture.planPath -Encoding utf8
     $pointerComplete = Invoke-Catalog @{ Command='complete';CatalogRoot=$pointerFixture.catalog;CachePath=$pointerFixture.cache;EvidenceDirectory=$pointerFixture.evidence;WorkingSetStatus='unverified';BlockingProcessNames=$blockers;Confirm=$false;Compact=$true;NoExit=$true }
     Assert-Test ($pointerComplete.ok -and $pointerComplete.state -eq 'complete' -and [IO.Path]::GetFullPath([string]$pointerComplete.data.task.workingTree.preservedPath) -eq [IO.Path]::GetFullPath([string]$pointerFixture.restore.data.displacedPath)) 'completion revalidates and accepts an exact persisted restore pointer after interruption'
+
+    foreach ($pointerConflictCase in @(
+        [pscustomobject]@{ label='persisted-pointer-malformed'; malformed=$true; unchanged=$false; promote=$false },
+        [pscustomobject]@{ label='persisted-pointer-foreign'; malformed=$false; unchanged=$false; promote=$true },
+        [pscustomobject]@{ label='persisted-pointer-unchanged-malformed'; malformed=$true; unchanged=$true; promote=$true },
+        [pscustomobject]@{ label='persisted-pointer-unchanged-foreign'; malformed=$false; unchanged=$true; promote=$false }
+    )) {
+        $conflictFixture = New-CatalogRestoreRecoveryFixture $pointerConflictCase.label -Unchanged:$pointerConflictCase.unchanged
+        $conflictPlan = Get-Content -LiteralPath $conflictFixture.planPath -Raw | ConvertFrom-Json -Depth 40
+        $conflictPlan | Add-Member -NotePropertyName restoreReceiptPath -NotePropertyValue ([string]$conflictFixture.restore.data.restoreReceiptPath) -Force
+        $conflictPlan.state = 'restored'
+        $conflictPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $conflictFixture.planPath -Encoding utf8
+        $extraReceiptPath = Join-Path $conflictFixture.evidence 'shader-cache-restore.conflicting-evidence.receipt.json'
+        if ($pointerConflictCase.malformed) {
+            Set-Content -LiteralPath $extraReceiptPath -Value '{' -Encoding utf8
+        }
+        else {
+            $extraReceipt = Get-Content -LiteralPath ([string]$conflictFixture.restore.data.restoreReceiptPath) -Raw | ConvertFrom-Json -Depth 30
+            $extraReceipt.transactionId = 'conflicting-evidence'
+            $extraReceipt | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $extraReceiptPath -Encoding utf8
+        }
+        $beforeConflictCatalog = Invoke-Catalog @{ Command='list';CatalogRoot=$conflictFixture.catalog;Compact=$true;NoExit=$true }
+        $pointerConflict = Invoke-Catalog @{ Command='complete';CatalogRoot=$conflictFixture.catalog;CachePath=$conflictFixture.cache;EvidenceDirectory=$conflictFixture.evidence;WorkingSetStatus='known-working';Promote=$pointerConflictCase.promote;BlockingProcessNames=$blockers;Confirm=$false;Compact=$true;NoExit=$true }
+        $afterConflictCatalog = Invoke-Catalog @{ Command='list';CatalogRoot=$conflictFixture.catalog;Compact=$true;NoExit=$true }
+        Assert-Test (-not $pointerConflict.ok -and $pointerConflict.errors[0] -match 'conflicts with other recovery evidence' -and
+            -not (Test-Path -LiteralPath (Join-Path $conflictFixture.evidence 'shader-cache-task.completion.json')) -and
+            (Test-Path -LiteralPath ([string]$conflictFixture.restore.data.restoreReceiptPath) -PathType Leaf) -and
+            (Test-Path -LiteralPath ([string]$conflictFixture.restore.data.displacedPath) -PathType Container) -and
+            @($afterConflictCatalog.data.snapshots).Count -eq @($beforeConflictCatalog.data.snapshots).Count) "saved-pointer recovery rejects $($pointerConflictCase.label) conflict without completion, promotion, replay, or evidence loss"
+    }
 
     $liveDriftFixture = New-CatalogRestoreRecoveryFixture 'live-drift'
     'drift' | Set-Content -LiteralPath (Join-Path $liveDriftFixture.cache 'unexpected.bin') -Encoding utf8
