@@ -68,9 +68,22 @@ observation/status. Those calls may proceed when listener and process identity
 are verified even if build or deployed-artifact provenance is unavailable.
 They do not broaden the mutation boundary.
 
-`ok` reflects transport success unless `-RequireSuccess` is supplied. Every
-call also reports `transportOk` and a normalized `semantic` result, so an API
-payload such as `idempotency_conflict` cannot be mistaken for successful work.
+Every `call` applies semantic qualification: `ok` is true only when both the
+transport and the action-specific semantic contract succeed. `transportOk`
+reports the transport result independently. `-RequireSuccess` additionally
+requests an explicit diagnostic when a response has no recognized semantic
+outcome; it does not relax or enable the semantic gate. For example, both calls
+below return `transportOk=true` and `ok=false` when the transport succeeds but
+the payload is semantically unverified; the second also requires the explicit
+unverified-outcome diagnostic:
+
+```powershell
+& $tool call -Tool inspect -ArgumentsJson '{"kind":"unknown"}' -RuntimePath $runtime
+& $tool call -Tool inspect -ArgumentsJson '{"kind":"unknown"}' -RuntimePath $runtime -RequireSuccess
+```
+
+Thus an API payload such as `idempotency_conflict` cannot be mistaken for
+successful work with or without the switch.
 The `communityshaders.profiler` bridge has a contract-specific adapter because
 its legacy response does not carry a generic top-level `ok`: `status` must
 contain a frame-bearing status object, while `enable` and `disable` must report

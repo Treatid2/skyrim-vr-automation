@@ -14,32 +14,99 @@ function Get-DevBenchSemanticStatus {
     $affirmativeSignals = [Collections.Generic.List[string]]::new()
     $replaySchedulerReceipts = [Collections.Generic.List[string]]::new()
     $explicitOutcomeEvidence = [Collections.Generic.List[string]]::new()
+    $rejectedOutcomeEvidence = [Collections.Generic.List[string]]::new()
     $guardCodes = @('producer_mismatch', 'contract_mismatch', 'unsupported_contract_major', 'idempotency_conflict')
     $successNames = @('success', 'ok', 'ready', 'completed', 'accepted', 'idle', 'available')
     $transientNames = @('service_unavailable', 'initializing', 'starting', 'waiting_for_safe_point', 'loading_transition', 'relatch_pending', 'compiling', 'pending', 'queued', 'running')
 
-    function Test-ExplicitOutcomeValue($Value) {
-        if ($null -eq $Value) { return $false }
-        if ($Value -is [bool]) { return $Value }
-        if ($Value -is [string] -or $Value -is [ValueType]) { return $false }
-        if ($Value -is [Collections.IDictionary]) {
-            $evidenceProperties = @($Value.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Key; Value = $_.Value } })
-        }
-        elseif ($Value -is [Collections.IEnumerable] -and $Value -isnot [pscustomobject]) {
-            foreach ($entry in $Value) { if (Test-ExplicitOutcomeValue $entry) { return $true } }
-            return $false
-        }
-        else {
-            $evidenceProperties = @($Value.PSObject.Properties)
-        }
-        foreach ($property in $evidenceProperties) {
-            $name = [string]$property.Name
-            if ($name -in @('ok', 'success', 'passed', 'failed', 'aborted', 'code', 'state', 'status', 'resultStatus') -and $null -ne $property.Value) {
-                return $true
+    function Get-ExplicitOutcomeAssessment($Value, [string]$Path) {
+        $positive = [Collections.Generic.List[string]]::new()
+        $rejected = [Collections.Generic.List[string]]::new()
+
+        function Visit-OutcomeValue($Node, [string]$NodePath, [bool]$Required) {
+            if ($null -eq $Node) {
+                if ($Required) { $rejected.Add("$NodePath is null") }
+                return
             }
-            if (Test-ExplicitOutcomeValue $property.Value) { return $true }
+            if ($Node -is [bool]) {
+                if ($Node) { $positive.Add($NodePath) } else { $rejected.Add("$NodePath is Boolean false") }
+                return
+            }
+            if ($Node -is [string] -or $Node -is [ValueType]) {
+                if ($Required) { $rejected.Add("$NodePath contains no typed outcome evidence") }
+                return
+            }
+            if ($Node -is [Collections.IDictionary]) {
+                $properties = @($Node.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Key; Value = $_.Value } })
+            }
+            elseif ($Node -is [Collections.IEnumerable] -and $Node -isnot [pscustomobject]) {
+                $entries = @($Node)
+                if ($entries.Count -eq 0) { $rejected.Add("$NodePath is empty"); return }
+                for ($index = 0; $index -lt $entries.Count; $index++) {
+                    Visit-OutcomeValue $entries[$index] "$NodePath[$index]" $true
+                }
+                return
+            }
+            else {
+                $properties = @($Node.PSObject.Properties)
+            }
+
+            $positiveBefore = $positive.Count
+            $rejectedBefore = $rejected.Count
+            foreach ($property in $properties) {
+                $name = [string]$property.Name
+                $child = $property.Value
+                $childPath = "$NodePath.$name"
+                if ($name -in @('ok', 'success', 'passed')) {
+                    if ($child -isnot [bool]) { $rejected.Add("$childPath is not Boolean") }
+                    elseif ($child) { $positive.Add($childPath) }
+                    else { $rejected.Add("$childPath is false") }
+                }
+                elseif ($name -in @('failed', 'aborted')) {
+                    if ($child -isnot [bool]) { $rejected.Add("$childPath is not Boolean") }
+                    elseif ($child) { $rejected.Add("$childPath is true") }
+                }
+                elseif ($name -in @('code', 'state', 'status', 'resultStatus')) {
+                    if ($child -is [string]) {
+                        if ([string]::IsNullOrWhiteSpace($child) -or $child -notin $successNames) {
+                            $rejected.Add("$childPath is not a success value")
+                        }
+                        else { $positive.Add($childPath) }
+                    }
+                    elseif ($name -in @('status', 'resultStatus') -and
+                        ($child -is [pscustomobject] -or $child -is [Collections.IDictionary])) {
+                        $statusNameProperty = $child.PSObject.Properties['name']
+                        $statusValueProperty = $child.PSObject.Properties['value']
+                        if (-not $statusNameProperty -or $statusNameProperty.Value -isnot [string] -or
+                            [string]$statusNameProperty.Value -notin $successNames) {
+                            $rejected.Add("$childPath.name is not a success value")
+                        }
+                        elseif ($statusValueProperty -and
+                            ($null -eq $statusValueProperty.Value -or
+                                $statusValueProperty.Value.GetType() -notin @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64]) -or
+                                [int64]$statusValueProperty.Value -ne 0)) {
+                            $rejected.Add("$childPath.value is not integer zero")
+                        }
+                        else { $positive.Add("$childPath.name") }
+                    }
+                    else { $rejected.Add("$childPath is not a supported outcome value") }
+                }
+                elseif ($child -is [pscustomobject] -or $child -is [Collections.IDictionary] -or
+                    ($child -is [Collections.IEnumerable] -and $child -isnot [string])) {
+                    Visit-OutcomeValue $child $childPath $false
+                }
+            }
+            if ($Required -and $positive.Count -eq $positiveBefore -and $rejected.Count -eq $rejectedBefore) {
+                $rejected.Add("$NodePath contains no affirmative outcome evidence")
+            }
         }
-        return $false
+
+        Visit-OutcomeValue $Value $Path $true
+        return [pscustomobject][ordered]@{
+            affirmative = $positive.Count -gt 0 -and $rejected.Count -eq 0
+            positivePaths = @($positive)
+            rejectedPaths = @($rejected)
+        }
     }
 
     function Visit-Value($Value, [string]$Path) {
@@ -66,8 +133,15 @@ function Get-DevBenchSemanticStatus {
         }
         foreach ($evidenceName in @('semantic', 'postconditions', 'outcomeChecks', 'assertions')) {
             $evidenceProperty = @($properties | Where-Object Name -eq $evidenceName | Select-Object -First 1)
-            if ($evidenceProperty.Count -eq 1 -and (Test-ExplicitOutcomeValue $evidenceProperty[0].Value)) {
-                $explicitOutcomeEvidence.Add("$Path.$evidenceName")
+            if ($evidenceProperty.Count -eq 1) {
+                $evidencePath = "$Path.$evidenceName"
+                $assessment = Get-ExplicitOutcomeAssessment $evidenceProperty[0].Value $evidencePath
+                if ($assessment.affirmative) { $explicitOutcomeEvidence.Add($evidencePath) }
+                else {
+                    foreach ($rejectedPath in @($assessment.rejectedPaths)) {
+                        $rejectedOutcomeEvidence.Add([string]$rejectedPath)
+                    }
+                }
             }
         }
 
@@ -180,6 +254,7 @@ function Get-DevBenchSemanticStatus {
     finally {
         Remove-Variable semanticKnown -Scope Script -ErrorAction SilentlyContinue
     }
+    if ($rejectedOutcomeEvidence.Count -gt 0) { $explicitOutcomeEvidence.Clear() }
     $schedulerOnly = $replaySchedulerReceipts.Count -gt 0 -and $explicitOutcomeEvidence.Count -eq 0 -and $reasons.Count -eq 0
     if ($schedulerOnly) { $known = $false }
     $guarded = @($codes | Where-Object { $_ -in $guardCodes }).Count -gt 0
@@ -198,6 +273,7 @@ function Get-DevBenchSemanticStatus {
         schedulerOnly = $schedulerOnly
         schedulerReceiptPaths = @($replaySchedulerReceipts)
         explicitOutcomeEvidence = @($explicitOutcomeEvidence)
+        rejectedOutcomeEvidence = @($rejectedOutcomeEvidence | Select-Object -Unique)
         affirmative = $affirmativeSignals.Count -gt 0
         affirmativePaths = @($affirmativeSignals | Select-Object -Unique)
     }
@@ -246,8 +322,8 @@ function Get-DevBenchCallSemanticStatus {
         if ([string]::IsNullOrWhiteSpace($requestedName)) {
             $reasons.Add('request.name is required for an exact load receipt')
         }
-        $payload = if ($payloads.Count -eq 1 -and $null -ne $payloads[0] -and
-            $payloads[0] -isnot [string] -and $payloads[0] -isnot [ValueType]) {
+        $payload = if ($payloads.Count -eq 1 -and
+            ($payloads[0] -is [pscustomobject] -or $payloads[0] -is [Collections.IDictionary])) {
             $payloads[0]
         } else {
             $reasons.Add('content must contain exactly one structured load receipt')
@@ -299,8 +375,8 @@ function Get-DevBenchCallSemanticStatus {
         if ($semantic.known -and -not $semantic.ok) {
             foreach ($reason in @($semantic.reasons)) { $reasons.Add([string]$reason) }
         }
-        $payload = if ($payloads.Count -eq 1 -and $null -ne $payloads[0] -and
-            $payloads[0] -isnot [string] -and $payloads[0] -isnot [ValueType]) {
+        $payload = if ($payloads.Count -eq 1 -and
+            ($payloads[0] -is [pscustomobject] -or $payloads[0] -is [Collections.IDictionary])) {
             $payloads[0]
         }
         else {
@@ -309,24 +385,24 @@ function Get-DevBenchCallSemanticStatus {
         }
         $status = $null
         $guardStatuses = @('preflight_required', 'preflight_expired', 'state_revision_mismatch', 'producer_mismatch', 'contract_mismatch', 'unsupported_contract_major', 'idempotency_conflict')
-        if ($payload) {
+        if ($null -ne $payload) {
             $commandProperty = $payload.PSObject.Properties['command']
-            $commandActionProperty = if ($commandProperty -and $null -ne $commandProperty.Value -and
-                $commandProperty.Value -isnot [string] -and $commandProperty.Value -isnot [ValueType]) {
+            $commandActionProperty = if ($commandProperty -and
+                ($commandProperty.Value -is [pscustomobject] -or $commandProperty.Value -is [Collections.IDictionary])) {
                 $commandProperty.Value.PSObject.Properties['action']
             } else { $null }
             if (-not $commandActionProperty -or [string]$commandActionProperty.Value -cne 'execute') {
                 $reasons.Add('content.command.action is not the exact execute action')
             }
             $resultProperty = $payload.PSObject.Properties['result']
-            $result = if ($resultProperty -and $null -ne $resultProperty.Value -and
-                $resultProperty.Value -isnot [string] -and $resultProperty.Value -isnot [ValueType]) {
+            $result = if ($resultProperty -and
+                ($resultProperty.Value -is [pscustomobject] -or $resultProperty.Value -is [Collections.IDictionary])) {
                 $resultProperty.Value
             } else {
                 $reasons.Add('content.result is not a structured weather execute result')
                 $null
             }
-            if ($result) {
+            if ($null -ne $result) {
                 $statusProperty = $result.PSObject.Properties['status']
                 $status = if ($statusProperty) { [string]$statusProperty.Value } else { $null }
                 if ([string]::IsNullOrWhiteSpace($status) -or $status -cne 'success') {
@@ -360,22 +436,23 @@ function Get-DevBenchCallSemanticStatus {
         if ($semantic.known -and -not $semantic.ok) {
             foreach ($reason in @($semantic.reasons)) { $reasons.Add([string]$reason) }
         }
-        $payload = if ($payloads.Count -eq 1 -and $null -ne $payloads[0] -and
-            $payloads[0] -isnot [string] -and $payloads[0] -isnot [ValueType]) {
+        $payload = if ($payloads.Count -eq 1 -and
+            ($payloads[0] -is [pscustomobject] -or $payloads[0] -is [Collections.IDictionary])) {
             $payloads[0]
         }
         else {
             $reasons.Add('content must contain exactly one structured record stop receipt')
             $null
         }
-        if ($payload) {
+        if ($null -ne $payload) {
             $actionProperty = $payload.PSObject.Properties['action']
             if (-not $actionProperty -or [string]$actionProperty.Value -cne 'stop') {
                 $reasons.Add('content.action is not the exact record stop action')
             }
             $pathProperty = $payload.PSObject.Properties['path']
-            if (-not $pathProperty -or [string]::IsNullOrWhiteSpace([string]$pathProperty.Value)) {
-                $reasons.Add('content.path is missing from the persisted recording receipt')
+            if (-not $pathProperty -or $pathProperty.Value -isnot [string] -or
+                [string]::IsNullOrWhiteSpace([string]$pathProperty.Value)) {
+                $reasons.Add('content.path is not a non-empty string in the persisted recording receipt')
             }
         }
         return [pscustomobject][ordered]@{
@@ -400,15 +477,15 @@ function Get-DevBenchCallSemanticStatus {
         if ($semantic.known -and -not $semantic.ok) {
             foreach ($reason in @($semantic.reasons)) { $reasons.Add([string]$reason) }
         }
-        $payload = if ($payloads.Count -eq 1 -and $null -ne $payloads[0] -and
-            $payloads[0] -isnot [string] -and $payloads[0] -isnot [ValueType]) {
+        $payload = if ($payloads.Count -eq 1 -and
+            ($payloads[0] -is [pscustomobject] -or $payloads[0] -is [Collections.IDictionary])) {
             $payloads[0]
         }
         else {
             $reasons.Add('content must contain exactly one structured VR tracked-set stop receipt')
             $null
         }
-        if ($payload) {
+        if ($null -ne $payload) {
             $actionProperty = $payload.PSObject.Properties['action']
             $deviceProperty = $payload.PSObject.Properties['device']
             $notActiveProperty = $payload.PSObject.Properties['notActive']
@@ -468,12 +545,12 @@ function Get-DevBenchCallSemanticStatus {
         if ($semantic.known -and -not $semantic.ok) {
             foreach ($reason in @($semantic.reasons)) { $reasons.Add([string]$reason) }
         }
-        $payload = if ($payloads.Count -eq 1 -and $null -ne $payloads[0] -and
-            $payloads[0] -isnot [string] -and $payloads[0] -isnot [ValueType]) { $payloads[0] } else {
+        $payload = if ($payloads.Count -eq 1 -and
+            ($payloads[0] -is [pscustomobject] -or $payloads[0] -is [Collections.IDictionary])) { $payloads[0] } else {
             $reasons.Add('content must contain exactly one structured record start receipt')
             $null
         }
-        if ($payload) {
+        if ($null -ne $payload) {
             $actionProperty = $payload.PSObject.Properties['action']
             $recordingProperty = $payload.PSObject.Properties['recording']
             if (-not $actionProperty -or [string]$actionProperty.Value -cne 'start') { $reasons.Add('content.action is not the exact record start action') }
@@ -506,18 +583,20 @@ function Get-DevBenchCallSemanticStatus {
         if ($semantic.known -and -not $semantic.ok) {
             foreach ($reason in @($semantic.reasons)) { $reasons.Add([string]$reason) }
         }
-        $payload = if ($payloads.Count -eq 1 -and $null -ne $payloads[0] -and
-            $payloads[0] -isnot [string] -and $payloads[0] -isnot [ValueType]) { $payloads[0] } else {
+        $payload = if ($payloads.Count -eq 1 -and
+            ($payloads[0] -is [pscustomobject] -or $payloads[0] -is [Collections.IDictionary])) { $payloads[0] } else {
             $reasons.Add('content must contain exactly one structured screenshot capabilities receipt')
             $null
         }
-        if ($payload) {
+        if ($null -ne $payload) {
             if (-not $payload.PSObject.Properties['schema'] -or [string]$payload.schema -cne 'urn:csx:devbench:screenshot:1') {
                 $reasons.Add('content.schema is not the screenshot contract schema')
             }
             $limits = $payload.PSObject.Properties['limits']
-            $frames = if ($limits -and $null -ne $limits.Value -and $limits.Value -isnot [string] -and $limits.Value -isnot [ValueType]) { $limits.Value.PSObject.Properties['maximumSequenceFrames'] } else { $null }
-            $duration = if ($limits -and $null -ne $limits.Value -and $limits.Value -isnot [string] -and $limits.Value -isnot [ValueType]) { $limits.Value.PSObject.Properties['maximumSequenceDurationMs'] } else { $null }
+            $limitsObject = if ($limits -and ($limits.Value -is [pscustomobject] -or $limits.Value -is [Collections.IDictionary])) { $limits.Value } else { $null }
+            $frames = if ($null -ne $limitsObject) { $limitsObject.PSObject.Properties['maximumSequenceFrames'] } else { $null }
+            $duration = if ($null -ne $limitsObject) { $limitsObject.PSObject.Properties['maximumSequenceDurationMs'] } else { $null }
+            if ($null -eq $limitsObject) { $reasons.Add('content.limits is not a structured screenshot limits object') }
             $integralTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
             if (-not $frames -or $null -eq $frames.Value -or $frames.Value.GetType() -notin $integralTypes -or [uint64]$frames.Value -eq 0) {
                 $reasons.Add('content.limits.maximumSequenceFrames is not a positive integer')
@@ -657,7 +736,8 @@ function Get-DevBenchCallSemanticStatus {
         }
     }
 
-    if ($payloads.Count -ne 1 -or $null -eq $payloads[0] -or $payloads[0] -is [string] -or $payloads[0] -is [ValueType]) {
+    if ($payloads.Count -ne 1 -or
+        -not ($payloads[0] -is [pscustomobject] -or $payloads[0] -is [Collections.IDictionary])) {
         return $semantic
     }
     $payload = $payloads[0]
@@ -679,12 +759,12 @@ function Get-DevBenchCallSemanticStatus {
         $action = if ($Arguments.Contains('action')) { [string]$Arguments['action'] } else { '' }
         $renderScaleStatus = $payload.PSObject.Properties['status']
         $screenshotLimits = $payload.PSObject.Properties['limits']
-        $maximumSequenceFrames = if ($screenshotLimits -and $null -ne $screenshotLimits.Value -and
-            $screenshotLimits.Value -isnot [string] -and $screenshotLimits.Value -isnot [ValueType]) {
+        $maximumSequenceFrames = if ($screenshotLimits -and
+            ($screenshotLimits.Value -is [pscustomobject] -or $screenshotLimits.Value -is [Collections.IDictionary])) {
             $screenshotLimits.Value.PSObject.Properties['maximumSequenceFrames']
         } else { $null }
-        $maximumSequenceDurationMs = if ($screenshotLimits -and $null -ne $screenshotLimits.Value -and
-            $screenshotLimits.Value -isnot [string] -and $screenshotLimits.Value -isnot [ValueType]) {
+        $maximumSequenceDurationMs = if ($screenshotLimits -and
+            ($screenshotLimits.Value -is [pscustomobject] -or $screenshotLimits.Value -is [Collections.IDictionary])) {
             $screenshotLimits.Value.PSObject.Properties['maximumSequenceDurationMs']
         } else { $null }
         $integralTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
@@ -696,8 +776,8 @@ function Get-DevBenchCallSemanticStatus {
             ($ToolName -eq 'input' -and $action -eq 'status' -and $payload.PSObject.Properties['device']) -or
             ($ToolName -eq 'communityshaders.renderscale' -and $action -eq 'status' -and
                 $payload.PSObject.Properties['action'] -and [string]$payload.action -ceq 'status' -and
-                $renderScaleStatus -and $null -ne $renderScaleStatus.Value -and
-                $renderScaleStatus.Value -isnot [string] -and $renderScaleStatus.Value -isnot [ValueType]) -or
+                $renderScaleStatus -and
+                ($renderScaleStatus.Value -is [pscustomobject] -or $renderScaleStatus.Value -is [Collections.IDictionary])) -or
             $false
         if ($contractSatisfied) {
             $semantic.known = $true

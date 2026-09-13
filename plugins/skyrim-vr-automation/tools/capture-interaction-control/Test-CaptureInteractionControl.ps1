@@ -102,7 +102,8 @@ if ($Tool -eq 'communityshaders.screenshot') {
   else { $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='stop_requested'}} }
 } elseif ($Tool -eq 'record') {
   $correlationId = if ($argsObject.PSObject.Properties['correlationId']) { $argsObject.correlationId } else { $null }
-  $value=[pscustomobject]@{action=$argsObject.action;recording=($argsObject.action -ne 'stop');correlationId=$correlationId;path=$(if($argsObject.action -eq 'stop'){'recording.json'}else{$null})}
+  $recordingPath = if ($argsObject.action -ne 'stop') { $null } elseif ($env:CAPTURE_INTERACTION_MALFORMED_RECORD_STOP -eq '1') { $false } else { 'recording.json' }
+  $value=[pscustomobject]@{action=$argsObject.action;recording=($argsObject.action -ne 'stop');correlationId=$correlationId;path=$recordingPath}
 } elseif ($Tool -eq 'input' -and $argsObject.action -eq 'observe') {
   $value=[pscustomobject]@{action='observe';source='physical_openvr';frame=$frame}
 } elseif ($Tool -eq 'input' -and $argsObject.action -eq 'status' -and $argsObject.device -eq 'vrTrackedSet') {
@@ -136,6 +137,14 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     $rollback = & $entry start -SessionDirectory $rollbackSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
     Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START -ErrorAction SilentlyContinue
     Assert-Test (-not $rollback.ok -and $rollback.state -eq 'start-failed-rolled-back' -and $rollback.data.rolledBack -and $rollback.data.sessionId -and $rollback.data.recording.startReceipt.correlationId -eq $rollback.data.sessionId -and $rollback.data.recording.stopReceipt.path -eq 'recording.json' -and (Test-Path -LiteralPath $rollback.data.recoveryReceiptPath -PathType Leaf)) 'definite visual-start rejection reports qualified recording rollback and retains startup identity and receipts'
+
+    $env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START = '1'
+    $env:CAPTURE_INTERACTION_MALFORMED_RECORD_STOP = '1'
+    $malformedRollbackSession = Join-Path $root 'malformed-record-rollback-session'
+    $malformedRollback = & $entry start -SessionDirectory $malformedRollbackSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_MALFORMED_RECORD_STOP -ErrorAction SilentlyContinue
+    Assert-Test (-not $malformedRollback.ok -and $malformedRollback.state -eq 'start-failed-cleanup-uncertain' -and -not $malformedRollback.data.rolledBack -and $malformedRollback.data.ownership -eq 'cleanup-uncertain' -and $null -eq $malformedRollback.data.recording.stopReceipt -and $malformedRollback.data.cleanupErrors -match 'non-empty string') 'malformed recording-stop evidence cannot certify rollback or clear recording recovery ownership'
 
     $env:CAPTURE_INTERACTION_INDETERMINATE_SEQUENCE_START = '1'
     $indeterminateScreenshotSession = Join-Path $root 'indeterminate-screenshot-session'
@@ -181,6 +190,13 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     $stopped = & $entry stop -SessionDirectory $session -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
     Assert-Test ($stopped.ok -and $stopped.state -eq 'stopped' -and $stopped.data.recording.stopReceipt.path -eq 'recording.json') 'stop finalizes visual capture before state recording and persists receipts'
 
+    $malformedStopSession = Join-Path $root 'malformed-record-stop-session'
+    $malformedStopStarted = & $entry start -SessionDirectory $malformedStopSession -RuntimePath $runtime -VisualMode none -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
+    $env:CAPTURE_INTERACTION_MALFORMED_RECORD_STOP = '1'
+    $malformedStopped = & $entry stop -SessionDirectory $malformedStopSession -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_MALFORMED_RECORD_STOP -ErrorAction SilentlyContinue
+    Assert-Test ($malformedStopStarted.ok -and -not $malformedStopped.ok -and $malformedStopped.state -eq 'stopped-with-errors' -and $null -eq $malformedStopped.data.recording.stopReceipt -and $malformedStopped.errors -match 'non-empty string') 'malformed recording-stop evidence cannot produce successful normal capture teardown'
+
     $contradictorySession = Join-Path $root 'contradictory-terminal-session'
     $contradictoryStarted = & $entry start -SessionDirectory $contradictorySession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
     $env:CAPTURE_INTERACTION_CONTRADICT_TERMINAL = '1'
@@ -197,6 +213,7 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     $env:CAPTURE_INTERACTION_FAIL_STOP = '1'
     $diagnosticStopped = & $entry stop -SessionDirectory $diagnosticSession -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
     Remove-Item Env:CAPTURE_INTERACTION_FAIL_STOP -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_MALFORMED_RECORD_STOP -ErrorAction SilentlyContinue
     Assert-Test (-not $diagnosticStopped.ok -and $diagnosticStopped.errors -match 'vr-tracked-set-stop-contract-failed' -and $diagnosticStopped.errors -match 'record-stop-contract-failed') 'stop preserves semantic outcomes when a failed controller envelope has an empty errors array'
 
     [pscustomobject]@{ ok=$true; sessionPath=$started.data.statePath; actionCount=(Get-CaptureInteractionActionCatalog).actions.Count } | ConvertTo-Json -Compress

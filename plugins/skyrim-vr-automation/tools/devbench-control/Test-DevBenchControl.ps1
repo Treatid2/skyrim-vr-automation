@@ -53,6 +53,19 @@ $falseOutcomeReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ d
 Assert-Test (-not $falseOutcomeReplay.known -and $falseOutcomeReplay.schedulerOnly -and $falseOutcomeReplay.outcome -eq 'scheduler-complete-unverified') 'a false Boolean postcondition never verifies replay semantics'
 $falseOutcomeArrayReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 7; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; outcomeChecks = @($false) })
 Assert-Test (-not $falseOutcomeArrayReplay.known -and $falseOutcomeArrayReplay.schedulerOnly) 'an array containing only false outcomes never verifies replay semantics'
+$neutralOutcomeReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 8; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; postconditions = [pscustomobject]@{ failed = $false } })
+Assert-Test (-not $neutralOutcomeReplay.known -and $neutralOutcomeReplay.schedulerOnly -and $neutralOutcomeReplay.explicitOutcomeEvidence.Count -eq 0 -and $neutralOutcomeReplay.rejectedOutcomeEvidence.Count -gt 0) 'a neutral failed-false outcome object remains unverified rather than becoming positive replay proof'
+foreach ($mixedCase in @(
+    [pscustomobject]@{ values = @($true, $false) },
+    [pscustomobject]@{ values = @($false, $true) }
+)) {
+    $mixedOutcomeReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 9; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; outcomeChecks = $mixedCase.values })
+    Assert-Test (-not $mixedOutcomeReplay.known -and $mixedOutcomeReplay.schedulerOnly -and $mixedOutcomeReplay.explicitOutcomeEvidence.Count -eq 0) 'mixed true/false replay evidence cannot be promoted in either order'
+}
+$nestedMixedReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 10; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; semantic = [pscustomobject]@{ checks = @([pscustomobject]@{ passed = $true }, $false) } })
+Assert-Test (-not $nestedMixedReplay.known -and $nestedMixedReplay.schedulerOnly -and $nestedMixedReplay.rejectedOutcomeEvidence.Count -gt 0) 'nested mixed Boolean evidence cannot be neutralized by a positive sibling'
+$crossContainerMixedReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 11; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; postconditions = $false; assertions = @([pscustomobject]@{ passed = $true }) })
+Assert-Test (-not $crossContainerMixedReplay.known -and $crossContainerMixedReplay.schedulerOnly -and $crossContainerMixedReplay.explicitOutcomeEvidence.Count -eq 0) 'a positive assertion cannot neutralize a false sibling outcome container'
 $readOnlyInspect = Test-DevBenchReadOnlyRequest -ToolName inspect -Arguments @{ kind = 'scene' }
 $readOnlyMenu = Test-DevBenchReadOnlyRequest -ToolName menu -Arguments @{ action = 'list' }
 $mutatingMenu = Test-DevBenchReadOnlyRequest -ToolName menu -Arguments @{ action = 'open'; name = 'InventoryMenu' }
@@ -63,6 +76,8 @@ $renderScaleSemantic = Get-DevBenchCallSemanticStatus -ToolName 'communityshader
 Assert-Test ($renderScaleSemantic.known -and $renderScaleSemantic.ok -and $renderScaleSemantic.outcome -eq 'read-contract-satisfied') 'render-scale status recognizes its explicit structured read contract'
 $renderScaleMissingStatus = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.renderscale' -Arguments @{ action = 'status' } -Content @([pscustomobject]@{ action = 'status' })
 Assert-Test (-not $renderScaleMissingStatus.known) 'render-scale status rejects a response without structured status telemetry'
+$renderScaleArrayStatus = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.renderscale' -Arguments @{ action = 'status' } -Content @([pscustomobject]@{ action = 'status'; status = [object[]]@() })
+Assert-Test (-not $renderScaleArrayStatus.ok -and $renderScaleArrayStatus.outcome -ne 'read-contract-satisfied') 'render-scale status rejects an array replacing its required status object'
 $screenshotCapabilities = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = 3600000 } })
 Assert-Test ($screenshotCapabilities.known -and $screenshotCapabilities.ok -and $screenshotCapabilities.outcome -eq 'read-contract-satisfied') 'screenshot capabilities recognize exact sequence limits as a read contract'
 $screenshotFractionalLimit = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = 3600000.5 } })
@@ -75,6 +90,8 @@ $screenshotGenericWrongSchema = Get-DevBenchCallSemanticStatus -ToolName 'commun
 Assert-Test ($screenshotGenericWrongSchema.known -and -not $screenshotGenericWrongSchema.ok) 'generic success cannot bypass the screenshot capabilities schema'
 $screenshotGenericValid = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ ok = $true; schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = 3600000 } })
 Assert-Test ($screenshotGenericValid.known -and $screenshotGenericValid.ok) 'generic success remains compatible with a valid screenshot capabilities contract'
+$screenshotArrayLimits = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [object[]]@() })
+Assert-Test ($screenshotArrayLimits.known -and -not $screenshotArrayLimits.ok -and $screenshotArrayLimits.reasons -match 'not a structured screenshot limits object') 'screenshot capabilities rejects an array replacing its limits object'
 $screenshotRequest = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_get'; requestId = 'req-1' } -Content @([pscustomobject]@{ ok = $true; result = [pscustomobject]@{ requestId = 'req-1'; state = 'completed'; terminal = $true } })
 Assert-Test ($screenshotRequest.known -and $screenshotRequest.ok -and $screenshotRequest.outcome -eq 'read-contract-satisfied') 'screenshot request_get accepts one exact terminal request receipt through the real semantic classifier'
 $screenshotRunningRequest = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_get'; requestId = 'req-1' } -Content @([pscustomobject]@{ requestId = 'req-1'; state = 'running'; terminal = $false })
@@ -122,12 +139,29 @@ $recordMismatch = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ 
 Assert-Test ($recordMismatch.known -and -not $recordMismatch.ok) 'record start rejects a mismatched correlation identity'
 $recordGenericMismatch = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ ok = $true; action = 'start'; recording = $true; correlationId = 'other' })
 Assert-Test ($recordGenericMismatch.known -and -not $recordGenericMismatch.ok) 'generic success cannot bypass the record-start correlation contract'
+$recordArrayStart = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content (,@([pscustomobject]@{ action = 'start'; recording = $true; correlationId = 'capture-1' }))
+Assert-Test ($recordArrayStart.known -and -not $recordArrayStart.ok -and $recordArrayStart.reasons -match 'structured record start receipt') 'record start rejects a collection replacing its receipt object'
 foreach ($malformedOk in @('false', 0, $null, [pscustomobject]@{ value = $false })) {
     $malformedRecord = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ ok = $malformedOk; action = 'start'; recording = $true; correlationId = 'capture-1' })
     Assert-Test ($malformedRecord.known -and -not $malformedRecord.ok -and $malformedRecord.reasons -match 'not Boolean') 'record start rejects a present malformed generic outcome indicator'
 }
 $recordStop = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ action = 'stop'; sampleCount = 12; path = 'recording.json' })
 Assert-Test ($recordStop.known -and $recordStop.ok -and $recordStop.outcome -eq 'record-stop-contract-satisfied') 'record stop recognizes its exact persisted recording receipt without a generic ok field'
+foreach ($malformedPath in @(
+    [pscustomobject]@{ value = $false; name = 'Boolean false' },
+    [pscustomobject]@{ value = $true; name = 'Boolean true' },
+    [pscustomobject]@{ value = 42; name = 'numeric' },
+    [pscustomobject]@{ value = [object[]]@(); name = 'array' },
+    [pscustomobject]@{ value = [pscustomobject]@{ file = 'recording.json' }; name = 'object' },
+    [pscustomobject]@{ value = $null; name = 'null' },
+    [pscustomobject]@{ value = ''; name = 'empty string' },
+    [pscustomobject]@{ value = '   '; name = 'whitespace string' }
+)) {
+    $malformedRecordStop = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ action = 'stop'; path = $malformedPath.value })
+    Assert-Test ($malformedRecordStop.known -and -not $malformedRecordStop.ok -and $malformedRecordStop.reasons -match 'non-empty string') "record stop rejects a $($malformedPath.name) persisted locator"
+}
+$missingRecordStopPath = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ action = 'stop' })
+Assert-Test ($missingRecordStopPath.known -and -not $missingRecordStopPath.ok -and $missingRecordStopPath.reasons -match 'non-empty string') 'record stop rejects a missing persisted locator'
 $recordStopError = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ error = 'not recording'; state = 'idle' })
 Assert-Test ($recordStopError.known -and -not $recordStopError.ok -and $recordStopError.reasons -match 'not recording') 'record stop preserves its structured not-recording diagnostic'
 $recordStopErrors = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ action = 'stop'; path = 'recording.json'; errors = @('flush failed') })
@@ -144,8 +178,12 @@ $vrReleasePending = Get-DevBenchCallSemanticStatus -ToolName input -Arguments @{
 Assert-Test ($vrReleasePending.known -and -not $vrReleasePending.ok -and $vrReleasePending.reasons.Count -eq 3) 'VR releaseAll rejects incomplete restoration evidence'
 $vrReleaseForeign = Get-DevBenchCallSemanticStatus -ToolName input -Arguments @{ action = 'releaseAll'; device = 'vrTrackedSet'; owner = 'capture:1' } -Content @([pscustomobject]@{ action = 'stop'; device = 'vrTrackedSet'; stopped = $true; restored = $true; restorationPending = $false; owner = 'foreign'; reason = 'releaseAll' })
 Assert-Test ($vrReleaseForeign.known -and -not $vrReleaseForeign.ok -and $vrReleaseForeign.reasons -match 'owner') 'VR releaseAll never accepts completed restoration attributed to another owner'
+$vrReleaseArray = Get-DevBenchCallSemanticStatus -ToolName input -Arguments @{ action = 'releaseAll'; device = 'vrTrackedSet'; owner = 'capture:1' } -Content (,@([pscustomobject]@{ action = 'stop'; device = 'vrTrackedSet'; notActive = $true }))
+Assert-Test ($vrReleaseArray.known -and -not $vrReleaseArray.ok -and $vrReleaseArray.reasons -match 'structured VR tracked-set stop receipt') 'VR releaseAll rejects a collection replacing its ownership receipt object'
 $weatherSuccess = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.weather_api' -Arguments @{ action = 'execute' } -Content @([pscustomobject]@{ ok = $true; command = [pscustomobject]@{ action = 'execute' }; result = [pscustomobject]@{ status = 'success'; applied = $true; changed = $false } })
 Assert-Test ($weatherSuccess.known -and $weatherSuccess.ok -and $weatherSuccess.outcome -eq 'weather-execute-contract-satisfied') 'weather execute requires and accepts explicit applied success even when the state was unchanged'
+$weatherArrayCommand = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.weather_api' -Arguments @{ action = 'execute' } -Content @([pscustomobject]@{ ok = $true; command = @([pscustomobject]@{ action = 'execute' }); result = [pscustomobject]@{ status = 'success'; applied = $true } })
+Assert-Test ($weatherArrayCommand.known -and -not $weatherArrayCommand.ok -and $weatherArrayCommand.reasons -match 'command.action') 'weather execute rejects a collection replacing its command object'
 foreach ($guardStatus in @('preflight_required', 'preflight_expired', 'state_revision_mismatch')) {
     $weatherGuard = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.weather_api' -Arguments @{ action = 'execute' } -Content @([pscustomobject]@{ ok = $true; command = [pscustomobject]@{ action = 'execute' }; result = [pscustomobject]@{ status = $guardStatus; applied = $false; changed = $false } })
     Assert-Test ($weatherGuard.known -and -not $weatherGuard.ok -and $weatherGuard.guarded -and $weatherGuard.codes -contains $guardStatus) "weather execute rejects guarded non-applied status $guardStatus despite top-level ok"
@@ -154,6 +192,13 @@ $weatherNotApplied = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.
 Assert-Test ($weatherNotApplied.known -and -not $weatherNotApplied.ok -and $weatherNotApplied.outcome -eq 'weather-execute-contract-failed') 'weather execute never promotes status success without Boolean applied success'
 $weatherNestedError = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.weather_api' -Arguments @{ action = 'execute' } -Content @([pscustomobject]@{ ok = $true; command = [pscustomobject]@{ action = 'execute' }; result = [pscustomobject]@{ status = 'success'; applied = $true; error = 'commit failed' } })
 Assert-Test ($weatherNestedError.known -and -not $weatherNestedError.ok -and $weatherNestedError.reasons -match 'commit failed') 'weather execute rejects nested scalar failure evidence despite success and applied fields'
+foreach ($malformedWeatherResult in @(
+    [pscustomobject]@{ value = [object[]]@(); name = 'empty array' },
+    [pscustomobject]@{ value = @([pscustomobject]@{ status = 'success'; applied = $true }); name = 'non-empty array' }
+)) {
+    $weatherArray = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.weather_api' -Arguments @{ action = 'execute' } -Content @([pscustomobject]@{ ok = $true; command = [pscustomobject]@{ action = 'execute' }; result = $malformedWeatherResult.value })
+    Assert-Test ($weatherArray.known -and -not $weatherArray.ok -and $weatherArray.reasons -match 'not a structured weather execute result') "weather execute rejects a $($malformedWeatherResult.name) replacing the result object"
+}
 $loadSemantic = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ action = 'load'; name = 'Save-1'; queued = $true })
 Assert-Test ($loadSemantic.known -and $loadSemantic.ok -and $loadSemantic.outcome -eq 'game-load-dispatch-queued' -and $loadSemantic.completionBasis -eq 'dispatch-only') 'game load recognizes an exact queued dispatch without claiming current-state completion'
 $loadMismatch = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ action = 'load'; name = 'Save-2'; queued = $true })
