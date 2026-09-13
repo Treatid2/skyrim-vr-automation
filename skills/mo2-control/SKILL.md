@@ -160,7 +160,10 @@ are:
   primary list additively: install a new version under a new mod name, disable
   the old marker, and enable the new marker. Retained task profiles remain
   unchanged until their owner explicitly requests a fresh clone.
-- Register a task DLL with its exact relative path in `-WinningPaths`. Treat
+- Register a task DLL with its one exact relative path in inline
+  `-WinningPaths`. For multiple paths in a native `pwsh -File` invocation,
+  always pass a JSON or line-delimited `-WinningPathsFile`; comma-separated
+  quoted arguments can bind as one path. Treat
   the returned loose-file provider proof as scoped: overwrite, unmanaged game
   files, and archives still require separate VFS evidence.
 - Never treat `coc APStartCell` as a genuine New Game. Copied ordinary saves

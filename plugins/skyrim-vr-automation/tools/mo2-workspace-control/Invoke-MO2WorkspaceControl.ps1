@@ -1554,10 +1554,23 @@ function Resolve-SelectedProfileJournal($Config, [string]$JournalPath) {
 function Resolve-PendingSelectedProfileJournals($Config) {
     $root = Get-WorkspaceControlRoot -Config $Config
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
-    $inventory = Get-BoundedTreeInventory -Path $root -Purpose 'Workspace selected-profile journal discovery'
+    $evidenceDirectories = @(
+        @(Get-ChildItem -LiteralPath $root -Directory -Filter '*-create-select'),
+        @(Get-ChildItem -LiteralPath $root -Directory -Filter '*-resume-*'),
+        @(Get-ChildItem -LiteralPath $root -Directory -Filter '*-retire-*')
+    ) | ForEach-Object { $_ } | Sort-Object FullName -Unique
+    $journalFiles = @()
+    foreach ($directory in $evidenceDirectories) {
+        Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
+        if ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Workspace selected-profile evidence directory is a reparse point: $($directory.FullName)"
+        }
+        $journalFiles += @(Get-ChildItem -LiteralPath $directory.FullName -Filter '*.selected-profile.journal.json' -File)
+    }
     $resolved = @()
-    foreach ($file in @($inventory.files | Where-Object { [IO.Path]::GetFileName([string]$_.path) -like '*.selected-profile.journal.json' })) {
-        $resolved += Resolve-SelectedProfileJournal -Config $Config -JournalPath ([string]$file.fullPath)
+    foreach ($file in $journalFiles) {
+        Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
+        $resolved += Resolve-SelectedProfileJournal -Config $Config -JournalPath $file.FullName
     }
     return @($resolved)
 }
@@ -1727,10 +1740,10 @@ function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
 function Resolve-PendingWorkspaceJournals($Config) {
     $root = Get-WorkspaceControlRoot -Config $Config
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
-    $inventory = Get-BoundedTreeInventory -Path $root -Purpose 'Workspace operation journal discovery'
     $resolved = @()
-    foreach ($file in @($inventory.files | Where-Object { [IO.Path]::GetFileName([string]$_.path) -match '\.(creation|resume\.[^.]+|retire\.[^.]+)\.journal\.json$' })) {
-        $resolved += Resolve-PendingWorkspaceJournal -Config $Config -JournalPath ([string]$file.fullPath)
+    foreach ($file in @(Get-ChildItem -LiteralPath $root -Filter '*.journal.json' -File | Where-Object { $_.Name -match '\.(creation|resume\.[^.]+|retire\.[^.]+)\.journal\.json$' })) {
+        Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
+        $resolved += Resolve-PendingWorkspaceJournal -Config $Config -JournalPath $file.FullName
     }
     return @($resolved)
 }
