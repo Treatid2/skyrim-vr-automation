@@ -2491,21 +2491,84 @@ function Invoke-MO2Prepare {
 function Set-MO2OwnedSessionGameProcesses {
     param(
         [Parameter(Mandatory)]$Owned,
-        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Processes
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Processes,
+        [string]$Status,
+        [string]$TimestampProperty
     )
+    if ([string]::IsNullOrWhiteSpace($Status) -ne [string]::IsNullOrWhiteSpace($TimestampProperty)) {
+        throw 'Game-process adoption status and timestamp property must be supplied together.'
+    }
     $records = @($Processes | ForEach-Object {
         [pscustomobject][ordered]@{ id = [int]$_.id; name = [string]$_.name; path = [string]$_.path; startTime = [string]$_.startTime }
     })
     $timestamp = [DateTime]::UtcNow.ToString('o')
     $Owned.data | Add-Member -NotePropertyName gameProcesses -NotePropertyValue $records -Force
     $Owned.data | Add-Member -NotePropertyName gameProcessesRecordedUtc -NotePropertyValue $timestamp -Force
+    if (-not [string]::IsNullOrWhiteSpace($Status)) {
+        $Owned.data.status = $Status
+        $Owned.data | Add-Member -NotePropertyName $TimestampProperty -NotePropertyValue $timestamp -Force
+    }
     $null = Write-MO2OwnedSessionAtomic -Owned $Owned -Value $Owned.data
     $manifestPath = Join-Path ([string]$Owned.data.sessionPath) 'session.json'
     $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw)
     $manifest | Add-Member -NotePropertyName gameProcesses -NotePropertyValue $records -Force
     $manifest | Add-Member -NotePropertyName gameProcessesRecordedUtc -NotePropertyValue $timestamp -Force
+    if (-not [string]::IsNullOrWhiteSpace($Status)) {
+        $manifest.status = $Status
+        $manifest | Add-Member -NotePropertyName $TimestampProperty -NotePropertyValue $timestamp -Force
+    }
     Write-MO2JsonAtomic -Path $manifestPath -Value $manifest
     return $records
+}
+
+function Get-MO2ObservedGameProcessAdoption {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Owned,
+        [AllowNull()]$OwnershipResolution,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Processes
+    )
+    $reasons = [Collections.Generic.List[string]]::new()
+    if ([string]$Owned.data.status -cne 'launching') { $reasons.Add('session-not-launching') }
+    if ($Owned.data.PSObject.Properties['gameProcesses'] -and @($Owned.data.gameProcesses).Count -gt 0) { $reasons.Add('game-processes-already-recorded') }
+    if ($null -eq $OwnershipResolution -or -not [bool]$OwnershipResolution.ok -or @($OwnershipResolution.targets).Count -ne 1) {
+        $reasons.Add('mo2-owner-not-exact')
+    }
+    elseif ($Owned.data.PSObject.Properties['ownerPid'] -and [int]$Owned.data.ownerPid -gt 0 -and
+        [int]$OwnershipResolution.targets[0].id -ne [int]$Owned.data.ownerPid) {
+        $reasons.Add('mo2-owner-identity-mismatch')
+    }
+    [DateTimeOffset]$launchedUtc = [DateTimeOffset]::MinValue
+    $hasLaunchTime = $Owned.data.PSObject.Properties['launchedUtc'] -and
+        [DateTimeOffset]::TryParse([string]$Owned.data.launchedUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$launchedUtc)
+    if (-not $hasLaunchTime) {
+        $reasons.Add('launch-time-unavailable')
+    }
+    if ($Processes.Count -eq 0) { $reasons.Add('no-game-process-observed') }
+    $allowedNames = @($Config.mo2.gameProcessNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $records = [Collections.Generic.List[object]]::new()
+    $seenIds = [Collections.Generic.HashSet[int]]::new()
+    foreach ($process in $Processes) {
+        $id = [int]$process.id
+        $name = [string]$process.name
+        $path = [string]$process.path
+        $startTimeText = [string]$process.startTime
+        [DateTimeOffset]$startTime = [DateTimeOffset]::MinValue
+        $pathName = if ([string]::IsNullOrWhiteSpace($path)) { '' } else { [IO.Path]::GetFileNameWithoutExtension($path) }
+        if ($id -le 0 -or -not $seenIds.Add($id)) { $reasons.Add("invalid-or-duplicate-game-pid:$id"); continue }
+        if (@($allowedNames | Where-Object { [string]::Equals([string]$_, $name, [StringComparison]::OrdinalIgnoreCase) }).Count -ne 1 -or
+            -not [string]::Equals($pathName, $name, [StringComparison]::OrdinalIgnoreCase)) {
+            $reasons.Add("unconfigured-game-identity:$id"); continue
+        }
+        if (-not [DateTimeOffset]::TryParse($startTimeText, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$startTime)) {
+            $reasons.Add("invalid-game-start-time:$id"); continue
+        }
+        if ($hasLaunchTime -and $startTime -lt $launchedUtc.AddSeconds(-5)) {
+            $reasons.Add("game-predates-launch:$id"); continue
+        }
+        $records.Add([pscustomobject][ordered]@{ id = $id; name = $name; path = [IO.Path]::GetFullPath($path); startTime = $startTime.ToUniversalTime().ToString('o') })
+    }
+    return [pscustomobject][ordered]@{ eligible = $reasons.Count -eq 0; reasons = @($reasons); records = @($records) }
 }
 
 function Invoke-MO2UnlockOnly {
@@ -2573,6 +2636,16 @@ function Invoke-MO2Status {
         $ownershipResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @($data.processes.mo2) -AdoptDetachedOwner
         if ($ownershipResolution.adopted) { $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId }
     }
+    $gameProcessAdoption = $null
+    if ($owned -and $data.processes.game.Count -gt 0) {
+        $gameProcessAdoption = Get-MO2ObservedGameProcessAdoption -Config $Config -Owned $owned -OwnershipResolution $ownershipResolution -Processes @($data.processes.game)
+        if ($gameProcessAdoption.eligible) {
+            $null = Set-MO2OwnedSessionGameProcesses -Owned $owned -Processes @($gameProcessAdoption.records) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc'
+            $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
+            $gameProcessAdoption | Add-Member -NotePropertyName adopted -NotePropertyValue $true -Force
+        }
+        else { $gameProcessAdoption | Add-Member -NotePropertyName adopted -NotePropertyValue $false -Force }
+    }
     $buildData = @($data.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
     $windows = if ($data.processes.mo2.Count -gt 0) { @(Get-MO2WindowSnapshot -Processes @($data.processes.mo2)) } else { @() }
     $openingCompleted = $false
@@ -2620,6 +2693,7 @@ function Invoke-MO2Status {
         headlessMO2 = $headlessMO2
         activeBuildData = @($buildData | ForEach-Object path)
         ownershipResolution = $ownershipResolution
+        gameProcessAdoption = $gameProcessAdoption
         openingCompleted = $openingCompleted
         launchPending = $launchPending
         launchElapsedSeconds = $launchElapsedSeconds

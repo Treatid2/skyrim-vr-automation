@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Let `status` durably adopt exact game and loader identities observed after a
+  `launch -StartOnly` request, so the owning session can safely terminate a
+  crashed game and complete RootBuilder recovery.
 - Enforce MO2 `SteamVRNull` admission inside null-HMD `apply` and `start`, bind
   the exact lease, profile, and provider inventory into the transaction
   receipt, and route-shape fresh SteamVR task clones so inherited OCU providers
