@@ -34,6 +34,13 @@ function Get-TestTextSha256([AllowEmptyString()][string]$Text) {
     return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Text))).ToLowerInvariant()
 }
 
+function Invoke-TestUnsealedQualificationReport([string]$Root) {
+    & (Get-Module RenderScaleQualification) {
+        param($EvidenceRoot)
+        Invoke-CSXQualificationReportUpdate -EvidenceDirectory $EvidenceRoot -AllowUnsealedSuccess
+    } $Root
+}
+
 function Assert-FinalizerRejects {
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -57,7 +64,7 @@ function Assert-FinalizerRejects {
     Write-CSXJsonFile -Path (Join-Path $Root 'visual-review.json') -Value $changedReview | Out-Null
     $validationResult = switch ($Validation) {
         'finalizer' {
-            $result = Update-CSXQualificationReport -EvidenceDirectory $Root -AllowUnsealedSuccess
+            $result = Invoke-TestUnsealedQualificationReport -Root $Root
             [pscustomobject]@{ ok = $result.report.status -in @('PASS', 'LOCAL_PASS'); errors = @($result.report.errors) }
         }
         'envelope' {
@@ -1254,7 +1261,7 @@ function New-TestEvidenceEnvelope {
     $review = New-CSXAutomatedVisualReview -EvidenceDirectory $Root -RunRaw $raw -VisualIndex $visual.index -BaselineVisualIndex $baselineIndex
     Write-CSXJsonFile -Path (Join-Path $Root 'visual-review.json') -Value $review | Out-Null
     Write-TestProgress "finalizing qualification report for '$RunId'"
-    $final = Update-CSXQualificationReport -EvidenceDirectory $Root -AllowUnsealedSuccess
+    $final = Invoke-TestUnsealedQualificationReport -Root $Root
     Write-TestProgress "finalized qualification report for '$RunId'"
     $completion = [pscustomobject][ordered]@{
         schema = 'csx-render-scale-qualification-completion-v1'; runId = $RunId
@@ -1297,7 +1304,7 @@ function Assert-EvidenceTamperRejected {
         Write-CSXJsonFile -Path (Join-Path $CaseRoot 'visual-review.json') -Value $review | Out-Null
         $validationResult = switch ($Validation) {
             'finalizer' {
-                $result = Update-CSXQualificationReport -EvidenceDirectory $CaseRoot -AllowUnsealedSuccess
+                $result = Invoke-TestUnsealedQualificationReport -Root $CaseRoot
                 [pscustomobject]@{ ok = $result.report.status -in @('PASS', 'LOCAL_PASS'); errors = @($result.report.errors) }
             }
             'inventory' {
@@ -1953,7 +1960,7 @@ try {
         $negativeIndex = Get-Content -LiteralPath (Join-Path $negativeRoot 'visual-index.json') -Raw | ConvertFrom-Json -Depth 100
         $negativeReview = New-CSXAutomatedVisualReview -EvidenceDirectory $negativeRoot -RunRaw $negativeRaw -VisualIndex $negativeIndex
         Write-CSXJsonFile -Path (Join-Path $negativeRoot 'visual-review.json') -Value $negativeReview | Out-Null
-        $negativeFinal = Update-CSXQualificationReport -EvidenceDirectory $negativeRoot -AllowUnsealedSuccess
+        $negativeFinal = Invoke-TestUnsealedQualificationReport -Root $negativeRoot
         Assert-Test ($negativeFinal.report.status -eq 'FAIL') 'A valid low-confidence visual result did not produce a truthful FAIL projection.'
         $negativeCompletion = [pscustomobject][ordered]@{
             schema = 'csx-render-scale-qualification-completion-v1'; runId = [string]$negativeRaw.runId
@@ -2091,6 +2098,34 @@ try {
         (Get-CSXFileSha256 (Join-Path $candidateRoot 'pr-summary.md')) -eq $sealedSummarySha256 -and
         (Test-CSXQualificationCompletionReceipt -EvidenceRoot $candidateRoot -ExpectedRunId ([string]$raw.runId)).ok) `
         'A later sealed-result validation failure rewrote immutable evidence or was not reported in memory.'
+    $sealedReviewBytes = [IO.File]::ReadAllBytes((Join-Path $candidateRoot 'visual-review.json'))
+    $script:statusMismatchValidationCalls = 0
+    $script:statusMismatchCompletion = $null
+    try {
+        $statusMismatchFailure = Update-CSXQualificationReport -EvidenceDirectory $candidateRoot -CompletionValidator {
+            param($root, $runId)
+            $script:statusMismatchValidationCalls++
+            if ($script:statusMismatchValidationCalls -eq 1) {
+                $script:statusMismatchCompletion = Test-CSXQualificationCompletionReceipt -EvidenceRoot $root -ExpectedRunId $runId
+                [IO.File]::WriteAllText((Join-Path $root 'visual-review.json'), '{ invalid after terminal preflight', [Text.UTF8Encoding]::new($false))
+            }
+            return $script:statusMismatchCompletion
+        }
+        Assert-Test ($statusMismatchFailure.report.status -eq 'INFRASTRUCTURE_ERROR' -and
+            ($statusMismatchFailure.report.errors -join ' | ') -match 'sealed qualification projection status differs' -and
+            (Get-CSXFileSha256 (Join-Path $candidateRoot 'run.json')) -eq $candidateRunHash -and
+            (Get-CSXFileSha256 (Join-Path $candidateRoot 'run.raw.json')) -eq $sealedRawSha256 -and
+            (Get-CSXFileSha256 (Join-Path $candidateRoot 'qualification-completion.json')) -eq $sealedCompletionSha256 -and
+            (Get-CSXFileSha256 (Join-Path $candidateRoot 'pr-summary.md')) -eq $sealedSummarySha256) `
+            'A later revalidation status mismatch overwrote the earlier sealed projection or was not reported in memory.'
+    }
+    finally {
+        [IO.File]::WriteAllBytes((Join-Path $candidateRoot 'visual-review.json'), $sealedReviewBytes)
+    }
+    Assert-Test ((Test-CSXQualificationCompletionReceipt -EvidenceRoot $candidateRoot -ExpectedRunId ([string]$raw.runId)).ok) `
+        'Restoring the transient status-mismatch fixture did not restore ordinary sealed-result validity.'
+    Assert-Test (-not (Get-Command Update-CSXQualificationReport).Parameters.ContainsKey('AllowUnsealedSuccess')) `
+        'The exported qualification report updater still exposes an unsealed-success bypass.'
     $prAutomated = $raw.assays.visual.automatedReview
     Assert-Test ((@($prAutomated.batches | ForEach-Object { "$($_.presentationPass):$($_.replicate)" }) -join ',') -eq
         '1:1,1:2,1:3,2:1,2:2,2:3') 'PR image-model batches are not in pass-major order.'

@@ -2121,7 +2121,6 @@ try {
     $rawPath = Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'run.raw.json') -Value $raw
     $review = New-CSXAutomatedVisualReview -EvidenceDirectory $script:evidenceRoot -RunRaw $raw -VisualIndex $visualIndex -BaselineVisualIndex $baselineIndex
     Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'visual-review.json') -Value $review | Out-Null
-    $updated = Update-CSXQualificationReport -EvidenceDirectory $script:evidenceRoot -AllowUnsealedSuccess
     $timeEvidence.evidenceFinalizationElapsedMs = [Math]::Round($finalizationWatch.Elapsed.TotalMilliseconds, 3)
     $timeEvidence.invocationElapsedMs = [Math]::Round($script:invocationWatch.Elapsed.TotalMilliseconds, 3)
     $timeEvidence.completedUtc = [DateTimeOffset]::UtcNow.ToString('o')
@@ -2135,7 +2134,6 @@ try {
     $rawPath = Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'run.raw.json') -Value $raw
     $review = New-CSXAutomatedVisualReview -EvidenceDirectory $script:evidenceRoot -RunRaw $raw -VisualIndex $visualIndex -BaselineVisualIndex $baselineIndex
     Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'visual-review.json') -Value $review | Out-Null
-    $updated = Update-CSXQualificationReport -EvidenceDirectory $script:evidenceRoot -AllowUnsealedSuccess
     $completionUtc = [DateTimeOffset]::UtcNow
     $completionElapsedMs = [Math]::Round($script:invocationWatch.Elapsed.TotalMilliseconds, 3)
     if ($completionElapsedMs -gt [double]$script:protocol.timeBudget.endToEndMs -or
@@ -2149,7 +2147,7 @@ try {
         invocationElapsedMs = $completionElapsedMs
         evidenceFinalizationElapsedMs = [Math]::Round($finalizationWatch.Elapsed.TotalMilliseconds, 3)
         within600Seconds = $true
-        runPath = 'run.json'; runSha256 = Get-CSXFileSha256 $updated.runPath
+        runPath = 'run.json'; runSha256 = $null
         rawPath = 'run.raw.json'; rawSha256 = Get-CSXFileSha256 $rawPath
         visualReviewPath = 'visual-review.json'; visualReviewSha256 = Get-CSXFileSha256 (Join-Path $script:evidenceRoot 'visual-review.json')
     }
@@ -2222,7 +2220,7 @@ catch {
             automatedGates = [pscustomobject][ordered]@{ passed = $false; failures = @($failures); infrastructureErrors = @($infrastructureFailures) }; warnings = @($warnings | Select-Object -Unique)
         }
         Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot 'run.raw.json') -Value $raw | Out-Null
-        $updated = Update-CSXQualificationReport -EvidenceDirectory $script:evidenceRoot -AllowUnsealedSuccess
+        $updated = Update-CSXQualificationReport -EvidenceDirectory $script:evidenceRoot
         $result = [pscustomobject][ordered]@{ ok = $false; status = $updated.report.status; runPath = $updated.runPath; summaryPath = $updated.summaryPath; reviewPath = $null; providerCustody = $script:providerCustodyEvidence; errors = @($updated.report.errors) }
     }
     catch { $result = [pscustomobject][ordered]@{ ok = $false; status = 'INFRASTRUCTURE_ERROR'; runPath = $null; summaryPath = $null; reviewPath = $null; providerCustody = $script:providerCustodyEvidence; errors = @($failures) + @($infrastructureFailures) + @("Evidence finalization failed: $($_.Exception.Message)") } } }

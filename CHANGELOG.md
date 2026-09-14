@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Keep unsealed qualification projection internal to the atomic receipt
+  committer, initialize every strict-mode terminal path, and return later
+  revalidation/status disagreements in memory without rewriting sealed bytes.
 - Keep render-scale terminal acceptance atomic through the runner result: reuse
   the receipt hash proven before public commit, and preserve an existing sealed
   report and summary when any later revalidation becomes unavailable.

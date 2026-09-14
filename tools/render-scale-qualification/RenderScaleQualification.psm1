@@ -4771,7 +4771,7 @@ function Test-CSXFinalizerEnvelope {
     return [pscustomobject][ordered]@{ ok = $errors.Count -eq 0; prMode = $prMode; errors = @($errors | Select-Object -Unique) }
 }
 
-function Update-CSXQualificationReport {
+function Invoke-CSXQualificationReportUpdate {
     param(
         [Parameter(Mandatory)][string]$EvidenceDirectory,
         [switch]$AllowUnsealedSuccess,
@@ -4791,6 +4791,7 @@ function Update-CSXQualificationReport {
     $prMode = [bool](Get-CSXPropertyValue $raw 'prMode' $false)
     $existingRunPath = Join-Path $root 'run.json'
     $terminalPreflightFailed = $false
+    $terminalPreflight = $null
     if (-not $AllowUnsealedSuccess -and (Test-Path -LiteralPath $existingRunPath -PathType Leaf)) {
         # A public re-finalization of an existing projection must first prove that its
         # terminal receipt still binds that projection. Broken terminal custody is
@@ -4891,10 +4892,25 @@ function Update-CSXQualificationReport {
             $existingRunPath = Join-Path $root 'run.json'
             $existingSummaryPath = Join-Path $root $(if ($prMode) { 'pr-summary.md' } else { 'qualification-summary.md' })
             $existingReport = Get-Content -LiteralPath $existingRunPath -Raw | ConvertFrom-Json -Depth 100
-            if ([string](Get-CSXPropertyValue $existingReport 'runId') -ne [string]$raw.runId -or
-                [string](Get-CSXPropertyValue $existingReport 'status') -ne $status -or
-                -not (Test-Path -LiteralPath $existingSummaryPath -PathType Leaf)) {
-                throw 'The sealed qualification projection is missing or inconsistent with its validated completion receipt.'
+            $sealedProjectionErrors = [Collections.Generic.List[string]]::new()
+            if ([string](Get-CSXPropertyValue $existingReport 'runId') -ne [string]$raw.runId) {
+                $sealedProjectionErrors.Add('The sealed qualification projection has a different run identity.')
+            }
+            if ([string](Get-CSXPropertyValue $existingReport 'status') -ne $status) {
+                $sealedProjectionErrors.Add("The sealed qualification projection status differs from the current revalidation result: sealed=$([string](Get-CSXPropertyValue $existingReport 'status')); current=$status.")
+            }
+            if (-not (Test-Path -LiteralPath $existingSummaryPath -PathType Leaf)) {
+                $sealedProjectionErrors.Add('The sealed qualification summary is missing.')
+            }
+            if ($sealedProjectionErrors.Count -gt 0) {
+                foreach ($sealedProjectionError in $sealedProjectionErrors) { $infrastructureErrors.Add($sealedProjectionError) }
+                $existingReport.status = 'INFRASTRUCTURE_ERROR'
+                $existingReport.errors = @(@(Get-CSXPropertyValue $existingReport 'errors' @()) + @($infrastructureErrors) | Select-Object -Unique)
+                $existingReport.infrastructureErrors = @(@(Get-CSXPropertyValue $existingReport 'infrastructureErrors' @()) + @($infrastructureErrors) | Select-Object -Unique)
+                return [pscustomobject][ordered]@{
+                    report = $existingReport; runPath = $existingRunPath; summaryPath = $existingSummaryPath
+                    completion = $completion
+                }
             }
             return [pscustomobject][ordered]@{
                 report = $existingReport; runPath = $existingRunPath; summaryPath = $existingSummaryPath
@@ -5030,6 +5046,20 @@ function Update-CSXQualificationReport {
     return [pscustomobject][ordered]@{ report = $report; runPath = $runPath; summaryPath = $summaryPath }
 }
 
+function Update-CSXQualificationReport {
+    param(
+        [Parameter(Mandatory)][string]$EvidenceDirectory,
+        [scriptblock]$CompletionValidator = {
+            param($EvidenceRoot, $ExpectedRunId)
+            Test-CSXQualificationCompletionReceipt -EvidenceRoot $EvidenceRoot -ExpectedRunId $ExpectedRunId
+        }
+    )
+    # Public validation can never create an unsealed success. The sole bypass is
+    # module-private and is used only while Complete-CSXSealedQualification owns
+    # the subsequent receipt commit.
+    Invoke-CSXQualificationReportUpdate -EvidenceDirectory $EvidenceDirectory -CompletionValidator $CompletionValidator
+}
+
 function New-CSXProviderCustodyEvidence($Execution) {
     $preflight = Get-CSXPropertyValue $Execution 'preflight'
     if ($null -eq $preflight -and $null -ne (Get-CSXPropertyValue $Execution 'processes')) { $preflight = $Execution }
@@ -5160,7 +5190,7 @@ function Complete-CSXSealedQualification {
         [Parameter(Mandatory)][double]$FinalizationBudgetMs,
         [scriptblock]$Finalizer = {
             param($EvidenceRoot)
-            Update-CSXQualificationReport -EvidenceDirectory $EvidenceRoot -AllowUnsealedSuccess
+            Invoke-CSXQualificationReportUpdate -EvidenceDirectory $EvidenceRoot -AllowUnsealedSuccess
         },
         [scriptblock]$CompletionCommitter = {
             param($StagedPath, $DestinationPath)
