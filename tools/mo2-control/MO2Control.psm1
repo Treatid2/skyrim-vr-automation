@@ -1450,6 +1450,75 @@ function Get-MO2ProcessRecords {
     return @($records | Sort-Object name, id)
 }
 
+function ConvertTo-MO2CanonicalUtcTimestamp {
+    param([Parameter(Mandatory)][string]$Value)
+
+    $parsed = [DateTimeOffset]::Parse($Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+    return $parsed.UtcDateTime.ToString('o')
+}
+
+function Test-MO2ProcessRecordIdentity {
+    param(
+        [Parameter(Mandatory)]$Expected,
+        [Parameter(Mandatory)]$Actual
+    )
+
+    try {
+        $expectedPath = [IO.Path]::GetFullPath([string]$Expected.path)
+        $actualPath = [IO.Path]::GetFullPath([string]$Actual.path)
+        $expectedStart = [DateTimeOffset]::Parse([string]$Expected.startTime, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).UtcDateTime
+        $actualStart = [DateTimeOffset]::Parse([string]$Actual.startTime, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).UtcDateTime
+    }
+    catch {
+        return [pscustomobject][ordered]@{ ok = $false; reason = 'process-identity-malformed'; detail = $_.Exception.Message }
+    }
+    $idMatches = [int]$Expected.id -eq [int]$Actual.id
+    $nameMatches = [string]::Equals([string]$Expected.name, [string]$Actual.name, [StringComparison]::OrdinalIgnoreCase)
+    $pathMatches = [string]::Equals($expectedPath, $actualPath, [StringComparison]::OrdinalIgnoreCase)
+    $startMatches = [math]::Abs(($actualStart - $expectedStart).TotalMilliseconds) -lt 1.0
+    return [pscustomobject][ordered]@{
+        ok = $idMatches -and $nameMatches -and $pathMatches -and $startMatches
+        reason = if (-not $idMatches) { 'process-id-mismatch' } elseif (-not $nameMatches) { 'process-name-mismatch' } elseif (-not $pathMatches) { 'process-path-mismatch' } elseif (-not $startMatches) { 'process-start-time-mismatch' } else { 'process-identity-matched' }
+        expectedPath = $expectedPath; actualPath = $actualPath
+        expectedStartTime = $expectedStart.ToString('o'); actualStartTime = $actualStart.ToString('o')
+    }
+}
+
+function Get-MO2ExpectedGameProcessPaths {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Owned
+    )
+
+    try {
+        $iniPath = Resolve-MO2ControlPath ([string]$Config.mo2.ini)
+        $ini = Read-MO2IniFile -Path $iniPath
+        $registered = @(Get-MO2RegisteredExecutables -Ini $ini | Where-Object { [string]$_.title -ceq [string]$Owned.data.executable })
+        if ($registered.Count -ne 1) {
+            return [pscustomobject][ordered]@{ ok = $false; reason = 'registered-executable-not-exact'; pathsByName = @{} }
+        }
+        $entry = $registered[0]
+        $pathsByName = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($configuredName in @($Config.mo2.gameProcessNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+            $name = [string]$configuredName
+            $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $isRegisteredBinaryRole = -not [string]::IsNullOrWhiteSpace([string]$entry.binary) -and
+                [string]::Equals([IO.Path]::GetFileNameWithoutExtension([string]$entry.binary), $name, [StringComparison]::OrdinalIgnoreCase)
+            if ($isRegisteredBinaryRole) {
+                $null = $paths.Add([IO.Path]::GetFullPath([string]$entry.binary))
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace([string]$entry.workingDirectory)) {
+                $null = $paths.Add([IO.Path]::GetFullPath((Join-Path ([string]$entry.workingDirectory) ($name + '.exe'))))
+            }
+            $pathsByName[$name] = $paths
+        }
+        return [pscustomobject][ordered]@{ ok = $true; reason = 'configured-game-paths-resolved'; pathsByName = $pathsByName; registeredExecutable = $entry }
+    }
+    catch {
+        return [pscustomobject][ordered]@{ ok = $false; reason = 'configured-game-paths-unavailable'; detail = $_.Exception.Message; pathsByName = @{} }
+    }
+}
+
 function Get-MO2BoundedDirectoryStats {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -3444,6 +3513,9 @@ function Resolve-MO2OwnedProcessTarget {
             reason = 'already-closed'
         }
     }
+    if ($ownedTargets.Count -eq 1 -and $Processes.Count -ne 1) {
+        return [pscustomobject][ordered]@{ ok = $false; ownerPid = $ownerPid; targets = @(); adopted = $false; adoption = $null; reason = 'ambiguous-process-set' }
+    }
     if ($ownedTargets.Count -eq 1) {
         Assert-MO2ExactProcessTargets -Config $Config -Processes @($ownedTargets[0])
         $identity = Test-MO2OwnedProcessIdentity -Owned $Owned -ProcessRecord $ownedTargets[0]
@@ -3665,11 +3737,14 @@ function Set-MO2OwnedSessionGameProcesses {
         throw 'Game-process adoption status and timestamp property must be supplied together.'
     }
     $records = @($Processes | ForEach-Object {
-        [pscustomobject][ordered]@{ id = [int]$_.id; name = [string]$_.name; path = [string]$_.path; startTime = [string]$_.startTime }
+        [pscustomobject][ordered]@{ id = [int]$_.id; name = [string]$_.name; path = [IO.Path]::GetFullPath([string]$_.path); startTime = ConvertTo-MO2CanonicalUtcTimestamp ([string]$_.startTime) }
     })
     $timestamp = [DateTime]::UtcNow.ToString('o')
     $Owned.data | Add-Member -NotePropertyName gameProcesses -NotePropertyValue $records -Force
     $Owned.data | Add-Member -NotePropertyName gameProcessesRecordedUtc -NotePropertyValue $timestamp -Force
+    if ($Owned.data.PSObject.Properties['launchAttemptId']) {
+        $Owned.data | Add-Member -NotePropertyName gameProcessesLaunchAttemptId -NotePropertyValue ([string]$Owned.data.launchAttemptId) -Force
+    }
     if (-not [string]::IsNullOrWhiteSpace($Status)) {
         $Owned.data.status = $Status
         $Owned.data | Add-Member -NotePropertyName $TimestampProperty -NotePropertyValue $timestamp -Force
@@ -3679,6 +3754,9 @@ function Set-MO2OwnedSessionGameProcesses {
     $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw)
     $manifest | Add-Member -NotePropertyName gameProcesses -NotePropertyValue $records -Force
     $manifest | Add-Member -NotePropertyName gameProcessesRecordedUtc -NotePropertyValue $timestamp -Force
+    if ($Owned.data.PSObject.Properties['launchAttemptId']) {
+        $manifest | Add-Member -NotePropertyName gameProcessesLaunchAttemptId -NotePropertyValue ([string]$Owned.data.launchAttemptId) -Force
+    }
     if (-not [string]::IsNullOrWhiteSpace($Status)) {
         $manifest.status = $Status
         $manifest | Add-Member -NotePropertyName $TimestampProperty -NotePropertyValue $timestamp -Force
@@ -3687,58 +3765,96 @@ function Set-MO2OwnedSessionGameProcesses {
     return $records
 }
 
+function Reset-MO2GameProcessStateForLaunch {
+    param(
+        [Parameter(Mandatory)]$Data,
+        [Parameter(Mandatory)][string]$LaunchAttemptId,
+        [Parameter(Mandatory)][string]$LaunchDispatchedUtc,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$PreLaunchGameProcesses
+    )
+
+    $priorProcesses = if ($Data.PSObject.Properties['gameProcesses']) { @($Data.gameProcesses) } else { @() }
+    if ($priorProcesses.Count -gt 0) {
+        $history = if ($Data.PSObject.Properties['gameProcessHistory']) { @($Data.gameProcessHistory) } else { @() }
+        $history += [pscustomobject][ordered]@{
+            launchAttemptId = if ($Data.PSObject.Properties['gameProcessesLaunchAttemptId']) { [string]$Data.gameProcessesLaunchAttemptId } elseif ($Data.PSObject.Properties['launchAttemptId']) { [string]$Data.launchAttemptId } else { $null }
+            launchedUtc = if ($Data.PSObject.Properties['launchDispatchedUtc']) { [string]$Data.launchDispatchedUtc } elseif ($Data.PSObject.Properties['launchedUtc']) { [string]$Data.launchedUtc } else { $null }
+            recordedUtc = if ($Data.PSObject.Properties['gameProcessesRecordedUtc']) { [string]$Data.gameProcessesRecordedUtc } else { $null }
+            retiredUtc = [DateTime]::UtcNow.ToString('o')
+            processes = @($priorProcesses)
+        }
+        $Data | Add-Member -NotePropertyName gameProcessHistory -NotePropertyValue @($history) -Force
+    }
+    $Data | Add-Member -NotePropertyName gameProcesses -NotePropertyValue @() -Force
+    $Data | Add-Member -NotePropertyName gameProcessesRecordedUtc -NotePropertyValue $null -Force
+    $Data | Add-Member -NotePropertyName gameProcessesLaunchAttemptId -NotePropertyValue $null -Force
+    $Data | Add-Member -NotePropertyName launchAttemptId -NotePropertyValue $LaunchAttemptId -Force
+    $Data | Add-Member -NotePropertyName launchDispatchedUtc -NotePropertyValue $LaunchDispatchedUtc -Force
+    $Data | Add-Member -NotePropertyName preLaunchGameProcesses -NotePropertyValue @($PreLaunchGameProcesses) -Force
+}
+
 function Get-MO2ObservedGameProcessAdoption {
     param(
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)]$Owned,
-        [AllowNull()]$OwnershipResolution,
-        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Processes
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Processes,
+        [scriptblock]$OwnerProcessInventoryFactory
     )
     $reasons = [Collections.Generic.List[string]]::new()
     if ([string]$Owned.data.status -cne 'launching') { $reasons.Add('session-not-launching') }
     if ($Owned.data.PSObject.Properties['gameProcesses'] -and @($Owned.data.gameProcesses).Count -gt 0) { $reasons.Add('game-processes-already-recorded') }
-    if ($null -eq $OwnershipResolution -or -not [bool]$OwnershipResolution.ok -or @($OwnershipResolution.targets).Count -ne 1) {
+    $freshOwnerProcesses = if ($null -ne $OwnerProcessInventoryFactory) { @(& $OwnerProcessInventoryFactory) } else { @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames)) }
+    $ownershipResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $Owned -Processes @($freshOwnerProcesses)
+    if (-not [bool]$ownershipResolution.ok -or @($ownershipResolution.targets).Count -ne 1) {
         $reasons.Add('mo2-owner-not-exact')
     }
     elseif ($Owned.data.PSObject.Properties['ownerPid'] -and [int]$Owned.data.ownerPid -gt 0 -and
-        [int]$OwnershipResolution.targets[0].id -ne [int]$Owned.data.ownerPid) {
+        [int]$ownershipResolution.targets[0].id -ne [int]$Owned.data.ownerPid) {
         $reasons.Add('mo2-owner-identity-mismatch')
     }
     else {
-        $ownerIdentity = Test-MO2OwnedProcessIdentity -Owned $Owned -ProcessRecord $OwnershipResolution.targets[0]
+        $ownerIdentity = Test-MO2OwnedProcessIdentity -Owned $Owned -ProcessRecord $ownershipResolution.targets[0]
         if (-not $ownerIdentity.ok) { $reasons.Add([string]$ownerIdentity.reason) }
     }
-    [DateTimeOffset]$launchedUtc = [DateTimeOffset]::MinValue
-    $hasLaunchTime = $Owned.data.PSObject.Properties['launchedUtc'] -and
-        [DateTimeOffset]::TryParse([string]$Owned.data.launchedUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$launchedUtc)
-    if (-not $hasLaunchTime) {
-        $reasons.Add('launch-time-unavailable')
+    [DateTimeOffset]$launchDispatchedUtc = [DateTimeOffset]::MinValue
+    $hasLaunchBoundary = $Owned.data.PSObject.Properties['launchDispatchedUtc'] -and
+        [DateTimeOffset]::TryParse([string]$Owned.data.launchDispatchedUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$launchDispatchedUtc)
+    if (-not $hasLaunchBoundary) {
+        $reasons.Add('launch-dispatch-time-unavailable')
     }
     if ($Processes.Count -eq 0) { $reasons.Add('no-game-process-observed') }
-    $allowedNames = @($Config.mo2.gameProcessNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $expectedPaths = Get-MO2ExpectedGameProcessPaths -Config $Config -Owned $Owned
+    if (-not $expectedPaths.ok) { $reasons.Add([string]$expectedPaths.reason) }
+    $preLaunchProcesses = if ($Owned.data.PSObject.Properties['preLaunchGameProcesses']) { @($Owned.data.preLaunchGameProcesses) } else { @() }
     $records = [Collections.Generic.List[object]]::new()
     $seenIds = [Collections.Generic.HashSet[int]]::new()
+    $seenRoles = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($process in $Processes) {
         $id = [int]$process.id
         $name = [string]$process.name
         $path = [string]$process.path
         $startTimeText = [string]$process.startTime
         [DateTimeOffset]$startTime = [DateTimeOffset]::MinValue
-        $pathName = if ([string]::IsNullOrWhiteSpace($path)) { '' } else { [IO.Path]::GetFileNameWithoutExtension($path) }
         if ($id -le 0 -or -not $seenIds.Add($id)) { $reasons.Add("invalid-or-duplicate-game-pid:$id"); continue }
-        if (@($allowedNames | Where-Object { [string]::Equals([string]$_, $name, [StringComparison]::OrdinalIgnoreCase) }).Count -ne 1 -or
-            -not [string]::Equals($pathName, $name, [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not $seenRoles.Add($name)) { $reasons.Add("ambiguous-game-role:$name"); continue }
+        $configuredPaths = if ($expectedPaths.ok -and $expectedPaths.pathsByName.ContainsKey($name)) { $expectedPaths.pathsByName[$name] } else { $null }
+        $resolvedPath = try { [IO.Path]::GetFullPath($path) } catch { $null }
+        if ($null -eq $configuredPaths -or [string]::IsNullOrWhiteSpace($resolvedPath) -or -not $configuredPaths.Contains($resolvedPath)) {
             $reasons.Add("unconfigured-game-identity:$id"); continue
         }
         if (-not [DateTimeOffset]::TryParse($startTimeText, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$startTime)) {
             $reasons.Add("invalid-game-start-time:$id"); continue
         }
-        if ($hasLaunchTime -and $startTime -lt $launchedUtc.AddSeconds(-5)) {
+        if ($hasLaunchBoundary -and $startTime.UtcDateTime -lt $launchDispatchedUtc.UtcDateTime) {
             $reasons.Add("game-predates-launch:$id"); continue
         }
-        $records.Add([pscustomobject][ordered]@{ id = $id; name = $name; path = [IO.Path]::GetFullPath($path); startTime = $startTime.ToUniversalTime().ToString('o') })
+        $observedRecord = [pscustomobject][ordered]@{ id = $id; name = $name; path = $resolvedPath; startTime = $startTime.UtcDateTime.ToString('o') }
+        if (@($preLaunchProcesses | Where-Object { (Test-MO2ProcessRecordIdentity -Expected $_ -Actual $observedRecord).ok }).Count -gt 0) {
+            $reasons.Add("game-present-before-dispatch:$id"); continue
+        }
+        $records.Add($observedRecord)
     }
-    return [pscustomobject][ordered]@{ eligible = $reasons.Count -eq 0; reasons = @($reasons); records = @($records) }
+    return [pscustomobject][ordered]@{ eligible = $reasons.Count -eq 0; reasons = @($reasons); records = @($records); ownershipResolution = $ownershipResolution; expectedPaths = $expectedPaths }
 }
 
 function Invoke-MO2UnlockOnly {
@@ -3808,11 +3924,21 @@ function Invoke-MO2Status {
     }
     $gameProcessAdoption = $null
     if ($owned -and $data.processes.game.Count -gt 0) {
-        $gameProcessAdoption = Get-MO2ObservedGameProcessAdoption -Config $Config -Owned $owned -OwnershipResolution $ownershipResolution -Processes @($data.processes.game)
+        $gameProcessAdoption = Get-MO2ObservedGameProcessAdoption -Config $Config -Owned $owned -Processes @($data.processes.game)
         if ($gameProcessAdoption.eligible) {
-            $null = Set-MO2OwnedSessionGameProcesses -Owned $owned -Processes @($gameProcessAdoption.records) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc'
-            $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
-            $gameProcessAdoption | Add-Member -NotePropertyName adopted -NotePropertyValue $true -Force
+            $commitOwnerResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
+            if ($commitOwnerResolution.ok -and @($commitOwnerResolution.targets).Count -eq 1) {
+                $null = Set-MO2OwnedSessionGameProcesses -Owned $owned -Processes @($gameProcessAdoption.records) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc'
+                $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
+                $gameProcessAdoption | Add-Member -NotePropertyName adopted -NotePropertyValue $true -Force
+                $gameProcessAdoption | Add-Member -NotePropertyName commitOwnershipResolution -NotePropertyValue $commitOwnerResolution -Force
+            }
+            else {
+                $gameProcessAdoption.eligible = $false
+                $gameProcessAdoption.reasons = @($gameProcessAdoption.reasons) + @('mo2-owner-changed-before-adoption-commit')
+                $gameProcessAdoption | Add-Member -NotePropertyName adopted -NotePropertyValue $false -Force
+                $gameProcessAdoption | Add-Member -NotePropertyName commitOwnershipResolution -NotePropertyValue $commitOwnerResolution -Force
+            }
         }
         else { $gameProcessAdoption | Add-Member -NotePropertyName adopted -NotePropertyValue $false -Force }
     }
@@ -3839,8 +3965,13 @@ function Invoke-MO2Status {
         catch { $launchStartedUtc = $null }
     }
     $launchPending = $null -ne $launchStartedUtc -and $launchElapsedSeconds -lt $launchGraceSeconds
+    $recordedGameResolution = if ($owned -and $owned.data.PSObject.Properties['gameProcesses'] -and @($owned.data.gameProcesses).Count -gt 0) {
+        Resolve-MO2RecordedGameProcessTargets -Recorded @($owned.data.gameProcesses) -Current @($data.processes.game)
+    }
+    else { $null }
+    $ownedGameExact = $null -eq $owned -or ($null -ne $recordedGameResolution -and $recordedGameResolution.ok -and @($recordedGameResolution.targets).Count -gt 0)
     $state = if ($data.processes.game.Count -gt 0) {
-        'game-running'
+        if ($ownedGameExact) { 'game-running' } else { 'game-running-unowned' }
     }
     elseif ($launchPending) {
         'launch-pending'
@@ -3864,6 +3995,7 @@ function Invoke-MO2Status {
         activeBuildData = @($buildData | ForEach-Object path)
         ownershipResolution = $ownershipResolution
         gameProcessAdoption = $gameProcessAdoption
+        recordedGameResolution = $recordedGameResolution
         openingCompleted = $openingCompleted
         launchPending = $launchPending
         launchElapsedSeconds = $launchElapsedSeconds
@@ -3939,14 +4071,22 @@ function Invoke-MO2Launch {
         return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'blocked' -Data @{ processes = $validation.data.processes; lock = $owned; resumeDisposition = $resumeDisposition } -Errors @('Resume requires no game process and either the exact retained MO2 owner or no MO2 process so the same session and profile can be reopened safely.')
     }
     $reuseRetainedMO2 = [string]$resumeDisposition.mode -eq 'retained-owner'
+    $resumeOwnerResolution = $null
 
     $mo2Path = [string]$validation.data.config.mo2Executable
     $arguments = @('--profile', [string]$lockData.profile, 'run', '--executable', [string]$lockData.executable)
     $argumentLine = ($arguments | ForEach-Object { ConvertTo-MO2CommandLineArgument ([string]$_) }) -join ' '
+    if ($reuseRetainedMO2) {
+        $resumeOwnerResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
+        if (-not $resumeOwnerResolution.ok -or @($resumeOwnerResolution.targets).Count -ne 1) {
+            return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'blocked' -Data @{ lock = $owned; ownershipResolution = $resumeOwnerResolution } -Errors @('The retained MO2 owner identity changed before launch authorization; no launch was dispatched.')
+        }
+    }
     if ($WhatIf) {
-        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'dry-run' -Data @{ path = $mo2Path; arguments = $arguments; argumentLine = $argumentLine; workingDirectory = (Split-Path -Parent $mo2Path); sessionId = $SessionId; startOnly = [bool]$StartOnly; rootBuilderRecovery = [bool]$RootBuilderRecovery; resumeDisposition = $resumeDisposition }
+        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'dry-run' -Data @{ path = $mo2Path; arguments = $arguments; argumentLine = $argumentLine; workingDirectory = (Split-Path -Parent $mo2Path); sessionId = $SessionId; startOnly = [bool]$StartOnly; rootBuilderRecovery = [bool]$RootBuilderRecovery; resumeDisposition = $resumeDisposition; ownershipResolution = $resumeOwnerResolution }
     }
 
+    $launchAttemptId = [guid]::NewGuid().ToString('D')
     $launchStartedPath = Join-Path ([string]$lockData.sessionPath) 'mo2-launch-started.json'
     $launchStarted = [pscustomobject][ordered]@{
         contractVersion = $script:MO2ControlContractVersion
@@ -3957,14 +4097,28 @@ function Invoke-MO2Launch {
         timeoutSeconds = $TimeoutSeconds
         startOnly = [bool]$StartOnly
         rootBuilderRecovery = [bool]$RootBuilderRecovery
+        launchAttemptId = $launchAttemptId
         requestedPid = $null
         startedUtc = [DateTime]::UtcNow.ToString('o')
+        dispatchStartedUtc = $null
+        preLaunchGameProcesses = @()
     }
     Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted
+    $preLaunchGameProcesses = @(Get-MO2ProcessRecords -Names @($Config.mo2.gameProcessNames))
+    if ($reuseRetainedMO2) {
+        $resumeOwnerResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
+        if (-not $resumeOwnerResolution.ok -or @($resumeOwnerResolution.targets).Count -ne 1) {
+            return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'blocked' -Data @{ lock = $owned; ownershipResolution = $resumeOwnerResolution; launchStartedReceiptPath = $launchStartedPath } -Errors @('The retained MO2 owner identity changed immediately before dispatch; no launch was started.')
+        }
+    }
+    $launchDispatchedUtc = [DateTime]::UtcNow.ToString('o')
+    $launchStarted.dispatchStartedUtc = $launchDispatchedUtc
+    $launchStarted.preLaunchGameProcesses = @($preLaunchGameProcesses)
     $process = Start-Process -FilePath $mo2Path -ArgumentList $argumentLine -WorkingDirectory (Split-Path -Parent $mo2Path) -WindowStyle Hidden -PassThru
     $launchStarted.requestedPid = $process.Id
     Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted
     $lockData.status = 'launching'
+    Reset-MO2GameProcessStateForLaunch -Data $lockData -LaunchAttemptId $launchAttemptId -LaunchDispatchedUtc $launchDispatchedUtc -PreLaunchGameProcesses $preLaunchGameProcesses
     if (-not $reuseRetainedMO2) {
         $launchedOwner = [pscustomobject][ordered]@{
             id = [int]$process.Id
@@ -3975,12 +4129,13 @@ function Invoke-MO2Launch {
         $lockData = $owned.data
     }
     if ($lockData.PSObject.Properties['latestLauncherPid']) { $lockData.latestLauncherPid = $process.Id } else { $lockData | Add-Member -NotePropertyName latestLauncherPid -NotePropertyValue $process.Id }
-    if ($lockData.PSObject.Properties['launchedUtc']) { $lockData.launchedUtc = [DateTime]::UtcNow.ToString('o') } else { $lockData | Add-Member -NotePropertyName launchedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) }
+    if ($lockData.PSObject.Properties['launchedUtc']) { $lockData.launchedUtc = $launchDispatchedUtc } else { $lockData | Add-Member -NotePropertyName launchedUtc -NotePropertyValue $launchDispatchedUtc }
     $null = Write-MO2OwnedSessionAtomic -Owned $owned -Value $lockData
     $lockData = $owned.data
 
     $manifestPath = Join-Path ([string]$lockData.sessionPath) 'session.json'
     $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw)
+    Reset-MO2GameProcessStateForLaunch -Data $manifest -LaunchAttemptId $launchAttemptId -LaunchDispatchedUtc $launchDispatchedUtc -PreLaunchGameProcesses $preLaunchGameProcesses
     $manifest.status = 'launching'
     $manifest.launcherPid = $process.Id
     $manifest.launchedUtc = $lockData.launchedUtc
@@ -4008,8 +4163,18 @@ function Invoke-MO2Launch {
         $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
         $lockData = $owned.data
     }
-    if ($gameObserved) { $null = Set-MO2OwnedSessionGameProcesses -Owned $owned -Processes @($status.processes.game) }
-    $lockData.status = if ($gameObserved) { 'running' } elseif ($blockingDialog.Count -gt 0) { 'launch-blocked-dialog' } else { 'launch-failed' }
+    $gameProcessAdoption = if ($gameObserved) { Get-MO2ObservedGameProcessAdoption -Config $Config -Owned $owned -Processes @($status.processes.game) } else { $null }
+    $commitOwnerResolution = if ($gameObserved -and $null -ne $gameProcessAdoption -and $gameProcessAdoption.eligible) { Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames)) } else { $null }
+    $gameOwned = $gameObserved -and $null -ne $gameProcessAdoption -and $gameProcessAdoption.eligible -and $null -ne $commitOwnerResolution -and $commitOwnerResolution.ok -and @($commitOwnerResolution.targets).Count -eq 1
+    if ($gameOwned) {
+        $null = Set-MO2OwnedSessionGameProcesses -Owned $owned -Processes @($gameProcessAdoption.records)
+    }
+    elseif ($null -ne $gameProcessAdoption -and $gameProcessAdoption.eligible) {
+        $gameProcessAdoption.eligible = $false
+        $gameProcessAdoption.reasons = @($gameProcessAdoption.reasons) + @('mo2-owner-changed-before-adoption-commit')
+        $gameProcessAdoption | Add-Member -NotePropertyName commitOwnershipResolution -NotePropertyValue $commitOwnerResolution -Force
+    }
+    $lockData.status = if ($gameOwned) { 'running' } elseif ($blockingDialog.Count -gt 0) { 'launch-blocked-dialog' } else { 'launch-failed' }
     $null = Write-MO2OwnedSessionAtomic -Owned $owned -Value $lockData
     $lockData = $owned.data
     $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw)
@@ -4033,8 +4198,9 @@ function Invoke-MO2Launch {
         return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'launch-blocked-dialog' -Data @{ sessionId = $SessionId; launcherPid = $process.Id; launchStartedReceiptPath = $launchStartedPath; dialogReceiptPath = $dialogReceiptPath; dialog = $blockingDialog[0]; processes = $status.processes; sessionPath = $lockData.sessionPath } -Errors @('MO2 reported Failed to write settings. The launch was classified immediately; use close/stop to acknowledge the exact dialog and shut down cooperatively.')
     }
 
-    if (-not $gameObserved) {
-        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'launch-failed' -Data @{ launcherPid = $process.Id; launcherExited = $process.HasExited; launcherExitCode = $(if ($process.HasExited) { $process.ExitCode } else { $null }); primaryGameProcessName = $primaryGameProcessName; processes = $status.processes; sessionPath = $lockData.sessionPath; launchStartedReceiptPath = $launchStartedPath } -Errors @("The primary game process '$primaryGameProcessName' was not observed within $TimeoutSeconds seconds. A launcher helper exit is non-terminal because an existing MO2 instance can accept the request asynchronously.")
+    if (-not $gameOwned) {
+        $launchError = if ($gameObserved) { "The observed game process did not satisfy exact current-launch ownership: $(@($gameProcessAdoption.reasons) -join ', ')." } else { "The primary game process '$primaryGameProcessName' was not observed within $TimeoutSeconds seconds. A launcher helper exit is non-terminal because an existing MO2 instance can accept the request asynchronously." }
+        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'launch-failed' -Data @{ launcherPid = $process.Id; launcherExited = $process.HasExited; launcherExitCode = $(if ($process.HasExited) { $process.ExitCode } else { $null }); primaryGameProcessName = $primaryGameProcessName; processes = $status.processes; gameProcessAdoption = $gameProcessAdoption; sessionPath = $lockData.sessionPath; launchStartedReceiptPath = $launchStartedPath } -Errors @($launchError)
     }
     return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'game-running' -Data @{ launcherPid = $process.Id; ownerPid = $ownerResolution.ownerPid; ownershipResolution = $ownerResolution; primaryGameProcessName = $primaryGameProcessName; processes = $status.processes; sessionPath = $lockData.sessionPath; launchStartedReceiptPath = $launchStartedPath; rootBuilderRecovery = [bool]$RootBuilderRecovery; resumeDisposition = $resumeDisposition }
 }
@@ -4467,6 +4633,31 @@ function Invoke-MO2StopGame {
     )
 }
 
+function Resolve-MO2RecordedGameProcessTargets {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Recorded,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Current
+    )
+
+    $targets = [Collections.Generic.List[object]]::new()
+    foreach ($recordedProcess in $Recorded) {
+        $matches = @($Current | Where-Object { [int]$_.id -eq [int]$recordedProcess.id })
+        if ($matches.Count -eq 0) { continue }
+        if ($matches.Count -ne 1) {
+            return [pscustomobject][ordered]@{ ok = $false; reason = 'recorded-game-pid-ambiguous'; recorded = $recordedProcess; current = $matches; targets = @($targets) }
+        }
+        $identity = Test-MO2ProcessRecordIdentity -Expected $recordedProcess -Actual $matches[0]
+        if (-not $identity.ok) {
+            return [pscustomobject][ordered]@{ ok = $false; reason = [string]$identity.reason; identity = $identity; recorded = $recordedProcess; current = $matches; targets = @($targets) }
+        }
+        $targets.Add($matches[0])
+    }
+    if ($Current.Count -gt $targets.Count) {
+        return [pscustomobject][ordered]@{ ok = $false; reason = 'unrecorded-game-process-present'; recorded = $Recorded; current = $Current; targets = @($targets) }
+    }
+    return [pscustomobject][ordered]@{ ok = $true; reason = if ($targets.Count -eq 0) { 'game-already-stopped' } else { 'exact-recorded-game-processes' }; recorded = $Recorded; current = $Current; targets = @($targets) }
+}
+
 function Invoke-MO2TerminateGame {
     [CmdletBinding()]
     param(
@@ -4484,18 +4675,11 @@ function Invoke-MO2TerminateGame {
     if (-not $owned.data.PSObject.Properties['gameProcesses'] -or @($owned.data.gameProcesses).Count -eq 0) {
         return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $false -State 'blocked' -Data @{ processes=$inspection.processes } -Errors @('The session has no launch-recorded game/loader process identities; refusing process-name termination.')
     }
-    $targets = @()
-    foreach ($recorded in @($owned.data.gameProcesses)) {
-        $current = @($inspection.processes.game | Where-Object { [int]$_.id -eq [int]$recorded.id })
-        if ($current.Count -eq 0) { continue }
-        if ($current.Count -ne 1 -or [string]$current[0].name -cne [string]$recorded.name -or [string]$current[0].path -cne [string]$recorded.path -or [string]$current[0].startTime -cne [string]$recorded.startTime) {
-            return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $false -State 'blocked' -Data @{ recorded=$recorded; current=$current } -Errors @('A recorded game PID no longer has the exact recorded name, path, and start time; refusing possible PID reuse.')
-        }
-        $targets += $current[0]
+    $gameResolution = Resolve-MO2RecordedGameProcessTargets -Recorded @($owned.data.gameProcesses) -Current @($inspection.processes.game)
+    if (-not $gameResolution.ok) {
+        return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $false -State 'blocked' -Data @{ gameResolution=$gameResolution } -Errors @('A current game process does not match the exact recorded PID, name, executable path, and start instant; refusing possible PID reuse or partial process-name termination.')
     }
-    if ($inspection.processes.game.Count -gt $targets.Count) {
-        return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $false -State 'blocked' -Data @{ recorded=$owned.data.gameProcesses; current=$inspection.processes.game; targets=$targets } -Errors @('An unrecorded game/loader process is present; refusing partial process-name termination.')
-    }
+    $targets = @($gameResolution.targets)
     if ($targets.Count -eq 0) {
         return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $true -State 'game-already-stopped' -Data @{ sessionId=$SessionId; mo2Retained=$true; targets=@(); forceTermination=$false }
     }
