@@ -573,6 +573,7 @@ function Get-CommittedRestoreProof(
     [string]$BaselineTreeSha256,
     [string]$WorkingTreeSha256,
     [string]$SnapshotTransactionId,
+    [Parameter(Mandatory)][string]$ExpectedNoOpPreservedPath,
     [switch]$RecoverMissingNoOpJournal) {
     if ([string]::IsNullOrWhiteSpace($ReceiptPath) -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) {
         throw 'Committed restore receipt is missing; recovery remains required.'
@@ -605,6 +606,11 @@ function Get-CommittedRestoreProof(
     $preservedPath = Assert-SafeDirectory ([string]$receipt.displacedPath) 'preserved task output' -MustExist
     if (-not $preservedPath.StartsWith($resolvedEvidence + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Committed restore receipt points outside the exact task evidence directory.'
+    }
+    if ($receiptOperation -ceq 'restore-noop' -and
+        ([string]::IsNullOrWhiteSpace($ExpectedNoOpPreservedPath) -or
+         -not (Test-SamePath $preservedPath $ExpectedNoOpPreservedPath))) {
+        throw 'Committed no-op restore receipt does not point to the exact preserved baseline from the task snapshot.'
     }
     $preserved = Get-TreeInventory $preservedPath
     if ([string]$preserved.treeSha256 -ine $WorkingTreeSha256) {
@@ -675,12 +681,13 @@ function Get-UniqueCommittedRestoreProof(
     [string]$BaselineTreeSha256,
     [string]$WorkingTreeSha256,
     [string]$SnapshotTransactionId,
+    [Parameter(Mandatory)][string]$ExpectedNoOpPreservedPath,
     [switch]$RecoverMissingNoOpJournal) {
     $receiptCandidates = @(Get-ChildItem -LiteralPath $EvidenceRoot -Filter 'shader-cache-restore.*.receipt.json' -File -Force)
     if ($receiptCandidates.Count -ne 1 -or -not (Test-SamePath $receiptCandidates[0].FullName $ReceiptPath)) {
         throw 'Stored restore receipt is missing or conflicts with other recovery evidence; recovery remains required.'
     }
-    return Get-CommittedRestoreProof -ReceiptPath $ReceiptPath -EvidenceRoot $EvidenceRoot -CachePath $CachePath -BaselineTreeSha256 $BaselineTreeSha256 -WorkingTreeSha256 $WorkingTreeSha256 -SnapshotTransactionId $SnapshotTransactionId -RecoverMissingNoOpJournal:$RecoverMissingNoOpJournal
+    return Get-CommittedRestoreProof -ReceiptPath $ReceiptPath -EvidenceRoot $EvidenceRoot -CachePath $CachePath -BaselineTreeSha256 $BaselineTreeSha256 -WorkingTreeSha256 $WorkingTreeSha256 -SnapshotTransactionId $SnapshotTransactionId -ExpectedNoOpPreservedPath $ExpectedNoOpPreservedPath -RecoverMissingNoOpJournal:$RecoverMissingNoOpJournal
 }
 
 function New-CommittedNoOpRestoreProof(
@@ -736,7 +743,7 @@ function New-CommittedNoOpRestoreProof(
     $journal | Add-Member -NotePropertyName receiptPath -NotePropertyValue $receiptPath -Force
     $journal | Add-Member -NotePropertyName committedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
     Write-JsonAtomic $journalPath $journal -RefuseExisting
-    return Get-CommittedRestoreProof -ReceiptPath $receiptPath -EvidenceRoot $resolvedEvidence -CachePath $CachePath -BaselineTreeSha256 $BaselineTreeSha256 -WorkingTreeSha256 $WorkingTreeSha256 -SnapshotTransactionId $SnapshotTransactionId
+    return Get-CommittedRestoreProof -ReceiptPath $receiptPath -EvidenceRoot $resolvedEvidence -CachePath $CachePath -BaselineTreeSha256 $BaselineTreeSha256 -WorkingTreeSha256 $WorkingTreeSha256 -SnapshotTransactionId $SnapshotTransactionId -ExpectedNoOpPreservedPath $baselinePath
 }
 
 function Assert-OverwriteOwnerBinding($Binding) {
@@ -1238,7 +1245,7 @@ function Complete-TaskCache($Storage) {
         throw 'Task snapshot receipt is missing; completion remains pending.'
     }
     $snapshotReceipt = Get-Content -LiteralPath ([string]$plan.transactionReceiptPath) -Raw | ConvertFrom-Json -Depth 30
-    foreach ($property in @('operation', 'transactionId', 'cachePath', 'beforeTreeSha256')) {
+    foreach ($property in @('operation', 'transactionId', 'cachePath', 'beforeTreeSha256', 'backupPath')) {
         if (-not $snapshotReceipt.PSObject.Properties[$property]) { throw "Task snapshot receipt lacks required field '$property'." }
     }
     if ([string]$snapshotReceipt.operation -cne 'snapshot' -or [string]::IsNullOrWhiteSpace([string]$snapshotReceipt.transactionId) -or
@@ -1247,6 +1254,10 @@ function Complete-TaskCache($Storage) {
         throw 'Task snapshot receipt no longer binds the exact task cache plan.'
     }
     $snapshotTransactionId = [string]$snapshotReceipt.transactionId
+    $snapshotPreservedPath = Assert-SafeDirectory ([string]$snapshotReceipt.backupPath) 'task snapshot preserved baseline' -MustExist
+    if (-not $snapshotPreservedPath.StartsWith($evidence + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Task snapshot preserved baseline escaped the exact task evidence directory.'
+    }
     $requireMaterialized = [bool]$RequireMaterializedOutput -or
         ((Test-Property $plan 'requireMaterializedOutput') -and [bool]$plan.requireMaterializedOutput)
 
@@ -1285,14 +1296,14 @@ function Complete-TaskCache($Storage) {
     }
     $restore = $null
     if ($plan.PSObject.Properties['restoreReceiptPath'] -and -not [string]::IsNullOrWhiteSpace([string]$plan.restoreReceiptPath)) {
-        $restore = Get-UniqueCommittedRestoreProof -ReceiptPath ([string]$plan.restoreReceiptPath) -EvidenceRoot $evidence -CachePath $resolvedCache -BaselineTreeSha256 ([string]$plan.beforeTreeSha256) -WorkingTreeSha256 ([string]$currentBeforeRestore.data.treeSha256) -SnapshotTransactionId $snapshotTransactionId -RecoverMissingNoOpJournal
+        $restore = Get-UniqueCommittedRestoreProof -ReceiptPath ([string]$plan.restoreReceiptPath) -EvidenceRoot $evidence -CachePath $resolvedCache -BaselineTreeSha256 ([string]$plan.beforeTreeSha256) -WorkingTreeSha256 ([string]$currentBeforeRestore.data.treeSha256) -SnapshotTransactionId $snapshotTransactionId -ExpectedNoOpPreservedPath $snapshotPreservedPath -RecoverMissingNoOpJournal
     }
     else {
         $liveNow = Invoke-Transaction 'inspect' @{ CachePath = $resolvedCache }
         $receiptCandidates = @(Get-ChildItem -LiteralPath $evidence -Filter 'shader-cache-restore.*.receipt.json' -File -Force | Sort-Object LastWriteTimeUtc -Descending)
         if ([string]$liveNow.data.treeSha256 -ieq [string]$plan.beforeTreeSha256) {
             if ($receiptCandidates.Count -eq 1) {
-                $restore = Get-CommittedRestoreProof -ReceiptPath $receiptCandidates[0].FullName -EvidenceRoot $evidence -CachePath $resolvedCache -BaselineTreeSha256 ([string]$plan.beforeTreeSha256) -WorkingTreeSha256 ([string]$currentBeforeRestore.data.treeSha256) -SnapshotTransactionId $snapshotTransactionId -RecoverMissingNoOpJournal
+                $restore = Get-CommittedRestoreProof -ReceiptPath $receiptCandidates[0].FullName -EvidenceRoot $evidence -CachePath $resolvedCache -BaselineTreeSha256 ([string]$plan.beforeTreeSha256) -WorkingTreeSha256 ([string]$currentBeforeRestore.data.treeSha256) -SnapshotTransactionId $snapshotTransactionId -ExpectedNoOpPreservedPath $snapshotPreservedPath -RecoverMissingNoOpJournal
             }
             elseif ($receiptCandidates.Count -eq 0 -and
                 [string]$liveNow.data.treeSha256 -ieq [string]$currentBeforeRestore.data.treeSha256) {
@@ -1305,7 +1316,7 @@ function Complete-TaskCache($Storage) {
             if ($receiptCandidates.Count -ne 0) { throw 'Restore receipt evidence exists while the live working tree remains active; recovery is required.' }
             Assert-OverwriteOwnerBinding $cacheBinding
             $restoreResult = Invoke-Transaction 'restore' @{ CachePath = $resolvedCache; EvidenceDirectory = $evidence; BlockingProcessNames = $BlockingProcessNames; Confirm = $false }
-            $restore = Get-CommittedRestoreProof -ReceiptPath ([string]$restoreResult.data.restoreReceiptPath) -EvidenceRoot $evidence -CachePath $resolvedCache -BaselineTreeSha256 ([string]$plan.beforeTreeSha256) -WorkingTreeSha256 ([string]$currentBeforeRestore.data.treeSha256) -SnapshotTransactionId $snapshotTransactionId
+            $restore = Get-CommittedRestoreProof -ReceiptPath ([string]$restoreResult.data.restoreReceiptPath) -EvidenceRoot $evidence -CachePath $resolvedCache -BaselineTreeSha256 ([string]$plan.beforeTreeSha256) -WorkingTreeSha256 ([string]$currentBeforeRestore.data.treeSha256) -SnapshotTransactionId $snapshotTransactionId -ExpectedNoOpPreservedPath $snapshotPreservedPath
         }
         else { throw 'Live cache matches neither the recorded working tree nor the preserved baseline; recovery is required.' }
         $plan | Add-Member -NotePropertyName restoreReceiptPath -NotePropertyValue ([string]$restore.data.restoreReceiptPath) -Force
@@ -1313,7 +1324,7 @@ function Complete-TaskCache($Storage) {
         Assert-OverwriteOwnerBinding $cacheBinding
         Write-JsonAtomic $planPath $plan
     }
-    $restore = Get-UniqueCommittedRestoreProof -ReceiptPath ([string]$restore.data.restoreReceiptPath) -EvidenceRoot $evidence -CachePath $resolvedCache -BaselineTreeSha256 ([string]$plan.beforeTreeSha256) -WorkingTreeSha256 ([string]$currentBeforeRestore.data.treeSha256) -SnapshotTransactionId $snapshotTransactionId
+    $restore = Get-UniqueCommittedRestoreProof -ReceiptPath ([string]$restore.data.restoreReceiptPath) -EvidenceRoot $evidence -CachePath $resolvedCache -BaselineTreeSha256 ([string]$plan.beforeTreeSha256) -WorkingTreeSha256 ([string]$currentBeforeRestore.data.treeSha256) -SnapshotTransactionId $snapshotTransactionId -ExpectedNoOpPreservedPath $snapshotPreservedPath
     $promoted = $null
     if ($Promote) {
         Assert-TaskCacheBindingCurrent $cacheBinding
@@ -1329,7 +1340,7 @@ function Complete-TaskCache($Storage) {
         $script:Label = if ([string]::IsNullOrWhiteSpace($Label)) { 'task-complete-' + [IO.Path]::GetFileName($evidence) } else { $Label }
         $promoted = New-CatalogSnapshot -Storage $Storage -Source ([string]$restore.data.displacedPath) -ExpectedHash ([string]$currentBeforeRestore.data.treeSha256) -ReceiptPath ([string]$restore.data.restoreReceiptPath) -Status 'known-working' -Caller $script:CatalogCommandContext
     }
-    $finalProof = Get-UniqueCommittedRestoreProof -ReceiptPath ([string]$restore.data.restoreReceiptPath) -EvidenceRoot $evidence -CachePath $resolvedCache -BaselineTreeSha256 ([string]$plan.beforeTreeSha256) -WorkingTreeSha256 ([string]$currentBeforeRestore.data.treeSha256) -SnapshotTransactionId $snapshotTransactionId
+    $finalProof = Get-UniqueCommittedRestoreProof -ReceiptPath ([string]$restore.data.restoreReceiptPath) -EvidenceRoot $evidence -CachePath $resolvedCache -BaselineTreeSha256 ([string]$plan.beforeTreeSha256) -WorkingTreeSha256 ([string]$currentBeforeRestore.data.treeSha256) -SnapshotTransactionId $snapshotTransactionId -ExpectedNoOpPreservedPath $snapshotPreservedPath
     $restore = $finalProof
     $completion = [pscustomobject][ordered]@{
         contractVersion = $contractVersion
