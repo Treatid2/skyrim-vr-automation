@@ -254,6 +254,9 @@ selected_profile=@ByteArray(Codex)
     $exactUnlockFactory = { $exactUnlockState.calls++; [pscustomobject]@{ processes = [pscustomobject]@{ mo2 = @($launchOwner.targets[0]); game = @() }; rootBuilder = [pscustomobject]@{ active = $(if ($exactUnlockState.calls -eq 1) { @([pscustomobject]@{ path = (Join-Path $fixture 'BuildData.json') }) } else { @() }) } } }.GetNewClosure()
     $exactUnlock = & $mo2Module { param($cfg, $owned, $factory, $action) Invoke-MO2UnlockOnly -Config $cfg -Owned $owned -TimeoutSeconds 1 -PollMilliseconds 0 -InspectionFactory $factory -UnlockAction $action } $config $launchingOwned $exactUnlockFactory $unlockCallback
     Assert-MO2Test ($exactUnlock.restored -and $exactUnlock.ownerIdentityVerified -and $unlockCalls.Count -eq 1) 'RootBuilder Unlock acts only on the exact current owner and revalidates it for final success'
+    $replacementCloseInventory = { param($fixtureConfig) @($reusedOwnerRecord) }.GetNewClosure()
+    $replacementClose = & $mo2Module { param($cfg, $owned, $initial, $factory) Invoke-MO2CooperativeCloseCore -Config $cfg -Owned $owned -InitialProcesses @($initial) -TimeoutSeconds 1 -ProcessInventoryFactory $factory } $config $launchingOwned $launchOwner.targets[0] $replacementCloseInventory
+    Assert-MO2Test (-not $replacementClose.closed -and -not $replacementClose.ownerIdentityVerified -and $replacementClose.blockedReason -eq 'recorded-owner-start-time-mismatch' -and @($replacementClose.actions).Count -eq 0) 'cooperative close refuses a reused MO2 owner identity before invoking any UI action'
     $preLaunchOwned = $launchingOwned | ConvertTo-Json -Depth 20 | ConvertFrom-Json
     $preLaunchOwned.data.ownerProcessStartTime = $ownerStartUtc.ToString('o')
     $preLaunchOwned.data.preLaunchGameProcesses = @($observedGame)
@@ -711,7 +714,7 @@ selected_profile=@ByteArray(Codex)
             try {
                 Set-Item -Path Function:script:Test-MO2InteractiveDesktop -Value { $true }
                 Set-Item -Path Function:script:Invoke-MO2CooperativeClose -Value {
-                    param($Config, $InitialProcesses, $EvidenceDirectory, $TimeoutSeconds)
+                    param($Config, $Owned, $InitialProcesses, $EvidenceDirectory, $TimeoutSeconds)
                     [pscustomobject][ordered]@{
                         closed = $true
                         initialProcesses = @($InitialProcesses)

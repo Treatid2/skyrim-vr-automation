@@ -182,6 +182,11 @@ live. Readable legacy PID/start-time records are labelled separately from the
 modern path-bound identity contract; PID presence alone is never reported as an
 identity match.
 
+Cooperative close re-resolves that exact owner after game shutdown and retains
+an open kernel process handle across each `Unlock`, `Exit`, or window-close UI
+action. If the owner exits or its PID, path, or start time changes, close stops
+without acting on the replacement process.
+
 Every task must call `release-access` as soon as it no longer needs MO2. This
 includes compilation, source editing, result analysis, report writing, and any
 other phase that does not operate MO2 or Skyrim. Do not hold the lease merely
