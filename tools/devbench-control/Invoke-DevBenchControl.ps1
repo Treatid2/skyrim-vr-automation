@@ -1348,17 +1348,23 @@ try {
                 $observation | Add-Member -NotePropertyName requiredStableSeconds -NotePropertyValue $MinimumMenuStableSeconds -Force
             }
             elseif ($Condition -eq 'playerLoaded') {
+                $stateProbe = $null
+                $sceneProbe = $null
                 try {
                     $stateContent = @((Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'state' } -Headers $headers).content)
                     $stateProbe = Get-DevBenchWaitProbeAssessment -ProbeKind player-state -Content $stateContent
-                    $sceneContent = @((Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'scene' } -Headers $headers).content)
-                    $sceneProbe = Get-DevBenchWaitProbeAssessment -ProbeKind scene -Content $sceneContent
-                    $failedProbe = @(@($stateProbe, $sceneProbe) | Where-Object { -not $_.ok } | Select-Object -First 1)
-                    if ($failedProbe.Count -gt 0) {
-                        $probe = $failedProbe[0]
+                    if (-not $stateProbe.terminalFailure) {
+                        $sceneContent = @((Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'scene' } -Headers $headers).content)
+                        $sceneProbe = Get-DevBenchWaitProbeAssessment -ProbeKind scene -Content $sceneContent
+                    }
+                    $probeFailure = Select-DevBenchWaitProbeFailure -Probes @($stateProbe, $sceneProbe)
+                    if ($probeFailure.found) {
                         $observation = [pscustomobject][ordered]@{
-                            satisfied = $false; retryable = $probe.retryable; terminalFailure = $probe.terminalFailure
-                            semantic = $probe.semantic; state = $stateProbe.payload; scene = $sceneProbe.payload
+                            satisfied = $false; retryable = $probeFailure.retryable; terminalFailure = $probeFailure.terminalFailure
+                            semantic = $probeFailure.semantic
+                            probeFailures = @($probeFailure.failures)
+                            state = if ($stateProbe) { $stateProbe.payload } else { $null }
+                            scene = if ($sceneProbe) { $sceneProbe.payload } else { $null }
                             expectedCell = $ExpectedCell; classification = 'current-state-probe-semantic-failure'
                         }
                     }
@@ -1395,11 +1401,25 @@ try {
                 }
             }
             elseif ($Condition -eq 'upscalingStable') {
+                $stateProbe = $null
+                $sceneProbe = $null
+                $menuProbe = $null
+                $upscalingProbe = $null
+                $renderScaleProbe = $null
                 try {
-                    $state = @(Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'state' } -Headers $headers).content | Select-Object -First 1
-                    $scene = @(Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'scene' } -Headers $headers).content | Select-Object -First 1
-                    $menu = @(Invoke-ToolRpc -Name 'menu' -Arguments @{ action = 'list' } -Headers $headers).content | Select-Object -First 1
-                    $menuState = Test-DevBenchNoBlockingMenu -MenuState $menu -IgnoredMenus $IgnoredMenus
+                    $stateContent = @((Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'state' } -Headers $headers).content)
+                    $stateProbe = Get-DevBenchWaitProbeAssessment -ProbeKind player-state -Content $stateContent
+                    $terminalProbeObserved = [bool]$stateProbe.terminalFailure
+                    if (-not $terminalProbeObserved) {
+                        $sceneContent = @((Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'scene' } -Headers $headers).content)
+                        $sceneProbe = Get-DevBenchWaitProbeAssessment -ProbeKind scene -Content $sceneContent
+                        $terminalProbeObserved = [bool]$sceneProbe.terminalFailure
+                    }
+                    if (-not $terminalProbeObserved) {
+                        $menuContent = @((Invoke-ToolRpc -Name 'menu' -Arguments @{ action = 'list' } -Headers $headers).content)
+                        $menuProbe = Get-DevBenchWaitProbeAssessment -ProbeKind menu -Content $menuContent
+                        $terminalProbeObserved = [bool]$menuProbe.terminalFailure
+                    }
                     $buildId = if ($runtimeIdentity -and $runtimeIdentity.build) { [string]$runtimeIdentity.build.buildId } else { $ExpectedBuildId }
                     $upscalingArguments = @{
                         contractMajor = 1
@@ -1412,53 +1432,88 @@ try {
                         $upscalingArguments['expectedBuildId'] = $buildId
                         $renderScaleArguments['expectedBuildId'] = $buildId
                     }
-                    $upscaling = @(Invoke-ToolRpc -Name 'communityshaders.upscaling_api' -Arguments $upscalingArguments -Headers $headers).content | Select-Object -First 1
-                    $renderScale = @(Invoke-ToolRpc -Name 'communityshaders.renderscale' -Arguments $renderScaleArguments -Headers $headers).content | Select-Object -First 1
-                    $stability = Test-DevBenchUpscalingStable -UpscalingSnapshot $upscaling -RenderScaleStatus $renderScale -ExpectedProfile $expectedUpscalingProfile
-                    $actualCell = if ($scene.cell -is [string]) {
-                        [string]$scene.cell
+                    if (-not $terminalProbeObserved) {
+                        $upscalingContent = @((Invoke-ToolRpc -Name 'communityshaders.upscaling_api' -Arguments $upscalingArguments -Headers $headers).content)
+                        $upscalingProbe = Get-DevBenchWaitProbeAssessment -ProbeKind upscaling-snapshot -Content $upscalingContent
+                        $terminalProbeObserved = [bool]$upscalingProbe.terminalFailure
                     }
-                    elseif ($scene.cell -and $scene.cell.PSObject.Properties['editorId']) {
-                        [string]$scene.cell.editorId
+                    if (-not $terminalProbeObserved) {
+                        $renderScaleContent = @((Invoke-ToolRpc -Name 'communityshaders.renderscale' -Arguments $renderScaleArguments -Headers $headers).content)
+                        $renderScaleProbe = Get-DevBenchWaitProbeAssessment -ProbeKind render-scale -Content $renderScaleContent
                     }
-                    else { $null }
-                    $cellMatches = [string]::Equals($actualCell, $ExpectedCell, [StringComparison]::OrdinalIgnoreCase)
-                    $instantaneousStable = [bool]$state.playerLoaded -and $cellMatches -and $menuState.satisfied -and $stability.satisfied
-                    if ($instantaneousStable) {
-                        if ($stableSignature -eq $stability.signature -and [uint32]$stability.frame -gt $stableLastFrame) {
-                            $stableCandidateCount++
-                        }
-                        else {
-                            $stableCandidateCount = 1
-                            $stableFirstFrame = [uint32]$stability.frame
-                            $stableSignature = $stability.signature
-                        }
-                        $stableLastFrame = [uint32]$stability.frame
-                    }
-                    else {
+                    $probeFailure = Select-DevBenchWaitProbeFailure -Probes @($stateProbe, $sceneProbe, $menuProbe, $upscalingProbe, $renderScaleProbe)
+                    if ($probeFailure.found) {
                         $stableCandidateCount = 0
                         $stableFirstFrame = 0u
                         $stableLastFrame = 0u
                         $stableSignature = $null
+                        $observation = [pscustomobject][ordered]@{
+                            satisfied = $false
+                            retryable = $probeFailure.retryable
+                            terminalFailure = $probeFailure.terminalFailure
+                            semantic = $probeFailure.semantic
+                            probeFailures = @($probeFailure.failures)
+                            state = if ($stateProbe) { $stateProbe.payload } else { $null }
+                            scene = if ($sceneProbe) { $sceneProbe.payload } else { $null }
+                            menu = if ($menuProbe) { $menuProbe.payload } else { $null }
+                            upscaling = if ($upscalingProbe) { $upscalingProbe.payload } else { $null }
+                            renderScale = if ($renderScaleProbe) { $renderScaleProbe.payload } else { $null }
+                            expectedCell = $ExpectedCell
+                            expectedProfile = $expectedUpscalingProfile
+                            classification = 'upscaling-stability-probe-semantic-failure'
+                        }
                     }
-                    $stableFrameAdvance = if ($stableFirstFrame -ne 0 -and $stableLastFrame -ge $stableFirstFrame) { $stableLastFrame - $stableFirstFrame } else { 0u }
-                    $observation = [pscustomobject][ordered]@{
-                        satisfied = $instantaneousStable -and $stableCandidateCount -ge $StableSamples -and $stableFrameAdvance -ge $MinimumStableFrameAdvance
-                        retryable = $false
-                        expectedCell = $ExpectedCell
-                        expectedProfile = $expectedUpscalingProfile
-                        actualCell = $actualCell
-                        cellMatches = $cellMatches
-                        playerLoaded = [bool]$state.playerLoaded
-                        menu = $menuState
-                        upscaling = $stability
-                        stableSamples = $stableCandidateCount
-                        requiredStableSamples = $StableSamples
-                        stableFirstFrame = $stableFirstFrame
-                        stableLastFrame = $stableLastFrame
-                        stableFrameAdvance = $stableFrameAdvance
-                        requiredFrameAdvance = $MinimumStableFrameAdvance
-                        probeError = $null
+                    else {
+                        $state = $stateProbe.payload
+                        $scene = $sceneProbe.payload
+                        $menuState = Test-DevBenchNoBlockingMenu -MenuState $menuProbe.payload -IgnoredMenus $IgnoredMenus
+                        $stability = Test-DevBenchUpscalingStable -UpscalingSnapshot $upscalingProbe.payload -RenderScaleStatus $renderScaleProbe.payload -ExpectedProfile $expectedUpscalingProfile
+                        $actualCell = if ($scene.cell -is [string]) {
+                            [string]$scene.cell
+                        }
+                        elseif ($scene.cell -and $scene.cell.PSObject.Properties['editorId']) {
+                            [string]$scene.cell.editorId
+                        }
+                        else { $null }
+                        $cellMatches = [string]::Equals($actualCell, $ExpectedCell, [StringComparison]::OrdinalIgnoreCase)
+                        $instantaneousStable = [bool]$state.playerLoaded -and $cellMatches -and $menuState.satisfied -and $stability.satisfied
+                        if ($instantaneousStable) {
+                            if ($stableSignature -eq $stability.signature -and [uint32]$stability.frame -gt $stableLastFrame) {
+                                $stableCandidateCount++
+                            }
+                            else {
+                                $stableCandidateCount = 1
+                                $stableFirstFrame = [uint32]$stability.frame
+                                $stableSignature = $stability.signature
+                            }
+                            $stableLastFrame = [uint32]$stability.frame
+                        }
+                        else {
+                            $stableCandidateCount = 0
+                            $stableFirstFrame = 0u
+                            $stableLastFrame = 0u
+                            $stableSignature = $null
+                        }
+                        $stableFrameAdvance = if ($stableFirstFrame -ne 0 -and $stableLastFrame -ge $stableFirstFrame) { $stableLastFrame - $stableFirstFrame } else { 0u }
+                        $observation = [pscustomobject][ordered]@{
+                            satisfied = $instantaneousStable -and $stableCandidateCount -ge $StableSamples -and $stableFrameAdvance -ge $MinimumStableFrameAdvance
+                            retryable = $false
+                            terminalFailure = $false
+                            expectedCell = $ExpectedCell
+                            expectedProfile = $expectedUpscalingProfile
+                            actualCell = $actualCell
+                            cellMatches = $cellMatches
+                            playerLoaded = [bool]$state.playerLoaded
+                            menu = $menuState
+                            upscaling = $stability
+                            stableSamples = $stableCandidateCount
+                            requiredStableSamples = $StableSamples
+                            stableFirstFrame = $stableFirstFrame
+                            stableLastFrame = $stableLastFrame
+                            stableFrameAdvance = $stableFrameAdvance
+                            requiredFrameAdvance = $MinimumStableFrameAdvance
+                            probeError = $null
+                        }
                     }
                 }
                 catch {

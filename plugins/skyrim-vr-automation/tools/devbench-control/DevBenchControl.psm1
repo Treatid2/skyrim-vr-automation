@@ -76,8 +76,12 @@ function Get-DevBenchSemanticStatus {
                     }
                     elseif ($name -in @('status', 'resultStatus') -and
                         ($child -is [pscustomobject] -or $child -is [Collections.IDictionary])) {
-                        $statusNameProperty = $child.PSObject.Properties['name']
-                        $statusValueProperty = $child.PSObject.Properties['value']
+                        $statusProperties = if ($child -is [Collections.IDictionary]) {
+                            @($child.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Key; Value = $_.Value } })
+                        }
+                        else { @($child.PSObject.Properties) }
+                        $statusNameProperty = @($statusProperties | Where-Object Name -eq 'name' | Select-Object -First 1)
+                        $statusValueProperty = @($statusProperties | Where-Object Name -eq 'value' | Select-Object -First 1)
                         if (-not $statusNameProperty -or $statusNameProperty.Value -isnot [string] -or
                             [string]$statusNameProperty.Value -notin $successNames) {
                             $rejected.Add("$childPath.name is not a success value")
@@ -89,6 +93,19 @@ function Get-DevBenchSemanticStatus {
                             $rejected.Add("$childPath.value is not integer zero")
                         }
                         else { $positive.Add("$childPath.name") }
+                        foreach ($statusProperty in $statusProperties) {
+                            $statusMemberName = [string]$statusProperty.Name
+                            if ($statusMemberName -in @('name', 'value')) { continue }
+                            $statusMemberPath = "$childPath.$statusMemberName"
+                            if ($statusMemberName -in $outcomeMetadataNames) {
+                                if ($statusProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$statusProperty.Value)) {
+                                    $rejected.Add("$statusMemberPath is not valid outcome metadata")
+                                }
+                            }
+                            else {
+                                Visit-OutcomeValue $statusProperty.Value $statusMemberPath $true
+                            }
+                        }
                     }
                     else { $rejected.Add("$childPath is not a supported outcome value") }
                 }
@@ -306,6 +323,7 @@ function Test-DevBenchReadOnlyRequest {
     if ($ToolName -eq 'record') { return $action -eq 'status' }
     if ($ToolName -eq 'input') { return $action -in @('observe', 'status') }
     if ($ToolName -eq 'communityshaders.renderscale') { return $action -eq 'status' }
+    if ($ToolName -eq 'communityshaders.upscaling_api') { return $action -eq 'snapshot' }
     if ($ToolName -eq 'communityshaders.screenshot') {
         return $action -in @('capabilities', 'status', 'settings_get', 'request_get', 'request_list', 'events_poll')
     }
@@ -769,6 +787,12 @@ function Get-DevBenchCallSemanticStatus {
         }
         $action = if ($Arguments.Contains('action')) { [string]$Arguments['action'] } else { '' }
         $renderScaleStatus = $payload.PSObject.Properties['status']
+        $upscalingSnapshotProperty = $payload.PSObject.Properties['snapshot']
+        $upscalingSnapshot = if ($upscalingSnapshotProperty -and
+            ($upscalingSnapshotProperty.Value -is [pscustomobject] -or $upscalingSnapshotProperty.Value -is [Collections.IDictionary])) {
+            $upscalingSnapshotProperty.Value
+        }
+        else { $payload }
         $screenshotLimits = $payload.PSObject.Properties['limits']
         $maximumSequenceFrames = if ($screenshotLimits -and
             ($screenshotLimits.Value -is [pscustomobject] -or $screenshotLimits.Value -is [Collections.IDictionary])) {
@@ -789,6 +813,8 @@ function Get-DevBenchCallSemanticStatus {
                 $payload.PSObject.Properties['action'] -and [string]$payload.action -ceq 'status' -and
                 $renderScaleStatus -and
                 ($renderScaleStatus.Value -is [pscustomobject] -or $renderScaleStatus.Value -is [Collections.IDictionary])) -or
+            ($ToolName -eq 'communityshaders.upscaling_api' -and $action -eq 'snapshot' -and
+                $upscalingSnapshot.PSObject.Properties['stateRevision']) -or
             $false
         if ($contractSatisfied) {
             $semantic.known = $true
@@ -880,12 +906,23 @@ function Test-DevBenchWaitDeadlineAcceptance {
 function Get-DevBenchWaitProbeAssessment {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][ValidateSet('menu', 'player-state', 'scene')][string]$ProbeKind,
+        [Parameter(Mandatory)][ValidateSet('menu', 'player-state', 'scene', 'upscaling-snapshot', 'render-scale')][string]$ProbeKind,
         [AllowEmptyCollection()][object[]]$Content
     )
 
-    $toolName = if ($ProbeKind -eq 'menu') { 'menu' } else { 'inspect' }
-    $arguments = if ($ProbeKind -eq 'menu') { @{ action = 'list' } } else { @{ kind = $(if ($ProbeKind -eq 'player-state') { 'state' } else { 'scene' }) } }
+    $toolName = switch ($ProbeKind) {
+        'menu' { 'menu' }
+        'upscaling-snapshot' { 'communityshaders.upscaling_api' }
+        'render-scale' { 'communityshaders.renderscale' }
+        default { 'inspect' }
+    }
+    $arguments = switch ($ProbeKind) {
+        'menu' { @{ action = 'list' } }
+        'upscaling-snapshot' { @{ action = 'snapshot' } }
+        'render-scale' { @{ action = 'status' } }
+        'player-state' { @{ kind = 'state' } }
+        default { @{ kind = 'scene' } }
+    }
     $semantic = Get-DevBenchCallSemanticStatus -ToolName $toolName -Arguments $arguments -Content $Content
     $reasons = [Collections.Generic.List[string]]::new()
     foreach ($reason in @($semantic.reasons)) { $reasons.Add([string]$reason) }
@@ -918,7 +955,7 @@ function Get-DevBenchWaitProbeAssessment {
                 $reasons.Add('player-state wait probe playerLoaded is not Boolean')
             }
         }
-        else {
+        elseif ($ProbeKind -eq 'scene') {
             $cell = $payload.PSObject.Properties['cell']
             $editorId = if ($cell -and $null -ne $cell.Value -and
                 ($cell.Value -is [pscustomobject] -or $cell.Value -is [Collections.IDictionary])) {
@@ -928,6 +965,16 @@ function Get-DevBenchWaitProbeAssessment {
                 ($cell.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$cell.Value)) -or
                 ($editorId -and $editorId.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$editorId.Value)))
             if (-not $validCell) { $reasons.Add('scene wait probe cell identity is missing or malformed') }
+        }
+        elseif ($ProbeKind -eq 'upscaling-snapshot') {
+            $snapshotProperty = $payload.PSObject.Properties['snapshot']
+            $snapshot = if ($snapshotProperty -and
+                ($snapshotProperty.Value -is [pscustomobject] -or $snapshotProperty.Value -is [Collections.IDictionary])) {
+                $snapshotProperty.Value
+            } else { $payload }
+            if (-not $snapshot.PSObject.Properties['stateRevision']) {
+                $reasons.Add('upscaling-snapshot wait probe stateRevision is missing')
+            }
         }
     }
 
@@ -945,6 +992,40 @@ function Get-DevBenchWaitProbeAssessment {
         terminalFailure = -not $ok -and -not [bool]$semantic.transient
         semantic = $semantic
         payload = $payload
+    }
+}
+
+function Select-DevBenchWaitProbeFailure {
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][object[]]$Probes)
+
+    $failed = @($Probes | Where-Object { $null -ne $_ -and -not [bool]$_.ok })
+    if ($failed.Count -eq 0) {
+        return [pscustomobject][ordered]@{ found = $false; retryable = $false; terminalFailure = $false; semantic = $null; failures = @() }
+    }
+    $selected = @($failed | Where-Object { [bool]$_.terminalFailure } | Select-Object -First 1)
+    if ($selected.Count -eq 0) { $selected = @($failed | Select-Object -First 1) }
+    $terminal = @($failed | Where-Object { [bool]$_.terminalFailure }).Count -gt 0
+    $semantics = @($failed | ForEach-Object { $_.semantic })
+    $semantic = [pscustomobject][ordered]@{
+        known = $true
+        ok = $false
+        outcome = if ($terminal) { 'wait-probe-terminal-failure' } else { 'wait-probe-retryable-failure' }
+        guarded = @($semantics | Where-Object { [bool]$_.guarded }).Count -gt 0
+        transient = -not $terminal
+        codes = @($semantics | ForEach-Object { @($_.codes) } | Select-Object -Unique)
+        states = @($semantics | ForEach-Object { @($_.states) } | Select-Object -Unique)
+        reasons = @($semantics | ForEach-Object { @($_.reasons) } | Select-Object -Unique)
+        schedulerOnly = $false
+        schedulerReceiptPaths = @()
+        explicitOutcomeEvidence = @($semantics | ForEach-Object { @($_.explicitOutcomeEvidence) } | Select-Object -Unique)
+    }
+    return [pscustomobject][ordered]@{
+        found = $true
+        retryable = -not $terminal -and [bool]$selected[0].retryable
+        terminalFailure = $terminal
+        semantic = $semantic
+        failures = @($failed)
     }
 }
 
@@ -1918,4 +1999,4 @@ function Get-DevBenchRestMutationFailureDisposition {
     }
 }
 
-Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchWaitDeadlineAcceptance, Get-DevBenchWaitProbeAssessment, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Test-DevBenchExecutableIdentityMatch, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow, Test-DevBenchInitialMcpCapabilityMiss, Get-DevBenchRestMutationFailureDisposition
+Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchWaitDeadlineAcceptance, Get-DevBenchWaitProbeAssessment, Select-DevBenchWaitProbeFailure, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Test-DevBenchExecutableIdentityMatch, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow, Test-DevBenchInitialMcpCapabilityMiss, Get-DevBenchRestMutationFailureDisposition

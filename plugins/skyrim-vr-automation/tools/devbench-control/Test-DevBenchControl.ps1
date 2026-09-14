@@ -80,6 +80,36 @@ $namedMetadataOutcome = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{
 Assert-Test ($namedMetadataOutcome.known -and $namedMetadataOutcome.ok) 'explicit non-empty outcome metadata does not become a required outcome member'
 $recordRejectedOutcome = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ ok = $true; action = 'stop'; path = 'C:\captures\recording.json'; postconditions = $false })
 Assert-Test ($recordRejectedOutcome.known -and -not $recordRejectedOutcome.ok -and $recordRejectedOutcome.reasons -match 'Explicit outcome evidence rejected') 'detected rejected outcomes veto action-specific non-replay success'
+foreach ($structuredStatusName in @('status', 'resultStatus')) {
+    foreach ($extraFirst in @($false, $true)) {
+        $structuredStatus = [ordered]@{}
+        if ($extraFirst) { $structuredStatus['restored'] = $false }
+        $structuredStatus['name'] = 'success'
+        $structuredStatus['value'] = 0
+        if (-not $extraFirst) { $structuredStatus['restored'] = $false }
+        $outcomeCollection = [ordered]@{}
+        $outcomeCollection[$structuredStatusName] = $structuredStatus
+        $structuredStatusFailure = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ ok = $true; postconditions = $outcomeCollection })
+        Assert-Test ($structuredStatusFailure.known -and -not $structuredStatusFailure.ok -and $structuredStatusFailure.rejectedOutcomeEvidence -match 'restored') "structured $structuredStatusName rejects a false extra member in either property order"
+    }
+    foreach ($structuredExtraCase in @(
+        [pscustomobject]@{ label = 'null'; value = $null },
+        [pscustomobject]@{ label = 'empty-string'; value = '' },
+        [pscustomobject]@{ label = 'neutral-object'; value = [pscustomobject]@{ failed = $false } },
+        [pscustomobject]@{ label = 'unsupported-scalar'; value = 'unknown' },
+        [pscustomobject]@{ label = 'nested-false'; value = [pscustomobject]@{ nested = [pscustomobject]@{ passed = $false } } }
+    )) {
+        $statusWithExtra = [ordered]@{ name = 'success'; value = 0; restored = $structuredExtraCase.value }
+        $collectionWithExtra = [ordered]@{}
+        $collectionWithExtra[$structuredStatusName] = $statusWithExtra
+        $structuredExtraFailure = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ ok = $true; postconditions = $collectionWithExtra })
+        Assert-Test ($structuredExtraFailure.known -and -not $structuredExtraFailure.ok -and $structuredExtraFailure.rejectedOutcomeEvidence -match 'restored') "structured $structuredStatusName rejects $($structuredExtraCase.label) extra evidence"
+    }
+}
+$validStructuredStatus = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ ok = $true; postconditions = [pscustomobject]@{ status = [pscustomobject]@{ name = 'success'; value = 0; message = 'restored' } } })
+Assert-Test ($validStructuredStatus.known -and $validStructuredStatus.ok) 'structured status accepts its recognized fields plus non-empty outcome metadata'
+$recordStructuredStatusFailure = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ ok = $true; action = 'stop'; path = 'C:\captures\recording.json'; postconditions = [pscustomobject]@{ status = [pscustomobject]@{ name = 'success'; value = 0; restored = $false } } })
+Assert-Test ($recordStructuredStatusFailure.known -and -not $recordStructuredStatusFailure.ok -and $recordStructuredStatusFailure.reasons -match 'restored') 'structured status sibling veto reaches the non-replay record-stop adapter'
 $readOnlyInspect = Test-DevBenchReadOnlyRequest -ToolName inspect -Arguments @{ kind = 'scene' }
 $readOnlyMenu = Test-DevBenchReadOnlyRequest -ToolName menu -Arguments @{ action = 'list' }
 $mutatingMenu = Test-DevBenchReadOnlyRequest -ToolName menu -Arguments @{ action = 'open'; name = 'InventoryMenu' }
@@ -498,6 +528,18 @@ $missingPlayerProbe = Get-DevBenchWaitProbeAssessment -ProbeKind player-state -C
 Assert-Test (-not $missingPlayerProbe.ok -and $missingPlayerProbe.terminalFailure) 'missing playerLoaded evidence cannot satisfy a current-state barrier'
 $failedSceneProbe = Get-DevBenchWaitProbeAssessment -ProbeKind scene -Content @([pscustomobject]@{ ok = $false; cell = 'Whiterun' })
 Assert-Test (-not $failedSceneProbe.ok -and $failedSceneProbe.terminalFailure) 'negative scene semantics veto an otherwise matching cell identity'
+$retryablePlayerProbe = Get-DevBenchWaitProbeAssessment -ProbeKind player-state -Content @([pscustomobject]@{ ok = $false; retryable = $true; playerLoaded = $false })
+$terminalSceneProbe = Get-DevBenchWaitProbeAssessment -ProbeKind scene -Content @([pscustomobject]@{ ok = $false; retryable = $false; errors = @('scene snapshot rejected'); cell = 'Whiterun' })
+$mixedProbeFailure = Select-DevBenchWaitProbeFailure -Probes @($retryablePlayerProbe, $terminalSceneProbe)
+Assert-Test ($mixedProbeFailure.found -and $mixedProbeFailure.terminalFailure -and -not $mixedProbeFailure.retryable -and $mixedProbeFailure.semantic.reasons -match 'scene snapshot rejected') 'terminal wait-probe evidence dominates and retains a retryable sibling'
+$validUpscalingProbe = Get-DevBenchWaitProbeAssessment -ProbeKind upscaling-snapshot -Content @([pscustomobject]@{ stateRevision = 12 })
+Assert-Test $validUpscalingProbe.ok 'upscaling snapshot wait probes require a structured state revision'
+$failedUpscalingProbe = Get-DevBenchWaitProbeAssessment -ProbeKind upscaling-snapshot -Content @([pscustomobject]@{ ok = $false; errors = @('snapshot rejected'); stateRevision = 12 })
+Assert-Test (-not $failedUpscalingProbe.ok -and $failedUpscalingProbe.terminalFailure) 'negative upscaling snapshot semantics veto plausible telemetry'
+$validRenderScaleProbe = Get-DevBenchWaitProbeAssessment -ProbeKind render-scale -Content @([pscustomobject]@{ action = 'status'; status = [pscustomobject]@{ controller = [pscustomobject]@{ state = 'Active' } } })
+Assert-Test $validRenderScaleProbe.ok 'render-scale wait probes require their action-specific status response'
+$failedRenderScaleProbe = Get-DevBenchWaitProbeAssessment -ProbeKind render-scale -Content @([pscustomobject]@{ ok = $false; action = 'status'; status = [pscustomobject]@{ controller = [pscustomobject]@{ state = 'Active' } } })
+Assert-Test (-not $failedRenderScaleProbe.ok -and $failedRenderScaleProbe.terminalFailure) 'negative render-scale semantics veto plausible status telemetry'
 
 Assert-Test (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $false -IssuedSessionId '' -StatusCode 404) 'only an initial sessionless MCP 404 proves capability absence'
 Assert-Test (-not (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $true -IssuedSessionId 'session-1' -StatusCode 404)) 'a post-initialization MCP 404 cannot authorize REST fallback'
@@ -1005,6 +1047,8 @@ Assert-Test ($entryPointText -match 'transport = \$transport') 'runtime and invo
 Assert-Test (([regex]::Matches($entryPointText, '\$AcceptAlreadyLoaded')).Count -eq 1 -and ([regex]::Matches($entryPointText, '\$LoadAlreadyQueued')).Count -eq 1 -and $entryPointText -notmatch '\$playerTransitionObserved') 'legacy load switches are accepted without retaining a transient load-edge dependency'
 Assert-Test ($entryPointText -match 'Condition ''playerLoaded'' requires -ExpectedCell') 'playerLoaded requires an exact destination cell'
 Assert-Test ($entryPointText -match 'elseif \(\$Condition -eq ''playerLoaded''\)[\s\S]+?kind = ''state''[\s\S]+?kind = ''scene''') 'playerLoaded polls authoritative player and scene state'
+Assert-Test ($entryPointText -match 'if \(-not \$stateProbe\.terminalFailure\)[\s\S]+?kind = ''scene''') 'playerLoaded does not let a later scene acquisition erase an established terminal player-state failure'
+Assert-Test ($entryPointText -match 'Select-DevBenchWaitProbeFailure -Probes @\(\$stateProbe, \$sceneProbe\)') 'playerLoaded combines all acquired probe failures with terminal precedence'
 Assert-Test ($entryPointText -match 'completionBasis = ''current-state''') 'playerLoaded receipts identify state-based completion'
 Assert-Test ($entryPointText -match 'satisfied = \[bool\]\$state\.playerLoaded -and \$cellMatches') 'playerLoaded requires loaded state in the expected cell'
 Assert-Test ($entryPointText -match '\[string\[\]\]\$DismissBlockingMenus') 'menu recovery requires an explicit menu allowlist'
@@ -1057,6 +1101,10 @@ Assert-Test ($entryPointText -match 'ExpectedProfile \$expectedUpscalingProfile'
 Assert-Test ($entryPointText -match "scene\.cell\.PSObject\.Properties\['editorId'\]") 'upscalingStable reads the structured live scene cell editor ID'
 Assert-Test ($entryPointText -match '\$stableCandidateCount -ge \$StableSamples') 'upscalingStable requires consecutive stable observations'
 Assert-Test ($entryPointText -match '\$stableFrameAdvance -ge \$MinimumStableFrameAdvance') 'upscalingStable requires advancing world frames'
+foreach ($requiredStableProbe in @('player-state', 'scene', 'menu', 'upscaling-snapshot', 'render-scale')) {
+    Assert-Test ($entryPointText -match "Get-DevBenchWaitProbeAssessment -ProbeKind $requiredStableProbe") "upscalingStable qualifies its $requiredStableProbe contribution before stability evidence"
+}
+Assert-Test ($entryPointText -match 'Select-DevBenchWaitProbeFailure -Probes @\(\$stateProbe, \$sceneProbe, \$menuProbe, \$upscalingProbe, \$renderScaleProbe\)') 'upscalingStable applies terminal-preserving failure precedence across every contributing read'
 Assert-Test ($entryPointText -match 'elapsedMs = \[Math\]::Round') 'bounded waits report measured elapsed time'
 
 [pscustomobject][ordered]@{ ok = $failures.Count -eq 0; passed = $passes.Count; failed = $failures.Count; passes = @($passes); failures = @($failures) } | ConvertTo-Json -Depth 10
