@@ -263,11 +263,13 @@ path, argument, and timestamp evidence for exact-process adoption.
 Each retained relaunch archives the preceding active game identities with their
 launch-attempt provenance before opening a new active identity set; it does not
 discard the earlier evidence or reuse it as authority for the new game.
-`stop-game` binds every graceful-close target to a retained live process handle,
-revalidates its recorded PID, name, executable path, start instant, and current
-session generation, and only then requests normal closure while preserving the
-exact owner MO2 PID. `stop` uses the same helper and never reopens an earlier
-PID. After the game exits `stop-game` first
+`stop-game` derives its complete graceful-close target set from the game
+identities recorded in the current serialized session, vetoes the action when
+the live inventory contains any additional configured game or loader process,
+binds every owned target to a retained live process handle, and revalidates its
+PID, name, executable path, start instant, and current session generation before
+requesting normal closure. `stop` uses the same helper and never reopens an
+earlier PID. After the game exits `stop-game` first
 observes the exact session-owned MO2 PID for a bounded stability window,
 allowing a delayed post-stop dialog to arrive. It then acknowledges only a
 structurally classified retained `Failed to run` dialog; an unknown modal returns

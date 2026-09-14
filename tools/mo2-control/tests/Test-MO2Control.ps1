@@ -327,9 +327,26 @@ selected_profile=@ByteArray(Codex)
     $gameReplacementCloser = { param($process) $gameCloseCalls.Add([string]$process.id) }.GetNewClosure()
     $gameCloseReplacementRace = & $mo2Module { param($cfg, $owned, $target, $binding, $closer) Invoke-MO2VerifiedGameCloseRequestSet -Config $cfg -Owned $owned -Targets @($target) -BindingFactory $binding -CloseAction $closer } $config $launchingOwned $observedGame $gameReplacementBinding $gameReplacementCloser
     Assert-MO2Test (-not $gameCloseReplacementRace.ok -and $gameCloseReplacementRace.reason -eq 'process-start-time-mismatch' -and $gameCloseCalls.Count -eq 0) 'graceful game close rejects a changed live identity after inspection without invoking CloseMainWindow'
+    $recordedCloseOwned = $launchingOwned | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $recordedCloseOwned.data.gameProcesses = @($observedGame)
+    $unrecordedGame = $observedGame | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $unrecordedGame.id = [int]$observedGame.id + 1
+    $unrecordedGame.startTime = ([DateTimeOffset]::Parse([string]$observedGame.startTime)).AddSeconds(1).UtcDateTime.ToString('o')
+    $unrecordedInspection = [pscustomobject]@{ processes = [pscustomobject]@{ game = @($observedGame, $unrecordedGame) } }
+    $unrecordedCloseCalls = [Collections.Generic.List[string]]::new()
+    $unrecordedCloser = { param($process) $unrecordedCloseCalls.Add([string]$process.id) }.GetNewClosure()
+    $unrecordedClose = & $mo2Module { param($cfg, $owned, $data, $inspection, $closer) Invoke-MO2CurrentGameCloseRequest -Config $cfg -Owned $owned -CurrentData $data -CurrentInspection $inspection -CloseAction $closer } $config $recordedCloseOwned $recordedCloseOwned.data $unrecordedInspection $unrecordedCloser
+    Assert-MO2Test (-not $unrecordedClose.ok -and $unrecordedClose.reason -eq 'unrecorded-game-process-present' -and $unrecordedCloseCalls.Count -eq 0) 'graceful game close refuses a configured but session-unrecorded process without invoking CloseMainWindow'
     $stopGameSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2StopGame \{.*?\n\}').Value
     $stopSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Stop \{.*?\n\}').Value
-    Assert-MO2Test ($stopGameSource -match 'Invoke-MO2OwnedGameCloseRequest' -and $stopSource -match 'Invoke-MO2OwnedGameCloseRequest' -and $stopGameSource -notmatch 'Get-Process -Id' -and $stopSource -notmatch 'Get-Process -Id') 'stop-game and stop share serialized retained-handle identity validation instead of reopening observed PIDs'
+    $ownedCloseSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2OwnedGameCloseRequest \{.*?\n\}').Value
+    Assert-MO2Test ($stopGameSource -match 'Invoke-MO2OwnedGameCloseRequest -Config \$Config -Owned \$owned' -and
+        $stopSource -match 'Invoke-MO2OwnedGameCloseRequest -Config \$Config -Owned \$owned' -and
+        $stopGameSource -notmatch 'Invoke-MO2OwnedGameCloseRequest[^\r\n]+-Targets' -and
+        $stopSource -notmatch 'Invoke-MO2OwnedGameCloseRequest[^\r\n]+-Targets' -and
+        $ownedCloseSource -match 'Invoke-MO2CurrentGameCloseRequest[^\r\n]+-CurrentData \$currentData' -and
+        $moduleSource -match 'Resolve-MO2RecordedGameProcessTargets -Recorded @\(\$CurrentData[.]gameProcesses\)' -and
+        $stopGameSource -notmatch 'Get-Process -Id' -and $stopSource -notmatch 'Get-Process -Id') 'stop-game and stop close only the serialized session-recorded game set through retained live handles'
     $terminateGameSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2TerminateGame \{.*?\n\}').Value
     $serializedTerminationIndex = $terminateGameSource.IndexOf('Invoke-MO2OwnedSessionMutation', [StringComparison]::Ordinal)
     $currentOwnerGuardIndex = $terminateGameSource.IndexOf('$currentOwnerResolution = Resolve-MO2OwnedProcessTarget', [StringComparison]::Ordinal)
