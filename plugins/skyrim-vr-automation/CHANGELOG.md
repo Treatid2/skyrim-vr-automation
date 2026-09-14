@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Normalize the evidence-directory boundary before validating snapshot
+  containment so an equivalent trailing-separator spelling cannot block task
+  completion or receipt-only recovery.
 - Bind every no-op completion and receipt-only recovery proof to the original
   snapshot's exact preserved-baseline path, not merely a same-hash directory.
 - Make receipt-only no-op recovery authorization an explicit validator input,
