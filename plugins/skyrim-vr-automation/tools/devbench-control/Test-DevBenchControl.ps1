@@ -787,8 +787,15 @@ $tokens = $null
 $entryPointAst = [Management.Automation.Language.Parser]::ParseFile($entryPointPath, [ref]$tokens, [ref]$parseErrors)
 $waitTimeoutSemanticAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'New-DevBenchWaitTimeoutSemantic' }, $true))[0]
 Invoke-Expression $waitTimeoutSemanticAst.Extent.Text
+$waitCompletionAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-DevBenchWaitCompletion' }, $true))[0]
+Invoke-Expression $waitCompletionAst.Extent.Text
 $ordinaryTimeoutSemantic = New-DevBenchWaitTimeoutSemantic -Condition 'serviceReady' -TimeoutSeconds 42
 Assert-Test (-not $ordinaryTimeoutSemantic.ok -and $ordinaryTimeoutSemantic.outcome -eq 'wait-timeout' -and $ordinaryTimeoutSemantic.codes -contains 'wait_timeout' -and $ordinaryTimeoutSemantic.states -contains 'timeout') 'ordinary and exceptional wait expiry share one structured timeout semantic contract'
+$terminalServiceSemantic = [pscustomobject][ordered]@{ known = $true; ok = $false; outcome = 'guard-rejected'; codes = @('guard_rejected'); states = @('rejected'); reasons = @('fixture guard rejection') }
+$terminalServiceCompletion = Get-DevBenchWaitCompletion -Condition 'serviceReady' -TimeoutSeconds 42 -Observation ([pscustomobject]@{ satisfied = $false; service = [pscustomobject]@{ terminalFailure = $true; semantic = $terminalServiceSemantic } })
+Assert-Test ($terminalServiceCompletion.state -eq 'semantic-failed' -and $terminalServiceCompletion.terminalServiceFailure -and $terminalServiceCompletion.semantic.outcome -eq 'guard-rejected' -and $terminalServiceCompletion.semantic.codes -contains 'guard_rejected' -and $terminalServiceCompletion.semantic.states -contains 'rejected') 'terminal service failure preserves its semantic evidence and is not rewritten as a timeout'
+$deadlineCompletion = Get-DevBenchWaitCompletion -Condition 'serviceReady' -TimeoutSeconds 42 -Observation ([pscustomobject]@{ satisfied = $false; service = [pscustomobject]@{ terminalFailure = $false; semantic = [pscustomobject]@{ known = $true; ok = $true } } })
+Assert-Test ($deadlineCompletion.state -eq 'timeout' -and -not $deadlineCompletion.terminalServiceFailure -and $deadlineCompletion.semantic.outcome -eq 'wait-timeout') 'ordinary unsatisfied service wait remains a deadline timeout'
 $runtimeIdentityAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-RuntimeIdentity' }, $true))[0]
 $retryableExceptionAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-WaitRetryableException' }, $true))[0]
 $identityProbeResult = & {
@@ -834,7 +841,7 @@ Assert-Test ($entryPointText -match '\$expectations\.buildId\s+-and\s+\$actualBu
 Assert-Test ($entryPointText -match '\$Command -eq ''wait'' -and \$statusCode -eq 404') 'transient MCP 404 recovery is restricted to bounded waits'
 Assert-Test ($entryPointText -match 'full-runtime-rebind-required') 'bounded waits route invalidated MCP sessions through a full runtime rebind'
 Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$RequirePerformanceNeutral\) -and -not \$semantic\.known') 'required semantic outcomes reject unknown responses'
-Assert-Test ($entryPointText -match '\$semantic = if \(\$observation\.satisfied\)' -and $entryPointText -match 'New-DevBenchWaitTimeoutSemantic -Condition \$Condition -TimeoutSeconds \$TimeoutSeconds') 'wait semantics retain the observed unsatisfied condition as a qualified timeout'
+Assert-Test ($entryPointText -match '\$waitCompletion = Get-DevBenchWaitCompletion -Observation \$observation' -and $entryPointText -match '\$semantic = \$waitCompletion\.semantic') 'wait semantics preserve terminal service failures and qualify ordinary expiry through one completion classifier'
 Assert-Test ($entryPointText -match '\$Command -eq ''call'' -and -not \$readOnlyCall -and -not \$runtimeIdentity\.complete') 'only mutation-capable calls require complete runtime identity'
 Assert-Test ($entryPointText -match 'if \(\$Command -eq ''call''\) \{[\s\S]{0,100}-not \$semantic\.known -or -not \$semantic\.ok') 'mutation-capable calls fail closed on unknown semantic outcomes'
 Assert-Test ($entryPointText -match '\$Tool -eq ''communityshaders\.profiler''') 'profiler calls have an explicit semantic contract adapter'
@@ -852,7 +859,7 @@ Assert-Test ($entryPointText -notmatch 'Start-Sleep -Milliseconds \$currentDelay
 Assert-Test ($entryPointText -match 'mcp-session-reinitialized') 'bounded waits reinitialize invalidated MCP sessions'
 Assert-Test ($entryPointText -match '\[ValidateRange\(0, 1000\)\][\s\S]{0,80}\[int\]\$MaxSessionRebinds = 0' -and $entryPointText -match '\$MaxSessionRebinds -gt 0') 'bounded waits rely on the caller deadline by default and expose an optional explicit session-churn cap'
 Assert-Test ($entryPointText -match '\[ValidateRange\(1, 3600\)\][\s\S]{0,80}\[int\]\$TimeoutSeconds = 30') 'readiness waits admit explicit task-proportional deadlines up to one hour'
-Assert-Test ($entryPointText -match 'state = if \(\$Command -eq ''wait'' -and -not \$observation\.satisfied\) \{ ''timeout'' \}' -and $entryPointText -match 'lastSuccessfulObservation = if \(\$observation\.satisfied\)' -and $entryPointText -match 'outcome = ''wait-timeout''') 'ordinary deadline expiry returns the documented top-level state and last successful observation'
+Assert-Test ($entryPointText -match 'state = if \(\$Command -eq ''wait''\) \{ \[string\]\$waitCompletion\.state \}' -and $entryPointText -match 'lastSuccessfulObservation = if \(\$observation\.satisfied\)' -and $entryPointText -match 'outcome = ''wait-timeout''') 'wait completion returns the classified top-level state and preserves the last successful observation'
 Assert-Test ($entryPointText -match "persistentSessionInvalidation\) \{ 'persistent-session-invalidated'" -and $entryPointText -match 'lastSuccessfulObservation = \$lastSuccessfulWaitObservation' -and $entryPointText -match 'Update-InvocationEvidence -State \$failureState .* -Data \$failureData') 'persistent session invalidation returns and journals a distinct state with the last successfully decoded observation'
 Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$Command -eq ''wait''\)') 'unsatisfied waits fail even without RequireSuccess'
 Assert-Test ($entryPointText -match 'function Close-McpSession') 'entry point defines deterministic MCP session cleanup'

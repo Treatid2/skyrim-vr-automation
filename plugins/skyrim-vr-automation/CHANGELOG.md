@@ -4,7 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
-- Reject negative screenshot limits without unsigned conversion faults, keep
+- Preserve terminal `serviceReady` failure semantics instead of rewriting them
+  as deadline timeouts; reject negative screenshot limits without unsigned conversion faults, keep
   retryable identity-probe propagation exclusive to bounded waits, and emit one
   structured timeout shape for both ordinary and mid-iteration wait expiry.
 - Keep DevBench discovery, identity verification, and qualified readiness probes
