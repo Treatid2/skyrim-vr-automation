@@ -629,6 +629,39 @@ function New-DevBenchWaitTimeoutSemantic([string]$Condition, [int]$TimeoutSecond
     }
 }
 
+function Get-DevBenchWaitCompletion {
+    param(
+        [Parameter(Mandatory)]$Observation,
+        [Parameter(Mandatory)][string]$Condition,
+        [Parameter(Mandatory)][int]$TimeoutSeconds
+    )
+    $service = if ($Observation.PSObject.Properties['service']) { $Observation.service } else { $null }
+    $terminalFailureProperty = if ($service) { $service.PSObject.Properties['terminalFailure'] } else { $null }
+    $terminalServiceFailure = $Condition -eq 'serviceReady' -and
+        $terminalFailureProperty -and
+        $terminalFailureProperty.Value -is [bool] -and
+        [bool]$terminalFailureProperty.Value
+    if ($terminalServiceFailure) {
+        return [pscustomobject][ordered]@{
+            state = 'semantic-failed'
+            semantic = $service.semantic
+            terminalServiceFailure = $true
+        }
+    }
+    if ([bool]$Observation.satisfied) {
+        return [pscustomobject][ordered]@{
+            state = 'completed'
+            semantic = [pscustomobject][ordered]@{ known = $true; ok = $true; reasons = @() }
+            terminalServiceFailure = $false
+        }
+    }
+    return [pscustomobject][ordered]@{
+        state = 'timeout'
+        semantic = New-DevBenchWaitTimeoutSemantic -Condition $Condition -TimeoutSeconds $TimeoutSeconds
+        terminalServiceFailure = $false
+    }
+}
+
 function Close-McpSession {
     param([string]$Endpoint, [hashtable]$Headers)
     $sessionId = if ($null -ne $Headers -and $Headers.ContainsKey('Mcp-Session-Id')) {
@@ -1539,10 +1572,8 @@ try {
             lastSuccessfulObservation = if ($observation.satisfied) { $null } else { $lastSuccessfulWaitObservation }
         }
         if ($observation.satisfied -and -not $SkipRuntimeIdentityVerification) { $evidencePath = Write-RuntimeEvidence $runtimeIdentity }
-        $semantic = if ($observation.satisfied) {
-            [pscustomobject][ordered]@{ known = $true; ok = $true; reasons = @() }
-        }
-        else { New-DevBenchWaitTimeoutSemantic -Condition $Condition -TimeoutSeconds $TimeoutSeconds }
+        $waitCompletion = Get-DevBenchWaitCompletion -Observation $observation -Condition $Condition -TimeoutSeconds $TimeoutSeconds
+        $semantic = $waitCompletion.semantic
     }
 
     if (($RequireSuccess -or $RequirePerformanceNeutral) -and -not $semantic.known) {
@@ -1560,7 +1591,7 @@ try {
     $result = [pscustomobject][ordered]@{
         ok = -not $semanticFailure
         transportOk = $true
-        state = $(if ($Command -eq 'wait' -and -not $observation.satisfied) { 'timeout' } elseif ($semanticFailure) { 'semantic-failed' } else { 'completed' })
+        state = $(if ($Command -eq 'wait') { [string]$waitCompletion.state } elseif ($semanticFailure) { 'semantic-failed' } else { 'completed' })
         indeterminate = $false
         dispatchReached = [bool]$dispatch.dispatchReached
         responseDataRetained = [bool]$dispatch.responseDataRetained
