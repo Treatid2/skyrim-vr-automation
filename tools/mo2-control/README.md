@@ -31,8 +31,11 @@ Notepad++, or another editor and never force-terminates. Existing retained-MO2
 game cycling and explicit safe-gated termination remain available.
 
 `open` and `launch` accept `-StartOnly`: they write their exact session receipt,
-start only the intended process, return immediately with the session/evidence
-path, and direct the caller to poll `status`. When `status` proves the one exact
+start only the intended process, and commit the resulting process identity while
+holding the same generation transition that authorized dispatch. A stale renewal
+or competing lifecycle transition therefore refuses before process creation,
+not after it. They then return with the session/evidence path and direct the
+caller to poll `status`. When `status` proves the one exact
 adopted MO2 process and its visible `MainWindow`, it advances an `opening`
 session to durable `mo2-open` so a later game launch is valid. After a
 `launch -StartOnly`, `status` also adopts only configured game/loader identities
@@ -44,15 +47,21 @@ pending until the configured primary game appears, so polling cannot finalize
 an incomplete launch set. Helper-to-runtime owner adoption is allowed only once,
 while the session is still opening or launching, and requires the candidate to
 be the exact requested process or its direct child whose parent PID and start
-time match the dispatched helper under a matching durable dispatch receipt; a
-merely configured later process cannot become session
+time match the dispatched helper under a matching durable dispatch receipt.
+Launch/open capture an eligible direct child's exact identity while retaining
+the original helper handle, so the lifetime proof survives a later helper exit
+without treating a recycled parent PID as authority. A merely configured later
+process cannot become session
 authority. Later `terminate-game` rebinds every
 recorded game identity to a retained live process handle, revalidates its full
-identity and configured path immediately before mutation, and never reopens a
-PID for termination. This makes exact termination and RootBuilder recovery
+identity, configured path, and current serialized session generation immediately
+before mutation, and never reopens a PID for termination. This makes exact
+termination and RootBuilder recovery
 available without reissuing the launch. RootBuilder `Unlock` revalidates that
-same recorded MO2 PID, executable path, and start time before every UI action
-and again before reporting recovery success. A missing session
+same recorded MO2 PID, executable path, and start time through one retained
+process handle before window selection, before every UI action, and again before
+reporting recovery success. Each action also checks current session-generation
+authority. A missing session
 ID is a structured `missing-session-id` precondition instead of a PowerShell
 binding failure. Launch classifies the exact `Failed to write settings` dialog
 and cooperative close acknowledges only its exact `OK` button.
@@ -176,6 +185,11 @@ overrides the profile's actual runtime files.
 never expires, steals, or transfers a lease because its estimate elapsed.
 `renew-access` refreshes the recorded activity time and can replace the
 estimate. `access-status` reports availability and exact ownership.
+Every lifecycle commit writes the ownership lock as the authoritative state and
+projects that same generation into `session.json` before releasing the transition
+lock. An older writer cannot overtake a newer manifest. If projection itself
+fails, the error identifies the already committed lock generation; the next
+serialized commit reconciles the manifest from that authoritative state.
 Modern session owner liveness is bound to process ID, executable path, and
 process start time, so a reused PID cannot make an abandoned session appear
 live. Readable legacy PID/start-time records are labelled separately from the

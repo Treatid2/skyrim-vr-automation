@@ -1185,10 +1185,69 @@ function Get-MO2NextLeaseGeneration {
     return $current + 1L
 }
 
+function Write-MO2SessionManifestProjection {
+    param([Parameter(Mandatory)]$SessionData)
+
+    if (-not $SessionData.PSObject.Properties['sessionPath'] -or
+        [string]::IsNullOrWhiteSpace([string]$SessionData.sessionPath)) { return }
+    $manifestPath = Join-Path ([string]$SessionData.sessionPath) 'session.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return }
+
+    $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop)
+    foreach ($property in @($SessionData.PSObject.Properties)) {
+        $manifest | Add-Member -NotePropertyName ([string]$property.Name) -NotePropertyValue $property.Value -Force
+    }
+    Write-MO2JsonAtomic -Path $manifestPath -Value $manifest
+}
+
+function Assert-MO2OwnedSessionTransitionCurrent {
+    param([Parameter(Mandatory)]$Owned)
+
+    $sessionId = [string]$Owned.sessionId
+    $current = Get-MO2SessionLockRecord -Path ([string]$Owned.path)
+    if (-not $current.valid -or $current.sessionId -ne $sessionId -or $current.accessId -ne [string]$Owned.accessId) {
+        throw "Session '$sessionId' no longer owns the MO2 lease transition."
+    }
+    $expectedGeneration = if ($Owned.data.PSObject.Properties['generation']) { [long]$Owned.data.generation } else { 0L }
+    $currentGeneration = if ($current.data.PSObject.Properties['generation']) { [long]$current.data.generation } else { 0L }
+    if ($currentGeneration -ne $expectedGeneration) {
+        throw "Session '$sessionId' lease transition is stale: expected generation $expectedGeneration, current generation $currentGeneration."
+    }
+    return $current
+}
+
+function Write-MO2OwnedSessionUnderTransitionLock {
+    param(
+        [Parameter(Mandatory)]$Owned,
+        [Parameter(Mandatory)]$Current,
+        [Parameter(Mandatory)]$Value,
+        [scriptblock]$ManifestProjectionAction
+    )
+
+    $updated = $Value
+    foreach ($propertyName in @('contractVersion', 'accessId', 'leaseId', 'acquisitionMode', 'label', 'requestedUtc', 'lastRenewedUtc', 'estimatedDurationMinutes', 'estimatedReleaseUtc', 'ownerRequestPid', 'ownerRequestStartTime', 'runtimeRoute')) {
+        if ($Current.data.PSObject.Properties[$propertyName]) {
+            $updated | Add-Member -NotePropertyName $propertyName -NotePropertyValue $Current.data.$propertyName -Force
+        }
+    }
+    $updated | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $Current.data) -Force
+    Write-MO2JsonAtomic -Path ([string]$Owned.path) -Value $updated
+    $Owned.data = $updated
+    try {
+        if ($ManifestProjectionAction) { & $ManifestProjectionAction $updated }
+        else { Write-MO2SessionManifestProjection -SessionData $updated }
+    }
+    catch {
+        throw "The authoritative MO2 ownership lock committed generation $($updated.generation), but its session manifest projection failed and must be reconciled from that lock: $($_.Exception.Message)"
+    }
+    return Get-MO2SessionLockRecord -Path ([string]$Owned.path)
+}
+
 function Write-MO2OwnedSessionAtomic {
     param(
         [Parameter(Mandatory)]$Owned,
-        [Parameter(Mandatory)]$Value
+        [Parameter(Mandatory)]$Value,
+        [scriptblock]$ManifestProjectionAction
     )
 
     $sessionId = [string]$Owned.sessionId
@@ -1197,28 +1256,31 @@ function Write-MO2OwnedSessionAtomic {
     }
 
     $updatedRecord = Invoke-WithMO2LeaseTransitionLock -LockPath ([string]$Owned.path) -Action {
-        $current = Get-MO2SessionLockRecord -Path ([string]$Owned.path)
-        if (-not $current.valid -or $current.sessionId -ne $sessionId -or $current.accessId -ne [string]$Owned.accessId) {
-            throw "Session '$sessionId' no longer owns the MO2 lease transition."
-        }
-        $expectedGeneration = if ($Owned.data.PSObject.Properties['generation']) { [long]$Owned.data.generation } else { 0L }
-        $currentGeneration = if ($current.data.PSObject.Properties['generation']) { [long]$current.data.generation } else { 0L }
-        if ($currentGeneration -ne $expectedGeneration) {
-            throw "Session '$sessionId' lease transition is stale: expected generation $expectedGeneration, current generation $currentGeneration."
-        }
-
-        $updated = $Value
-        foreach ($propertyName in @('contractVersion', 'accessId', 'leaseId', 'acquisitionMode', 'label', 'requestedUtc', 'lastRenewedUtc', 'estimatedDurationMinutes', 'estimatedReleaseUtc', 'ownerRequestPid', 'ownerRequestStartTime', 'runtimeRoute')) {
-            if ($current.data.PSObject.Properties[$propertyName]) {
-                $updated | Add-Member -NotePropertyName $propertyName -NotePropertyValue $current.data.$propertyName -Force
-            }
-        }
-        $updated | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $current.data) -Force
-        Write-MO2JsonAtomic -Path ([string]$Owned.path) -Value $updated
-        return Get-MO2SessionLockRecord -Path ([string]$Owned.path)
+        $current = Assert-MO2OwnedSessionTransitionCurrent -Owned $Owned
+        return Write-MO2OwnedSessionUnderTransitionLock -Owned $Owned -Current $current -Value $Value -ManifestProjectionAction $ManifestProjectionAction
     }
     $Owned.data = $updatedRecord.data
     return $updatedRecord
+}
+
+function Invoke-MO2OwnedSessionMutation {
+    param(
+        [Parameter(Mandatory)]$Owned,
+        [Parameter(Mandatory)][scriptblock]$Action
+    )
+
+    $transaction = Invoke-WithMO2LeaseTransitionLock -LockPath ([string]$Owned.path) -Action {
+        $current = Assert-MO2OwnedSessionTransitionCurrent -Owned $Owned
+        $outcome = & $Action $current.data
+        if ($null -eq $outcome -or -not $outcome.PSObject.Properties['sessionData']) {
+            throw 'The serialized MO2 mutation did not return sessionData.'
+        }
+        $commit = -not $outcome.PSObject.Properties['commit'] -or [bool]$outcome.commit
+        $record = if ($commit) { Write-MO2OwnedSessionUnderTransitionLock -Owned $Owned -Current $current -Value $outcome.sessionData } else { $current }
+        return [pscustomobject][ordered]@{ record = $record; result = $outcome.result }
+    }
+    $Owned.data = $transaction.record.data
+    return $transaction.result
 }
 
 function New-MO2DurableSessionController {
@@ -2348,22 +2410,35 @@ function Set-MO2OwnedSessionStatus {
         }
     }
     $null = Write-MO2OwnedSessionAtomic -Owned $Owned -Value $Owned.data
+}
 
-    $manifestPath = Join-Path ([string]$Owned.data.sessionPath) 'session.json'
-    $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw)
-    $manifest.status = $Status
-    if ($manifest.PSObject.Properties[$TimestampProperty]) {
-        $manifest.$TimestampProperty = $timestamp
+function Set-MO2OwnedSessionOwnerData {
+    param(
+        [Parameter(Mandatory)]$Data,
+        [Parameter(Mandatory)]$ProcessRecord,
+        [Parameter(Mandatory)][string]$Reason
+    )
+
+    $previousOwnerPid = if ($Data.PSObject.Properties['ownerPid']) { [int]$Data.ownerPid } else { 0 }
+    $adoption = [pscustomobject][ordered]@{
+        timestampUtc = [DateTime]::UtcNow.ToString('o')
+        previousOwnerPid = $previousOwnerPid
+        ownerPid = [int]$ProcessRecord.id
+        processPath = [string]$ProcessRecord.path
+        processStartTime = [string]$ProcessRecord.startTime
+        reason = $Reason
     }
-    else {
-        $manifest | Add-Member -NotePropertyName $TimestampProperty -NotePropertyValue $timestamp
+    $Data | Add-Member -NotePropertyName ownerPid -NotePropertyValue ([int]$ProcessRecord.id) -Force
+    $Data | Add-Member -NotePropertyName ownerProcessPath -NotePropertyValue ([IO.Path]::GetFullPath([string]$ProcessRecord.path)) -Force
+    $Data | Add-Member -NotePropertyName ownerProcessStartTime -NotePropertyValue ([string]$ProcessRecord.startTime) -Force
+    [object[]]$adoptions = @()
+    if ($Data.PSObject.Properties['ownerAdoptions']) {
+        $adoptions = @($Data.ownerAdoptions)
     }
-    if ($null -ne $Properties) {
-        foreach ($propertyName in @($Properties.Keys)) {
-            $manifest | Add-Member -NotePropertyName $propertyName -NotePropertyValue $Properties[$propertyName] -Force
-        }
-    }
-    Write-MO2JsonAtomic -Path $manifestPath -Value $manifest
+    [object[]]$updatedAdoptions = @($adoptions)
+    $updatedAdoptions += $adoption
+    $Data | Add-Member -NotePropertyName ownerAdoptions -NotePropertyValue @($updatedAdoptions) -Force
+    return $adoption
 }
 
 function Set-MO2OwnedSessionOwner {
@@ -2373,63 +2448,8 @@ function Set-MO2OwnedSessionOwner {
         [Parameter(Mandatory)][string]$Reason
     )
 
-    $previousOwnerPid = if ($Owned.data.PSObject.Properties['ownerPid']) { [int]$Owned.data.ownerPid } else { 0 }
-    $adoption = [pscustomobject][ordered]@{
-        timestampUtc = [DateTime]::UtcNow.ToString('o')
-        previousOwnerPid = $previousOwnerPid
-        ownerPid = [int]$ProcessRecord.id
-        processPath = [string]$ProcessRecord.path
-        processStartTime = [string]$ProcessRecord.startTime
-        reason = $Reason
-    }
-    if ($Owned.data.PSObject.Properties['ownerPid']) {
-        $Owned.data.ownerPid = [int]$ProcessRecord.id
-    }
-    else {
-        $Owned.data | Add-Member -NotePropertyName ownerPid -NotePropertyValue ([int]$ProcessRecord.id)
-    }
-    $Owned.data | Add-Member -NotePropertyName ownerProcessPath -NotePropertyValue ([IO.Path]::GetFullPath([string]$ProcessRecord.path)) -Force
-    $Owned.data | Add-Member -NotePropertyName ownerProcessStartTime -NotePropertyValue ([string]$ProcessRecord.startTime) -Force
-    [object[]]$adoptions = @()
-    if ($Owned.data.PSObject.Properties['ownerAdoptions']) {
-        $adoptions = @($Owned.data.ownerAdoptions)
-    }
-    [object[]]$updatedAdoptions = @($adoptions)
-    $updatedAdoptions += $adoption
-    if ($Owned.data.PSObject.Properties['ownerAdoptions']) {
-        $Owned.data.ownerAdoptions = $updatedAdoptions
-    }
-    else {
-        $Owned.data | Add-Member -NotePropertyName ownerAdoptions -NotePropertyValue @($adoption)
-    }
+    $adoption = Set-MO2OwnedSessionOwnerData -Data $Owned.data -ProcessRecord $ProcessRecord -Reason $Reason
     $null = Write-MO2OwnedSessionAtomic -Owned $Owned -Value $Owned.data
-
-    $manifestPath = Join-Path ([string]$Owned.data.sessionPath) 'session.json'
-    $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw)
-    if ($manifest.PSObject.Properties['ownerPid']) {
-        $manifest.ownerPid = [int]$ProcessRecord.id
-    }
-    else {
-        $manifest | Add-Member -NotePropertyName ownerPid -NotePropertyValue ([int]$ProcessRecord.id)
-    }
-    $manifest | Add-Member -NotePropertyName ownerProcessPath -NotePropertyValue ([IO.Path]::GetFullPath([string]$ProcessRecord.path)) -Force
-    $manifest | Add-Member -NotePropertyName ownerProcessStartTime -NotePropertyValue ([string]$ProcessRecord.startTime) -Force
-    [object[]]$manifestAdoptions = @()
-    if ($manifest.PSObject.Properties['ownerAdoptions']) {
-        $manifestAdoptions = @($manifest.ownerAdoptions)
-    }
-    [object[]]$updatedManifestAdoptions = @($manifestAdoptions)
-    $updatedManifestAdoptions += $adoption
-    if ($manifest.PSObject.Properties['ownerAdoptions']) {
-        $manifest.ownerAdoptions = $updatedManifestAdoptions
-    }
-    else {
-        $manifest | Add-Member -NotePropertyName ownerAdoptions -NotePropertyValue @($adoption)
-    }
-    if ($Owned.data.PSObject.Properties['ownerTransition']) {
-        $manifest | Add-Member -NotePropertyName ownerTransition -NotePropertyValue $Owned.data.ownerTransition -Force
-    }
-    Write-MO2JsonAtomic -Path $manifestPath -Value $manifest
     return $adoption
 }
 
@@ -2461,6 +2481,47 @@ function Test-MO2OwnedProcessIdentity {
         expectedPath = $expectedPath; actualPath = $actualPath
         expectedStartTime = $expectedStart.ToString('o'); actualStartTime = $actualStart.ToString('o')
     }
+}
+
+function Get-MO2DispatchBoundChildEvidence {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$ParentProcess,
+        [Parameter(Mandatory)][string]$ParentStartTime,
+        [Parameter(Mandatory)][string]$DispatchStartedUtc,
+        [ValidateRange(0, 5000)][int]$TimeoutMilliseconds = 750
+    )
+
+    # Retaining the parent process handle prevents its PID from being recycled
+    # while direct children are inventoried. Persist the known parent lifetime
+    # with each child so later status calls do not depend on the parent remaining
+    # alive merely to reconstruct that proof.
+    $parentHandle = $ParentProcess.SafeHandle
+    if ($parentHandle.IsInvalid -or $parentHandle.IsClosed) { return @() }
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    $dispatchUtc = [DateTimeOffset]::Parse($DispatchStartedUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).UtcDateTime
+    do {
+        $children = @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames) | Where-Object {
+            $_.PSObject.Properties['parentId'] -and [int]$_.parentId -eq [int]$ParentProcess.Id -and
+            -not [string]::IsNullOrWhiteSpace([string]$_.startTime) -and
+            ([DateTimeOffset]::Parse([string]$_.startTime, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).UtcDateTime -ge $dispatchUtc)
+        })
+        if ($children.Count -gt 0) {
+            return @($children | ForEach-Object {
+                [pscustomobject][ordered]@{
+                    id = [int]$_.id
+                    name = [string]$_.name
+                    path = [IO.Path]::GetFullPath([string]$_.path)
+                    startTime = ConvertTo-MO2CanonicalUtcTimestamp ([string]$_.startTime)
+                    parentId = [int]$ParentProcess.Id
+                    parentStartTime = ConvertTo-MO2CanonicalUtcTimestamp $ParentStartTime
+                }
+            })
+        }
+        if ([DateTime]::UtcNow -ge $deadline) { break }
+        Start-Sleep -Milliseconds 25
+    } while ($true)
+    return @()
 }
 
 function Test-MO2DetachedOwnerAdoptionEvidence {
@@ -2525,11 +2586,30 @@ function Test-MO2DetachedOwnerAdoptionEvidence {
         }
         $isRequestedProcess = [int]$Candidate.id -eq [int]$transition.requestedPid -and
             [math]::Abs(([DateTimeOffset]::Parse([string]$Candidate.startTime, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).UtcDateTime - $requestedStartUtc).TotalMilliseconds) -lt 1.0
-        $isDirectHandoff = $Candidate.PSObject.Properties['parentId'] -and [int]$Candidate.parentId -eq [int]$transition.requestedPid -and
+        $isLiveDirectHandoff = $Candidate.PSObject.Properties['parentId'] -and [int]$Candidate.parentId -eq [int]$transition.requestedPid -and
             $Candidate.PSObject.Properties['parentStartTime'] -and -not [string]::IsNullOrWhiteSpace([string]$Candidate.parentStartTime) -and
             [math]::Abs(([DateTimeOffset]::Parse([string]$Candidate.parentStartTime, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).UtcDateTime - $requestedStartUtc).TotalMilliseconds) -lt 1.0
+        [object[]]$transitionChildren = if ($transition.PSObject.Properties['dispatchBoundChildren']) { @($transition.dispatchBoundChildren) } else { @() }
+        [object[]]$receiptChildren = if ($receipt.PSObject.Properties['dispatchBoundChildren']) { @($receipt.dispatchBoundChildren) } else { @() }
+        $durableChild = @()
+        foreach ($transitionChild in $transitionChildren) {
+            $candidateIdentity = Test-MO2ProcessRecordIdentity -Expected $transitionChild -Actual $Candidate
+            if (-not $candidateIdentity.ok) { continue }
+            if (-not $transitionChild.PSObject.Properties['parentId'] -or [int]$transitionChild.parentId -ne [int]$transition.requestedPid) { continue }
+            if (-not $transitionChild.PSObject.Properties['parentStartTime']) { continue }
+            $durableParentStartUtc = [DateTimeOffset]::Parse([string]$transitionChild.parentStartTime, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).UtcDateTime
+            if ([math]::Abs(($durableParentStartUtc - $requestedStartUtc).TotalMilliseconds) -ge 1.0) { continue }
+            $matchingReceiptChildren = @($receiptChildren | Where-Object {
+                (Test-MO2ProcessRecordIdentity -Expected $transitionChild -Actual $_).ok -and
+                $_.PSObject.Properties['parentId'] -and [int]$_.parentId -eq [int]$transition.requestedPid -and
+                $_.PSObject.Properties['parentStartTime'] -and
+                [math]::Abs(([DateTimeOffset]::Parse([string]$_.parentStartTime, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).UtcDateTime - $requestedStartUtc).TotalMilliseconds) -lt 1.0
+            })
+            if (@($matchingReceiptChildren).Count -eq 1) { $durableChild = @($transitionChild); break }
+        }
+        $isDirectHandoff = $isLiveDirectHandoff -or @($durableChild).Count -eq 1
         if (-not $isRequestedProcess -and -not $isDirectHandoff) {
-            return [pscustomobject][ordered]@{ ok = $false; reason = 'detached-owner-handoff-unproven'; requestedPid = [int]$transition.requestedPid; requestedProcessStartTime = $requestedStartUtc.ToString('o'); candidatePid = [int]$Candidate.id; candidateParentPid = $(if ($Candidate.PSObject.Properties['parentId']) { [int]$Candidate.parentId } else { $null }); candidateParentStartTime = $(if ($Candidate.PSObject.Properties['parentStartTime']) { [string]$Candidate.parentStartTime } else { $null }) }
+            return [pscustomobject][ordered]@{ ok = $false; reason = 'detached-owner-handoff-unproven'; requestedPid = [int]$transition.requestedPid; requestedProcessStartTime = $requestedStartUtc.ToString('o'); candidatePid = [int]$Candidate.id; candidateParentPid = $(if ($Candidate.PSObject.Properties['parentId']) { [int]$Candidate.parentId } else { $null }); candidateParentStartTime = $(if ($Candidate.PSObject.Properties['parentStartTime']) { [string]$Candidate.parentStartTime } else { $null }); dispatchBoundChildCount = @($transitionChildren).Count; receiptBoundChildCount = @($receiptChildren).Count; matchedDurableChildCount = @($durableChild).Count }
         }
         if (-not [string]::Equals($configuredPath, $receiptMO2Path, [StringComparison]::OrdinalIgnoreCase) -or
             -not [string]::Equals($configuredPath, $requestedProcessPath, [StringComparison]::OrdinalIgnoreCase) -or
@@ -2809,18 +2889,6 @@ function Set-MO2OwnedSessionGameProcesses {
         $Owned.data | Add-Member -NotePropertyName $TimestampProperty -NotePropertyValue $timestamp -Force
     }
     $null = Write-MO2OwnedSessionAtomic -Owned $Owned -Value $Owned.data
-    $manifestPath = Join-Path ([string]$Owned.data.sessionPath) 'session.json'
-    $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw)
-    $manifest | Add-Member -NotePropertyName gameProcesses -NotePropertyValue $records -Force
-    $manifest | Add-Member -NotePropertyName gameProcessesRecordedUtc -NotePropertyValue $timestamp -Force
-    if ($Owned.data.PSObject.Properties['launchAttemptId']) {
-        $manifest | Add-Member -NotePropertyName gameProcessesLaunchAttemptId -NotePropertyValue ([string]$Owned.data.launchAttemptId) -Force
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Status)) {
-        $manifest.status = $Status
-        $manifest | Add-Member -NotePropertyName $TimestampProperty -NotePropertyValue $timestamp -Force
-    }
-    Write-MO2JsonAtomic -Path $manifestPath -Value $manifest
     return $records
 }
 
@@ -2927,10 +2995,49 @@ function Invoke-MO2UnlockOnly {
         [ValidateRange(1, 600)][int]$TimeoutSeconds = 90,
         [ValidateRange(0, 1000)][int]$PollMilliseconds = 250,
         [scriptblock]$InspectionFactory,
-        [scriptblock]$UnlockAction
+        [scriptblock]$UnlockAction,
+        [scriptblock]$BindingFactory,
+        [scriptblock]$OwnerIdentityFactory,
+        [scriptblock]$WindowFactory,
+        [scriptblock]$UnlockControlFactory,
+        [scriptblock]$UnlockControlAction
     )
     if (-not $InspectionFactory) {
         $InspectionFactory = { Get-MO2InspectionData -Config $Config }.GetNewClosure()
+    }
+    if (-not $BindingFactory) {
+        $BindingFactory = {
+            param([int]$ProcessId)
+            $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+            if (-not $process) { return [pscustomobject][ordered]@{ available=$false; reason='process-exited'; process=$null } }
+            try {
+                $handle = $process.SafeHandle
+                if ($handle.IsInvalid -or $handle.IsClosed) { throw 'The process handle is unavailable.' }
+                return [pscustomobject][ordered]@{ available=$true; reason='bound'; process=$process }
+            }
+            catch {
+                $process.Dispose()
+                return [pscustomobject][ordered]@{ available=$false; reason='live-process-identity-unavailable'; process=$null; detail=$_.Exception.Message }
+            }
+        }
+    }
+    if (-not $OwnerIdentityFactory) {
+        $OwnerIdentityFactory = {
+            param($Binding)
+            try {
+                if ($Binding.process.HasExited) { return $null }
+                return [pscustomobject][ordered]@{
+                    name = [string]$Binding.process.ProcessName
+                    id = [int]$Binding.process.Id
+                    path = [IO.Path]::GetFullPath([string]$Binding.process.Path)
+                    startTime = $Binding.process.StartTime.ToUniversalTime().ToString('o')
+                }
+            }
+            catch { return $null }
+        }
+    }
+    if (-not $WindowFactory) {
+        $WindowFactory = { param($Binding) @(Get-MO2AutomationWindows -ProcessId ([int]$Binding.process.Id)) }
     }
     $actions = [Collections.Generic.List[object]]::new()
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
@@ -2946,18 +3053,97 @@ function Invoke-MO2UnlockOnly {
             break
         }
         $record = $ownerResolution.targets[0]
-        if ($UnlockAction) {
-            $accepted = [bool](& $UnlockAction $record)
-            $actions.Add([pscustomobject][ordered]@{ timestampUtc=[DateTime]::UtcNow.ToString('o'); processId=[int]$record.id; windowTitle=$null; action='invoke-exact-unlock'; accepted=$accepted })
+        $binding = & $BindingFactory ([int]$record.id)
+        if (-not $binding.available) {
+            $blockedReason = [string]$binding.reason
+            break
         }
-        else {
-            foreach ($window in @(Get-MO2AutomationWindows -ProcessId ([int]$record.id))) {
-                foreach ($button in @(Get-MO2UnlockButtons -Window $window)) {
-                    $invoked = Invoke-MO2AutomationButton -Button $button -ExpectedName 'Unlock'
-                    $actions.Add([pscustomobject][ordered]@{ timestampUtc=[DateTime]::UtcNow.ToString('o'); processId=[int]$record.id; windowTitle=[string]$window.Current.Name; action='invoke-exact-unlock'; accepted=$invoked })
+        try {
+            $actionBlocked = $false
+            $assertBoundOwner = {
+                param($AuthorityOwned)
+                $liveRecord = & $OwnerIdentityFactory $binding
+                if ($null -eq $liveRecord) { return [pscustomobject][ordered]@{ ok=$false; reason='bound-owner-exited'; record=$null } }
+                $identity = Test-MO2OwnedProcessIdentity -Owned $AuthorityOwned -ProcessRecord $liveRecord
+                if (-not $identity.ok) { return [pscustomobject][ordered]@{ ok=$false; reason=[string]$identity.reason; record=$liveRecord; identity=$identity } }
+                if (-not (Test-MO2ExactProcessPath -Record $liveRecord -ExpectedPath (Resolve-MO2ControlPath ([string]$Config.mo2.executable))) -or @($Config.mo2.processNames) -notcontains [string]$liveRecord.name) {
+                    return [pscustomobject][ordered]@{ ok=$false; reason='bound-owner-not-exact-configured-mo2'; record=$liveRecord }
+                }
+                return [pscustomobject][ordered]@{ ok=$true; reason='bound-owner-exact'; record=$liveRecord; identity=$identity }
+            }
+            $preSelection = & $assertBoundOwner $Owned
+            if (-not $preSelection.ok) {
+                $blockedReason = [string]$preSelection.reason
+                break
+            }
+            if ($UnlockAction) {
+                $authorizedAction = {
+                    param($AuthorityOwned)
+                    $preAction = & $assertBoundOwner $AuthorityOwned
+                    if (-not $preAction.ok) { return [pscustomobject][ordered]@{ ok=$false; reason=[string]$preAction.reason; record=$preAction.record; accepted=$false } }
+                    return [pscustomobject][ordered]@{ ok=$true; reason='unlock-invoked'; record=$preAction.record; accepted=[bool](& $UnlockAction $preAction.record) }
+                }
+                try {
+                    if ($Owned.PSObject.Properties['path'] -and $Owned.PSObject.Properties['accessId']) {
+                        $actionResult = Invoke-WithMO2LeaseTransitionLock -LockPath ([string]$Owned.path) -Action {
+                            $current = Assert-MO2OwnedSessionTransitionCurrent -Owned $Owned
+                            $authorityOwned = [pscustomobject][ordered]@{ path=$Owned.path; sessionId=$Owned.sessionId; accessId=$Owned.accessId; data=$current.data }
+                            & $authorizedAction $authorityOwned
+                        }
+                    }
+                    else { $actionResult = & $authorizedAction $Owned }
+                }
+                catch {
+                    $reason = if ($_.Exception.Message -match 'lease transition is stale|no longer owns the MO2 lease transition') { 'lease-transition-stale' } else { 'unlock-action-failed' }
+                    $actionResult = [pscustomobject][ordered]@{ ok=$false; reason=$reason; detail=$_.Exception.Message; record=$null; accepted=$false }
+                }
+                if (-not $actionResult.ok) { $blockedReason = [string]$actionResult.reason; break }
+                $accepted = [bool]$actionResult.accepted
+                $actions.Add([pscustomobject][ordered]@{ timestampUtc=[DateTime]::UtcNow.ToString('o'); processId=[int]$actionResult.record.id; windowTitle=$null; action='invoke-exact-unlock'; accepted=$accepted })
+            }
+            else {
+                [object[]]$unlockControls = if ($UnlockControlFactory) {
+                    @(& $UnlockControlFactory $binding)
+                }
+                else {
+                    @(& $WindowFactory $binding | ForEach-Object {
+                        $window = $_
+                        @(Get-MO2UnlockButtons -Window $window) | ForEach-Object {
+                            [pscustomobject][ordered]@{ window=$window; button=$_; windowTitle=[string]$window.Current.Name }
+                        }
+                    })
+                }
+                foreach ($unlockControl in $unlockControls) {
+                        $authorizedAction = {
+                            param($AuthorityOwned)
+                            $preAction = & $assertBoundOwner $AuthorityOwned
+                            if (-not $preAction.ok) { return [pscustomobject][ordered]@{ ok=$false; reason=[string]$preAction.reason; record=$preAction.record; accepted=$false } }
+                            $accepted = if ($UnlockControlAction) { [bool](& $UnlockControlAction $unlockControl) } else { Invoke-MO2AutomationButton -Button $unlockControl.button -ExpectedName 'Unlock' }
+                            return [pscustomobject][ordered]@{ ok=$true; reason='unlock-invoked'; record=$preAction.record; accepted=$accepted }
+                        }
+                        try {
+                            if ($Owned.PSObject.Properties['path'] -and $Owned.PSObject.Properties['accessId']) {
+                                $current = Invoke-WithMO2LeaseTransitionLock -LockPath ([string]$Owned.path) -Action {
+                                    $authority = Assert-MO2OwnedSessionTransitionCurrent -Owned $Owned
+                                    $authorityOwned = [pscustomobject][ordered]@{ path=$Owned.path; sessionId=$Owned.sessionId; accessId=$Owned.accessId; data=$authority.data }
+                                    & $authorizedAction $authorityOwned
+                                }
+                            }
+                            else { $current = & $authorizedAction $Owned }
+                        }
+                        catch {
+                            $reason = if ($_.Exception.Message -match 'lease transition is stale|no longer owns the MO2 lease transition') { 'lease-transition-stale' } else { 'unlock-action-failed' }
+                            $current = [pscustomobject][ordered]@{ ok=$false; reason=$reason; detail=$_.Exception.Message; record=$null; accepted=$false }
+                        }
+                        if (-not $current.ok) { $blockedReason = [string]$current.reason; $actionBlocked = $true; break }
+                        $actions.Add([pscustomobject][ordered]@{ timestampUtc=[DateTime]::UtcNow.ToString('o'); processId=[int]$current.record.id; windowTitle=[string]$unlockControl.windowTitle; action='invoke-exact-unlock'; accepted=[bool]$current.accepted })
                 }
             }
         }
+        finally {
+            if ($binding.process -is [IDisposable]) { $binding.process.Dispose() }
+        }
+        if ($actionBlocked) { break }
         if ($PollMilliseconds -gt 0) { Start-Sleep -Milliseconds $PollMilliseconds }
     } while ([DateTime]::UtcNow -lt $deadline)
     $final = & $InspectionFactory
@@ -3158,60 +3344,65 @@ function Invoke-MO2Launch {
         preLaunchGameProcesses = @($preLaunchGameProcesses)
         preDispatchProcesses = @($preLaunchMO2Processes)
     }
-    Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted
-    if ($resumeExistingMO2) {
-        $resumeOwnerResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
-        if (-not $resumeOwnerResolution.ok -or @($resumeOwnerResolution.targets).Count -ne 1) {
-            return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'blocked' -Data @{ lock = $owned; ownershipResolution = $resumeOwnerResolution; launchStartedReceiptPath = $launchStartedPath } -Errors @('The retained MO2 owner identity changed immediately before dispatch; no launch was started.')
+    $dispatch = Invoke-MO2OwnedSessionMutation -Owned $owned -Action {
+        param($currentData)
+        $currentOwned = [pscustomobject][ordered]@{ path = $owned.path; sessionId = $owned.sessionId; accessId = $owned.accessId; data = $currentData }
+        if ([string]$currentData.status -notin $acceptedStatuses) {
+            throw "Session status '$($currentData.status)' changed before launch dispatch."
+        }
+        if ($resumeExistingMO2) {
+            $currentResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $currentOwned -Processes @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
+            if (-not $currentResolution.ok -or @($currentResolution.targets).Count -ne 1) {
+                throw 'The retained MO2 owner identity changed immediately before serialized launch dispatch.'
+            }
+        }
+
+        Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted
+        $launchDispatchedUtc = [DateTime]::UtcNow.ToString('o')
+        $launchStarted.dispatchStartedUtc = $launchDispatchedUtc
+        $launchStarted.preLaunchGameProcesses = @($preLaunchGameProcesses)
+        $process = Start-Process -FilePath $mo2Path -ArgumentList $argumentLine -WorkingDirectory (Split-Path -Parent $mo2Path) -WindowStyle Hidden -PassThru
+        $launchOwnerProcessPath = [IO.Path]::GetFullPath($mo2Path)
+        $launchOwnerProcessStartTime = $(try { $process.StartTime.ToUniversalTime().ToString('o') } catch { $null })
+        $dispatchBoundChildren = if ([string]::IsNullOrWhiteSpace($launchOwnerProcessStartTime)) { @() } else { @(Get-MO2DispatchBoundChildEvidence -Config $Config -ParentProcess $process -ParentStartTime $launchOwnerProcessStartTime -DispatchStartedUtc $launchDispatchedUtc) }
+        $launchStarted.requestedPid = $process.Id
+        $launchStarted.requestedProcessStartTime = $launchOwnerProcessStartTime
+        $launchStarted | Add-Member -NotePropertyName dispatchBoundChildren -NotePropertyValue @($dispatchBoundChildren) -Force
+        $receiptWriteError = $null
+        try { Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted } catch { $receiptWriteError = $_.Exception.Message }
+        $ownerTransition = [pscustomobject][ordered]@{
+            kind = 'launch'
+            attemptId = $launchAttemptId
+            dispatchStartedUtc = $launchDispatchedUtc
+            requestedPid = [int]$process.Id
+            requestedProcessPath = $launchOwnerProcessPath
+            requestedProcessStartTime = $launchOwnerProcessStartTime
+            preDispatchProcesses = @($preLaunchMO2Processes)
+            dispatchBoundChildren = @($dispatchBoundChildren)
+            receiptPath = $launchStartedPath
+            detachedAdoptionAllowed = -not $resumeExistingMO2
+        }
+        $currentData.status = 'launching'
+        Reset-MO2GameProcessStateForLaunch -Data $currentData -LaunchAttemptId $launchAttemptId -LaunchDispatchedUtc $launchDispatchedUtc -PreLaunchGameProcesses $preLaunchGameProcesses
+        $currentData | Add-Member -NotePropertyName ownerTransition -NotePropertyValue $ownerTransition -Force
+        if (-not $resumeExistingMO2) {
+            $currentData | Add-Member -NotePropertyName ownerPid -NotePropertyValue ([int]$process.Id) -Force
+            $currentData | Add-Member -NotePropertyName ownerProcessPath -NotePropertyValue $launchOwnerProcessPath -Force
+            $currentData | Add-Member -NotePropertyName ownerProcessStartTime -NotePropertyValue $launchOwnerProcessStartTime -Force
+        }
+        $currentData | Add-Member -NotePropertyName latestLauncherPid -NotePropertyValue ([int]$process.Id) -Force
+        $currentData | Add-Member -NotePropertyName launchedUtc -NotePropertyValue $launchDispatchedUtc -Force
+        $currentData | Add-Member -NotePropertyName launchStartedReceiptPath -NotePropertyValue $launchStartedPath -Force
+        return [pscustomobject][ordered]@{
+            sessionData = $currentData
+            result = [pscustomobject][ordered]@{ process = $process; receiptWriteError = $receiptWriteError }
         }
     }
-    $launchDispatchedUtc = [DateTime]::UtcNow.ToString('o')
-    $launchStarted.dispatchStartedUtc = $launchDispatchedUtc
-    $launchStarted.preLaunchGameProcesses = @($preLaunchGameProcesses)
-    $process = Start-Process -FilePath $mo2Path -ArgumentList $argumentLine -WorkingDirectory (Split-Path -Parent $mo2Path) -WindowStyle Hidden -PassThru
-    $launchOwnerProcessPath = [IO.Path]::GetFullPath($mo2Path)
-    $launchOwnerProcessStartTime = $(try { $process.StartTime.ToUniversalTime().ToString('o') } catch { $null })
-    $launchStarted.requestedPid = $process.Id
-    $launchStarted.requestedProcessStartTime = $launchOwnerProcessStartTime
-    Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted
-    $ownerTransition = [pscustomobject][ordered]@{
-        kind = 'launch'
-        attemptId = $launchAttemptId
-        dispatchStartedUtc = $launchDispatchedUtc
-        requestedPid = [int]$process.Id
-        requestedProcessPath = $launchOwnerProcessPath
-        requestedProcessStartTime = $launchOwnerProcessStartTime
-        preDispatchProcesses = @($preLaunchMO2Processes)
-        receiptPath = $launchStartedPath
-        detachedAdoptionAllowed = -not $resumeExistingMO2
+    $process = $dispatch.process
+    if (-not [string]::IsNullOrWhiteSpace([string]$dispatch.receiptWriteError)) {
+        throw "Launch process $($process.Id) was recorded in the ownership lock, but its dispatch receipt could not be updated: $($dispatch.receiptWriteError)"
     }
-    $lockData.status = 'launching'
-    Reset-MO2GameProcessStateForLaunch -Data $lockData -LaunchAttemptId $launchAttemptId -LaunchDispatchedUtc $launchDispatchedUtc -PreLaunchGameProcesses $preLaunchGameProcesses
-    $lockData | Add-Member -NotePropertyName ownerTransition -NotePropertyValue $ownerTransition -Force
-    if (-not $resumeExistingMO2) {
-        if ($lockData.PSObject.Properties['ownerPid']) { $lockData.ownerPid = $process.Id } else { $lockData | Add-Member -NotePropertyName ownerPid -NotePropertyValue $process.Id }
-        $lockData | Add-Member -NotePropertyName ownerProcessPath -NotePropertyValue $launchOwnerProcessPath -Force
-        $lockData | Add-Member -NotePropertyName ownerProcessStartTime -NotePropertyValue $launchOwnerProcessStartTime -Force
-    }
-    if ($lockData.PSObject.Properties['latestLauncherPid']) { $lockData.latestLauncherPid = $process.Id } else { $lockData | Add-Member -NotePropertyName latestLauncherPid -NotePropertyValue $process.Id }
-    if ($lockData.PSObject.Properties['launchedUtc']) { $lockData.launchedUtc = $launchDispatchedUtc } else { $lockData | Add-Member -NotePropertyName launchedUtc -NotePropertyValue $launchDispatchedUtc }
-    $null = Write-MO2OwnedSessionAtomic -Owned $owned -Value $lockData
     $lockData = $owned.data
-
-    $manifestPath = Join-Path ([string]$lockData.sessionPath) 'session.json'
-    $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw)
-    Reset-MO2GameProcessStateForLaunch -Data $manifest -LaunchAttemptId $launchAttemptId -LaunchDispatchedUtc $launchDispatchedUtc -PreLaunchGameProcesses $preLaunchGameProcesses
-    $manifest | Add-Member -NotePropertyName ownerTransition -NotePropertyValue $ownerTransition -Force
-    $manifest.status = 'launching'
-    $manifest.launcherPid = $process.Id
-    $manifest.launchedUtc = $lockData.launchedUtc
-    if (-not $resumeExistingMO2) {
-        $manifest | Add-Member -NotePropertyName ownerPid -NotePropertyValue $process.Id -Force
-        $manifest | Add-Member -NotePropertyName ownerProcessPath -NotePropertyValue $launchOwnerProcessPath -Force
-        $manifest | Add-Member -NotePropertyName ownerProcessStartTime -NotePropertyValue $launchOwnerProcessStartTime -Force
-    }
-    if ($manifest.PSObject.Properties['launchStartedReceiptPath']) { $manifest.launchStartedReceiptPath = $launchStartedPath } else { $manifest | Add-Member -NotePropertyName launchStartedReceiptPath -NotePropertyValue $launchStartedPath }
-    Write-MO2JsonAtomic -Path $manifestPath -Value $manifest
     if ($StartOnly) {
         return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'launching' -Data @{ sessionId = $SessionId; launcherPid = $process.Id; launchStartedReceiptPath = $launchStartedPath; sessionPath = $lockData.sessionPath; pollWith = "status -SessionId $SessionId"; rootBuilderRecovery = [bool]$RootBuilderRecovery }
     }
@@ -3251,11 +3442,6 @@ function Invoke-MO2Launch {
         $lockData.status = if ($blockingDialog.Count -gt 0) { 'launch-blocked-dialog' } else { 'launch-failed' }
         $null = Write-MO2OwnedSessionAtomic -Owned $owned -Value $lockData
         $lockData = $owned.data
-        $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw)
-        $manifest.status = $lockData.status
-        $manifest.launcherPid = $process.Id
-        $manifest.launchedUtc = $lockData.launchedUtc
-        Write-MO2JsonAtomic -Path $manifestPath -Value $manifest
     }
 
     if ($blockingDialog.Count -gt 0) {
@@ -3349,7 +3535,6 @@ function Invoke-MO2Open {
     $openStartedPath = Join-Path ([string]$owned.data.sessionPath) 'mo2-open-started.json'
     $openAttemptId = [guid]::NewGuid().ToString('D')
     $preOpenMO2Processes = @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
-    $openDispatchedUtc = [DateTime]::UtcNow.ToString('o')
     $openStarted = [pscustomobject][ordered]@{
         contractVersion = $script:MO2ControlContractVersion
         sessionId = $SessionId
@@ -3361,51 +3546,78 @@ function Invoke-MO2Open {
         argumentLine = $argumentLine
         timeoutSeconds = $TimeoutSeconds
         startedUtc = [DateTime]::UtcNow.ToString('o')
-        dispatchStartedUtc = $openDispatchedUtc
+        dispatchStartedUtc = $null
         preDispatchProcesses = @($preOpenMO2Processes)
     }
-    Write-MO2JsonAtomic -Path $openStartedPath -Value $openStarted
-    $process = Start-Process -FilePath $mo2Path -ArgumentList $argumentLine -WorkingDirectory (Split-Path -Parent $mo2Path) -PassThru
-    $openOwner = [pscustomobject][ordered]@{
-        id = [int]$process.Id
-        name = [string]$process.ProcessName
-        path = [IO.Path]::GetFullPath($mo2Path)
-        startTime = $(try { $process.StartTime.ToUniversalTime().ToString('o') } catch { $null })
+    $dispatch = Invoke-MO2OwnedSessionMutation -Owned $owned -Action {
+        param($currentData)
+        if ([string]$currentData.status -notin @('prepared', 'mo2-closed', 'stopped')) {
+            throw "Session status '$($currentData.status)' changed before open dispatch."
+        }
+        Write-MO2JsonAtomic -Path $openStartedPath -Value $openStarted
+        $openDispatchedUtc = [DateTime]::UtcNow.ToString('o')
+        $openStarted.dispatchStartedUtc = $openDispatchedUtc
+        $process = Start-Process -FilePath $mo2Path -ArgumentList $argumentLine -WorkingDirectory (Split-Path -Parent $mo2Path) -PassThru
+        $openOwner = [pscustomobject][ordered]@{
+            id = [int]$process.Id
+            name = [string]$process.ProcessName
+            path = [IO.Path]::GetFullPath($mo2Path)
+            startTime = $(try { $process.StartTime.ToUniversalTime().ToString('o') } catch { $null })
+        }
+        $dispatchBoundChildren = if ([string]::IsNullOrWhiteSpace([string]$openOwner.startTime)) { @() } else { @(Get-MO2DispatchBoundChildEvidence -Config $Config -ParentProcess $process -ParentStartTime ([string]$openOwner.startTime) -DispatchStartedUtc $openDispatchedUtc) }
+        $openStarted.requestedPid = $process.Id
+        $openStarted.requestedProcessStartTime = [string]$openOwner.startTime
+        $openStarted | Add-Member -NotePropertyName dispatchBoundChildren -NotePropertyValue @($dispatchBoundChildren) -Force
+        $receiptWriteError = $null
+        try { Write-MO2JsonAtomic -Path $openStartedPath -Value $openStarted } catch { $receiptWriteError = $_.Exception.Message }
+        $ownerTransition = [pscustomobject][ordered]@{
+            kind = 'open'
+            attemptId = $openAttemptId
+            dispatchStartedUtc = $openDispatchedUtc
+            requestedPid = [int]$process.Id
+            requestedProcessPath = [IO.Path]::GetFullPath($mo2Path)
+            requestedProcessStartTime = [string]$openOwner.startTime
+            preDispatchProcesses = @($preOpenMO2Processes)
+            dispatchBoundChildren = @($dispatchBoundChildren)
+            receiptPath = $openStartedPath
+            detachedAdoptionAllowed = $true
+        }
+        $currentData | Add-Member -NotePropertyName ownerTransition -NotePropertyValue $ownerTransition -Force
+        $null = Set-MO2OwnedSessionOwnerData -Data $currentData -ProcessRecord $openOwner -Reason 'exact MO2 process bound directly to open dispatch'
+        $currentData.status = 'opening'
+        $currentData | Add-Member -NotePropertyName openedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
+        $currentData | Add-Member -NotePropertyName openStartedReceiptPath -NotePropertyValue $openStartedPath -Force
+        return [pscustomobject][ordered]@{
+            sessionData = $currentData
+            result = [pscustomobject][ordered]@{ process = $process; openOwner = $openOwner; receiptWriteError = $receiptWriteError }
+        }
     }
-    $openStarted.requestedPid = $process.Id
-    $openStarted.requestedProcessStartTime = [string]$openOwner.startTime
-    Write-MO2JsonAtomic -Path $openStartedPath -Value $openStarted
-    $ownerTransition = [pscustomobject][ordered]@{
-        kind = 'open'
-        attemptId = $openAttemptId
-        dispatchStartedUtc = $openDispatchedUtc
-        requestedPid = [int]$process.Id
-        requestedProcessPath = [IO.Path]::GetFullPath($mo2Path)
-        requestedProcessStartTime = [string]$openOwner.startTime
-        preDispatchProcesses = @($preOpenMO2Processes)
-        receiptPath = $openStartedPath
-        detachedAdoptionAllowed = $true
+    $process = $dispatch.process
+    $openOwner = $dispatch.openOwner
+    if (-not [string]::IsNullOrWhiteSpace([string]$dispatch.receiptWriteError)) {
+        throw "Open process $($process.Id) was recorded in the ownership lock, but its dispatch receipt could not be updated: $($dispatch.receiptWriteError)"
     }
-    $owned.data | Add-Member -NotePropertyName ownerTransition -NotePropertyValue $ownerTransition -Force
-    $null = Set-MO2OwnedSessionOwner -Owned $owned -ProcessRecord $openOwner -Reason 'exact MO2 process bound directly to open dispatch'
-    Set-MO2OwnedSessionStatus -Owned $owned -Status 'opening' -TimestampProperty 'openedUtc' -Properties @{ openStartedReceiptPath = $openStartedPath; ownerTransition = $ownerTransition }
     if ($StartOnly) {
         return New-MO2ActionResult -Config $Config -Command 'open' -Ok $true -State 'opening' -Data @{ sessionId = $SessionId; requestedPid = $process.Id; openStartedReceiptPath = $openStartedPath; sessionPath = $owned.data.sessionPath; pollWith = "status -SessionId $SessionId"; gameOpened = $false }
     }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $observed = $null
+    $observedResolution = $null
     do {
         Start-Sleep -Milliseconds 250
         $records = @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
-        $observed = @($records | Where-Object { [int]$_.id -eq $process.Id }) | Select-Object -First 1
-        if ($observed) { break }
+        $observedResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes $records -AdoptDetachedOwner
+        if ($observedResolution.ok -and @($observedResolution.targets).Count -eq 1) {
+            $observed = @($observedResolution.targets)[0]
+            if ($observedResolution.adopted) { $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId }
+            break
+        }
+        if ($records.Count -gt 0 -and -not $observedResolution.ok) { break }
     } while ([DateTime]::UtcNow -lt $deadline)
 
     if (-not $observed) {
-        return New-MO2ActionResult -Config $Config -Command 'open' -Ok $false -State 'open-failed' -Data @{ requestedPid = $process.Id; launcherExited = $process.HasExited; launcherExitCode = $(if ($process.HasExited) { $process.ExitCode } else { $null }); openStartedReceiptPath = $openStartedPath; processes = @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames)); sessionPath = $owned.data.sessionPath } -Errors @('The exact newly started MO2 process was not observed within the bounded timeout. The durable start receipt and opening session state allow a later status or recover-close call to adopt the exact process.')
+        return New-MO2ActionResult -Config $Config -Command 'open' -Ok $false -State 'open-failed' -Data @{ requestedPid = $process.Id; launcherExited = $process.HasExited; launcherExitCode = $(if ($process.HasExited) { $process.ExitCode } else { $null }); ownershipResolution = $observedResolution; openStartedReceiptPath = $openStartedPath; processes = @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames)); sessionPath = $owned.data.sessionPath } -Errors @('The opening owner could not be confirmed as the original dispatch-bound process or one explicitly proven detached child. The recorded owner tuple was not replaced.')
     }
-    Assert-MO2ExactProcessTargets -Config $Config -Processes @($observed)
-    $null = Set-MO2OwnedSessionOwner -Owned $owned -ProcessRecord $observed -Reason 'exact MO2 process observed after open'
     $visibleMainWindow = $null
     do {
         # Process.MainWindowHandle is not a readiness signal: during startup it
@@ -3711,12 +3923,8 @@ function Invoke-MO2StopGame {
     }
     $mo2Retained = $closed -and $retention -and $retention.stable
     $owned.data.status = if (-not $closed) { 'game-stop-incomplete' } elseif (-not $mo2Retained) { 'mo2-exited-after-game-stop' } elseif ($dialogNeedsAttention) { 'game-stopped-needs-attention' } else { 'game-stopped' }
+    $owned.data | Add-Member -NotePropertyName stoppedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
     $null = Write-MO2OwnedSessionAtomic -Owned $owned -Value $owned.data
-    $manifestPath = Join-Path ([string]$owned.data.sessionPath) 'session.json'
-    $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw)
-    $manifest.status = $owned.data.status
-    $manifest.stoppedUtc = [DateTime]::UtcNow.ToString('o')
-    Write-MO2JsonAtomic -Path $manifestPath -Value $manifest
 
     $ok = $closed -and $mo2Retained -and -not $dialogNeedsAttention
     return New-MO2ActionResult -Config $Config -Command 'stop-game' -Ok $ok -State $owned.data.status -Data @{ before = $before.processes; after = $after.processes; mo2Retained = $mo2Retained; retention = $retention; releaseRequired = $closed -and -not $mo2Retained; retainedDialogCleanup = $dialogCleanup; forceTermination = $false; sessionPath = $owned.data.sessionPath } -Errors $(
@@ -3869,7 +4077,22 @@ function Invoke-MO2TerminateGame {
     if (-not (Test-MO2InteractiveDesktop)) {
         return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $false -State 'interactive-desktop-required' -Data @{ sessionId=$SessionId; targets=$targets } -Errors @('Exact Unlock handling after game termination requires the logged-on interactive desktop.')
     }
-    $termination = Invoke-MO2VerifiedGameTerminationSet -Config $Config -Owned $owned -Targets $targets
+    $termination = Invoke-MO2OwnedSessionMutation -Owned $owned -Action {
+        param($currentData)
+        $currentOwned = [pscustomobject][ordered]@{ path = $owned.path; sessionId = $owned.sessionId; accessId = $owned.accessId; data = $currentData }
+        $currentInspection = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$currentData.profile) -RequestedExecutable ([string]$currentData.executable)
+        $currentGameResolution = Resolve-MO2RecordedGameProcessTargets -Recorded @($currentData.gameProcesses) -Current @($currentInspection.processes.game)
+        if (-not $currentGameResolution.ok) {
+            return [pscustomobject][ordered]@{ commit = $false; sessionData = $currentData; result = [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = [string]$currentGameResolution.reason; resolution = $currentGameResolution } }
+        }
+        $verified = Invoke-MO2VerifiedGameTerminationSet -Config $Config -Owned $currentOwned -Targets @($currentGameResolution.targets)
+        if ($verified.ok) {
+            $currentData.status = 'game-termination-requested'
+            $currentData | Add-Member -NotePropertyName gameTerminationRequestedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
+            $currentData | Add-Member -NotePropertyName gameTerminationTargets -NotePropertyValue @($verified.targets) -Force
+        }
+        return [pscustomobject][ordered]@{ commit = [bool]$verified.ok; sessionData = $currentData; result = $verified }
+    }
     if (-not $termination.ok) {
         return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $false -State 'blocked' -Data @{ gameTermination=$termination } -Errors @('A launch-recorded game identity changed before force termination; no PID-based fallback was attempted.')
     }
@@ -4118,7 +4341,27 @@ function Invoke-MO2Terminate {
     }
     $forceTermination = $null
     if ($targets.Count -gt 0) {
-        $forceTermination = Invoke-MO2VerifiedForceTermination -Config $Config -Owned $owned -Target $targets[0] -WhatIf:$WhatIf
+        if ($WhatIf) {
+            $forceTermination = Invoke-MO2VerifiedForceTermination -Config $Config -Owned $owned -Target $targets[0] -WhatIf
+        }
+        else {
+            $forceTermination = Invoke-MO2OwnedSessionMutation -Owned $owned -Action {
+                param($currentData)
+                $currentOwned = [pscustomobject][ordered]@{ path = $owned.path; sessionId = $owned.sessionId; accessId = $owned.accessId; data = $currentData }
+                $currentProcesses = @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
+                $currentResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $currentOwned -Processes $currentProcesses
+                if (-not $currentResolution.ok -or @($currentResolution.targets).Count -ne 1) {
+                    return [pscustomobject][ordered]@{ commit = $false; sessionData = $currentData; result = [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = [string]$currentResolution.reason; ownershipResolution = $currentResolution } }
+                }
+                $verified = Invoke-MO2VerifiedForceTermination -Config $Config -Owned $currentOwned -Target @($currentResolution.targets)[0]
+                if ($verified.ok) {
+                    $currentData.status = 'mo2-termination-requested'
+                    $currentData | Add-Member -NotePropertyName terminationRequestedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
+                    $currentData | Add-Member -NotePropertyName terminationTarget -NotePropertyValue $verified.liveIdentity -Force
+                }
+                return [pscustomobject][ordered]@{ commit = [bool]$verified.ok; sessionData = $currentData; result = $verified }
+            }
+        }
         if (-not $forceTermination.ok) {
             return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $false -State 'blocked' -Data @{ processes = $inspection.processes; ownerPid = $ownerPid; forceTermination = $forceTermination } -Errors @('The live MO2 process no longer matches the exact recorded owner identity; forced termination is refused.')
         }
@@ -4134,12 +4377,8 @@ function Invoke-MO2Terminate {
     } while ([DateTime]::UtcNow -lt $deadline)
     $terminated = $remaining.Count -eq 0
     $owned.data.status = if ($terminated) { 'mo2-terminated' } else { 'terminate-incomplete' }
+    $owned.data | Add-Member -NotePropertyName terminatedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
     $null = Write-MO2OwnedSessionAtomic -Owned $owned -Value $owned.data
-    $manifestPath = Join-Path ([string]$owned.data.sessionPath) 'session.json'
-    $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw)
-    $manifest.status = $owned.data.status
-    if ($manifest.PSObject.Properties['terminatedUtc']) { $manifest.terminatedUtc = [DateTime]::UtcNow.ToString('o') } else { $manifest | Add-Member -NotePropertyName terminatedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) }
-    Write-MO2JsonAtomic -Path $manifestPath -Value $manifest
     return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $terminated -State $owned.data.status -Data @{ targets = $targets; remaining = $remaining; gameProcesses = @(); activeRootBuilderBuildData = @(); sessionPath = $owned.data.sessionPath } -Errors $(if ($terminated) { @() } else { @('MO2 remained after exact forced termination was requested.') })
 }
 

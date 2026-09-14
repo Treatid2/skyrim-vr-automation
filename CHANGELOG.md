@@ -4,6 +4,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Serialize launch, open, game termination, MO2 termination, and RootBuilder
+  `Unlock` authorization against the current session generation before their
+  external process/UI action; bind Unlock to one retained exact-owner handle at
+  every control boundary; preserve synchronous-open ownership unless the full
+  detached transition proves a replacement; capture direct-child identity while
+  the dispatched parent handle prevents PID reuse; and update `session.json`
+  inside the same ordered transition as its authoritative ownership-lock state.
 - Reject stale lease generations at the serialized MO2 session commit boundary,
   bind detached handoff ancestry to the dispatched helper's exact lifetime, and
   make session-lock liveness consume the modern owner path/start-time schema.
