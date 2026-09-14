@@ -20,6 +20,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - Complete failed or unverified shader-cache tasks without a physical restore
   when the live tree still exactly matches the prepared baseline, recording a
   committed no-op restore proof bound to the original snapshot.
+- Keep loader-first StartOnly observations pending until the configured primary
+  game arrives, require exact dispatch and direct process-lineage evidence for
+  one helper-to-runtime owner handoff, and co-write synchronous game identity
+  with its durable running transition.
 - Bind every `terminate-game` target to a retained live process handle, recheck
   its complete recorded and configured identity immediately before mutation,
   and eliminate PID reopening from game force termination.
