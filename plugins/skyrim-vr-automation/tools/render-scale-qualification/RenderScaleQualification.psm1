@@ -4774,7 +4774,11 @@ function Test-CSXFinalizerEnvelope {
 function Update-CSXQualificationReport {
     param(
         [Parameter(Mandatory)][string]$EvidenceDirectory,
-        [switch]$AllowUnsealedSuccess
+        [switch]$AllowUnsealedSuccess,
+        [scriptblock]$CompletionValidator = {
+            param($EvidenceRoot, $ExpectedRunId)
+            Test-CSXQualificationCompletionReceipt -EvidenceRoot $EvidenceRoot -ExpectedRunId $ExpectedRunId
+        }
     )
     $root = [IO.Path]::GetFullPath($EvidenceDirectory)
     $rawPath = Join-Path $root 'run.raw.json'
@@ -4792,7 +4796,7 @@ function Update-CSXQualificationReport {
         # terminal receipt still binds that projection. Broken terminal custody is
         # decisive, so do not spend the finalization budget revalidating the complete
         # evidence envelope before reporting it.
-        $terminalPreflight = Test-CSXQualificationCompletionReceipt -EvidenceRoot $root -ExpectedRunId ([string]$raw.runId)
+        $terminalPreflight = & $CompletionValidator $root ([string]$raw.runId)
         if (-not $terminalPreflight.ok) {
             $terminalPreflightFailed = $true
             foreach ($terminalError in @($terminalPreflight.errors)) {
@@ -4882,7 +4886,7 @@ function Update-CSXQualificationReport {
     $requiresSealedProjection = $status -in @('PASS', 'LOCAL_PASS') -or
         (Test-Path -LiteralPath $completionReceiptPath -PathType Leaf)
     if (-not $AllowUnsealedSuccess -and -not $terminalPreflightFailed -and $requiresSealedProjection) {
-        $completion = Test-CSXQualificationCompletionReceipt -EvidenceRoot $root -ExpectedRunId ([string]$raw.runId)
+        $completion = & $CompletionValidator $root ([string]$raw.runId)
         if ($completion.ok) {
             $existingRunPath = Join-Path $root 'run.json'
             $existingSummaryPath = Join-Path $root $(if ($prMode) { 'pr-summary.md' } else { 'qualification-summary.md' })
@@ -4899,6 +4903,21 @@ function Update-CSXQualificationReport {
         }
         foreach ($completionError in @($completion.errors)) {
             $infrastructureErrors.Add("Qualification terminal result is not sealed: $completionError")
+        }
+        # The initial check proved that an immutable publication existed when this
+        # validation began. A later inability to revalidate it is reported only in
+        # memory; it must not fall through to the writers and destroy that evidence.
+        if ($null -ne $terminalPreflight -and $terminalPreflight.ok) {
+            $existingReport = Get-Content -LiteralPath $existingRunPath -Raw | ConvertFrom-Json -Depth 100
+            $existingReport.status = 'INFRASTRUCTURE_ERROR'
+            $existingReport.errors = @(@(Get-CSXPropertyValue $existingReport 'errors' @()) + @($infrastructureErrors) | Select-Object -Unique)
+            $existingReport.infrastructureErrors = @(@(Get-CSXPropertyValue $existingReport 'infrastructureErrors' @()) + @($infrastructureErrors) | Select-Object -Unique)
+            return [pscustomobject][ordered]@{
+                report = $existingReport
+                runPath = $existingRunPath
+                summaryPath = Join-Path $root $(if ($prMode) { 'pr-summary.md' } else { 'qualification-summary.md' })
+                completion = $completion
+            }
         }
         $status = 'INFRASTRUCTURE_ERROR'
     }
@@ -5226,6 +5245,10 @@ function Complete-CSXSealedQualification {
             [DateTimeOffset]::UtcNow -gt $ResultDeadlineUtc) {
             throw 'The committed qualification completion receipt crossed its complete invocation or evidence-finalization deadline before public acceptance.'
         }
+        $completionSha256 = [string](Get-CSXPropertyValue $committedValidation 'sha256')
+        if ([string]::IsNullOrWhiteSpace($completionSha256)) {
+            $completionSha256 = Get-CSXFileSha256 $committedCompletionPath
+        }
         Move-Item -LiteralPath $committedCompletionPath -Destination $completionFullPath
     }
     finally {
@@ -5239,6 +5262,7 @@ function Complete-CSXSealedQualification {
     return [pscustomobject][ordered]@{
         updated = $updated
         completionReceipt = $CompletionReceipt
+        completionSha256 = $completionSha256
         finalizationElapsedMs = $terminalFinalizationElapsedMs
     }
 }

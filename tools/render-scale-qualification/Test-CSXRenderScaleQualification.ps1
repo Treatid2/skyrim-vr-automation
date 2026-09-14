@@ -1604,7 +1604,9 @@ try {
         -ResultDeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) -EndToEndBudgetMs 5000 -FinalizationBudgetMs 5000 `
         -Finalizer { param($root) [pscustomobject]@{ report = [pscustomobject]@{ status = 'PASS' }; runPath = (Join-Path $root 'run.json'); summaryPath = (Join-Path $root 'summary.md') } }
     Assert-Test ($timelyTerminal.completionReceipt.within600Seconds -and
-        (Get-Content -LiteralPath $timelyReceiptPath -Raw | ConvertFrom-Json).within600Seconds) 'A timely mandatory terminal validation was not retained as complete.'
+        (Get-Content -LiteralPath $timelyReceiptPath -Raw | ConvertFrom-Json).within600Seconds -and
+        $timelyTerminal.completionSha256 -eq (Get-CSXFileSha256 $timelyReceiptPath)) `
+        'A timely mandatory terminal validation was not retained as complete with its pre-publication hash.'
 
     $lateRoot = Join-Path $terminalBudgetRoot 'late'
     $lateReceipt = New-TerminalCommitFixture -Root $lateRoot -RunId 'late-run'
@@ -1728,7 +1730,9 @@ try {
         ($runnerSource -match '(?s)providerCustody = \$script:providerCustodyEvidence.*?if \(-not \$script:evidenceWritable\).*?providerCustody = \$script:providerCustodyEvidence')) 'Runner-side preparation expiry does not retain its six not-started outcomes through unwritable failure evidence.'
     Assert-Test ($runnerSource.Contains('-DeadlineUtc $evaluationDeadlineUtc') -and
         $runnerSource.Contains('$completionPath = Join-Path $script:evidenceRoot ''qualification-completion.json''') -and
-        -not $runnerSource.Contains('$completionPath = Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot ''qualification-completion.json'')')) 'Runner restarts the visual deadline or publishes acceptance before mandatory terminal validation.'
+        $runnerSource.Contains('completionSha256 = $terminal.completionSha256') -and
+        -not $runnerSource.Contains('completionSha256 = Get-CSXFileSha256 $completionPath') -and
+        -not $runnerSource.Contains('$completionPath = Write-CSXJsonFile -Path (Join-Path $script:evidenceRoot ''qualification-completion.json'')')) 'Runner restarts the visual deadline, publishes acceptance early, or performs fallible receipt work after acceptance.'
     Assert-Test ($runnerSource.Contains('New-CSXMcpConnection -Runtime $script:runtime -DeadlineUtc $connectionDeadlineUtc') -and
         $runnerSource.Contains("-ClientName 'CSXRenderScaleQualificationCleanup'") -and
         $runnerSource.Contains('-DeadlineUtc $script:resultDeadlineUtc')) 'Runner does not bind normal and cleanup MCP session establishment to the shared result deadline.'
@@ -2026,7 +2030,10 @@ try {
         'Repeated finalization rewrote an already sealed PR projection or invalidated its completion binding.'
     $sealedRunBytes = [IO.File]::ReadAllBytes((Join-Path $candidateRoot 'run.json'))
     $sealedCompletionBytes = [IO.File]::ReadAllBytes((Join-Path $candidateRoot 'qualification-completion.json'))
+    $sealedCompletionSha256 = Get-CSXFileSha256 (Join-Path $candidateRoot 'qualification-completion.json')
     $sealedSummarySha256 = Get-CSXFileSha256 (Join-Path $candidateRoot 'pr-summary.md')
+    $sealedRawSha256 = Get-CSXFileSha256 (Join-Path $candidateRoot 'run.raw.json')
+    $sealedReviewSha256 = Get-CSXFileSha256 (Join-Path $candidateRoot 'visual-review.json')
     foreach ($sealCase in @(
         [pscustomobject]@{
             name = 'missing'; pattern = 'completion receipt is missing'
@@ -2066,6 +2073,24 @@ try {
                 "Terminal preflight failure overwrote the prior valid summary for $($sealCase.name)."
         }
     }
+    $script:completionValidationCalls = 0
+    $laterValidationFailure = Update-CSXQualificationReport -EvidenceDirectory $candidateRoot -CompletionValidator {
+        param($root, $runId)
+        $script:completionValidationCalls++
+        if ($script:completionValidationCalls -eq 2) {
+            return [pscustomobject]@{ ok = $false; errors = @('simulated later bound-artifact read failure') }
+        }
+        Test-CSXQualificationCompletionReceipt -EvidenceRoot $root -ExpectedRunId $runId
+    }
+    Assert-Test ($laterValidationFailure.report.status -eq 'INFRASTRUCTURE_ERROR' -and
+        ($laterValidationFailure.report.errors -join ' | ') -match 'simulated later bound-artifact read failure' -and
+        (Get-CSXFileSha256 (Join-Path $candidateRoot 'run.json')) -eq $candidateRunHash -and
+        (Get-CSXFileSha256 (Join-Path $candidateRoot 'run.raw.json')) -eq $sealedRawSha256 -and
+        (Get-CSXFileSha256 (Join-Path $candidateRoot 'visual-review.json')) -eq $sealedReviewSha256 -and
+        (Get-CSXFileSha256 (Join-Path $candidateRoot 'qualification-completion.json')) -eq $sealedCompletionSha256 -and
+        (Get-CSXFileSha256 (Join-Path $candidateRoot 'pr-summary.md')) -eq $sealedSummarySha256 -and
+        (Test-CSXQualificationCompletionReceipt -EvidenceRoot $candidateRoot -ExpectedRunId ([string]$raw.runId)).ok) `
+        'A later sealed-result validation failure rewrote immutable evidence or was not reported in memory.'
     $prAutomated = $raw.assays.visual.automatedReview
     Assert-Test ((@($prAutomated.batches | ForEach-Object { "$($_.presentationPass):$($_.replicate)" }) -join ',') -eq
         '1:1,1:2,1:3,2:1,2:2,2:3') 'PR image-model batches are not in pass-major order.'
