@@ -92,7 +92,8 @@ if ($runnerSource -notmatch 'Get-CSXResultBoundedTimeoutSeconds' -or
     $runnerSource -notmatch 'CommandTimeoutMilliseconds \$providerCommandTimeoutMs' -or
     $runnerSource -notmatch 'remainingResultWorkMs' -or
     $runnerSource -notmatch 'TimeoutSeconds \(Get-CSXResultBoundedTimeoutSeconds -OperationCapMs 5000\)' -or
-    $runnerSource -notmatch 'Update-CSXQualificationReport -EvidenceDirectory \$script:evidenceRoot -AllowUnsealedSuccess' -or
+    $runnerSource -match 'Update-CSXQualificationReport -EvidenceDirectory \$script:evidenceRoot -AllowUnsealedSuccess' -or
+    $runnerSource -notmatch 'Complete-CSXSealedQualification -EvidenceDirectory \$script:evidenceRoot' -or
     $runnerSource -notmatch '(?s)qualification-completion\.json.*Update-CSXQualificationReport -EvidenceDirectory \$script:evidenceRoot') {
     throw 'Direct runner does not propagate the shared result deadline and sealed-success boundary through production operations.'
 }
