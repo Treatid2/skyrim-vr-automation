@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Keep render-scale terminal acceptance atomic through the runner result: reuse
+  the receipt hash proven before public commit, and preserve an existing sealed
+  report and summary when any later revalidation becomes unavailable.
 - Enforce MO2 `SteamVRNull` admission inside null-HMD `apply` and `start`, bind
   the exact lease, profile, and provider inventory into the transaction
   receipt, and route-shape fresh SteamVR task clones so inherited OCU providers

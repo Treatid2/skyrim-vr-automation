@@ -2170,7 +2170,7 @@ try {
     $result = [pscustomobject][ordered]@{
         ok = [string]$updated.report.status -in @('PASS', 'LOCAL_PASS'); status = $updated.report.status
         runPath = $updated.runPath; summaryPath = $updated.summaryPath; reviewPath = (Join-Path $script:evidenceRoot 'visual-review.json')
-        completionPath = $completionPath; completionSha256 = Get-CSXFileSha256 $completionPath
+        completionPath = $completionPath; completionSha256 = $terminal.completionSha256
         providerCustody = $script:providerCustodyEvidence
         errors = @($updated.report.errors)
     }
