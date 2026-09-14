@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Preserve each synchronous launch/open generation through its completion,
+  refuse stale terminal writes after a concurrent lifecycle wins, and recognize
+  success only when the newer record proves the same exact attempt completed.
 - Stage qualification reports and summaries until their completion receipt is
   validated and privately committed, then publish the sealed result with
   rollback so a later failure cannot leave a new unsealed PASS projection.

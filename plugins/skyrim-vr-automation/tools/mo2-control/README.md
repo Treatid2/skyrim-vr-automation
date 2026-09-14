@@ -58,7 +58,11 @@ Launch/open capture an eligible direct child's exact identity while retaining
 the original helper handle, so the lifetime proof survives a later helper exit
 without treating a recycled parent PID as authority. A merely configured later
 process cannot become session
-authority. Later `terminate-game` rebinds every
+authority. Synchronous compatibility callers keep the generation produced by
+their own handoff through terminal completion. If `status` or another lifecycle
+writer wins that race, the older caller preserves the newer state and recognizes
+success only when that durable record proves the same exact attempt completed.
+Later `terminate-game` rebinds every
 recorded game identity to a retained live process handle, revalidates its full
 identity, configured path, and current serialized session generation immediately
 before mutation, and never reopens a PID for termination. This makes exact
