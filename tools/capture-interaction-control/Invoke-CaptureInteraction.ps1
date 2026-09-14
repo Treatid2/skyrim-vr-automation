@@ -279,12 +279,12 @@ function Get-ScreenshotSequencePreflight([string]$SessionId, [string]$Runtime, [
     $maximumDurationProperty = $limitsProperty.Value.PSObject.Properties['maximumSequenceDurationMs']
     if (-not $maximumFramesProperty -or $null -eq $maximumFramesProperty.Value -or
         $maximumFramesProperty.Value.GetType() -notin $integralTypes -or
-        [uint64]$maximumFramesProperty.Value -eq 0) {
+        [decimal]$maximumFramesProperty.Value -le 0) {
         throw 'Screenshot sequence preflight returned an invalid maximumSequenceFrames limit.'
     }
     if (-not $maximumDurationProperty -or $null -eq $maximumDurationProperty.Value -or
         $maximumDurationProperty.Value.GetType() -notin $integralTypes -or
-        [uint64]$maximumDurationProperty.Value -eq 0) {
+        [decimal]$maximumDurationProperty.Value -le 0) {
         throw 'Screenshot sequence preflight returned an invalid maximumSequenceDurationMs limit.'
     }
     $maximumFrames = [uint64]$maximumFramesProperty.Value

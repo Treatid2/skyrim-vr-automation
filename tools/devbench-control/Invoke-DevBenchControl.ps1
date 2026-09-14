@@ -586,6 +586,19 @@ function Test-WaitRetryableException {
         $message -match '\[(404|429|502|503|504)\]|timed out|temporarily unavailable|connection.*closed|connection.*refused|actively refused|main-thread task did not run|main thread busy'
 }
 
+function New-DevBenchWaitTimeoutSemantic([string]$Condition, [int]$TimeoutSeconds) {
+    return [pscustomobject][ordered]@{
+        known = $true
+        ok = $false
+        outcome = 'wait-timeout'
+        guarded = $false
+        transient = $false
+        codes = @('wait_timeout')
+        states = @('timeout')
+        reasons = @("Condition '$Condition' was not satisfied within $TimeoutSeconds seconds.")
+    }
+}
+
 function Close-McpSession {
     param([string]$Endpoint, [hashtable]$Headers)
     $sessionId = if ($null -ne $Headers -and $Headers.ContainsKey('Mcp-Session-Id')) {
@@ -658,7 +671,7 @@ function Close-McpSessionForRebind {
     return $cleanup
 }
 
-function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
+function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity, [switch]$PropagateRetryable) {
     $baseHeaders = @{ Accept = 'application/json, text/event-stream'; 'Content-Type' = 'application/json' }
     $sessionHeaders = $null
     $initializeCompleted = $false
@@ -684,7 +697,7 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
         $sessionTools = @($listRpc.json.result.tools)
         $identity = $null
         if (-not $SkipRuntimeIdentityVerification) {
-            $identity = Get-RuntimeIdentity -Runtime $Runtime -Headers $sessionHeaders -Tools $sessionTools -AllowDeferredBuildIdentity:$AllowDeferredBuildIdentity
+            $identity = Get-RuntimeIdentity -Runtime $Runtime -Headers $sessionHeaders -Tools $sessionTools -AllowDeferredBuildIdentity:$AllowDeferredBuildIdentity -PropagateRetryable:$PropagateRetryable
             if ($identity.errors.Count -gt 0) { throw "DevBench runtime identity verification failed: $($identity.errors -join ' ')" }
         }
         return [pscustomobject][ordered]@{ headers = $sessionHeaders; tools = $sessionTools; runtimeIdentity = $identity; sessionId = $sessionId }
@@ -725,11 +738,11 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
     }
 }
 
-function Open-DevBenchSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
+function Open-DevBenchSession($Runtime, [switch]$AllowDeferredBuildIdentity, [switch]$PropagateRetryable) {
     try {
         $script:transport = 'mcp'
         $script:endpoint = "$script:baseEndpoint/mcp"
-        $session = Open-McpSession -Runtime $Runtime -AllowDeferredBuildIdentity:$AllowDeferredBuildIdentity
+        $session = Open-McpSession -Runtime $Runtime -AllowDeferredBuildIdentity:$AllowDeferredBuildIdentity -PropagateRetryable:$PropagateRetryable
         $session | Add-Member -NotePropertyName transport -NotePropertyValue 'mcp'
         return $session
     }
@@ -748,7 +761,7 @@ function Open-DevBenchSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
     $tools = @(Get-ToolDescriptors -Headers $headers)
     $identity = $null
     if (-not $SkipRuntimeIdentityVerification) {
-        $identity = Get-RuntimeIdentity -Runtime $Runtime -Headers $headers -Tools $tools -AllowDeferredBuildIdentity:$AllowDeferredBuildIdentity
+        $identity = Get-RuntimeIdentity -Runtime $Runtime -Headers $headers -Tools $tools -AllowDeferredBuildIdentity:$AllowDeferredBuildIdentity -PropagateRetryable:$PropagateRetryable
         if ($identity.errors.Count -gt 0) { throw "DevBench runtime identity verification failed: $($identity.errors -join ' ')" }
     }
     return [pscustomobject][ordered]@{ headers = $headers; tools = $tools; runtimeIdentity = $identity; sessionId = $null; transport = 'rest' }
@@ -770,7 +783,7 @@ function Get-ListenerPid([int]$Port) {
     return [int]$records[0]
 }
 
-function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [switch]$AllowDeferredBuildIdentity) {
+function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [switch]$AllowDeferredBuildIdentity, [switch]$PropagateRetryable) {
     $expectations = Get-DevBenchRuntimeExpectations -Runtime $Runtime
     if (-not [string]::IsNullOrWhiteSpace($ArtifactPath)) { $expectations.artifactPath = [IO.Path]::GetFullPath($ArtifactPath) }
     if (-not [string]::IsNullOrWhiteSpace($ExpectedBuildId)) { $expectations.buildId = $ExpectedBuildId }
@@ -782,7 +795,7 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
     if ($inspectAvailable) {
         try { $health = @(Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'health' } -Headers $Headers).content | Select-Object -First 1 }
         catch {
-            if (Test-WaitRetryableException -Exception $_.Exception) { throw }
+            if ($PropagateRetryable -and (Test-WaitRetryableException -Exception $_.Exception)) { throw }
             $errors.Add($_.Exception.Message)
         }
     }
@@ -830,7 +843,7 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
                 if ($producer) { break }
             }
             catch {
-                if (Test-WaitRetryableException -Exception $_.Exception) { throw }
+                if ($PropagateRetryable -and (Test-WaitRetryableException -Exception $_.Exception)) { throw }
                 $candidateError = $_.Exception.Message
             }
         }
@@ -1130,7 +1143,7 @@ try {
             $attempts++
             if ($null -eq $headers) {
                 try {
-                    $session = Open-DevBenchSession -Runtime $runtime -AllowDeferredBuildIdentity:($Condition -in @('toolAvailable', 'serviceReady'))
+                    $session = Open-DevBenchSession -Runtime $runtime -AllowDeferredBuildIdentity:($Condition -in @('toolAvailable', 'serviceReady')) -PropagateRetryable
                     $headers = $session.headers
                     $tools = @($session.tools)
                     $runtimeIdentity = $session.runtimeIdentity
@@ -1340,7 +1353,7 @@ try {
                     $currentTools = @(Get-ToolDescriptors -Headers $headers)
                     $toolPresent = @($currentTools | Where-Object name -eq $Tool).Count -eq 1
                     if ($toolPresent -and -not $SkipRuntimeIdentityVerification) {
-                        $refreshedIdentity = Get-RuntimeIdentity -Runtime $runtime -Headers $headers -Tools $currentTools
+                        $refreshedIdentity = Get-RuntimeIdentity -Runtime $runtime -Headers $headers -Tools $currentTools -PropagateRetryable
                         if ($refreshedIdentity.errors.Count -gt 0) { throw "DevBench runtime identity verification failed after target registration: $($refreshedIdentity.errors -join ' ')" }
                         $runtimeIdentity = $refreshedIdentity
                     }
@@ -1459,9 +1472,13 @@ try {
             completedUtc = $waitCompletedUtc.ToString('o')
             elapsedMs = [Math]::Round(($waitCompletedUtc - $waitStartedUtc).TotalMilliseconds, 3)
             observation = $observation
+            lastSuccessfulObservation = if ($observation.satisfied) { $null } else { $lastSuccessfulWaitObservation }
         }
         if ($observation.satisfied -and -not $SkipRuntimeIdentityVerification) { $evidencePath = Write-RuntimeEvidence $runtimeIdentity }
-        $semantic = [pscustomobject][ordered]@{ known = $true; ok = [bool]$observation.satisfied; reasons = $(if ($observation.satisfied) { @() } else { @("Condition '$Condition' was not satisfied within $TimeoutSeconds seconds.") }) }
+        $semantic = if ($observation.satisfied) {
+            [pscustomobject][ordered]@{ known = $true; ok = $true; reasons = @() }
+        }
+        else { New-DevBenchWaitTimeoutSemantic -Condition $Condition -TimeoutSeconds $TimeoutSeconds }
     }
 
     if (($RequireSuccess -or $RequirePerformanceNeutral) -and -not $semantic.known) {
@@ -1479,6 +1496,7 @@ try {
         ok = -not $semanticFailure
         transportOk = $true
         command = $Command
+        state = if ($Command -eq 'wait' -and -not $observation.satisfied) { 'timeout' } else { 'completed' }
         endpoint = $endpoint
         transport = $transport
         timestampUtc = [DateTime]::UtcNow.ToString('o')
@@ -1529,16 +1547,7 @@ catch {
     }
     else { $null }
     $failureSemantic = if ($waitDeadlineExpired) {
-        [pscustomobject][ordered]@{
-            known = $true
-            ok = $false
-            outcome = 'wait-timeout'
-            guarded = $false
-            transient = $false
-            codes = @('wait_timeout')
-            states = @('timeout')
-            reasons = @("Condition '$Condition' was not satisfied within $TimeoutSeconds seconds.")
-        }
+        New-DevBenchWaitTimeoutSemantic -Condition $Condition -TimeoutSeconds $TimeoutSeconds
     }
     else { $null }
     if ($waitDeadlineExpired) { $failureMessage = [string]$failureSemantic.reasons[0] }
