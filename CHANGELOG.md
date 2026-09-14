@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Preserve each synchronous launch/open generation through its completion,
+  refuse stale terminal writes after a concurrent lifecycle wins, and recognize
+  success only when the newer record proves the same exact attempt completed.
 - Recheck the exact MO2 owner beside the serialized game-close inventory, guard
   every retained failed-to-run dialog action with the initiating generation and
   retained owner handle, and keep recovery-close completion on that same

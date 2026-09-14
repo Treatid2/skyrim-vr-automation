@@ -184,6 +184,33 @@ selected_profile=@ByteArray(Codex)
     $openingReady = & $mo2Module { param($owned, $resolution) Test-MO2OpeningReady -Owned $owned -OwnershipResolution $resolution -MO2Processes @([pscustomobject]@{ id = 101 }) -GameProcesses @() -Windows @([pscustomobject]@{ visible = $true; automationId = 'MainWindow' }) } $openingOwned $openingResolution
     Assert-MO2Test $openingReady 'an exact adopted StartOnly MO2 main window is eligible for durable mo2-open promotion'
 
+    $completionSupersession = & $mo2Module {
+        param($cfg, $gameRecord)
+        $originalOwnedSession = (Get-Command Get-MO2OwnedSession -CommandType Function).ScriptBlock
+        $initiating = [pscustomobject]@{ sessionId='supersession-session'; data=[pscustomobject]@{ generation=4L; status='launching' } }
+        $current = [pscustomobject]@{ sessionId='supersession-session'; data=[pscustomobject]@{
+            generation=5L; status='running'; launchAttemptId='launch-attempt'; gameProcessesLaunchAttemptId='launch-attempt'; gameProcesses=@($gameRecord)
+            ownerTransition=[pscustomobject]@{ kind='launch'; attemptId='launch-attempt' }
+        } }
+        try {
+            Set-Item Function:script:Get-MO2OwnedSession -Value ({ $current }.GetNewClosure())
+            $launch = Get-MO2SynchronousCompletionSupersession -Config $cfg -Owned $initiating -SessionId 'supersession-session' -Operation launch -AttemptId 'launch-attempt'
+            $launchResult = New-MO2SynchronousCompletionSupersededResult -Config $cfg -Supersession $launch -SessionId 'supersession-session'
+            $current.data.status = 'mo2-closed'
+            $current.data.ownerTransition = [pscustomobject]@{ kind='open'; attemptId='open-attempt' }
+            $open = Get-MO2SynchronousCompletionSupersession -Config $cfg -Owned $initiating -SessionId 'supersession-session' -Operation open -AttemptId 'open-attempt'
+            $openResult = New-MO2SynchronousCompletionSupersededResult -Config $cfg -Supersession $open -SessionId 'supersession-session'
+            [pscustomobject]@{ launch=$launch; launchResult=$launchResult; open=$open; openResult=$openResult; finalStatus=[string]$current.data.status; finalGeneration=[long]$current.data.generation }
+        }
+        finally { Set-Item Function:script:Get-MO2OwnedSession -Value $originalOwnedSession }
+    } $config ([pscustomobject]@{ id=202; name='MO2ControlImpossibleFixtureGame' })
+    Assert-MO2Test ($completionSupersession.launch.superseded -and $completionSupersession.launch.equivalentSuccess -and
+        $completionSupersession.launchResult.ok -and $completionSupersession.launchResult.state -eq 'game-running' -and
+        $completionSupersession.launchResult.data.completionSuperseded) 'a synchronous launch overtaken by status adoption recognizes only the same exact completed launch without rewriting it'
+    Assert-MO2Test ($completionSupersession.open.superseded -and -not $completionSupersession.open.equivalentSuccess -and
+        -not $completionSupersession.openResult.ok -and $completionSupersession.openResult.state -eq 'open-superseded' -and
+        $completionSupersession.finalStatus -eq 'mo2-closed' -and $completionSupersession.finalGeneration -eq 5L) 'a synchronous open overtaken by a newer lifecycle reports supersession and preserves the newer generation'
+
     $launchUtc = [DateTimeOffset]::UtcNow.AddSeconds(-1)
     $ownerStartUtc = [DateTimeOffset]::UtcNow.AddSeconds(-2)
     $launchingOwned = [pscustomobject]@{ data = [pscustomobject]@{ status = 'launching'; executable = 'Launch MGO - Do Not Unlock'; launchedUtc = $launchUtc.ToString('o'); launchDispatchedUtc = $launchUtc.ToString('o'); launchAttemptId = 'launch-1'; preLaunchGameProcesses = @(); ownerPid = 101; ownerProcessPath = $mo2Exe; ownerProcessStartTime = $ownerStartUtc.ToString('o'); gameProcesses = @() } }
@@ -306,6 +333,12 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test (@([regex]::Matches($moduleSource, 'Invoke-MO2OwnedSessionMutation -Owned [$]owned -Action')).Count -eq 4) 'launch, open, terminate-game, and terminate all serialize current lifecycle authority before process mutation'
     Assert-MO2Test ($moduleSource -match 'param\([$]CurrentOwned, [$]MutationAction\)' -and $moduleSource -match 'Invoke-WithMO2LeaseTransitionLock[^\r\n]+-Action [$]lockedMutation -ArgumentList @\([$]Owned, [$]Action\)') 'serialized lifecycle mutation passes its caller action explicitly without colliding with the lock wrapper Action parameter'
     Assert-MO2Test ($moduleSource -notmatch "Set-MO2OwnedSessionOwner -Owned[^`r`n]+exact MO2 process observed after open" -and $moduleSource -match 'Resolve-MO2OwnedProcessTarget[^\r\n]+-AdoptDetachedOwner') 'synchronous open preserves its dispatch-bound owner tuple unless the explicit detached-owner proof succeeds'
+    $launchSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Launch \{.*?\n\}').Value
+    $openSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Open \{.*?\n\}').Value
+    Assert-MO2Test ($launchSource -notmatch 'if \([$]ownerResolution[.]adopted\) \{\s*[$]owned = Get-MO2OwnedSession' -and
+        $openSource -notmatch 'if \([$]observedResolution[.]adopted\) \{\s*[$]owned = Get-MO2OwnedSession' -and
+        @([regex]::Matches($launchSource, 'Get-MO2SynchronousCompletionSupersession')).Count -eq 2 -and
+        @([regex]::Matches($openSource, 'Get-MO2SynchronousCompletionSupersession')).Count -eq 2) 'synchronous launch/open keep their initiating post-handoff generation and classify stale terminal writes without adopting newer authority'
     Assert-MO2Test ($moduleSource -match 'Write-MO2SessionManifestProjection -SessionData [$]updated' -and $moduleSource -notmatch '(?s)Write-MO2OwnedSessionAtomic[^}]+Write-MO2JsonAtomic -Path [$]manifestPath') 'ownership-lock and session-manifest lifecycle projection share one serialized generation boundary'
     $gamePersistenceSource = [regex]::Match($moduleSource, '(?s)function Set-MO2OwnedSessionGameProcesses \{.*?\n\}').Value
     Assert-MO2Test ($gamePersistenceSource -match 'Invoke-MO2OwnedSessionMutation' -and $gamePersistenceSource -match 'Resolve-MO2OwnedProcessTarget' -and $gamePersistenceSource.IndexOf('Resolve-MO2OwnedProcessTarget', [StringComparison]::Ordinal) -lt $gamePersistenceSource.IndexOf('gameProcesses -NotePropertyValue', [StringComparison]::Ordinal)) 'game-process persistence resolves one exact live MO2 owner inside the serialized transition before changing running state'

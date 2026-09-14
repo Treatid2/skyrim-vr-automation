@@ -3333,6 +3333,77 @@ function Test-MO2OpeningReady {
     return @($Windows | Where-Object { $_.visible -and [string]$_.automationId -ceq 'MainWindow' }).Count -eq 1
 }
 
+function Get-MO2SynchronousCompletionSupersession {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Owned,
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][ValidateSet('launch', 'open')][string]$Operation,
+        [Parameter(Mandatory)][string]$AttemptId
+    )
+
+    $current = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
+    $expectedGeneration = if ($Owned.data.PSObject.Properties['generation']) { [long]$Owned.data.generation } else { 0L }
+    $currentGeneration = if ($current.data.PSObject.Properties['generation']) { [long]$current.data.generation } else { 0L }
+    $superseded = $currentGeneration -ne $expectedGeneration
+    $currentAttemptId = if ($Operation -eq 'launch' -and $current.data.PSObject.Properties['launchAttemptId']) {
+        [string]$current.data.launchAttemptId
+    }
+    elseif ($current.data.PSObject.Properties['ownerTransition'] -and
+        [string]$current.data.ownerTransition.kind -ceq $Operation) {
+        [string]$current.data.ownerTransition.attemptId
+    }
+    else { $null }
+    $sameAttempt = -not [string]::IsNullOrWhiteSpace($currentAttemptId) -and $currentAttemptId -ceq $AttemptId
+    $equivalentSuccess = if ($Operation -eq 'launch') {
+        $sameAttempt -and [string]$current.data.status -ceq 'running' -and
+            $current.data.PSObject.Properties['gameProcessesLaunchAttemptId'] -and
+            [string]$current.data.gameProcessesLaunchAttemptId -ceq $AttemptId -and
+            $current.data.PSObject.Properties['gameProcesses'] -and @($current.data.gameProcesses).Count -gt 0
+    }
+    else { $sameAttempt -and [string]$current.data.status -ceq 'mo2-open' }
+    return [pscustomobject][ordered]@{
+        superseded = $superseded
+        equivalentSuccess = $equivalentSuccess
+        sameAttempt = $sameAttempt
+        operation = $Operation
+        attemptId = $AttemptId
+        currentAttemptId = $currentAttemptId
+        expectedGeneration = $expectedGeneration
+        currentGeneration = $currentGeneration
+        current = $current
+    }
+}
+
+function New-MO2SynchronousCompletionSupersededResult {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Supersession,
+        [Parameter(Mandatory)][string]$SessionId
+    )
+
+    $operation = [string]$Supersession.operation
+    $successState = if ($operation -eq 'launch') { 'game-running' } else { 'mo2-open' }
+    $supersededState = if ($operation -eq 'launch') { 'launch-superseded' } else { 'open-superseded' }
+    $data = @{
+        sessionId = $SessionId
+        completionSuperseded = $true
+        sameAttempt = [bool]$Supersession.sameAttempt
+        attemptId = [string]$Supersession.attemptId
+        currentAttemptId = [string]$Supersession.currentAttemptId
+        expectedGeneration = [long]$Supersession.expectedGeneration
+        currentGeneration = [long]$Supersession.currentGeneration
+        currentStatus = [string]$Supersession.current.data.status
+        lock = $Supersession.current
+    }
+    if ($Supersession.equivalentSuccess) {
+        return New-MO2ActionResult -Config $Config -Command $operation -Ok $true -State $successState -Data $data `
+            -Warnings @("The synchronous $operation completion was superseded after the same attempt had already reached '$successState'; the newer lifecycle was preserved.")
+    }
+    return New-MO2ActionResult -Config $Config -Command $operation -Ok $false -State $supersededState -Data $data `
+        -Errors @("The synchronous $operation completion lost its initiating session generation to a newer lifecycle; no stale completion was written.")
+}
+
 function Invoke-MO2Status {
     [CmdletBinding()]
     param(
@@ -3584,17 +3655,20 @@ function Invoke-MO2Launch {
 
     $gameObserved = @($status.processes.game | Where-Object { $_.name -ieq $primaryGameProcessName }).Count -gt 0
     $ownerResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @($status.processes.mo2) -AdoptDetachedOwner
-    if ($ownerResolution.adopted) {
-        $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
-        $lockData = $owned.data
-    }
+    if ($ownerResolution.adopted) { $lockData = $owned.data }
     $gameProcessAdoption = if ($gameObserved) { Get-MO2ObservedGameProcessAdoption -Config $Config -Owned $owned -Processes @($status.processes.game) } else { $null }
     $commitOwnerResolution = if ($gameObserved -and $null -ne $gameProcessAdoption -and $gameProcessAdoption.eligible) { Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames)) } else { $null }
     $gameOwned = $gameObserved -and $null -ne $gameProcessAdoption -and $gameProcessAdoption.eligible -and $null -ne $commitOwnerResolution -and $commitOwnerResolution.ok -and @($commitOwnerResolution.targets).Count -eq 1
     if ($gameOwned) {
-        $null = Set-MO2OwnedSessionGameProcesses -Config $Config -Owned $owned -Processes @($gameProcessAdoption.records) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc'
-        $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
-        $lockData = $owned.data
+        try {
+            $null = Set-MO2OwnedSessionGameProcesses -Config $Config -Owned $owned -Processes @($gameProcessAdoption.records) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc'
+            $lockData = $owned.data
+        }
+        catch {
+            $supersession = Get-MO2SynchronousCompletionSupersession -Config $Config -Owned $owned -SessionId $SessionId -Operation launch -AttemptId $launchAttemptId
+            if (-not $supersession.superseded) { throw }
+            return New-MO2SynchronousCompletionSupersededResult -Config $Config -Supersession $supersession -SessionId $SessionId
+        }
     }
     elseif ($null -ne $gameProcessAdoption -and $gameProcessAdoption.eligible) {
         $gameProcessAdoption.eligible = $false
@@ -3603,8 +3677,15 @@ function Invoke-MO2Launch {
     }
     if (-not $gameOwned) {
         $lockData.status = if ($blockingDialog.Count -gt 0) { 'launch-blocked-dialog' } else { 'launch-failed' }
-        $null = Write-MO2OwnedSessionAtomic -Owned $owned -Value $lockData
-        $lockData = $owned.data
+        try {
+            $null = Write-MO2OwnedSessionAtomic -Owned $owned -Value $lockData
+            $lockData = $owned.data
+        }
+        catch {
+            $supersession = Get-MO2SynchronousCompletionSupersession -Config $Config -Owned $owned -SessionId $SessionId -Operation launch -AttemptId $launchAttemptId
+            if (-not $supersession.superseded) { throw }
+            return New-MO2SynchronousCompletionSupersededResult -Config $Config -Supersession $supersession -SessionId $SessionId
+        }
     }
 
     if ($blockingDialog.Count -gt 0) {
@@ -3772,7 +3853,6 @@ function Invoke-MO2Open {
         $observedResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes $records -AdoptDetachedOwner
         if ($observedResolution.ok -and @($observedResolution.targets).Count -eq 1) {
             $observed = @($observedResolution.targets)[0]
-            if ($observedResolution.adopted) { $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId }
             break
         }
         if ($records.Count -gt 0 -and -not $observedResolution.ok) { break }
@@ -3794,10 +3874,20 @@ function Invoke-MO2Open {
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
     if (-not $visibleMainWindow) {
-        Set-MO2OwnedSessionStatus -Owned $owned -Status 'open-incomplete' -TimestampProperty 'openedUtc'
+        try { Set-MO2OwnedSessionStatus -Owned $owned -Status 'open-incomplete' -TimestampProperty 'openedUtc' }
+        catch {
+            $supersession = Get-MO2SynchronousCompletionSupersession -Config $Config -Owned $owned -SessionId $SessionId -Operation open -AttemptId $openAttemptId
+            if (-not $supersession.superseded) { throw }
+            return New-MO2SynchronousCompletionSupersededResult -Config $Config -Supersession $supersession -SessionId $SessionId
+        }
         return New-MO2ActionResult -Config $Config -Command 'open' -Ok $false -State 'open-incomplete' -Data @{ ownerPid = $process.Id; openStartedReceiptPath = $openStartedPath; process = $observed; windows = @(Get-MO2WindowSnapshot -Processes @($observed)); sessionPath = $owned.data.sessionPath } -Errors @('The exact MO2 process started, but its visible MainWindow was not ready within the bounded timeout. The durable start receipt and adopted owner PID remain available for cooperative recovery.')
     }
-    Set-MO2OwnedSessionStatus -Owned $owned -Status 'mo2-open' -TimestampProperty 'openedUtc'
+    try { Set-MO2OwnedSessionStatus -Owned $owned -Status 'mo2-open' -TimestampProperty 'openedUtc' }
+    catch {
+        $supersession = Get-MO2SynchronousCompletionSupersession -Config $Config -Owned $owned -SessionId $SessionId -Operation open -AttemptId $openAttemptId
+        if (-not $supersession.superseded) { throw }
+        return New-MO2SynchronousCompletionSupersededResult -Config $Config -Supersession $supersession -SessionId $SessionId
+    }
     return New-MO2ActionResult -Config $Config -Command 'open' -Ok $true -State 'mo2-open' -Data @{ sessionId = $SessionId; ownerPid = $process.Id; openStartedReceiptPath = $openStartedPath; process = $observed; mainWindow = $visibleMainWindow; sessionPath = $owned.data.sessionPath; gameOpened = $false }
 }
 
