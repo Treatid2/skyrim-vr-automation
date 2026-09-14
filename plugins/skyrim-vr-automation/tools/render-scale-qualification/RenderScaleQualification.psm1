@@ -3694,7 +3694,8 @@ function Test-CSXQualificationCompletionReceipt {
     param(
         [Parameter(Mandatory)][string]$EvidenceRoot,
         [Parameter(Mandatory)][string]$ExpectedRunId,
-        [string]$CompletionPath
+        [string]$CompletionPath,
+        [hashtable]$ArtifactPaths
     )
     $errors = [Collections.Generic.List[string]]::new()
     $root = [IO.Path]::GetFullPath($EvidenceRoot)
@@ -3745,7 +3746,13 @@ function Test-CSXQualificationCompletionReceipt {
             if ([string](Get-CSXPropertyValue $receipt $binding.pathField) -cne $binding.path) {
                 throw "Qualification completion receipt path '$($binding.pathField)' is not canonical."
             }
-            $boundPath = Resolve-CSXEvidencePath -EvidenceRoot $root -RelativePath $binding.path
+            $boundPath = if ($ArtifactPaths -and $ArtifactPaths.ContainsKey($binding.path)) {
+                [IO.Path]::GetFullPath([string]$ArtifactPaths[$binding.path])
+            }
+            else { Resolve-CSXEvidencePath -EvidenceRoot $root -RelativePath $binding.path }
+            if (-not $boundPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Qualification completion artifact '$($binding.path)' resolves outside the evidence root."
+            }
             $expectedHash = [string](Get-CSXPropertyValue $receipt $binding.hashField)
             if (-not (Test-CSXSha256Text $expectedHash) -or
                 -not (Test-Path -LiteralPath $boundPath -PathType Leaf) -or
@@ -4775,12 +4782,19 @@ function Invoke-CSXQualificationReportUpdate {
     param(
         [Parameter(Mandatory)][string]$EvidenceDirectory,
         [switch]$AllowUnsealedSuccess,
+        [string]$RunOutputPath,
+        [string]$SummaryOutputPath,
         [scriptblock]$CompletionValidator = {
             param($EvidenceRoot, $ExpectedRunId)
             Test-CSXQualificationCompletionReceipt -EvidenceRoot $EvidenceRoot -ExpectedRunId $ExpectedRunId
         }
     )
     $root = [IO.Path]::GetFullPath($EvidenceDirectory)
+    $rootPrefix = $root.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $runOutputFull = if ([string]::IsNullOrWhiteSpace($RunOutputPath)) { Join-Path $root 'run.json' } else { [IO.Path]::GetFullPath($RunOutputPath) }
+    if (-not $runOutputFull.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The qualification report output path is outside the evidence root.'
+    }
     $rawPath = Join-Path $root 'run.raw.json'
     $indexPath = Join-Path $root 'visual-index.json'
     if (-not (Test-Path -LiteralPath $rawPath -PathType Leaf) -or -not (Test-Path -LiteralPath $indexPath -PathType Leaf)) { throw 'run.raw.json and visual-index.json are required.' }
@@ -4948,7 +4962,7 @@ function Invoke-CSXQualificationReportUpdate {
         warnings = @($raw.warnings); errors = @(@($errors) + @($infrastructureErrors) | Select-Object -Unique); infrastructureErrors = @($infrastructureErrors | Select-Object -Unique)
         evidenceDirectory = $root
     }
-    $runPath = Write-CSXJsonFile -Path (Join-Path $root 'run.json') -Value $report
+    $runPath = Write-CSXJsonFile -Path $runOutputFull -Value $report
     Write-CSXJsonFile -Path (Join-Path $root 'failures.json') -Value ([pscustomobject][ordered]@{
         schema = 'csx-render-scale-qualification-failures-v1'
         runId = $raw.runId
@@ -5042,7 +5056,11 @@ function Invoke-CSXQualificationReportUpdate {
         $markdown += "`nThis is not a passing PR qualification. See run.json errors; protocol revision 5 has no manual review or pending state.`n"
     }
     $summaryName = if ($prMode) { 'pr-summary.md' } else { 'qualification-summary.md' }
-    $summaryPath = Write-CSXTextFile -Path (Join-Path $root $summaryName) -Value $markdown
+    $summaryOutputFull = if ([string]::IsNullOrWhiteSpace($SummaryOutputPath)) { Join-Path $root $summaryName } else { [IO.Path]::GetFullPath($SummaryOutputPath) }
+    if (-not $summaryOutputFull.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The qualification summary output path is outside the evidence root.'
+    }
+    $summaryPath = Write-CSXTextFile -Path $summaryOutputFull -Value $markdown
     return [pscustomobject][ordered]@{ report = $report; runPath = $runPath; summaryPath = $summaryPath }
 }
 
@@ -5189,57 +5207,83 @@ function Complete-CSXSealedQualification {
         [Parameter(Mandatory)][double]$EndToEndBudgetMs,
         [Parameter(Mandatory)][double]$FinalizationBudgetMs,
         [scriptblock]$Finalizer = {
-            param($EvidenceRoot)
-            Invoke-CSXQualificationReportUpdate -EvidenceDirectory $EvidenceRoot -AllowUnsealedSuccess
+            param($EvidenceRoot, $RunOutputPath, $SummaryOutputPath)
+            Invoke-CSXQualificationReportUpdate -EvidenceDirectory $EvidenceRoot -AllowUnsealedSuccess `
+                -RunOutputPath $RunOutputPath -SummaryOutputPath $SummaryOutputPath
         },
         [scriptblock]$CompletionCommitter = {
             param($StagedPath, $DestinationPath)
             Move-Item -LiteralPath $StagedPath -Destination $DestinationPath
         },
         [scriptblock]$CompletionValidator = {
-            param($EvidenceRoot, $ExpectedRunId, $ReceiptPath)
+            param($EvidenceRoot, $ExpectedRunId, $ReceiptPath, $ArtifactPaths)
             Test-CSXQualificationCompletionReceipt -EvidenceRoot $EvidenceRoot `
-                -ExpectedRunId $ExpectedRunId -CompletionPath $ReceiptPath
+                -ExpectedRunId $ExpectedRunId -CompletionPath $ReceiptPath -ArtifactPaths $ArtifactPaths
         }
     )
     $root = [IO.Path]::GetFullPath($EvidenceDirectory)
-    $completionFullPath = [IO.Path]::GetFullPath($CompletionPath)
     $rootPrefix = $root.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $completionFullPath = [IO.Path]::GetFullPath($CompletionPath)
     if (-not $completionFullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'The qualification completion path is outside the evidence root.'
     }
     if (Test-Path -LiteralPath $completionFullPath) {
         throw 'The qualification completion path already exists before terminal commit.'
     }
-    try {
-        $updated = & $Finalizer $EvidenceDirectory
-    }
-    catch {
-        throw
-    }
-
-    $CompletionReceipt.completedUtc = [DateTimeOffset]::UtcNow.ToString('o')
-    $CompletionReceipt.invocationElapsedMs = [Math]::Round($InvocationWatch.Elapsed.TotalMilliseconds, 3)
-    $CompletionReceipt.evidenceFinalizationElapsedMs = [Math]::Round($FinalizationWatch.Elapsed.TotalMilliseconds, 3)
-    $CompletionReceipt.within600Seconds = $CompletionReceipt.invocationElapsedMs -le $EndToEndBudgetMs -and
-        $CompletionReceipt.evidenceFinalizationElapsedMs -le $FinalizationBudgetMs -and
-        [DateTimeOffset]::UtcNow -le $ResultDeadlineUtc
-    if (-not $CompletionReceipt.within600Seconds -or
-        $InvocationWatch.Elapsed.TotalMilliseconds -gt $EndToEndBudgetMs -or
-        $FinalizationWatch.Elapsed.TotalMilliseconds -gt $FinalizationBudgetMs -or
-        [DateTimeOffset]::UtcNow -gt $ResultDeadlineUtc) {
-        throw 'The mandatory sealed-result validation crossed its complete invocation or evidence-finalization deadline.'
-    }
-    $CompletionReceipt.runSha256 = Get-CSXFileSha256 $updated.runPath
-    $CompletionReceipt.rawSha256 = Get-CSXFileSha256 (Join-Path $root ([string]$CompletionReceipt.rawPath))
-    $CompletionReceipt.visualReviewSha256 = Get-CSXFileSha256 (Join-Path $root ([string]$CompletionReceipt.visualReviewPath))
-
     $terminalId = [guid]::NewGuid().ToString('N')
+    $stagedRunPath = Join-Path $root ".run.pending-$terminalId.json"
+    $stagedSummaryPath = Join-Path $root ".summary.pending-$terminalId.md"
     $stagedCompletionPath = Join-Path $root ".qualification-completion.pending-$terminalId.json"
     $committedCompletionPath = Join-Path $root ".qualification-completion.committed-$terminalId.json"
+    $canonicalRunPath = Join-Path $root 'run.json'
+    $canonicalSummaryPath = $null
+    $runBackupPath = Join-Path $root ".run.previous-$terminalId.json"
+    $summaryBackupPath = Join-Path $root ".summary.previous-$terminalId.md"
+    $runBackedUp = $false
+    $summaryBackedUp = $false
+    $receiptPublished = $false
+    $runPublished = $false
+    $summaryPublished = $false
+    $publicationComplete = $false
     try {
+        $updated = & $Finalizer $EvidenceDirectory $stagedRunPath $stagedSummaryPath
+        if (-not (Test-Path -LiteralPath $updated.runPath -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $updated.summaryPath -PathType Leaf)) {
+            throw 'The qualification finalizer did not produce both staged terminal artifacts.'
+        }
+        if ([IO.Path]::GetFullPath([string]$updated.runPath) -cne $stagedRunPath) {
+            Copy-Item -LiteralPath $updated.runPath -Destination $stagedRunPath -Force
+        }
+        if ([IO.Path]::GetFullPath([string]$updated.summaryPath) -cne $stagedSummaryPath) {
+            Copy-Item -LiteralPath $updated.summaryPath -Destination $stagedSummaryPath -Force
+        }
+        $canonicalSummaryPath = Join-Path $root $(if ([bool](Get-CSXPropertyValue $updated.report 'prMode' $false)) { 'pr-summary.md' } else { 'qualification-summary.md' })
+        $updated.runPath = $stagedRunPath
+        $updated.summaryPath = $stagedSummaryPath
+
+        $CompletionReceipt.completedUtc = [DateTimeOffset]::UtcNow.ToString('o')
+        $CompletionReceipt.invocationElapsedMs = [Math]::Round($InvocationWatch.Elapsed.TotalMilliseconds, 3)
+        $CompletionReceipt.evidenceFinalizationElapsedMs = [Math]::Round($FinalizationWatch.Elapsed.TotalMilliseconds, 3)
+        $CompletionReceipt.within600Seconds = $CompletionReceipt.invocationElapsedMs -le $EndToEndBudgetMs -and
+            $CompletionReceipt.evidenceFinalizationElapsedMs -le $FinalizationBudgetMs -and
+            [DateTimeOffset]::UtcNow -le $ResultDeadlineUtc
+        if (-not $CompletionReceipt.within600Seconds -or
+            $InvocationWatch.Elapsed.TotalMilliseconds -gt $EndToEndBudgetMs -or
+            $FinalizationWatch.Elapsed.TotalMilliseconds -gt $FinalizationBudgetMs -or
+            [DateTimeOffset]::UtcNow -gt $ResultDeadlineUtc) {
+            throw 'The mandatory sealed-result validation crossed its complete invocation or evidence-finalization deadline.'
+        }
+        $CompletionReceipt.runSha256 = Get-CSXFileSha256 $stagedRunPath
+        $CompletionReceipt.rawSha256 = Get-CSXFileSha256 (Join-Path $root ([string]$CompletionReceipt.rawPath))
+        $CompletionReceipt.visualReviewSha256 = Get-CSXFileSha256 (Join-Path $root ([string]$CompletionReceipt.visualReviewPath))
+        $stagedArtifacts = @{
+            'run.json' = $stagedRunPath
+            'run.raw.json' = Join-Path $root ([string]$CompletionReceipt.rawPath)
+            'visual-review.json' = Join-Path $root ([string]$CompletionReceipt.visualReviewPath)
+        }
+
         Write-CSXJsonFile -Path $stagedCompletionPath -Value $CompletionReceipt | Out-Null
-        $stagedValidation = & $CompletionValidator $root ([string]$CompletionReceipt.runId) $stagedCompletionPath
+        $stagedValidation = & $CompletionValidator $root ([string]$CompletionReceipt.runId) $stagedCompletionPath $stagedArtifacts
         if (-not $stagedValidation.ok) {
             throw "The staged qualification completion receipt is invalid: $(@($stagedValidation.errors) -join ' | ')"
         }
@@ -5254,7 +5298,7 @@ function Complete-CSXSealedQualification {
             throw 'The mandatory sealed-result validation crossed its complete invocation or evidence-finalization deadline before terminal commit.'
         }
         Write-CSXJsonFile -Path $stagedCompletionPath -Value $CompletionReceipt | Out-Null
-        $stagedValidation = & $CompletionValidator $root ([string]$CompletionReceipt.runId) $stagedCompletionPath
+        $stagedValidation = & $CompletionValidator $root ([string]$CompletionReceipt.runId) $stagedCompletionPath $stagedArtifacts
         if (-not $stagedValidation.ok) {
             throw "The final staged qualification completion receipt is invalid: $(@($stagedValidation.errors) -join ' | ')"
         }
@@ -5265,7 +5309,7 @@ function Complete-CSXSealedQualification {
             throw 'The qualification completion receipt cannot be committed inside the reserved terminal-publication budget.'
         }
         & $CompletionCommitter $stagedCompletionPath $committedCompletionPath
-        $committedValidation = & $CompletionValidator $root ([string]$CompletionReceipt.runId) $committedCompletionPath
+        $committedValidation = & $CompletionValidator $root ([string]$CompletionReceipt.runId) $committedCompletionPath $stagedArtifacts
         if (-not $committedValidation.ok) {
             throw "The committed qualification completion receipt is invalid: $(@($committedValidation.errors) -join ' | ')"
         }
@@ -5279,14 +5323,66 @@ function Complete-CSXSealedQualification {
         if ([string]::IsNullOrWhiteSpace($completionSha256)) {
             $completionSha256 = Get-CSXFileSha256 $committedCompletionPath
         }
+
+        if (Test-Path -LiteralPath $canonicalRunPath -PathType Leaf) {
+            Move-Item -LiteralPath $canonicalRunPath -Destination $runBackupPath
+            $runBackedUp = $true
+        }
+        if (Test-Path -LiteralPath $canonicalSummaryPath -PathType Leaf) {
+            Move-Item -LiteralPath $canonicalSummaryPath -Destination $summaryBackupPath
+            $summaryBackedUp = $true
+        }
         Move-Item -LiteralPath $committedCompletionPath -Destination $completionFullPath
+        $receiptPublished = $true
+        Move-Item -LiteralPath $stagedRunPath -Destination $canonicalRunPath
+        $runPublished = $true
+        Move-Item -LiteralPath $stagedSummaryPath -Destination $canonicalSummaryPath
+        $summaryPublished = $true
+        $canonicalValidation = & $CompletionValidator $root ([string]$CompletionReceipt.runId) $completionFullPath @{
+            'run.json' = $canonicalRunPath
+            'run.raw.json' = Join-Path $root ([string]$CompletionReceipt.rawPath)
+            'visual-review.json' = Join-Path $root ([string]$CompletionReceipt.visualReviewPath)
+        }
+        if (-not $canonicalValidation.ok) {
+            throw "The publicly committed qualification result is invalid: $(@($canonicalValidation.errors) -join ' | ')"
+        }
+        if ($InvocationWatch.Elapsed.TotalMilliseconds -gt $EndToEndBudgetMs -or
+            $FinalizationWatch.Elapsed.TotalMilliseconds -gt $FinalizationBudgetMs -or
+            [DateTimeOffset]::UtcNow -gt $ResultDeadlineUtc) {
+            throw 'The public qualification result crossed its complete invocation or evidence-finalization deadline.'
+        }
+        $updated.runPath = $canonicalRunPath
+        $updated.summaryPath = $canonicalSummaryPath
+        $publicationComplete = $true
     }
     finally {
+        if (-not $publicationComplete) {
+            if ($summaryPublished -and (Test-Path -LiteralPath $canonicalSummaryPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $canonicalSummaryPath -Force
+            }
+            if ($runPublished -and (Test-Path -LiteralPath $canonicalRunPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $canonicalRunPath -Force
+            }
+            if ($receiptPublished -and (Test-Path -LiteralPath $completionFullPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $completionFullPath -Force
+            }
+            if ($runBackedUp -and (Test-Path -LiteralPath $runBackupPath -PathType Leaf)) {
+                Move-Item -LiteralPath $runBackupPath -Destination $canonicalRunPath
+            }
+            if ($summaryBackedUp -and (Test-Path -LiteralPath $summaryBackupPath -PathType Leaf)) {
+                Move-Item -LiteralPath $summaryBackupPath -Destination $canonicalSummaryPath
+            }
+        }
         if (Test-Path -LiteralPath $stagedCompletionPath -PathType Leaf) {
             Remove-Item -LiteralPath $stagedCompletionPath -Force
         }
         if (Test-Path -LiteralPath $committedCompletionPath -PathType Leaf) {
             Remove-Item -LiteralPath $committedCompletionPath -Force
+        }
+        foreach ($temporaryPath in @($stagedRunPath, $stagedSummaryPath, $runBackupPath, $summaryBackupPath)) {
+            if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+                Remove-Item -LiteralPath $temporaryPath -Force
+            }
         }
     }
     return [pscustomobject][ordered]@{

@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Stage qualification reports and summaries until their completion receipt is
+  validated and privately committed, then publish the sealed result with
+  rollback so a later failure cannot leave a new unsealed PASS projection.
 - Keep unsealed qualification projection internal to the atomic receipt
   committer, initialize every strict-mode terminal path, and return later
   revalidation/status disagreements in memory without rewriting sealed bytes.

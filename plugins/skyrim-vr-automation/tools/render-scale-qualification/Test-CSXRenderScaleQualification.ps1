@@ -1606,14 +1606,27 @@ try {
     $timelyReceiptPath = Join-Path $timelyRoot 'qualification-completion.json'
     $timelyInvocationWatch = [Diagnostics.Stopwatch]::StartNew()
     $timelyFinalizationWatch = [Diagnostics.Stopwatch]::StartNew()
+    $script:terminalCallbackOrder = [Collections.Generic.List[string]]::new()
     $timelyTerminal = Complete-CSXSealedQualification -EvidenceDirectory $timelyRoot -CompletionPath $timelyReceiptPath `
         -CompletionReceipt $timelyReceipt -InvocationWatch $timelyInvocationWatch -FinalizationWatch $timelyFinalizationWatch `
         -ResultDeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) -EndToEndBudgetMs 5000 -FinalizationBudgetMs 5000 `
-        -Finalizer { param($root) [pscustomobject]@{ report = [pscustomobject]@{ status = 'PASS' }; runPath = (Join-Path $root 'run.json'); summaryPath = (Join-Path $root 'summary.md') } }
+        -Finalizer {
+            param($root, $runOutputPath, $summaryOutputPath)
+            $script:terminalCallbackOrder.Add('finalizer')
+            Copy-Item -LiteralPath (Join-Path $root 'run.json') -Destination $runOutputPath
+            Copy-Item -LiteralPath (Join-Path $root 'summary.md') -Destination $summaryOutputPath
+            [pscustomobject]@{ report = [pscustomobject]@{ status = 'PASS' }; runPath = $runOutputPath; summaryPath = $summaryOutputPath }
+        } `
+        -CompletionCommitter {
+            param($staged, $destination)
+            $script:terminalCallbackOrder.Add('completion-committer')
+            Move-Item -LiteralPath $staged -Destination $destination
+        }
     Assert-Test ($timelyTerminal.completionReceipt.within600Seconds -and
         (Get-Content -LiteralPath $timelyReceiptPath -Raw | ConvertFrom-Json).within600Seconds -and
-        $timelyTerminal.completionSha256 -eq (Get-CSXFileSha256 $timelyReceiptPath)) `
-        'A timely mandatory terminal validation was not retained as complete with its pre-publication hash.'
+        $timelyTerminal.completionSha256 -eq (Get-CSXFileSha256 $timelyReceiptPath) -and
+        ($script:terminalCallbackOrder -join ',') -eq 'finalizer,completion-committer') `
+        'A timely mandatory terminal validation was not retained as complete, or its finalizer did not run before its completion committer.'
 
     $lateRoot = Join-Path $terminalBudgetRoot 'late'
     $lateReceipt = New-TerminalCommitFixture -Root $lateRoot -RunId 'late-run'
@@ -1633,6 +1646,8 @@ try {
     $failedCommitRoot = Join-Path $terminalBudgetRoot 'failed-commit'
     $failedCommitReceipt = New-TerminalCommitFixture -Root $failedCommitRoot -RunId 'failed-commit-run'
     $failedCommitPath = Join-Path $failedCommitRoot 'qualification-completion.json'
+    $failedCommitRunHash = Get-CSXFileSha256 (Join-Path $failedCommitRoot 'run.json')
+    $failedCommitSummaryHash = Get-CSXFileSha256 (Join-Path $failedCommitRoot 'summary.md')
     $failedCommitRejected = $false
     try {
         Complete-CSXSealedQualification -EvidenceDirectory $failedCommitRoot -CompletionPath $failedCommitPath `
@@ -1645,7 +1660,11 @@ try {
     catch { $failedCommitRejected = $_.Exception.Message -match 'simulated terminal publication failure' }
     $failedCommitValidation = Test-CSXQualificationCompletionReceipt -EvidenceRoot $failedCommitRoot -ExpectedRunId 'failed-commit-run'
     Assert-Test ($failedCommitRejected -and -not (Test-Path -LiteralPath $failedCommitPath) -and
-        -not $failedCommitValidation.ok) 'A failed terminal commit left an acceptance-valid completion receipt for an ordinary consumer.'
+        -not $failedCommitValidation.ok -and
+        $failedCommitRunHash -eq (Get-CSXFileSha256 (Join-Path $failedCommitRoot 'run.json')) -and
+        $failedCommitSummaryHash -eq (Get-CSXFileSha256 (Join-Path $failedCommitRoot 'summary.md')) -and
+        -not (Test-Path -LiteralPath (Join-Path $failedCommitRoot 'qualification-summary.md'))) `
+        'A failed terminal commit changed the prior projection or left an acceptance-valid completion receipt for an ordinary consumer.'
 
     $delayedCommitRoot = Join-Path $terminalBudgetRoot 'delayed-commit'
     $delayedCommitReceipt = New-TerminalCommitFixture -Root $delayedCommitRoot -RunId 'delayed-commit-run'
