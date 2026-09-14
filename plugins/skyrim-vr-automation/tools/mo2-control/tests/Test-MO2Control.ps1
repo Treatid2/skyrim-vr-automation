@@ -211,6 +211,112 @@ selected_profile=@ByteArray(Codex)
         -not $completionSupersession.openResult.ok -and $completionSupersession.openResult.state -eq 'open-superseded' -and
         $completionSupersession.finalStatus -eq 'mo2-closed' -and $completionSupersession.finalGeneration -eq 5L) 'a synchronous open overtaken by a newer lifecycle reports supersession and preserves the newer generation'
 
+    $publicLaunchInterleaving = & $mo2Module {
+        param($cfg, $ownerPath, $gamePath)
+        $functionNames = @('Get-MO2OwnedSession','Invoke-MO2Validate','Get-MO2ProcessRecords','Get-MO2DispatchBoundChildEvidence','Write-MO2JsonAtomic','Invoke-MO2OwnedSessionMutation','Get-MO2InspectionData','Get-MO2WindowSnapshot','Resolve-MO2OwnedProcessTarget','Get-MO2ObservedGameProcessAdoption')
+        $originals = @{}
+        foreach ($name in $functionNames) { $originals[$name] = (Get-Command $name -CommandType Function).ScriptBlock }
+        $ownerStart = [DateTimeOffset]::UtcNow.AddSeconds(-2).ToString('o')
+        $gameStart = [DateTimeOffset]::UtcNow.ToString('o')
+        $ownerRecord = [pscustomobject]@{ id=501; name='MO2ControlFixtureProcess'; path=$ownerPath; startTime=$ownerStart }
+        $gameRecord = [pscustomobject]@{ id=502; name='MO2ControlImpossibleFixtureGame'; path=$gamePath; startTime=$gameStart }
+        $script:PublicLaunchGetCalls = 0
+        $script:PublicLaunchMutationCalls = 0
+        $script:PublicLaunchInitial = [pscustomobject]@{ path='fixture-lock'; sessionId='public-launch'; accessId='access'; data=[pscustomobject]@{ generation=0L; status='prepared'; profile='Codex'; executable='Launch MGO - Do Not Unlock'; sessionPath='fixture-session'; requirements=[pscustomobject]@{ skseLoader=$false }; gameProcesses=@([pscustomobject]@{ id=400 }) } }
+        $script:PublicLaunchCurrent = $null
+        try {
+            Set-Item Function:script:Get-MO2OwnedSession { $script:PublicLaunchGetCalls++; if ($script:PublicLaunchGetCalls -eq 1) { $script:PublicLaunchInitial } else { $script:PublicLaunchCurrent } }
+            Set-Item Function:script:Invoke-MO2Validate { [pscustomobject]@{ ok=$true; warnings=@(); errors=@(); data=[pscustomobject]@{ config=[pscustomobject]@{ mo2Executable=$ownerPath }; processes=[pscustomobject]@{ mo2=@(); game=@() } } } }
+            Set-Item Function:script:Get-MO2ProcessRecords { @($ownerRecord) }
+            Set-Item Function:script:Get-MO2DispatchBoundChildEvidence { @() }
+            Set-Item Function:script:Write-MO2JsonAtomic { }
+            Set-Item Function:script:Invoke-MO2OwnedSessionMutation {
+                param($Owned, $Action)
+                $script:PublicLaunchMutationCalls++
+                if ($script:PublicLaunchMutationCalls -eq 1) {
+                    $outcome = & $Action $Owned.data
+                    $outcome.sessionData | Add-Member -NotePropertyName generation -NotePropertyValue 1L -Force
+                    $Owned.data = $outcome.sessionData
+                    return $outcome.result
+                }
+                $newer = $Owned.data | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+                $newer.generation = 2L
+                $newer.status = 'running'
+                $newer | Add-Member -NotePropertyName gameProcesses -NotePropertyValue @($gameRecord) -Force
+                $newer | Add-Member -NotePropertyName gameProcessesLaunchAttemptId -NotePropertyValue ([string]$newer.launchAttemptId) -Force
+                $script:PublicLaunchCurrent = [pscustomobject]@{ path=$Owned.path; sessionId=$Owned.sessionId; accessId=$Owned.accessId; data=$newer }
+                throw "Session '$($Owned.sessionId)' lease transition is stale: expected generation 1, current generation 2."
+            }
+            Set-Item Function:script:Get-MO2InspectionData { [pscustomobject]@{ processes=[pscustomobject]@{ mo2=@($ownerRecord); game=@($gameRecord) } } }
+            Set-Item Function:script:Get-MO2WindowSnapshot { @() }
+            Set-Item Function:script:Resolve-MO2OwnedProcessTarget { [pscustomobject]@{ ok=$true; adopted=$false; ownerPid=501; targets=@($ownerRecord); reason='recorded-owner' } }
+            Set-Item Function:script:Get-MO2ObservedGameProcessAdoption { [pscustomobject]@{ eligible=$true; records=@($gameRecord); reasons=@() } }
+            Set-Item Function:script:Start-Process { [pscustomobject]@{ Id=501; ProcessName='MO2ControlFixtureProcess'; StartTime=[DateTime]::UtcNow.AddSeconds(-2); HasExited=$false; ExitCode=$null } }
+            Set-Item Function:script:Start-Sleep { }
+            $result = Invoke-MO2Launch -Config $cfg -SessionId 'public-launch' -TimeoutSeconds 1
+            [pscustomobject]@{ result=$result; mutationCalls=$script:PublicLaunchMutationCalls; status=[string]$script:PublicLaunchCurrent.data.status; generation=[long]$script:PublicLaunchCurrent.data.generation }
+        }
+        finally {
+            foreach ($name in $functionNames) { Set-Item "Function:script:$name" -Value $originals[$name] }
+            Remove-Item Function:script:Start-Process, Function:script:Start-Sleep -ErrorAction SilentlyContinue
+            Remove-Variable -Scope Script -Name PublicLaunchGetCalls,PublicLaunchMutationCalls,PublicLaunchInitial,PublicLaunchCurrent -ErrorAction SilentlyContinue
+        }
+    } $config $mo2Exe $fixtureGame
+    Assert-MO2Test ($publicLaunchInterleaving.result.ok -and $publicLaunchInterleaving.result.state -eq 'game-running' -and
+        $publicLaunchInterleaving.result.data.completionSuperseded -and $publicLaunchInterleaving.mutationCalls -eq 2 -and
+        $publicLaunchInterleaving.status -eq 'running' -and $publicLaunchInterleaving.generation -eq 2L) 'public synchronous launch preserves a concurrent same-attempt status adoption instead of writing launch-failed'
+
+    $publicOpenInterleaving = & $mo2Module {
+        param($cfg, $ownerPath)
+        $functionNames = @('Get-MO2OwnedSession','Test-MO2InteractiveDesktop','Invoke-MO2Validate','Get-MO2ProcessRecords','Get-MO2DispatchBoundChildEvidence','Write-MO2JsonAtomic','Invoke-MO2OwnedSessionMutation','Resolve-MO2OwnedProcessTarget','Get-MO2WindowSnapshot','Write-MO2OwnedSessionAtomic')
+        $originals = @{}
+        foreach ($name in $functionNames) { $originals[$name] = (Get-Command $name -CommandType Function).ScriptBlock }
+        $ownerStart = [DateTimeOffset]::UtcNow.AddSeconds(-2).ToString('o')
+        $ownerRecord = [pscustomobject]@{ id=601; name='MO2ControlFixtureProcess'; path=$ownerPath; startTime=$ownerStart }
+        $script:PublicOpenGetCalls = 0
+        $script:PublicOpenMutationCalls = 0
+        $script:PublicOpenInitial = [pscustomobject]@{ path='fixture-lock'; sessionId='public-open'; accessId='access'; data=[pscustomobject]@{ generation=0L; status='prepared'; profile='Codex'; executable='Launch MGO - Do Not Unlock'; sessionPath='fixture-session' } }
+        $script:PublicOpenCurrent = $null
+        try {
+            Set-Item Function:script:Get-MO2OwnedSession { $script:PublicOpenGetCalls++; if ($script:PublicOpenGetCalls -eq 1) { $script:PublicOpenInitial } else { $script:PublicOpenCurrent } }
+            Set-Item Function:script:Test-MO2InteractiveDesktop { $true }
+            Set-Item Function:script:Invoke-MO2Validate { [pscustomobject]@{ ok=$true; warnings=@(); errors=@(); data=[pscustomobject]@{ config=[pscustomobject]@{ mo2Executable=$ownerPath } } } }
+            Set-Item Function:script:Get-MO2ProcessRecords { @($ownerRecord) }
+            Set-Item Function:script:Get-MO2DispatchBoundChildEvidence { @() }
+            Set-Item Function:script:Write-MO2JsonAtomic { }
+            Set-Item Function:script:Invoke-MO2OwnedSessionMutation {
+                param($Owned, $Action)
+                $script:PublicOpenMutationCalls++
+                $outcome = & $Action $Owned.data
+                $outcome.sessionData | Add-Member -NotePropertyName generation -NotePropertyValue 1L -Force
+                $Owned.data = $outcome.sessionData
+                return $outcome.result
+            }
+            Set-Item Function:script:Resolve-MO2OwnedProcessTarget { [pscustomobject]@{ ok=$true; adopted=$false; ownerPid=601; targets=@($ownerRecord); reason='recorded-owner' } }
+            Set-Item Function:script:Get-MO2WindowSnapshot { @([pscustomobject]@{ visible=$true; automationAvailable=$true; automationId='MainWindow' }) }
+            Set-Item Function:script:Write-MO2OwnedSessionAtomic {
+                param($Owned, $Value)
+                $newer = $Value | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+                $newer.generation = 2L
+                $newer.status = 'mo2-closed'
+                $script:PublicOpenCurrent = [pscustomobject]@{ path=$Owned.path; sessionId=$Owned.sessionId; accessId=$Owned.accessId; data=$newer }
+                throw "Session '$($Owned.sessionId)' lease transition is stale: expected generation 1, current generation 2."
+            }
+            Set-Item Function:script:Start-Process { [pscustomobject]@{ Id=601; ProcessName='MO2ControlFixtureProcess'; StartTime=[DateTime]::UtcNow.AddSeconds(-2); HasExited=$false; ExitCode=$null } }
+            Set-Item Function:script:Start-Sleep { }
+            $result = Invoke-MO2Open -Config $cfg -SessionId 'public-open' -TimeoutSeconds 1
+            [pscustomobject]@{ result=$result; mutationCalls=$script:PublicOpenMutationCalls; status=[string]$script:PublicOpenCurrent.data.status; generation=[long]$script:PublicOpenCurrent.data.generation }
+        }
+        finally {
+            foreach ($name in $functionNames) { Set-Item "Function:script:$name" -Value $originals[$name] }
+            Remove-Item Function:script:Start-Process, Function:script:Start-Sleep -ErrorAction SilentlyContinue
+            Remove-Variable -Scope Script -Name PublicOpenGetCalls,PublicOpenMutationCalls,PublicOpenInitial,PublicOpenCurrent -ErrorAction SilentlyContinue
+        }
+    } $config $mo2Exe
+    Assert-MO2Test (-not $publicOpenInterleaving.result.ok -and $publicOpenInterleaving.result.state -eq 'open-superseded' -and
+        $publicOpenInterleaving.result.data.completionSuperseded -and $publicOpenInterleaving.mutationCalls -eq 1 -and
+        $publicOpenInterleaving.status -eq 'mo2-closed' -and $publicOpenInterleaving.generation -eq 2L) 'public synchronous open preserves a concurrent newer closed lifecycle instead of rewriting mo2-open'
+
     $launchUtc = [DateTimeOffset]::UtcNow.AddSeconds(-1)
     $ownerStartUtc = [DateTimeOffset]::UtcNow.AddSeconds(-2)
     $launchingOwned = [pscustomobject]@{ data = [pscustomobject]@{ status = 'launching'; executable = 'Launch MGO - Do Not Unlock'; launchedUtc = $launchUtc.ToString('o'); launchDispatchedUtc = $launchUtc.ToString('o'); launchAttemptId = 'launch-1'; preLaunchGameProcesses = @(); ownerPid = 101; ownerProcessPath = $mo2Exe; ownerProcessStartTime = $ownerStartUtc.ToString('o'); gameProcesses = @() } }
