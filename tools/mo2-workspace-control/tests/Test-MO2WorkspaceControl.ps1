@@ -550,6 +550,11 @@ try {
     $recoveryList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
     $partialJournalResult = Get-Content -LiteralPath $partialJournal -Raw | ConvertFrom-Json
     if (-not $recoveryList.ok -or (Test-Path -LiteralPath $partialProfile) -or (Test-Path -LiteralPath $partialManifest) -or $partialJournalResult.phase -ne 'rolled-back') { throw 'Startup recovery did not remove and terminally record an interrupted workspace creation.' }
+    $unrelatedPayload = Join-Path $workspaceControlRoot 'unrelated-output-evidence\preserved-cache'
+    New-Item -ItemType Directory -Path $unrelatedPayload -Force | Out-Null
+    foreach ($index in 1..101) { [IO.File]::WriteAllBytes((Join-Path $unrelatedPayload ("payload-$index.bin")), [byte[]]$index) }
+    $boundedList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -MaxProfileFiles 100 -Compact | ConvertFrom-Json
+    if (-not $boundedList.ok -or $boundedList.data.count -ne 1 -or $boundedList.data.workspaces[0].workspaceId -ne $created.data.workspaceId) { throw 'Exact list-task was gated by unrelated workspace payload volume.' }
     $selectionJournalPath = [string]$created.data.selectedProfileTransaction.journalPath
     $selectionReceiptPath = [string]$created.data.selectedProfileTransaction.receiptPath
     $interruptedSelection = Get-Content -LiteralPath $selectionJournalPath -Raw | ConvertFrom-Json
