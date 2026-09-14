@@ -4667,6 +4667,10 @@ function Invoke-MO2Terminate {
         return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $false -State 'blocked' -Data @{ processes = $inspection.processes; ownerPid = $ownerPid } -Errors @('Forced termination requires exactly one configured MO2 process matching the session owner PID.')
     }
     if ($targets.Count -gt 0) {
+        $ownerIdentity = Test-MO2OwnedProcessIdentity -Owned $owned -ProcessRecord $targets[0]
+        if (-not $ownerIdentity.ok) {
+            return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $false -State 'blocked' -Data @{ processes = $inspection.processes; ownerPid = $ownerPid; ownerIdentity = $ownerIdentity } -Errors @('Forced termination requires the exact recorded MO2 executable path and process start time.')
+        }
         Assert-MO2ExactProcessTargets -Config $Config -Processes $targets
     }
     if ($WhatIf) {

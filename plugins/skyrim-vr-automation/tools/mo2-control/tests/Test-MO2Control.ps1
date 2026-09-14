@@ -550,6 +550,28 @@ selected_profile=@ByteArray(Codex)
     $terminateGameWithoutRecordedIdentity = Invoke-MO2TerminateGame -Config $config -SessionId $sessionId -WhatIf
     Assert-MO2Test (-not $terminateGameWithoutRecordedIdentity.ok -and $terminateGameWithoutRecordedIdentity.state -eq 'blocked') 'terminate-game refuses process-name recovery without launch-recorded identities and a retained MO2 owner'
 
+    $ownerFixtureProcess = $null
+    $preTerminateIdentityLock = Get-Content -LiteralPath $config.session.lockFile -Raw
+    try {
+        $ownerFixtureProcess = Start-Process -FilePath $mo2Exe -ArgumentList '/c', 'ping -n 30 127.0.0.1 > nul' -PassThru -WindowStyle Hidden
+        Start-Sleep -Milliseconds 100
+        $ownerFixtureProcess.Refresh()
+        $reusedPidLock = $preTerminateIdentityLock | ConvertFrom-Json
+        $reusedPidLock | Add-Member -NotePropertyName ownerPid -NotePropertyValue ([int]$ownerFixtureProcess.Id) -Force
+        $reusedPidLock | Add-Member -NotePropertyName processPath -NotePropertyValue $mo2Exe -Force
+        $reusedPidLock | Add-Member -NotePropertyName processStartTime -NotePropertyValue ([DateTimeOffset]$ownerFixtureProcess.StartTime.AddMinutes(-1)).ToString('o') -Force
+        $reusedPidLock | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+        $reusedPidTerminate = Invoke-MO2Terminate -Config $config -SessionId $sessionId -WhatIf
+        Assert-MO2Test (-not $reusedPidTerminate.ok -and $reusedPidTerminate.state -eq 'blocked' -and $reusedPidTerminate.data.ownerIdentity.reason -eq 'recorded-owner-start-time-mismatch') 'terminate refuses a configured MO2 process whose reused PID does not match the recorded start time'
+    }
+    finally {
+        $preTerminateIdentityLock | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+        if ($ownerFixtureProcess -and -not $ownerFixtureProcess.HasExited) {
+            Stop-Process -Id $ownerFixtureProcess.Id -Force -ErrorAction SilentlyContinue
+            $ownerFixtureProcess.WaitForExit(5000) | Out-Null
+        }
+    }
+
     $terminateDryRun = Invoke-MO2Terminate -Config $config -SessionId $sessionId -WhatIf
     Assert-MO2Test ($terminateDryRun.ok -and $terminateDryRun.state -eq 'dry-run') 'terminate dry-run succeeds only after game/rootbuilder absence'
     Assert-MO2Test (@($terminateDryRun.errors).Count -eq 0 -and @($terminateDryRun.warnings).Count -eq 0) 'action results omit null warning and error entries'
