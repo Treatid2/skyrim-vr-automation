@@ -235,6 +235,16 @@ selected_profile=@ByteArray(Codex)
     $reusedOwnerAdoption = & $mo2Module { param($cfg, $owned, $process, $processes) $factory = { @($process) }.GetNewClosure(); Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -Processes $processes -OwnerProcessInventoryFactory $factory } $config $launchingOwned $reusedOwnerRecord @($observedGame)
     Assert-MO2Test (-not $reusedOwnerResolution.ok -and $reusedOwnerResolution.reason -eq 'recorded-owner-start-time-mismatch') 'recorded MO2 ownership rejects a reused PID with a different process start time'
     Assert-MO2Test (-not $reusedOwnerAdoption.eligible -and $reusedOwnerAdoption.reasons -contains 'mo2-owner-not-exact') 'StartOnly status cannot adopt game identities under a stale or replaced MO2 owner snapshot'
+    $unlockCalls = [Collections.Generic.List[int]]::new()
+    $activeBuildDataInspection = [pscustomobject]@{ processes = [pscustomobject]@{ mo2 = @($reusedOwnerRecord); game = @() }; rootBuilder = [pscustomobject]@{ active = @([pscustomobject]@{ path = (Join-Path $fixture 'BuildData.json') }) } }
+    $replacementInspectionFactory = { $activeBuildDataInspection }.GetNewClosure()
+    $unlockCallback = { param($process) $unlockCalls.Add([int]$process.id); return $true }.GetNewClosure()
+    $replacementUnlock = & $mo2Module { param($cfg, $owned, $factory, $action) Invoke-MO2UnlockOnly -Config $cfg -Owned $owned -TimeoutSeconds 1 -PollMilliseconds 0 -InspectionFactory $factory -UnlockAction $action } $config $launchingOwned $replacementInspectionFactory $unlockCallback
+    Assert-MO2Test (-not $replacementUnlock.restored -and -not $replacementUnlock.ownerIdentityVerified -and $replacementUnlock.blockedReason -eq 'recorded-owner-start-time-mismatch' -and $unlockCalls.Count -eq 0) 'RootBuilder Unlock refuses a reused MO2 owner identity before invoking any UI action'
+    $exactUnlockState = [pscustomobject]@{ calls = 0 }
+    $exactUnlockFactory = { $exactUnlockState.calls++; [pscustomobject]@{ processes = [pscustomobject]@{ mo2 = @($launchOwner.targets[0]); game = @() }; rootBuilder = [pscustomobject]@{ active = $(if ($exactUnlockState.calls -eq 1) { @([pscustomobject]@{ path = (Join-Path $fixture 'BuildData.json') }) } else { @() }) } } }.GetNewClosure()
+    $exactUnlock = & $mo2Module { param($cfg, $owned, $factory, $action) Invoke-MO2UnlockOnly -Config $cfg -Owned $owned -TimeoutSeconds 1 -PollMilliseconds 0 -InspectionFactory $factory -UnlockAction $action } $config $launchingOwned $exactUnlockFactory $unlockCallback
+    Assert-MO2Test ($exactUnlock.restored -and $exactUnlock.ownerIdentityVerified -and $unlockCalls.Count -eq 1) 'RootBuilder Unlock acts only on the exact current owner and revalidates it for final success'
     $preLaunchOwned = $launchingOwned | ConvertTo-Json -Depth 20 | ConvertFrom-Json
     $preLaunchOwned.data.ownerProcessStartTime = $ownerStartUtc.ToString('o')
     $preLaunchOwned.data.preLaunchGameProcesses = @($observedGame)
