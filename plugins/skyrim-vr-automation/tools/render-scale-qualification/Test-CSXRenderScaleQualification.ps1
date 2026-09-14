@@ -1,7 +1,19 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+[CmdletBinding()]
+param(
+    [switch]$QuietProgress
+)
+
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+$testStopwatch = [Diagnostics.Stopwatch]::StartNew()
+function Write-TestProgress([string]$Phase) {
+    if (-not $QuietProgress) {
+        [Console]::Error.WriteLine(('[render-scale-qualification {0,8:N1}s] {1}' -f $testStopwatch.Elapsed.TotalSeconds, $Phase))
+    }
+}
 
 $module = Join-Path $PSScriptRoot 'RenderScaleQualification.psm1'
 $providerModule = Join-Path $PSScriptRoot 'AutomatedVisualReviewProvider.psm1'
@@ -30,8 +42,11 @@ function Assert-FinalizerRejects {
         [Parameter(Mandatory)][scriptblock]$Mutation,
         [Parameter(Mandatory)][string]$ErrorPattern,
         [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('finalizer', 'envelope', 'core', 'automated')][string]$Validation = 'finalizer',
+        $Protocol,
         [switch]$RebindInventory
     )
+    Write-TestProgress "starting finalizer rejection '$Message'"
     $changedRaw = $Raw | ConvertTo-Json -Depth 100 | ConvertFrom-Json -Depth 100
     & $Mutation $changedRaw
     if ($RebindInventory) { Set-TestArtifactInventory -Root $Root -Raw $changedRaw | Out-Null }
@@ -40,10 +55,40 @@ function Assert-FinalizerRejects {
     $changedReview.runRawSha256 = Get-CSXFileSha256 (Join-Path $Root 'run.raw.json')
     $changedReview.baselineRunSha256 = Get-CSXPathValue $changedRaw 'baseline.runSha256'
     Write-CSXJsonFile -Path (Join-Path $Root 'visual-review.json') -Value $changedReview | Out-Null
-    $result = Update-CSXQualificationReport -EvidenceDirectory $Root
-    $errorText = $result.report.errors -join ' | '
-    Assert-Test ($result.report.status -notin @('PASS', 'LOCAL_PASS') -and $errorText -match $ErrorPattern) `
-        "$Message Status=$($result.report.status); errors=$errorText"
+    $validationResult = switch ($Validation) {
+        'finalizer' {
+            $result = Update-CSXQualificationReport -EvidenceDirectory $Root -AllowUnsealedSuccess
+            [pscustomobject]@{ ok = $result.report.status -in @('PASS', 'LOCAL_PASS'); errors = @($result.report.errors) }
+        }
+        'envelope' {
+            & (Get-Module RenderScaleQualification) {
+                param($EvidenceRoot, $RunRaw)
+                Test-CSXFinalizerEnvelope -EvidenceRoot $EvidenceRoot -Raw $RunRaw -SkipBaselineComparison
+            } $Root $changedRaw
+        }
+        'core' {
+            $coreErrors = @(& (Get-Module RenderScaleQualification) {
+                param($RunRaw, $QualificationProtocol)
+                Test-CSXCoreQualificationEvidence -Raw $RunRaw -Protocol $QualificationProtocol
+            } $changedRaw $Protocol)
+            [pscustomobject]@{ ok = $coreErrors.Count -eq 0; errors = $coreErrors }
+        }
+        'automated' {
+            $candidateIndex = Get-Content -LiteralPath (Join-Path $Root 'visual-index.json') -Raw | ConvertFrom-Json -Depth 100
+            $baselineIndex = Get-Content -LiteralPath (Join-Path $Root $changedRaw.baseline.visualIndexPath) -Raw | ConvertFrom-Json -Depth 100
+            Test-CSXAutomatedVisualReviewEvidence -EvidenceDirectory $Root -RunRaw $changedRaw `
+                -VisualIndex $candidateIndex -BaselineVisualIndex $baselineIndex
+        }
+    }
+    $errorText = @($validationResult.errors) -join ' | '
+    Assert-Test (-not $validationResult.ok -and $errorText -match $ErrorPattern) `
+        "$Message Validator=$Validation; errors=$errorText"
+    $changedRaw = $null
+    $changedReview = $null
+    $result = $null
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    Write-TestProgress "completed finalizer rejection '$Message'"
 }
 
 function New-TestDiagnosticsDelta {
@@ -1167,7 +1212,9 @@ function New-TestEvidenceEnvelope {
         $Baseline = $null
     )
     New-Item -ItemType Directory -Path $Root -Force | Out-Null
+    Write-TestProgress "creating core assay objects for '$RunId'"
     $assays = New-TestCoreAssays -Protocol $ProtocolRecord.protocol -RunId $RunId -BuildId $BuildId -VisualIndexSha256 ('0' * 64)
+    Write-TestProgress "writing visual fixture for '$RunId'"
     $visual = Write-TestVisualEvidence -Root $Root -Protocol $ProtocolRecord.protocol -RunId $RunId -Assays $assays
     $raw = [pscustomobject][ordered]@{
         schema = $(if ($null -eq $Baseline) { 'csx-render-scale-local-v1-raw' } else { 'csx-render-scale-pr-v1-raw' })
@@ -1191,18 +1238,24 @@ function New-TestEvidenceEnvelope {
         automatedGates = [pscustomobject][ordered]@{ passed = $true; failures = @(); infrastructureErrors = @() }
         warnings = @()
     }
+    Write-TestProgress "writing producer evidence for '$RunId'"
     Write-TestProducerEvidence -Root $Root -Raw $raw -Protocol $ProtocolRecord.protocol -ProtocolSource $ProtocolSource -FixtureSource $FixtureSource
     $baselineIndex = if ($null -ne $Baseline) {
         Get-Content -LiteralPath (Join-Path $Root $Baseline.visualIndexPath) -Raw | ConvertFrom-Json -Depth 100
     }
     else { $null }
+    Write-TestProgress "writing automated visual-review evidence for '$RunId'"
     Write-TestAutomatedVisualReviewEvidence -Root $Root -Raw $raw -Protocol $ProtocolRecord.protocol `
         -VisualIndex $visual.index -BaselineVisualIndex $baselineIndex
+    Write-TestProgress "inventorying evidence for '$RunId'"
     Set-TestArtifactInventory -Root $Root -Raw $raw | Out-Null
     Write-CSXJsonFile -Path (Join-Path $Root 'run.raw.json') -Value $raw | Out-Null
+    Write-TestProgress "validating visual review for '$RunId'"
     $review = New-CSXAutomatedVisualReview -EvidenceDirectory $Root -RunRaw $raw -VisualIndex $visual.index -BaselineVisualIndex $baselineIndex
     Write-CSXJsonFile -Path (Join-Path $Root 'visual-review.json') -Value $review | Out-Null
+    Write-TestProgress "finalizing qualification report for '$RunId'"
     $final = Update-CSXQualificationReport -EvidenceDirectory $Root -AllowUnsealedSuccess
+    Write-TestProgress "finalized qualification report for '$RunId'"
     $completion = [pscustomobject][ordered]@{
         schema = 'csx-render-scale-qualification-completion-v1'; runId = $RunId
         invocationStartedUtc = $raw.time.invocationStartedUtc; completedUtc = $raw.time.completedUtc
@@ -1225,9 +1278,12 @@ function Assert-EvidenceTamperRejected {
         [Parameter(Mandatory)][string]$CaseRoot,
         [Parameter(Mandatory)][scriptblock]$Mutation,
         [ValidateSet('none', 'existing', 'regenerate')][string]$InventoryMode = 'none',
+        [ValidateSet('finalizer', 'inventory', 'producer', 'visual')][string]$Validation = 'finalizer',
+        $Protocol,
         [Parameter(Mandatory)][string]$ErrorPattern,
         [Parameter(Mandatory)][string]$Message
     )
+    Write-TestProgress "starting finalizer tamper case '$([IO.Path]::GetFileName($CaseRoot))'"
     Copy-Item -LiteralPath $SourceRoot -Destination $CaseRoot -Recurse
     try {
         $raw = Get-Content -LiteralPath (Join-Path $CaseRoot 'run.raw.json') -Raw | ConvertFrom-Json -Depth 100
@@ -1239,13 +1295,40 @@ function Assert-EvidenceTamperRejected {
         $review.runRawSha256 = Get-CSXFileSha256 (Join-Path $CaseRoot 'run.raw.json')
         $review.baselineRunSha256 = $(if ([bool]$raw.prMode) { [string]$raw.baseline.runSha256 } else { $null })
         Write-CSXJsonFile -Path (Join-Path $CaseRoot 'visual-review.json') -Value $review | Out-Null
-        $result = Update-CSXQualificationReport -EvidenceDirectory $CaseRoot
-        $errorText = $result.report.errors -join ' | '
-        Assert-Test ($result.report.status -notin @('PASS', 'LOCAL_PASS') -and
-            $errorText -match $ErrorPattern) "$Message Status=$($result.report.status); errors=$errorText"
+        $validationResult = switch ($Validation) {
+            'finalizer' {
+                $result = Update-CSXQualificationReport -EvidenceDirectory $CaseRoot -AllowUnsealedSuccess
+                [pscustomobject]@{ ok = $result.report.status -in @('PASS', 'LOCAL_PASS'); errors = @($result.report.errors) }
+            }
+            'inventory' {
+                & (Get-Module RenderScaleQualification) {
+                    param($EvidenceRoot, $RunRaw)
+                    Test-CSXAutomationArtifactInventory -EvidenceRoot $EvidenceRoot -Raw $RunRaw
+                } $CaseRoot $raw
+            }
+            'producer' {
+                & (Get-Module RenderScaleQualification) {
+                    param($EvidenceRoot, $RunRaw, $QualificationProtocol)
+                    Test-CSXProducerArtifactEvidence -EvidenceRoot $EvidenceRoot -Raw $RunRaw -Protocol $QualificationProtocol
+                } $CaseRoot $raw $Protocol
+            }
+            'visual' {
+                $visualIndex = Get-Content -LiteralPath (Join-Path $CaseRoot 'visual-index.json') -Raw | ConvertFrom-Json -Depth 100
+                & (Get-Module RenderScaleQualification) {
+                    param($EvidenceRoot, $RunRaw, $Index)
+                    Test-CSXVisualArtifactEvidence -EvidenceRoot $EvidenceRoot -Raw $RunRaw -VisualIndex $Index
+                } $CaseRoot $raw $visualIndex
+            }
+        }
+        $errorText = @($validationResult.errors) -join ' | '
+        Assert-Test (-not $validationResult.ok -and $errorText -match $ErrorPattern) `
+            "$Message Validator=$Validation; errors=$errorText"
     }
     finally {
         if (Test-Path -LiteralPath $CaseRoot) { Remove-Item -LiteralPath $CaseRoot -Recurse -Force }
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+        Write-TestProgress "completed finalizer tamper case '$([IO.Path]::GetFileName($CaseRoot))'"
     }
 }
 
@@ -1327,6 +1410,7 @@ function Assert-AutomatedVisualEvidenceRejects {
         [Parameter(Mandatory)][string]$Message,
         [switch]$ExpectIntegrityOk
     )
+    Write-TestProgress "starting visual-evidence tamper case '$([IO.Path]::GetFileName($CaseRoot))'"
     Copy-Item -LiteralPath $SourceRoot -Destination $CaseRoot -Recurse
     try {
         $raw = Get-Content -LiteralPath (Join-Path $CaseRoot 'run.raw.json') -Raw | ConvertFrom-Json -Depth 100
@@ -1369,6 +1453,9 @@ function Assert-AutomatedVisualEvidenceRejects {
     }
     finally {
         if (Test-Path -LiteralPath $CaseRoot) { Remove-Item -LiteralPath $CaseRoot -Recurse -Force }
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+        Write-TestProgress "completed visual-evidence tamper case '$([IO.Path]::GetFileName($CaseRoot))'"
     }
 }
 
@@ -1811,6 +1898,7 @@ try {
     $baselineRoot = Join-Path $candidateRoot 'baseline'
     $candidateBuildId = 'e' * 64
     $baselineBuildId = 'f' * 64
+    Write-TestProgress 'building standalone baseline evidence'
     $baselineEnvelope = New-TestEvidenceEnvelope -Root $baselineSourceRoot -RunId rsq-baseline -BuildId $baselineBuildId `
         -ProtocolRecord $record -FixtureIdentity $fixtureIdentity -ProtocolSource $protocolPath -FixtureSource $fixtureManifestPath
     Assert-Test ($baselineEnvelope.final.report.status -eq 'LOCAL_PASS') `
@@ -1921,6 +2009,7 @@ try {
     }
     Remove-Item -LiteralPath $baselineSourceRoot -Recurse -Force
     Assert-Test (-not (Test-Path -LiteralPath $baselineSourceRoot)) 'The relocated baseline test still depended on its original evidence directory.'
+    Write-TestProgress 'building PR candidate evidence'
     $candidateEnvelope = New-TestEvidenceEnvelope -Root $candidateRoot -RunId rsq-candidate -BuildId $candidateBuildId `
         -ProtocolRecord $record -FixtureIdentity $fixtureIdentity -ProtocolSource $protocolPath -FixtureSource $fixtureManifestPath `
         -Baseline $baselineMetadata
@@ -1937,6 +2026,7 @@ try {
         'Repeated finalization rewrote an already sealed PR projection or invalidated its completion binding.'
     $sealedRunBytes = [IO.File]::ReadAllBytes((Join-Path $candidateRoot 'run.json'))
     $sealedCompletionBytes = [IO.File]::ReadAllBytes((Join-Path $candidateRoot 'qualification-completion.json'))
+    $sealedSummarySha256 = Get-CSXFileSha256 (Join-Path $candidateRoot 'pr-summary.md')
     foreach ($sealCase in @(
         [pscustomobject]@{
             name = 'missing'; pattern = 'completion receipt is missing'
@@ -1972,6 +2062,8 @@ try {
             [IO.File]::WriteAllBytes((Join-Path $candidateRoot 'run.json'), $sealedRunBytes)
             [IO.File]::WriteAllBytes((Join-Path $candidateRoot 'qualification-completion.json'), $sealedCompletionBytes)
             Remove-Item -LiteralPath (Join-Path $candidateRoot 'qualification-package-rejection.json') -Force -ErrorAction SilentlyContinue
+            Assert-Test ((Get-CSXFileSha256 (Join-Path $candidateRoot 'pr-summary.md')) -eq $sealedSummarySha256) `
+                "Terminal preflight failure overwrote the prior valid summary for $($sealCase.name)."
         }
     }
     $prAutomated = $raw.assays.visual.automatedReview
@@ -2141,21 +2233,22 @@ try {
     }
 
     $candidateRejections = @(
-        [pscustomobject]@{ name = 'raw schema'; pattern = 'Raw schema'; mutate = { param($value) $value.schema = 'csx-render-scale-local-v1-raw' } },
-        [pscustomobject]@{ name = 'automated gate'; pattern = 'Automated gates'; mutate = { param($value) $value.automatedGates.passed = $false } },
-        [pscustomobject]@{ name = 'duplicate COC ordinal'; pattern = 'ordinal 2 is missing or duplicated'; mutate = { param($value) $value.assays.coc.records[1].ordinal = 1 } },
+        [pscustomobject]@{ name = 'raw schema'; validation = 'envelope'; pattern = 'Raw schema'; mutate = { param($value) $value.schema = 'csx-render-scale-local-v1-raw' } },
+        [pscustomobject]@{ name = 'automated gate'; validation = 'envelope'; pattern = 'Automated gates'; mutate = { param($value) $value.automatedGates.passed = $false } },
+        [pscustomobject]@{ name = 'duplicate COC ordinal'; validation = 'core'; pattern = 'ordinal 2 is missing or duplicated'; mutate = { param($value) $value.assays.coc.records[1].ordinal = 1 } },
         [pscustomobject]@{ name = 'performance gate'; pattern = 'performance comparison gates'; mutate = { param($value) $value.baseline.gates.cocAggregateMedianP95 = $false } },
         [pscustomobject]@{ name = 'baseline recorded root'; pattern = 'recorded evidence root|escapes'; mutate = { param($value) $value.baseline.sourceEvidenceRoot = [IO.Path]::GetFullPath($candidateRoot) } },
         [pscustomobject]@{ name = 'baseline completion binding'; pattern = 'completion receipt'; mutate = { param($value) $value.baseline.completionSha256 = ('0' * 64) } },
-        [pscustomobject]@{ name = 'evidence finalization deadline'; pattern = 'Raw timing'; mutate = { param($value) $value.time.evidenceFinalizationElapsedMs = 15001.0 } },
+        [pscustomobject]@{ name = 'evidence finalization deadline'; validation = 'envelope'; pattern = 'Raw timing'; mutate = { param($value) $value.time.evidenceFinalizationElapsedMs = 15001.0 } },
         [pscustomobject]@{
-            name = 'missing automated batch'; pattern = 'six|batch|Automated visual'
+            name = 'missing automated batch'; validation = 'automated'; pattern = 'six|batch|Automated visual'
             mutate = { param($value) $value.assays.visual.automatedReview.batches = @($value.assays.visual.automatedReview.batches | Select-Object -First 5) }
         }
     )
     foreach ($case in $candidateRejections) {
         Assert-FinalizerRejects -Root $candidateRoot -Raw $raw -Review $review -Mutation $case.mutate `
-            -ErrorPattern $case.pattern -Message "Finalizer accepted invalid $($case.name) evidence." -RebindInventory
+            -ErrorPattern $case.pattern -Message "Finalizer accepted invalid $($case.name) evidence." `
+            -Validation ([string](Get-CSXPropertyValue $case 'validation' 'finalizer')) -Protocol $protocol -RebindInventory
     }
     Set-TestArtifactInventory -Root $candidateRoot -Raw $raw | Out-Null
     Write-CSXJsonFile -Path (Join-Path $candidateRoot 'run.raw.json') -Value $raw | Out-Null
@@ -2165,11 +2258,11 @@ try {
 
     $tamperCases = @(
         [pscustomobject]@{
-            name = 'inventory-hash'; mode = 'none'; pattern = 'inventory SHA-256 binding'
+            name = 'inventory-hash'; mode = 'none'; validation = 'inventory'; pattern = 'inventory SHA-256 binding'
             mutate = { param($root, $value) $value.artifactInventory.sha256 = ('0' * 64) }
         },
         [pscustomobject]@{
-            name = 'inventory-path'; mode = 'existing'; pattern = 'invalid or excluded path|escapes the evidence root'
+            name = 'inventory-path'; mode = 'existing'; validation = 'inventory'; pattern = 'invalid or excluded path|escapes the evidence root'
             mutate = {
                 param($root, $value)
                 $inventoryPath = Join-Path $root 'automation-artifacts.json'
@@ -2179,11 +2272,11 @@ try {
             }
         },
         [pscustomobject]@{
-            name = 'extra-file'; mode = 'none'; pattern = 'Uninventoried automation producer artifact|Unsupported file'
+            name = 'extra-file'; mode = 'none'; validation = 'inventory'; pattern = 'Uninventoried automation producer artifact|Unsupported file'
             mutate = { param($root, $value) [IO.File]::WriteAllText((Join-Path $root 'untracked.json'), '{}') }
         },
         [pscustomobject]@{
-            name = 'scenario-receipt'; mode = 'regenerate'; pattern = 'scenario receipt'
+            name = 'scenario-receipt'; mode = 'regenerate'; validation = 'producer'; pattern = 'scenario receipt'
             mutate = {
                 param($root, $value)
                 $path = Join-Path $root 'coc/scenario.result.json'
@@ -2193,7 +2286,7 @@ try {
             }
         },
         [pscustomobject]@{
-            name = 'cpu-session'; mode = 'regenerate'; pattern = 'CPU record|diagnostic response|diagnostic session IDs'
+            name = 'cpu-session'; mode = 'regenerate'; validation = 'producer'; pattern = 'CPU record|diagnostic response|diagnostic session IDs'
             mutate = {
                 param($root, $value)
                 $cpuPath = Join-Path $root 'coc/cpu-record.json'; $diagnosticPath = Join-Path $root 'coc/diagnostics.json'
@@ -2204,7 +2297,7 @@ try {
             }
         },
         [pscustomobject]@{
-            name = 'stress-session'; mode = 'regenerate'; pattern = 'stress record session|different stress session|diagnostic session IDs'
+            name = 'stress-session'; mode = 'regenerate'; validation = 'producer'; pattern = 'stress record session|different stress session|diagnostic session IDs'
             mutate = {
                 param($root, $value)
                 $stressPath = Join-Path $root 'coc/stress-record.json'; $diagnosticPath = Join-Path $root 'coc/diagnostics.json'
@@ -2215,7 +2308,7 @@ try {
             }
         },
         [pscustomobject]@{
-            name = 'recovery'; mode = 'regenerate'; pattern = 'Recovery one'
+            name = 'recovery'; mode = 'regenerate'; validation = 'producer'; pattern = 'Recovery one'
             mutate = {
                 param($root, $value)
                 $path = Join-Path $root 'recovery-1.json'; $source = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -Depth 100
@@ -2225,7 +2318,7 @@ try {
             }
         },
         [pscustomobject]@{
-            name = 'transcript'; mode = 'regenerate'; pattern = 'MCP transcript'
+            name = 'transcript'; mode = 'regenerate'; validation = 'producer'; pattern = 'MCP transcript'
             mutate = {
                 param($root, $value)
                 $path = Join-Path $root 'mcp-transcript.json'; $source = @(Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -Depth 100)
@@ -2234,7 +2327,7 @@ try {
             }
         },
         [pscustomobject]@{
-            name = 'sequence-request'; mode = 'regenerate'; pattern = 'sequence request differs'
+            name = 'sequence-request'; mode = 'regenerate'; validation = 'visual'; pattern = 'sequence request differs'
             mutate = {
                 param($root, $value)
                 $run = $value.assays.visual.runs[0]; $path = Join-Path $root $run.sequenceRequestPath
@@ -2248,7 +2341,7 @@ try {
             }
         },
         [pscustomobject]@{
-            name = 'manifest'; mode = 'regenerate'; pattern = 'final manifest identity|capture contract'
+            name = 'manifest'; mode = 'regenerate'; validation = 'visual'; pattern = 'final manifest identity|capture contract'
             mutate = {
                 param($root, $value)
                 $run = $value.assays.visual.runs[0]; $manifestPath = Join-Path $root $run.manifestPath
@@ -2268,7 +2361,7 @@ try {
             }
         },
         [pscustomobject]@{
-            name = 'child-receipt'; mode = 'regenerate'; pattern = 'child receipt identity'
+            name = 'child-receipt'; mode = 'regenerate'; validation = 'visual'; pattern = 'child receipt identity'
             mutate = {
                 param($root, $value)
                 $run = $value.assays.visual.runs[0]; $path = Join-Path $root $run.childReceiptsPath
@@ -2280,7 +2373,7 @@ try {
             }
         },
         [pscustomobject]@{
-            name = 'non-review-png-iend'; mode = 'regenerate'; pattern = 'IEND|PNG|144 PNG artifacts'
+            name = 'non-review-png-iend'; mode = 'regenerate'; validation = 'visual'; pattern = 'IEND|PNG|144 PNG artifacts'
             mutate = {
                 param($root, $value)
                 $run = $value.assays.visual.runs[0]; $childrenPath = Join-Path $root $run.childReceiptsPath
@@ -2315,11 +2408,13 @@ try {
     foreach ($case in $tamperCases) {
         $caseNumber++
         Assert-EvidenceTamperRejected -SourceRoot $candidateRoot -CaseRoot (Join-Path $fixture "tamper-$($caseNumber.ToString('D2'))") `
-            -Mutation $case.mutate -InventoryMode $case.mode -ErrorPattern $case.pattern `
+            -Mutation $case.mutate -InventoryMode $case.mode `
+            -Validation ([string](Get-CSXPropertyValue $case 'validation' 'finalizer')) -Protocol $protocol -ErrorPattern $case.pattern `
             -Message "Finalizer accepted tampered $($case.name) evidence."
     }
 
-    [pscustomobject]@{ ok = $true; protocolSha256 = $record.sha256; cocTransitions = 20; nvidiaMenuTransitions = 25; amdMenuTransitions = 25; visualSamples = 9 } | ConvertTo-Json
+    Write-TestProgress 'completed qualification regression suite'
+    [pscustomobject]@{ ok = $true; protocolSha256 = $record.sha256; cocTransitions = 20; nvidiaMenuTransitions = 25; amdMenuTransitions = 25; visualSamples = 9; elapsedMs = [long]$testStopwatch.Elapsed.TotalMilliseconds } | ConvertTo-Json
 }
 finally {
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }

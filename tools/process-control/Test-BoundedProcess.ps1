@@ -46,7 +46,15 @@ Start-Sleep -Seconds 30
     $firstEvidence = & $tool -FilePath $pwsh -ArgumentList @('-NoProfile', '-Command', 'exit 0') -WorkingDirectory $root -EvidenceDirectory $evidenceRoot -NoExit | ConvertFrom-Json
     $secondEvidence = & $tool -FilePath $pwsh -ArgumentList @('-NoProfile', '-Command', 'exit 0') -WorkingDirectory $root -EvidenceDirectory $evidenceRoot -NoExit | ConvertFrom-Json
     if ($firstEvidence.receiptPath -eq $secondEvidence.receiptPath -or -not (Test-Path -LiteralPath $firstEvidence.receiptPath) -or -not (Test-Path -LiteralPath $secondEvidence.receiptPath)) { throw 'Repeated runs did not preserve unique append-only receipts.' }
-    [pscustomobject][ordered]@{ ok = $true; assertions = 6; receipt = $result.attemptsRun } | ConvertTo-Json
+    $aggregatePath = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'tests\Test-Toolset.ps1'
+    $aggregateText = Get-Content -LiteralPath $aggregatePath -Raw
+    if ($aggregateText -notmatch 'Invoke-BoundedProcess\.ps1' -or
+        $aggregateText -notmatch '\[ValidateRange\(30, 3600\)\]\[int\]\$PerSuiteTimeoutSeconds = 600' -or
+        $aggregateText -notmatch '\$boundedProcess @boundedArguments' -or
+        $aggregateText -notmatch 'terminationConfirmed') {
+        throw 'Aggregate toolset runner does not preserve bounded per-suite custody and timeout reporting.'
+    }
+    [pscustomobject][ordered]@{ ok = $true; assertions = 7; receipt = $result.attemptsRun } | ConvertTo-Json
 }
 finally {
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }

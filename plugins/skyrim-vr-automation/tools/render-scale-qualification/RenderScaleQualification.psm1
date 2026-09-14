@@ -4784,25 +4784,62 @@ function Update-CSXQualificationReport {
     $index = Get-Content -LiteralPath $indexPath -Raw | ConvertFrom-Json -Depth 100
     $errors = [Collections.Generic.List[string]]::new()
     $infrastructureErrors = [Collections.Generic.List[string]]::new()
-    $envelope = Test-CSXFinalizerEnvelope -EvidenceRoot $root -Raw $raw
-    foreach ($error in $envelope.errors) { $errors.Add([string]$error) }
-    $prMode = [bool]$envelope.prMode
-    try {
-        Assert-CSXVisualIndexSet -VisualIndex $index -Label 'Candidate' -ExpectedRunId ([string]$raw.runId)
-        if ((Get-CSXFileSha256 $indexPath) -ne [string](Get-CSXPathValue $raw 'assays.visual.indexSha256')) { $errors.Add('Candidate visual-index SHA-256 binding does not match.') }
+    $prMode = [bool](Get-CSXPropertyValue $raw 'prMode' $false)
+    $existingRunPath = Join-Path $root 'run.json'
+    $terminalPreflightFailed = $false
+    if (-not $AllowUnsealedSuccess -and (Test-Path -LiteralPath $existingRunPath -PathType Leaf)) {
+        # A public re-finalization of an existing projection must first prove that its
+        # terminal receipt still binds that projection. Broken terminal custody is
+        # decisive, so do not spend the finalization budget revalidating the complete
+        # evidence envelope before reporting it.
+        $terminalPreflight = Test-CSXQualificationCompletionReceipt -EvidenceRoot $root -ExpectedRunId ([string]$raw.runId)
+        if (-not $terminalPreflight.ok) {
+            $terminalPreflightFailed = $true
+            foreach ($terminalError in @($terminalPreflight.errors)) {
+                $infrastructureErrors.Add("Qualification terminal result is not sealed: $terminalError")
+            }
+        }
     }
-    catch { $errors.Add($_.Exception.Message) }
-    try {
-        $visualArtifacts = Test-CSXVisualArtifactEvidence -EvidenceRoot $root -Raw $raw -VisualIndex $index
-        foreach ($error in $visualArtifacts.errors) { $errors.Add([string]$error) }
+    if ($terminalPreflightFailed) {
+        # The previously published files are evidence. Return the terminal-custody
+        # failure in memory without overwriting either the projection or summary.
+        $existingReport = Get-Content -LiteralPath $existingRunPath -Raw | ConvertFrom-Json -Depth 100
+        $existingReport.status = 'INFRASTRUCTURE_ERROR'
+        $existingReport.errors = @(@(Get-CSXPropertyValue $existingReport 'errors' @()) + @($infrastructureErrors) | Select-Object -Unique)
+        $existingReport.infrastructureErrors = @(@(Get-CSXPropertyValue $existingReport 'infrastructureErrors' @()) + @($infrastructureErrors) | Select-Object -Unique)
+        return [pscustomobject][ordered]@{
+            report = $existingReport
+            runPath = $existingRunPath
+            summaryPath = Join-Path $root $(if ($prMode) { 'pr-summary.md' } else { 'qualification-summary.md' })
+            completion = $terminalPreflight
+        }
     }
-    catch { $errors.Add("Candidate visual artifact validation failed: $($_.Exception.Message)") }
-    foreach ($failure in @(Get-CSXPathValue $raw 'automatedGates.failures' @())) { $errors.Add([string]$failure) }
-    foreach ($failure in @(Get-CSXPathValue $raw 'automatedGates.infrastructureErrors' @())) { $infrastructureErrors.Add([string]$failure) }
+    if (-not $terminalPreflightFailed) {
+        $envelope = Test-CSXFinalizerEnvelope -EvidenceRoot $root -Raw $raw
+        foreach ($error in $envelope.errors) { $errors.Add([string]$error) }
+        $prMode = [bool]$envelope.prMode
+        # Review and artifact validators depend on a valid outer envelope. Once
+        # that prerequisite fails, continuing only repeats large evidence scans
+        # and cannot turn the result into a pass.
+        if ($envelope.ok) {
+            try {
+                Assert-CSXVisualIndexSet -VisualIndex $index -Label 'Candidate' -ExpectedRunId ([string]$raw.runId)
+                if ((Get-CSXFileSha256 $indexPath) -ne [string](Get-CSXPathValue $raw 'assays.visual.indexSha256')) { $errors.Add('Candidate visual-index SHA-256 binding does not match.') }
+            }
+            catch { $errors.Add($_.Exception.Message) }
+            try {
+                $visualArtifacts = Test-CSXVisualArtifactEvidence -EvidenceRoot $root -Raw $raw -VisualIndex $index
+                foreach ($error in $visualArtifacts.errors) { $errors.Add([string]$error) }
+            }
+            catch { $errors.Add("Candidate visual artifact validation failed: $($_.Exception.Message)") }
+        }
+        foreach ($failure in @(Get-CSXPathValue $raw 'automatedGates.failures' @())) { $errors.Add([string]$failure) }
+        foreach ($failure in @(Get-CSXPathValue $raw 'automatedGates.infrastructureErrors' @())) { $infrastructureErrors.Add([string]$failure) }
+    }
     $reviewState = 'FAIL'
     $reviewResult = $null
     $reviewPath = Join-Path $root 'visual-review.json'
-    if (Test-Path -LiteralPath $reviewPath -PathType Leaf) {
+    if (-not $terminalPreflightFailed -and $envelope.ok -and (Test-Path -LiteralPath $reviewPath -PathType Leaf)) {
         try {
             $review = Get-Content -LiteralPath $reviewPath -Raw | ConvertFrom-Json -Depth 100
             $baselineIndex = $null
@@ -4832,7 +4869,7 @@ function Update-CSXQualificationReport {
         }
         catch { $infrastructureErrors.Add("Visual review validation failed: $($_.Exception.Message)"); $reviewState = 'FAIL' }
     }
-    else {
+    elseif (-not $terminalPreflightFailed -and $envelope.ok) {
         $infrastructureErrors.Add('Protocol revision 5 requires the same-run automated image-model visual review; no review file was produced.')
     }
     $status = if ($infrastructureErrors.Count -gt 0) {
@@ -4844,7 +4881,7 @@ function Update-CSXQualificationReport {
     $completionReceiptPath = Join-Path $root 'qualification-completion.json'
     $requiresSealedProjection = $status -in @('PASS', 'LOCAL_PASS') -or
         (Test-Path -LiteralPath $completionReceiptPath -PathType Leaf)
-    if (-not $AllowUnsealedSuccess -and $requiresSealedProjection) {
+    if (-not $AllowUnsealedSuccess -and -not $terminalPreflightFailed -and $requiresSealedProjection) {
         $completion = Test-CSXQualificationCompletionReceipt -EvidenceRoot $root -ExpectedRunId ([string]$raw.runId)
         if ($completion.ok) {
             $existingRunPath = Join-Path $root 'run.json'

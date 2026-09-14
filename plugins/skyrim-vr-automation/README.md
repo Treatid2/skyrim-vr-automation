@@ -155,6 +155,13 @@ Run the isolated suite with:
 .\tests\Test-Toolset.ps1
 ```
 
+The aggregate prints suite start/completion progress to stderr and supervises
+each child in a Windows job with a 600-second wall-clock limit by default.
+Override that bounded per-suite budget with `-PerSuiteTimeoutSeconds`; pass
+`-EvidenceDirectory` to retain each child's stdout, stderr, and custody receipt.
+A timed-out suite is terminated with its owned process tree and reported as a
+bounded failure instead of leaving the aggregate silent indefinitely.
+
 Support, privacy, terms, compatibility, clean-install, and release contracts
 are documented in the repository root and `docs/`.
 
