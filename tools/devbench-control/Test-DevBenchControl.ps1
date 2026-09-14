@@ -46,26 +46,40 @@ Assert-Test (-not $schedulerOnly.known -and $schedulerOnly.ok -and $schedulerOnl
 $verifiedReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 3; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; postconditions = [pscustomobject]@{ ok = $true } })
 Assert-Test ($verifiedReplay.known -and $verifiedReplay.ok -and -not $verifiedReplay.schedulerOnly) 'explicit replay postconditions establish semantic evidence'
 $nullEvidenceReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 4; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; semantic = $null; assertions = @() })
-Assert-Test (-not $nullEvidenceReplay.known -and $nullEvidenceReplay.schedulerOnly) 'null or empty outcome fields do not verify replay semantics'
+Assert-Test ($nullEvidenceReplay.known -and -not $nullEvidenceReplay.ok -and -not $nullEvidenceReplay.schedulerOnly) 'present null or empty outcome fields reject replay semantics'
 $failedAssertionReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 5; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; assertions = @([pscustomobject]@{ passed = $false }) })
 Assert-Test ($failedAssertionReplay.known -and -not $failedAssertionReplay.ok -and -not $failedAssertionReplay.schedulerOnly) 'explicit failed assertions reject replay semantics'
 $falseOutcomeReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 6; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; postconditions = $false })
-Assert-Test (-not $falseOutcomeReplay.known -and $falseOutcomeReplay.schedulerOnly -and $falseOutcomeReplay.outcome -eq 'scheduler-complete-unverified') 'a false Boolean postcondition never verifies replay semantics'
+Assert-Test ($falseOutcomeReplay.known -and -not $falseOutcomeReplay.ok -and -not $falseOutcomeReplay.schedulerOnly) 'a false Boolean postcondition is a global semantic veto'
 $falseOutcomeArrayReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 7; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; outcomeChecks = @($false) })
-Assert-Test (-not $falseOutcomeArrayReplay.known -and $falseOutcomeArrayReplay.schedulerOnly) 'an array containing only false outcomes never verifies replay semantics'
+Assert-Test ($falseOutcomeArrayReplay.known -and -not $falseOutcomeArrayReplay.ok -and -not $falseOutcomeArrayReplay.schedulerOnly) 'an array containing a false outcome rejects replay semantics'
 $neutralOutcomeReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 8; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; postconditions = [pscustomobject]@{ failed = $false } })
-Assert-Test (-not $neutralOutcomeReplay.known -and $neutralOutcomeReplay.schedulerOnly -and $neutralOutcomeReplay.explicitOutcomeEvidence.Count -eq 0 -and $neutralOutcomeReplay.rejectedOutcomeEvidence.Count -gt 0) 'a neutral failed-false outcome object remains unverified rather than becoming positive replay proof'
+Assert-Test ($neutralOutcomeReplay.known -and -not $neutralOutcomeReplay.ok -and -not $neutralOutcomeReplay.schedulerOnly -and $neutralOutcomeReplay.explicitOutcomeEvidence.Count -eq 0 -and $neutralOutcomeReplay.rejectedOutcomeEvidence.Count -gt 0) 'a neutral failed-false outcome object rejects replay semantics'
 foreach ($mixedCase in @(
     [pscustomobject]@{ values = @($true, $false) },
     [pscustomobject]@{ values = @($false, $true) }
 )) {
     $mixedOutcomeReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 9; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; outcomeChecks = $mixedCase.values })
-    Assert-Test (-not $mixedOutcomeReplay.known -and $mixedOutcomeReplay.schedulerOnly -and $mixedOutcomeReplay.explicitOutcomeEvidence.Count -eq 0) 'mixed true/false replay evidence cannot be promoted in either order'
+    Assert-Test ($mixedOutcomeReplay.known -and -not $mixedOutcomeReplay.ok -and -not $mixedOutcomeReplay.schedulerOnly -and $mixedOutcomeReplay.explicitOutcomeEvidence.Count -eq 0) 'mixed true/false replay evidence is rejected in either order'
 }
 $nestedMixedReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 10; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; semantic = [pscustomobject]@{ checks = @([pscustomobject]@{ passed = $true }, $false) } })
-Assert-Test (-not $nestedMixedReplay.known -and $nestedMixedReplay.schedulerOnly -and $nestedMixedReplay.rejectedOutcomeEvidence.Count -gt 0) 'nested mixed Boolean evidence cannot be neutralized by a positive sibling'
+Assert-Test ($nestedMixedReplay.known -and -not $nestedMixedReplay.ok -and -not $nestedMixedReplay.schedulerOnly -and $nestedMixedReplay.rejectedOutcomeEvidence.Count -gt 0) 'nested mixed Boolean evidence cannot be neutralized by a positive sibling'
 $crossContainerMixedReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 11; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; postconditions = $false; assertions = @([pscustomobject]@{ passed = $true }) })
-Assert-Test (-not $crossContainerMixedReplay.known -and $crossContainerMixedReplay.schedulerOnly -and $crossContainerMixedReplay.explicitOutcomeEvidence.Count -eq 0) 'a positive assertion cannot neutralize a false sibling outcome container'
+Assert-Test ($crossContainerMixedReplay.known -and -not $crossContainerMixedReplay.ok -and -not $crossContainerMixedReplay.schedulerOnly -and $crossContainerMixedReplay.explicitOutcomeEvidence.Count -eq 0) 'a positive assertion cannot neutralize a false sibling outcome container'
+foreach ($namedOutcomeCase in @(
+    [pscustomobject]@{ label = 'false'; value = $false },
+    [pscustomobject]@{ label = 'null'; value = $null },
+    [pscustomobject]@{ label = 'empty-object'; value = [pscustomobject]@{} },
+    [pscustomobject]@{ label = 'neutral-object'; value = [pscustomobject]@{ failed = $false } },
+    [pscustomobject]@{ label = 'unsupported-scalar'; value = 'unknown' }
+)) {
+    $namedOutcome = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 12; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; postconditions = [pscustomobject]@{ saved = [pscustomobject]@{ passed = $true }; restored = $namedOutcomeCase.value } })
+    Assert-Test ($namedOutcome.known -and -not $namedOutcome.ok -and $namedOutcome.rejectedOutcomeEvidence.Count -gt 0) "named outcome maps reject a positive sibling paired with $($namedOutcomeCase.label) evidence"
+}
+$namedMetadataOutcome = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ ok = $true; postconditions = [pscustomobject]@{ saved = [pscustomobject]@{ passed = $true }; message = 'saved' } })
+Assert-Test ($namedMetadataOutcome.known -and $namedMetadataOutcome.ok) 'explicit non-empty outcome metadata does not become a required outcome member'
+$recordRejectedOutcome = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ ok = $true; action = 'stop'; path = 'C:\captures\recording.json'; postconditions = $false })
+Assert-Test ($recordRejectedOutcome.known -and -not $recordRejectedOutcome.ok -and $recordRejectedOutcome.reasons -match 'Explicit outcome evidence rejected') 'detected rejected outcomes veto action-specific non-replay success'
 $readOnlyInspect = Test-DevBenchReadOnlyRequest -ToolName inspect -Arguments @{ kind = 'scene' }
 $readOnlyMenu = Test-DevBenchReadOnlyRequest -ToolName menu -Arguments @{ action = 'list' }
 $mutatingMenu = Test-DevBenchReadOnlyRequest -ToolName menu -Arguments @{ action = 'open'; name = 'InventoryMenu' }
@@ -294,6 +308,19 @@ try {
         Assert-Test (-not $negativeStatusPlan.ok -and $null -eq $negativeStatusPlan.arguments -and -not $negativeStatusPlan.receiptPublished) "render-map planner rejects named negative status $negativeStatus"
     }
 
+    foreach ($nullStatusCase in @(
+        [pscustomobject]@{ label = 'envelope-status'; layer = 'envelope'; name = 'status' },
+        [pscustomobject]@{ label = 'result-status'; layer = 'result'; name = 'resultStatus' }
+    )) {
+        $nullStatusPath = Join-Path $planFixture "$($nullStatusCase.label)-registry.json"
+        $nullStatusRegistry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+        $target = if ($nullStatusCase.layer -eq 'envelope') { $nullStatusRegistry } else { $nullStatusRegistry.result }
+        $target | Add-Member -NotePropertyName $nullStatusCase.name -NotePropertyValue $null -Force
+        $nullStatusRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $nullStatusPath -Encoding utf8
+        $nullStatusPlan = & $plannerPath -RegistryPath $nullStatusPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId $nullStatusCase.label -OutputPath (Join-Path $planFixture "$($nullStatusCase.label)-plan.json") -NoExit -Compact | ConvertFrom-Json
+        Assert-Test (-not $nullStatusPlan.ok -and $null -eq $nullStatusPlan.arguments -and -not $nullStatusPlan.receiptPublished) "render-map planner rejects present-null $($nullStatusCase.label) before issuing start arguments"
+    }
+
     foreach ($missingBinding in @('service', 'major', 'producerBuildId')) {
         $bindingPath = Join-Path $planFixture "missing-$missingBinding-registry.json"
         $bindingRegistry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
@@ -459,6 +486,18 @@ $mixedDismissal = Get-DevBenchMenuDismissalPlan -MenuObservation $mixedMenus -Di
 Assert-Test (-not $mixedDismissal.permitted -and $mixedDismissal.retainedMenus[0] -eq 'MapMenu') 'unlisted blocking menus prevent partial dismissal'
 $modalDismissal = Get-DevBenchMenuDismissalPlan -MenuObservation $modal -DismissBlockingMenus @('InventoryMenu')
 Assert-Test (-not $modalDismissal.permitted -and $modalDismissal.reason -eq 'message-box-requires-explicit-answer') 'message boxes are never auto-dismissed'
+$validMenuProbe = Get-DevBenchWaitProbeAssessment -ProbeKind menu -Content @([pscustomobject]@{ openMenus = @('HUD Menu'); messageBoxOpen = $false })
+Assert-Test $validMenuProbe.ok 'wait menu probes require and retain a complete action-specific read contract'
+$failedMenuProbe = Get-DevBenchWaitProbeAssessment -ProbeKind menu -Content @([pscustomobject]@{ ok = $false; errors = @('menu snapshot unavailable'); openMenus = @(); messageBoxOpen = $false })
+Assert-Test (-not $failedMenuProbe.ok -and $failedMenuProbe.terminalFailure -and -not $failedMenuProbe.semantic.ok) 'negative menu semantics cannot satisfy a nonblocking-menu barrier'
+$missingMenuProbe = Get-DevBenchWaitProbeAssessment -ProbeKind menu -Content @([pscustomobject]@{ openMenus = @() })
+Assert-Test (-not $missingMenuProbe.ok -and $missingMenuProbe.terminalFailure) 'missing menu response fields cannot fabricate a successful barrier'
+$failedPlayerProbe = Get-DevBenchWaitProbeAssessment -ProbeKind player-state -Content @([pscustomobject]@{ ok = $false; playerLoaded = $true })
+Assert-Test (-not $failedPlayerProbe.ok -and $failedPlayerProbe.terminalFailure) 'negative player-state semantics veto apparently loaded state'
+$missingPlayerProbe = Get-DevBenchWaitProbeAssessment -ProbeKind player-state -Content @([pscustomobject]@{ ok = $true })
+Assert-Test (-not $missingPlayerProbe.ok -and $missingPlayerProbe.terminalFailure) 'missing playerLoaded evidence cannot satisfy a current-state barrier'
+$failedSceneProbe = Get-DevBenchWaitProbeAssessment -ProbeKind scene -Content @([pscustomobject]@{ ok = $false; cell = 'Whiterun' })
+Assert-Test (-not $failedSceneProbe.ok -and $failedSceneProbe.terminalFailure) 'negative scene semantics veto an otherwise matching cell identity'
 
 Assert-Test (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $false -IssuedSessionId '' -StatusCode 404) 'only an initial sessionless MCP 404 proves capability absence'
 Assert-Test (-not (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $true -IssuedSessionId 'session-1' -StatusCode 404)) 'a post-initialization MCP 404 cannot authorize REST fallback'
@@ -823,11 +862,23 @@ $waitTimeoutSemanticAst = @($entryPointAst.FindAll({ param($node) $node -is [Man
 Invoke-Expression $waitTimeoutSemanticAst.Extent.Text
 $waitCompletionAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-DevBenchWaitCompletion' }, $true))[0]
 Invoke-Expression $waitCompletionAst.Extent.Text
+$requestTimeoutAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-RequestTimeoutSeconds' }, $true))[0]
+Invoke-Expression $requestTimeoutAst.Extent.Text
+$script:requestTimeoutSecondsForRpc = 15
+$script:operationDeadlineUtc = [DateTime]::UtcNow.AddMilliseconds(500)
+$positiveSubsecondTimeout = Get-RequestTimeoutSeconds
+Assert-Test ($positiveSubsecondTimeout -eq 1) 'a positive subsecond operation budget remains eligible for one bounded request'
+$script:operationDeadlineUtc = [DateTime]::UtcNow.AddMilliseconds(-1)
+$expiredBudgetRejected = $false
+try { $null = Get-RequestTimeoutSeconds } catch { $expiredBudgetRejected = $_.Exception -is [TimeoutException] }
+Assert-Test $expiredBudgetRejected 'request admission reports expiry only after the absolute deadline has elapsed'
 $ordinaryTimeoutSemantic = New-DevBenchWaitTimeoutSemantic -Condition 'serviceReady' -TimeoutSeconds 42
 Assert-Test (-not $ordinaryTimeoutSemantic.ok -and $ordinaryTimeoutSemantic.outcome -eq 'wait-timeout' -and $ordinaryTimeoutSemantic.codes -contains 'wait_timeout' -and $ordinaryTimeoutSemantic.states -contains 'timeout') 'ordinary and exceptional wait expiry share one structured timeout semantic contract'
 $terminalServiceSemantic = [pscustomobject][ordered]@{ known = $true; ok = $false; outcome = 'guard-rejected'; codes = @('guard_rejected'); states = @('rejected'); reasons = @('fixture guard rejection') }
 $terminalServiceCompletion = Get-DevBenchWaitCompletion -Condition 'serviceReady' -TimeoutSeconds 42 -Observation ([pscustomobject]@{ satisfied = $false; service = [pscustomobject]@{ terminalFailure = $true; semantic = $terminalServiceSemantic } })
 Assert-Test ($terminalServiceCompletion.state -eq 'semantic-failed' -and $terminalServiceCompletion.terminalServiceFailure -and $terminalServiceCompletion.semantic.outcome -eq 'guard-rejected' -and $terminalServiceCompletion.semantic.codes -contains 'guard_rejected' -and $terminalServiceCompletion.semantic.states -contains 'rejected') 'terminal service failure preserves its semantic evidence and is not rewritten as a timeout'
+$terminalMenuCompletion = Get-DevBenchWaitCompletion -Condition 'noBlockingMenu' -TimeoutSeconds 42 -Observation ([pscustomobject]@{ satisfied = $false; terminalFailure = $true; semantic = $failedMenuProbe.semantic })
+Assert-Test ($terminalMenuCompletion.state -eq 'semantic-failed' -and $terminalMenuCompletion.terminalProbeFailure -and -not $terminalMenuCompletion.semantic.ok) 'terminal menu probe failure remains attributable instead of becoming a timeout'
 $deadlineCompletion = Get-DevBenchWaitCompletion -Condition 'serviceReady' -TimeoutSeconds 42 -Observation ([pscustomobject]@{ satisfied = $false; service = [pscustomobject]@{ terminalFailure = $false; semantic = [pscustomobject]@{ known = $true; ok = $true } } })
 Assert-Test ($deadlineCompletion.state -eq 'timeout' -and -not $deadlineCompletion.terminalServiceFailure -and $deadlineCompletion.semantic.outcome -eq 'wait-timeout') 'ordinary unsatisfied service wait remains a deadline timeout'
 $runtimeIdentityAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-RuntimeIdentity' }, $true))[0]

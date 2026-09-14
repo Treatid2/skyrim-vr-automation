@@ -79,7 +79,8 @@ function Assert-RegistryEnvelopeSuccess($Value, [string]$Path) {
     }
     foreach ($name in @('status', 'resultStatus')) {
         $property = $Value.PSObject.Properties[$name]
-        if (-not $property -or $null -eq $property.Value) { continue }
+        if (-not $property) { continue }
+        if ($null -eq $property.Value) { throw "$Path.$name is present but has no supported registry status." }
         $statusName = if ($property.Value -is [string] -or $property.Value -is [ValueType]) {
             [string]$property.Value
         } else {

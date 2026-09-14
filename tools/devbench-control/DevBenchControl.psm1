@@ -18,6 +18,7 @@ function Get-DevBenchSemanticStatus {
     $guardCodes = @('producer_mismatch', 'contract_mismatch', 'unsupported_contract_major', 'idempotency_conflict')
     $successNames = @('success', 'ok', 'ready', 'completed', 'accepted', 'idle', 'available')
     $transientNames = @('service_unavailable', 'initializing', 'starting', 'waiting_for_safe_point', 'loading_transition', 'relatch_pending', 'compiling', 'pending', 'queued', 'running')
+    $outcomeMetadataNames = @('message', 'description', 'label')
 
     function Get-ExplicitOutcomeAssessment($Value, [string]$Path) {
         $positive = [Collections.Generic.List[string]]::new()
@@ -91,9 +92,13 @@ function Get-DevBenchSemanticStatus {
                     }
                     else { $rejected.Add("$childPath is not a supported outcome value") }
                 }
-                elseif ($child -is [pscustomobject] -or $child -is [Collections.IDictionary] -or
-                    ($child -is [Collections.IEnumerable] -and $child -isnot [string])) {
-                    Visit-OutcomeValue $child $childPath $false
+                elseif ($name -in $outcomeMetadataNames) {
+                    if ($child -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$child)) {
+                        $rejected.Add("$childPath is not valid outcome metadata")
+                    }
+                }
+                else {
+                    Visit-OutcomeValue $child $childPath $true
                 }
             }
             if ($Required -and $positive.Count -eq $positiveBefore -and $rejected.Count -eq $rejectedBefore) {
@@ -254,7 +259,13 @@ function Get-DevBenchSemanticStatus {
     finally {
         Remove-Variable semanticKnown -Scope Script -ErrorAction SilentlyContinue
     }
-    if ($rejectedOutcomeEvidence.Count -gt 0) { $explicitOutcomeEvidence.Clear() }
+    if ($rejectedOutcomeEvidence.Count -gt 0) {
+        $explicitOutcomeEvidence.Clear()
+        $known = $true
+        foreach ($rejectedPath in @($rejectedOutcomeEvidence | Select-Object -Unique)) {
+            $reasons.Add("Explicit outcome evidence rejected: $rejectedPath")
+        }
+    }
     $schedulerOnly = $replaySchedulerReceipts.Count -gt 0 -and $explicitOutcomeEvidence.Count -eq 0 -and $reasons.Count -eq 0
     if ($schedulerOnly) { $known = $false }
     $guarded = @($codes | Where-Object { $_ -in $guardCodes }).Count -gt 0
@@ -864,6 +875,77 @@ function Test-DevBenchWaitDeadlineAcceptance {
         [Parameter(Mandatory)][DateTime]$DeadlineUtc
     )
     return $Satisfied -and $ObservedUtc -lt $DeadlineUtc
+}
+
+function Get-DevBenchWaitProbeAssessment {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('menu', 'player-state', 'scene')][string]$ProbeKind,
+        [AllowEmptyCollection()][object[]]$Content
+    )
+
+    $toolName = if ($ProbeKind -eq 'menu') { 'menu' } else { 'inspect' }
+    $arguments = if ($ProbeKind -eq 'menu') { @{ action = 'list' } } else { @{ kind = $(if ($ProbeKind -eq 'player-state') { 'state' } else { 'scene' }) } }
+    $semantic = Get-DevBenchCallSemanticStatus -ToolName $toolName -Arguments $arguments -Content $Content
+    $reasons = [Collections.Generic.List[string]]::new()
+    foreach ($reason in @($semantic.reasons)) { $reasons.Add([string]$reason) }
+    $payloads = @($Content)
+    $payload = if ($payloads.Count -eq 1 -and
+        ($payloads[0] -is [pscustomobject] -or $payloads[0] -is [Collections.IDictionary])) {
+        $payloads[0]
+    }
+    else {
+        $reasons.Add("$ProbeKind wait probe must return exactly one structured response")
+        $null
+    }
+
+    if ($payload) {
+        if ($ProbeKind -eq 'menu') {
+            $openMenus = $payload.PSObject.Properties['openMenus']
+            $messageBoxOpen = $payload.PSObject.Properties['messageBoxOpen']
+            if (-not $openMenus -or $null -eq $openMenus.Value -or $openMenus.Value -is [string] -or
+                $openMenus.Value -isnot [Collections.IEnumerable] -or
+                @($openMenus.Value | Where-Object { $_ -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$_) }).Count -gt 0) {
+                $reasons.Add('menu wait probe openMenus is not a collection of non-empty menu names')
+            }
+            if (-not $messageBoxOpen -or $messageBoxOpen.Value -isnot [bool]) {
+                $reasons.Add('menu wait probe messageBoxOpen is not Boolean')
+            }
+        }
+        elseif ($ProbeKind -eq 'player-state') {
+            $playerLoaded = $payload.PSObject.Properties['playerLoaded']
+            if (-not $playerLoaded -or $playerLoaded.Value -isnot [bool]) {
+                $reasons.Add('player-state wait probe playerLoaded is not Boolean')
+            }
+        }
+        else {
+            $cell = $payload.PSObject.Properties['cell']
+            $editorId = if ($cell -and $null -ne $cell.Value -and
+                ($cell.Value -is [pscustomobject] -or $cell.Value -is [Collections.IDictionary])) {
+                $cell.Value.PSObject.Properties['editorId']
+            } else { $null }
+            $validCell = $cell -and (
+                ($cell.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$cell.Value)) -or
+                ($editorId -and $editorId.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$editorId.Value)))
+            if (-not $validCell) { $reasons.Add('scene wait probe cell identity is missing or malformed') }
+        }
+    }
+
+    if (-not $semantic.known) { $reasons.Add("$ProbeKind wait probe did not establish a known semantic result") }
+    $ok = $semantic.known -and $semantic.ok -and $reasons.Count -eq 0
+    if (-not $ok) {
+        $semantic.known = $true
+        $semantic.ok = $false
+        $semantic.outcome = 'wait-probe-contract-failed'
+        $semantic.reasons = @($reasons | Select-Object -Unique)
+    }
+    return [pscustomobject][ordered]@{
+        ok = $ok
+        retryable = -not $ok -and [bool]$semantic.transient
+        terminalFailure = -not $ok -and -not [bool]$semantic.transient
+        semantic = $semantic
+        payload = $payload
+    }
 }
 
 function Test-DevBenchNoBlockingMenu {
@@ -1836,4 +1918,4 @@ function Get-DevBenchRestMutationFailureDisposition {
     }
 }
 
-Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchWaitDeadlineAcceptance, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Test-DevBenchExecutableIdentityMatch, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow, Test-DevBenchInitialMcpCapabilityMiss, Get-DevBenchRestMutationFailureDisposition
+Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchWaitDeadlineAcceptance, Get-DevBenchWaitProbeAssessment, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Test-DevBenchExecutableIdentityMatch, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow, Test-DevBenchInitialMcpCapabilityMiss, Get-DevBenchRestMutationFailureDisposition

@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Treat every named outcome-map member as required unless it is explicitly
+  typed metadata, make rejected outcomes a global semantic veto, qualify menu
+  and current-state wait probes before barrier evaluation, reject present-null
+  registry statuses, and retain positive subsecond request budget.
 - Recover an interrupted receipt-only no-op completion after revalidating the
   exact task evidence, and admit its receipt as promotion source proof.
 - Complete failed or unverified shader-cache tasks without a physical restore
