@@ -2100,38 +2100,92 @@ function Request-MO2AutomationWindowClose {
 function Invoke-MO2RetainedSessionDialogCleanup {
     param(
         [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Owned,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Processes,
-        [ValidateRange(1, 60)][int]$TimeoutSeconds = 10
+        [ValidateRange(1, 60)][int]$TimeoutSeconds = 10,
+        [scriptblock]$BindingFactory,
+        [scriptblock]$WindowFactory,
+        [scriptblock]$OwnedAction
     )
     if ($Processes.Count -eq 0) {
         return [pscustomobject][ordered]@{ cleared = $true; before = @(); actions = @(); remaining = @(); needsAttention = @() }
     }
     Assert-MO2ExactProcessTargets -Config $Config -Processes $Processes
+    if (-not $BindingFactory) {
+        $BindingFactory = {
+            param([int]$ProcessId)
+            $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+            if (-not $process) { return [pscustomobject][ordered]@{ available=$false; reason='process-exited'; process=$null; record=$null } }
+            try {
+                $handle = $process.SafeHandle
+                if ($handle.IsInvalid -or $handle.IsClosed) { throw 'The process handle is unavailable.' }
+                $record = [pscustomobject][ordered]@{
+                    name=$process.ProcessName; id=$process.Id; path=[IO.Path]::GetFullPath($process.Path)
+                    startTime=$process.StartTime.ToUniversalTime().ToString('o')
+                }
+                return [pscustomobject][ordered]@{ available=$true; reason='bound'; process=$process; record=$record }
+            }
+            catch {
+                $process.Dispose()
+                return [pscustomobject][ordered]@{ available=$false; reason='live-process-identity-unavailable'; process=$null; record=$null; detail=$_.Exception.Message }
+            }
+        }
+    }
+    if (-not $WindowFactory) { $WindowFactory = { param($Binding) @(Get-MO2AutomationWindows -ProcessId ([int]$Binding.record.id)) } }
+    if (-not $OwnedAction) {
+        $OwnedAction = {
+            param($AuthorityOwned, $Binding, $Action, [object[]]$Arguments)
+            Invoke-MO2OwnedProcessAction -Config $Config -Owned $AuthorityOwned -Process $Binding.process -Action $Action -ArgumentList $Arguments
+        }.GetNewClosure()
+    }
     $before = @(Get-MO2WindowSnapshot -Processes $Processes)
     $actions = [Collections.Generic.List[object]]::new()
+    $blockedReason = $null
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         $handled = $false
         foreach ($record in $Processes) {
-            foreach ($window in @(Get-MO2AutomationWindows -ProcessId ([int]$record.id))) {
-                if ([string]$window.Current.AutomationId -eq 'MainWindow') { continue }
-                $kind = Get-MO2KnownDialogKind -Title ([string]$window.Current.Name) -Texts @(Get-MO2WindowTextElements -Window $window)
-                if ($kind -ne 'failed-to-run') { continue }
-                $accepted = $false
-                foreach ($name in @('OK', 'Close')) {
-                    foreach ($button in @(Get-MO2NamedButtons -Window $window -Name $name)) {
-                        $accepted = (Invoke-MO2AutomationButton -Button $button -ExpectedName $name) -or $accepted
-                    }
+            $binding = & $BindingFactory ([int]$record.id)
+            if (-not $binding.available) { $blockedReason = [string]$binding.reason; break }
+            try {
+                if ($binding.PSObject.Properties['record']) {
+                    $identity = Test-MO2ProcessRecordIdentity -Expected $record -Actual $binding.record
+                    if (-not $identity.ok) { $blockedReason = [string]$identity.reason; break }
                 }
-                if (-not $accepted) { $accepted = Request-MO2AutomationWindowClose -Window $window }
-                $actions.Add([pscustomobject][ordered]@{
-                    timestampUtc = [DateTime]::UtcNow.ToString('o'); processId = [int]$record.id
-                    windowHandle = [int64]$window.Current.NativeWindowHandle; windowTitle = [string]$window.Current.Name
-                    dialogKind = $kind; action = 'acknowledge-retained-failed-to-run'; accepted = [bool]$accepted
-                })
-                $handled = $true
+                foreach ($window in @(& $WindowFactory $binding)) {
+                    if ([string]$window.Current.AutomationId -eq 'MainWindow') { continue }
+                    $kind = Get-MO2KnownDialogKind -Title ([string]$window.Current.Name) -Texts @(Get-MO2WindowTextElements -Window $window)
+                    if ($kind -ne 'failed-to-run') { continue }
+                    $accepted = $false
+                    foreach ($name in @('OK', 'Close')) {
+                        foreach ($button in @(Get-MO2NamedButtons -Window $window -Name $name)) {
+                            try {
+                                $invoked = & $OwnedAction $Owned $binding { param($targetButton, $expectedName) Invoke-MO2AutomationButton -Button $targetButton -ExpectedName $expectedName } @($button, $name)
+                                $accepted = [bool]$invoked -or $accepted
+                            }
+                            catch { $blockedReason = if ($_.Exception.Message -match 'lease transition is stale') { 'stale-session-generation' } else { $_.Exception.Message }; break }
+                        }
+                        if ($blockedReason) { break }
+                    }
+                    if ($blockedReason) { break }
+                    if (-not $accepted) {
+                        try { $accepted = [bool](& $OwnedAction $Owned $binding { param($targetWindow) Request-MO2AutomationWindowClose -Window $targetWindow } @($window)) }
+                        catch { $blockedReason = if ($_.Exception.Message -match 'lease transition is stale') { 'stale-session-generation' } else { $_.Exception.Message }; break }
+                    }
+                    $actions.Add([pscustomobject][ordered]@{
+                        timestampUtc = [DateTime]::UtcNow.ToString('o'); processId = [int]$record.id
+                        windowHandle = [int64]$window.Current.NativeWindowHandle; windowTitle = [string]$window.Current.Name
+                        dialogKind = $kind; action = 'acknowledge-retained-failed-to-run'; accepted = [bool]$accepted
+                    })
+                    $handled = $true
+                }
             }
+            finally {
+                if ($binding.process -is [IDisposable]) { $binding.process.Dispose() }
+            }
+            if ($blockedReason) { break }
         }
+        if ($blockedReason) { break }
         if (-not $handled) { break }
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
@@ -2141,8 +2195,8 @@ function Invoke-MO2RetainedSessionDialogCleanup {
         $_.visible -and $_.automationId -ine 'MainWindow' -and $_.dialogKind -ne 'unlock-required' -and $_.dialogKind -ne 'failed-to-run'
     })
     return [pscustomobject][ordered]@{
-        cleared = $remainingKnown.Count -eq 0; before = $before; actions = @($actions)
-        remaining = $remaining; remainingKnown = $remainingKnown; needsAttention = $needsAttention
+        cleared = $null -eq $blockedReason -and $remainingKnown.Count -eq 0; before = $before; actions = @($actions)
+        remaining = $remaining; remainingKnown = $remainingKnown; needsAttention = $needsAttention; blockedReason = $blockedReason
     }
 }
 
@@ -3931,8 +3985,8 @@ function Invoke-MO2RecoverClose {
         throw "Failed to acquire recovery session '$sessionId'. Evidence is retained at '$sessionPath'. $($_.Exception.Message)"
     }
 
-    $close = Invoke-MO2CooperativeClose -Config $Config -Owned (Get-MO2OwnedSession -Config $Config -SessionId $sessionId) -InitialProcesses $targets -EvidenceDirectory $sessionPath -TimeoutSeconds $TimeoutSeconds
     $owned = Get-MO2OwnedSession -Config $Config -SessionId $sessionId
+    $close = Invoke-MO2CooperativeClose -Config $Config -Owned $owned -InitialProcesses $targets -EvidenceDirectory $sessionPath -TimeoutSeconds $TimeoutSeconds
     $status = if ($close.closed) { 'mo2-closed' } else { 'close-incomplete' }
     Set-MO2OwnedSessionStatus -Owned $owned -Status $status -TimestampProperty 'closedUtc'
     Write-MO2JsonAtomic -Path (Join-Path $sessionPath 'mo2-close.json') -Value $close
@@ -4027,7 +4081,7 @@ function Invoke-MO2StopGame {
     if ($closed -and $after.processes.mo2.Count -gt 0) {
         $resolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @($after.processes.mo2)
         if ($resolution.ok) {
-            $dialogCleanup = Invoke-MO2RetainedSessionDialogCleanup -Config $Config -Processes @($resolution.targets)
+            $dialogCleanup = Invoke-MO2RetainedSessionDialogCleanup -Config $Config -Owned $owned -Processes @($resolution.targets)
             $dialogNeedsAttention = -not $dialogCleanup.cleared -or @($dialogCleanup.needsAttention).Count -gt 0
         }
         else {
@@ -4195,6 +4249,10 @@ function Invoke-MO2CurrentGameCloseRequest {
     $resolution = Resolve-MO2RecordedGameProcessTargets -Recorded @($CurrentData.gameProcesses) -Current @($CurrentInspection.processes.game)
     if (-not $resolution.ok) {
         return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = [string]$resolution.reason; gameResolution = $resolution }
+    }
+    $ownerResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $Owned -Processes @($CurrentInspection.processes.mo2)
+    if (-not $ownerResolution.ok -or @($ownerResolution.targets).Count -ne 1) {
+        return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = 'mo2-owner-changed-before-game-close'; ownershipResolution = $ownerResolution }
     }
     return Invoke-MO2VerifiedGameCloseRequestSet -Config $Config -Owned $Owned -Targets @($resolution.targets) -BindingFactory $BindingFactory -CloseAction $CloseAction
 }

@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Recheck the exact MO2 owner beside the serialized game-close inventory, guard
+  every retained failed-to-run dialog action with the initiating generation and
+  retained owner handle, and keep recovery-close completion on that same
+  generation so stale results cannot overwrite a newer lifecycle.
 - Derive graceful game-close authority from the current session's recorded
   identities and veto all close requests when another configured but unowned
   game or loader process is present.
