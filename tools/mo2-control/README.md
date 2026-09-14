@@ -190,6 +190,9 @@ projects that same generation into `session.json` before releasing the transitio
 lock. An older writer cannot overtake a newer manifest. If projection itself
 fails, the error identifies the already committed lock generation; the next
 serialized commit reconciles the manifest from that authoritative state.
+Initial preparation, recovery-session binding, and in-session `renew-access`
+use the same projection rule; access-only renewal has no session manifest to
+update.
 Game-identity persistence also resolves one exact live MO2 owner inside that
 same serialized transition before it may publish `running`. Exact game
 termination repeats that owner proof inside its serialized transition before
@@ -272,9 +275,12 @@ after the game, `stop-game` returns `mo2-exited-after-game-stop`, sets
 refuses while a game/loader exists and cooperatively resolves
 MO2's structured `File` → `Exit` path and visible modal chain, including the VFS
 `Unlock` prompt. `stop` first closes the game and then uses the same MO2
-resolver. `release` ends only the exactly owned session after proving MO2 and
-the game are closed, while retaining the evidence directory. It returns the
-explicit lease to access-only state. All mutation commands have `-WhatIf`.
+resolver. Every cooperative UI action rechecks the caller's current lease
+generation while retaining the exact owner handle. `release` repeats current
+generation and live-process checks inside its serialized transition, then ends
+only the exactly owned session while retaining the evidence directory. It
+returns the explicit lease to access-only state. All mutation commands have
+`-WhatIf`.
 Evidence
 collection, archive verification, profile mutation, cache management, and
 recovery remain deferred until separately bounded.
@@ -297,7 +303,9 @@ authorize dry-run or live relaunch.
 
 `terminate` is intentionally distinct from `stop`: it force-terminates only
 MO2 processes owned by the active session, and only after proving that no game
-or loader process is running and no RootBuilder `BuildData.json` remains.
+or loader process is running and no RootBuilder `BuildData.json` remains. Those
+vetoes are reobserved inside the same serialized boundary that revalidates the
+exact owner and requests termination.
 
 Visible `open`, `close`, `recover-close`, `stop-game`, and `stop` operations must
 run as the logged-on user on the interactive Windows desktop. In Codex this

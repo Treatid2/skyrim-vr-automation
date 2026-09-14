@@ -1192,7 +1192,9 @@ function Write-MO2SessionManifestProjection {
     if (-not $SessionData.PSObject.Properties['sessionPath'] -or
         [string]::IsNullOrWhiteSpace([string]$SessionData.sessionPath)) { return }
     $manifestPath = Join-Path ([string]$SessionData.sessionPath) 'session.json'
-    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return }
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw "The bound session manifest does not exist: $manifestPath"
+    }
 
     $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop)
     foreach ($property in @($SessionData.PSObject.Properties)) {
@@ -1677,6 +1679,12 @@ function Invoke-MO2RenewAccess {
         }
         $updated | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $updated) -Force
         Write-MO2JsonAtomic -Path $current.path -Value $updated
+        try {
+            Write-MO2SessionManifestProjection -SessionData $updated
+        }
+        catch {
+            throw "The authoritative MO2 ownership lock committed generation $($updated.generation), but its session manifest projection failed and must be reconciled from that lock: $($_.Exception.Message)"
+        }
         return New-MO2ActionResult -Config $Config -Command 'renew-access' -Ok $true -State 'access-renewed' -Data @{ access = Get-MO2AccessLeaseSummary -Lock (Get-MO2SessionLockRecord -Path $current.path); estimateIsAdvisory = $true }
     }
 }
@@ -2152,6 +2160,55 @@ function Assert-MO2ExactProcessTargets {
     }
 }
 
+function Invoke-MO2OwnedProcessAction {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Owned,
+        [Parameter(Mandatory)]$Process,
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [AllowEmptyCollection()][object[]]$ArgumentList = @()
+    )
+
+    $payload = [pscustomobject][ordered]@{
+        owned = $Owned
+        process = $Process
+        action = $Action
+        arguments = @($ArgumentList)
+        config = $Config
+    }
+    return Invoke-WithMO2LeaseTransitionLock -LockPath ([string]$Owned.path) -Action {
+        param($Context)
+        $CurrentOwned = $Context.owned
+        $BoundProcess = $Context.process
+        $ExternalAction = $Context.action
+        $ExternalArguments = @($Context.arguments)
+        $FixtureConfig = $Context.config
+        $current = Assert-MO2OwnedSessionTransitionCurrent -Owned $CurrentOwned
+        $currentOwnedView = [pscustomobject][ordered]@{
+            path = $CurrentOwned.path
+            sessionId = $CurrentOwned.sessionId
+            accessId = $CurrentOwned.accessId
+            data = $current.data
+        }
+        $BoundProcess.Refresh()
+        $handle = $BoundProcess.SafeHandle
+        if ($handle.IsInvalid -or $handle.IsClosed -or $BoundProcess.HasExited) {
+            throw 'The retained MO2 process binding is no longer available.'
+        }
+        $boundRecord = [pscustomobject][ordered]@{
+            name = $BoundProcess.ProcessName
+            id = $BoundProcess.Id
+            path = [IO.Path]::GetFullPath($BoundProcess.Path)
+            startTime = $BoundProcess.StartTime.ToUniversalTime().ToString('o')
+        }
+        $resolution = Resolve-MO2OwnedProcessTarget -Config $FixtureConfig -Owned $currentOwnedView -Processes @($boundRecord)
+        if (-not $resolution.ok -or @($resolution.targets).Count -ne 1) {
+            throw "The retained MO2 process no longer has current session authority: $([string]$resolution.reason)"
+        }
+        return & $ExternalAction @ExternalArguments
+    } -ArgumentList @($payload)
+}
+
 function Invoke-MO2CooperativeCloseCore {
     param(
         [Parameter(Mandatory)]$Config,
@@ -2226,7 +2283,10 @@ function Invoke-MO2CooperativeCloseCore {
                 $unlockButtons = @(Get-MO2UnlockButtons -Window $window)
                 if ($unlockButtons.Count -gt 0) {
                     foreach ($button in $unlockButtons) {
-                        $invoked = Invoke-MO2AutomationButton -Button $button -ExpectedName 'Unlock'
+                        $invoked = Invoke-MO2OwnedProcessAction -Config $Config -Owned $Owned -Process $process -Action {
+                            param($targetButton)
+                            Invoke-MO2AutomationButton -Button $targetButton -ExpectedName 'Unlock'
+                        } -ArgumentList @($button)
                         $actions.Add([pscustomobject][ordered]@{
                             timestampUtc = [DateTime]::UtcNow.ToString('o')
                             processId = [int]$record.id
@@ -2239,7 +2299,10 @@ function Invoke-MO2CooperativeCloseCore {
                     continue
                 }
                 foreach ($menuItem in @(Get-MO2NamedMenuItems -Window $window -Name 'Exit')) {
-                    $invoked = Invoke-MO2AutomationButton -Button $menuItem -ExpectedName 'Exit'
+                    $invoked = Invoke-MO2OwnedProcessAction -Config $Config -Owned $Owned -Process $process -Action {
+                        param($targetMenuItem)
+                        Invoke-MO2AutomationButton -Button $targetMenuItem -ExpectedName 'Exit'
+                    } -ArgumentList @($menuItem)
                     $exitRequested = $exitRequested -or $invoked
                     $actions.Add([pscustomobject][ordered]@{
                         timestampUtc = [DateTime]::UtcNow.ToString('o')
@@ -2253,7 +2316,10 @@ function Invoke-MO2CooperativeCloseCore {
                 if ($mainHandle -ne 0 -and [int64]$window.Current.NativeWindowHandle -eq $mainHandle) {
                     if (-not $exitRequested) {
                         foreach ($fileMenu in @(Get-MO2NamedMenuItems -Window $window -Name 'File')) {
-                            $expanded = Expand-MO2AutomationMenu -MenuItem $fileMenu
+                            $expanded = Invoke-MO2OwnedProcessAction -Config $Config -Owned $Owned -Process $process -Action {
+                                param($targetMenuItem)
+                                Expand-MO2AutomationMenu -MenuItem $targetMenuItem
+                            } -ArgumentList @($fileMenu)
                             $exitRequested = $exitRequested -or $expanded
                             $actions.Add([pscustomobject][ordered]@{
                                 timestampUtc = [DateTime]::UtcNow.ToString('o')
@@ -2268,7 +2334,10 @@ function Invoke-MO2CooperativeCloseCore {
                     if ($exitRequested) {
                         Start-Sleep -Milliseconds 100
                         foreach ($menuItem in @(Get-MO2NamedMenuItems -Window $window -Name 'Exit')) {
-                            $invoked = Invoke-MO2AutomationButton -Button $menuItem -ExpectedName 'Exit'
+                            $invoked = Invoke-MO2OwnedProcessAction -Config $Config -Owned $Owned -Process $process -Action {
+                                param($targetMenuItem)
+                                Invoke-MO2AutomationButton -Button $targetMenuItem -ExpectedName 'Exit'
+                            } -ArgumentList @($menuItem)
                             $exitRequested = $exitRequested -or $invoked
                             $actions.Add([pscustomobject][ordered]@{
                                 timestampUtc = [DateTime]::UtcNow.ToString('o')
@@ -2285,7 +2354,10 @@ function Invoke-MO2CooperativeCloseCore {
                 $dialogKind = Get-MO2KnownDialogKind -Title ([string]$window.Current.Name) -Texts @(Get-MO2WindowTextElements -Window $window)
                 if ($dialogKind -eq 'failed-to-write-settings') {
                     foreach ($button in @(Get-MO2NamedButtons -Window $window -Name 'OK')) {
-                        $invoked = Invoke-MO2AutomationButton -Button $button -ExpectedName 'OK'
+                        $invoked = Invoke-MO2OwnedProcessAction -Config $Config -Owned $Owned -Process $process -Action {
+                            param($targetButton)
+                            Invoke-MO2AutomationButton -Button $targetButton -ExpectedName 'OK'
+                        } -ArgumentList @($button)
                         $actions.Add([pscustomobject][ordered]@{
                             timestampUtc = [DateTime]::UtcNow.ToString('o')
                             processId = [int]$record.id
@@ -2303,7 +2375,10 @@ function Invoke-MO2CooperativeCloseCore {
                     [int64]$_.Current.NativeWindowHandle -ne $mainHandle -and @(Get-MO2UnlockButtons -Window $_).Count -eq 0
                 })
                 foreach ($window in $secondary) {
-                    $requested = Request-MO2AutomationWindowClose -Window $window
+                    $requested = Invoke-MO2OwnedProcessAction -Config $Config -Owned $Owned -Process $process -Action {
+                        param($targetWindow)
+                        Request-MO2AutomationWindowClose -Window $targetWindow
+                    } -ArgumentList @($window)
                     $actions.Add([pscustomobject][ordered]@{
                         timestampUtc = [DateTime]::UtcNow.ToString('o')
                         processId = [int]$record.id
@@ -2316,7 +2391,10 @@ function Invoke-MO2CooperativeCloseCore {
             }
 
             if (-not $exitRequested) {
-                $accepted = $process.CloseMainWindow()
+                $accepted = Invoke-MO2OwnedProcessAction -Config $Config -Owned $Owned -Process $process -Action {
+                    param($boundProcess)
+                    $boundProcess.CloseMainWindow()
+                } -ArgumentList @($process)
                 $actions.Add([pscustomobject][ordered]@{
                     timestampUtc = [DateTime]::UtcNow.ToString('o')
                     processId = [int]$record.id
@@ -2328,7 +2406,7 @@ function Invoke-MO2CooperativeCloseCore {
             }
             }
             catch {
-                $blockedReason = 'live-owner-binding-unavailable'
+                $blockedReason = if ($_.Exception.Message -match 'lease transition is stale') { 'stale-session-generation' } else { $_.Exception.Message }
                 break
             }
             finally {
@@ -2731,6 +2809,12 @@ function Bind-MO2PreparedAccessLease {
         $bound | Add-Member -NotePropertyName runtimeRoute -NotePropertyValue $validatedRuntimeRoute -Force
         $bound | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $currentAccess.data) -Force
         Write-MO2JsonAtomic -Path $LockPath -Value $bound
+        try {
+            Write-MO2SessionManifestProjection -SessionData $bound
+        }
+        catch {
+            throw "The authoritative MO2 ownership lock committed generation $($bound.generation), but its session manifest projection failed and must be reconciled from that lock: $($_.Exception.Message)"
+        }
     } | Out-Null
 }
 
@@ -3835,6 +3919,12 @@ function Invoke-MO2RecoverClose {
             }
             $bound | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $currentAccess.data) -Force
             Write-MO2JsonAtomic -Path $lockPath -Value $bound
+            try {
+                Write-MO2SessionManifestProjection -SessionData $bound
+            }
+            catch {
+                throw "The authoritative MO2 ownership lock committed generation $($bound.generation), but its session manifest projection failed and must be reconciled from that lock: $($_.Exception.Message)"
+            }
         } | Out-Null
     }
     catch {
@@ -4211,6 +4301,61 @@ function Invoke-MO2Stop {
     return New-MO2ActionResult -Config $Config -Command 'stop' -Ok $closed -State $status -Data @{ before = $before.processes; afterGameClose = $after.processes; after = $final.processes; mo2Close = $close; forceTermination = $false; unrelatedProcessesTouched = @(); sessionPath = $owned.data.sessionPath } -Errors $(if ($closed) { @() } else { @('One or more exact owned processes remained after graceful game close and cooperative MO2 dialogue resolution; no force termination was attempted.') })
 }
 
+function Invoke-MO2ReleaseTransition {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Owned,
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$SessionPath,
+        [scriptblock]$InspectionFactory
+    )
+
+    $releaseAction = {
+        param($CurrentOwned, $RequestedSessionId, $RetainedSessionPath, $FixtureConfig, $CurrentInspectionFactory)
+        try {
+            $current = Assert-MO2OwnedSessionTransitionCurrent -Owned $CurrentOwned
+        }
+        catch {
+            return New-MO2ActionResult -Config $FixtureConfig -Command 'release' -Ok $false -State 'blocked' -Data @{ lock = Get-MO2SessionLockRecord -Path $CurrentOwned.path; sessionPath = $RetainedSessionPath } -Errors @("Lock ownership or generation changed before release; the newer lifecycle was retained. $($_.Exception.Message)")
+        }
+
+        $currentInspection = if ($CurrentInspectionFactory) {
+            & $CurrentInspectionFactory $FixtureConfig $current.data
+        }
+        else {
+            Get-MO2InspectionData -Config $FixtureConfig -RequestedProfile ([string]$current.data.profile) -RequestedExecutable ([string]$current.data.executable)
+        }
+        $activeBuildData = @($currentInspection.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
+        if (@($currentInspection.processes.game).Count -gt 0 -or @($currentInspection.processes.mo2).Count -gt 0 -or $activeBuildData.Count -gt 0) {
+            return New-MO2ActionResult -Config $FixtureConfig -Command 'release' -Ok $false -State 'blocked' -Data @{ processes = $currentInspection.processes; activeBuildData = $activeBuildData; lock = $current; sessionPath = $RetainedSessionPath } -Errors @('The session became active before release; its current lifecycle and evidence were retained.')
+        }
+
+        $nextGeneration = Get-MO2NextLeaseGeneration -Lease $current.data
+        $manifestPath = Join-Path $RetainedSessionPath 'session.json'
+        $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw)
+        $manifest.status = 'released'
+        $manifest | Add-Member -NotePropertyName releasedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
+        $manifest | Add-Member -NotePropertyName generation -NotePropertyValue $nextGeneration -Force
+        Write-MO2JsonAtomic -Path $manifestPath -Value $manifest
+
+        if ($current.acquisitionMode -eq 'explicit-access') {
+            $accessOnly = $current.data
+            $accessOnly.status = 'access-held'
+            $accessOnly.sessionId = $null
+            $accessOnly.sessionPath = $null
+            $accessOnly | Add-Member -NotePropertyName lastSessionId -NotePropertyValue $RequestedSessionId -Force
+            $accessOnly | Add-Member -NotePropertyName lastSessionReleasedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
+            $accessOnly | Add-Member -NotePropertyName generation -NotePropertyValue $nextGeneration -Force
+            if ($accessOnly.PSObject.Properties['ownerPid']) { $accessOnly.PSObject.Properties.Remove('ownerPid') }
+            Write-MO2JsonAtomic -Path $CurrentOwned.path -Value $accessOnly
+            return New-MO2ActionResult -Config $FixtureConfig -Command 'release' -Ok $true -State 'session-released-access-retained' -Data @{ sessionId = $RequestedSessionId; accessId = $current.accessId; lockPath = $CurrentOwned.path; sessionPath = $RetainedSessionPath; lockRemoved = $false; accessRetained = $true; sessionRetained = $true; releaseAccessRequired = $true }
+        }
+        Remove-Item -LiteralPath $CurrentOwned.path -Force
+        return New-MO2ActionResult -Config $FixtureConfig -Command 'release' -Ok $true -State 'released' -Data @{ sessionId = $RequestedSessionId; accessId = $current.accessId; lockPath = $CurrentOwned.path; sessionPath = $RetainedSessionPath; lockRemoved = $true; accessRetained = $false; sessionRetained = $true }
+    }
+    return Invoke-WithMO2LeaseTransitionLock -LockPath ([string]$Owned.path) -Action $releaseAction -ArgumentList @($Owned, $SessionId, $SessionPath, $Config, $InspectionFactory)
+}
+
 function Invoke-MO2Release {
     [CmdletBinding()]
     param(
@@ -4231,33 +4376,7 @@ function Invoke-MO2Release {
     }
 
     $sessionPath = [string]$owned.data.sessionPath
-    return Invoke-WithMO2LeaseTransitionLock -LockPath $owned.path -Action {
-        $current = Get-MO2SessionLockRecord -Path $owned.path
-        if (-not $current.valid -or $current.sessionId -ne $SessionId) {
-            return New-MO2ActionResult -Config $Config -Command 'release' -Ok $false -State 'blocked' -Data @{ lock = $current; sessionPath = $sessionPath } -Errors @('Lock ownership changed before release; the lock was retained.')
-        }
-
-        $manifestPath = Join-Path $sessionPath 'session.json'
-        $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw)
-        $manifest.status = 'released'
-        $manifest | Add-Member -NotePropertyName releasedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
-        Write-MO2JsonAtomic -Path $manifestPath -Value $manifest
-
-        if ($current.acquisitionMode -eq 'explicit-access') {
-            $accessOnly = $current.data
-            $accessOnly.status = 'access-held'
-            $accessOnly.sessionId = $null
-            $accessOnly.sessionPath = $null
-            $accessOnly | Add-Member -NotePropertyName lastSessionId -NotePropertyValue $SessionId -Force
-            $accessOnly | Add-Member -NotePropertyName lastSessionReleasedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
-            $accessOnly | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $current.data) -Force
-            if ($accessOnly.PSObject.Properties['ownerPid']) { $accessOnly.PSObject.Properties.Remove('ownerPid') }
-            Write-MO2JsonAtomic -Path $owned.path -Value $accessOnly
-            return New-MO2ActionResult -Config $Config -Command 'release' -Ok $true -State 'session-released-access-retained' -Data @{ sessionId = $SessionId; accessId = $current.accessId; lockPath = $owned.path; sessionPath = $sessionPath; lockRemoved = $false; accessRetained = $true; sessionRetained = $true; releaseAccessRequired = $true }
-        }
-        Remove-Item -LiteralPath $owned.path -Force
-        return New-MO2ActionResult -Config $Config -Command 'release' -Ok $true -State 'released' -Data @{ sessionId = $SessionId; accessId = $current.accessId; lockPath = $owned.path; sessionPath = $sessionPath; lockRemoved = $true; accessRetained = $false; sessionRetained = $true }
-    }
+    return Invoke-MO2ReleaseTransition -Config $Config -Owned $owned -SessionId $SessionId -SessionPath $sessionPath
 }
 
 function Invoke-MO2VerifiedForceTermination {
@@ -4340,25 +4459,27 @@ function Invoke-MO2Terminate {
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)][string]$SessionId,
         [ValidateRange(1, 600)][int]$TimeoutSeconds = 30,
-        [switch]$WhatIf
+        [switch]$WhatIf,
+        [scriptblock]$InspectionFactory
     )
 
     $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
-    $inspection = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$owned.data.profile) -RequestedExecutable ([string]$owned.data.executable)
-    if ($inspection.processes.game.Count -gt 0) {
+    $inspection = if ($InspectionFactory) {
+        & $InspectionFactory $Config $owned.data
+    }
+    else {
+        Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$owned.data.profile) -RequestedExecutable ([string]$owned.data.executable)
+    }
+    if (@($inspection.processes.game).Count -gt 0) {
         return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $false -State 'blocked' -Data @{ processes = $inspection.processes } -Errors @('Refusing forced MO2 termination while a game/loader process is running.')
     }
-    $rootBuilderData = Resolve-MO2ControlPath ([string]$Config.mo2.rootBuilderDataDirectory)
-    $activeBuildData = @()
-    if (Test-Path -LiteralPath $rootBuilderData -PathType Container) {
-        $activeBuildData = @(Get-ChildItem -LiteralPath $rootBuilderData -Filter 'BuildData.json' -File -Recurse -ErrorAction Stop)
-    }
+    $activeBuildData = @($inspection.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
     if ($activeBuildData.Count -gt 0) {
-        return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $false -State 'blocked' -Data @{ buildData = @($activeBuildData.FullName); processes = $inspection.processes } -Errors @('Refusing forced MO2 termination while RootBuilder BuildData.json remains active.')
+        return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $false -State 'blocked' -Data @{ buildData = @($activeBuildData | ForEach-Object { [string]$_.path }); processes = $inspection.processes } -Errors @('Refusing forced MO2 termination while RootBuilder BuildData.json remains active.')
     }
     $ownerPid = if ($owned.data.PSObject.Properties['ownerPid']) { [int]$owned.data.ownerPid } else { 0 }
     $targets = @($inspection.processes.mo2 | Where-Object { [int]$_.id -eq $ownerPid })
-    if ($inspection.processes.mo2.Count -gt 0 -and ($ownerPid -le 0 -or $targets.Count -ne 1 -or $inspection.processes.mo2.Count -ne 1)) {
+    if (@($inspection.processes.mo2).Count -gt 0 -and ($ownerPid -le 0 -or $targets.Count -ne 1 -or @($inspection.processes.mo2).Count -ne 1)) {
         return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $false -State 'blocked' -Data @{ processes = $inspection.processes; ownerPid = $ownerPid } -Errors @('Forced termination requires exactly one configured MO2 process matching the session owner PID.')
     }
     if ($targets.Count -gt 0) {
@@ -4377,7 +4498,28 @@ function Invoke-MO2Terminate {
             $forceTermination = Invoke-MO2OwnedSessionMutation -Owned $owned -Action {
                 param($currentData)
                 $currentOwned = [pscustomobject][ordered]@{ path = $owned.path; sessionId = $owned.sessionId; accessId = $owned.accessId; data = $currentData }
-                $currentProcesses = @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
+                $currentInspection = if ($InspectionFactory) {
+                    & $InspectionFactory $Config $currentData
+                }
+                else {
+                    Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$currentData.profile) -RequestedExecutable ([string]$currentData.executable)
+                }
+                $currentActiveBuildData = @($currentInspection.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
+                if (@($currentInspection.processes.game).Count -gt 0 -or $currentActiveBuildData.Count -gt 0) {
+                    $reason = if (@($currentInspection.processes.game).Count -gt 0) { 'game-or-loader-became-active' } else { 'rootbuilder-builddata-became-active' }
+                    return [pscustomobject][ordered]@{
+                        commit = $false
+                        sessionData = $currentData
+                        result = [pscustomobject][ordered]@{
+                            ok = $false
+                            state = 'blocked'
+                            reason = $reason
+                            gameProcesses = @($currentInspection.processes.game)
+                            activeRootBuilderBuildData = @($currentActiveBuildData | ForEach-Object { [string]$_.path })
+                        }
+                    }
+                }
+                $currentProcesses = @($currentInspection.processes.mo2)
                 $currentResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $currentOwned -Processes $currentProcesses
                 if (-not $currentResolution.ok -or @($currentResolution.targets).Count -ne 1) {
                     return [pscustomobject][ordered]@{ commit = $false; sessionData = $currentData; result = [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = [string]$currentResolution.reason; ownershipResolution = $currentResolution } }
@@ -4392,7 +4534,16 @@ function Invoke-MO2Terminate {
             }
         }
         if (-not $forceTermination.ok) {
-            return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $false -State 'blocked' -Data @{ processes = $inspection.processes; ownerPid = $ownerPid; forceTermination = $forceTermination } -Errors @('The live MO2 process no longer matches the exact recorded owner identity; forced termination is refused.')
+            $message = if ([string]$forceTermination.reason -eq 'game-or-loader-became-active') {
+                'A game or loader became active before the serialized termination boundary; forced MO2 termination is refused.'
+            }
+            elseif ([string]$forceTermination.reason -eq 'rootbuilder-builddata-became-active') {
+                'RootBuilder BuildData.json became active before the serialized termination boundary; forced MO2 termination is refused.'
+            }
+            else {
+                'The live MO2 process no longer matches the exact recorded owner identity; forced termination is refused.'
+            }
+            return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $false -State 'blocked' -Data @{ processes = $inspection.processes; ownerPid = $ownerPid; forceTermination = $forceTermination } -Errors @($message)
         }
     }
     if ($WhatIf) {
@@ -4405,10 +4556,17 @@ function Invoke-MO2Terminate {
         if ($remaining.Count -eq 0) { break }
     } while ([DateTime]::UtcNow -lt $deadline)
     $terminated = $remaining.Count -eq 0
+    $finalInspection = if ($InspectionFactory) {
+        & $InspectionFactory $Config $owned.data
+    }
+    else {
+        Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$owned.data.profile) -RequestedExecutable ([string]$owned.data.executable)
+    }
+    $finalActiveBuildData = @($finalInspection.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
     $owned.data.status = if ($terminated) { 'mo2-terminated' } else { 'terminate-incomplete' }
     $owned.data | Add-Member -NotePropertyName terminatedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
     $null = Write-MO2OwnedSessionAtomic -Owned $owned -Value $owned.data
-    return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $terminated -State $owned.data.status -Data @{ targets = $targets; remaining = $remaining; gameProcesses = @(); activeRootBuilderBuildData = @(); sessionPath = $owned.data.sessionPath } -Errors $(if ($terminated) { @() } else { @('MO2 remained after exact forced termination was requested.') })
+    return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $terminated -State $owned.data.status -Data @{ targets = $targets; remaining = $remaining; gameProcesses = @($finalInspection.processes.game); activeRootBuilderBuildData = @($finalActiveBuildData | ForEach-Object { [string]$_.path }); sessionPath = $owned.data.sessionPath } -Errors $(if ($terminated) { @() } else { @('MO2 remained after exact forced termination was requested.') })
 }
 
 function Get-MO2ControlHelp {

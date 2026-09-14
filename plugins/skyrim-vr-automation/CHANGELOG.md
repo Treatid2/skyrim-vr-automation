@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Qualify every cooperative-close UI mutation against the current lease
+  generation, refuse stale session release after a competing lifecycle change,
+  and recheck game/loader and RootBuilder vetoes inside forced MO2 termination.
+- Project initial and recovery session binding plus in-session access renewal
+  into `session.json` at the authoritative lock generation, including
+  attributable projection failure and renewal-based reconciliation.
 - Revalidate the exact live MO2 owner inside the serialized game-identity commit
   and immediately before exact game termination, so owner exit or replacement
   cannot publish `running` state or strand RootBuilder restoration.
