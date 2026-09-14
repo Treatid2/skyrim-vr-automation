@@ -3167,8 +3167,10 @@ function Assert-MO2ExactProcessTargets {
 function Invoke-MO2CooperativeCloseCore {
     param(
         [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Owned,
         [Parameter(Mandatory)][object[]]$InitialProcesses,
-        [ValidateRange(1, 600)][int]$TimeoutSeconds = 90
+        [ValidateRange(1, 600)][int]$TimeoutSeconds = 90,
+        [scriptblock]$ProcessInventoryFactory
     )
 
     Assert-MO2ExactProcessTargets -Config $Config -Processes $InitialProcesses
@@ -3176,15 +3178,41 @@ function Invoke-MO2CooperativeCloseCore {
     $actions = [System.Collections.Generic.List[object]]::new()
     $beforeWindows = @(Get-MO2WindowSnapshot -Processes $InitialProcesses)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $blockedReason = $null
+    $ownershipResolution = $null
+    if (-not $ProcessInventoryFactory) {
+        $ProcessInventoryFactory = { param($fixtureConfig) @(Get-MO2ProcessRecords -Names @($fixtureConfig.mo2.processNames)) }
+    }
 
     do {
-        $liveRecords = @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames) | Where-Object { $targetIds -contains [int]$_.id })
-        if ($liveRecords.Count -eq 0) { break }
-        Assert-MO2ExactProcessTargets -Config $Config -Processes $liveRecords
+        $currentInventory = @(& $ProcessInventoryFactory $Config)
+        if ($currentInventory.Count -eq 0) { break }
+        $ownershipResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $Owned -Processes $currentInventory
+        if (-not $ownershipResolution.ok -or @($ownershipResolution.targets).Count -ne 1) {
+            $blockedReason = [string]$ownershipResolution.reason
+            break
+        }
+        $liveRecords = @($ownershipResolution.targets)
 
         foreach ($record in $liveRecords) {
             $process = Get-Process -Id ([int]$record.id) -ErrorAction SilentlyContinue
             if (-not $process) { continue }
+            try {
+                # Keep the kernel process object open for the complete UI-action
+                # boundary so this PID cannot be recycled underneath window APIs.
+                $handle = $process.SafeHandle
+                if ($handle.IsInvalid -or $handle.IsClosed) { throw 'The process handle is unavailable.' }
+                $boundRecord = [pscustomobject][ordered]@{
+                    name = $process.ProcessName
+                    id = $process.Id
+                    path = [IO.Path]::GetFullPath($process.Path)
+                    startTime = $process.StartTime.ToUniversalTime().ToString('o')
+                }
+                $boundIdentity = Test-MO2OwnedProcessIdentity -Owned $Owned -ProcessRecord $boundRecord
+                if (-not $boundIdentity.ok) {
+                    $blockedReason = [string]$boundIdentity.reason
+                    break
+                }
             $nativeVisibility = @{}
             foreach ($native in @(Get-MO2NativeWindows -ProcessId ([int]$record.id))) {
                 $nativeVisibility[[string][int64]$native.handle] = [bool]$native.visible
@@ -3329,16 +3357,31 @@ function Invoke-MO2CooperativeCloseCore {
                     accepted = [bool]$accepted
                 })
             }
+            }
+            catch {
+                $blockedReason = 'live-owner-binding-unavailable'
+                break
+            }
+            finally {
+                $process.Dispose()
+            }
         }
+        if (-not [string]::IsNullOrWhiteSpace($blockedReason)) { break }
         Start-Sleep -Milliseconds 500
     } while ([DateTime]::UtcNow -lt $deadline)
 
-    $remaining = @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames) | Where-Object { $targetIds -contains [int]$_.id })
-    if ($remaining.Count -gt 0) {
-        Assert-MO2ExactProcessTargets -Config $Config -Processes $remaining
+    $remaining = @(& $ProcessInventoryFactory $Config)
+    if ($remaining.Count -gt 0 -and [string]::IsNullOrWhiteSpace($blockedReason)) {
+        $ownershipResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $Owned -Processes $remaining
+        if (-not $ownershipResolution.ok -or @($ownershipResolution.targets).Count -ne 1) {
+            $blockedReason = [string]$ownershipResolution.reason
+        }
     }
     return [pscustomobject][ordered]@{
-        closed = $remaining.Count -eq 0
+        closed = $remaining.Count -eq 0 -and [string]::IsNullOrWhiteSpace($blockedReason)
+        ownerIdentityVerified = [string]::IsNullOrWhiteSpace($blockedReason)
+        blockedReason = $blockedReason
+        ownershipResolution = $ownershipResolution
         targetProcessIds = @($targetIds)
         beforeWindows = @($beforeWindows)
         actions = @($actions)
@@ -3352,6 +3395,7 @@ function Invoke-MO2CooperativeCloseCore {
 function Invoke-MO2CooperativeClose {
     param(
         [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Owned,
         [Parameter(Mandatory)][object[]]$InitialProcesses,
         [Parameter(Mandatory)][string]$EvidenceDirectory,
         [ValidateRange(1, 600)][int]$TimeoutSeconds = 90
@@ -3373,7 +3417,7 @@ function Invoke-MO2CooperativeClose {
             unrelatedProcessesTouched = @()
         }
     }
-    $close = Invoke-MO2CooperativeCloseCore -Config $Config -InitialProcesses $InitialProcesses -TimeoutSeconds $TimeoutSeconds
+    $close = Invoke-MO2CooperativeCloseCore -Config $Config -Owned $Owned -InitialProcesses $InitialProcesses -TimeoutSeconds $TimeoutSeconds
     $close | Add-Member -NotePropertyName route -NotePropertyValue 'current-interactive-desktop' -Force
     return $close
 }
@@ -4554,7 +4598,7 @@ function Invoke-MO2Close {
         return New-MO2ActionResult -Config $Config -Command 'close' -Ok $true -State 'mo2-closed' -Data @{ sessionId = $SessionId; alreadyClosed = $true; forceTermination = $false; unrelatedProcessesTouched = @(); sessionPath = $owned.data.sessionPath }
     }
 
-    $close = Invoke-MO2CooperativeClose -Config $Config -InitialProcesses $targets -EvidenceDirectory ([string]$owned.data.sessionPath) -TimeoutSeconds $TimeoutSeconds
+    $close = Invoke-MO2CooperativeClose -Config $Config -Owned $owned -InitialProcesses $targets -EvidenceDirectory ([string]$owned.data.sessionPath) -TimeoutSeconds $TimeoutSeconds
     $final = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$owned.data.profile) -RequestedExecutable ([string]$owned.data.executable)
     $activeBuildData = @($final.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
     $closed = $close.closed -and $final.processes.mo2.Count -eq 0 -and $activeBuildData.Count -eq 0
@@ -4636,6 +4680,8 @@ function Invoke-MO2RecoverClose {
         runtimeRoute = $runtimeRoute
         mo2Path = [string]$inspection.config.mo2Executable
         ownerPid = [int]$targets[0].id
+        processPath = [IO.Path]::GetFullPath([string]$targets[0].path)
+        processStartTime = [string]$targets[0].startTime
         recovery = $true
         accessId = $AccessId
         acquisitionMode = 'explicit-access'
@@ -4668,6 +4714,8 @@ function Invoke-MO2RecoverClose {
         runtimeRoute = $runtimeRoute
         controllerPath = [string]$controller.controllerPath
         ownerPid = [int]$targets[0].id
+        processPath = [IO.Path]::GetFullPath([string]$targets[0].path)
+        processStartTime = [string]$targets[0].startTime
         recovery = $true
     }
     if ($WhatIf) {
@@ -4688,7 +4736,7 @@ function Invoke-MO2RecoverClose {
                 throw "The access lease runtime route changed before recovery-close binding ('$($runtimeRoute.id)' to '$($validatedRuntimeRoute.id)')."
             }
             $bound = $currentAccess.data
-            foreach ($propertyName in @('sessionId', 'sessionPath', 'status', 'createdUtc', 'profile', 'profileName', 'profileDirectory', 'modListPath', 'executable', 'runtimeRoute', 'controllerPath', 'ownerPid', 'recovery')) {
+            foreach ($propertyName in @('sessionId', 'sessionPath', 'status', 'createdUtc', 'profile', 'profileName', 'profileDirectory', 'modListPath', 'executable', 'runtimeRoute', 'controllerPath', 'ownerPid', 'processPath', 'processStartTime', 'recovery')) {
                 $bound | Add-Member -NotePropertyName $propertyName -NotePropertyValue $lock.$propertyName -Force
             }
             $bound | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $currentAccess.data) -Force
@@ -4699,7 +4747,7 @@ function Invoke-MO2RecoverClose {
         throw "Failed to acquire recovery session '$sessionId'. Evidence is retained at '$sessionPath'. $($_.Exception.Message)"
     }
 
-    $close = Invoke-MO2CooperativeClose -Config $Config -InitialProcesses $targets -EvidenceDirectory $sessionPath -TimeoutSeconds $TimeoutSeconds
+    $close = Invoke-MO2CooperativeClose -Config $Config -Owned (Get-MO2OwnedSession -Config $Config -SessionId $sessionId) -InitialProcesses $targets -EvidenceDirectory $sessionPath -TimeoutSeconds $TimeoutSeconds
     $owned = Get-MO2OwnedSession -Config $Config -SessionId $sessionId
     $final = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$owned.data.profile) -RequestedExecutable ([string]$owned.data.executable)
     $activeBuildData = @($final.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
@@ -5037,12 +5085,16 @@ function Invoke-MO2Stop {
     }
 
     $remainingSeconds = [math]::Max(1, [int][math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds))
-    $currentMO2 = @($after.processes.mo2 | Where-Object { [int]$_.id -eq $ownerPid })
-    $close = if ($currentMO2.Count -gt 0) {
-        Invoke-MO2CooperativeClose -Config $Config -InitialProcesses $currentMO2 -EvidenceDirectory ([string]$owned.data.sessionPath) -TimeoutSeconds $remainingSeconds
+    $currentOwnerResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @($after.processes.mo2)
+    $currentMO2 = @($currentOwnerResolution.targets)
+    $close = if ($currentOwnerResolution.ok -and $currentMO2.Count -eq 1) {
+        Invoke-MO2CooperativeClose -Config $Config -Owned $owned -InitialProcesses $currentMO2 -EvidenceDirectory ([string]$owned.data.sessionPath) -TimeoutSeconds $remainingSeconds
+    }
+    elseif ($after.processes.mo2.Count -eq 0) {
+        [pscustomobject][ordered]@{ closed = $true; targetProcessIds = @(); beforeWindows = @(); actions = @(); remaining = @(); remainingWindows = @(); forceTermination = $false; unrelatedProcessesTouched = @() }
     }
     else {
-        [pscustomobject][ordered]@{ closed = $true; targetProcessIds = @(); beforeWindows = @(); actions = @(); remaining = @(); remainingWindows = @(); forceTermination = $false; unrelatedProcessesTouched = @() }
+        [pscustomobject][ordered]@{ closed = $false; ownerIdentityVerified = $false; blockedReason = [string]$currentOwnerResolution.reason; ownershipResolution = $currentOwnerResolution; targetProcessIds = @(); beforeWindows = @(); actions = @(); remaining = @($after.processes.mo2); remainingWindows = @(); forceTermination = $false; unrelatedProcessesTouched = @() }
     }
     $final = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$owned.data.profile) -RequestedExecutable ([string]$owned.data.executable)
     $activeBuildData = @($final.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })

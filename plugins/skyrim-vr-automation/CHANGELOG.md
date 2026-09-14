@@ -7,6 +7,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - Reject stale lease generations at the serialized MO2 session commit boundary
   and bind detached handoff ancestry to the dispatched helper's exact process
   lifetime.
+- Revalidate and retain the exact MO2 owner process lifetime across every
+  cooperative-close UI action, including the stop path after game shutdown.
 - Treat every named outcome-map member as required unless it is explicitly
   typed metadata, make rejected outcomes a global semantic veto, qualify menu
   and current-state wait probes before barrier evaluation, reject present-null
