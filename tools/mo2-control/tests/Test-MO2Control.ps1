@@ -209,6 +209,18 @@ selected_profile=@ByteArray(Codex)
     $openingReady = & $mo2Module { param($owned, $resolution) Test-MO2OpeningReady -Owned $owned -OwnershipResolution $resolution -MO2Processes @([pscustomobject]@{ id = 101 }) -GameProcesses @() -Windows @([pscustomobject]@{ visible = $true; automationId = 'MainWindow' }) } $openingOwned $openingResolution
     Assert-MO2Test $openingReady 'an exact adopted StartOnly MO2 main window is eligible for durable mo2-open promotion'
 
+    $launchUtc = [DateTimeOffset]::UtcNow.AddSeconds(-1)
+    $launchingOwned = [pscustomobject]@{ data = [pscustomobject]@{ status = 'launching'; launchedUtc = $launchUtc.ToString('o'); ownerPid = 101; gameProcesses = @() } }
+    $launchOwner = [pscustomobject]@{ ok = $true; ownerPid = 101; targets = @([pscustomobject]@{ id = 101 }) }
+    $observedGame = [pscustomobject]@{ id = 202; name = 'MO2ControlImpossibleFixtureGame'; path = 'C:\Games\MO2ControlImpossibleFixtureGame.exe'; startTime = [DateTimeOffset]::UtcNow.ToString('o') }
+    $gameAdoption = & $mo2Module { param($cfg, $owned, $resolution, $processes) Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -OwnershipResolution $resolution -Processes $processes } $config $launchingOwned $launchOwner @($observedGame)
+    Assert-MO2Test ($gameAdoption.eligible -and $gameAdoption.records.Count -eq 1 -and $gameAdoption.records[0].id -eq 202 -and $gameAdoption.records[0].path -eq 'C:\Games\MO2ControlImpossibleFixtureGame.exe') 'StartOnly status can adopt one exact configured post-launch game identity under the proven MO2 owner'
+    $predatingGame = [pscustomobject]@{ id = 203; name = 'MO2ControlImpossibleFixtureGame'; path = 'C:\Games\MO2ControlImpossibleFixtureGame.exe'; startTime = $launchUtc.AddMinutes(-1).ToString('o') }
+    $predatingAdoption = & $mo2Module { param($cfg, $owned, $resolution, $processes) Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -OwnershipResolution $resolution -Processes $processes } $config $launchingOwned $launchOwner @($predatingGame)
+    Assert-MO2Test (-not $predatingAdoption.eligible -and $predatingAdoption.reasons -contains 'game-predates-launch:203') 'status refuses to assign a pre-existing game process to a StartOnly launch'
+    $moduleSource = Get-Content -LiteralPath (Join-Path $packageRoot 'MO2Control.psm1') -Raw
+    Assert-MO2Test ($moduleSource -match "Set-MO2OwnedSessionGameProcesses .* -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc'") 'status durably records the verified observed identity and running transition in one session update'
+
     $missingProfile = Invoke-MO2Validate -Config $config -Profile 'Does Not Exist'
     Assert-MO2Test (-not $missingProfile.ok) 'missing exact profile blocks validation'
     Assert-MO2Test (@($missingProfile.checks | Where-Object { $_.name -eq 'requested-profile' -and $_.status -eq 'fail' }).Count -eq 1) 'profile fallback is never accepted'

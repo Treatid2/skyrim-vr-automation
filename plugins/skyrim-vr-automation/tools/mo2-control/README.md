@@ -40,7 +40,11 @@ game cycling and explicit safe-gated termination remain available.
 start only the intended process, return immediately with the session/evidence
 path, and direct the caller to poll `status`. When `status` proves the one exact
 adopted MO2 process and its visible `MainWindow`, it advances an `opening`
-session to durable `mo2-open` so a later game launch is valid. A missing session
+session to durable `mo2-open` so a later game launch is valid. After a
+`launch -StartOnly`, `status` also adopts only configured game/loader identities
+whose PID, process name, executable path, and start time bind them to the
+recorded launch and exact MO2 owner. This makes later exact `terminate-game`
+and RootBuilder recovery available without reissuing the launch. A missing session
 ID is a structured `missing-session-id` precondition instead of a PowerShell
 binding failure. Launch classifies the exact `Failed to write settings` dialog
 and cooperative close acknowledges only its exact `OK` button.
@@ -234,8 +238,9 @@ Immediately after process creation it writes `mo2-open-started.json` and marks
 the owned session `opening`. If the caller's outer timeout expires before UIA
 readiness, a later `status`, `close`, or `recover-close` still has durable PID,
 path, argument, and timestamp evidence for exact-process adoption.
-`status` is bounded and mutates only the durable `opening` to `mo2-open`
-transition after exact process and visible-main-window proof. `stop-game`
+`status` is bounded and mutates only proven lifecycle transitions: `opening` to
+`mo2-open`, or `launching` to `running` with exact post-launch process identities.
+`stop-game`
 requests normal closure of the owned game/loader while preserving the exact
 owner MO2 PID, allowing controlled relaunches. After the game exits it first
 observes the exact session-owned MO2 PID for a bounded stability window,
