@@ -276,6 +276,30 @@ try {
     Assert-Test ([string]$unchangedRestore.operation -ceq 'restore-noop' -and -not [bool]$unchangedRestore.restorationNecessary -and
         [string]$unchangedRestore.restoredTreeSha256 -ieq [string]$unchangedRestore.displacedTreeSha256 -and
         [IO.Path]::GetFullPath([string]$unchangedRestore.displacedPath) -eq [IO.Path]::GetFullPath((Join-Path $unchangedEvidence 'cache.before'))) 'unchanged completion records a committed no-op restore bound to the preserved snapshot instead of rebuilding the same live tree'
+    $unchangedCompletionPath = Join-Path $unchangedEvidence 'shader-cache-task.completion.json'
+    $unchangedJournalPath = Join-Path $unchangedEvidence "shader-cache-restore.$([string]$unchangedRestore.transactionId).journal.json"
+    Remove-Item -LiteralPath $unchangedCompletionPath, $unchangedJournalPath -Force
+    $noopDriftPath = Join-Path $unchangedCache 'unexpected-after-receipt.bin'
+    [IO.File]::WriteAllBytes($noopDriftPath, [byte[]](9, 9, 9))
+    $unsafeNoOpRecovery = Invoke-Catalog @{
+        Command = 'complete'; CatalogRoot = $unchangedCatalog
+        CachePath = $unchangedCache; EvidenceDirectory = $unchangedEvidence
+        WorkingSetStatus = 'unverified'; BlockingProcessNames = $blockers
+        Confirm = $false; Compact = $true; NoExit = $true
+    }
+    Assert-Test (-not $unsafeNoOpRecovery.ok -and $unsafeNoOpRecovery.errors[0] -match 'Live cache no longer matches' -and
+        -not (Test-Path -LiteralPath $unchangedJournalPath -PathType Leaf) -and
+        -not (Test-Path -LiteralPath $unchangedCompletionPath -PathType Leaf)) 'receipt-only no-op recovery rejects live baseline drift without creating a journal or completion'
+    Remove-Item -LiteralPath $noopDriftPath -Force
+    $recoveredNoOpCompletion = Invoke-Catalog @{
+        Command = 'complete'; CatalogRoot = $unchangedCatalog
+        CachePath = $unchangedCache; EvidenceDirectory = $unchangedEvidence
+        Promote = $true; WorkingSetStatus = 'known-working'; Label = 'recovered no-op fixture'
+        BlockingProcessNames = $blockers; Confirm = $false; Compact = $true; NoExit = $true
+    }
+    $recoveredNoOpJournal = Get-Content -LiteralPath $unchangedJournalPath -Raw | ConvertFrom-Json -Depth 30
+    Assert-Test ($recoveredNoOpCompletion.ok -and $recoveredNoOpCompletion.data.task.promoted.state -eq 'captured' -and
+        [bool]$recoveredNoOpJournal.recoveredFromReceipt -and [string]$recoveredNoOpJournal.phase -ceq 'committed') 'receipt-only no-op recovery revalidates exact evidence, recreates the committed journal, and supports promotion source proof'
 
     $recoveryCatalog = Join-Path $resolvedTestRoot 'post-restore-catalog'
     $recoveryCache = Join-Path $resolvedTestRoot 'post-restore-live\ShaderCache'

@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Recover an interrupted receipt-only no-op completion after revalidating the
+  exact task evidence, and admit its receipt as promotion source proof.
 - Complete failed or unverified shader-cache tasks without a physical restore
   when the live tree still exactly matches the prepared baseline, recording a
   committed no-op restore proof bound to the original snapshot.
