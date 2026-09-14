@@ -183,16 +183,23 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test $openingReady 'an exact adopted StartOnly MO2 main window is eligible for durable mo2-open promotion'
 
     $launchUtc = [DateTimeOffset]::UtcNow.AddSeconds(-1)
-    $launchingOwned = [pscustomobject]@{ data = [pscustomobject]@{ status = 'launching'; launchedUtc = $launchUtc.ToString('o'); ownerPid = 101; gameProcesses = @() } }
-    $launchOwner = [pscustomobject]@{ ok = $true; ownerPid = 101; targets = @([pscustomobject]@{ id = 101 }) }
+    $ownerStartUtc = [DateTimeOffset]::UtcNow.AddSeconds(-2)
+    $launchingOwned = [pscustomobject]@{ data = [pscustomobject]@{ status = 'launching'; launchedUtc = $launchUtc.ToString('o'); ownerPid = 101; ownerProcessPath = $mo2Exe; ownerProcessStartTime = $ownerStartUtc.ToString('o'); gameProcesses = @() } }
+    $launchOwner = [pscustomobject]@{ ok = $true; ownerPid = 101; targets = @([pscustomobject]@{ id = 101; name = 'MO2ControlFixtureProcess'; path = $mo2Exe; startTime = $ownerStartUtc.ToString('o') }) }
     $observedGame = [pscustomobject]@{ id = 202; name = 'MO2ControlImpossibleFixtureGame'; path = 'C:\Games\MO2ControlImpossibleFixtureGame.exe'; startTime = [DateTimeOffset]::UtcNow.ToString('o') }
     $gameAdoption = & $mo2Module { param($cfg, $owned, $resolution, $processes) Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -OwnershipResolution $resolution -Processes $processes } $config $launchingOwned $launchOwner @($observedGame)
     Assert-MO2Test ($gameAdoption.eligible -and $gameAdoption.records.Count -eq 1 -and $gameAdoption.records[0].id -eq 202 -and $gameAdoption.records[0].path -eq 'C:\Games\MO2ControlImpossibleFixtureGame.exe') 'StartOnly status can adopt one exact configured post-launch game identity under the proven MO2 owner'
     $predatingGame = [pscustomobject]@{ id = 203; name = 'MO2ControlImpossibleFixtureGame'; path = 'C:\Games\MO2ControlImpossibleFixtureGame.exe'; startTime = $launchUtc.AddMinutes(-1).ToString('o') }
     $predatingAdoption = & $mo2Module { param($cfg, $owned, $resolution, $processes) Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -OwnershipResolution $resolution -Processes $processes } $config $launchingOwned $launchOwner @($predatingGame)
     Assert-MO2Test (-not $predatingAdoption.eligible -and $predatingAdoption.reasons -contains 'game-predates-launch:203') 'status refuses to assign a pre-existing game process to a StartOnly launch'
+    $reusedOwnerRecord = [pscustomobject]@{ id = 101; name = 'MO2ControlFixtureProcess'; path = $mo2Exe; startTime = $ownerStartUtc.AddMinutes(1).ToString('o') }
+    $reusedOwnerResolution = & $mo2Module { param($cfg, $owned, $process) Resolve-MO2OwnedProcessTarget -Config $cfg -Owned $owned -Processes @($process) } $config $launchingOwned $reusedOwnerRecord
+    $reusedOwnerAdoption = & $mo2Module { param($cfg, $owned, $resolution, $processes) Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -OwnershipResolution $resolution -Processes $processes } $config $launchingOwned ([pscustomobject]@{ ok = $true; ownerPid = 101; targets = @($reusedOwnerRecord) }) @($observedGame)
+    Assert-MO2Test (-not $reusedOwnerResolution.ok -and $reusedOwnerResolution.reason -eq 'recorded-owner-start-time-mismatch') 'recorded MO2 ownership rejects a reused PID with a different process start time'
+    Assert-MO2Test (-not $reusedOwnerAdoption.eligible -and $reusedOwnerAdoption.reasons -contains 'recorded-owner-start-time-mismatch') 'StartOnly status cannot adopt game identities under a PID-only MO2 ownership match'
     $moduleSource = Get-Content -LiteralPath (Join-Path $packageRoot 'MO2Control.psm1') -Raw
     Assert-MO2Test ($moduleSource -match "Set-MO2OwnedSessionGameProcesses .* -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc'") 'status durably records the verified observed identity and running transition in one session update'
+    Assert-MO2Test ($moduleSource -match 'ownerProcessPath' -and $moduleSource -match 'ownerProcessStartTime') 'launch and detached-owner adoption persist exact MO2 path and start-time identity'
 
     $missingProfile = Invoke-MO2Validate -Config $config -Profile 'Does Not Exist'
     Assert-MO2Test (-not $missingProfile.ok) 'missing exact profile blocks validation'
