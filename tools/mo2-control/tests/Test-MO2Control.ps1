@@ -359,11 +359,50 @@ selected_profile=@ByteArray(Codex)
     $unrecordedGame = $observedGame | ConvertTo-Json -Depth 20 | ConvertFrom-Json
     $unrecordedGame.id = [int]$observedGame.id + 1
     $unrecordedGame.startTime = ([DateTimeOffset]::Parse([string]$observedGame.startTime)).AddSeconds(1).UtcDateTime.ToString('o')
-    $unrecordedInspection = [pscustomobject]@{ processes = [pscustomobject]@{ game = @($observedGame, $unrecordedGame) } }
+    $unrecordedInspection = [pscustomobject]@{ processes = [pscustomobject]@{ game = @($observedGame, $unrecordedGame); mo2 = @($launchOwner.targets) } }
     $unrecordedCloseCalls = [Collections.Generic.List[string]]::new()
     $unrecordedCloser = { param($process) $unrecordedCloseCalls.Add([string]$process.id) }.GetNewClosure()
     $unrecordedClose = & $mo2Module { param($cfg, $owned, $data, $inspection, $closer) Invoke-MO2CurrentGameCloseRequest -Config $cfg -Owned $owned -CurrentData $data -CurrentInspection $inspection -CloseAction $closer } $config $recordedCloseOwned $recordedCloseOwned.data $unrecordedInspection $unrecordedCloser
     Assert-MO2Test (-not $unrecordedClose.ok -and $unrecordedClose.reason -eq 'unrecorded-game-process-present' -and $unrecordedCloseCalls.Count -eq 0) 'graceful game close refuses a configured but session-unrecorded process without invoking CloseMainWindow'
+    $missingOwnerInspection = [pscustomobject]@{ processes = [pscustomobject]@{ game = @($observedGame); mo2 = @() } }
+    $missingOwnerClose = & $mo2Module { param($cfg, $owned, $data, $inspection, $closer) Invoke-MO2CurrentGameCloseRequest -Config $cfg -Owned $owned -CurrentData $data -CurrentInspection $inspection -CloseAction $closer } $config $recordedCloseOwned $recordedCloseOwned.data $missingOwnerInspection $unrecordedCloser
+    Assert-MO2Test (-not $missingOwnerClose.ok -and $missingOwnerClose.reason -eq 'mo2-owner-changed-before-game-close' -and $unrecordedCloseCalls.Count -eq 0) 'graceful game close requires the exact current MO2 owner before invoking CloseMainWindow'
+
+    $dialogAuthority = & $mo2Module {
+        param($cfg, $owned, $ownerRecord)
+        $originalSnapshot = (Get-Command Get-MO2WindowSnapshot -CommandType Function).ScriptBlock
+        $originalTexts = (Get-Command Get-MO2WindowTextElements -CommandType Function).ScriptBlock
+        $originalKind = (Get-Command Get-MO2KnownDialogKind -CommandType Function).ScriptBlock
+        $originalButtons = (Get-Command Get-MO2NamedButtons -CommandType Function).ScriptBlock
+        $script:DialogAuthorityAttempts = 0
+        $script:DialogAuthorityExecutions = 0
+        try {
+            Set-Item Function:script:Get-MO2WindowSnapshot { @() }
+            Set-Item Function:script:Get-MO2WindowTextElements { @('fixture') }
+            Set-Item Function:script:Get-MO2KnownDialogKind { 'failed-to-run' }
+            Set-Item Function:script:Get-MO2NamedButtons { param($Window, $Name) @([pscustomobject]@{ Name=$Name }) }
+            $window = [pscustomobject]@{ Current=[pscustomobject]@{ AutomationId='Dialog'; Name='fixture failed to run'; NativeWindowHandle=42 } }
+            $binding = { param($ProcessId) [pscustomobject]@{ available=$true; reason='bound'; process=[pscustomobject]@{ id=$ProcessId }; record=$ownerRecord } }.GetNewClosure()
+            $windows = { param($Binding) @($window) }.GetNewClosure()
+            $guardedAction = {
+                param($AuthorityOwned, $Binding, $Action, [object[]]$Arguments)
+                $script:DialogAuthorityAttempts++
+                if ($script:DialogAuthorityAttempts -gt 1) { throw 'lease transition is stale: fixture' }
+                $script:DialogAuthorityExecutions++
+                return $true
+            }
+            $result = Invoke-MO2RetainedSessionDialogCleanup -Config $cfg -Owned $owned -Processes @($ownerRecord) -TimeoutSeconds 1 -BindingFactory $binding -WindowFactory $windows -OwnedAction $guardedAction
+            [pscustomobject]@{ result=$result; attempts=$script:DialogAuthorityAttempts; executions=$script:DialogAuthorityExecutions }
+        }
+        finally {
+            Set-Item Function:script:Get-MO2WindowSnapshot -Value $originalSnapshot
+            Set-Item Function:script:Get-MO2WindowTextElements -Value $originalTexts
+            Set-Item Function:script:Get-MO2KnownDialogKind -Value $originalKind
+            Set-Item Function:script:Get-MO2NamedButtons -Value $originalButtons
+            Remove-Variable -Scope Script -Name DialogAuthorityAttempts, DialogAuthorityExecutions -ErrorAction SilentlyContinue
+        }
+    } $config $launchingOwned $launchOwner.targets[0]
+    Assert-MO2Test (-not $dialogAuthority.result.cleared -and $dialogAuthority.result.blockedReason -eq 'stale-session-generation' -and $dialogAuthority.attempts -eq 2 -and $dialogAuthority.executions -eq 1) 'retained dialog cleanup revalidates current generation before every UI action and stops between controls when authority changes'
     $stopGameSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2StopGame \{.*?\n\}').Value
     $stopSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Stop \{.*?\n\}').Value
     $ownedCloseSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2OwnedGameCloseRequest \{.*?\n\}').Value
@@ -372,8 +411,11 @@ selected_profile=@ByteArray(Codex)
         $stopGameSource -notmatch 'Invoke-MO2OwnedGameCloseRequest[^\r\n]+-Targets' -and
         $stopSource -notmatch 'Invoke-MO2OwnedGameCloseRequest[^\r\n]+-Targets' -and
         $ownedCloseSource -match 'Invoke-MO2CurrentGameCloseRequest[^\r\n]+-CurrentData \$currentData' -and
+        $moduleSource -match 'Resolve-MO2OwnedProcessTarget -Config \$Config -Owned \$Owned -Processes @\(\$CurrentInspection[.]processes[.]mo2\)' -and
         $moduleSource -match 'Resolve-MO2RecordedGameProcessTargets -Recorded @\(\$CurrentData[.]gameProcesses\)' -and
         $stopGameSource -notmatch 'Get-Process -Id' -and $stopSource -notmatch 'Get-Process -Id') 'stop-game and stop close only the serialized session-recorded game set through retained live handles'
+    $recoverCloseSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2RecoverClose \{.*?\n\}').Value
+    Assert-MO2Test (@([regex]::Matches($recoverCloseSource, '\$owned = Get-MO2OwnedSession -Config \$Config -SessionId \$sessionId')).Count -eq 1 -and $recoverCloseSource -match 'Invoke-MO2CooperativeClose -Config \$Config -Owned \$owned' -and $recoverCloseSource -match 'Set-MO2OwnedSessionStatus -Owned \$owned') 'recovery close preserves one initiating owned-session generation through process action and completion write'
     $terminateGameSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2TerminateGame \{.*?\n\}').Value
     $serializedTerminationIndex = $terminateGameSource.IndexOf('Invoke-MO2OwnedSessionMutation', [StringComparison]::Ordinal)
     $currentOwnerGuardIndex = $terminateGameSource.IndexOf('$currentOwnerResolution = Resolve-MO2OwnedProcessTarget', [StringComparison]::Ordinal)

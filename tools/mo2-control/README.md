@@ -292,12 +292,14 @@ identities recorded in the current serialized session, vetoes the action when
 the live inventory contains any additional configured game or loader process,
 binds every owned target to a retained live process handle, and revalidates its
 PID, name, executable path, start instant, and current session generation before
-requesting normal closure. `stop` uses the same helper and never reopens an
+requesting normal closure; the same serialized boundary must still contain the
+exact recorded MO2 owner. `stop` uses the same helper and never reopens an
 earlier PID. After the game exits `stop-game` first
 observes the exact session-owned MO2 PID for a bounded stability window,
 allowing a delayed post-stop dialog to arrive. It then acknowledges only a
 structurally classified retained `Failed to run` dialog; an unknown modal returns
-`game-stopped-needs-attention` without touching it. If MO2 exits immediately
+`game-stopped-needs-attention` without touching it. Each retained-dialog action
+rechecks the initiating generation and exact retained owner handle. If MO2 exits immediately
 after the game, `stop-game` returns `mo2-exited-after-game-stop`, sets
 `releaseRequired`, and records that MO2 must be reopened or the lease released
 before another task receives it. `close`
@@ -305,7 +307,9 @@ refuses while a game/loader exists and cooperatively resolves
 MO2's structured `File` → `Exit` path and visible modal chain, including the VFS
 `Unlock` prompt. `stop` first closes the game and then uses the same MO2
 resolver. Every cooperative UI action rechecks the caller's current lease
-generation while retaining the exact owner handle. `release` repeats current
+generation while retaining the exact owner handle. Recovery close also carries
+one initiating generation through its close result and completion write rather
+than reacquiring newer authority for an older result. `release` repeats current
 generation and live-process checks inside its serialized transition, then ends
 only the exactly owned session while retaining the evidence directory. It
 returns the explicit lease to access-only state. All mutation commands have
