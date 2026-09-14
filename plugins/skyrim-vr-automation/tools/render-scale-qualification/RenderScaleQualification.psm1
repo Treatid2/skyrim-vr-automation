@@ -5245,6 +5245,17 @@ function Complete-CSXSealedQualification {
     $runPublished = $false
     $summaryPublished = $false
     $publicationComplete = $false
+    $publicationFailure = $null
+    $cleanupErrors = [Collections.Generic.List[string]]::new()
+    $invokeCleanupStep = {
+        param([string]$Label, [scriptblock]$Action)
+        try {
+            & $Action
+        }
+        catch {
+            $cleanupErrors.Add("$Label failed: $($_.Exception.Message)")
+        }
+    }
     try {
         $updated = & $Finalizer $EvidenceDirectory $stagedRunPath $stagedSummaryPath
         if (-not (Test-Path -LiteralPath $updated.runPath -PathType Leaf) -or
@@ -5355,35 +5366,70 @@ function Complete-CSXSealedQualification {
         $updated.summaryPath = $canonicalSummaryPath
         $publicationComplete = $true
     }
+    catch {
+        $publicationFailure = $_
+    }
     finally {
         if (-not $publicationComplete) {
             if ($summaryPublished -and (Test-Path -LiteralPath $canonicalSummaryPath -PathType Leaf)) {
-                Remove-Item -LiteralPath $canonicalSummaryPath -Force
+                & $invokeCleanupStep 'remove published summary' {
+                    Remove-Item -LiteralPath $canonicalSummaryPath -Force
+                }
             }
             if ($runPublished -and (Test-Path -LiteralPath $canonicalRunPath -PathType Leaf)) {
-                Remove-Item -LiteralPath $canonicalRunPath -Force
+                & $invokeCleanupStep 'remove published run' {
+                    Remove-Item -LiteralPath $canonicalRunPath -Force
+                }
             }
             if ($receiptPublished -and (Test-Path -LiteralPath $completionFullPath -PathType Leaf)) {
-                Remove-Item -LiteralPath $completionFullPath -Force
+                & $invokeCleanupStep 'remove published completion receipt' {
+                    Remove-Item -LiteralPath $completionFullPath -Force
+                }
             }
             if ($runBackedUp -and (Test-Path -LiteralPath $runBackupPath -PathType Leaf)) {
-                Move-Item -LiteralPath $runBackupPath -Destination $canonicalRunPath
+                & $invokeCleanupStep 'restore previous run' {
+                    Move-Item -LiteralPath $runBackupPath -Destination $canonicalRunPath
+                }
             }
             if ($summaryBackedUp -and (Test-Path -LiteralPath $summaryBackupPath -PathType Leaf)) {
-                Move-Item -LiteralPath $summaryBackupPath -Destination $canonicalSummaryPath
+                & $invokeCleanupStep 'restore previous summary' {
+                    Move-Item -LiteralPath $summaryBackupPath -Destination $canonicalSummaryPath
+                }
             }
         }
         if (Test-Path -LiteralPath $stagedCompletionPath -PathType Leaf) {
-            Remove-Item -LiteralPath $stagedCompletionPath -Force
-        }
-        if (Test-Path -LiteralPath $committedCompletionPath -PathType Leaf) {
-            Remove-Item -LiteralPath $committedCompletionPath -Force
-        }
-        foreach ($temporaryPath in @($stagedRunPath, $stagedSummaryPath, $runBackupPath, $summaryBackupPath)) {
-            if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
-                Remove-Item -LiteralPath $temporaryPath -Force
+            & $invokeCleanupStep 'remove staged completion receipt' {
+                Remove-Item -LiteralPath $stagedCompletionPath -Force
             }
         }
+        if (Test-Path -LiteralPath $committedCompletionPath -PathType Leaf) {
+            & $invokeCleanupStep 'remove committed private completion receipt' {
+                Remove-Item -LiteralPath $committedCompletionPath -Force
+            }
+        }
+        foreach ($temporaryArtifact in @(
+            [pscustomobject]@{ label = 'remove staged run'; path = $stagedRunPath; remove = $true },
+            [pscustomobject]@{ label = 'remove staged summary'; path = $stagedSummaryPath; remove = $true },
+            [pscustomobject]@{ label = 'remove obsolete run backup'; path = $runBackupPath; remove = $publicationComplete },
+            [pscustomobject]@{ label = 'remove obsolete summary backup'; path = $summaryBackupPath; remove = $publicationComplete }
+        )) {
+            if ($temporaryArtifact.remove -and (Test-Path -LiteralPath $temporaryArtifact.path -PathType Leaf)) {
+                & $invokeCleanupStep $temporaryArtifact.label {
+                    Remove-Item -LiteralPath $temporaryArtifact.path -Force
+                }
+            }
+        }
+    }
+    if ($null -ne $publicationFailure) {
+        if ($cleanupErrors.Count -gt 0) {
+            throw [InvalidOperationException]::new(
+                "$($publicationFailure.Exception.Message) Cleanup/rollback failures: $($cleanupErrors -join ' | ')",
+                $publicationFailure.Exception)
+        }
+        throw $publicationFailure
+    }
+    if ($cleanupErrors.Count -gt 0) {
+        throw "Qualification publication completed, but cleanup failed: $($cleanupErrors -join ' | ')"
     }
     return [pscustomobject][ordered]@{
         updated = $updated

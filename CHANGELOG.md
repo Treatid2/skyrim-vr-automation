@@ -7,6 +7,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - Preserve each synchronous launch/open generation through its completion,
   refuse stale terminal writes after a concurrent lifecycle wins, and recognize
   success only when the newer record proves the same exact attempt completed.
+- Attempt every qualification publication rollback and temporary-file cleanup
+  step even when one filesystem operation fails, compose cleanup failures with
+  the original error, and retain unrestored backups for manual recovery.
 - Stage qualification reports and summaries until their completion receipt is
   validated and privately committed, then publish the sealed result with
   rollback so a later failure cannot leave a new unsealed PASS projection.
