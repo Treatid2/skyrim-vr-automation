@@ -214,6 +214,7 @@ selected_profile=@ByteArray(Codex)
     $publicLaunchInterleaving = & $mo2Module {
         param($cfg, $ownerPath, $gamePath)
         $functionNames = @('Get-MO2OwnedSession','Invoke-MO2Validate','Get-MO2ProcessRecords','Get-MO2DispatchBoundChildEvidence','Write-MO2JsonAtomic','Invoke-MO2OwnedSessionMutation','Get-MO2InspectionData','Get-MO2WindowSnapshot','Resolve-MO2OwnedProcessTarget','Get-MO2ObservedGameProcessAdoption')
+        if (Get-Command Get-MO2TaskWorkspaceIsolation -CommandType Function -ErrorAction SilentlyContinue) { $functionNames += 'Get-MO2TaskWorkspaceIsolation' }
         $originals = @{}
         foreach ($name in $functionNames) { $originals[$name] = (Get-Command $name -CommandType Function).ScriptBlock }
         $ownerStart = [DateTimeOffset]::UtcNow.AddSeconds(-2).ToString('o')
@@ -222,11 +223,12 @@ selected_profile=@ByteArray(Codex)
         $gameRecord = [pscustomobject]@{ id=502; name='MO2ControlImpossibleFixtureGame'; path=$gamePath; startTime=$gameStart }
         $script:PublicLaunchGetCalls = 0
         $script:PublicLaunchMutationCalls = 0
-        $script:PublicLaunchInitial = [pscustomobject]@{ path='fixture-lock'; sessionId='public-launch'; accessId='access'; data=[pscustomobject]@{ generation=0L; status='prepared'; profile='Codex'; executable='Launch MGO - Do Not Unlock'; sessionPath='fixture-session'; requirements=[pscustomobject]@{ skseLoader=$false }; gameProcesses=@([pscustomobject]@{ id=400 }) } }
+        $script:PublicLaunchInitial = [pscustomobject]@{ path='fixture-lock'; sessionId='public-launch'; accessId='access'; data=[pscustomobject]@{ generation=0L; accessId='access'; status='prepared'; profile='Codex'; executable='Launch MGO - Do Not Unlock'; sessionPath='fixture-session'; requirements=[pscustomobject]@{ skseLoader=$false }; gameProcesses=@([pscustomobject]@{ id=400 }) } }
         $script:PublicLaunchCurrent = $null
         try {
             Set-Item Function:script:Get-MO2OwnedSession { $script:PublicLaunchGetCalls++; if ($script:PublicLaunchGetCalls -eq 1) { $script:PublicLaunchInitial } else { $script:PublicLaunchCurrent } }
             Set-Item Function:script:Invoke-MO2Validate { [pscustomobject]@{ ok=$true; warnings=@(); errors=@(); data=[pscustomobject]@{ config=[pscustomobject]@{ mo2Executable=$ownerPath }; processes=[pscustomobject]@{ mo2=@(); game=@() } } } }
+            if ($functionNames -contains 'Get-MO2TaskWorkspaceIsolation') { Set-Item Function:script:Get-MO2TaskWorkspaceIsolation { [pscustomobject]@{ ok=$true; errors=@() } } }
             Set-Item Function:script:Get-MO2ProcessRecords { @($ownerRecord) }
             Set-Item Function:script:Get-MO2DispatchBoundChildEvidence { @() }
             Set-Item Function:script:Write-MO2JsonAtomic { }
@@ -269,18 +271,20 @@ selected_profile=@ByteArray(Codex)
     $publicOpenInterleaving = & $mo2Module {
         param($cfg, $ownerPath)
         $functionNames = @('Get-MO2OwnedSession','Test-MO2InteractiveDesktop','Invoke-MO2Validate','Get-MO2ProcessRecords','Get-MO2DispatchBoundChildEvidence','Write-MO2JsonAtomic','Invoke-MO2OwnedSessionMutation','Resolve-MO2OwnedProcessTarget','Get-MO2WindowSnapshot','Write-MO2OwnedSessionAtomic')
+        if (Get-Command Get-MO2TaskWorkspaceIsolation -CommandType Function -ErrorAction SilentlyContinue) { $functionNames += 'Get-MO2TaskWorkspaceIsolation' }
         $originals = @{}
         foreach ($name in $functionNames) { $originals[$name] = (Get-Command $name -CommandType Function).ScriptBlock }
         $ownerStart = [DateTimeOffset]::UtcNow.AddSeconds(-2).ToString('o')
         $ownerRecord = [pscustomobject]@{ id=601; name='MO2ControlFixtureProcess'; path=$ownerPath; startTime=$ownerStart }
         $script:PublicOpenGetCalls = 0
         $script:PublicOpenMutationCalls = 0
-        $script:PublicOpenInitial = [pscustomobject]@{ path='fixture-lock'; sessionId='public-open'; accessId='access'; data=[pscustomobject]@{ generation=0L; status='prepared'; profile='Codex'; executable='Launch MGO - Do Not Unlock'; sessionPath='fixture-session' } }
+        $script:PublicOpenInitial = [pscustomobject]@{ path='fixture-lock'; sessionId='public-open'; accessId='access'; data=[pscustomobject]@{ generation=0L; accessId='access'; status='prepared'; profile='Codex'; executable='Launch MGO - Do Not Unlock'; sessionPath='fixture-session' } }
         $script:PublicOpenCurrent = $null
         try {
             Set-Item Function:script:Get-MO2OwnedSession { $script:PublicOpenGetCalls++; if ($script:PublicOpenGetCalls -eq 1) { $script:PublicOpenInitial } else { $script:PublicOpenCurrent } }
             Set-Item Function:script:Test-MO2InteractiveDesktop { $true }
             Set-Item Function:script:Invoke-MO2Validate { [pscustomobject]@{ ok=$true; warnings=@(); errors=@(); data=[pscustomobject]@{ config=[pscustomobject]@{ mo2Executable=$ownerPath } } } }
+            if ($functionNames -contains 'Get-MO2TaskWorkspaceIsolation') { Set-Item Function:script:Get-MO2TaskWorkspaceIsolation { [pscustomobject]@{ ok=$true; errors=@() } } }
             Set-Item Function:script:Get-MO2ProcessRecords { @($ownerRecord) }
             Set-Item Function:script:Get-MO2DispatchBoundChildEvidence { @() }
             Set-Item Function:script:Write-MO2JsonAtomic { }
