@@ -256,6 +256,11 @@ try {
         NoExit = $true
     }
     $unchangedBefore = & $transactionTool inspect -CachePath $unchangedCache -NoExit | ConvertFrom-Json -Depth 30
+    $unchangedPlanPath = Join-Path $unchangedEvidence 'shader-cache-task.plan.json'
+    $interruptedUnchangedPlan = Get-Content -LiteralPath $unchangedPlanPath -Raw | ConvertFrom-Json -Depth 40
+    $interruptedUnchangedPlan | Add-Member -NotePropertyName workingTreeInventory -NotePropertyValue $unchangedBefore.data -Force
+    $interruptedUnchangedPlan.state = 'completing'
+    $interruptedUnchangedPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $unchangedPlanPath -Encoding utf8
     $unchangedComplete = Invoke-Catalog @{
         Command = 'complete'; CatalogRoot = $unchangedCatalog
         CachePath = $unchangedCache; EvidenceDirectory = $unchangedEvidence
@@ -263,10 +268,14 @@ try {
         Confirm = $false; Compact = $true; NoExit = $true
     }
     $unchangedAfter = & $transactionTool inspect -CachePath $unchangedCache -NoExit | ConvertFrom-Json -Depth 30
-    $unchangedPlan = Get-Content -LiteralPath (Join-Path $unchangedEvidence 'shader-cache-task.plan.json') -Raw | ConvertFrom-Json -Depth 40
+    $unchangedPlan = Get-Content -LiteralPath $unchangedPlanPath -Raw | ConvertFrom-Json -Depth 40
+    $unchangedRestore = Get-Content -LiteralPath ([string]$unchangedPlan.restoreReceiptPath) -Raw | ConvertFrom-Json -Depth 30
     Assert-Test ($unchangedPrepare.ok -and $unchangedComplete.ok -and
         [string]$unchangedBefore.data.treeSha256 -ieq [string]$unchangedAfter.data.treeSha256 -and
-        (Test-Path -LiteralPath ([string]$unchangedPlan.restoreReceiptPath) -PathType Leaf)) 'first completion durably restores and completes an unchanged optional-output cache'
+        (Test-Path -LiteralPath ([string]$unchangedPlan.restoreReceiptPath) -PathType Leaf)) 'resumed completion durably finalizes an unchanged optional-output cache'
+    Assert-Test ([string]$unchangedRestore.operation -ceq 'restore-noop' -and -not [bool]$unchangedRestore.restorationNecessary -and
+        [string]$unchangedRestore.restoredTreeSha256 -ieq [string]$unchangedRestore.displacedTreeSha256 -and
+        [IO.Path]::GetFullPath([string]$unchangedRestore.displacedPath) -eq [IO.Path]::GetFullPath((Join-Path $unchangedEvidence 'cache.before'))) 'unchanged completion records a committed no-op restore bound to the preserved snapshot instead of rebuilding the same live tree'
 
     $recoveryCatalog = Join-Path $resolvedTestRoot 'post-restore-catalog'
     $recoveryCache = Join-Path $resolvedTestRoot 'post-restore-live\ShaderCache'
