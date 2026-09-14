@@ -220,7 +220,7 @@ try {
         Command = 'complete'
         CatalogRoot = $catalogRoot
         CachePath = $liveCache
-        EvidenceDirectory = $taskEvidence
+        EvidenceDirectory = $taskEvidence + [IO.Path]::DirectorySeparatorChar
         Promote = $true
         WorkingSetStatus = 'known-working'
         Label = 'fixture completed task'
@@ -229,7 +229,7 @@ try {
         Compact = $true
         NoExit = $true
     }
-    Assert-Test ($complete.ok -and $complete.state -eq 'complete') 'task completion restores the caller-owned cache and publishes an explicitly verified result'
+    Assert-Test ($complete.ok -and $complete.state -eq 'complete') 'changed-output completion accepts the exact evidence directory with a trailing separator'
     $afterComplete = & $transactionTool inspect -CachePath $liveCache -NoExit | ConvertFrom-Json -Depth 30
     Assert-Test ([string]$afterComplete.data.treeSha256 -ieq [string]$beforeTask.data.treeSha256) 'task completion restores the exact pre-task live cache'
     Assert-Test ([string]$complete.data.task.workingTree.inventory.treeSha256 -ieq [string]$taskResult.data.treeSha256) 'task completion records the exact compiled result before restoration'
@@ -256,17 +256,101 @@ try {
         NoExit = $true
     }
     $unchangedBefore = & $transactionTool inspect -CachePath $unchangedCache -NoExit | ConvertFrom-Json -Depth 30
+    $unchangedPlanPath = Join-Path $unchangedEvidence 'shader-cache-task.plan.json'
+    $interruptedUnchangedPlan = Get-Content -LiteralPath $unchangedPlanPath -Raw | ConvertFrom-Json -Depth 40
+    $interruptedUnchangedPlan | Add-Member -NotePropertyName workingTreeInventory -NotePropertyValue $unchangedBefore.data -Force
+    $interruptedUnchangedPlan.state = 'completing'
+    $interruptedUnchangedPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $unchangedPlanPath -Encoding utf8
     $unchangedComplete = Invoke-Catalog @{
+        Command = 'complete'; CatalogRoot = $unchangedCatalog
+        CachePath = $unchangedCache; EvidenceDirectory = $unchangedEvidence + [IO.Path]::DirectorySeparatorChar
+        WorkingSetStatus = 'unverified'; BlockingProcessNames = $blockers
+        Confirm = $false; Compact = $true; NoExit = $true
+    }
+    $unchangedAfter = & $transactionTool inspect -CachePath $unchangedCache -NoExit | ConvertFrom-Json -Depth 30
+    $unchangedPlan = Get-Content -LiteralPath $unchangedPlanPath -Raw | ConvertFrom-Json -Depth 40
+    $unchangedRestore = Get-Content -LiteralPath ([string]$unchangedPlan.restoreReceiptPath) -Raw | ConvertFrom-Json -Depth 30
+    Assert-Test ($unchangedPrepare.ok -and $unchangedComplete.ok -and
+        [string]$unchangedBefore.data.treeSha256 -ieq [string]$unchangedAfter.data.treeSha256 -and
+        (Test-Path -LiteralPath ([string]$unchangedPlan.restoreReceiptPath) -PathType Leaf)) 'unchanged completion accepts the exact evidence directory with a trailing separator'
+    Assert-Test ([string]$unchangedRestore.operation -ceq 'restore-noop' -and -not [bool]$unchangedRestore.restorationNecessary -and
+        [string]$unchangedRestore.restoredTreeSha256 -ieq [string]$unchangedRestore.displacedTreeSha256 -and
+        [IO.Path]::GetFullPath([string]$unchangedRestore.displacedPath) -eq [IO.Path]::GetFullPath((Join-Path $unchangedEvidence 'cache.before'))) 'unchanged completion records a committed no-op restore bound to the preserved snapshot instead of rebuilding the same live tree'
+    $unchangedCompletionPath = Join-Path $unchangedEvidence 'shader-cache-task.completion.json'
+    $unchangedJournalPath = Join-Path $unchangedEvidence "shader-cache-restore.$([string]$unchangedRestore.transactionId).journal.json"
+    Remove-Item -LiteralPath $unchangedCompletionPath, $unchangedJournalPath -Force
+    $receiptOnlyPlan = Get-Content -LiteralPath $unchangedPlanPath -Raw | ConvertFrom-Json -Depth 40
+    $receiptOnlyPlan.PSObject.Properties.Remove('restoreReceiptPath')
+    $receiptOnlyPlan.state = 'completing'
+    $receiptOnlyPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $unchangedPlanPath -Encoding utf8
+    Remove-Variable RecoverMissingNoOpJournal -Scope Script -ErrorAction SilentlyContinue
+    $receiptOnlyCompletion = Invoke-Catalog @{
+        Command = 'complete'; CatalogRoot = $unchangedCatalog
+        CachePath = $unchangedCache; EvidenceDirectory = $unchangedEvidence + [IO.Path]::DirectorySeparatorChar
+        WorkingSetStatus = 'unverified'; BlockingProcessNames = $blockers
+        Confirm = $false; Compact = $true; NoExit = $true
+    }
+    $receiptOnlyRecoveredPlan = Get-Content -LiteralPath $unchangedPlanPath -Raw | ConvertFrom-Json -Depth 40
+    $receiptOnlyRecoveredJournal = Get-Content -LiteralPath $unchangedJournalPath -Raw | ConvertFrom-Json -Depth 30
+    Assert-Test ($receiptOnlyCompletion.ok -and [bool]$receiptOnlyRecoveredJournal.recoveredFromReceipt -and
+        [IO.Path]::GetFullPath([string]$receiptOnlyRecoveredPlan.restoreReceiptPath) -eq [IO.Path]::GetFullPath([string]$unchangedPlan.restoreReceiptPath)) 'fresh receipt-only recovery accepts a trailing separator and explicitly authorizes journal reconstruction before the plan has persisted its receipt pointer'
+    $unchangedRestorePath = [string]$unchangedPlan.restoreReceiptPath
+    $originalUnchangedRestoreJson = Get-Content -LiteralPath $unchangedRestorePath -Raw
+    $alternatePreservedPath = Join-Path $unchangedEvidence 'cache.before-alternate'
+    Copy-Item -LiteralPath (Join-Path $unchangedEvidence 'cache.before') -Destination $alternatePreservedPath -Recurse
+    $mismatchedPathReceipt = $originalUnchangedRestoreJson | ConvertFrom-Json -Depth 30
+    $mismatchedPathReceipt.displacedPath = $alternatePreservedPath
+    $mismatchedPathReceipt | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $unchangedRestorePath -Encoding utf8
+    Remove-Item -LiteralPath $unchangedCompletionPath, $unchangedJournalPath -Force
+    foreach ($pathMismatchRoute in @(
+        [pscustomobject]@{ label = 'saved-pointer'; retainPointer = $true },
+        [pscustomobject]@{ label = 'direct-discovery'; retainPointer = $false }
+    )) {
+        $pathMismatchPlan = Get-Content -LiteralPath $unchangedPlanPath -Raw | ConvertFrom-Json -Depth 40
+        if ($pathMismatchRoute.retainPointer) {
+            $pathMismatchPlan | Add-Member -NotePropertyName restoreReceiptPath -NotePropertyValue $unchangedRestorePath -Force
+        }
+        else { $pathMismatchPlan.PSObject.Properties.Remove('restoreReceiptPath') }
+        $pathMismatchPlan.state = 'completing'
+        $pathMismatchPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $unchangedPlanPath -Encoding utf8
+        $pathMismatchResult = Invoke-Catalog @{
+            Command = 'complete'; CatalogRoot = $unchangedCatalog
+            CachePath = $unchangedCache; EvidenceDirectory = $unchangedEvidence
+            WorkingSetStatus = 'unverified'; BlockingProcessNames = $blockers
+            Confirm = $false; Compact = $true; NoExit = $true
+        }
+        Assert-Test (-not $pathMismatchResult.ok -and $pathMismatchResult.errors[0] -match 'exact preserved baseline' -and
+            -not (Test-Path -LiteralPath $unchangedJournalPath -PathType Leaf) -and
+            -not (Test-Path -LiteralPath $unchangedCompletionPath -PathType Leaf)) "receipt-only no-op $($pathMismatchRoute.label) recovery rejects a same-hash path that differs from the task snapshot"
+    }
+    $originalUnchangedRestoreJson | Set-Content -LiteralPath $unchangedRestorePath -Encoding utf8
+    $restoredPathPlan = Get-Content -LiteralPath $unchangedPlanPath -Raw | ConvertFrom-Json -Depth 40
+    $restoredPathPlan | Add-Member -NotePropertyName restoreReceiptPath -NotePropertyValue $unchangedRestorePath -Force
+    $restoredPathPlan.state = 'completing'
+    $restoredPathPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $unchangedPlanPath -Encoding utf8
+    Remove-Item -LiteralPath $alternatePreservedPath -Recurse -Force
+    Remove-Item -LiteralPath $unchangedCompletionPath, $unchangedJournalPath -Force -ErrorAction SilentlyContinue
+    $noopDriftPath = Join-Path $unchangedCache 'unexpected-after-receipt.bin'
+    [IO.File]::WriteAllBytes($noopDriftPath, [byte[]](9, 9, 9))
+    $unsafeNoOpRecovery = Invoke-Catalog @{
         Command = 'complete'; CatalogRoot = $unchangedCatalog
         CachePath = $unchangedCache; EvidenceDirectory = $unchangedEvidence
         WorkingSetStatus = 'unverified'; BlockingProcessNames = $blockers
         Confirm = $false; Compact = $true; NoExit = $true
     }
-    $unchangedAfter = & $transactionTool inspect -CachePath $unchangedCache -NoExit | ConvertFrom-Json -Depth 30
-    $unchangedPlan = Get-Content -LiteralPath (Join-Path $unchangedEvidence 'shader-cache-task.plan.json') -Raw | ConvertFrom-Json -Depth 40
-    Assert-Test ($unchangedPrepare.ok -and $unchangedComplete.ok -and
-        [string]$unchangedBefore.data.treeSha256 -ieq [string]$unchangedAfter.data.treeSha256 -and
-        (Test-Path -LiteralPath ([string]$unchangedPlan.restoreReceiptPath) -PathType Leaf)) 'first completion durably restores and completes an unchanged optional-output cache'
+    Assert-Test (-not $unsafeNoOpRecovery.ok -and $unsafeNoOpRecovery.errors[0] -match 'Live cache no longer matches' -and
+        -not (Test-Path -LiteralPath $unchangedJournalPath -PathType Leaf) -and
+        -not (Test-Path -LiteralPath $unchangedCompletionPath -PathType Leaf)) 'receipt-only no-op recovery rejects live baseline drift without creating a journal or completion'
+    Remove-Item -LiteralPath $noopDriftPath -Force
+    $recoveredNoOpCompletion = Invoke-Catalog @{
+        Command = 'complete'; CatalogRoot = $unchangedCatalog
+        CachePath = $unchangedCache; EvidenceDirectory = $unchangedEvidence
+        Promote = $true; WorkingSetStatus = 'known-working'; Label = 'recovered no-op fixture'
+        BlockingProcessNames = $blockers; Confirm = $false; Compact = $true; NoExit = $true
+    }
+    $recoveredNoOpJournal = Get-Content -LiteralPath $unchangedJournalPath -Raw | ConvertFrom-Json -Depth 30
+    Assert-Test ($recoveredNoOpCompletion.ok -and $recoveredNoOpCompletion.data.task.promoted.state -eq 'captured' -and
+        [bool]$recoveredNoOpJournal.recoveredFromReceipt -and [string]$recoveredNoOpJournal.phase -ceq 'committed') 'receipt-only no-op recovery revalidates exact evidence, recreates the committed journal, and supports promotion source proof'
 
     $recoveryCatalog = Join-Path $resolvedTestRoot 'post-restore-catalog'
     $recoveryCache = Join-Path $resolvedTestRoot 'post-restore-live\ShaderCache'
@@ -372,6 +456,19 @@ try {
     'drift' | Set-Content -LiteralPath (Join-Path ([string]$preservedDriftFixture.restore.data.displacedPath) 'unexpected.bin') -Encoding utf8
     $preservedDrift = Invoke-Catalog @{ Command='complete';CatalogRoot=$preservedDriftFixture.catalog;CachePath=$preservedDriftFixture.cache;EvidenceDirectory=$preservedDriftFixture.evidence;WorkingSetStatus='unverified';BlockingProcessNames=$blockers;Confirm=$false;Compact=$true;NoExit=$true }
     Assert-Test (-not $preservedDrift.ok -and $preservedDrift.errors[0] -match 'Preserved task output differs' -and -not (Test-Path -LiteralPath (Join-Path $preservedDriftFixture.evidence 'shader-cache-task.completion.json'))) 'recovery rejects changed preserved task output without publishing completion'
+
+    $operationCaseFixture = New-CatalogRestoreRecoveryFixture 'operation-case' -Unchanged
+    $operationCaseReceiptPath = [string]$operationCaseFixture.restore.data.restoreReceiptPath
+    $operationCaseReceipt = Get-Content -LiteralPath $operationCaseReceiptPath -Raw | ConvertFrom-Json -Depth 30
+    $operationCaseJournalPath = Join-Path $operationCaseFixture.evidence "shader-cache-restore.$([string]$operationCaseReceipt.transactionId).journal.json"
+    $operationCaseJournal = Get-Content -LiteralPath $operationCaseJournalPath -Raw | ConvertFrom-Json -Depth 30
+    $operationCaseReceipt.operation = 'RESTORE-NOOP'
+    $operationCaseJournal.operation = 'RESTORE-NOOP'
+    $operationCaseReceipt | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $operationCaseReceiptPath -Encoding utf8
+    $operationCaseJournal | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $operationCaseJournalPath -Encoding utf8
+    $operationCaseResult = Invoke-Catalog @{ Command='complete';CatalogRoot=$operationCaseFixture.catalog;CachePath=$operationCaseFixture.cache;EvidenceDirectory=$operationCaseFixture.evidence;WorkingSetStatus='unverified';BlockingProcessNames=$blockers;Confirm=$false;Compact=$true;NoExit=$true }
+    Assert-Test (-not $operationCaseResult.ok -and $operationCaseResult.errors[0] -match 'does not bind' -and
+        -not (Test-Path -LiteralPath (Join-Path $operationCaseFixture.evidence 'shader-cache-task.completion.json'))) 'noncanonical operation casing cannot bypass no-op proof validation or authorize completion'
 
     foreach ($invalidCase in @(
         [pscustomobject]@{ label='wrong-operation'; mutate={ param($r) $r.operation='seed' }; expected='does not bind' },

@@ -4,6 +4,18 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Normalize the evidence-directory boundary before validating snapshot
+  containment so an equivalent trailing-separator spelling cannot block task
+  completion or receipt-only recovery.
+- Bind every no-op completion and receipt-only recovery proof to the original
+  snapshot's exact preserved-baseline path, not merely a same-hash directory.
+- Make receipt-only no-op recovery authorization an explicit validator input,
+  and reject noncanonical restore operation casing before proof dispatch.
+- Recover an interrupted receipt-only no-op completion after revalidating the
+  exact task evidence, and admit its receipt as promotion source proof.
+- Complete failed or unverified shader-cache tasks without a physical restore
+  when the live tree still exactly matches the prepared baseline, recording a
+  committed no-op restore proof bound to the original snapshot.
 - Raise the bounded MO2 workspace profile traversal default to 100,000 files
   so the maintained MGO profile no longer requires a per-call override.
 - Enforce MO2 `SteamVRNull` admission inside null-HMD `apply` and `start`, bind
