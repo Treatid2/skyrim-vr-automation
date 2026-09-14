@@ -4639,6 +4639,80 @@ function Invoke-MO2Release {
     }
 }
 
+function Invoke-MO2VerifiedForceTermination {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Owned,
+        [Parameter(Mandatory)]$Target,
+        [switch]$WhatIf,
+        [scriptblock]$BindingFactory,
+        [scriptblock]$TerminationAction
+    )
+
+    if (-not $BindingFactory) {
+        $BindingFactory = {
+            param([int]$ProcessId)
+            $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+            if (-not $process) {
+                return [pscustomobject][ordered]@{ available = $false; reason = 'process-exited'; process = $null; record = $null }
+            }
+            try {
+                # Opening and retaining SafeHandle binds the Process object to this exact
+                # kernel process. A later PID reuse cannot redirect Process.Kill().
+                $handle = $process.SafeHandle
+                if ($handle.IsInvalid -or $handle.IsClosed) { throw 'The process handle is unavailable.' }
+                $record = [pscustomobject][ordered]@{
+                    name = $process.ProcessName
+                    id = $process.Id
+                    path = [IO.Path]::GetFullPath($process.Path)
+                    startTime = $process.StartTime.ToUniversalTime().ToString('o')
+                }
+                return [pscustomobject][ordered]@{ available = $true; reason = 'bound'; process = $process; record = $record }
+            }
+            catch {
+                $process.Dispose()
+                return [pscustomobject][ordered]@{ available = $false; reason = 'live-process-identity-unavailable'; process = $null; record = $null; detail = $_.Exception.Message }
+            }
+        }
+    }
+
+    $binding = & $BindingFactory ([int]$Target.id)
+    if (-not $binding.available) {
+        if ([string]$binding.reason -eq 'process-exited') {
+            return [pscustomobject][ordered]@{ ok = $true; state = 'already-exited'; target = $Target; liveIdentity = $null; identity = $null }
+        }
+        return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = [string]$binding.reason; target = $Target; liveIdentity = $null; identity = $null; detail = [string]$binding.detail }
+    }
+
+    try {
+        $liveRecord = $binding.record
+        if ([int]$liveRecord.id -ne [int]$Target.id) {
+            return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = 'live-process-id-mismatch'; target = $Target; liveIdentity = $liveRecord; identity = $null }
+        }
+        $identity = Test-MO2OwnedProcessIdentity -Owned $Owned -ProcessRecord $liveRecord
+        if (-not $identity.ok) {
+            return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = [string]$identity.reason; target = $Target; liveIdentity = $liveRecord; identity = $identity }
+        }
+        $expectedMO2Path = Resolve-MO2ControlPath ([string]$Config.mo2.executable)
+        if (-not (Test-MO2ExactProcessPath -Record $liveRecord -ExpectedPath $expectedMO2Path) -or @($Config.mo2.processNames) -notcontains [string]$liveRecord.name) {
+            return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = 'live-process-not-exact-configured-mo2'; target = $Target; liveIdentity = $liveRecord; identity = $identity }
+        }
+        if ($WhatIf) {
+            return [pscustomobject][ordered]@{ ok = $true; state = 'verified-dry-run'; target = $Target; liveIdentity = $liveRecord; identity = $identity }
+        }
+        if ($TerminationAction) {
+            & $TerminationAction $binding.process
+        }
+        else {
+            $binding.process.Kill()
+        }
+        return [pscustomobject][ordered]@{ ok = $true; state = 'termination-requested'; target = $Target; liveIdentity = $liveRecord; identity = $identity }
+    }
+    finally {
+        if ($binding.process -is [IDisposable]) { $binding.process.Dispose() }
+    }
+}
+
 function Invoke-MO2Terminate {
     [CmdletBinding()]
     param(
@@ -4673,17 +4747,15 @@ function Invoke-MO2Terminate {
         }
         Assert-MO2ExactProcessTargets -Config $Config -Processes $targets
     }
-    if ($WhatIf) {
-        return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $true -State 'dry-run' -Data @{ sessionId = $SessionId; wouldForceTerminate = @($targets); gameProcesses = @(); activeRootBuilderBuildData = @() }
-    }
-
-    $expectedMO2Path = Resolve-MO2ControlPath ([string]$Config.mo2.executable)
-    foreach ($record in $targets) {
-        $process = Get-Process -Id ([int]$record.id) -ErrorAction SilentlyContinue
-        $exactPath = Test-MO2ExactProcessPath -Record $record -ExpectedPath $expectedMO2Path
-        if ($process -and @($Config.mo2.processNames) -contains $process.ProcessName -and $exactPath) {
-            Stop-Process -Id $process.Id -Force -ErrorAction Stop
+    $forceTermination = $null
+    if ($targets.Count -gt 0) {
+        $forceTermination = Invoke-MO2VerifiedForceTermination -Config $Config -Owned $owned -Target $targets[0] -WhatIf:$WhatIf
+        if (-not $forceTermination.ok) {
+            return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $false -State 'blocked' -Data @{ processes = $inspection.processes; ownerPid = $ownerPid; forceTermination = $forceTermination } -Errors @('The live MO2 process no longer matches the exact recorded owner identity; forced termination is refused.')
         }
+    }
+    if ($WhatIf) {
+        return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $true -State 'dry-run' -Data @{ sessionId = $SessionId; wouldForceTerminate = @($targets); forceTermination = $forceTermination; gameProcesses = @(); activeRootBuilderBuildData = @() }
     }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
