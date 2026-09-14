@@ -214,6 +214,11 @@ projects that same generation into `session.json` before releasing the transitio
 lock. An older writer cannot overtake a newer manifest. If projection itself
 fails, the error identifies the already committed lock generation; the next
 serialized commit reconciles the manifest from that authoritative state.
+Game-identity persistence also resolves one exact live MO2 owner inside that
+same serialized transition before it may publish `running`. Exact game
+termination repeats that owner proof inside its serialized transition before
+requesting any game-process termination, preserving the owner required for
+RootBuilder restoration.
 Modern session owner liveness is bound to process ID, executable path, and
 process start time, so a reused PID cannot make an abandoned session appear
 live. Readable legacy PID/start-time records are labelled separately from the
