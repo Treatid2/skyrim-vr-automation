@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Keep loader-first StartOnly observations pending until the configured primary
+  game arrives, require exact dispatch and direct process-lineage evidence for
+  one helper-to-runtime owner handoff, and co-write synchronous game identity
+  with its durable running transition.
 - Bind every `terminate-game` target to a retained live process handle, recheck
   its complete recorded and configured identity immediately before mutation,
   and eliminate PID reopening from game force termination.

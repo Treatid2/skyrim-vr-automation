@@ -39,7 +39,13 @@ session to durable `mo2-open` so a later game launch is valid. After a
 whose PID, process name, executable path, and start time bind them to the
 recorded launch and a freshly revalidated exact MO2 owner. The launch records a
 pre-dispatch process set and dispatch boundary, so a recent pre-existing process
-cannot enter through a timing allowance. Later `terminate-game` rebinds every
+cannot enter through a timing allowance. A loader-only observation remains
+pending until the configured primary game appears, so polling cannot finalize
+an incomplete launch set. Helper-to-runtime owner adoption is allowed only once,
+while the session is still opening or launching, and requires the candidate to
+be the exact requested process or its direct child under a matching durable
+dispatch receipt; a merely configured later process cannot become session
+authority. Later `terminate-game` rebinds every
 recorded game identity to a retained live process handle, revalidates its full
 identity and configured path immediately before mutation, and never reopens a
 PID for termination. This makes exact termination and RootBuilder recovery
