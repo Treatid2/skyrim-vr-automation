@@ -20,6 +20,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - Complete failed or unverified shader-cache tasks without a physical restore
   when the live tree still exactly matches the prepared baseline, recording a
   committed no-op restore proof bound to the original snapshot.
+- Revalidate the exact recorded MO2 owner before every RootBuilder `Unlock` UI
+  action and before reporting successful recovery, so PID reuse cannot redirect
+  recovery after game termination.
 - Keep loader-first StartOnly observations pending until the configured primary
   game arrives, require exact dispatch and direct process-lineage evidence for
   one helper-to-runtime owner handoff, and co-write synchronous game identity
