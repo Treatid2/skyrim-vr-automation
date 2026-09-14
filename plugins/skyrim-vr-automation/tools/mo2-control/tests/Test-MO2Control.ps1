@@ -227,7 +227,7 @@ selected_profile=@ByteArray(Codex)
         $script:PublicLaunchCurrent = $null
         try {
             Set-Item Function:script:Get-MO2OwnedSession { $script:PublicLaunchGetCalls++; if ($script:PublicLaunchGetCalls -eq 1) { $script:PublicLaunchInitial } else { $script:PublicLaunchCurrent } }
-            Set-Item Function:script:Invoke-MO2Validate { [pscustomobject]@{ ok=$true; warnings=@(); errors=@(); data=[pscustomobject]@{ config=[pscustomobject]@{ mo2Executable=$ownerPath }; processes=[pscustomobject]@{ mo2=@(); game=@() } } } }
+            Set-Item Function:script:Invoke-MO2Validate { [pscustomobject]@{ ok=$true; warnings=@(); errors=@(); data=[pscustomobject]@{ config=[pscustomobject]@{ mo2Executable=$ownerPath }; processes=[pscustomobject]@{ mo2=@(); game=@() }; sessionLock=[pscustomobject]@{ ownerIdentityMatched=$false } } } }
             if ($functionNames -contains 'Get-MO2TaskWorkspaceIsolation') { Set-Item Function:script:Get-MO2TaskWorkspaceIsolation { [pscustomobject]@{ ok=$true; errors=@() } } }
             Set-Item Function:script:Get-MO2ProcessRecords { @($ownerRecord) }
             Set-Item Function:script:Get-MO2DispatchBoundChildEvidence { @() }
