@@ -3490,6 +3490,88 @@ function Resolve-MO2RecordedGameProcessTargets {
     return [pscustomobject][ordered]@{ ok = $true; reason = if ($targets.Count -eq 0) { 'game-already-stopped' } else { 'exact-recorded-game-processes' }; recorded = $Recorded; current = $Current; targets = @($targets) }
 }
 
+function Invoke-MO2VerifiedGameTerminationSet {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Owned,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Targets,
+        [switch]$WhatIf,
+        [scriptblock]$BindingFactory,
+        [scriptblock]$TerminationAction
+    )
+
+    if (-not $BindingFactory) {
+        $BindingFactory = {
+            param([int]$ProcessId)
+            $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+            if (-not $process) {
+                return [pscustomobject][ordered]@{ available = $false; reason = 'process-exited'; process = $null; record = $null }
+            }
+            try {
+                # Retaining SafeHandle binds this object to the exact kernel process;
+                # later PID reuse cannot redirect Process.Kill().
+                $handle = $process.SafeHandle
+                if ($handle.IsInvalid -or $handle.IsClosed) { throw 'The process handle is unavailable.' }
+                $record = [pscustomobject][ordered]@{
+                    name = $process.ProcessName
+                    id = $process.Id
+                    path = [IO.Path]::GetFullPath($process.Path)
+                    startTime = $process.StartTime.ToUniversalTime().ToString('o')
+                }
+                return [pscustomobject][ordered]@{ available = $true; reason = 'bound'; process = $process; record = $record }
+            }
+            catch {
+                $process.Dispose()
+                return [pscustomobject][ordered]@{ available = $false; reason = 'live-process-identity-unavailable'; process = $null; record = $null; detail = $_.Exception.Message }
+            }
+        }
+    }
+
+    $expectedPaths = Get-MO2ExpectedGameProcessPaths -Config $Config -Owned $Owned
+    if (-not $expectedPaths.ok) {
+        return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = [string]$expectedPaths.reason; targets = @(); bindings = @() }
+    }
+    $bindings = [Collections.Generic.List[object]]::new()
+    $verified = [Collections.Generic.List[object]]::new()
+    try {
+        foreach ($target in $Targets) {
+            $binding = & $BindingFactory ([int]$target.id)
+            if (-not $binding.available) {
+                if ([string]$binding.reason -eq 'process-exited') { continue }
+                return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = [string]$binding.reason; target = $target; targets = @($verified); detail = [string]$binding.detail }
+            }
+            $bindings.Add($binding)
+            $liveRecord = $binding.record
+            $identity = Test-MO2ProcessRecordIdentity -Expected $target -Actual $liveRecord
+            if (-not $identity.ok) {
+                return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = [string]$identity.reason; target = $target; liveIdentity = $liveRecord; identity = $identity; targets = @($verified) }
+            }
+            $name = [string]$liveRecord.name
+            if (-not $expectedPaths.pathsByName.ContainsKey($name)) {
+                return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = 'live-process-name-not-configured'; target = $target; liveIdentity = $liveRecord; targets = @($verified) }
+            }
+            $configuredPaths = $expectedPaths.pathsByName[$name]
+            if ($configuredPaths.Count -ne 1 -or -not $configuredPaths.Contains([IO.Path]::GetFullPath([string]$liveRecord.path))) {
+                return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = 'live-process-path-not-configured'; target = $target; liveIdentity = $liveRecord; targets = @($verified) }
+            }
+            $verified.Add($liveRecord)
+        }
+        if ($WhatIf) {
+            return [pscustomobject][ordered]@{ ok = $true; state = 'verified-dry-run'; reason = 'exact-recorded-game-processes'; targets = @($verified) }
+        }
+        foreach ($binding in $bindings) {
+            if ($TerminationAction) { & $TerminationAction $binding.process }
+            else { $binding.process.Kill() }
+        }
+        return [pscustomobject][ordered]@{ ok = $true; state = 'termination-requested'; reason = 'exact-recorded-game-processes'; targets = @($verified) }
+    }
+    finally {
+        foreach ($binding in $bindings) {
+            if ($binding.process -is [IDisposable]) { $binding.process.Dispose() }
+        }
+    }
+}
+
 function Invoke-MO2TerminateGame {
     [CmdletBinding()]
     param(
@@ -3516,12 +3598,20 @@ function Invoke-MO2TerminateGame {
         return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $true -State 'game-already-stopped' -Data @{ sessionId=$SessionId; mo2Retained=$true; targets=@(); forceTermination=$false }
     }
     if ($WhatIf) {
-        return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $true -State 'dry-run' -Data @{ sessionId=$SessionId; wouldForceTerminateExactRecordedGameProcesses=$targets; wouldRetainMO2=$resolution.targets; wouldInvokeExactControls=@('Unlock'); wouldRequireBuildDataRemoval=$true }
+        $verification = Invoke-MO2VerifiedGameTerminationSet -Config $Config -Owned $owned -Targets $targets -WhatIf
+        if (-not $verification.ok) {
+            return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $false -State 'blocked' -Data @{ gameTermination=$verification } -Errors @('A launch-recorded game identity changed before dry-run authorization; refusing possible PID reuse.')
+        }
+        return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $true -State 'dry-run' -Data @{ sessionId=$SessionId; wouldForceTerminateExactRecordedGameProcesses=$verification.targets; wouldRetainMO2=$resolution.targets; wouldInvokeExactControls=@('Unlock'); wouldRequireBuildDataRemoval=$true }
     }
     if (-not (Test-MO2InteractiveDesktop)) {
         return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $false -State 'interactive-desktop-required' -Data @{ sessionId=$SessionId; targets=$targets } -Errors @('Exact Unlock handling after game termination requires the logged-on interactive desktop.')
     }
-    foreach ($target in $targets) { Stop-Process -Id ([int]$target.id) -Force -ErrorAction Stop }
+    $termination = Invoke-MO2VerifiedGameTerminationSet -Config $Config -Owned $owned -Targets $targets
+    if (-not $termination.ok) {
+        return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $false -State 'blocked' -Data @{ gameTermination=$termination } -Errors @('A launch-recorded game identity changed before force termination; no PID-based fallback was attempted.')
+    }
+    $targets = @($termination.targets)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         Start-Sleep -Milliseconds 250

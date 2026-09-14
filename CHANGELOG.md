@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Bind every `terminate-game` target to a retained live process handle, recheck
+  its complete recorded and configured identity immediately before mutation,
+  and eliminate PID reopening from game force termination.
 - Bind StartOnly adoption and retained relaunch to configured full executable
   paths, a pre-dispatch process snapshot and timestamp, a freshly observed exact
   MO2 owner, and a per-launch active identity set while retaining prior game
