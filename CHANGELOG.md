@@ -4,6 +4,68 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Keep the synchronous-completion public-call fixtures composable with the
+  integrated workspace-isolation gate by supplying the real access identity
+  and session-lock evidence, and replacing that unrelated dependency inside
+  the bounded fixture.
+- Preserve each synchronous launch/open generation through its completion,
+  refuse stale terminal writes after a concurrent lifecycle wins, and recognize
+  success only when the newer record proves the same exact attempt completed.
+- Recheck the exact MO2 owner beside the serialized game-close inventory, guard
+  every retained failed-to-run dialog action with the initiating generation and
+  retained owner handle, and keep recovery-close completion on that same
+  generation so stale results cannot overwrite a newer lifecycle.
+- Derive graceful game-close authority from the current session's recorded
+  identities and veto all close requests when another configured but unowned
+  game or loader process is present.
+- Bind graceful `stop-game` and `stop` targets to retained live process handles,
+  revalidate exact PID/name/path/start identity and current session generation,
+  and never reopen a previously observed PID for `CloseMainWindow`.
+- Qualify every cooperative-close UI mutation against the current lease
+  generation, refuse stale session release after a competing lifecycle change,
+  and recheck game/loader and RootBuilder vetoes inside forced MO2 termination.
+- Project initial and recovery session binding plus in-session access renewal
+  into `session.json` at the authoritative lock generation, including
+  attributable projection failure and renewal-based reconciliation.
+- Revalidate the exact live MO2 owner inside the serialized game-identity commit
+  and immediately before exact game termination, so owner exit or replacement
+  cannot publish `running` state or strand RootBuilder restoration.
+- Capture serialized lifecycle callbacks under a distinct closed-over binding so
+  the lock wrapper cannot recursively resolve its own `Action` parameter.
+- Serialize launch, open, game termination, MO2 termination, and RootBuilder
+  `Unlock` authorization against the current session generation before their
+  external process/UI action; bind Unlock to one retained exact-owner handle at
+  every control boundary; preserve synchronous-open ownership unless the full
+  detached transition proves a replacement; capture direct-child identity while
+  the dispatched parent handle prevents PID reuse; and update `session.json`
+  inside the same ordered transition as its authoritative ownership-lock state.
+- Reject stale lease generations at the serialized MO2 session commit boundary,
+  bind detached handoff ancestry to the dispatched helper's exact lifetime, and
+  make session-lock liveness consume the modern owner path/start-time schema.
+- Revalidate and retain the exact MO2 owner process lifetime across every
+  cooperative-close UI action, including the stop path after game shutdown.
+- Revalidate the exact recorded MO2 owner before every RootBuilder `Unlock` UI
+  action and before reporting successful recovery, so PID reuse cannot redirect
+  recovery after game termination.
+- Keep loader-first StartOnly observations pending until the configured primary
+  game arrives, require exact dispatch and direct process-lineage evidence for
+  one helper-to-runtime owner handoff, and co-write synchronous game identity
+  with its durable running transition.
+- Bind every `terminate-game` target to a retained live process handle, recheck
+  its complete recorded and configured identity immediately before mutation,
+  and eliminate PID reopening from game force termination.
+- Bind StartOnly adoption and retained relaunch to configured full executable
+  paths, a pre-dispatch process snapshot and timestamp, a freshly observed exact
+  MO2 owner, and a per-launch active identity set while retaining prior game
+  identities as history; normalize process timestamps across persistence and
+  exact termination comparisons.
+- Bind recorded MO2 ownership to exact PID, executable path, and start time
+  before `status` can adopt game identities after a StartOnly launch or
+  `terminate` can force-stop the recorded MO2 owner, and retain the verified
+  process handle so PID reuse cannot retarget the final termination call.
+- Let `status` durably adopt exact game and loader identities observed after a
+  `launch -StartOnly` request, so the owning session can safely terminate a
+  crashed game and complete RootBuilder recovery.
 - Enforce MO2 `SteamVRNull` admission inside null-HMD `apply` and `start`, bind
   the exact lease, profile, and provider inventory into the transaction
   receipt, and route-shape fresh SteamVR task clones so inherited OCU providers
