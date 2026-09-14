@@ -6,7 +6,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 - Bind recorded MO2 ownership to exact PID, executable path, and start time
   before `status` can adopt game identities after a StartOnly launch or
-  `terminate` can force-stop the recorded MO2 owner.
+  `terminate` can force-stop the recorded MO2 owner, and retain the verified
+  process handle so PID reuse cannot retarget the final termination call.
 - Let `status` durably adopt exact game and loader identities observed after a
   `launch -StartOnly` request, so the owning session can safely terminate a
   crashed game and complete RootBuilder recovery.

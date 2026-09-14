@@ -200,6 +200,13 @@ selected_profile=@ByteArray(Codex)
     $moduleSource = Get-Content -LiteralPath (Join-Path $packageRoot 'MO2Control.psm1') -Raw
     Assert-MO2Test ($moduleSource -match "Set-MO2OwnedSessionGameProcesses .* -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc'") 'status durably records the verified observed identity and running transition in one session update'
     Assert-MO2Test ($moduleSource -match 'ownerProcessPath' -and $moduleSource -match 'ownerProcessStartTime') 'launch and detached-owner adoption persist exact MO2 path and start-time identity'
+    $terminationCalls = [Collections.Generic.List[string]]::new()
+    $changedLiveOwner = [pscustomobject]@{ id = 101; name = 'MO2ControlFixtureProcess'; path = $mo2Exe; startTime = $ownerStartUtc.AddMinutes(1).ToString('o') }
+    $replacementBinding = { param($processId) [pscustomobject]@{ available = $true; reason = 'bound'; process = [pscustomobject]@{ id = $processId }; record = $changedLiveOwner } }.GetNewClosure()
+    $replacementTerminator = { param($process) $terminationCalls.Add([string]$process.id) }.GetNewClosure()
+    $replacementRace = & $mo2Module { param($cfg, $owned, $target, $binding, $terminator) Invoke-MO2VerifiedForceTermination -Config $cfg -Owned $owned -Target $target -BindingFactory $binding -TerminationAction $terminator } $config $launchingOwned $launchOwner.targets[0] $replacementBinding $replacementTerminator
+    Assert-MO2Test (-not $replacementRace.ok -and $replacementRace.reason -eq 'recorded-owner-start-time-mismatch' -and $terminationCalls.Count -eq 0) 'force termination rejects a changed live identity after the earlier inspection without invoking termination'
+    Assert-MO2Test ($moduleSource -match 'Invoke-MO2VerifiedForceTermination .* -Target \$targets\[0\]' -and $moduleSource -match '\$binding[.]process[.]Kill\(\)') 'terminate rebinds the live process and kills only through its retained exact process handle'
 
     $missingProfile = Invoke-MO2Validate -Config $config -Profile 'Does Not Exist'
     Assert-MO2Test (-not $missingProfile.ok) 'missing exact profile blocks validation'
