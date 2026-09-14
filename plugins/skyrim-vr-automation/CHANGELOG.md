@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Attempt every qualification publication rollback and temporary-file cleanup
+  step even when one filesystem operation fails, compose cleanup failures with
+  the original error, and retain unrestored backups for manual recovery.
 - Stage qualification reports and summaries until their completion receipt is
   validated and privately committed, then publish the sealed result with
   rollback so a later failure cannot leave a new unsealed PASS projection.

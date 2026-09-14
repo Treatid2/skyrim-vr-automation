@@ -1743,6 +1743,60 @@ try {
     $failedValidationSafe = $failedValidationRejected -and -not $failedValidationResult.ok -and -not (Test-Path -LiteralPath $failedValidationPath) -and @(Get-ChildItem -LiteralPath $failedValidationRoot -Filter '.qualification-completion.*.json').Count -eq 0
     Assert-Test $failedValidationSafe 'A post-commit validation failure left an ordinary-consumer-valid receipt when no later failure evidence was published.'
 
+    $cleanupFailureRoot = Join-Path $terminalBudgetRoot 'cleanup-failure'
+    $cleanupFailureReceipt = New-TerminalCommitFixture -Root $cleanupFailureRoot -RunId 'cleanup-failure-run'
+    $cleanupFailurePath = Join-Path $cleanupFailureRoot 'qualification-completion.json'
+    $cleanupFailureSummaryPath = Join-Path $cleanupFailureRoot 'qualification-summary.md'
+    [IO.File]::WriteAllText($cleanupFailureSummaryPath, 'prior-summary', [Text.UTF8Encoding]::new($false))
+    $cleanupFailureRunHash = Get-CSXFileSha256 (Join-Path $cleanupFailureRoot 'run.json')
+    $script:cleanupFailureValidationCalls = 0
+    $script:cleanupFailureSummaryLock = $null
+    $cleanupFailureMessage = ''
+    try {
+        Complete-CSXSealedQualification -EvidenceDirectory $cleanupFailureRoot -CompletionPath $cleanupFailurePath `
+            -CompletionReceipt $cleanupFailureReceipt -InvocationWatch ([Diagnostics.Stopwatch]::StartNew()) `
+            -FinalizationWatch ([Diagnostics.Stopwatch]::StartNew()) -ResultDeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) `
+            -EndToEndBudgetMs 5000 -FinalizationBudgetMs 5000 `
+            -Finalizer {
+                param($root, $runOutputPath, $summaryOutputPath)
+                Copy-Item -LiteralPath (Join-Path $root 'run.json') -Destination $runOutputPath
+                Copy-Item -LiteralPath (Join-Path $root 'summary.md') -Destination $summaryOutputPath
+                [pscustomobject]@{ report = [pscustomobject]@{ status = 'PASS' }; runPath = $runOutputPath; summaryPath = $summaryOutputPath }
+            } `
+            -CompletionValidator {
+                param($root, $runId, $receiptPath, $artifactPaths)
+                $script:cleanupFailureValidationCalls++
+                if ($script:cleanupFailureValidationCalls -eq 4) {
+                    $script:cleanupFailureSummaryLock = [IO.File]::Open(
+                        (Join-Path $root 'qualification-summary.md'),
+                        [IO.FileMode]::Open,
+                        [IO.FileAccess]::Read,
+                        [IO.FileShare]::Read)
+                    return [pscustomobject]@{ ok = $false; errors = @('simulated public validation failure') }
+                }
+                Test-CSXQualificationCompletionReceipt -EvidenceRoot $root -ExpectedRunId $runId `
+                    -CompletionPath $receiptPath -ArtifactPaths $artifactPaths
+            } | Out-Null
+    }
+    catch {
+        $cleanupFailureMessage = $_.Exception.Message
+    }
+    finally {
+        if ($null -ne $script:cleanupFailureSummaryLock) {
+            $script:cleanupFailureSummaryLock.Dispose()
+            $script:cleanupFailureSummaryLock = $null
+        }
+    }
+    $retainedSummaryBackup = @(Get-ChildItem -LiteralPath $cleanupFailureRoot -Filter '.summary.previous-*.md')
+    Assert-Test ($cleanupFailureMessage -match 'simulated public validation failure' -and
+        $cleanupFailureMessage -match 'remove published summary' -and
+        $cleanupFailureMessage -match 'restore previous summary' -and
+        $cleanupFailureRunHash -eq (Get-CSXFileSha256 (Join-Path $cleanupFailureRoot 'run.json')) -and
+        -not (Test-Path -LiteralPath $cleanupFailurePath) -and
+        $retainedSummaryBackup.Count -eq 1 -and
+        [IO.File]::ReadAllText($retainedSummaryBackup[0].FullName) -eq 'prior-summary') `
+        'A failing rollback step blocked later cleanup/restoration or discarded the retained prior artifact needed for recovery.'
+
     $providerCustodyOffset = $runnerSource.IndexOf('$script:providerCustodyEvidence = New-CSXProviderCustodyEvidence $visualProviderPreflight', [StringComparison]::Ordinal)
     $providerBudgetOffset = $runnerSource.IndexOf("Assert-CSXResultBudget -Stage 'post-provider admission'", [StringComparison]::Ordinal)
     $executionCustodyOffset = $runnerSource.IndexOf('$script:providerCustodyEvidence = New-CSXProviderCustodyEvidence $execution', [StringComparison]::Ordinal)
