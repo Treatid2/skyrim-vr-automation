@@ -8,6 +8,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   typed metadata, make rejected outcomes a global semantic veto, qualify menu
   and current-state wait probes before barrier evaluation, reject present-null
   registry statuses, and retain positive subsecond request budget.
+- Normalize the evidence-directory boundary before validating snapshot
+  containment so an equivalent trailing-separator spelling cannot block task
+  completion or receipt-only recovery.
 - Bind every no-op completion and receipt-only recovery proof to the original
   snapshot's exact preserved-baseline path, not merely a same-hash directory.
 - Make receipt-only no-op recovery authorization an explicit validator input,

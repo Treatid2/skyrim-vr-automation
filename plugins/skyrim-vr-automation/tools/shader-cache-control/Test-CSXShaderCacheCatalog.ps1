@@ -221,7 +221,7 @@ try {
         Command = 'complete'
         CatalogRoot = $catalogRoot
         CachePath = $liveCache
-        EvidenceDirectory = $taskEvidence
+        EvidenceDirectory = $taskEvidence + [IO.Path]::DirectorySeparatorChar
         Promote = $true
         WorkingSetStatus = 'known-working'
         Label = 'fixture completed task'
@@ -230,7 +230,7 @@ try {
         Compact = $true
         NoExit = $true
     }
-    Assert-Test ($complete.ok -and $complete.state -eq 'complete') 'task completion restores the caller-owned cache and publishes an explicitly verified result'
+    Assert-Test ($complete.ok -and $complete.state -eq 'complete') 'changed-output completion accepts the exact evidence directory with a trailing separator'
     Assert-Test ($complete.output.mode -eq 'bounded' -and $complete.data.task.workingTree.inventory.inventoryEntriesOmitted -and -not $complete.data.task.workingTree.inventory.PSObject.Properties['entries']) 'complete output remains bounded independently of cache file count'
     $afterComplete = & $transactionTool inspect -CachePath $liveCache -NoExit | ConvertFrom-Json -Depth 30
     Assert-Test ([string]$afterComplete.data.treeSha256 -ieq [string]$beforeTask.data.treeSha256) 'task completion restores the exact pre-task live cache'
@@ -265,7 +265,7 @@ try {
     $interruptedUnchangedPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $unchangedPlanPath -Encoding utf8
     $unchangedComplete = Invoke-Catalog @{
         Command = 'complete'; CatalogRoot = $unchangedCatalog
-        CachePath = $unchangedCache; EvidenceDirectory = $unchangedEvidence
+        CachePath = $unchangedCache; EvidenceDirectory = $unchangedEvidence + [IO.Path]::DirectorySeparatorChar
         WorkingSetStatus = 'unverified'; BlockingProcessNames = $blockers
         Confirm = $false; Compact = $true; NoExit = $true
     }
@@ -274,7 +274,7 @@ try {
     $unchangedRestore = Get-Content -LiteralPath ([string]$unchangedPlan.restoreReceiptPath) -Raw | ConvertFrom-Json -Depth 30
     Assert-Test ($unchangedPrepare.ok -and $unchangedComplete.ok -and
         [string]$unchangedBefore.data.treeSha256 -ieq [string]$unchangedAfter.data.treeSha256 -and
-        (Test-Path -LiteralPath ([string]$unchangedPlan.restoreReceiptPath) -PathType Leaf)) 'resumed completion durably finalizes an unchanged optional-output cache'
+        (Test-Path -LiteralPath ([string]$unchangedPlan.restoreReceiptPath) -PathType Leaf)) 'unchanged completion accepts the exact evidence directory with a trailing separator'
     Assert-Test ([string]$unchangedRestore.operation -ceq 'restore-noop' -and -not [bool]$unchangedRestore.restorationNecessary -and
         [string]$unchangedRestore.restoredTreeSha256 -ieq [string]$unchangedRestore.displacedTreeSha256 -and
         [IO.Path]::GetFullPath([string]$unchangedRestore.displacedPath) -eq [IO.Path]::GetFullPath((Join-Path $unchangedEvidence 'cache.before'))) 'unchanged completion records a committed no-op restore bound to the preserved snapshot instead of rebuilding the same live tree'
@@ -288,14 +288,14 @@ try {
     Remove-Variable RecoverMissingNoOpJournal -Scope Script -ErrorAction SilentlyContinue
     $receiptOnlyCompletion = Invoke-Catalog @{
         Command = 'complete'; CatalogRoot = $unchangedCatalog
-        CachePath = $unchangedCache; EvidenceDirectory = $unchangedEvidence
+        CachePath = $unchangedCache; EvidenceDirectory = $unchangedEvidence + [IO.Path]::DirectorySeparatorChar
         WorkingSetStatus = 'unverified'; BlockingProcessNames = $blockers
         Confirm = $false; Compact = $true; NoExit = $true
     }
     $receiptOnlyRecoveredPlan = Get-Content -LiteralPath $unchangedPlanPath -Raw | ConvertFrom-Json -Depth 40
     $receiptOnlyRecoveredJournal = Get-Content -LiteralPath $unchangedJournalPath -Raw | ConvertFrom-Json -Depth 30
     Assert-Test ($receiptOnlyCompletion.ok -and [bool]$receiptOnlyRecoveredJournal.recoveredFromReceipt -and
-        [IO.Path]::GetFullPath([string]$receiptOnlyRecoveredPlan.restoreReceiptPath) -eq [IO.Path]::GetFullPath([string]$unchangedPlan.restoreReceiptPath)) 'fresh receipt-only recovery explicitly authorizes journal reconstruction before the plan has persisted its receipt pointer'
+        [IO.Path]::GetFullPath([string]$receiptOnlyRecoveredPlan.restoreReceiptPath) -eq [IO.Path]::GetFullPath([string]$unchangedPlan.restoreReceiptPath)) 'fresh receipt-only recovery accepts a trailing separator and explicitly authorizes journal reconstruction before the plan has persisted its receipt pointer'
     $unchangedRestorePath = [string]$unchangedPlan.restoreReceiptPath
     $originalUnchangedRestoreJson = Get-Content -LiteralPath $unchangedRestorePath -Raw
     $alternatePreservedPath = Join-Path $unchangedEvidence 'cache.before-alternate'

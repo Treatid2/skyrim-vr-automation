@@ -1255,7 +1255,8 @@ function Complete-TaskCache($Storage) {
     }
     $snapshotTransactionId = [string]$snapshotReceipt.transactionId
     $snapshotPreservedPath = Assert-SafeDirectory ([string]$snapshotReceipt.backupPath) 'task snapshot preserved baseline' -MustExist
-    if (-not $snapshotPreservedPath.StartsWith($evidence + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    $evidenceBoundary = $evidence.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    if (-not $snapshotPreservedPath.StartsWith($evidenceBoundary, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Task snapshot preserved baseline escaped the exact task evidence directory.'
     }
     $requireMaterialized = [bool]$RequireMaterializedOutput -or
