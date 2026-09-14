@@ -49,8 +49,9 @@ cannot enter through a timing allowance. A loader-only observation remains
 pending until the configured primary game appears, so polling cannot finalize
 an incomplete launch set. Helper-to-runtime owner adoption is allowed only once,
 while the session is still opening or launching, and requires the candidate to
-be the exact requested process or its direct child under a matching durable
-dispatch receipt; a merely configured later process cannot become session
+be the exact requested process or its direct child whose parent PID and start
+time match the dispatched helper under a matching durable dispatch receipt; a
+merely configured later process cannot become session
 authority. Later `terminate-game` rebinds every
 recorded game identity to a retained live process handle, revalidates its full
 identity and configured path immediately before mutation, and never reopens a
@@ -199,8 +200,10 @@ overrides the profile's actual runtime files.
 never expires, steals, or transfers a lease because its estimate elapsed.
 `renew-access` refreshes the recorded activity time and can replace the
 estimate. `access-status` reports availability and exact ownership.
-Session owner liveness is bound to both process ID and process start time, so a
-reused PID cannot make an abandoned session appear live.
+Session owner liveness is bound to process ID, executable path, and process
+start time, so a reused PID cannot make an abandoned session appear live.
+Readable legacy records without the complete identity tuple cannot authorize
+live-process reuse.
 
 Every task must call `release-access` as soon as it no longer needs MO2. This
 includes compilation, source editing, result analysis, report writing, and any

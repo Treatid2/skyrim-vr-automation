@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Reject stale lease generations at the serialized MO2 session commit boundary
+  and bind detached handoff ancestry to the dispatched helper's exact process
+  lifetime.
 - Treat every named outcome-map member as required unless it is explicitly
   typed metadata, make rejected outcomes a global semantic veto, qualify menu
   and current-state wait probes before barrier evaluation, reject present-null

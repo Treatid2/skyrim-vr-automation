@@ -1436,10 +1436,12 @@ function Get-MO2ProcessRecords {
     $records = @()
     foreach ($name in @($Names | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
         foreach ($process in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
+            $parentId = $(try { [int](Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($process.Id)" -ErrorAction Stop).ParentProcessId } catch { $null })
             $records += [pscustomobject][ordered]@{
                 name = $process.ProcessName
                 id = $process.Id
-                parentId = $(try { [int](Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($process.Id)" -ErrorAction Stop).ParentProcessId } catch { $null })
+                parentId = $parentId
+                parentStartTime = $(try { (Get-Process -Id $parentId -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o') } catch { $null })
                 path = $(try { [IO.Path]::GetFullPath($process.Path) } catch { $null })
                 startTime = $(try { $process.StartTime.ToUniversalTime().ToString('o') } catch { $null })
                 cpuSeconds = $(try { [math]::Round($process.CPU, 3) } catch { $null })
@@ -2266,6 +2268,11 @@ function Write-MO2OwnedSessionAtomic {
         $current = Get-MO2SessionLockRecord -Path ([string]$Owned.path)
         if (-not $current.valid -or $current.sessionId -ne $sessionId -or $current.accessId -ne [string]$Owned.accessId) {
             throw "Session '$sessionId' no longer owns the MO2 lease transition."
+        }
+        $expectedGeneration = if ($Owned.data.PSObject.Properties['generation']) { [long]$Owned.data.generation } else { 0L }
+        $currentGeneration = if ($current.data.PSObject.Properties['generation']) { [long]$current.data.generation } else { 0L }
+        if ($currentGeneration -ne $expectedGeneration) {
+            throw "Session '$sessionId' lease transition is stale: expected generation $expectedGeneration, current generation $currentGeneration."
         }
 
         $updated = $Value
@@ -3532,6 +3539,12 @@ function Test-MO2DetachedOwnerAdoptionEvidence {
     if ([string]::IsNullOrWhiteSpace($requiredStatus) -or [string]$Owned.data.status -cne $requiredStatus) {
         return [pscustomobject][ordered]@{ ok = $false; reason = 'detached-owner-transition-state-mismatch'; transitionKind = $kind; sessionStatus = [string]$Owned.data.status }
     }
+    if (-not $Owned.data.PSObject.Properties['ownerPid'] -or -not $Owned.data.PSObject.Properties['processPath'] -or
+        -not $Owned.data.PSObject.Properties['processStartTime'] -or
+        [int]$Owned.data.ownerPid -le 0 -or [string]::IsNullOrWhiteSpace([string]$Owned.data.processPath) -or
+        [string]::IsNullOrWhiteSpace([string]$Owned.data.processStartTime)) {
+        return [pscustomobject][ordered]@{ ok = $false; reason = 'detached-owner-original-identity-unbound' }
+    }
 
     try {
         $sessionPath = [IO.Path]::GetFullPath([string]$Owned.data.sessionPath)
@@ -3543,18 +3556,33 @@ function Test-MO2DetachedOwnerAdoptionEvidence {
         $receipt = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $expectedReceiptPath -Raw -ErrorAction Stop)
         $sessionId = if ($Owned.PSObject.Properties['sessionId']) { [string]$Owned.sessionId } else { [string]$Owned.data.sessionId }
         if ([string]$receipt.sessionId -cne $sessionId -or [string]$receipt.attemptId -cne [string]$transition.attemptId -or
-            [int]$receipt.requestedPid -ne [int]$transition.requestedPid -or [int]$receipt.requestedPid -le 0) {
+            [int]$receipt.requestedPid -ne [int]$transition.requestedPid -or [int]$receipt.requestedPid -le 0 -or
+            -not $transition.PSObject.Properties['requestedProcessStartTime'] -or
+            -not $receipt.PSObject.Properties['requestedProcessStartTime']) {
             return [pscustomobject][ordered]@{ ok = $false; reason = 'detached-owner-receipt-identity-mismatch' }
-        }
-        $isRequestedProcess = [int]$Candidate.id -eq [int]$transition.requestedPid
-        $isDirectHandoff = $Candidate.PSObject.Properties['parentId'] -and [int]$Candidate.parentId -eq [int]$transition.requestedPid
-        if (-not $isRequestedProcess -and -not $isDirectHandoff) {
-            return [pscustomobject][ordered]@{ ok = $false; reason = 'detached-owner-handoff-unproven'; requestedPid = [int]$transition.requestedPid; candidatePid = [int]$Candidate.id; candidateParentPid = $(if ($Candidate.PSObject.Properties['parentId']) { [int]$Candidate.parentId } else { $null }) }
         }
         $configuredPath = [IO.Path]::GetFullPath([string]$Config.mo2.executable)
         $receiptMO2Path = [IO.Path]::GetFullPath([string]$receipt.mo2Path)
         $requestedProcessPath = [IO.Path]::GetFullPath([string]$transition.requestedProcessPath)
         $candidatePath = [IO.Path]::GetFullPath([string]$Candidate.path)
+        $requestedStartUtc = [DateTimeOffset]::Parse([string]$transition.requestedProcessStartTime, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).UtcDateTime
+        $receiptRequestedStartUtc = [DateTimeOffset]::Parse([string]$receipt.requestedProcessStartTime, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).UtcDateTime
+        $recordedOwnerStartUtc = [DateTimeOffset]::Parse([string]$Owned.data.processStartTime, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).UtcDateTime
+        $recordedOwnerPath = [IO.Path]::GetFullPath([string]$Owned.data.processPath)
+        if ([int]$Owned.data.ownerPid -ne [int]$transition.requestedPid -or
+            -not [string]::Equals($recordedOwnerPath, $requestedProcessPath, [StringComparison]::OrdinalIgnoreCase) -or
+            [math]::Abs(($recordedOwnerStartUtc - $requestedStartUtc).TotalMilliseconds) -ge 1.0 -or
+            [math]::Abs(($receiptRequestedStartUtc - $requestedStartUtc).TotalMilliseconds) -ge 1.0) {
+            return [pscustomobject][ordered]@{ ok = $false; reason = 'detached-owner-original-identity-mismatch' }
+        }
+        $isRequestedProcess = [int]$Candidate.id -eq [int]$transition.requestedPid -and
+            [math]::Abs(([DateTimeOffset]::Parse([string]$Candidate.startTime, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).UtcDateTime - $requestedStartUtc).TotalMilliseconds) -lt 1.0
+        $isDirectHandoff = $Candidate.PSObject.Properties['parentId'] -and [int]$Candidate.parentId -eq [int]$transition.requestedPid -and
+            $Candidate.PSObject.Properties['parentStartTime'] -and -not [string]::IsNullOrWhiteSpace([string]$Candidate.parentStartTime) -and
+            [math]::Abs(([DateTimeOffset]::Parse([string]$Candidate.parentStartTime, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).UtcDateTime - $requestedStartUtc).TotalMilliseconds) -lt 1.0
+        if (-not $isRequestedProcess -and -not $isDirectHandoff) {
+            return [pscustomobject][ordered]@{ ok = $false; reason = 'detached-owner-handoff-unproven'; requestedPid = [int]$transition.requestedPid; requestedProcessStartTime = $requestedStartUtc.ToString('o'); candidatePid = [int]$Candidate.id; candidateParentPid = $(if ($Candidate.PSObject.Properties['parentId']) { [int]$Candidate.parentId } else { $null }); candidateParentStartTime = $(if ($Candidate.PSObject.Properties['parentStartTime']) { [string]$Candidate.parentStartTime } else { $null }) }
+        }
         if (-not [string]::Equals($configuredPath, $receiptMO2Path, [StringComparison]::OrdinalIgnoreCase) -or
             -not [string]::Equals($configuredPath, $requestedProcessPath, [StringComparison]::OrdinalIgnoreCase) -or
             -not [string]::Equals($configuredPath, $candidatePath, [StringComparison]::OrdinalIgnoreCase)) {
@@ -4214,6 +4242,7 @@ function Invoke-MO2Launch {
         launchAttemptId = $launchAttemptId
         attemptId = $launchAttemptId
         requestedPid = $null
+        requestedProcessStartTime = $null
         startedUtc = [DateTime]::UtcNow.ToString('o')
         dispatchStartedUtc = $null
         preLaunchGameProcesses = @($preLaunchGameProcesses)
@@ -4230,7 +4259,9 @@ function Invoke-MO2Launch {
     $launchStarted.dispatchStartedUtc = $launchDispatchedUtc
     $launchStarted.preLaunchGameProcesses = @($preLaunchGameProcesses)
     $process = Start-Process -FilePath $mo2Path -ArgumentList $argumentLine -WorkingDirectory (Split-Path -Parent $mo2Path) -WindowStyle Hidden -PassThru
+    $launchProcessStartTime = $(try { $process.StartTime.ToUniversalTime().ToString('o') } catch { $null })
     $launchStarted.requestedPid = $process.Id
+    $launchStarted.requestedProcessStartTime = $launchProcessStartTime
     Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted
     $ownerTransition = [pscustomobject][ordered]@{
         kind = 'launch'
@@ -4238,6 +4269,7 @@ function Invoke-MO2Launch {
         dispatchStartedUtc = $launchDispatchedUtc
         requestedPid = [int]$process.Id
         requestedProcessPath = $(try { [IO.Path]::GetFullPath($process.Path) } catch { $mo2Path })
+        requestedProcessStartTime = $launchProcessStartTime
         preDispatchProcesses = @($preLaunchMO2Processes)
         receiptPath = $launchStartedPath
         detachedAdoptionAllowed = -not $reuseRetainedMO2
@@ -4249,7 +4281,7 @@ function Invoke-MO2Launch {
         $launchedOwner = [pscustomobject][ordered]@{
             id = [int]$process.Id
             path = $(try { [IO.Path]::GetFullPath($process.Path) } catch { $mo2Path })
-            startTime = $(try { $process.StartTime.ToUniversalTime().ToString('o') } catch { $null })
+            startTime = $launchProcessStartTime
         }
         $null = Set-MO2OwnedSessionOwner -Owned $owned -ProcessRecord $launchedOwner -Reason 'exact MO2 launcher process started for this retained session'
         $lockData = $owned.data
@@ -4411,6 +4443,7 @@ function Invoke-MO2Open {
         sessionId = $SessionId
         attemptId = $openAttemptId
         requestedPid = $null
+        requestedProcessStartTime = $null
         mo2Path = $mo2Path
         arguments = $arguments
         argumentLine = $argumentLine
@@ -4421,20 +4454,22 @@ function Invoke-MO2Open {
     }
     Write-MO2JsonAtomic -Path $openStartedPath -Value $openStarted
     $process = Start-Process -FilePath $mo2Path -ArgumentList $argumentLine -WorkingDirectory (Split-Path -Parent $mo2Path) -PassThru
-    $openStarted.requestedPid = $process.Id
-    Write-MO2JsonAtomic -Path $openStartedPath -Value $openStarted
     $openOwner = [pscustomobject][ordered]@{
         id = [int]$process.Id
         name = [string]$process.ProcessName
         path = [IO.Path]::GetFullPath($mo2Path)
         startTime = $(try { $process.StartTime.ToUniversalTime().ToString('o') } catch { $null })
     }
+    $openStarted.requestedPid = $process.Id
+    $openStarted.requestedProcessStartTime = $openOwner.startTime
+    Write-MO2JsonAtomic -Path $openStartedPath -Value $openStarted
     $ownerTransition = [pscustomobject][ordered]@{
         kind = 'open'
         attemptId = $openAttemptId
         dispatchStartedUtc = $openDispatchedUtc
         requestedPid = [int]$process.Id
         requestedProcessPath = [IO.Path]::GetFullPath($mo2Path)
+        requestedProcessStartTime = $openOwner.startTime
         preDispatchProcesses = @($preOpenMO2Processes)
         receiptPath = $openStartedPath
         detachedAdoptionAllowed = $true
