@@ -37,7 +37,9 @@ adopted MO2 process and its visible `MainWindow`, it advances an `opening`
 session to durable `mo2-open` so a later game launch is valid. After a
 `launch -StartOnly`, `status` also adopts only configured game/loader identities
 whose PID, process name, executable path, and start time bind them to the
-recorded launch and exact MO2 owner. This makes later exact `terminate-game`
+recorded launch and a freshly revalidated exact MO2 owner. The launch records a
+pre-dispatch process set and dispatch boundary, so a recent pre-existing process
+cannot enter through a timing allowance. This makes later exact `terminate-game`
 and RootBuilder recovery available without reissuing the launch. A missing session
 ID is a structured `missing-session-id` precondition instead of a PowerShell
 binding failure. Launch classifies the exact `Failed to write settings` dialog
@@ -216,6 +218,9 @@ readiness, a later `status`, `close`, or `recover-close` still has durable PID,
 path, argument, and timestamp evidence for exact-process adoption.
 `status` is bounded and mutates only proven lifecycle transitions: `opening` to
 `mo2-open`, or `launching` to `running` with exact post-launch process identities.
+Each retained relaunch archives the preceding active game identities with their
+launch-attempt provenance before opening a new active identity set; it does not
+discard the earlier evidence or reuse it as authority for the new game.
 `stop-game`
 requests normal closure of the owned game/loader while preserving the exact
 owner MO2 PID, allowing controlled relaunches. After the game exits it first
@@ -246,7 +251,10 @@ The retained cycle is:
 ```
 
 Resume is accepted only from a bounded stopped/failure state, with no game
-process and exactly one MO2 process matching the session's original owner PID.
+process and exactly one MO2 process matching the session's recorded owner PID,
+configured executable path, and process start instant. That exact identity is
+checked again immediately before dispatch; legacy PID-only records cannot
+authorize dry-run or live relaunch.
 
 `terminate` is intentionally distinct from `stop`: it force-terminates only
 MO2 processes owned by the active session, and only after proving that no game

@@ -4,6 +4,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Bind StartOnly adoption and retained relaunch to configured full executable
+  paths, a pre-dispatch process snapshot and timestamp, a freshly observed exact
+  MO2 owner, and a per-launch active identity set while retaining prior game
+  identities as history; normalize process timestamps across persistence and
+  exact termination comparisons.
 - Bind recorded MO2 ownership to exact PID, executable path, and start time
   before `status` can adopt game identities after a StartOnly launch or
   `terminate` can force-stop the recorded MO2 owner, and retain the verified
