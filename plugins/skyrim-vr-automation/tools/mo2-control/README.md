@@ -45,8 +45,11 @@ session to durable `mo2-open` so a later game launch is valid. After a
 whose PID, process name, executable path, and start time bind them to the
 recorded launch and a freshly revalidated exact MO2 owner. The launch records a
 pre-dispatch process set and dispatch boundary, so a recent pre-existing process
-cannot enter through a timing allowance. This makes later exact `terminate-game`
-and RootBuilder recovery available without reissuing the launch. A missing session
+cannot enter through a timing allowance. Later `terminate-game` rebinds every
+recorded game identity to a retained live process handle, revalidates its full
+identity and configured path immediately before mutation, and never reopens a
+PID for termination. This makes exact termination and RootBuilder recovery
+available without reissuing the launch. A missing session
 ID is a structured `missing-session-id` precondition instead of a PowerShell
 binding failure. Launch classifies the exact `Failed to write settings` dialog
 and cooperative close acknowledges only its exact `OK` button.

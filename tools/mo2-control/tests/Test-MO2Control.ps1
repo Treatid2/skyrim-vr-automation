@@ -263,6 +263,13 @@ selected_profile=@ByteArray(Codex)
     $replacementRace = & $mo2Module { param($cfg, $owned, $target, $binding, $terminator) Invoke-MO2VerifiedForceTermination -Config $cfg -Owned $owned -Target $target -BindingFactory $binding -TerminationAction $terminator } $config $launchingOwned $launchOwner.targets[0] $replacementBinding $replacementTerminator
     Assert-MO2Test (-not $replacementRace.ok -and $replacementRace.reason -eq 'recorded-owner-start-time-mismatch' -and $terminationCalls.Count -eq 0) 'force termination rejects a changed live identity after the earlier inspection without invoking termination'
     Assert-MO2Test ($moduleSource -match 'Invoke-MO2VerifiedForceTermination .* -Target \$targets\[0\]' -and $moduleSource -match '\$binding[.]process[.]Kill\(\)') 'terminate rebinds the live process and kills only through its retained exact process handle'
+    $gameTerminationCalls = [Collections.Generic.List[string]]::new()
+    $changedLiveGame = [pscustomobject]@{ id = [int]$observedGame.id; name = [string]$observedGame.name; path = [string]$observedGame.path; startTime = ([DateTimeOffset]::Parse([string]$observedGame.startTime)).AddMinutes(1).UtcDateTime.ToString('o') }
+    $gameReplacementBinding = { param($processId) [pscustomobject]@{ available = $true; reason = 'bound'; process = [pscustomobject]@{ id = $processId }; record = $changedLiveGame } }.GetNewClosure()
+    $gameReplacementTerminator = { param($process) $gameTerminationCalls.Add([string]$process.id) }.GetNewClosure()
+    $gameReplacementRace = & $mo2Module { param($cfg, $owned, $target, $binding, $terminator) Invoke-MO2VerifiedGameTerminationSet -Config $cfg -Owned $owned -Targets @($target) -BindingFactory $binding -TerminationAction $terminator } $config $launchingOwned $observedGame $gameReplacementBinding $gameReplacementTerminator
+    Assert-MO2Test (-not $gameReplacementRace.ok -and $gameReplacementRace.reason -eq 'process-start-time-mismatch' -and $gameTerminationCalls.Count -eq 0) 'terminate-game rejects a changed live game identity after inspection without invoking termination'
+    Assert-MO2Test ($moduleSource -match 'Invoke-MO2VerifiedGameTerminationSet .* -Targets \$targets' -and $moduleSource -notmatch 'Stop-Process -Id \(\[int\]\$target[.]id\)') 'terminate-game rebinds every game process and terminates only through retained exact process handles'
 
     $missingProfile = Invoke-MO2Validate -Config $config -Profile 'Does Not Exist'
     Assert-MO2Test (-not $missingProfile.ok) 'missing exact profile blocks validation'
