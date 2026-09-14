@@ -350,6 +350,13 @@ selected_profile=@ByteArray(Codex)
     $gameReplacementRace = & $mo2Module { param($cfg, $owned, $target, $binding, $terminator) Invoke-MO2VerifiedGameTerminationSet -Config $cfg -Owned $owned -Targets @($target) -BindingFactory $binding -TerminationAction $terminator } $config $launchingOwned $observedGame $gameReplacementBinding $gameReplacementTerminator
     Assert-MO2Test (-not $gameReplacementRace.ok -and $gameReplacementRace.reason -eq 'process-start-time-mismatch' -and $gameTerminationCalls.Count -eq 0) 'terminate-game rejects a changed live game identity after inspection without invoking termination'
     Assert-MO2Test ($moduleSource -match 'Invoke-MO2VerifiedGameTerminationSet .* -Targets \$targets' -and $moduleSource -notmatch 'Stop-Process -Id \(\[int\]\$target[.]id\)') 'terminate-game rebinds every game process and terminates only through retained exact process handles'
+    $gameCloseCalls = [Collections.Generic.List[string]]::new()
+    $gameReplacementCloser = { param($process) $gameCloseCalls.Add([string]$process.id) }.GetNewClosure()
+    $gameCloseReplacementRace = & $mo2Module { param($cfg, $owned, $target, $binding, $closer) Invoke-MO2VerifiedGameCloseRequestSet -Config $cfg -Owned $owned -Targets @($target) -BindingFactory $binding -CloseAction $closer } $config $launchingOwned $observedGame $gameReplacementBinding $gameReplacementCloser
+    Assert-MO2Test (-not $gameCloseReplacementRace.ok -and $gameCloseReplacementRace.reason -eq 'process-start-time-mismatch' -and $gameCloseCalls.Count -eq 0) 'graceful game close rejects a changed live identity after inspection without invoking CloseMainWindow'
+    $stopGameSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2StopGame \{.*?\n\}').Value
+    $stopSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Stop \{.*?\n\}').Value
+    Assert-MO2Test ($stopGameSource -match 'Invoke-MO2OwnedGameCloseRequest' -and $stopSource -match 'Invoke-MO2OwnedGameCloseRequest' -and $stopGameSource -notmatch 'Get-Process -Id' -and $stopSource -notmatch 'Get-Process -Id') 'stop-game and stop share serialized retained-handle identity validation instead of reopening observed PIDs'
     $terminateGameSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2TerminateGame \{.*?\n\}').Value
     $serializedTerminationIndex = $terminateGameSource.IndexOf('Invoke-MO2OwnedSessionMutation', [StringComparison]::Ordinal)
     $currentOwnerGuardIndex = $terminateGameSource.IndexOf('$currentOwnerResolution = Resolve-MO2OwnedProcessTarget', [StringComparison]::Ordinal)
