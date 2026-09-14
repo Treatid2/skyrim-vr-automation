@@ -1,0 +1,32 @@
+{
+  "schema": "csx-render-scale-fixture-v1",
+  "fixtureId": "windhelm-dragonsreach-static-v1",
+  "save": {
+    "id": "replace-with-save-identity",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "camera": {
+    "id": "replace-with-camera-pose-identity",
+    "configurationSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "vrFpsStabilizer": {
+    "version": "replace-with-version",
+    "configurationSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "gpu": {
+    "vendor": "NVIDIA",
+    "deviceId": "replace-with-device-id",
+    "driverVersion": "replace-with-driver-version"
+  },
+  "hmd": {
+    "model": "replace-with-hmd-model",
+    "runtime": "SteamVR",
+    "runtimeVersion": "replace-with-runtime-version",
+    "refreshHz": 90
+  },
+  "attestation": {
+    "operatorId": "replace-with-operator-identity",
+    "recordedUtc": "replace-with-iso-8601-time",
+    "operatorAttestedFields": ["save", "camera", "vrFpsStabilizer", "hmd"]
+  }
+}
