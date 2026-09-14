@@ -180,7 +180,10 @@ After the game and MO2 are closed, complete the cache transaction:
 and records a completion receipt. Promotion is opt-in and is refused unless the
 caller explicitly classifies the task result as `known-working`. An unverified
 or failed task result is still preserved as evidence but is not added to the
-catalog. A shader-source mismatch remains excluded unless
+catalog. If the failed or unverified run left the live cache byte-for-byte equal
+to its prepared baseline, `complete` verifies both trees and commits a
+`restore-noop` receipt instead of moving or rebuilding identical data. A
+shader-source mismatch remains excluded unless
 `-AllowSourceMismatch` is accompanied by a concrete `-CompatibilityReason`;
 this exception does not bypass ABI, runtime, bytecode-class, feature-set, status,
 or tag gates.
