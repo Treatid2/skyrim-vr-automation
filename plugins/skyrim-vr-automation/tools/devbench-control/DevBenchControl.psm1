@@ -598,10 +598,10 @@ function Get-DevBenchCallSemanticStatus {
             $duration = if ($null -ne $limitsObject) { $limitsObject.PSObject.Properties['maximumSequenceDurationMs'] } else { $null }
             if ($null -eq $limitsObject) { $reasons.Add('content.limits is not a structured screenshot limits object') }
             $integralTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
-            if (-not $frames -or $null -eq $frames.Value -or $frames.Value.GetType() -notin $integralTypes -or [uint64]$frames.Value -eq 0) {
+            if (-not $frames -or $null -eq $frames.Value -or $frames.Value.GetType() -notin $integralTypes -or [decimal]$frames.Value -le 0) {
                 $reasons.Add('content.limits.maximumSequenceFrames is not a positive integer')
             }
-            if (-not $duration -or $null -eq $duration.Value -or $duration.Value.GetType() -notin $integralTypes -or [uint64]$duration.Value -eq 0) {
+            if (-not $duration -or $null -eq $duration.Value -or $duration.Value.GetType() -notin $integralTypes -or [decimal]$duration.Value -le 0) {
                 $reasons.Add('content.limits.maximumSequenceDurationMs is not a positive integer')
             }
         }
@@ -691,7 +691,7 @@ function Get-DevBenchCallSemanticStatus {
                     }
                 }
                 if (-not $schemaVersion -or $null -eq $schemaVersion.Value -or
-                    $schemaVersion.Value.GetType() -notin $integralTypes -or [uint64]$schemaVersion.Value -eq 0) {
+                    $schemaVersion.Value.GetType() -notin $integralTypes -or [decimal]$schemaVersion.Value -le 0) {
                     $reasons.Add('content.settingsSchemaVersion is not a positive integer')
                 }
             }

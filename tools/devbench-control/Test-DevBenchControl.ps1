@@ -86,6 +86,10 @@ $screenshotBooleanLimit = Get-DevBenchCallSemanticStatus -ToolName 'communitysha
 Assert-Test ($screenshotBooleanLimit.known -and -not $screenshotBooleanLimit.ok) 'screenshot capabilities reject a Boolean sequence limit'
 $screenshotNullLimit = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = $null } })
 Assert-Test ($screenshotNullLimit.known -and -not $screenshotNullLimit.ok) 'screenshot capabilities reject a null sequence limit without a strict-mode exception'
+$screenshotNegativeFrameLimit = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = -1; maximumSequenceDurationMs = 3600000 } })
+Assert-Test ($screenshotNegativeFrameLimit.known -and -not $screenshotNegativeFrameLimit.ok -and $screenshotNegativeFrameLimit.reasons -match 'maximumSequenceFrames is not a positive integer') 'screenshot capabilities reject a signed negative frame limit without throwing'
+$screenshotNegativeDurationLimit = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = [int64]-1 } })
+Assert-Test ($screenshotNegativeDurationLimit.known -and -not $screenshotNegativeDurationLimit.ok -and $screenshotNegativeDurationLimit.reasons -match 'maximumSequenceDurationMs is not a positive integer') 'screenshot capabilities reject a signed negative duration limit without throwing'
 $screenshotGenericWrongSchema = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ ok = $true; schema = 'wrong'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = 3600000 } })
 Assert-Test ($screenshotGenericWrongSchema.known -and -not $screenshotGenericWrongSchema.ok) 'generic success cannot bypass the screenshot capabilities schema'
 $screenshotGenericValid = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ ok = $true; schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = 3600000 } })
@@ -104,6 +108,8 @@ $screenshotStatus = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.s
 Assert-Test ($screenshotStatus.known -and $screenshotStatus.ok) 'screenshot status accepts its exact structured sections'
 $screenshotSettings = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'settings_get' } -Content @([pscustomobject]@{ settingsSchemaVersion = 2; effective = [pscustomobject]@{}; persisted = [pscustomobject]@{} })
 Assert-Test ($screenshotSettings.known -and $screenshotSettings.ok) 'screenshot settings_get accepts its versioned settings receipt'
+$screenshotNegativeSettings = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'settings_get' } -Content @([pscustomobject]@{ settingsSchemaVersion = [int16]-1; effective = [pscustomobject]@{}; persisted = [pscustomobject]@{} })
+Assert-Test ($screenshotNegativeSettings.known -and -not $screenshotNegativeSettings.ok -and $screenshotNegativeSettings.reasons -match 'settingsSchemaVersion is not a positive integer') 'screenshot settings_get rejects a signed negative schema version without throwing'
 $screenshotList = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_list' } -Content @([pscustomobject]@{ requests = [object[]]@(); retained = 0 })
 Assert-Test ($screenshotList.known -and $screenshotList.ok) 'screenshot request_list accepts an empty bounded collection receipt'
 $screenshotEvents = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'events_poll' } -Content @([pscustomobject]@{ events = [object[]]@(); oldestRetainedEventId = 1; latestEventId = 0; nextEventId = 0; cursorExpired = $false; moreAvailable = $false })
@@ -813,6 +819,41 @@ $attemptedProvenance = Get-DevBenchDispatchProvenance -InvocationRecord ([pscust
 Assert-Test ($attemptedError -match 'target lost response' -and $targetInvocations -eq 1 -and
     -not [string]::IsNullOrWhiteSpace([string]$attemptedRecord.dispatchIntentUtc) -and
     -not [string]::IsNullOrWhiteSpace([string]$attemptedRecord.dispatchedUtc) -and $attemptedProvenance.dispatchReached) 'entered target with a lost response remains an attempted unknown mutation'
+$waitTimeoutSemanticAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'New-DevBenchWaitTimeoutSemantic' }, $true))[0]
+Invoke-Expression $waitTimeoutSemanticAst.Extent.Text
+$ordinaryTimeoutSemantic = New-DevBenchWaitTimeoutSemantic -Condition 'serviceReady' -TimeoutSeconds 42
+Assert-Test (-not $ordinaryTimeoutSemantic.ok -and $ordinaryTimeoutSemantic.outcome -eq 'wait-timeout' -and $ordinaryTimeoutSemantic.codes -contains 'wait_timeout' -and $ordinaryTimeoutSemantic.states -contains 'timeout') 'ordinary and exceptional wait expiry share one structured timeout semantic contract'
+$runtimeIdentityAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-RuntimeIdentity' }, $true))[0]
+$retryableExceptionAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-WaitRetryableException' }, $true))[0]
+$identityProbeResult = & {
+    param([string]$RuntimeIdentityFunction, [string]$RetryableFunction)
+    Invoke-Expression $RetryableFunction
+    function Get-DevBenchRuntimeExpectations {
+        [pscustomobject]@{ port = 1; pid = $PID; exe = $null; buildId = $null; artifactPath = $null; artifactSha256 = $null }
+    }
+    function Get-ListenerPid { return $PID }
+    function Test-DevBenchExecutableIdentityMatch { return $true }
+    function Invoke-ToolRpc {
+        param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers)
+        if ($Name -eq 'inspect') { return [pscustomobject]@{ content = @([pscustomobject]@{ pid = $PID; exe = 'pwsh.exe' }) } }
+        if ($Name -eq 'communityshaders.first_api') { throw [InvalidOperationException]::new('main thread busy') }
+        return [pscustomobject]@{ content = @([pscustomobject]@{ producer = [pscustomobject]@{ buildId = 'fixture-build' } }) }
+    }
+    $ArtifactPath = ''
+    $ExpectedBuildId = ''
+    $ExpectedArtifactSha256 = ''
+    $ExpectedRuntimeIdentityJson = ''
+    Invoke-Expression $RuntimeIdentityFunction
+    $tools = @([pscustomobject]@{ name = 'inspect' }, [pscustomobject]@{ name = 'communityshaders.first_api' }, [pscustomobject]@{ name = 'communityshaders.second_api' })
+    $runtime = [pscustomobject]@{ port = 1 }
+    $nonWait = Get-RuntimeIdentity -Runtime $runtime -Headers @{} -Tools $tools
+    $waitPropagated = $false
+    try { $null = Get-RuntimeIdentity -Runtime $runtime -Headers @{} -Tools $tools -PropagateRetryable }
+    catch { $waitPropagated = $_.Exception.Message -eq 'main thread busy' }
+    [pscustomobject]@{ nonWait = $nonWait; waitPropagated = $waitPropagated }
+} $runtimeIdentityAst.Extent.Text $retryableExceptionAst.Extent.Text
+Assert-Test ($identityProbeResult.nonWait.errors.Count -eq 0 -and $identityProbeResult.nonWait.build.buildId -eq 'fixture-build' -and $identityProbeResult.nonWait.build.sources[0].error -eq 'main thread busy') 'non-wait identity discovery retains one transient candidate failure and continues to a valid sibling producer'
+Assert-Test $identityProbeResult.waitPropagated 'wait identity discovery propagates a retryable producer failure into the bounded rebind loop'
 $terminalWriterAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Write-TerminalInvocationEvidence' }, $true))[0]
 Invoke-Expression $terminalWriterAst.Extent.Text
 $headerReaderAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-McpSessionHeaderValue' }, $true))[0]
@@ -828,7 +869,7 @@ Assert-Test ($entryPointText -match '\$expectations\.buildId\s+-and\s+\$actualBu
 Assert-Test ($entryPointText -match '\$Command -eq ''wait'' -and \$statusCode -eq 404') 'transient MCP 404 recovery is restricted to bounded waits'
 Assert-Test ($entryPointText -match 'full-runtime-rebind-required') 'bounded waits route invalidated MCP sessions through a full runtime rebind'
 Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$RequirePerformanceNeutral\) -and -not \$semantic\.known') 'required semantic outcomes reject unknown responses'
-Assert-Test ($entryPointText -match 'ok = \[bool\]\$observation\.satisfied') 'wait semantics retain the observed unsatisfied condition'
+Assert-Test ($entryPointText -match '\$semantic = if \(\$observation\.satisfied\)' -and $entryPointText -match 'New-DevBenchWaitTimeoutSemantic -Condition \$Condition -TimeoutSeconds \$TimeoutSeconds') 'wait semantics retain the observed unsatisfied condition as a qualified timeout'
 Assert-Test ($entryPointText -match '\$Command -eq ''call'' -and -not \$readOnlyCall -and -not \$runtimeIdentity\.complete') 'only mutation-capable calls require complete runtime identity'
 Assert-Test ($entryPointText -match '\[string\]\$ExpectedRuntimeIdentityJson') 'controller accepts an exact prior runtime identity for pre-dispatch continuity'
 Assert-Test ($entryPointText.IndexOf('Expected runtime identity is invalid:') -lt $entryPointText.IndexOf("Update-InvocationEvidence -State 'dispatching'")) 'runtime identity continuity is verified before mutation dispatch'
@@ -854,7 +895,7 @@ Assert-Test ($entryPointText -notmatch 'Start-Sleep -Milliseconds \$currentDelay
 Assert-Test ($entryPointText -match 'mcp-session-reinitialized') 'bounded waits reinitialize invalidated MCP sessions'
 Assert-Test ($entryPointText -match '\[ValidateRange\(0, 1000\)\][\s\S]{0,80}\[int\]\$MaxSessionRebinds = 0' -and $entryPointText -match '\$MaxSessionRebinds -gt 0') 'bounded waits rely on the caller deadline by default and expose an optional explicit session-churn cap'
 Assert-Test ($entryPointText -match '\[ValidateRange\(1, 3600\)\][\s\S]{0,80}\[int\]\$TimeoutSeconds = 30') 'readiness waits admit explicit task-proportional deadlines up to one hour'
-Assert-Test ($entryPointText -match "outcome = 'wait-timeout'" -and $entryPointText -match 'lastSuccessfulObservation = \$lastSuccessfulWaitObservation') 'deadline expiry returns a structured timeout with the last successful state observation'
+Assert-Test ($entryPointText -match 'state = \$\(if \(\$Command -eq ''wait'' -and -not \$observation\.satisfied\) \{ ''timeout'' \}' -and $entryPointText -match 'lastSuccessfulObservation = if \(\$observation\.satisfied\)' -and $entryPointText -match 'outcome = ''wait-timeout''') 'ordinary deadline expiry returns the documented top-level state and last successful observation'
 Assert-Test ($entryPointText -match "persistentSessionInvalidation\) \{ 'persistent-session-invalidated'" -and $entryPointText -match 'lastSuccessfulObservation = \$lastSuccessfulWaitObservation' -and $entryPointText -match 'Update-InvocationEvidence -State \$failureState .* -Data \$failureData') 'persistent session invalidation returns and journals a distinct state with the last successfully decoded observation'
 Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$Command -eq ''wait''\)') 'unsatisfied waits fail even without RequireSuccess'
 Assert-Test ($entryPointText -match 'function Close-McpSession') 'entry point defines deterministic MCP session cleanup'
@@ -894,7 +935,7 @@ $fullWaitRecoveryTry = @($entryPointAst.FindAll({
     @($node.CatchClauses | Where-Object { $_.Body.Extent.Text -match 'Close-McpSessionForRebind -Headers \$headers' }).Count -eq 1
 }, $true))
 Assert-Test ($fullWaitRecoveryTry.Count -eq 1) 'tool discovery, post-registration identity, and the read-only readiness probe share one cleanup-qualified rebind boundary'
-Assert-Test ($entryPointText -match 'Get-RuntimeIdentity[\s\S]+?catch \{\s*if \(Test-WaitRetryableException -Exception \$_\.Exception\) \{ throw \}') 'runtime identity preserves retryable health and producer-probe transport exceptions for the shared rebind state machine'
+Assert-Test ($entryPointText -match 'Get-RuntimeIdentity[\s\S]+?catch \{\s*if \(\$PropagateRetryable -and \(Test-WaitRetryableException -Exception \$_\.Exception\)\) \{ throw \}' -and $entryPointText -match 'Open-DevBenchSession -Runtime \$runtime[\s\S]{0,160}-PropagateRetryable' -and $entryPointText -match 'Get-RuntimeIdentity -Runtime \$runtime -Headers \$headers -Tools \$currentTools -PropagateRetryable') 'runtime identity propagates retryable probe failures only into the shared bounded wait rebind state machine'
 Assert-Test ($entryPointText -match 'probeError = \$_.Exception.Message') 'wait observations preserve the transient probe error'
 Assert-Test ($entryPointText -match "classification = 'late-positive-observation'" -and $entryPointText -match 'lateObservation = \$lateObservation' -and $entryPointText -match 'Test-DevBenchWaitDeadlineAcceptance') 'late positive observations are retained but cannot cross the absolute wait deadline as success'
 Assert-Test ($entryPointText -match "phase = 'initialize'; recovery = 'outer-wait-retry'") 'wait initialization failures remain inside the outer timeout state machine'

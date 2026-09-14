@@ -112,7 +112,13 @@ if ($env:CAPTURE_INTERACTION_FAIL_STOP -eq '1' -and
 }
 if ($Tool -eq 'communityshaders.screenshot') {
   if ($argsObject.action -eq 'capabilities') {
-    $value=[pscustomobject]@{schema='urn:csx:devbench:screenshot:1';limits=[pscustomobject]@{maximumSequenceFrames=60000;maximumSequenceDurationMs=3600000}}
+    $maximumFrames = if ($env:CAPTURE_INTERACTION_RAW_NEGATIVE_LIMIT -eq 'frames') { -1 } else { 60000 }
+    $maximumDuration = if ($env:CAPTURE_INTERACTION_RAW_NEGATIVE_LIMIT -eq 'duration') { [int64]-1 } else { 3600000 }
+    $value=[pscustomobject]@{schema='urn:csx:devbench:screenshot:1';limits=[pscustomobject]@{maximumSequenceFrames=$maximumFrames;maximumSequenceDurationMs=$maximumDuration}}
+    if ($env:CAPTURE_INTERACTION_RAW_NEGATIVE_LIMIT) {
+      [pscustomobject]@{ok=$true;transportOk=$true;indeterminate=$false;state='completed';semantic=[pscustomobject]@{known=$true;ok=$true};data=[pscustomobject]@{content=@($value)};errors=@()} | ConvertTo-Json -Depth 100 -Compress
+      return
+    }
   }
   elseif ($argsObject.action -eq 'sequence_start' -and $env:CAPTURE_INTERACTION_FAIL_VISUAL_START -eq '1') {
     $rejected=[pscustomobject]@{requestId='req-rejected';state='rejected';terminal=$true}
@@ -180,6 +186,20 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     $oversized = & $entry start -SessionDirectory $oversizedSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 60000 -FrameIntervalMs 1000 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test (-not $oversized.ok -and $oversized.errors -match 'runtime limits are 60000 frames and 3600000 ms' -and $oversized.errors -match 'no greater than 3600') 'sequence preflight reports the exact runtime duration limit and compatible frame count after accepting the server maximum at parameter binding'
     Assert-Test (-not (Test-Path -LiteralPath $oversizedSession)) 'sequence preflight rejects an incompatible request before creating session state or starting recording'
+
+    foreach ($negativeLimit in @('frames', 'duration')) {
+        $env:CAPTURE_INTERACTION_RAW_NEGATIVE_LIMIT = $negativeLimit
+        $negativeSession = Join-Path $root "negative-$negativeLimit-session"
+        $negative = & $entry start -SessionDirectory $negativeSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+        Remove-Item Env:CAPTURE_INTERACTION_RAW_NEGATIVE_LIMIT -ErrorAction SilentlyContinue
+        Assert-Test (-not $negative.ok -and $negative.errors -match "invalid maximumSequence$(if ($negativeLimit -eq 'frames') { 'Frames' } else { 'DurationMs' }) limit" -and -not (Test-Path -LiteralPath $negativeSession)) "capture preflight rejects a signed negative $negativeLimit limit without conversion failure or session mutation"
+    }
+
+    $env:CAPTURE_INTERACTION_FAIL_VISUAL_START = '1'
+    $rollbackSession = Join-Path $root 'rollback-session'
+    $rollback = & $entry start -SessionDirectory $rollbackSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_VISUAL_START -ErrorAction SilentlyContinue
+    Assert-Test (-not $rollback.ok -and $rollback.state -eq 'tool-error' -and $rollback.data.recordAccepted -and $rollback.data.sessionId -and $rollback.data.recordStartReceipt.correlationId -eq $rollback.data.sessionId -and $rollback.data.cleanup.state -eq 'verified' -and $rollback.data.cleanup.recordStop.path -eq 'recording.json' -and $rollback.data.screenshotRejectedReceipt.state -eq 'rejected' -and (Test-Path -LiteralPath $rollback.data.receiptPath -PathType Leaf)) "definite visual-start rejection reports qualified recording rollback and retains startup identity and receipts: $($rollback | ConvertTo-Json -Depth 20 -Compress)"
 
     $env:CAPTURE_INTERACTION_FAIL_VISUAL_START = '1'
     $env:CAPTURE_INTERACTION_MALFORMED_RECORD_STOP = '1'
@@ -296,6 +316,7 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     $env:CAPTURE_INTERACTION_CONTRADICT_TERMINAL = '1'
     $contradictoryStopped = & $entry stop -SessionDirectory $contradictorySession -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
     Remove-Item Env:CAPTURE_INTERACTION_CONTRADICT_TERMINAL -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_RAW_NEGATIVE_LIMIT -ErrorAction SilentlyContinue
     Assert-Test ($contradictoryStarted.ok -and -not $contradictoryStopped.ok -and
         $contradictoryStopped.state -eq 'stopped-with-errors' -and
         $null -eq $contradictoryStopped.data.screenshot.terminalReceipt -and

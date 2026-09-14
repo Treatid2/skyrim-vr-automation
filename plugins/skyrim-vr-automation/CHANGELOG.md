@@ -6,6 +6,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 - Raise the bounded MO2 workspace profile traversal default to 100,000 files
   so the maintained MGO profile no longer requires a per-call override.
+- Reject negative screenshot limits without unsigned conversion faults, keep
+  retryable identity-probe propagation exclusive to bounded waits, and emit one
+  structured timeout shape for both ordinary and mid-iteration wait expiry.
 - Keep DevBench discovery, identity verification, and qualified readiness probes
   inside one bounded session-rebind loop; reject contradictory success/error,
   readiness, restoration, recording, screenshot, and render-map receipts; and
