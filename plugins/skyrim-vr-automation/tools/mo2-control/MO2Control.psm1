@@ -3352,7 +3352,7 @@ function Set-MO2OwnedSessionOwner {
     else {
         $Owned.data | Add-Member -NotePropertyName ownerPid -NotePropertyValue ([int]$ProcessRecord.id)
     }
-    $Owned.data | Add-Member -NotePropertyName processPath -NotePropertyValue ([string]$ProcessRecord.path) -Force
+    $Owned.data | Add-Member -NotePropertyName processPath -NotePropertyValue ([IO.Path]::GetFullPath([string]$ProcessRecord.path)) -Force
     $Owned.data | Add-Member -NotePropertyName processStartTime -NotePropertyValue ([string]$ProcessRecord.startTime) -Force
     [object[]]$adoptions = @()
     if ($Owned.data.PSObject.Properties['ownerAdoptions']) {
@@ -3376,7 +3376,7 @@ function Set-MO2OwnedSessionOwner {
     else {
         $manifest | Add-Member -NotePropertyName ownerPid -NotePropertyValue ([int]$ProcessRecord.id)
     }
-    $manifest | Add-Member -NotePropertyName processPath -NotePropertyValue ([string]$ProcessRecord.path) -Force
+    $manifest | Add-Member -NotePropertyName processPath -NotePropertyValue ([IO.Path]::GetFullPath([string]$ProcessRecord.path)) -Force
     $manifest | Add-Member -NotePropertyName processStartTime -NotePropertyValue ([string]$ProcessRecord.startTime) -Force
     [object[]]$manifestAdoptions = @()
     if ($manifest.PSObject.Properties['ownerAdoptions']) {
@@ -3394,6 +3394,36 @@ function Set-MO2OwnedSessionOwner {
     return $adoption
 }
 
+function Test-MO2OwnedProcessIdentity {
+    param(
+        [Parameter(Mandatory)]$Owned,
+        [Parameter(Mandatory)]$ProcessRecord
+    )
+    if (-not $Owned.data.PSObject.Properties['processPath'] -or
+        -not $Owned.data.PSObject.Properties['processStartTime'] -or
+        [string]::IsNullOrWhiteSpace([string]$Owned.data.processPath) -or
+        [string]::IsNullOrWhiteSpace([string]$Owned.data.processStartTime)) {
+        return [pscustomobject][ordered]@{ ok = $false; reason = 'recorded-owner-identity-unbound'; expectedPath = $null; actualPath = [string]$ProcessRecord.path; expectedStartTime = $null; actualStartTime = [string]$ProcessRecord.startTime }
+    }
+    try {
+        $expectedPath = [IO.Path]::GetFullPath([string]$Owned.data.processPath)
+        $actualPath = [IO.Path]::GetFullPath([string]$ProcessRecord.path)
+        $expectedStart = [DateTimeOffset]::Parse([string]$Owned.data.processStartTime, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+        $actualStart = [DateTimeOffset]::Parse([string]$ProcessRecord.startTime, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+    }
+    catch {
+        return [pscustomobject][ordered]@{ ok = $false; reason = 'recorded-owner-identity-malformed'; expectedPath = [string]$Owned.data.processPath; actualPath = [string]$ProcessRecord.path; expectedStartTime = [string]$Owned.data.processStartTime; actualStartTime = [string]$ProcessRecord.startTime; detail = $_.Exception.Message }
+    }
+    $pathMatches = [string]::Equals($expectedPath, $actualPath, [StringComparison]::OrdinalIgnoreCase)
+    $startMatches = [math]::Abs(($actualStart - $expectedStart).TotalMilliseconds) -lt 1.0
+    return [pscustomobject][ordered]@{
+        ok = $pathMatches -and $startMatches
+        reason = if (-not $pathMatches) { 'recorded-owner-path-mismatch' } elseif (-not $startMatches) { 'recorded-owner-start-time-mismatch' } else { 'recorded-owner-identity-matched' }
+        expectedPath = $expectedPath; actualPath = $actualPath
+        expectedStartTime = $expectedStart.ToString('o'); actualStartTime = $actualStart.ToString('o')
+    }
+}
+
 function Resolve-MO2OwnedProcessTarget {
     param(
         [Parameter(Mandatory)]$Config,
@@ -3404,15 +3434,23 @@ function Resolve-MO2OwnedProcessTarget {
 
     $ownerPid = if ($Owned.data.PSObject.Properties['ownerPid']) { [int]$Owned.data.ownerPid } else { 0 }
     $ownedTargets = @($Processes | Where-Object { [int]$_.id -eq $ownerPid })
-    if ($Processes.Count -eq 0 -or $ownedTargets.Count -eq 1) {
+    if ($Processes.Count -eq 0) {
         return [pscustomobject][ordered]@{
             ok = $true
             ownerPid = $ownerPid
-            targets = @($ownedTargets)
+            targets = @()
             adopted = $false
             adoption = $null
-            reason = $(if ($Processes.Count -eq 0) { 'already-closed' } else { 'recorded-owner' })
+            reason = 'already-closed'
         }
+    }
+    if ($ownedTargets.Count -eq 1) {
+        Assert-MO2ExactProcessTargets -Config $Config -Processes @($ownedTargets[0])
+        $identity = Test-MO2OwnedProcessIdentity -Owned $Owned -ProcessRecord $ownedTargets[0]
+        if (-not $identity.ok) {
+            return [pscustomobject][ordered]@{ ok = $false; ownerPid = $ownerPid; targets = @(); adopted = $false; adoption = $null; reason = [string]$identity.reason; identity = $identity }
+        }
+        return [pscustomobject][ordered]@{ ok = $true; ownerPid = $ownerPid; targets = @($ownedTargets); adopted = $false; adoption = $null; reason = 'recorded-owner'; identity = $identity }
     }
     if (-not $AdoptDetachedOwner -or $Processes.Count -ne 1 -or $ownedTargets.Count -ne 0) {
         return [pscustomobject][ordered]@{ ok = $false; ownerPid = $ownerPid; targets = @(); adopted = $false; adoption = $null; reason = 'ambiguous-process-set' }
@@ -3665,6 +3703,10 @@ function Get-MO2ObservedGameProcessAdoption {
     elseif ($Owned.data.PSObject.Properties['ownerPid'] -and [int]$Owned.data.ownerPid -gt 0 -and
         [int]$OwnershipResolution.targets[0].id -ne [int]$Owned.data.ownerPid) {
         $reasons.Add('mo2-owner-identity-mismatch')
+    }
+    else {
+        $ownerIdentity = Test-MO2OwnedProcessIdentity -Owned $Owned -ProcessRecord $OwnershipResolution.targets[0]
+        if (-not $ownerIdentity.ok) { $reasons.Add([string]$ownerIdentity.reason) }
     }
     [DateTimeOffset]$launchedUtc = [DateTimeOffset]::MinValue
     $hasLaunchTime = $Owned.data.PSObject.Properties['launchedUtc'] -and

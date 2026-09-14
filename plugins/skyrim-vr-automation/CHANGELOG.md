@@ -9,6 +9,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - Complete failed or unverified shader-cache tasks without a physical restore
   when the live tree still exactly matches the prepared baseline, recording a
   committed no-op restore proof bound to the original snapshot.
+- Bind recorded MO2 ownership to exact PID, executable path, and start time
+  before `status` can adopt game identities after a StartOnly launch.
 - Let `status` durably adopt exact game and loader identities observed after a
   `launch -StartOnly` request, so the owning session can safely terminate a
   crashed game and complete RootBuilder recovery.
