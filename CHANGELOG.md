@@ -7,6 +7,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - Keep render-scale terminal acceptance atomic through the runner result: reuse
   the receipt hash proven before public commit, and preserve an existing sealed
   report and summary when any later revalidation becomes unavailable.
+- Derive graceful game-close authority from the current session's recorded
+  identities and veto all close requests when another configured but unowned
+  game or loader process is present.
 - Bind graceful `stop-game` and `stop` targets to retained live process handles,
   revalidate exact PID/name/path/start identity and current session generation,
   and never reopen a previously observed PID for `CloseMainWindow`.

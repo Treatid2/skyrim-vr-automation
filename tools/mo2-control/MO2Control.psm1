@@ -5152,7 +5152,7 @@ function Invoke-MO2StopGame {
         return New-MO2ActionResult -Config $Config -Command 'stop-game' -Ok $true -State 'dry-run' -Data @{ sessionId = $SessionId; wouldRequestClose = $targets; wouldLeaveMO2Running = $true; forceTermination = $false }
     }
 
-    $gameClose = Invoke-MO2OwnedGameCloseRequest -Config $Config -Owned $owned -Targets $targets
+    $gameClose = Invoke-MO2OwnedGameCloseRequest -Config $Config -Owned $owned
     if (-not $gameClose.ok) {
         return New-MO2ActionResult -Config $Config -Command 'stop-game' -Ok $false -State 'blocked' -Data @{ before = $before.processes; gameClose = $gameClose; sessionPath = $owned.data.sessionPath } -Errors @('A game process changed identity or session authority before graceful close; no close request was sent to an unverified process.')
     }
@@ -5327,11 +5327,30 @@ function Invoke-MO2VerifiedGameCloseRequestSet {
     return $result
 }
 
+function Invoke-MO2CurrentGameCloseRequest {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Owned,
+        [Parameter(Mandatory)]$CurrentData,
+        [Parameter(Mandatory)]$CurrentInspection,
+        [scriptblock]$BindingFactory,
+        [scriptblock]$CloseAction
+    )
+
+    # Session state, not a pre-lock inventory, defines the owned game set. An
+    # additional configured game/loader process is an ambiguity and vetoes all
+    # close requests, even when it appeared in the caller's earlier inspection.
+    $resolution = Resolve-MO2RecordedGameProcessTargets -Recorded @($CurrentData.gameProcesses) -Current @($CurrentInspection.processes.game)
+    if (-not $resolution.ok) {
+        return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = [string]$resolution.reason; gameResolution = $resolution }
+    }
+    return Invoke-MO2VerifiedGameCloseRequestSet -Config $Config -Owned $Owned -Targets @($resolution.targets) -BindingFactory $BindingFactory -CloseAction $CloseAction
+}
+
 function Invoke-MO2OwnedGameCloseRequest {
     param(
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)]$Owned,
-        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Targets,
         [scriptblock]$InspectionFactory,
         [scriptblock]$BindingFactory,
         [scriptblock]$CloseAction
@@ -5346,11 +5365,7 @@ function Invoke-MO2OwnedGameCloseRequest {
         else {
             Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$currentData.profile) -RequestedExecutable ([string]$currentData.executable)
         }
-        $resolution = Resolve-MO2RecordedGameProcessTargets -Recorded $Targets -Current @($currentInspection.processes.game)
-        if (-not $resolution.ok) {
-            return [pscustomobject][ordered]@{ commit = $false; sessionData = $currentData; result = [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = [string]$resolution.reason; gameResolution = $resolution } }
-        }
-        $verified = Invoke-MO2VerifiedGameCloseRequestSet -Config $Config -Owned $currentOwned -Targets @($resolution.targets) -BindingFactory $BindingFactory -CloseAction $CloseAction
+        $verified = Invoke-MO2CurrentGameCloseRequest -Config $Config -Owned $currentOwned -CurrentData $currentData -CurrentInspection $currentInspection -BindingFactory $BindingFactory -CloseAction $CloseAction
         return [pscustomobject][ordered]@{ commit = $false; sessionData = $currentData; result = $verified }
     }
 }
@@ -5462,7 +5477,7 @@ function Invoke-MO2Stop {
         return New-MO2ActionResult -Config $Config -Command 'stop' -Ok $true -State 'dry-run' -Data @{ sessionId = $SessionId; wouldRequestGameClose = $gameTargets; wouldCooperativelyCloseMO2 = $ownedMO2; mo2Windows = @(Get-MO2WindowSnapshot -Processes $ownedMO2); wouldInvokeExactControls = @('File', 'Exit', 'Unlock', 'Cancel'); forceTermination = $false; unrelatedProcessesTouched = @() }
     }
 
-    $gameClose = Invoke-MO2OwnedGameCloseRequest -Config $Config -Owned $owned -Targets $gameTargets
+    $gameClose = Invoke-MO2OwnedGameCloseRequest -Config $Config -Owned $owned
     if (-not $gameClose.ok) {
         return New-MO2ActionResult -Config $Config -Command 'stop' -Ok $false -State 'blocked' -Data @{ before = $before.processes; gameClose = $gameClose; mo2CloseAttempted = $false; forceTermination = $false; unrelatedProcessesTouched = @(); sessionPath = $owned.data.sessionPath } -Errors @('A game process changed identity or session authority before graceful close; MO2 cooperative close was not attempted.')
     }
