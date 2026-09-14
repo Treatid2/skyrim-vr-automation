@@ -193,7 +193,10 @@ restore receipt and committed journal proving the exact snapshot lineage, restor
 identity, cache path, live baseline, and physical preserved working tree. A
 stored receipt pointer is revalidated to the same standard. Malformed, foreign,
 missing, drifted, or ambiguous receipt-shaped evidence leaves the plan pending
-for recovery and never triggers a replacement restore.
+for recovery and never triggers a replacement restore. Receipt-only no-op
+recovery is an explicit validator mode and accepts only the canonical
+`restore-noop` operation spelling; operation casing cannot select a weaker
+proof path.
 
 `seed` requires the existing snapshot receipt for the same live cache and
 evidence directory, verifies the exact source tree, stages it, swaps it into

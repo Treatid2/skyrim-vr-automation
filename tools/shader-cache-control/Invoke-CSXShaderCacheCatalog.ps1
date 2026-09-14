@@ -267,7 +267,8 @@ function Get-ReceiptProof([string]$Path, [string]$SourcePath, [string]$ExpectedH
     $receipt = Get-Content -LiteralPath $resolvedReceipt -Raw | ConvertFrom-Json -Depth 30
     $operation = [string](Get-PropertyValue $receipt 'operation' '')
     $transactionId = [string](Get-PropertyValue $receipt 'transactionId' '')
-    if ($operation -notin @('snapshot', 'seed', 'restore', 'restore-noop') -or [string]::IsNullOrWhiteSpace($transactionId)) { throw 'Source receipt lacks a supported operation and immutable transaction identity.' }
+    if ($operation -cne 'snapshot' -and $operation -cne 'seed' -and $operation -cne 'restore' -and
+        $operation -cne 'restore-noop' -or [string]::IsNullOrWhiteSpace($transactionId)) { throw 'Source receipt lacks a supported operation and immutable transaction identity.' }
     $resolvedSource = [IO.Path]::GetFullPath($SourcePath)
     $pairs = @(
         @{ operation = 'snapshot'; path = 'backupPath'; hash = 'beforeTreeSha256' },
@@ -546,7 +547,8 @@ function Get-CommittedRestoreProof(
     [string]$CachePath,
     [string]$BaselineTreeSha256,
     [string]$WorkingTreeSha256,
-    [string]$SnapshotTransactionId) {
+    [string]$SnapshotTransactionId,
+    [switch]$RecoverMissingNoOpJournal) {
     if ([string]::IsNullOrWhiteSpace($ReceiptPath) -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) {
         throw 'Committed restore receipt is missing; recovery remains required.'
     }
@@ -561,7 +563,8 @@ function Get-CommittedRestoreProof(
         if (-not $receipt.PSObject.Properties[$property]) { throw "Committed restore receipt lacks required field '$property'." }
     }
     $transactionId = [string]$receipt.transactionId
-    if ([string]$receipt.operation -notin @('restore', 'restore-noop') -or [string]::IsNullOrWhiteSpace($transactionId) -or
+    $receiptOperation = [string]$receipt.operation
+    if (($receiptOperation -cne 'restore' -and $receiptOperation -cne 'restore-noop') -or [string]::IsNullOrWhiteSpace($transactionId) -or
         [IO.Path]::GetFileName($resolvedReceipt) -cne "shader-cache-restore.$transactionId.receipt.json" -or
         [string]$receipt.snapshotTransactionId -cne $SnapshotTransactionId -or
         -not (Test-SamePath ([string]$receipt.cachePath) $CachePath) -or
@@ -569,7 +572,7 @@ function Get-CommittedRestoreProof(
         [string]$receipt.displacedTreeSha256 -ine $WorkingTreeSha256) {
         throw 'Committed restore receipt does not bind the exact task snapshot, cache, baseline, and working tree.'
     }
-    if ([string]$receipt.operation -ceq 'restore-noop' -and
+    if ($receiptOperation -ceq 'restore-noop' -and
         (-not $receipt.PSObject.Properties['restorationNecessary'] -or [bool]$receipt.restorationNecessary -or
          [string]$receipt.restoredTreeSha256 -ine [string]$receipt.displacedTreeSha256)) {
         throw 'Committed no-op restore receipt does not prove that restoration was unnecessary.'
@@ -590,7 +593,7 @@ function Get-CommittedRestoreProof(
     $journalPath = Join-Path $resolvedEvidence "shader-cache-restore.$transactionId.journal.json"
     $journalRecovered = $false
     if (-not (Test-Path -LiteralPath $journalPath -PathType Leaf)) {
-        if (-not $RecoverMissingNoOpJournal -or [string]$receipt.operation -cne 'restore-noop') {
+        if (-not $RecoverMissingNoOpJournal -or $receiptOperation -cne 'restore-noop') {
             throw 'Committed restore journal is missing; recovery remains required.'
         }
         $recoveredUtc = [DateTime]::UtcNow.ToString('o')
@@ -613,12 +616,14 @@ function Get-CommittedRestoreProof(
     foreach ($property in @('operation', 'phase', 'operationId', 'snapshotTransactionId', 'cachePath', 'receiptPath')) {
         if (-not $journal.PSObject.Properties[$property]) { throw "Committed restore journal lacks required field '$property'." }
     }
-    if ([string]$journal.operation -cne [string]$receipt.operation -or [string]$journal.operation -notin @('restore', 'restore-noop') -or [string]$journal.phase -cne 'committed' -or
+    $journalOperation = [string]$journal.operation
+    if ($journalOperation -cne $receiptOperation -or
+        ($journalOperation -cne 'restore' -and $journalOperation -cne 'restore-noop') -or [string]$journal.phase -cne 'committed' -or
         [string]$journal.operationId -cne $transactionId -or [string]$journal.snapshotTransactionId -cne $SnapshotTransactionId -or
         -not (Test-SamePath ([string]$journal.cachePath) $CachePath) -or -not (Test-SamePath ([string]$journal.receiptPath) $resolvedReceipt)) {
         throw 'Restore journal does not prove the exact receipt is committed for this task snapshot.'
     }
-    if ([string]$journal.operation -ceq 'restore-noop' -and
+    if ($journalOperation -ceq 'restore-noop' -and
         ((-not $journal.PSObject.Properties['originalTreeSha256']) -or [string]$journal.originalTreeSha256 -ine $BaselineTreeSha256 -or
          (-not $journal.PSObject.Properties['requestedTreeSha256']) -or [string]$journal.requestedTreeSha256 -ine $BaselineTreeSha256 -or
          (-not $journal.PSObject.Properties['preservedBaselinePath']) -or -not (Test-SamePath ([string]$journal.preservedBaselinePath) $preservedPath))) {

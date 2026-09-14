@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Make receipt-only no-op recovery authorization an explicit validator input,
+  and reject noncanonical restore operation casing before proof dispatch.
 - Recover an interrupted receipt-only no-op completion after revalidating the
   exact task evidence, and admit its receipt as promotion source proof.
 - Complete failed or unverified shader-cache tasks without a physical restore
