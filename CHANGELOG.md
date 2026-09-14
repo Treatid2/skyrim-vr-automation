@@ -4,6 +4,29 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Treat every named outcome-map member as required unless it is explicitly
+  typed metadata, make rejected outcomes a global semantic veto, qualify menu
+  and current-state wait probes before barrier evaluation, reject present-null
+  registry statuses, and retain positive subsecond request budget.
+- Preserve terminal `serviceReady` failure semantics instead of rewriting them
+  as deadline timeouts; reject negative screenshot limits without unsigned conversion faults, keep
+  retryable identity-probe propagation exclusive to bounded waits, and emit one
+  structured timeout shape for both ordinary and mid-iteration wait expiry.
+- Keep DevBench discovery, identity verification, and qualified readiness probes
+  inside one bounded session-rebind loop; reject contradictory success/error,
+  readiness, restoration, recording, screenshot, and render-map receipts; and
+  preserve capture-start identity and cleanup evidence when rollback is
+  incomplete.
+- Qualify every screenshot read action explicitly, preserve retryable identity
+  probe failures for rebind, reject malformed outcome types and retryable
+  negative readiness, enforce the post-response wait deadline, and retain
+  indeterminate recording/screenshot start ownership without unscoped cleanup.
+- Recognize the structured render-scale status read contract before profiler
+  sampling, and reject screenshot sequences that exceed runtime-advertised
+  frame or duration limits before session creation or recording mutation.
+- Make DevBench game-load dispatch and render-map planning fail closed on
+  inexact receipts, failed or unbound registries, malformed numeric bounds,
+  missing scope estimates, and post-publication receipt-finalization faults.
 - Enforce MO2 `SteamVRNull` admission inside null-HMD `apply` and `start`, bind
   the exact lease, profile, and provider inventory into the transaction
   receipt, and route-shape fresh SteamVR task clones so inherited OCU providers

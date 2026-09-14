@@ -53,6 +53,7 @@ param(
     [switch]$NoExit,
     [switch]$SkipRuntimeIdentityVerification
 )
+Import-Module $env:CAPTURE_INTERACTION_SEMANTIC_MODULE -Force
 $argsObject = $ArgumentsJson | ConvertFrom-Json -Depth 80
 $frame = [pscustomobject]@{
   tMs=0; seq=1; originCode=1
@@ -60,36 +61,143 @@ $frame = [pscustomobject]@{
   left=[pscustomobject]@{available=$true;connected=$true;valid=$true;index=1;trackingResult=200;matrix=@(1,0,0,-0.2,0,1,0,1,0,0,1,-0.3);velocity=@(0,0,0);angularVelocity=@(0,0,0);controller=[pscustomobject]@{packetNumber=1;pressed=0;touched=0;axes=@(@(0,0),@(0,0),@(0,0),@(0,0),@(0,0))}}
   right=[pscustomobject]@{available=$true;connected=$true;valid=$true;index=2;trackingResult=200;matrix=@(1,0,0,0.2,0,1,0,1,0,0,1,-0.3);velocity=@(0,0,0);angularVelocity=@(0,0,0);controller=[pscustomobject]@{packetNumber=1;pressed=0;touched=0;axes=@(@(0,0),@(0,0),@(0,0),@(0,0),@(0,0))}}
 }
+if ($env:CAPTURE_INTERACTION_FAIL_STOP -eq '1' -and
+    (($Tool -eq 'record' -and $argsObject.action -eq 'stop') -or
+     ($Tool -eq 'input' -and $argsObject.action -eq 'releaseAll'))) {
+  $outcome = if ($Tool -eq 'record') { 'record-stop-contract-failed' } else { 'vr-tracked-set-stop-contract-failed' }
+  [pscustomobject]@{ok=$false;state='completed';semantic=[pscustomobject]@{known=$true;ok=$false;outcome=$outcome;reasons=@()};data=[pscustomobject]@{content=@()};errors=@()} | ConvertTo-Json -Depth 100 -Compress
+  return
+}
+if ($env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START -eq '1' -and
+    $Tool -eq 'communityshaders.screenshot' -and $argsObject.action -eq 'sequence_start') {
+  [pscustomobject]@{ok=$false;transportOk=$true;indeterminate=$false;state='completed';semantic=[pscustomobject]@{known=$true;ok=$false;guarded=$false;outcome='screenshot-start-rejected';reasons=@('definite rejection')};data=[pscustomobject]@{content=@()};errors=@('definite rejection')} | ConvertTo-Json -Depth 100 -Compress
+  return
+}
+if ($env:CAPTURE_INTERACTION_INDETERMINATE_SEQUENCE_START -eq '1' -and
+    $Tool -eq 'communityshaders.screenshot' -and $argsObject.action -eq 'sequence_start') {
+  [pscustomobject]@{ok=$false;transportOk=$false;indeterminate=$true;state='indeterminate-mutation';semantic=$null;invocationEvidencePath='screenshot-indeterminate.json';data=[pscustomobject]@{content=@()};errors=@('response lost after dispatch')} | ConvertTo-Json -Depth 100 -Compress
+  return
+}
+if ($env:CAPTURE_INTERACTION_ACCEPTED_FAILURE_SEQUENCE_START -eq '1' -and
+    $Tool -eq 'communityshaders.screenshot' -and $argsObject.action -eq 'sequence_start') {
+  $accepted=[pscustomobject]@{requestId='req-accepted';state='accepted';terminal=$false}
+  [pscustomobject]@{ok=$false;transportOk=$true;indeterminate=$false;state='completed';semantic=[pscustomobject]@{known=$true;ok=$false;guarded=$false;outcome='screenshot-start-contract-failed';reasons=@('unqualified accepted receipt')};invocationEvidencePath='screenshot-accepted-failure.json';data=[pscustomobject]@{content=@($accepted)};errors=@('unqualified accepted receipt')} | ConvertTo-Json -Depth 100 -Compress
+  return
+}
+if ($env:CAPTURE_INTERACTION_INDETERMINATE_RECORD_START -eq '1' -and
+    $Tool -eq 'record' -and $argsObject.action -eq 'start') {
+  [pscustomobject]@{ok=$false;transportOk=$false;indeterminate=$true;state='indeterminate-mutation';semantic=$null;invocationEvidencePath='record-indeterminate.json';data=[pscustomobject]@{content=@()};errors=@('record response lost after dispatch')} | ConvertTo-Json -Depth 100 -Compress
+  return
+}
 if ($Tool -eq 'communityshaders.screenshot') {
-  if ($argsObject.action -in @('sequence_start','capture')) { $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='running';terminal=$false}} }
+  if ($argsObject.action -eq 'capabilities') {
+    $maximumFrames = if ($env:CAPTURE_INTERACTION_RAW_NEGATIVE_LIMIT -eq 'frames') { -1 } else { 60000 }
+    $maximumDuration = if ($env:CAPTURE_INTERACTION_RAW_NEGATIVE_LIMIT -eq 'duration') { [int64]-1 } else { 3600000 }
+    $value=[pscustomobject]@{schema='urn:csx:devbench:screenshot:1';limits=[pscustomobject]@{maximumSequenceFrames=$maximumFrames;maximumSequenceDurationMs=$maximumDuration}}
+    if ($env:CAPTURE_INTERACTION_RAW_NEGATIVE_LIMIT) {
+      [pscustomobject]@{ok=$true;transportOk=$true;indeterminate=$false;state='completed';semantic=[pscustomobject]@{known=$true;ok=$true};data=[pscustomobject]@{content=@($value)};errors=@()} | ConvertTo-Json -Depth 100 -Compress
+      return
+    }
+  }
+  elseif ($argsObject.action -eq 'sequence_start' -and $env:CAPTURE_INTERACTION_FAIL_SEQUENCE_QUALIFICATION -eq '1') { $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{state='running';terminal=$false}} }
+  elseif ($argsObject.action -in @('sequence_start','capture')) { $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='running';terminal=$false}} }
   elseif ($argsObject.action -eq 'request_get') {
     $image=Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'frame-left.png'
     if (-not (Test-Path $image)) { [IO.File]::WriteAllBytes($image,[byte[]](1,2,3)) }
-    $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='completed';terminal=$true;children=@([pscustomobject]@{ordinal=4;scheduledEngineFrame=44;artifacts=@([pscustomobject]@{view='left_eye';path=$image;format='png';bytes=3;committed=$true})})}}
+    $terminalState = if ($env:CAPTURE_INTERACTION_CONTRADICT_TERMINAL -eq '1') { 'running' } else { 'completed' }
+    $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state=$terminalState;terminal=$true;children=@([pscustomobject]@{ordinal=4;scheduledEngineFrame=44;artifacts=@([pscustomobject]@{view='left_eye';path=$image;format='png';bytes=3;committed=$true})})}}
   }
   else { $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='stop_requested'}} }
 } elseif ($Tool -eq 'record') {
   $correlationId = if ($argsObject.PSObject.Properties['correlationId']) { $argsObject.correlationId } else { $null }
-  $value=[pscustomobject]@{action=$argsObject.action;recording=($argsObject.action -ne 'stop');correlationId=$correlationId;path=$(if($argsObject.action -eq 'stop'){'recording.json'}else{$null})}
+  $recordingPath = if ($argsObject.action -ne 'stop') { $null } elseif ($env:CAPTURE_INTERACTION_MALFORMED_RECORD_STOP -eq '1') { $false } else { 'recording.json' }
+  $value=[pscustomobject]@{action=$argsObject.action;recording=($argsObject.action -ne 'stop');correlationId=$correlationId;path=$recordingPath}
 } elseif ($Tool -eq 'input' -and $argsObject.action -eq 'observe') {
   $value=[pscustomobject]@{action='observe';source='physical_openvr';frame=$frame}
 } elseif ($Tool -eq 'input' -and $argsObject.action -eq 'status' -and $argsObject.device -eq 'vrTrackedSet') {
   $value=[pscustomobject]@{device='vrTrackedSet';ready=$true;active=$false;generation=1;lastCompletion=[pscustomobject]@{generation=1;completed=$true}}
+} elseif ($Tool -eq 'input' -and $argsObject.action -eq 'releaseAll' -and $argsObject.device -eq 'vrTrackedSet') {
+  $value=[pscustomobject]@{action='stop';device='vrTrackedSet';stopped=$true;restored=$true;restorationPending=$false;owner=$argsObject.owner;reason='releaseAll'}
 } elseif ($Tool -eq 'input') {
   $value=[pscustomobject]@{ok=$true;action=$argsObject.action;queued=($argsObject.action -eq 'sequence');generation=1}
 } elseif ($Tool -eq 'menu') { $value=[pscustomobject]@{openMenus=@('HUD Menu');messageBoxOpen=$false} }
 elseif ($Tool -eq 'inspect') { $value=[pscustomobject]@{playerLoaded=$true;frame=40} }
 else { $value=[pscustomobject]@{ok=$true} }
-[pscustomobject]@{ok=$true;data=[pscustomobject]@{content=@($value)};errors=@()} | ConvertTo-Json -Depth 100 -Compress
+$argumentTable = @{}
+foreach ($property in $argsObject.PSObject.Properties) { $argumentTable[[string]$property.Name] = $property.Value }
+$semantic = Get-DevBenchCallSemanticStatus -ToolName $Tool -Arguments $argumentTable -Content @($value)
+$ok = [bool]$semantic.known -and [bool]$semantic.ok
+[pscustomobject]@{ok=$ok;transportOk=$true;indeterminate=$false;state='completed';semantic=$semantic;data=[pscustomobject]@{content=@($value)};errors=$(if($ok){@()}else{@($semantic.reasons)})} | ConvertTo-Json -Depth 100 -Compress
 '@
     Set-Content -LiteralPath $fake -Value $fakeText -Encoding utf8
     $runtime = Join-Path $root 'runtime.json'
     '{}' | Set-Content -LiteralPath $runtime -Encoding utf8
     $env:CAPTURE_INTERACTION_FAKE_ROOT = $root
+    $env:CAPTURE_INTERACTION_SEMANTIC_MODULE = Join-Path (Split-Path -Parent $PSScriptRoot) 'devbench-control\DevBenchControl.psm1'
     $entry = Join-Path $PSScriptRoot 'Invoke-CaptureInteraction.ps1'
+    $oversizedSession = Join-Path $root 'oversized-session'
+    $oversized = & $entry start -SessionDirectory $oversizedSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 60000 -FrameIntervalMs 1000 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test (-not $oversized.ok -and $oversized.errors -match 'runtime limits are 60000 frames and 3600000 ms' -and $oversized.errors -match 'no greater than 3600') 'sequence preflight reports the exact runtime duration limit and compatible frame count after accepting the server maximum at parameter binding'
+    Assert-Test (-not (Test-Path -LiteralPath $oversizedSession)) 'sequence preflight rejects an incompatible request before creating session state or starting recording'
+
+    foreach ($negativeLimit in @('frames', 'duration')) {
+        $env:CAPTURE_INTERACTION_RAW_NEGATIVE_LIMIT = $negativeLimit
+        $negativeSession = Join-Path $root "negative-$negativeLimit-session"
+        $negative = & $entry start -SessionDirectory $negativeSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+        Remove-Item Env:CAPTURE_INTERACTION_RAW_NEGATIVE_LIMIT -ErrorAction SilentlyContinue
+        Assert-Test (-not $negative.ok -and $negative.errors -match "invalid maximumSequence$(if ($negativeLimit -eq 'frames') { 'Frames' } else { 'DurationMs' }) limit" -and -not (Test-Path -LiteralPath $negativeSession)) "capture preflight rejects a signed negative $negativeLimit limit without conversion failure or session mutation"
+    }
+
+    $env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START = '1'
+    $rollbackSession = Join-Path $root 'rollback-session'
+    $rollback = & $entry start -SessionDirectory $rollbackSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START -ErrorAction SilentlyContinue
+    Assert-Test (-not $rollback.ok -and $rollback.state -eq 'start-failed-rolled-back' -and $rollback.data.rolledBack -and $rollback.data.sessionId -and $rollback.data.recording.startReceipt.correlationId -eq $rollback.data.sessionId -and $rollback.data.recording.stopReceipt.path -eq 'recording.json' -and (Test-Path -LiteralPath $rollback.data.recoveryReceiptPath -PathType Leaf)) 'definite visual-start rejection reports qualified recording rollback and retains startup identity and receipts'
+
+    $env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START = '1'
+    $env:CAPTURE_INTERACTION_MALFORMED_RECORD_STOP = '1'
+    $malformedRollbackSession = Join-Path $root 'malformed-record-rollback-session'
+    $malformedRollback = & $entry start -SessionDirectory $malformedRollbackSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_MALFORMED_RECORD_STOP -ErrorAction SilentlyContinue
+    Assert-Test (-not $malformedRollback.ok -and $malformedRollback.state -eq 'start-failed-cleanup-uncertain' -and -not $malformedRollback.data.rolledBack -and $malformedRollback.data.ownership -eq 'cleanup-uncertain' -and $null -eq $malformedRollback.data.recording.stopReceipt -and $malformedRollback.data.cleanupErrors -match 'non-empty string') 'malformed recording-stop evidence cannot certify rollback or clear recording recovery ownership'
+
+    $env:CAPTURE_INTERACTION_INDETERMINATE_SEQUENCE_START = '1'
+    $indeterminateScreenshotSession = Join-Path $root 'indeterminate-screenshot-session'
+    $indeterminateScreenshot = & $entry start -SessionDirectory $indeterminateScreenshotSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_INDETERMINATE_SEQUENCE_START -ErrorAction SilentlyContinue
+    Assert-Test (-not $indeterminateScreenshot.ok -and $indeterminateScreenshot.state -eq 'start-failed-cleanup-uncertain' -and -not $indeterminateScreenshot.data.rolledBack -and $indeterminateScreenshot.data.recording.stopReceipt.path -eq 'recording.json' -and $indeterminateScreenshot.data.screenshot.startAttempt.commandId -and $indeterminateScreenshot.data.screenshot.failureEnvelope.indeterminate -and $indeterminateScreenshot.data.screenshot.failureEnvelope.invocationEvidencePath -eq 'screenshot-indeterminate.json') 'lost screenshot-start response remains ownership-uncertain even when recording cleanup succeeds and retains command plus journal identity'
+
+    $env:CAPTURE_INTERACTION_ACCEPTED_FAILURE_SEQUENCE_START = '1'
+    $acceptedFailureSession = Join-Path $root 'accepted-failure-session'
+    $acceptedFailure = & $entry start -SessionDirectory $acceptedFailureSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_ACCEPTED_FAILURE_SEQUENCE_START -ErrorAction SilentlyContinue
+    Assert-Test (-not $acceptedFailure.ok -and $acceptedFailure.state -eq 'start-failed-cleanup-uncertain' -and $acceptedFailure.data.screenshot.failureEnvelope.data.content[0].requestId -eq 'req-accepted' -and $acceptedFailure.data.recording.stopReceipt.path -eq 'recording.json') 'an ok-false envelope carrying an accepted screenshot receipt is retained and cannot be treated as definite non-dispatch'
+
+    $env:CAPTURE_INTERACTION_INDETERMINATE_RECORD_START = '1'
+    $indeterminateRecordSession = Join-Path $root 'indeterminate-record-session'
+    $indeterminateRecord = & $entry start -SessionDirectory $indeterminateRecordSession -RuntimePath $runtime -VisualMode none -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_INDETERMINATE_RECORD_START -ErrorAction SilentlyContinue
+    Assert-Test (-not $indeterminateRecord.ok -and $indeterminateRecord.state -eq 'start-failed-cleanup-uncertain' -and $indeterminateRecord.data.phase -eq 'record-start' -and $indeterminateRecord.data.recording.startAttempt.correlationId -eq $indeterminateRecord.data.sessionId -and $indeterminateRecord.data.recording.failureEnvelope.indeterminate -and $null -eq $indeterminateRecord.data.recording.stopReceipt) 'indeterminate recording start retains correlation and invocation evidence without issuing an unscoped stop'
+
+    $env:CAPTURE_INTERACTION_FAIL_SEQUENCE_QUALIFICATION = '1'
+    $env:CAPTURE_INTERACTION_FAIL_STOP = '1'
+    $uncertainSession = Join-Path $root 'uncertain-session'
+    $uncertain = & $entry start -SessionDirectory $uncertainSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_QUALIFICATION -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_STOP -ErrorAction SilentlyContinue
+    Assert-Test (-not $uncertain.ok -and $uncertain.state -eq 'start-failed-cleanup-uncertain' -and -not $uncertain.data.rolledBack -and $uncertain.data.ownership -eq 'cleanup-uncertain' -and $uncertain.data.screenshot.attemptReceipt.result.state -eq 'running' -and $uncertain.data.cleanupErrors.Count -eq 2) 'unqualified visual start plus failed recording cleanup retains evidence and reports uncertain ownership'
+
+    $publicationTarget = Join-Path $root 'state-path-is-directory'
+    New-Item -ItemType Directory -Path $publicationTarget -Force | Out-Null
+    $env:CAPTURE_INTERACTION_FAIL_STOP = '1'
+    $publicationFailure = & $entry start -SessionPath $publicationTarget -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_STOP -ErrorAction SilentlyContinue
+    Assert-Test (-not $publicationFailure.ok -and $publicationFailure.state -eq 'start-failed-cleanup-uncertain' -and $publicationFailure.data.phase -eq 'state-publication' -and $publicationFailure.data.screenshot.requestId -eq 'req-1' -and $publicationFailure.data.screenshot.terminalReceipt.terminal -and $publicationFailure.data.recording.startReceipt -and $publicationFailure.data.cleanupErrors -match 'Recording cleanup failed') 'state-publication failure retains session identity and both cleanup receipts while exposing unresolved recording ownership'
+
     $session = Join-Path $root 'session'
-    $started = & $entry start -SessionDirectory $session -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 500 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
-    Assert-Test ($started.ok -and $started.state -eq 'session-started' -and $started.data.screenshot.requestId -eq 'req-1') 'sequence session starts recording and screenshot capture under one session'
+    $started = & $entry start -SessionDirectory $session -RuntimePath $runtime -VisualMode sequence -MaximumFrames 60000 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
+    Assert-Test ($started.ok -and $started.state -eq 'session-started' -and $started.data.screenshot.requestId -eq 'req-1' -and $started.data.screenshot.preflight.maximumSequenceFrames -eq 60000) 'sequence session admits the DevBench-advertised 60000-frame limit when its requested duration also fits'
     $observed = & $entry observe -SessionDirectory $session -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
     Assert-Test ($observed.ok -and $observed.data.observation.latestFrame.ordinal -eq 4) 'observe composites runtime state and the latest committed frame'
     Assert-Test (Test-Path -LiteralPath $observed.data.observationPath -PathType Leaf) 'observe persists a latest-observation receipt'
@@ -98,9 +206,44 @@ else { $value=[pscustomobject]@{ok=$true} }
     $stopped = & $entry stop -SessionDirectory $session -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
     Assert-Test ($stopped.ok -and $stopped.state -eq 'stopped' -and $stopped.data.recording.stopReceipt.path -eq 'recording.json') 'stop finalizes visual capture before state recording and persists receipts'
 
+    $malformedStopSession = Join-Path $root 'malformed-record-stop-session'
+    $malformedStopStarted = & $entry start -SessionDirectory $malformedStopSession -RuntimePath $runtime -VisualMode none -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
+    $env:CAPTURE_INTERACTION_MALFORMED_RECORD_STOP = '1'
+    $malformedStopped = & $entry stop -SessionDirectory $malformedStopSession -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_MALFORMED_RECORD_STOP -ErrorAction SilentlyContinue
+    Assert-Test ($malformedStopStarted.ok -and -not $malformedStopped.ok -and $malformedStopped.state -eq 'stopped-with-errors' -and $null -eq $malformedStopped.data.recording.stopReceipt -and $malformedStopped.errors -match 'non-empty string') 'malformed recording-stop evidence cannot produce successful normal capture teardown'
+
+    $contradictorySession = Join-Path $root 'contradictory-terminal-session'
+    $contradictoryStarted = & $entry start -SessionDirectory $contradictorySession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -FrameIntervalMs 50 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
+    $env:CAPTURE_INTERACTION_CONTRADICT_TERMINAL = '1'
+    $contradictoryStopped = & $entry stop -SessionDirectory $contradictorySession -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_CONTRADICT_TERMINAL -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_RAW_NEGATIVE_LIMIT -ErrorAction SilentlyContinue
+    Assert-Test ($contradictoryStarted.ok -and -not $contradictoryStopped.ok -and
+        $contradictoryStopped.state -eq 'stopped-with-errors' -and
+        $null -eq $contradictoryStopped.data.screenshot.terminalReceipt -and
+        $contradictoryStopped.errors -match '(state and content\.terminal contradict|contradictory or unsupported terminal evidence)') 'contradictory screenshot terminal evidence cannot produce a successful stop'
+
+    $diagnosticSession = Join-Path $root 'diagnostic-session'
+    $diagnosticStarted = & $entry start -SessionDirectory $diagnosticSession -RuntimePath $runtime -VisualMode none -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact | ConvertFrom-Json -Depth 100
+    Assert-Test ($diagnosticStarted.ok) 'diagnostic stop fixture starts an owned recording'
+    $env:CAPTURE_INTERACTION_FAIL_STOP = '1'
+    $diagnosticStopped = & $entry stop -SessionDirectory $diagnosticSession -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_STOP -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_MALFORMED_RECORD_STOP -ErrorAction SilentlyContinue
+    Assert-Test (-not $diagnosticStopped.ok -and $diagnosticStopped.errors -match 'vr-tracked-set-stop-contract-failed' -and $diagnosticStopped.errors -match 'record-stop-contract-failed') 'stop preserves semantic outcomes when a failed controller envelope has an empty errors array'
+
     [pscustomobject]@{ ok=$true; sessionPath=$started.data.statePath; actionCount=(Get-CaptureInteractionActionCatalog).actions.Count } | ConvertTo-Json -Compress
 }
 finally {
     Remove-Item Env:CAPTURE_INTERACTION_FAKE_ROOT -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_SEMANTIC_MODULE -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_STOP -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_START -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_SEQUENCE_QUALIFICATION -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_INDETERMINATE_SEQUENCE_START -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_ACCEPTED_FAILURE_SEQUENCE_START -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_INDETERMINATE_RECORD_START -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_CONTRADICT_TERMINAL -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
 }

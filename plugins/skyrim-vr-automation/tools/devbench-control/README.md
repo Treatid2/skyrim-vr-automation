@@ -68,9 +68,22 @@ observation/status. Those calls may proceed when listener and process identity
 are verified even if build or deployed-artifact provenance is unavailable.
 They do not broaden the mutation boundary.
 
-`ok` reflects transport success unless `-RequireSuccess` is supplied. Every
-call also reports `transportOk` and a normalized `semantic` result, so an API
-payload such as `idempotency_conflict` cannot be mistaken for successful work.
+Every `call` applies semantic qualification: `ok` is true only when both the
+transport and the action-specific semantic contract succeed. `transportOk`
+reports the transport result independently. `-RequireSuccess` additionally
+requests an explicit diagnostic when a response has no recognized semantic
+outcome; it does not relax or enable the semantic gate. For example, both calls
+below return `transportOk=true` and `ok=false` when the transport succeeds but
+the payload is semantically unverified; the second also requires the explicit
+unverified-outcome diagnostic:
+
+```powershell
+& $tool call -Tool inspect -ArgumentsJson '{"kind":"unknown"}' -RuntimePath $runtime
+& $tool call -Tool inspect -ArgumentsJson '{"kind":"unknown"}' -RuntimePath $runtime -RequireSuccess
+```
+
+Thus an API payload such as `idempotency_conflict` cannot be mistaken for
+successful work with or without the switch.
 The `communityshaders.profiler` bridge has a contract-specific adapter because
 its legacy response does not carry a generic top-level `ok`: `status` must
 contain a frame-bearing status object, while `enable` and `disable` must report
@@ -79,17 +92,42 @@ without misclassifying a valid bridge response as unknown.
 Structured responses from allowlisted read-only calls establish a successful
 read contract. `record start` has a separate adapter that requires
 `action=start`, `recording=true`, and the requested correlation ID before
-`-RequireSuccess` accepts the result.
+`-RequireSuccess` accepts the result. `record stop` requires the exact stop
+action and a persisted recording path. Tracked-set `stop`/`releaseAll` requires
+either exact already-inactive evidence or owner-bound completed restoration.
+Weather `execute` treats top-level `ok` as envelope success only: the nested
+result must report `status=success` and Boolean `applied=true`; preflight and
+revision guards remain semantic failures.
+The allowlist includes the exact structured `communityshaders.renderscale`
+`status` response and the screenshot `capabilities` response. Screenshot
+capabilities require the version-1 schema plus positive integral frame and
+duration limits before clients may use them for mutation preflight. Screenshot
+`status`, `settings_get`, `request_get`, `request_list`, and `events_poll` each
+have an action-specific structured read contract. In particular, `request_get`
+requires the exact requested ID, a non-empty state, and a Boolean terminal flag;
+this admits both valid running and terminal receipts without accepting a foreign
+or malformed receipt.
 Replay completion receipts containing only scheduler facts such as `done`,
 `runId`, and `stepsRun` are classified as
 `scheduler-complete-unverified`, not semantic success. A replay response must
 include explicit `semantic`, `postconditions`, `outcomeChecks`, or `assertions`
 evidence before `-RequireSuccess` will accept it. This proves that the requested
 interaction outcome occurred instead of merely proving that the scheduler ran.
+Every member of an explicit outcome map must qualify; a false, null, empty, or
+unsupported named sibling vetoes the whole result even when another sibling is
+positive. Only non-empty `message`, `description`, and `label` fields are
+treated as outcome metadata rather than checks.
 Nested `error.code`, `status`, and `result.state` values are classified. Use
 `-ExpectedErrorCode producer_mismatch` when a guarded rejection is the intended
 test outcome. Transient HTTP 429/502/503/504 responses and timeouts use bounded
 exponential retry and are preserved under `transportRetries`.
+
+Menu and current-state waits qualify each contributing read response before
+testing the barrier predicate. A failed or malformed probe is retained as a
+semantic failure and cannot be replaced by synthetic readiness from apparently
+nonblocking menus, a truthy loaded flag, or a matching cell. Positive
+subsecond deadline budget remains available for one request; `wait-timeout` is
+reported only after the absolute deadline has actually elapsed.
 
 Every timing, frame-rate, CPU, or GPU capture must use
 `-RequirePerformanceNeutral`. When the standalone upscaler temporal probe is
@@ -153,7 +191,9 @@ closed.
 `toolAvailable` repeatedly refreshes the authoritative tool inventory rather
 than freezing the initial list. `serviceReady` additionally calls a controller-
 qualified read-only probe and understands accepted and retryable service states,
-including structured errors that explicitly declare `retryable: true`. The
+including structured errors that explicitly declare `retryable: true`.
+Retryability controls whether an unsatisfied observation may be polled again; it
+never converts negative semantic evidence into readiness. The
 controller inspects the authoritative
 `inputSchema`: an empty object is used only when the schema permits it, while a
 versioned service requiring `contractMajor`, `clientId`, `commandId`, and
@@ -182,18 +222,46 @@ terminate immediately and the last transient error remains in the result.
 The initial MCP initialize/initialized/tools-list exchange is part of that same
 outer wait state machine, so a temporarily unavailable listener cannot exhaust
 the short transport budget before the requested timeout begins.
-An invalidated MCP session is fully rebound, but repeated invalidations are not
-allowed to consume the entire wait invisibly. `-MaxSessionRebinds` defaults to
-three; reaching it returns `persistent-session-invalidated` with the count and
-last successfully decoded observation so callers can distinguish server churn
-from an ordinary unsatisfied predicate.
+An invalidated MCP session is fully rebound within the same absolute wait
+deadline. Periodic server session retirement is therefore not an independent
+failure limit: `-MaxSessionRebinds` defaults to zero (deadline-only). Callers
+may set a positive explicit churn cap when required; reaching it returns
+`persistent-session-invalidated` with the count and last successfully decoded
+observation. `-TimeoutSeconds` accepts explicit bounded waits up to one hour,
+and ordinary deadline expiry returns `timeout` with the last successful state
+observation rather than retrying a request that can no longer start. Transport
+classification from health, registry, or capabilities identity probes is
+preserved into that shared cleanup-qualified rebind boundary. A positive probe
+that arrives at or after the absolute deadline is retained as a late diagnostic
+observation and cannot satisfy the expired wait.
 
 `playerLoaded` is a current-state post-load barrier. After one separately
 verified `game load` dispatch reports `queued: true`, call it with the exact
 `-ExpectedCell`. It polls both `inspect state` and `inspect scene` until the
 player is loaded in that cell. It does not wait for, or require observation of,
 the transient unloaded-to-loaded edge because that edge can occur between
-polls. A transport failure never causes the load mutation to be replayed.
+polls. The call adapter classifies an exact `action=load`, `queued=true`, and
+matching save name as `game-load-dispatch-queued` with
+`completionBasis=dispatch-only`; it does not claim that loading has completed.
+A generic positive status never substitutes for that exact receipt, and any
+contradictory error, extra payload, missing request identity, wrong action,
+non-Boolean queue state, or mismatched save remains rejected.
+A transport failure never causes the load mutation to be replayed.
+
+Before a `communityshaders.render_map` `start`, capture the live `registry`
+response and use `New-CSXRenderMapCapturePlan.ps1` with a workload JSON file.
+The retained registry must be a successful response bound to the exact
+`communityshaders.render_map` service, explicit contract major, producer build,
+and source snapshot hash. The workload states positive integer JSON numbers for
+expected duration, frames, event count, event bytes, scope depth, and every
+catalogue observation family. The planner multiplies each by explicit headroom,
+adds the registry's fixed catalogue allocation to the byte budget, rejects any
+plan beyond the live service ceilings, and writes an immutable receipt
+containing the selected bounds and rationale. Pass only a successful result's
+`arguments` to `start`. If final hashing fails after receipt publication, the
+failure result retains the committed path and withholds arguments so the exact
+receipt can be reconciled. Any limit hit makes the evidence incomplete unless
+saturation itself is the experiment.
 
 `upscalingStable` is the fail-closed barrier for paced cell-transition tests.
 It requires the exact `-ExpectedCell`, a loaded player, no blocking menu, and a
