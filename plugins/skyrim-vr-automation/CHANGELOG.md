@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Reject stale lease generations at the serialized MO2 session commit boundary,
+  bind detached handoff ancestry to the dispatched helper's exact lifetime, and
+  make session-lock liveness consume the modern owner path/start-time schema.
 - Revalidate the exact recorded MO2 owner before every RootBuilder `Unlock` UI
   action and before reporting successful recovery, so PID reuse cannot redirect
   recovery after game termination.
