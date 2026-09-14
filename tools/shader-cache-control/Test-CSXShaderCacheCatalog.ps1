@@ -294,7 +294,42 @@ try {
     $receiptOnlyRecoveredJournal = Get-Content -LiteralPath $unchangedJournalPath -Raw | ConvertFrom-Json -Depth 30
     Assert-Test ($receiptOnlyCompletion.ok -and [bool]$receiptOnlyRecoveredJournal.recoveredFromReceipt -and
         [IO.Path]::GetFullPath([string]$receiptOnlyRecoveredPlan.restoreReceiptPath) -eq [IO.Path]::GetFullPath([string]$unchangedPlan.restoreReceiptPath)) 'fresh receipt-only recovery explicitly authorizes journal reconstruction before the plan has persisted its receipt pointer'
+    $unchangedRestorePath = [string]$unchangedPlan.restoreReceiptPath
+    $originalUnchangedRestoreJson = Get-Content -LiteralPath $unchangedRestorePath -Raw
+    $alternatePreservedPath = Join-Path $unchangedEvidence 'cache.before-alternate'
+    Copy-Item -LiteralPath (Join-Path $unchangedEvidence 'cache.before') -Destination $alternatePreservedPath -Recurse
+    $mismatchedPathReceipt = $originalUnchangedRestoreJson | ConvertFrom-Json -Depth 30
+    $mismatchedPathReceipt.displacedPath = $alternatePreservedPath
+    $mismatchedPathReceipt | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $unchangedRestorePath -Encoding utf8
     Remove-Item -LiteralPath $unchangedCompletionPath, $unchangedJournalPath -Force
+    foreach ($pathMismatchRoute in @(
+        [pscustomobject]@{ label = 'saved-pointer'; retainPointer = $true },
+        [pscustomobject]@{ label = 'direct-discovery'; retainPointer = $false }
+    )) {
+        $pathMismatchPlan = Get-Content -LiteralPath $unchangedPlanPath -Raw | ConvertFrom-Json -Depth 40
+        if ($pathMismatchRoute.retainPointer) {
+            $pathMismatchPlan | Add-Member -NotePropertyName restoreReceiptPath -NotePropertyValue $unchangedRestorePath -Force
+        }
+        else { $pathMismatchPlan.PSObject.Properties.Remove('restoreReceiptPath') }
+        $pathMismatchPlan.state = 'completing'
+        $pathMismatchPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $unchangedPlanPath -Encoding utf8
+        $pathMismatchResult = Invoke-Catalog @{
+            Command = 'complete'; CatalogRoot = $unchangedCatalog
+            CachePath = $unchangedCache; EvidenceDirectory = $unchangedEvidence
+            WorkingSetStatus = 'unverified'; BlockingProcessNames = $blockers
+            Confirm = $false; Compact = $true; NoExit = $true
+        }
+        Assert-Test (-not $pathMismatchResult.ok -and $pathMismatchResult.errors[0] -match 'exact preserved baseline' -and
+            -not (Test-Path -LiteralPath $unchangedJournalPath -PathType Leaf) -and
+            -not (Test-Path -LiteralPath $unchangedCompletionPath -PathType Leaf)) "receipt-only no-op $($pathMismatchRoute.label) recovery rejects a same-hash path that differs from the task snapshot"
+    }
+    $originalUnchangedRestoreJson | Set-Content -LiteralPath $unchangedRestorePath -Encoding utf8
+    $restoredPathPlan = Get-Content -LiteralPath $unchangedPlanPath -Raw | ConvertFrom-Json -Depth 40
+    $restoredPathPlan | Add-Member -NotePropertyName restoreReceiptPath -NotePropertyValue $unchangedRestorePath -Force
+    $restoredPathPlan.state = 'completing'
+    $restoredPathPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $unchangedPlanPath -Encoding utf8
+    Remove-Item -LiteralPath $alternatePreservedPath -Recurse -Force
+    Remove-Item -LiteralPath $unchangedCompletionPath, $unchangedJournalPath -Force -ErrorAction SilentlyContinue
     $noopDriftPath = Join-Path $unchangedCache 'unexpected-after-receipt.bin'
     [IO.File]::WriteAllBytes($noopDriftPath, [byte[]](9, 9, 9))
     $unsafeNoOpRecovery = Invoke-Catalog @{

@@ -196,7 +196,9 @@ missing, drifted, or ambiguous receipt-shaped evidence leaves the plan pending
 for recovery and never triggers a replacement restore. Receipt-only no-op
 recovery is an explicit validator mode and accepts only the canonical
 `restore-noop` operation spelling; operation casing cannot select a weaker
-proof path.
+proof path. Its receipt and journal must also name the exact preserved-baseline
+path recorded by the original snapshot; another evidence-root directory with
+identical bytes cannot substitute for that snapshot-bound identity.
 
 `seed` requires the existing snapshot receipt for the same live cache and
 evidence directory, verifies the exact source tree, stages it, swaps it into
