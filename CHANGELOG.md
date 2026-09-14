@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Keep the synchronous-completion public-call fixtures composable with the
+  integrated workspace-isolation gate by supplying the real access identity
+  and replacing that unrelated dependency inside the bounded fixture.
 - Preserve each synchronous launch/open generation through its completion,
   refuse stale terminal writes after a concurrent lifecycle wins, and recognize
   success only when the newer record proves the same exact attempt completed.
