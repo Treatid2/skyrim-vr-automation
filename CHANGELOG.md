@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Bind graceful `stop-game` and `stop` targets to retained live process handles,
+  revalidate exact PID/name/path/start identity and current session generation,
+  and never reopen a previously observed PID for `CloseMainWindow`.
 - Qualify every cooperative-close UI mutation against the current lease
   generation, refuse stale session release after a competing lifecycle change,
   and recheck game/loader and RootBuilder vetoes inside forced MO2 termination.
