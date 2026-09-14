@@ -84,7 +84,7 @@ $script:requestTimeoutSecondsForRpc = $RequestTimeoutSeconds
 function Get-RequestTimeoutSeconds {
     if ($null -eq $script:operationDeadlineUtc) { return $script:requestTimeoutSecondsForRpc }
     $remainingSeconds = ($script:operationDeadlineUtc - [DateTime]::UtcNow).TotalSeconds
-    if ($remainingSeconds -lt 1) { throw [TimeoutException]::new('The DevBench operation deadline expired before another request could start.') }
+    if ($remainingSeconds -le 0) { throw [TimeoutException]::new('The DevBench operation deadline expired before another request could start.') }
     return [int][Math]::Max(1, [Math]::Min($script:requestTimeoutSecondsForRpc, [Math]::Ceiling($remainingSeconds)))
 }
 
@@ -606,16 +606,21 @@ function Get-DevBenchWaitCompletion {
         [Parameter(Mandatory)][int]$TimeoutSeconds
     )
     $service = if ($Observation.PSObject.Properties['service']) { $Observation.service } else { $null }
-    $terminalFailureProperty = if ($service) { $service.PSObject.Properties['terminalFailure'] } else { $null }
-    $terminalServiceFailure = $Condition -eq 'serviceReady' -and
-        $terminalFailureProperty -and
-        $terminalFailureProperty.Value -is [bool] -and
-        [bool]$terminalFailureProperty.Value
-    if ($terminalServiceFailure) {
+    $directTerminalFailureProperty = $Observation.PSObject.Properties['terminalFailure']
+    $serviceTerminalFailureProperty = if ($service) { $service.PSObject.Properties['terminalFailure'] } else { $null }
+    $terminalServiceFailure = $Condition -eq 'serviceReady' -and $serviceTerminalFailureProperty -and
+        $serviceTerminalFailureProperty.Value -is [bool] -and [bool]$serviceTerminalFailureProperty.Value
+    $terminalProbeFailure = $directTerminalFailureProperty -and
+        $directTerminalFailureProperty.Value -is [bool] -and [bool]$directTerminalFailureProperty.Value
+    if ($terminalServiceFailure -or $terminalProbeFailure) {
+        $failureSemantic = if ($terminalProbeFailure -and $Observation.PSObject.Properties['semantic']) {
+            $Observation.semantic
+        } else { $service.semantic }
         return [pscustomobject][ordered]@{
             state = 'semantic-failed'
-            semantic = $service.semantic
-            terminalServiceFailure = $true
+            semantic = $failureSemantic
+            terminalServiceFailure = $terminalServiceFailure
+            terminalProbeFailure = $terminalProbeFailure
         }
     }
     if ([bool]$Observation.satisfied) {
@@ -623,12 +628,14 @@ function Get-DevBenchWaitCompletion {
             state = 'completed'
             semantic = [pscustomobject][ordered]@{ known = $true; ok = $true; reasons = @() }
             terminalServiceFailure = $false
+            terminalProbeFailure = $false
         }
     }
     return [pscustomobject][ordered]@{
         state = 'timeout'
         semantic = New-DevBenchWaitTimeoutSemantic -Condition $Condition -TimeoutSeconds $TimeoutSeconds
         terminalServiceFailure = $false
+        terminalProbeFailure = $false
     }
 }
 
@@ -1221,11 +1228,21 @@ try {
             }
             if ($Condition -in @('noBlockingMenu', 'mainMenuReady')) {
                 try {
-                    $menu = @(Invoke-ToolRpc -Name 'menu' -Arguments @{ action = 'list' } -Headers $headers).content | Select-Object -First 1
-                    $observation = if ($Condition -eq 'mainMenuReady') {
-                        Test-DevBenchMainMenuReady -MenuState $menu -AllowedMenus $AllowedMainMenuMenus
-                    } else {
-                        Test-DevBenchNoBlockingMenu -MenuState $menu -IgnoredMenus $IgnoredMenus
+                    $menuContent = @((Invoke-ToolRpc -Name 'menu' -Arguments @{ action = 'list' } -Headers $headers).content)
+                    $menuProbe = Get-DevBenchWaitProbeAssessment -ProbeKind menu -Content $menuContent
+                    if (-not $menuProbe.ok) {
+                        $observation = [pscustomobject][ordered]@{
+                            satisfied = $false; retryable = $menuProbe.retryable; terminalFailure = $menuProbe.terminalFailure
+                            semantic = $menuProbe.semantic; menu = $menuProbe.payload; classification = 'menu-probe-semantic-failure'
+                        }
+                    }
+                    else {
+                        $observation = if ($Condition -eq 'mainMenuReady') {
+                            Test-DevBenchMainMenuReady -MenuState $menuProbe.payload -AllowedMenus $AllowedMainMenuMenus
+                        } else {
+                            Test-DevBenchNoBlockingMenu -MenuState $menuProbe.payload -IgnoredMenus $IgnoredMenus
+                        }
+                        $observation | Add-Member -NotePropertyName semantic -NotePropertyValue $menuProbe.semantic -Force
                     }
                     if ($Condition -eq 'noBlockingMenu' -and -not $observation.satisfied -and $DismissBlockingMenus.Count -gt 0) {
                         $plan = Get-DevBenchMenuDismissalPlan -MenuObservation $observation -DismissBlockingMenus $DismissBlockingMenus
@@ -1268,27 +1285,42 @@ try {
             }
             elseif ($Condition -eq 'playerLoaded') {
                 try {
-                    $state = @(Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'state' } -Headers $headers).content | Select-Object -First 1
-                    $scene = @(Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'scene' } -Headers $headers).content | Select-Object -First 1
-                    $actualCell = if ($scene.cell -is [string]) {
-                        [string]$scene.cell
+                    $stateContent = @((Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'state' } -Headers $headers).content)
+                    $stateProbe = Get-DevBenchWaitProbeAssessment -ProbeKind player-state -Content $stateContent
+                    $sceneContent = @((Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'scene' } -Headers $headers).content)
+                    $sceneProbe = Get-DevBenchWaitProbeAssessment -ProbeKind scene -Content $sceneContent
+                    $failedProbe = @(@($stateProbe, $sceneProbe) | Where-Object { -not $_.ok } | Select-Object -First 1)
+                    if ($failedProbe.Count -gt 0) {
+                        $probe = $failedProbe[0]
+                        $observation = [pscustomobject][ordered]@{
+                            satisfied = $false; retryable = $probe.retryable; terminalFailure = $probe.terminalFailure
+                            semantic = $probe.semantic; state = $stateProbe.payload; scene = $sceneProbe.payload
+                            expectedCell = $ExpectedCell; classification = 'current-state-probe-semantic-failure'
+                        }
                     }
-                    elseif ($scene.cell -and $scene.cell.PSObject.Properties['editorId']) {
-                        [string]$scene.cell.editorId
-                    }
-                    else { $null }
-                    $cellMatches = [string]::Equals($actualCell, $ExpectedCell, [StringComparison]::OrdinalIgnoreCase)
-                    $observation = [pscustomobject][ordered]@{
-                        satisfied = [bool]$state.playerLoaded -and $cellMatches
-                        state = $state
-                        scene = $scene
-                        playerLoaded = [bool]$state.playerLoaded
-                        expectedCell = $ExpectedCell
-                        actualCell = $actualCell
-                        cellMatches = $cellMatches
-                        completionBasis = 'current-state'
-                        retryable = $false
-                        probeError = $null
+                    else {
+                        $state = $stateProbe.payload
+                        $scene = $sceneProbe.payload
+                        $actualCell = if ($scene.cell -is [string]) {
+                            [string]$scene.cell
+                        }
+                        else {
+                            [string]$scene.cell.editorId
+                        }
+                        $cellMatches = [string]::Equals($actualCell, $ExpectedCell, [StringComparison]::OrdinalIgnoreCase)
+                        $observation = [pscustomobject][ordered]@{
+                            satisfied = [bool]$state.playerLoaded -and $cellMatches
+                            state = $state
+                            scene = $scene
+                            playerLoaded = [bool]$state.playerLoaded
+                            expectedCell = $ExpectedCell
+                            actualCell = $actualCell
+                            cellMatches = $cellMatches
+                            completionBasis = 'current-state'
+                            retryable = $false
+                            terminalFailure = $false
+                            probeError = $null
+                        }
                     }
                 }
                 catch {
@@ -1472,6 +1504,9 @@ try {
             if ($observation -and [string]::IsNullOrWhiteSpace($observationProbeError)) {
                 $lastSuccessfulWaitObservation = $observation
             }
+            $terminalProbeFailureProperty = if ($observation) { $observation.PSObject.Properties['terminalFailure'] } else { $null }
+            if ($terminalProbeFailureProperty -and $terminalProbeFailureProperty.Value -is [bool] -and
+                [bool]$terminalProbeFailureProperty.Value) { break }
             if ($observation.satisfied) {
                 $observationCompletedUtc = [DateTime]::UtcNow
                 if (-not (Test-DevBenchWaitDeadlineAcceptance -Satisfied $true -ObservedUtc $observationCompletedUtc -DeadlineUtc $deadline)) {
@@ -1553,7 +1588,8 @@ catch {
     $failureMessage = $caughtException.Message
     $indeterminateMutation = [bool]$caughtException.Data['DevBenchIndeterminateMutation']
     $persistentSessionInvalidation = [bool]$caughtException.Data['DevBenchPersistentSessionInvalidation']
-    $waitDeadlineExpired = $Command -eq 'wait' -and $failureMessage -eq 'The DevBench operation deadline expired before another request could start.'
+    $waitDeadlineExpired = $Command -eq 'wait' -and $caughtException -is [TimeoutException] -and
+        $null -ne $script:operationDeadlineUtc -and [DateTime]::UtcNow -ge $script:operationDeadlineUtc
     $failureState = if ($indeterminateMutation) { 'indeterminate' } elseif ($persistentSessionInvalidation) { 'persistent-session-invalidated' } elseif ($waitDeadlineExpired) { 'timeout' } else { 'failed' }
     $failureData = if ($persistentSessionInvalidation) {
         [pscustomobject][ordered]@{ sessionInvalidationCount = [int]$caughtException.Data['DevBenchSessionInvalidationCount']; maxSessionRebinds = $MaxSessionRebinds; lastSuccessfulObservation = $lastSuccessfulWaitObservation }

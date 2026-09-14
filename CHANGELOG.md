@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Treat every named outcome-map member as required unless it is explicitly
+  typed metadata, make rejected outcomes a global semantic veto, qualify menu
+  and current-state wait probes before barrier evaluation, reject present-null
+  registry statuses, and retain positive subsecond request budget.
 - Preserve terminal `serviceReady` failure semantics instead of rewriting them
   as deadline timeouts; reject negative screenshot limits without unsigned conversion faults, keep
   retryable identity-probe propagation exclusive to bounded waits, and emit one

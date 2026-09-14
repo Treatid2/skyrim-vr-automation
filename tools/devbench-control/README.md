@@ -113,10 +113,21 @@ Replay completion receipts containing only scheduler facts such as `done`,
 include explicit `semantic`, `postconditions`, `outcomeChecks`, or `assertions`
 evidence before `-RequireSuccess` will accept it. This proves that the requested
 interaction outcome occurred instead of merely proving that the scheduler ran.
+Every member of an explicit outcome map must qualify; a false, null, empty, or
+unsupported named sibling vetoes the whole result even when another sibling is
+positive. Only non-empty `message`, `description`, and `label` fields are
+treated as outcome metadata rather than checks.
 Nested `error.code`, `status`, and `result.state` values are classified. Use
 `-ExpectedErrorCode producer_mismatch` when a guarded rejection is the intended
 test outcome. Transient HTTP 429/502/503/504 responses and timeouts use bounded
 exponential retry and are preserved under `transportRetries`.
+
+Menu and current-state waits qualify each contributing read response before
+testing the barrier predicate. A failed or malformed probe is retained as a
+semantic failure and cannot be replaced by synthetic readiness from apparently
+nonblocking menus, a truthy loaded flag, or a matching cell. Positive
+subsecond deadline budget remains available for one request; `wait-timeout` is
+reported only after the absolute deadline has actually elapsed.
 
 Every timing, frame-rate, CPU, or GPU capture must use
 `-RequirePerformanceNeutral`. When the standalone upscaler temporal probe is
