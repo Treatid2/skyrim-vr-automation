@@ -1139,6 +1139,7 @@ function Invoke-WithMO2LeaseTransitionLock {
     param(
         [Parameter(Mandatory)][string]$LockPath,
         [Parameter(Mandatory)][scriptblock]$Action,
+        [AllowEmptyCollection()][object[]]$ArgumentList = @(),
         [ValidateRange(100, 60000)][int]$TimeoutMilliseconds = 10000
     )
 
@@ -1168,7 +1169,7 @@ function Invoke-WithMO2LeaseTransitionLock {
     }
 
     try {
-        return & $Action
+        return & $Action @ArgumentList
     }
     finally {
         $stream.Dispose()
@@ -1269,16 +1270,18 @@ function Invoke-MO2OwnedSessionMutation {
         [Parameter(Mandatory)][scriptblock]$Action
     )
 
-    $transaction = Invoke-WithMO2LeaseTransitionLock -LockPath ([string]$Owned.path) -Action {
-        $current = Assert-MO2OwnedSessionTransitionCurrent -Owned $Owned
-        $outcome = & $Action $current.data
+    $lockedMutation = {
+        param($CurrentOwned, $MutationAction)
+        $current = Assert-MO2OwnedSessionTransitionCurrent -Owned $CurrentOwned
+        $outcome = & $MutationAction $current.data
         if ($null -eq $outcome -or -not $outcome.PSObject.Properties['sessionData']) {
             throw 'The serialized MO2 mutation did not return sessionData.'
         }
         $commit = -not $outcome.PSObject.Properties['commit'] -or [bool]$outcome.commit
-        $record = if ($commit) { Write-MO2OwnedSessionUnderTransitionLock -Owned $Owned -Current $current -Value $outcome.sessionData } else { $current }
+        $record = if ($commit) { Write-MO2OwnedSessionUnderTransitionLock -Owned $CurrentOwned -Current $current -Value $outcome.sessionData } else { $current }
         return [pscustomobject][ordered]@{ record = $record; result = $outcome.result }
     }
+    $transaction = Invoke-WithMO2LeaseTransitionLock -LockPath ([string]$Owned.path) -Action $lockedMutation -ArgumentList @($Owned, $Action)
     $Owned.data = $transaction.record.data
     return $transaction.result
 }
@@ -2867,10 +2870,12 @@ function Invoke-MO2Prepare {
 
 function Set-MO2OwnedSessionGameProcesses {
     param(
+        [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)]$Owned,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Processes,
         [string]$Status,
-        [string]$TimestampProperty
+        [string]$TimestampProperty,
+        [scriptblock]$OwnerProcessInventoryFactory
     )
     if ([string]::IsNullOrWhiteSpace($Status) -ne [string]::IsNullOrWhiteSpace($TimestampProperty)) {
         throw 'Game-process adoption status and timestamp property must be supplied together.'
@@ -2878,18 +2883,38 @@ function Set-MO2OwnedSessionGameProcesses {
     $records = @($Processes | ForEach-Object {
         [pscustomobject][ordered]@{ id = [int]$_.id; name = [string]$_.name; path = [IO.Path]::GetFullPath([string]$_.path); startTime = ConvertTo-MO2CanonicalUtcTimestamp ([string]$_.startTime) }
     })
-    $timestamp = [DateTime]::UtcNow.ToString('o')
-    $Owned.data | Add-Member -NotePropertyName gameProcesses -NotePropertyValue $records -Force
-    $Owned.data | Add-Member -NotePropertyName gameProcessesRecordedUtc -NotePropertyValue $timestamp -Force
-    if ($Owned.data.PSObject.Properties['launchAttemptId']) {
-        $Owned.data | Add-Member -NotePropertyName gameProcessesLaunchAttemptId -NotePropertyValue ([string]$Owned.data.launchAttemptId) -Force
+    $commit = Invoke-MO2OwnedSessionMutation -Owned $Owned -Action {
+        param($currentData)
+        $currentOwned = [pscustomobject][ordered]@{ path = $Owned.path; sessionId = $Owned.sessionId; accessId = $Owned.accessId; data = $currentData }
+        $ownerProcesses = if ($OwnerProcessInventoryFactory) { @(& $OwnerProcessInventoryFactory) } else { @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames)) }
+        $ownerResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $currentOwned -Processes $ownerProcesses
+        if (-not $ownerResolution.ok -or @($ownerResolution.targets).Count -ne 1) {
+            return [pscustomobject][ordered]@{
+                commit = $false
+                sessionData = $currentData
+                result = [pscustomobject][ordered]@{ ok = $false; reason = 'mo2-owner-changed-before-game-process-commit'; ownershipResolution = $ownerResolution; records = @() }
+            }
+        }
+
+        $timestamp = [DateTime]::UtcNow.ToString('o')
+        $currentData | Add-Member -NotePropertyName gameProcesses -NotePropertyValue $records -Force
+        $currentData | Add-Member -NotePropertyName gameProcessesRecordedUtc -NotePropertyValue $timestamp -Force
+        if ($currentData.PSObject.Properties['launchAttemptId']) {
+            $currentData | Add-Member -NotePropertyName gameProcessesLaunchAttemptId -NotePropertyValue ([string]$currentData.launchAttemptId) -Force
+        }
+        if (-not [string]::IsNullOrWhiteSpace($Status)) {
+            $currentData.status = $Status
+            $currentData | Add-Member -NotePropertyName $TimestampProperty -NotePropertyValue $timestamp -Force
+        }
+        return [pscustomobject][ordered]@{
+            sessionData = $currentData
+            result = [pscustomobject][ordered]@{ ok = $true; reason = 'exact-live-mo2-owner'; ownershipResolution = $ownerResolution; records = @($records) }
+        }
     }
-    if (-not [string]::IsNullOrWhiteSpace($Status)) {
-        $Owned.data.status = $Status
-        $Owned.data | Add-Member -NotePropertyName $TimestampProperty -NotePropertyValue $timestamp -Force
+    if (-not $commit.ok) {
+        throw "The exact live MO2 owner changed before game-process persistence; no running state was committed ($($commit.ownershipResolution.reason))."
     }
-    $null = Write-MO2OwnedSessionAtomic -Owned $Owned -Value $Owned.data
-    return $records
+    return @($commit.records)
 }
 
 function Reset-MO2GameProcessStateForLaunch {
@@ -3197,7 +3222,7 @@ function Invoke-MO2Status {
         if ($gameProcessAdoption.eligible) {
             $commitOwnerResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
             if ($commitOwnerResolution.ok -and @($commitOwnerResolution.targets).Count -eq 1) {
-                $null = Set-MO2OwnedSessionGameProcesses -Owned $owned -Processes @($gameProcessAdoption.records) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc'
+                $null = Set-MO2OwnedSessionGameProcesses -Config $Config -Owned $owned -Processes @($gameProcessAdoption.records) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc'
                 $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
                 $gameProcessAdoption | Add-Member -NotePropertyName adopted -NotePropertyValue $true -Force
                 $gameProcessAdoption | Add-Member -NotePropertyName commitOwnershipResolution -NotePropertyValue $commitOwnerResolution -Force
@@ -3429,7 +3454,7 @@ function Invoke-MO2Launch {
     $commitOwnerResolution = if ($gameObserved -and $null -ne $gameProcessAdoption -and $gameProcessAdoption.eligible) { Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames)) } else { $null }
     $gameOwned = $gameObserved -and $null -ne $gameProcessAdoption -and $gameProcessAdoption.eligible -and $null -ne $commitOwnerResolution -and $commitOwnerResolution.ok -and @($commitOwnerResolution.targets).Count -eq 1
     if ($gameOwned) {
-        $null = Set-MO2OwnedSessionGameProcesses -Owned $owned -Processes @($gameProcessAdoption.records) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc'
+        $null = Set-MO2OwnedSessionGameProcesses -Config $Config -Owned $owned -Processes @($gameProcessAdoption.records) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc'
         $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
         $lockData = $owned.data
     }
@@ -4081,6 +4106,10 @@ function Invoke-MO2TerminateGame {
         param($currentData)
         $currentOwned = [pscustomobject][ordered]@{ path = $owned.path; sessionId = $owned.sessionId; accessId = $owned.accessId; data = $currentData }
         $currentInspection = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$currentData.profile) -RequestedExecutable ([string]$currentData.executable)
+        $currentOwnerResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $currentOwned -Processes @($currentInspection.processes.mo2)
+        if (-not $currentOwnerResolution.ok -or @($currentOwnerResolution.targets).Count -ne 1) {
+            return [pscustomobject][ordered]@{ commit = $false; sessionData = $currentData; result = [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = 'mo2-owner-changed-before-game-termination'; ownershipResolution = $currentOwnerResolution } }
+        }
         $currentGameResolution = Resolve-MO2RecordedGameProcessTargets -Recorded @($currentData.gameProcesses) -Current @($currentInspection.processes.game)
         if (-not $currentGameResolution.ok) {
             return [pscustomobject][ordered]@{ commit = $false; sessionData = $currentData; result = [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = [string]$currentGameResolution.reason; resolution = $currentGameResolution } }

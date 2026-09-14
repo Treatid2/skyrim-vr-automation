@@ -304,8 +304,11 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test ($qualifiedGameCommitCalls.Count -eq 2 -and $allGameCommitCalls.Count -eq 2) 'both status and synchronous launch durably co-write verified game identity with the running transition'
     Assert-MO2Test ($moduleSource -match 'ownerProcessPath' -and $moduleSource -match 'ownerProcessStartTime') 'launch and detached-owner adoption persist exact MO2 path and start-time identity'
     Assert-MO2Test (@([regex]::Matches($moduleSource, 'Invoke-MO2OwnedSessionMutation -Owned [$]owned -Action')).Count -eq 4) 'launch, open, terminate-game, and terminate all serialize current lifecycle authority before process mutation'
+    Assert-MO2Test ($moduleSource -match 'param\([$]CurrentOwned, [$]MutationAction\)' -and $moduleSource -match 'Invoke-WithMO2LeaseTransitionLock[^\r\n]+-Action [$]lockedMutation -ArgumentList @\([$]Owned, [$]Action\)') 'serialized lifecycle mutation passes its caller action explicitly without colliding with the lock wrapper Action parameter'
     Assert-MO2Test ($moduleSource -notmatch "Set-MO2OwnedSessionOwner -Owned[^`r`n]+exact MO2 process observed after open" -and $moduleSource -match 'Resolve-MO2OwnedProcessTarget[^\r\n]+-AdoptDetachedOwner') 'synchronous open preserves its dispatch-bound owner tuple unless the explicit detached-owner proof succeeds'
     Assert-MO2Test ($moduleSource -match 'Write-MO2SessionManifestProjection -SessionData [$]updated' -and $moduleSource -notmatch '(?s)Write-MO2OwnedSessionAtomic[^}]+Write-MO2JsonAtomic -Path [$]manifestPath') 'ownership-lock and session-manifest lifecycle projection share one serialized generation boundary'
+    $gamePersistenceSource = [regex]::Match($moduleSource, '(?s)function Set-MO2OwnedSessionGameProcesses \{.*?\n\}').Value
+    Assert-MO2Test ($gamePersistenceSource -match 'Invoke-MO2OwnedSessionMutation' -and $gamePersistenceSource -match 'Resolve-MO2OwnedProcessTarget' -and $gamePersistenceSource.IndexOf('Resolve-MO2OwnedProcessTarget', [StringComparison]::Ordinal) -lt $gamePersistenceSource.IndexOf('gameProcesses -NotePropertyValue', [StringComparison]::Ordinal)) 'game-process persistence resolves one exact live MO2 owner inside the serialized transition before changing running state'
     $terminationCalls = [Collections.Generic.List[string]]::new()
     $changedLiveOwner = [pscustomobject]@{ id = 101; name = 'MO2ControlFixtureProcess'; path = $mo2Exe; startTime = $ownerStartUtc.AddMinutes(1).ToString('o') }
     $replacementBinding = { param($processId) [pscustomobject]@{ available = $true; reason = 'bound'; process = [pscustomobject]@{ id = $processId }; record = $changedLiveOwner } }.GetNewClosure()
@@ -320,6 +323,11 @@ selected_profile=@ByteArray(Codex)
     $gameReplacementRace = & $mo2Module { param($cfg, $owned, $target, $binding, $terminator) Invoke-MO2VerifiedGameTerminationSet -Config $cfg -Owned $owned -Targets @($target) -BindingFactory $binding -TerminationAction $terminator } $config $launchingOwned $observedGame $gameReplacementBinding $gameReplacementTerminator
     Assert-MO2Test (-not $gameReplacementRace.ok -and $gameReplacementRace.reason -eq 'process-start-time-mismatch' -and $gameTerminationCalls.Count -eq 0) 'terminate-game rejects a changed live game identity after inspection without invoking termination'
     Assert-MO2Test ($moduleSource -match 'Invoke-MO2VerifiedGameTerminationSet .* -Targets \$targets' -and $moduleSource -notmatch 'Stop-Process -Id \(\[int\]\$target[.]id\)') 'terminate-game rebinds every game process and terminates only through retained exact process handles'
+    $terminateGameSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2TerminateGame \{.*?\n\}').Value
+    $serializedTerminationIndex = $terminateGameSource.IndexOf('Invoke-MO2OwnedSessionMutation', [StringComparison]::Ordinal)
+    $currentOwnerGuardIndex = $terminateGameSource.IndexOf('$currentOwnerResolution = Resolve-MO2OwnedProcessTarget', [StringComparison]::Ordinal)
+    $gameMutationIndex = $terminateGameSource.IndexOf('$verified = Invoke-MO2VerifiedGameTerminationSet', [StringComparison]::Ordinal)
+    Assert-MO2Test ($serializedTerminationIndex -ge 0 -and $currentOwnerGuardIndex -gt $serializedTerminationIndex -and $gameMutationIndex -gt $currentOwnerGuardIndex) 'terminate-game revalidates the exact live MO2 owner inside the serialized transition before requesting game termination'
 
     $missingProfile = Invoke-MO2Validate -Config $config -Profile 'Does Not Exist'
     Assert-MO2Test (-not $missingProfile.ok) 'missing exact profile blocks validation'
@@ -402,7 +410,7 @@ selected_profile=@ByteArray(Codex)
     $inSessionRenewal = Invoke-MO2RenewAccess -Config $config -AccessId $accessId -EstimatedMinutes 45
     $staleGameRecord = [pscustomobject]@{ id = 9191; name = 'MO2ControlImpossibleFixtureGame'; path = $fixtureGame; startTime = [DateTimeOffset]::UtcNow.ToString('o') }
     $staleWriterRejected = $false
-    try { $null = & $mo2Module { param($fixtureOwned, $game) Set-MO2OwnedSessionGameProcesses -Owned $fixtureOwned -Processes @($game) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc' } $staleOwnedSession $staleGameRecord }
+    try { $null = & $mo2Module { param($fixtureConfig, $fixtureOwned, $game) Set-MO2OwnedSessionGameProcesses -Config $fixtureConfig -Owned $fixtureOwned -Processes @($game) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc' } $config $staleOwnedSession $staleGameRecord }
     catch { $staleWriterRejected = $_.Exception.Message -match 'lease transition is stale' }
     $postStaleWriteStatus = Invoke-MO2AccessStatus -Config $config -AccessId $accessId
     $postStaleWriteLock = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
@@ -594,8 +602,24 @@ selected_profile=@ByteArray(Codex)
     $atomicManifestBefore = Get-Content -LiteralPath $atomicManifestPath -Raw
     try {
         $atomicOwned = & $mo2Module { param($cfg, $sessionId) Get-MO2OwnedSession -Config $cfg -SessionId $sessionId } $config ([string]$prepared.data.session.sessionId)
+        $atomicOwnerProcess = Get-Process -Id $PID -ErrorAction Stop
+        $atomicConfig = $config | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+        $atomicConfig.mo2.executable = [IO.Path]::GetFullPath([string]$atomicOwnerProcess.Path)
+        $atomicConfig.mo2.processNames = @([string]$atomicOwnerProcess.ProcessName)
+        $atomicOwnerRecord = [pscustomobject]@{ id = [int]$atomicOwnerProcess.Id; name = [string]$atomicOwnerProcess.ProcessName; path = [IO.Path]::GetFullPath([string]$atomicOwnerProcess.Path); startTime = $atomicOwnerProcess.StartTime.ToUniversalTime().ToString('o') }
+        $null = & $mo2Module { param($owned, $owner) Set-MO2OwnedSessionOwner -Owned $owned -ProcessRecord $owner -Reason 'test-owned exact MO2 owner' } $atomicOwned $atomicOwnerRecord
         $atomicStaleOwned = $atomicOwned | ConvertTo-Json -Depth 30 | ConvertFrom-Json
-        $null = & $mo2Module { param($owned, $process) Set-MO2OwnedSessionGameProcesses -Owned $owned -Processes @($process) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc' } $atomicOwned $observedGame
+        $ownerGuardLockBefore = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+        $changedAtomicOwner = [pscustomobject]@{ id = [int]$atomicOwnerRecord.id; name = [string]$atomicOwnerRecord.name; path = [string]$atomicOwnerRecord.path; startTime = ([DateTimeOffset]::Parse([string]$atomicOwnerRecord.startTime)).AddSeconds(1).ToString('o') }
+        $ownerCommitRejected = $false
+        try {
+            $null = & $mo2Module { param($cfg, $owned, $process, $changedOwner) $inventory = { @($changedOwner) }.GetNewClosure(); Set-MO2OwnedSessionGameProcesses -Config $cfg -Owned $owned -Processes @($process) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc' -OwnerProcessInventoryFactory $inventory } $atomicConfig $atomicOwned $observedGame $changedAtomicOwner
+        }
+        catch { $ownerCommitRejected = $_.Exception.Message -match 'exact live MO2 owner changed before game-process persistence' }
+        $ownerGuardLockAfter = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+        $ownerGuardGameCount = if ($ownerGuardLockAfter.PSObject.Properties['gameProcesses']) { @($ownerGuardLockAfter.gameProcesses).Count } else { 0 }
+        Assert-MO2Test ($ownerCommitRejected -and [long]$ownerGuardLockAfter.generation -eq [long]$ownerGuardLockBefore.generation -and $ownerGuardLockAfter.status -ne 'running' -and $ownerGuardGameCount -eq 0) 'game-process persistence revalidates the exact live MO2 owner inside the serialized transition and refuses an owner replacement without committing'
+        $null = & $mo2Module { param($cfg, $owned, $process, $owner) $inventory = { @($owner) }.GetNewClosure(); Set-MO2OwnedSessionGameProcesses -Config $cfg -Owned $owned -Processes @($process) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc' -OwnerProcessInventoryFactory $inventory } $atomicConfig $atomicOwned $observedGame $atomicOwnerRecord
         $atomicLock = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
         $atomicManifest = Get-Content -LiteralPath $atomicManifestPath -Raw | ConvertFrom-Json
         Assert-MO2Test ($atomicLock.status -eq 'running' -and @($atomicLock.gameProcesses).Count -eq 1 -and -not [string]::IsNullOrWhiteSpace([string]$atomicLock.gameProcessesAdoptedUtc)) 'game identity and running state are coherent in the durable ownership record'

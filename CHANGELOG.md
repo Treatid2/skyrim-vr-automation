@@ -4,6 +4,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Revalidate the exact live MO2 owner inside the serialized game-identity commit
+  and immediately before exact game termination, so owner exit or replacement
+  cannot publish `running` state or strand RootBuilder restoration.
+- Capture serialized lifecycle callbacks under a distinct closed-over binding so
+  the lock wrapper cannot recursively resolve its own `Action` parameter.
 - Serialize launch, open, game termination, MO2 termination, and RootBuilder
   `Unlock` authorization against the current session generation before their
   external process/UI action; bind Unlock to one retained exact-owner handle at
