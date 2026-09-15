@@ -680,10 +680,36 @@ selected_profile=@ByteArray(Codex)
         $releaseStdOut = Join-Path $fixture 'human-release.stdout.json'
         $releaseStdErr = Join-Path $fixture 'human-release.stderr.txt'
         $releaseProbePath = Join-Path $fixture 'human-release.probe.json'
+        $releaseProbeScript = Join-Path $fixture 'Invoke-HumanReleaseProbe.ps1'
+        @'
+param(
+    [Parameter(Mandatory)][string]$TransitionLockPath,
+    [Parameter(Mandatory)][string]$ProbePath,
+    [Parameter(Mandatory)][string]$EntryPoint,
+    [Parameter(Mandatory)][string]$ConfigPath,
+    [Parameter(Mandatory)][string]$AccessId
+)
+$ErrorActionPreference = 'Stop'
+try {
+    $unexpected = [IO.File]::Open($TransitionLockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $unexpected.Dispose()
+    [IO.File]::WriteAllText($ProbePath, '{"state":"lock-acquired-unexpected"}', [Text.UTF8Encoding]::new($false))
+    exit 23
+}
+catch [IO.IOException] {
+    [IO.File]::WriteAllText($ProbePath, '{"state":"transition-lock-contended"}', [Text.UTF8Encoding]::new($false))
+}
+& $EntryPoint release-access -ConfigPath $ConfigPath -AccessId $AccessId -Compact -NoExit
+'@ | Set-Content -LiteralPath $releaseProbeScript -Encoding utf8
         $releaseAction = {
-            $releaseProcess = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile', '-NonInteractive', '-File', (Join-Path $packageRoot 'Invoke-MO2Control.ps1'), 'release-access', '-ConfigPath', $configPath, '-AccessId', $humanAccessId, '-Compact', '-NoExit') -RedirectStandardOutput $releaseStdOut -RedirectStandardError $releaseStdErr -PassThru
-            Start-Sleep -Milliseconds 700
-            [IO.File]::WriteAllText($releaseProbePath, ([pscustomobject]@{ pid = $releaseProcess.Id; blockedDuringMutation = -not $releaseProcess.HasExited } | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+            $transitionLockPath = ([string]$config.session.lockFile) + '.transition.lock'
+            $releaseProcess = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $releaseProbeScript, '-TransitionLockPath', $transitionLockPath, '-ProbePath', $releaseProbePath, '-EntryPoint', (Join-Path $packageRoot 'Invoke-MO2Control.ps1'), '-ConfigPath', $configPath, '-AccessId', $humanAccessId) -RedirectStandardOutput $releaseStdOut -RedirectStandardError $releaseStdErr -PassThru
+            $probeDeadline = [DateTime]::UtcNow.AddSeconds(5)
+            while (-not (Test-Path -LiteralPath $releaseProbePath -PathType Leaf) -and [DateTime]::UtcNow -lt $probeDeadline) { Start-Sleep -Milliseconds 25 }
+            if (-not (Test-Path -LiteralPath $releaseProbePath -PathType Leaf)) { throw 'Release child did not reach the exact transition-lock probe.' }
+            $probe = Get-Content -LiteralPath $releaseProbePath -Raw | ConvertFrom-Json
+            Start-Sleep -Milliseconds 150
+            [pscustomobject][ordered]@{ pid = $releaseProcess.Id; lockProbeState = [string]$probe.state; blockedDuringMutation = -not $releaseProcess.HasExited }
         }
         $guardedReleaseProbe = & $mo2Module {
             param($fixtureConfig, $fixtureMutationId, $fixtureAction)
@@ -699,9 +725,8 @@ selected_profile=@ByteArray(Codex)
                 Set-Item -Path Function:script:Get-MO2WindowSnapshot -Value $originalWindowSnapshot
             }
         } $config $humanMutationId $releaseAction
-        if (-not (Test-Path -LiteralPath $releaseProbePath -PathType Leaf)) { throw "Guarded mutation action did not execute: $($guardedReleaseProbe | ConvertTo-Json -Depth 8 -Compress)" }
-        $releaseProbe = Get-Content -LiteralPath $releaseProbePath -Raw | ConvertFrom-Json
-        Assert-MO2Test ($guardedReleaseProbe.ok -and $releaseProbe.blockedDuringMutation) 'release-access cannot revoke the human lease while an authorized profile mutation holds the transition lock'
+        $releaseProbe = @($guardedReleaseProbe.actionResult)[0]
+        Assert-MO2Test ($guardedReleaseProbe.ok -and $releaseProbe.lockProbeState -eq 'transition-lock-contended' -and $releaseProbe.blockedDuringMutation) 'release child reaches and contends on the exact transition lock before the authorized profile mutation returns'
         $releaseDeadline = [DateTime]::UtcNow.AddSeconds(10)
         while ((-not (Test-Path -LiteralPath $releaseStdOut -PathType Leaf) -or (Get-Item -LiteralPath $releaseStdOut).Length -eq 0) -and [DateTime]::UtcNow -lt $releaseDeadline) {
             Start-Sleep -Milliseconds 50
