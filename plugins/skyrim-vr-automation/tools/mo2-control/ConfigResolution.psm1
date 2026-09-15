@@ -111,7 +111,7 @@ function Resolve-MO2ControlConfigPath {
         }
         else { @() }
 
-        if ($namedConfigs.Count -gt 0) {
+        if (@($namedConfigs).Count -gt 0) {
             $selectedSource = 'named-selection-required'
             $selectedPath = $activeModlistPath
             foreach ($namedConfig in $namedConfigs) {
