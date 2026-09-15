@@ -555,6 +555,7 @@ function Invoke-AuthorizedProfileMutation {
     if (-not $guarded.ok) {
         throw "Human mutation authority changed before commit ($($guarded.authority.state)): $($guarded.authority.errors -join ' ')"
     }
+    $script:humanMutationAuthority = $guarded.authority
     return @($guarded.actionResult)
 }
 
