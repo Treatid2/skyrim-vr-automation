@@ -3,7 +3,7 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [ValidateSet('inspect', 'register', 'register-winning', 'ensure-winner', 'enable', 'disable', 'restore')]
+    [ValidateSet('inspect', 'register', 'register-winning', 'add-enable', 'ensure-winner', 'enable', 'disable', 'restore')]
     [string]$Command,
 
     [Parameter(Mandatory)]
@@ -25,6 +25,24 @@ param(
     [string[]]$WinningPaths,
 
     [string]$WinningPathsFile,
+
+    [ValidateSet('KeepProviders', 'DisableExactDllOnly')]
+    [string]$RetirementPolicy = 'DisableExactDllOnly',
+
+    [ValidateRange(1, 100000)]
+    [int]$MaximumModFiles = 10000,
+
+    [ValidateRange(1, 100000)]
+    [int]$MaximumModDirectories = 10000,
+
+    [ValidateRange(1, 1099511627776)]
+    [long]$MaximumModBytes = 4294967296,
+
+    [ValidateRange(1, 256)]
+    [int]$MaximumModDepth = 64,
+
+    [ValidateRange(1, 10000)]
+    [int]$MaximumMatchingProviders = 1000,
 
     [switch]$RegisterEnabled,
 
@@ -226,6 +244,118 @@ function Test-WinningPostcondition([byte[]]$Bytes, [string]$TargetName, [string]
     $losing = @($plan.otherEnabledProviders | Where-Object { [int]$_.lineNumber -lt $targetLine })
     if ($losing.Count -gt 0) { throw "Winning postcondition failed; an enabled provider precedes '$TargetName': $($losing.modName -join ', ')." }
     return [pscustomobject][ordered]@{ verified = $true; targetLineNumber = $targetLine; relativePaths = $plan.relativePaths; displacedProviders = $plan.otherEnabledProviders; scopeNote = $plan.scopeNote }
+}
+
+function Get-BoundedModFileInventory([string]$Root, [string]$Purpose) {
+    $resolvedRoot = [IO.Path]::GetFullPath($Root)
+    if (-not (Test-Path -LiteralPath $resolvedRoot -PathType Container)) { throw "$Purpose does not exist: $resolvedRoot" }
+    Assert-NoReparsePointPath -Path $resolvedRoot -Purpose $Purpose
+    $files = [Collections.Generic.List[object]]::new()
+    $pending = [Collections.Generic.Stack[object]]::new()
+    $pending.Push([pscustomobject]@{ path = $resolvedRoot; depth = 0 })
+    $directoryCount = 1
+    [long]$totalBytes = 0
+    while ($pending.Count -gt 0) {
+        $current = $pending.Pop()
+        foreach ($item in @(Get-ChildItem -LiteralPath $current.path -Force)) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Purpose contains a reparse point and is not qualified: $($item.FullName)"
+            }
+            if ($item -is [IO.DirectoryInfo]) {
+                $depth = [int]$current.depth + 1
+                if ($depth -gt $MaximumModDepth) { throw "$Purpose exceeds depth limit $MaximumModDepth`: $($item.FullName)" }
+                $directoryCount++
+                if ($directoryCount -gt $MaximumModDirectories) { throw "$Purpose exceeds directory limit $MaximumModDirectories." }
+                $pending.Push([pscustomobject]@{ path = $item.FullName; depth = $depth })
+                continue
+            }
+            $relative = [IO.Path]::GetRelativePath($resolvedRoot, $item.FullName).Replace('/', [IO.Path]::DirectorySeparatorChar)
+            if ([IO.Path]::IsPathRooted($relative) -or $relative -eq '..' -or $relative.StartsWith('..' + [IO.Path]::DirectorySeparatorChar)) {
+                throw "$Purpose file escapes its root: $($item.FullName)"
+            }
+            $files.Add([pscustomobject][ordered]@{ path = $relative; fullPath = $item.FullName; length = [long]$item.Length })
+            if ($files.Count -gt $MaximumModFiles) { throw "$Purpose exceeds file limit $MaximumModFiles." }
+            if ([long]$item.Length -gt ($MaximumModBytes - $totalBytes)) { throw "$Purpose exceeds byte limit $MaximumModBytes." }
+            $totalBytes += [long]$item.Length
+        }
+    }
+    return @($files | Sort-Object path)
+}
+
+function Test-NonFunctionalProviderFile([string]$Path) {
+    $normalized = $Path.Replace('\', '/').TrimStart('/')
+    $segments = @($normalized -split '/')
+    $fileName = $segments[-1]
+    $extension = [IO.Path]::GetExtension($fileName).ToLowerInvariant()
+    if ($fileName -ieq 'meta.ini' -or $extension -in @('.bmp', '.jpeg', '.jpg', '.md', '.pdf', '.pdb', '.png', '.txt', '.mohidden')) { return $true }
+    return $segments.Count -gt 1 -and $segments[0] -in @('docs', 'fomod')
+}
+
+function Get-AutomaticDllPlan([byte[]]$Bytes, [string]$TargetName, [string]$TargetDirectory, [string]$ModRoot) {
+    $targetInventory = @(Get-BoundedModFileInventory -Root $TargetDirectory -Purpose "Target mod '$TargetName'")
+    $targetDlls = @($targetInventory | Where-Object { [IO.Path]::GetExtension([string]$_.path) -ieq '.dll' } | ForEach-Object path | Sort-Object -Unique)
+    if ($targetDlls.Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            targetDllPaths = @()
+            initialProviderPlan = $null
+            providers = @()
+            disableMods = @()
+            scopeNote = 'The target contains no DLLs. It will be registered or enabled, but no DLL winner or provider-retirement action is required.'
+        }
+    }
+
+    $winnerPlan = Resolve-WinningPlan -Bytes $Bytes -TargetName $TargetName -TargetDirectory $TargetDirectory -ModRoot $ModRoot -Paths $targetDlls
+    $providerNames = @($winnerPlan.otherEnabledProviders | ForEach-Object modName | Sort-Object -Unique)
+    if ($providerNames.Count -gt $MaximumMatchingProviders) { throw "Matching DLL providers exceed limit $MaximumMatchingProviders." }
+    $providerAssessments = [Collections.Generic.List[object]]::new()
+    foreach ($providerName in $providerNames) {
+        $providerRoot = [IO.Path]::GetFullPath((Join-Path $ModRoot $providerName))
+        $inventory = @(Get-BoundedModFileInventory -Root $providerRoot -Purpose "Enabled provider '$providerName'")
+        $functional = @($inventory | Where-Object { -not (Test-NonFunctionalProviderFile ([string]$_.path)) })
+        $unmatchedFunctional = @($functional | Where-Object {
+            [IO.Path]::GetExtension([string]$_.path) -ine '.dll' -or $targetDlls -inotcontains [string]$_.path
+        })
+        $matchingDlls = @($inventory | Where-Object { [IO.Path]::GetExtension([string]$_.path) -ieq '.dll' -and $targetDlls -icontains [string]$_.path } | ForEach-Object path | Sort-Object -Unique)
+        $eligible = $matchingDlls.Count -gt 0 -and $functional.Count -gt 0 -and $unmatchedFunctional.Count -eq 0
+        $providerAssessments.Add([pscustomobject][ordered]@{
+            modName = $providerName
+            modDirectory = $providerRoot
+            matchingDllPaths = $matchingDlls
+            functionalFileCount = $functional.Count
+            retainedFunctionalPaths = @($unmatchedFunctional | ForEach-Object path)
+            exactDllOnly = $eligible
+            action = if ($RetirementPolicy -eq 'DisableExactDllOnly' -and $eligible) { 'disable' } else { 'keep-enabled' }
+            reason = if (-not $eligible) { 'Provider has functional content not completely replaced by the target, so it remains enabled.' } elseif ($RetirementPolicy -eq 'DisableExactDllOnly') { 'Every functional file is an exact DLL path supplied by the target.' } else { 'RetirementPolicy keeps previous providers enabled.' }
+        })
+    }
+    return [pscustomobject][ordered]@{
+        targetDllPaths = $targetDlls
+        initialProviderPlan = $winnerPlan
+        providers = @($providerAssessments)
+        disableMods = @($providerAssessments | Where-Object action -eq 'disable' | ForEach-Object modName)
+        scopeNote = 'Automatic winner proof covers exact relative DLL paths from enabled loose-file providers in this modlist. Mixed-content providers stay enabled.'
+    }
+}
+
+function Set-ModEnabledState([byte[]]$Bytes, [string]$Name, [bool]$Enabled) {
+    $result = [byte[]]::new($Bytes.Length)
+    [Array]::Copy($Bytes, $result, $Bytes.Length)
+    $line = Get-ModLineRecord -Bytes $result -Name $Name
+    $targetMarker = if ($Enabled) { '+' } else { '-' }
+    if ($line.marker -cne $targetMarker) {
+        $result[$line.byteOffset] = [byte][char]$targetMarker
+    }
+    return $result
+}
+
+function Test-AddEnablePostcondition([byte[]]$Bytes, [string]$TargetName, [string]$TargetDirectory, [string]$ModRoot, [string[]]$DllPaths, [string[]]$DisabledMods) {
+    $target = Get-ModLineRecord -Bytes $Bytes -Name $TargetName
+    if (-not $target.enabled) { throw "Add-enable postcondition failed: '$TargetName' is not enabled." }
+    foreach ($disabledMod in @($DisabledMods)) {
+        if ((Get-ModLineRecord -Bytes $Bytes -Name $disabledMod).enabled) { throw "Add-enable postcondition failed: '$disabledMod' is not disabled." }
+    }
+    $winnerProof = if ($DllPaths.Count -gt 0) { Test-WinningPostcondition -Bytes $Bytes -TargetName $TargetName -TargetDirectory $TargetDirectory -ModRoot $ModRoot -Paths $DllPaths } else { $null }
+    return [pscustomobject][ordered]@{ verified = $true; targetEnabled = $true; disabledMods = @($DisabledMods); winnerProof = $winnerProof }
 }
 
 function Write-BytesAtomically([string]$Path, [byte[]]$Bytes) {
@@ -534,6 +664,7 @@ $beforeMatches = @(Get-ModLineMatches -Bytes $beforeBytes -Name $ModName)
 $beforeLine = if ($beforeMatches.Count -eq 1) { Get-ModLineRecord -Bytes $beforeBytes -Name $ModName } else { $null }
 $beforeHash = Get-Sha256 $resolvedProfile
 $processes = @(Get-LiveProcesses -Names $BlockingProcessNames)
+$operationResult = $null
 
 if ($Command -eq 'inspect') {
     if ($beforeMatches.Count -ne 1) { throw "Expected exactly one modlist line for '$ModName'; found $($beforeMatches.Count)." }
@@ -568,7 +699,74 @@ $resolvedEvidence = [IO.Path]::GetFullPath($EvidenceDirectory)
 $backupPath = Join-Path $resolvedEvidence 'modlist.before.bin'
 $receiptPath = Join-Path $resolvedEvidence 'modlist-control.receipt.json'
 
-if ($Command -in @('register', 'register-winning')) {
+if ($Command -eq 'add-enable') {
+    if ($beforeMatches.Count -gt 1) { throw "Expected at most one modlist line for '$ModName'; found $($beforeMatches.Count)." }
+    if ([string]::IsNullOrWhiteSpace($ModDirectory)) { throw '-ModDirectory is required for add-enable.' }
+    if ([string]::IsNullOrWhiteSpace($ModsDirectory)) { throw '-ModsDirectory is required for add-enable.' }
+    if ($resolvedWinningPaths.Count -gt 0) { throw 'add-enable discovers target DLL paths automatically; do not pass WinningPaths or WinningPathsFile.' }
+    $resolvedModDirectory = [IO.Path]::GetFullPath($ModDirectory)
+    $resolvedModsDirectory = [IO.Path]::GetFullPath($ModsDirectory)
+    if (-not (Test-Path -LiteralPath $resolvedModsDirectory -PathType Container)) { throw "ModsDirectory does not exist: $resolvedModsDirectory" }
+    Assert-NoReparsePointPath -Path $resolvedModsDirectory -Purpose 'ModsDirectory'
+    if (-not (Test-Path -LiteralPath $resolvedModDirectory -PathType Container)) { throw "Deployed mod directory does not exist: $resolvedModDirectory" }
+    if ([IO.Path]::GetFileName($resolvedModDirectory) -cne $ModName) { throw "The deployed mod directory name must exactly match ModName ('$ModName')." }
+    if (-not $resolvedModDirectory.StartsWith($resolvedModsDirectory + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'The deployed mod directory must be inside ModsDirectory.' }
+    if (Test-Path -LiteralPath $backupPath -PathType Leaf) { throw "Refusing to overwrite an existing exact backup: $backupPath" }
+
+    $withoutTarget = if ($beforeMatches.Count -eq 1) { Remove-ModLine -Bytes $beforeBytes -Name $ModName } else { $beforeBytes }
+    $automaticPlan = Get-AutomaticDllPlan -Bytes $withoutTarget -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $resolvedModsDirectory
+    $workingBytes = $withoutTarget
+    foreach ($retiredMod in @($automaticPlan.disableMods)) {
+        $workingBytes = Set-ModEnabledState -Bytes $workingBytes -Name $retiredMod -Enabled $false
+    }
+
+    $finalWinnerPlan = $null
+    if (@($automaticPlan.targetDllPaths).Count -gt 0) {
+        $finalWinnerPlan = Resolve-WinningPlan -Bytes $workingBytes -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $resolvedModsDirectory -Paths @($automaticPlan.targetDllPaths)
+        $effectivePlacement = if ([string]::IsNullOrWhiteSpace([string]$finalWinnerPlan.placeBeforeMod)) { 'End' } else { 'Before' }
+        $effectiveRelative = [string]$finalWinnerPlan.placeBeforeMod
+        $afterBytes = Add-ModLine -Bytes $workingBytes -Name $ModName -Enabled $true -LinePlacement $effectivePlacement -RelativeName $effectiveRelative
+    }
+    elseif ($beforeMatches.Count -eq 1) {
+        $afterBytes = Set-ModEnabledState -Bytes $beforeBytes -Name $ModName -Enabled $true
+        $effectivePlacement = 'Unchanged'
+        $effectiveRelative = $null
+    }
+    else {
+        $afterBytes = Add-ModLine -Bytes $beforeBytes -Name $ModName -Enabled $true -LinePlacement End -RelativeName $null
+        $effectivePlacement = 'End'
+        $effectiveRelative = $null
+    }
+
+    $postcondition = {
+        param([byte[]]$liveBytes)
+        Test-AddEnablePostcondition -Bytes $liveBytes -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $resolvedModsDirectory -DllPaths @($automaticPlan.targetDllPaths) -DisabledMods @($automaticPlan.disableMods)
+    }
+    $plannedProof = & $postcondition $afterBytes
+    $changed = (Get-BytesSha256 $afterBytes) -cne (Get-BytesSha256 $beforeBytes)
+    $operationResult = [pscustomobject][ordered]@{
+        changed = $changed
+        registered = $beforeMatches.Count -eq 0
+        beforeMarker = if ($beforeLine) { $beforeLine.marker } else { $null }
+        placement = $effectivePlacement
+        relativeToMod = $effectiveRelative
+        retirementPolicy = $RetirementPolicy
+        automaticDllPlan = $automaticPlan
+        finalWinnerPlan = $finalWinnerPlan
+        postcondition = $plannedProof
+    }
+    if ($changed -and (Test-ProfileShouldProcess -Caller $PSCmdlet -Target $resolvedProfile -Action "add or enable '$ModName', place it above exact DLL providers, and apply '$RetirementPolicy'")) {
+        $receipt = [pscustomobject][ordered]@{
+            operation = 'add-enable'; profilePath = $resolvedProfile
+            profileName = $profileName; profileDirectory = $profileDirectory; modListPath = $resolvedProfile
+            modName = $ModName; modDirectory = $resolvedModDirectory; beforeMarker = if ($beforeLine) { $beforeLine.marker } else { $null }
+            resultMarker = '+'; placement = $effectivePlacement; relativeToMod = $effectiveRelative
+            retirementPolicy = $RetirementPolicy; automaticDllPlan = $automaticPlan; finalWinnerPlan = $finalWinnerPlan; postcondition = $plannedProof
+        }
+        $null = Invoke-ProfileMutationTransaction -Path $resolvedProfile -ExpectedBeforeBytes $beforeBytes -AfterBytes $afterBytes -EvidenceRoot $resolvedEvidence -BackupPath $backupPath -ReceiptPath $receiptPath -Receipt $receipt -Postcondition $postcondition
+    }
+}
+elseif ($Command -in @('register', 'register-winning')) {
     if ($beforeMatches.Count -ne 0) {
         throw "Registration requires no existing marker for '$ModName'; found $($beforeMatches.Count)."
     }
@@ -721,6 +919,7 @@ $finalResult = [pscustomobject][ordered]@{
     sha256 = Get-Sha256 $resolvedProfile
     backupPath = $backupPath
     receiptPath = $receiptPath
+    operationResult = $operationResult
     approval = New-ProfileApprovalMetadata -Subcommand $Command
 }
 $jsonParameters = @{ InputObject = $finalResult; Depth = 7 }

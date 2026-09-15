@@ -15,7 +15,9 @@ optional integration rather than the identity or boundary of the toolkit.
 - `tools/mo2-control` — exact-profile MO2 inspection, cooperative cross-task
   access leases, and a bounded single-owner launch lifecycle.
 - `tools/mo2-profile-control` — transactional toggling of an exact MO2
-  `modlist.txt` marker and guarded registration of a newly deployed mod.
+  `modlist.txt` marker, guarded registration of a newly deployed mod, and a
+  high-level add/enable operation that discovers matching DLL providers,
+  selects winning priority, and conservatively retires exact DLL-only predecessors.
 - `tools/mo2-workspace-control` — stable-source ShaderCache evacuation plus
   unique task profiles cloned from that explicit source, with a verified copy
   of its complete saves tree, a mandatory integrity-verified world-entry save, and
