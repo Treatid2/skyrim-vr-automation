@@ -1,5 +1,10 @@
 # Changelog
 
+- Fix config discovery under strict mode when zero or one named modlist exists;
+  the controller now falls through to stable configuration or returns the
+  explicit `named-selection-required` precondition instead of a scalar `.Count`
+  error.
+
 All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
