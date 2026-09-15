@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Add a high-level MO2 `add-enable` transaction that discovers target DLLs,
+  registers or enables the deployed mod at sufficient winning priority, and by
+  default disables only fully superseded exact DLL-only providers while
+  retaining every mixed-content provider.
 - Normalize the evidence-directory boundary before validating snapshot
   containment so an equivalent trailing-separator spelling cannot block task
   completion or receipt-only recovery.
