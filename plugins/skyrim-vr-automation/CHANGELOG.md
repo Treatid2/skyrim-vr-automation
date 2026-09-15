@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Add deterministic MO2 ZIP packaging from an explicit Skyrim Data root plus
+  safe archive inspection that distinguishes direct layouts, flatten-dependent
+  wrappers, the quick-installer `Data`-plus-docs special case, and wrapper
+  layouts blocked by sibling files.
 - Normalize the evidence-directory boundary before validating snapshot
   containment so an equivalent trailing-separator spelling cannot block task
   completion or receipt-only recovery.
