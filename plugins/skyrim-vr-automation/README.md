@@ -62,7 +62,7 @@ new task to the bundled implementations and their operational contracts:
 - `$mo2-control` routes MO2 inspection, exact-profile lifecycle management,
   and transactional profile edits.
 - `$mo2-mod-packaging` packages and diagnoses MO2 archives without guessed
-  wrapper flattening, and routes exact-profile mod activation work.
+  wrapper flattening.
 - `$steamvr-null-hmd` routes backed-up SteamVR null-HMD apply/restore and
   bounded runtime shutdown.
 - `$devbench-control` discovers and calls the exact loopback DevBench MCP API.
