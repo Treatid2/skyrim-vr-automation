@@ -16,7 +16,9 @@ optional integration rather than the identity or boundary of the toolkit.
   automation and human leases, supported live-instance refresh, and a bounded
   single-owner launch lifecycle.
 - `tools/mo2-profile-control` — transactional toggling of an exact MO2
-  `modlist.txt` marker and guarded registration of a newly deployed mod.
+  `modlist.txt` marker, guarded registration of a newly deployed mod, and a
+  high-level add/enable operation that discovers matching DLL providers,
+  selects winning priority, and conservatively retires exact DLL-only predecessors.
 - `tools/mo2-mod-package-control` — safe ZIP inspection and deterministic MO2
   install-package creation from an explicit Skyrim Data root, without relying
   on installer flattening heuristics.

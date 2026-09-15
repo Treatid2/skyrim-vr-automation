@@ -24,6 +24,11 @@
   rewrite, revert, or retire the task-owned MO2 profile.
 - A task may delete or replace only uniquely named mods that its workspace
   proves did not predate the task and explicitly records as task-owned.
+- When a deployed mod must be added or enabled, use the profile controller's
+  `add-enable` transaction instead of manually calculating mod priority. Its
+  default may disable only enabled providers proven to contain no functional
+  content beyond exact matching DLL paths; mixed-content providers remain
+  enabled below the selected winner.
 - Do not inherit unknown-provenance saves, and do not treat COC as New Game.
 - Require Skyrim and its loader to be closed before profile or package
   mutation. The normal autonomous task flow also closes MO2 to establish a

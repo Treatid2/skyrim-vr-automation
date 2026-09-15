@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Add a high-level MO2 `add-enable` transaction that discovers target DLLs,
+  registers or enables the deployed mod at sufficient winning priority, and by
+  default disables only fully superseded exact DLL-only providers while
+  retaining every mixed-content provider.
 - Add deterministic MO2 ZIP packaging from an explicit Skyrim Data root plus
   safe archive inspection that distinguishes direct layouts, flatten-dependent
   wrappers, the quick-installer `Data`-plus-docs special case, and wrapper
