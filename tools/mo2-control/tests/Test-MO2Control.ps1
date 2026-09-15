@@ -599,6 +599,70 @@ selected_profile=@ByteArray(Codex)
     $entryAccessDryRun = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') request-access -ConfigPath $configPath -Label 'approval fixture' -TaskId 'entry-fixture-task' -RuntimeRoute SteamVR -EstimatedMinutes 5 -WhatIf -Compact -NoExit | ConvertFrom-Json
     Assert-MO2Test ($entryAccessDryRun.ok -and $entryAccessDryRun.data.access.ownerTaskId -eq 'entry-fixture-task' -and $entryAccessDryRun.data.configuration.exists -and $entryAccessDryRun.data.approval.reusableApprovalEligible -and $entryAccessDryRun.data.approval.reusablePrefix[5] -eq 'request-access') 'dictionary-backed entry-point results retain task identity, configuration, and approval metadata'
 
+    $entryHumanDryRun = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') request-access -ConfigPath $configPath -AccessKind human -Profile Codex -Label 'human fixture' -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-MO2Test ($entryHumanDryRun.ok -and $entryHumanDryRun.data.access.accessKind -eq 'human' -and $entryHumanDryRun.data.access.profile -eq 'Codex' -and $null -eq $entryHumanDryRun.data.access.runtimeRoute) 'human access binds the exact selected profile without inventing a runtime route'
+
+    $humanProcess = Start-Process -FilePath $mo2Exe -ArgumentList @('/d', '/c', 'ping -n 30 127.0.0.1 >nul') -WindowStyle Hidden -PassThru
+    try {
+        $humanProcessDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        do {
+            $humanInspection = Invoke-MO2Inspect -Config $config
+            if (@($humanInspection.data.processes.mo2 | Where-Object id -eq $humanProcess.Id).Count -eq 1) { break }
+            Start-Sleep -Milliseconds 50
+        } while ([DateTime]::UtcNow -lt $humanProcessDeadline)
+
+        $humanAccess = Invoke-MO2RequestAccess -Config $config -AccessKind human -Profile Codex -Label 'human fixture'
+        $humanAccessId = [string]$humanAccess.data.access.accessId
+        $humanLeaseId = [string]$humanAccess.data.access.leaseId
+        Assert-MO2Test ($humanAccess.ok -and $humanAccess.data.access.accessKind -eq 'human' -and $humanAccess.data.access.profile -eq 'Codex') 'human access can reserve an already-open exact MO2 profile'
+        $humanPrepare = Invoke-MO2Prepare -Config $config -AccessId $humanAccessId -Profile Codex -WhatIf
+        Assert-MO2Test (-not $humanPrepare.ok -and $humanPrepare.state -eq 'human-lease-session-forbidden') 'human access cannot be converted into an automation launch session'
+
+        $unclassifiedRefresh = Invoke-MO2Refresh -Config $config -LeaseId $humanLeaseId -Profile Codex -WhatIf
+        Assert-MO2Test (-not $unclassifiedRefresh.ok -and $unclassifiedRefresh.state -eq 'known-ground-state-required') 'human refresh refuses an unclassified non-MO2 fixture window state'
+
+        $humanLiveActions = & $mo2Module {
+            param($fixtureConfig, $fixtureLeaseId)
+            $originalWindowSnapshot = (Get-Command Get-MO2WindowSnapshot -CommandType Function).ScriptBlock
+            $originalRefreshHelper = (Get-Command Invoke-MO2RefreshHelperProcess -CommandType Function).ScriptBlock
+            try {
+                Set-Item -Path Function:script:Get-MO2WindowSnapshot -Value {
+                    param($Processes)
+                    @([pscustomobject][ordered]@{ processId=[int]$Processes[0].id; handle=101; title='Mod Organizer'; className='Qt'; visible=$true; automationAvailable=$true; automationId='MainWindow'; buttons=@(); texts=@(); dialogKind=$null })
+                }
+                Set-Item -Path Function:script:Invoke-MO2RefreshHelperProcess -Value {
+                    param($Path, $WorkingDirectory, $TimeoutSeconds)
+                    [pscustomobject][ordered]@{ pid=9911; exited=$true; exitCode=0 }
+                }
+                [pscustomobject]@{
+                    validation = Invoke-MO2ValidateHumanMutation -Config $fixtureConfig -LeaseId $fixtureLeaseId -Profile Codex
+                    refresh = Invoke-MO2Refresh -Config $fixtureConfig -LeaseId $fixtureLeaseId -Profile Codex
+                }
+            }
+            finally {
+                Set-Item -Path Function:script:Get-MO2WindowSnapshot -Value $originalWindowSnapshot
+                Set-Item -Path Function:script:Invoke-MO2RefreshHelperProcess -Value $originalRefreshHelper
+            }
+        } $config $humanLeaseId
+        $humanValidation = $humanLiveActions.validation
+        $humanRefresh = $humanLiveActions.refresh
+        Assert-MO2Test ($humanValidation.ok -and $humanValidation.state -eq 'human-mutation-authorized' -and $humanValidation.data.mo2Open -and $humanValidation.data.refreshRequiredAfterMutation) 'human lease authorizes exact-profile mutation while one unblocked exact MO2 process is open'
+        Assert-MO2Test ($humanRefresh.ok -and $humanRefresh.state -eq 'refreshed' -and $humanRefresh.data.authorityKind -eq 'human-lease' -and $humanRefresh.data.primaryRetained -and $humanRefresh.data.postconditionVerified) 'human lease authorizes exact-primary CLI refresh with closed-game postconditions'
+        Assert-MO2Test ((Test-Path -LiteralPath $humanRefresh.data.receiptPath -PathType Leaf) -and (Get-Content -LiteralPath $humanRefresh.data.receiptPath -Raw | ConvertFrom-Json).command.arguments[0] -eq 'refresh') 'human refresh preserves a durable exact-command receipt'
+
+        $buildData = Join-Path $rootBuilderData 'BuildData.json'
+        '{}' | Set-Content -LiteralPath $buildData -Encoding utf8
+        $uncertainRefresh = Invoke-MO2Refresh -Config $config -LeaseId $humanLeaseId -Profile Codex -WhatIf
+        Assert-MO2Test (-not $uncertainRefresh.ok -and $uncertainRefresh.state -eq 'known-ground-state-required') 'refresh routes active RootBuilder deployment to the known-ground-state recovery path'
+        Remove-Item -LiteralPath $buildData -Force
+
+        $humanRelease = Invoke-MO2ReleaseAccess -Config $config -AccessId $humanAccessId
+        Assert-MO2Test ($humanRelease.ok -and $humanRelease.state -eq 'access-released' -and $humanRelease.data.liveStateRetained -and @($humanRelease.data.processes.mo2).Count -eq 1) 'human Release removes only coordination state while leaving the live MO2 process untouched'
+    }
+    finally {
+        if (-not $humanProcess.HasExited) { $humanProcess.Kill($true); $humanProcess.WaitForExit(5000) | Out-Null }
+    }
+
     $access = Invoke-MO2RequestAccess -Config $config -Label 'first task' -RuntimeRoute SteamVRNull -EstimatedMinutes 15
     $accessId = [string]$access.data.access.accessId
     $leaseId = [string]$access.data.access.leaseId

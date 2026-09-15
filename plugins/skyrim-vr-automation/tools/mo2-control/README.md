@@ -189,8 +189,9 @@ RootBuilder failures.
 ## Cooperative access lifecycle
 
 `request-access` atomically acquires the one shared MO2 lock and returns an
-`accessId` bearer credential plus a distinct public `leaseId`. Every request
-must select exactly one `-RuntimeRoute`: `OCU`, `SteamVR`, or `SteamVRNull`.
+`accessId` bearer credential plus a distinct public `leaseId`. Every automation
+request must select exactly one `-RuntimeRoute`: `OCU`, `SteamVR`, or
+`SteamVRNull`.
 `OCU` is incompatible with both SteamVR routes. `SteamVRNull` is SteamVR with
 the null HMD and is mutually exclusive with physical `SteamVR`. The selected
 route is retained on the lease and copied into prepared session evidence so
@@ -237,13 +238,28 @@ an open kernel process handle across each `Unlock`, `Exit`, or window-close UI
 action. If the owner exits or its PID, path, or start time changes, close stops
 without acting on the replacement process.
 
-Every task must call `release-access` as soon as it no longer needs MO2. This
+The human code word `Lease` maps to `request-access -AccessKind human`. It has
+no runtime route and binds to MO2's exact selected existing profile, including
+when that exact MO2 instance or Skyrim is already running. Its public `leaseId`
+may be given to a task for a bounded child mutation; the private `accessId`
+remains with the lease owner. Before writing, the task calls
+`validate-human-mutation -LeaseId -Profile`. This requires Skyrim and its
+loader closed, no active RootBuilder deployment, no profile drift, and either
+closed MO2 or one exact unblocked `MainWindow`. It authorizes no fallback
+profile. If MO2 is open, run `refresh -LeaseId -Profile` after a mod-directory
+or `modlist.txt` membership change. The supported upstream command is
+`ModOrganizer.exe refresh` (the same operation as F5); the controller proves
+the exact primary PID and profile remain stable and writes a receipt.
+
+Every automation task must call `release-access` as soon as it no longer needs MO2. This
 includes compilation, source editing, result analysis, report writing, and any
 other phase that does not operate MO2 or Skyrim. Do not hold the lease merely
-because the overall task remains active. `release-access` proves MO2, Skyrim,
-and RootBuilder deployment are inactive before removing the lock. It does not
-delete the task workspace: profile state and saves remain available for an
-explicit later `resume` under a newly acquired lease.
+because the overall task remains active. Automation `release-access` proves
+MO2, Skyrim, and RootBuilder deployment are inactive before removing the lock.
+The human code word `Release` removes only the human coordination lease and
+deliberately leaves live MO2/Skyrim state untouched. Neither form deletes the
+task workspace: profile state and saves remain available for an explicit later
+`resume` under a newly acquired lease.
 
 If a task disappears while retaining a lease, `recover-access` requires the
 exact `accessId`, explicit `-ConfirmAbandoned`, and the same closed-state proof.
@@ -258,6 +274,15 @@ result, then substitute its literal returned identity into the next command:
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> prepare -AccessId <literal-access-id> -Label weather-api-run -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <literal-controllerPath> release -SessionId <literal-session-id> -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> release-access -AccessId <literal-access-id> -Compact
+```
+
+The delegated live-profile flow is:
+
+```text
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -AccessKind human -Profile <exact-selected-profile> -Label human -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate-human-mutation -LeaseId <public-human-lease-id> -Profile <exact-selected-profile> -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> refresh -LeaseId <public-human-lease-id> -Profile <exact-selected-profile> -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> release-access -AccessId <private-human-access-id> -Compact
 ```
 
 `prepare` requires the explicit `accessId` returned by `request-access`.

@@ -120,7 +120,58 @@ try {
     $rollbackJournal = Get-Content -LiteralPath $rollbackJournalPath -Raw | ConvertFrom-Json
     if (-not $rollbackObserved -or $rollbackJournal.phase -ne 'rolled-back' -or (Get-FileHash -LiteralPath $profile -Algorithm SHA256).Hash -ne $originalHash) { throw 'Post-write receipt failure did not roll back and journal the exact live preimage.' }
 
-    [pscustomobject]@{ ok = $true; assertions = 30; restoredSha256 = $enableRestored.sha256 } | ConvertTo-Json
+    $humanRoot = Join-Path $fixture 'human-live'
+    $humanMO2Root = Join-Path $humanRoot 'MO2'
+    $humanProfilesRoot = Join-Path $humanMO2Root 'profiles'
+    $humanProfileRoot = Join-Path $humanProfilesRoot 'Codex'
+    $humanModsRoot = Join-Path $humanMO2Root 'mods'
+    $humanOverwrite = Join-Path $humanMO2Root 'overwrite'
+    $humanRootBuilderData = Join-Path $humanMO2Root 'rootbuilder-data'
+    $humanSessions = Join-Path $humanRoot 'sessions'
+    foreach ($directory in @($humanProfileRoot, $humanModsRoot, $humanOverwrite, $humanRootBuilderData, $humanSessions, (Join-Path $humanRoot 'staging'), (Join-Path $humanRoot 'archive'))) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    $humanModList = Join-Path $humanProfileRoot 'modlist.txt'
+    [IO.File]::WriteAllBytes($humanModList, [Text.Encoding]::UTF8.GetBytes("+Human Lease Test Mod`r`n"))
+    $humanExe = Join-Path $humanMO2Root 'MO2ProfileHumanFixture.exe'
+    Copy-Item -LiteralPath $env:ComSpec -Destination $humanExe -Force
+    $humanDefinition = Join-Path $humanRootBuilderData 'rootbuilder_defaults.json'
+    $humanGameData = Join-Path $humanRootBuilderData 'GameData.json'
+    '{}' | Set-Content -LiteralPath $humanDefinition -Encoding utf8
+    '{}' | Set-Content -LiteralPath $humanGameData -Encoding utf8
+    $humanIni = Join-Path $humanMO2Root 'ModOrganizer.ini'
+    "[General]`r`nselected_profile=@ByteArray(Codex)`r`n" | Set-Content -LiteralPath $humanIni -Encoding utf8
+    $humanConfigPath = Join-Path $humanRoot 'config.json'
+    [ordered]@{
+        contractVersion = '0.3.0'; machine = 'fixture'
+        mo2 = [ordered]@{
+            root = $humanMO2Root; executable = $humanExe; ini = $humanIni
+            profilesDirectory = $humanProfilesRoot; modsDirectory = $humanModsRoot
+            overwriteDirectory = $humanOverwrite; logsDirectory = (Join-Path $humanMO2Root 'logs')
+            rootBuilderDefinitions = @($humanDefinition); rootBuilderDataDirectory = $humanRootBuilderData
+            processNames = @('MO2ProfileHumanImpossibleProcess'); gameProcessNames = @('MO2ProfileHumanImpossibleGame'); runtimeProcessNames = @()
+        }
+        defaults = [ordered]@{ profile = 'Codex'; executable = 'Fixture' }
+        storage = [ordered]@{ sessionStaging = (Join-Path $humanRoot 'staging'); archive = (Join-Path $humanRoot 'archive') }
+        limits = [ordered]@{ maxEnumeratedFiles = 100; overwriteWarningFiles = 10; overwriteBlockFiles = 50; overwriteWarningBytes = 1024; overwriteBlockBytes = 4096 }
+        session = [ordered]@{ lockFile = (Join-Path $humanSessions 'active-session.lock.json') }
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $humanConfigPath -Encoding utf8
+    $mo2ControlRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $script) '..\mo2-control'))
+    Import-Module (Join-Path $mo2ControlRoot 'MO2Control.psm1') -Force
+    $humanConfig = Read-MO2ControlConfig -ConfigPath $humanConfigPath
+    $humanAccess = Invoke-MO2RequestAccess -Config $humanConfig -AccessKind human -Profile Codex -Label 'profile-control fixture'
+    try {
+        $humanEvidence = Join-Path $humanRoot 'evidence'
+        $humanDisabled = & $script disable -ProfilePath $humanProfileRoot -ModName 'Human Lease Test Mod' -EvidenceDirectory $humanEvidence -ConfigPath $humanConfigPath -HumanLeaseId $humanAccess.data.access.leaseId -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
+        if ($humanDisabled.ok -ne $true -or $humanDisabled.state -ne 'committed' -or $humanDisabled.enabled -or $humanDisabled.humanLeaseId -ne $humanAccess.data.access.leaseId -or $null -ne $humanDisabled.refresh) { throw 'Closed-MO2 human lease mutation did not commit without requesting a refresh.' }
+        $humanRestored = & $script restore -ProfilePath $humanProfileRoot -ModName 'Human Lease Test Mod' -EvidenceDirectory $humanEvidence -ConfigPath $humanConfigPath -HumanLeaseId $humanAccess.data.access.leaseId -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
+        if (-not $humanRestored.ok -or $humanRestored.state -ne 'committed' -or -not $humanRestored.enabled) { throw 'Closed-MO2 human lease restore did not retain exact authority and restore the marker.' }
+    }
+    finally {
+        $null = Invoke-MO2ReleaseAccess -Config $humanConfig -AccessId $humanAccess.data.access.accessId
+    }
+
+    [pscustomobject]@{ ok = $true; assertions = 32; restoredSha256 = $enableRestored.sha256 } | ConvertTo-Json
 }
 finally {
     $env:CSX_MO2_PROFILE_CONTROL_ROOT = $priorControlRoot
