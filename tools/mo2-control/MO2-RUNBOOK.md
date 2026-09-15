@@ -124,16 +124,18 @@ The lease and prepared session both record the route.
 The human code word `Lease` uses this separate flow:
 
 ```text
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -AccessKind human -Profile <exact-selected-profile> -Label human -Compact
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate-human-mutation -LeaseId <public-human-lease-id> -Profile <exact-selected-profile> -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -AccessKind human -Profile <exact-selected-profile> -TaskId <recipient-task-id> -Label human -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate-human-mutation -HumanMutationId <private-task-bound-mutation-id> -TaskId <recipient-task-id> -Profile <exact-selected-profile> -Compact
 ```
 
-The public lease identity delegates only exact selected-profile or separately
-authorized mod-content changes. Skyrim and its loader must be closed. MO2 may
+The public lease identity is coordination metadata only. The private
+`humanMutationId` delegates exact selected-profile or separately authorized
+mod-content changes to its bound recipient task and must not appear in status,
+logs, receipts, or task messages. Skyrim and its loader must be closed. MO2 may
 be closed or may be one exact process with one unblocked main window, no profile
 drift, and no active RootBuilder deployment. After a live `modlist.txt` or
-mod-directory membership change, call `refresh -LeaseId ... -Profile ...`.
-`Invoke-MO2ProfileControl.ps1 -HumanLeaseId ...` validates and performs this
+mod-directory membership change, call `refresh -HumanMutationId ... -TaskId ... -Profile ...`.
+`Invoke-MO2ProfileControl.ps1 -HumanMutationId ... -TaskId ...` validates and performs this
 refresh automatically after its committed live transaction. `Release` removes
 only the human coordination lease; it does not close applications.
 

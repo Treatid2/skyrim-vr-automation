@@ -599,8 +599,8 @@ selected_profile=@ByteArray(Codex)
     $entryAccessDryRun = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') request-access -ConfigPath $configPath -Label 'approval fixture' -TaskId 'entry-fixture-task' -RuntimeRoute SteamVR -EstimatedMinutes 5 -WhatIf -Compact -NoExit | ConvertFrom-Json
     Assert-MO2Test ($entryAccessDryRun.ok -and $entryAccessDryRun.data.access.ownerTaskId -eq 'entry-fixture-task' -and $entryAccessDryRun.data.configuration.exists -and $entryAccessDryRun.data.approval.reusableApprovalEligible -and $entryAccessDryRun.data.approval.reusablePrefix[5] -eq 'request-access') 'dictionary-backed entry-point results retain task identity, configuration, and approval metadata'
 
-    $entryHumanDryRun = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') request-access -ConfigPath $configPath -AccessKind human -Profile Codex -Label 'human fixture' -WhatIf -Compact -NoExit | ConvertFrom-Json
-    Assert-MO2Test ($entryHumanDryRun.ok -and $entryHumanDryRun.data.access.accessKind -eq 'human' -and $entryHumanDryRun.data.access.profile -eq 'Codex' -and $null -eq $entryHumanDryRun.data.access.runtimeRoute) 'human access binds the exact selected profile without inventing a runtime route'
+    $entryHumanDryRun = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') request-access -ConfigPath $configPath -AccessKind human -Profile Codex -TaskId 'human-fixture-task' -Label 'human fixture' -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-MO2Test ($entryHumanDryRun.ok -and $entryHumanDryRun.data.access.accessKind -eq 'human' -and $entryHumanDryRun.data.access.profile -eq 'Codex' -and $entryHumanDryRun.data.access.humanMutationTaskId -eq 'human-fixture-task' -and -not [string]::IsNullOrWhiteSpace([string]$entryHumanDryRun.data.access.humanMutationId) -and $null -eq $entryHumanDryRun.data.access.runtimeRoute) 'human access binds the exact selected profile and private mutation capability to one recipient task without inventing a runtime route'
 
     $humanProcess = Start-Process -FilePath $mo2Exe -ArgumentList @('/d', '/c', 'ping -n 30 127.0.0.1 >nul') -WindowStyle Hidden -PassThru
     try {
@@ -611,18 +611,35 @@ selected_profile=@ByteArray(Codex)
             Start-Sleep -Milliseconds 50
         } while ([DateTime]::UtcNow -lt $humanProcessDeadline)
 
-        $humanAccess = Invoke-MO2RequestAccess -Config $config -AccessKind human -Profile Codex -Label 'human fixture'
+        $humanAccess = Invoke-MO2RequestAccess -Config $config -AccessKind human -Profile Codex -TaskId 'human-fixture-task' -Label 'human fixture'
         $humanAccessId = [string]$humanAccess.data.access.accessId
         $humanLeaseId = [string]$humanAccess.data.access.leaseId
+        $humanMutationId = [string]$humanAccess.data.access.humanMutationId
         Assert-MO2Test ($humanAccess.ok -and $humanAccess.data.access.accessKind -eq 'human' -and $humanAccess.data.access.profile -eq 'Codex') 'human access can reserve an already-open exact MO2 profile'
+        $humanLockText = Get-Content -LiteralPath $config.session.lockFile -Raw
+        Assert-MO2Test (-not ($humanLockText -match [regex]::Escape($humanMutationId)) -and ($humanLockText | ConvertFrom-Json).humanMutationHash.Length -eq 64) 'durable human lease stores only the private credential hash'
+        $humanStatus = Invoke-MO2AccessStatus -Config $config
+        Assert-MO2Test (-not (($humanStatus | ConvertTo-Json -Depth 16 -Compress) -match [regex]::Escape($humanMutationId))) 'public access status never discloses the private human mutation credential'
         $humanPrepare = Invoke-MO2Prepare -Config $config -AccessId $humanAccessId -Profile Codex -WhatIf
         Assert-MO2Test (-not $humanPrepare.ok -and $humanPrepare.state -eq 'human-lease-session-forbidden') 'human access cannot be converted into an automation launch session'
 
-        $unclassifiedRefresh = Invoke-MO2Refresh -Config $config -LeaseId $humanLeaseId -Profile Codex -WhatIf
+        $publicLeaseRejected = $false
+        try { Invoke-MO2ValidateHumanMutation -Config $config -HumanMutationId $humanLeaseId -Profile Codex -TaskId 'human-fixture-task' | Out-Null }
+        catch { $publicLeaseRejected = $_.Exception.Message -eq 'The supplied human mutation credential is not authorized for this task.' }
+        Assert-MO2Test $publicLeaseRejected 'public LeaseId is coordination metadata and cannot authorize mutation'
+        $wrongTaskRejected = $false
+        try { Invoke-MO2ValidateHumanMutation -Config $config -HumanMutationId $humanMutationId -Profile Codex -TaskId 'other-task' | Out-Null }
+        catch { $wrongTaskRejected = $_.Exception.Message -eq 'The supplied human mutation credential is not authorized for this task.' }
+        Assert-MO2Test $wrongTaskRejected 'private human mutation credential is rejected outside its recipient task'
+
+        $unclassifiedRefresh = Invoke-MO2Refresh -Config $config -HumanMutationId $humanMutationId -Profile Codex -TaskId 'human-fixture-task' -WhatIf
         Assert-MO2Test (-not $unclassifiedRefresh.ok -and $unclassifiedRefresh.state -eq 'known-ground-state-required') 'human refresh refuses an unclassified non-MO2 fixture window state'
 
+        $originalMO2Executable = [string]$config.mo2.executable
+        $env:MO2_REFRESH_FIXTURE_EXE = $mo2Exe
+        $config.mo2.executable = '%MO2_REFRESH_FIXTURE_EXE%'
         $humanLiveActions = & $mo2Module {
-            param($fixtureConfig, $fixtureLeaseId)
+            param($fixtureConfig, $fixtureMutationId)
             $originalWindowSnapshot = (Get-Command Get-MO2WindowSnapshot -CommandType Function).ScriptBlock
             $originalRefreshHelper = (Get-Command Invoke-MO2RefreshHelperProcess -CommandType Function).ScriptBlock
             try {
@@ -635,28 +652,62 @@ selected_profile=@ByteArray(Codex)
                     [pscustomobject][ordered]@{ pid=9911; exited=$true; exitCode=0 }
                 }
                 [pscustomobject]@{
-                    validation = Invoke-MO2ValidateHumanMutation -Config $fixtureConfig -LeaseId $fixtureLeaseId -Profile Codex
-                    refresh = Invoke-MO2Refresh -Config $fixtureConfig -LeaseId $fixtureLeaseId -Profile Codex
+                    validation = Invoke-MO2ValidateHumanMutation -Config $fixtureConfig -HumanMutationId $fixtureMutationId -Profile Codex -TaskId 'human-fixture-task'
+                    refresh = Invoke-MO2Refresh -Config $fixtureConfig -HumanMutationId $fixtureMutationId -Profile Codex -TaskId 'human-fixture-task'
                 }
             }
             finally {
                 Set-Item -Path Function:script:Get-MO2WindowSnapshot -Value $originalWindowSnapshot
                 Set-Item -Path Function:script:Invoke-MO2RefreshHelperProcess -Value $originalRefreshHelper
             }
-        } $config $humanLeaseId
+        } $config $humanMutationId
         $humanValidation = $humanLiveActions.validation
         $humanRefresh = $humanLiveActions.refresh
+        $config.mo2.executable = $originalMO2Executable
+        Remove-Item Env:MO2_REFRESH_FIXTURE_EXE -ErrorAction SilentlyContinue
         Assert-MO2Test ($humanValidation.ok -and $humanValidation.state -eq 'human-mutation-authorized' -and $humanValidation.data.mo2Open -and $humanValidation.data.refreshRequiredAfterMutation) 'human lease authorizes exact-profile mutation while one unblocked exact MO2 process is open'
-        Assert-MO2Test ($humanRefresh.ok -and $humanRefresh.state -eq 'refreshed' -and $humanRefresh.data.authorityKind -eq 'human-lease' -and $humanRefresh.data.primaryRetained -and $humanRefresh.data.postconditionVerified) 'human lease authorizes exact-primary CLI refresh with closed-game postconditions'
+        Assert-MO2Test ($humanRefresh.ok -and $humanRefresh.state -eq 'refreshed' -and $humanRefresh.data.authorityKind -eq 'human-mutation' -and $humanRefresh.data.primaryRetained -and $humanRefresh.data.postconditionVerified) 'private task-bound human authority authorizes exact-primary CLI refresh with closed-game postconditions'
+        Assert-MO2Test ([string]$humanRefresh.data.plan.path -ceq [IO.Path]::GetFullPath($mo2Exe)) 'refresh expands environment variables in the configured MO2 executable path'
         Assert-MO2Test ((Test-Path -LiteralPath $humanRefresh.data.receiptPath -PathType Leaf) -and (Get-Content -LiteralPath $humanRefresh.data.receiptPath -Raw | ConvertFrom-Json).command.arguments[0] -eq 'refresh') 'human refresh preserves a durable exact-command receipt'
+        Assert-MO2Test (-not ((Get-Content -LiteralPath $humanRefresh.data.receiptPath -Raw) -match [regex]::Escape($humanMutationId))) 'human refresh receipt records only public lease identity and never the private mutation credential'
 
         $buildData = Join-Path $rootBuilderData 'BuildData.json'
         '{}' | Set-Content -LiteralPath $buildData -Encoding utf8
-        $uncertainRefresh = Invoke-MO2Refresh -Config $config -LeaseId $humanLeaseId -Profile Codex -WhatIf
+        $uncertainRefresh = Invoke-MO2Refresh -Config $config -HumanMutationId $humanMutationId -Profile Codex -TaskId 'human-fixture-task' -WhatIf
         Assert-MO2Test (-not $uncertainRefresh.ok -and $uncertainRefresh.state -eq 'known-ground-state-required') 'refresh routes active RootBuilder deployment to the known-ground-state recovery path'
         Remove-Item -LiteralPath $buildData -Force
 
-        $humanRelease = Invoke-MO2ReleaseAccess -Config $config -AccessId $humanAccessId
+        $releaseStdOut = Join-Path $fixture 'human-release.stdout.json'
+        $releaseStdErr = Join-Path $fixture 'human-release.stderr.txt'
+        $releaseProbePath = Join-Path $fixture 'human-release.probe.json'
+        $releaseAction = {
+            $releaseProcess = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile', '-NonInteractive', '-File', (Join-Path $packageRoot 'Invoke-MO2Control.ps1'), 'release-access', '-ConfigPath', $configPath, '-AccessId', $humanAccessId, '-Compact', '-NoExit') -RedirectStandardOutput $releaseStdOut -RedirectStandardError $releaseStdErr -PassThru
+            Start-Sleep -Milliseconds 700
+            [IO.File]::WriteAllText($releaseProbePath, ([pscustomobject]@{ pid = $releaseProcess.Id; blockedDuringMutation = -not $releaseProcess.HasExited } | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+        }
+        $guardedReleaseProbe = & $mo2Module {
+            param($fixtureConfig, $fixtureMutationId, $fixtureAction)
+            $originalWindowSnapshot = (Get-Command Get-MO2WindowSnapshot -CommandType Function).ScriptBlock
+            try {
+                Set-Item -Path Function:script:Get-MO2WindowSnapshot -Value {
+                    param($Processes)
+                    @([pscustomobject][ordered]@{ processId=[int]$Processes[0].id; handle=101; title='Mod Organizer'; className='Qt'; visible=$true; automationAvailable=$true; automationId='MainWindow'; buttons=@(); texts=@(); dialogKind=$null })
+                }
+                Invoke-MO2HumanMutationTransaction -Config $fixtureConfig -HumanMutationId $fixtureMutationId -Profile Codex -TaskId 'human-fixture-task' -Action $fixtureAction
+            }
+            finally {
+                Set-Item -Path Function:script:Get-MO2WindowSnapshot -Value $originalWindowSnapshot
+            }
+        } $config $humanMutationId $releaseAction
+        if (-not (Test-Path -LiteralPath $releaseProbePath -PathType Leaf)) { throw "Guarded mutation action did not execute: $($guardedReleaseProbe | ConvertTo-Json -Depth 8 -Compress)" }
+        $releaseProbe = Get-Content -LiteralPath $releaseProbePath -Raw | ConvertFrom-Json
+        Assert-MO2Test ($guardedReleaseProbe.ok -and $releaseProbe.blockedDuringMutation) 'release-access cannot revoke the human lease while an authorized profile mutation holds the transition lock'
+        $releaseDeadline = [DateTime]::UtcNow.AddSeconds(10)
+        while ((-not (Test-Path -LiteralPath $releaseStdOut -PathType Leaf) -or (Get-Item -LiteralPath $releaseStdOut).Length -eq 0) -and [DateTime]::UtcNow -lt $releaseDeadline) {
+            Start-Sleep -Milliseconds 50
+        }
+        if (-not (Test-Path -LiteralPath $releaseStdOut -PathType Leaf) -or (Get-Item -LiteralPath $releaseStdOut).Length -eq 0) { throw 'Guarded release fixture did not complete after the human mutation released the transition lock.' }
+        $humanRelease = Get-Content -LiteralPath $releaseStdOut -Raw | ConvertFrom-Json
         Assert-MO2Test ($humanRelease.ok -and $humanRelease.state -eq 'access-released' -and $humanRelease.data.liveStateRetained -and @($humanRelease.data.processes.mo2).Count -eq 1) 'human Release removes only coordination state while leaving the live MO2 process untouched'
     }
     finally {

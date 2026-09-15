@@ -159,12 +159,12 @@ try {
     $mo2ControlRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $script) '..\mo2-control'))
     Import-Module (Join-Path $mo2ControlRoot 'MO2Control.psm1') -Force
     $humanConfig = Read-MO2ControlConfig -ConfigPath $humanConfigPath
-    $humanAccess = Invoke-MO2RequestAccess -Config $humanConfig -AccessKind human -Profile Codex -Label 'profile-control fixture'
+    $humanAccess = Invoke-MO2RequestAccess -Config $humanConfig -AccessKind human -Profile Codex -TaskId 'profile-control-fixture-task' -Label 'profile-control fixture'
     try {
         $humanEvidence = Join-Path $humanRoot 'evidence'
-        $humanDisabled = & $script disable -ProfilePath $humanProfileRoot -ModName 'Human Lease Test Mod' -EvidenceDirectory $humanEvidence -ConfigPath $humanConfigPath -HumanLeaseId $humanAccess.data.access.leaseId -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
+        $humanDisabled = & $script disable -ProfilePath $humanProfileRoot -ModName 'Human Lease Test Mod' -EvidenceDirectory $humanEvidence -ConfigPath $humanConfigPath -HumanMutationId $humanAccess.data.access.humanMutationId -TaskId 'profile-control-fixture-task' -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
         if ($humanDisabled.ok -ne $true -or $humanDisabled.state -ne 'committed' -or $humanDisabled.enabled -or $humanDisabled.humanLeaseId -ne $humanAccess.data.access.leaseId -or $null -ne $humanDisabled.refresh) { throw 'Closed-MO2 human lease mutation did not commit without requesting a refresh.' }
-        $humanRestored = & $script restore -ProfilePath $humanProfileRoot -ModName 'Human Lease Test Mod' -EvidenceDirectory $humanEvidence -ConfigPath $humanConfigPath -HumanLeaseId $humanAccess.data.access.leaseId -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
+        $humanRestored = & $script restore -ProfilePath $humanProfileRoot -ModName 'Human Lease Test Mod' -EvidenceDirectory $humanEvidence -ConfigPath $humanConfigPath -HumanMutationId $humanAccess.data.access.humanMutationId -TaskId 'profile-control-fixture-task' -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
         if (-not $humanRestored.ok -or $humanRestored.state -ne 'committed' -or -not $humanRestored.enabled) { throw 'Closed-MO2 human lease restore did not retain exact authority and restore the marker.' }
     }
     finally {

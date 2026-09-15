@@ -69,12 +69,14 @@ are:
    blocked until its owner explicitly repairs it or requests a fresh clone.
    The human code word `Lease` selects the separate `request-access -AccessKind
    human` flow: bind the lease to the exact currently selected profile and
-   return the public `leaseId`. A task acting under that human delegation calls
-   `validate-human-mutation -LeaseId -Profile` before any write. Skyrim and its
+   return a public coordination `leaseId` plus a private `humanMutationId`
+   bound to the exact recipient `TaskId`. Never expose the private mutation ID
+   in status, logs, receipts, or messages. The recipient task calls
+   `validate-human-mutation -HumanMutationId -TaskId -Profile` before any write. Skyrim and its
    loader must be closed. MO2 may remain open only when there is one exact
    configured process, one unblocked `MainWindow`, no other visible modal, no
    profile drift, and no active RootBuilder deployment. After `modlist.txt` or
-   mod-directory membership changes, invoke `refresh -LeaseId -Profile`; the
+   mod-directory membership changes, invoke `refresh -HumanMutationId -TaskId -Profile`; the
    profile controller does this automatically after a committed live marker
    transaction. The code word `Release` removes only the human coordination
    lease and does not close live applications.
@@ -152,9 +154,10 @@ are:
   names and report a mismatch as a failed precondition.
 - Require Skyrim and its loader closed before changing a profile, mod package,
   or other MO2-owned state. Autonomous task setup retains the closed-MO2
-  default. A public human lease permits exact selected-profile or explicitly
-  authorized mod-content mutation while one unblocked exact MO2 instance is
-  open; validate first and refresh after membership/list changes. Uncertain
+  default. A private recipient-task-bound human mutation credential permits
+  exact selected-profile or explicitly authorized mod-content mutation while
+  one unblocked exact MO2 instance is open; the public lease ID is coordination
+  metadata only. Validate first and refresh after membership/list changes. Uncertain
   state must use close/recover-close rather than being guessed through.
 - Do not launch a second owner while the first session is unresolved. Do not
   retry a crash or failed launch before classifying the evidence.
