@@ -7,8 +7,9 @@ the Skyrim VR installation. The local machine configuration is
 the resolved machine configuration; do not rediscover paths or guess profile and
 executable names when the package can report them.
 
-Version 1.0.0 requires a route-qualified explicit access lease for preparation
-and launch, and provides cooperative cross-task access leases, read-only
+Version 1.1.0 requires a route-qualified explicit automation access lease for
+preparation and launch, adds exact-profile human leases and supported CLI
+refresh, and provides cooperative cross-task access leases, read-only
 inspection, single-owner `prepare`, exact
 `open` and `launch`, bounded `status`, graceful `stop-game`, MO2-only
 cooperative `close`, stranded-instance `recover-close`, and graceful full
@@ -56,7 +57,11 @@ install and overwrite are not long-term diagnostic stores.
    treat MO2's fallback profile as success. For DevBench or any SKSE-dependent
    run, use `-RequireSKSE` during validation and preparation; a plain
    `SkyrimVR.exe` entry is not an equivalent launcher.
-2. Before editing MO2 state, require MO2 and the game to be closed. VR runtime
+2. Before editing MO2 state, require Skyrim and its loader to be closed. The
+   autonomous setup path also requires MO2 closed. Under an active exact-profile
+   human lease, a delegated task may keep one exact unblocked MO2 instance open,
+   validate the mutation, and refresh that same instance after membership/list
+   changes. Any ambiguity returns to the closed/recovery path. VR runtime
    processes may remain live unless the operation specifically requires them
    closed.
 3. Run one automation owner at a time. Acquire access before preparing or
@@ -115,6 +120,29 @@ mode, not an OCU mode, and cannot coexist with the physical SteamVR route. To
 change routes, end the session, release the access lease, perform the relevant
 runtime restore/apply transaction, and request a new lease for the new route.
 The lease and prepared session both record the route.
+
+The human code word `Lease` uses this separate flow:
+
+```text
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -AccessKind human -Profile <exact-selected-profile> -TaskId <recipient-task-id> -Label human -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate-human-mutation -HumanMutationId <private-task-bound-mutation-id> -TaskId <recipient-task-id> -Profile <exact-selected-profile> -Compact
+```
+
+The public lease identity is coordination metadata only. The private
+`humanMutationId` delegates exact selected-profile or separately authorized
+mod-content changes to its bound recipient task and must not appear in status,
+logs, receipts, or task messages. Skyrim and its loader must be closed. MO2 may
+be closed or may be one exact process with one unblocked main window, no profile
+drift, and no active RootBuilder deployment. After a live `modlist.txt` or
+mod-directory membership change, call `refresh -HumanMutationId ... -TaskId ... -Profile ...`.
+`Invoke-MO2ProfileControl.ps1 -HumanMutationId ... -TaskId ...` validates and performs this
+refresh automatically after its committed live transaction. `Release` removes
+only the human coordination lease; it does not close applications.
+
+Dump Management has standing content authority for installing, updating,
+configuring, and enabling Tullius. It still obeys the closed-Skyrim rule and
+the active lease/known-state gates. If no human lease is active, use the normal
+automation flow.
 
 If another task owns it, `state` is `access-busy`. The response includes its
 label, whether a session is bound, and any estimated release time. The estimate

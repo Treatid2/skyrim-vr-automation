@@ -40,11 +40,11 @@ prefix.
 The following MO2 lifecycle commands are eligible for a narrow reusable rule:
 
 ```text
-request-access renew-access release-access prepare open launch status
+request-access renew-access release-access prepare open launch status refresh
 stop-game close recover-close recover-rootbuilder stop release
 ```
 
-Read-only `inspect`, `validate`, `access-status`, `status`, and `help` normally
+Read-only `inspect`, `validate`, `validate-human-mutation`, `access-status`, `status`, and `help` normally
 need no escalation, but retain the same literal shape if escalation is required
 by the host environment.
 
