@@ -32,7 +32,9 @@ param(
 
     [string]$ConfigPath,
 
-    [string]$HumanLeaseId,
+    [string]$HumanMutationId,
+
+    [string]$TaskId,
 
     [ValidateRange(1, 600)]
     [int]$RefreshTimeoutSeconds = 90,
@@ -524,7 +526,7 @@ Assert-NoReparsePointPath -Path $resolvedProfile -Purpose 'Profile modlist'
 $profileName = [IO.Path]::GetFileName($profileDirectory)
 $humanMutationAuthority = $null
 $humanMutationConfig = $null
-if (-not [string]::IsNullOrWhiteSpace($HumanLeaseId)) {
+if (-not [string]::IsNullOrWhiteSpace($HumanMutationId)) {
     $mo2ControlRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\mo2-control'))
     Import-Module (Join-Path $mo2ControlRoot 'ConfigResolution.psm1') -Force -ErrorAction Stop
     Import-Module (Join-Path $mo2ControlRoot 'MO2Control.psm1') -Force -ErrorAction Stop
@@ -536,11 +538,24 @@ if (-not [string]::IsNullOrWhiteSpace($HumanLeaseId)) {
         throw "Human lease mutation must target the configured exact profile directory '$authorizedProfileDirectory', not '$profileDirectory'."
     }
     if ($Command -ne 'inspect') {
-        $humanMutationAuthority = Invoke-MO2ValidateHumanMutation -Config $humanMutationConfig -LeaseId $HumanLeaseId -Profile $profileName
+        $humanMutationAuthority = Invoke-MO2ValidateHumanMutation -Config $humanMutationConfig -HumanMutationId $HumanMutationId -Profile $profileName -TaskId $TaskId
         if (-not $humanMutationAuthority.ok) {
             throw "Human lease mutation preflight failed ($($humanMutationAuthority.state)): $($humanMutationAuthority.errors -join ' ')"
         }
     }
+}
+
+function Invoke-AuthorizedProfileMutation {
+    param([Parameter(Mandatory)][scriptblock]$Action)
+
+    if ($null -eq $humanMutationConfig) {
+        return @(& $Action)
+    }
+    $guarded = Invoke-MO2HumanMutationTransaction -Config $humanMutationConfig -HumanMutationId $HumanMutationId -Profile $profileName -TaskId $TaskId -TimeoutMilliseconds $TransactionLockTimeoutMilliseconds -Action $Action
+    if (-not $guarded.ok) {
+        throw "Human mutation authority changed before commit ($($guarded.authority.state)): $($guarded.authority.errors -join ' ')"
+    }
+    return @($guarded.actionResult)
 }
 
 if ($Command -ne 'inspect') {
@@ -549,9 +564,11 @@ if ($Command -ne 'inspect') {
         if (Test-Path -LiteralPath $previewControl.journal -PathType Leaf) { Resolve-PendingProfileTransaction -Path $resolvedProfile -Control $previewControl -NoMutation | Out-Null }
     }
     else {
-        $null = Invoke-WithProfileTransactionLock -Path $resolvedProfile -Action {
-            param($control)
-            Resolve-PendingProfileTransaction -Path $resolvedProfile -Control $control
+        $null = Invoke-AuthorizedProfileMutation -Action {
+            Invoke-WithProfileTransactionLock -Path $resolvedProfile -Action {
+                param($control)
+                Resolve-PendingProfileTransaction -Path $resolvedProfile -Control $control
+            }
         }
     }
 }
@@ -640,7 +657,7 @@ if ($Command -in @('register', 'register-winning')) {
             if ($Command -eq 'register-winning') { return Test-WinningPostcondition -Bytes $liveBytes -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $ModsDirectory -Paths $resolvedWinningPaths }
             return [pscustomobject]@{ verified = $true; marker = $line.marker }
         }
-        $null = Invoke-ProfileMutationTransaction -Path $resolvedProfile -ExpectedBeforeBytes $beforeBytes -AfterBytes $afterBytes -EvidenceRoot $resolvedEvidence -BackupPath $backupPath -ReceiptPath $receiptPath -Receipt $receipt -Postcondition $postcondition
+        $null = Invoke-AuthorizedProfileMutation -Action { Invoke-ProfileMutationTransaction -Path $resolvedProfile -ExpectedBeforeBytes $beforeBytes -AfterBytes $afterBytes -EvidenceRoot $resolvedEvidence -BackupPath $backupPath -ReceiptPath $receiptPath -Receipt $receipt -Postcondition $postcondition }
         $mutationApplied = $true
     }
 }
@@ -663,7 +680,7 @@ elseif ($Command -eq 'ensure-winner') {
             winnerProof = $winnerProof; providerPlan = $winningPlan
         }
         $postcondition = { param([byte[]]$liveBytes) Test-WinningPostcondition -Bytes $liveBytes -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $ModsDirectory -Paths $resolvedWinningPaths }
-        $null = Invoke-ProfileMutationTransaction -Path $resolvedProfile -ExpectedBeforeBytes $beforeBytes -AfterBytes $afterBytes -EvidenceRoot $resolvedEvidence -BackupPath $backupPath -ReceiptPath $receiptPath -Receipt $receipt -Postcondition $postcondition
+        $null = Invoke-AuthorizedProfileMutation -Action { Invoke-ProfileMutationTransaction -Path $resolvedProfile -ExpectedBeforeBytes $beforeBytes -AfterBytes $afterBytes -EvidenceRoot $resolvedEvidence -BackupPath $backupPath -ReceiptPath $receiptPath -Receipt $receipt -Postcondition $postcondition }
         $mutationApplied = $true
     }
 }
@@ -706,7 +723,7 @@ elseif ($Command -in @('enable', 'disable')) {
             }
             return [pscustomobject]@{ verified = $true; enabled = $line.enabled; marker = $line.marker }
         }
-        $null = Invoke-ProfileMutationTransaction -Path $resolvedProfile -ExpectedBeforeBytes $beforeBytes -AfterBytes $afterBytes -EvidenceRoot $resolvedEvidence -BackupPath $backupPath -ReceiptPath $receiptPath -Receipt $receipt -Postcondition $postcondition
+        $null = Invoke-AuthorizedProfileMutation -Action { Invoke-ProfileMutationTransaction -Path $resolvedProfile -ExpectedBeforeBytes $beforeBytes -AfterBytes $afterBytes -EvidenceRoot $resolvedEvidence -BackupPath $backupPath -ReceiptPath $receiptPath -Receipt $receipt -Postcondition $postcondition }
         $mutationApplied = $true
     }
 }
@@ -737,14 +754,24 @@ elseif ($Command -eq 'restore') {
     }
     $restoreBytes = [IO.File]::ReadAllBytes($backupPath)
     if (Test-ProfileShouldProcess -Caller $PSCmdlet -Target $resolvedProfile -Action "Restore exact MO2 modlist bytes for '$ModName'") {
-        $null = Invoke-ProfileRestoreTransaction -Path $resolvedProfile -CurrentBytes $beforeBytes -RestoreBytes $restoreBytes -EvidenceRoot $resolvedEvidence -ExpectedCurrentHash $expectedResultHash -ExpectedRestoreHash ([string]$receipt.beforeSha256)
+        $null = Invoke-AuthorizedProfileMutation -Action { Invoke-ProfileRestoreTransaction -Path $resolvedProfile -CurrentBytes $beforeBytes -RestoreBytes $restoreBytes -EvidenceRoot $resolvedEvidence -ExpectedCurrentHash $expectedResultHash -ExpectedRestoreHash ([string]$receipt.beforeSha256) }
         $mutationApplied = $true
     }
 }
 
 $refreshResult = $null
 if ($mutationApplied -and $humanMutationAuthority -and [bool]$humanMutationAuthority.data.refreshRequiredAfterMutation) {
-    $refreshResult = Invoke-MO2Refresh -Config $humanMutationConfig -LeaseId $HumanLeaseId -Profile $profileName -TimeoutSeconds $RefreshTimeoutSeconds
+    try {
+        $refreshResult = Invoke-MO2Refresh -Config $humanMutationConfig -HumanMutationId $HumanMutationId -Profile $profileName -TaskId $TaskId -TimeoutSeconds $RefreshTimeoutSeconds
+    }
+    catch {
+        $refreshResult = [pscustomobject][ordered]@{
+            ok = $false
+            state = 'refresh-authority-lost'
+            errors = @($_.Exception.Message)
+            data = [pscustomobject][ordered]@{ leaseId = [string]$humanMutationAuthority.data.leaseId; profile = $profileName; retryable = $false }
+        }
+    }
 }
 $finalBytes = [IO.File]::ReadAllBytes($resolvedProfile)
 $finalMatches = @(Get-ModLineMatches -Bytes $finalBytes -Name $ModName)
@@ -765,7 +792,7 @@ $finalResult = [pscustomobject][ordered]@{
     sha256 = Get-Sha256 $resolvedProfile
     backupPath = $backupPath
     receiptPath = $receiptPath
-    humanLeaseId = if ([string]::IsNullOrWhiteSpace($HumanLeaseId)) { $null } else { $HumanLeaseId }
+    humanLeaseId = if ($humanMutationAuthority) { [string]$humanMutationAuthority.data.leaseId } else { $null }
     refresh = $refreshResult
     approval = New-ProfileApprovalMetadata -Subcommand $Command
 }

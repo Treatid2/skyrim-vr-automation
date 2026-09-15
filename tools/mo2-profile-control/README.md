@@ -54,8 +54,11 @@ isolated fixtures; an operational override must still name every process that
 can own the target profile.
 
 The normal task flow keeps all of those processes closed. When the human has
-said `Lease`, pass the public `-HumanLeaseId`, the exact configured
-`-ConfigPath`, and the leased profile. The controller first runs the
+said `Lease`, pass the private task-bound `-HumanMutationId`, its exact
+recipient `-TaskId`, the configured `-ConfigPath`, and the leased profile. The
+public lease ID remains coordination metadata only. The controller holds the
+lease transition lock across the exact file transaction so Release cannot
+revoke authority between validation and commit. It first runs the
 exact-profile human mutation gate: Skyrim/loader must be closed, RootBuilder
 must be inactive, the selected profile must match, and MO2 must be either closed
 or one exact unblocked main window. A committed marker change made while MO2 is

@@ -182,12 +182,15 @@ reused PID cannot make an abandoned session appear live.
 The human code word `Lease` maps to `request-access -AccessKind human`. It has
 no runtime route and binds to MO2's exact selected existing profile, including
 when that exact MO2 instance or Skyrim is already running. Its public `leaseId`
-may be given to a task for a bounded child mutation; the private `accessId`
-remains with the lease owner. Before writing, the task calls
-`validate-human-mutation -LeaseId -Profile`. This requires Skyrim and its
+is coordination metadata only. The access response also returns a private
+`humanMutationId` bound to the exact recipient `TaskId`; only that task may use
+it for bounded child mutations, while the private `accessId` remains with the
+lease owner. Do not publish the mutation credential in status, logs, receipts,
+or task messages. Before writing, the recipient calls
+`validate-human-mutation -HumanMutationId -TaskId -Profile`. This requires Skyrim and its
 loader closed, no active RootBuilder deployment, no profile drift, and either
 closed MO2 or one exact unblocked `MainWindow`. It authorizes no fallback
-profile. If MO2 is open, run `refresh -LeaseId -Profile` after a mod-directory
+profile. If MO2 is open, run `refresh -HumanMutationId -TaskId -Profile` after a mod-directory
 or `modlist.txt` membership change. The supported upstream command is
 `ModOrganizer.exe refresh` (the same operation as F5); the controller proves
 the exact primary PID and profile remain stable and writes a receipt.
@@ -220,9 +223,9 @@ result, then substitute its literal returned identity into the next command:
 The delegated live-profile flow is:
 
 ```text
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -AccessKind human -Profile <exact-selected-profile> -Label human -Compact
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate-human-mutation -LeaseId <public-human-lease-id> -Profile <exact-selected-profile> -Compact
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> refresh -LeaseId <public-human-lease-id> -Profile <exact-selected-profile> -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -AccessKind human -Profile <exact-selected-profile> -TaskId <recipient-task-id> -Label human -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate-human-mutation -HumanMutationId <private-task-bound-mutation-id> -TaskId <recipient-task-id> -Profile <exact-selected-profile> -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> refresh -HumanMutationId <private-task-bound-mutation-id> -TaskId <recipient-task-id> -Profile <exact-selected-profile> -Compact
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> release-access -AccessId <private-human-access-id> -Compact
 ```
 

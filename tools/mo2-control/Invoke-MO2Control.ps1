@@ -16,7 +16,7 @@ param(
 
     [string]$AccessId,
 
-    [string]$LeaseId,
+    [string]$HumanMutationId,
 
     [Alias('ReporterTaskId')]
     [string]$TaskId,
@@ -142,17 +142,17 @@ try {
             data = [pscustomobject]@{ requiredParameter = 'RuntimeRoute'; allowedValues = @('OCU', 'SteamVR', 'SteamVRNull'); supplied = $false }
         }
     }
-    elseif ($Command -eq 'validate-human-mutation' -and [string]::IsNullOrWhiteSpace($LeaseId)) {
+    elseif ($Command -eq 'validate-human-mutation' -and [string]::IsNullOrWhiteSpace($HumanMutationId)) {
         $result = [pscustomobject][ordered]@{
             contractVersion = '1.1.0'
             command = $Command
             ok = $false
-            state = 'missing-lease-id'
+            state = 'missing-human-mutation-id'
             timestampUtc = [DateTime]::UtcNow.ToString('o')
             checks = @()
             warnings = @()
-            errors = @("Command '$Command' requires the public -LeaseId of the active human lease.")
-            data = [pscustomobject]@{ requiredParameter = 'LeaseId'; supplied = $false }
+            errors = @("Command '$Command' requires the private task-bound -HumanMutationId returned with human access.")
+            data = [pscustomobject]@{ requiredParameter = 'HumanMutationId'; supplied = $false }
         }
     }
     elseif ($Command -in @('renew-access', 'release-access', 'recover-access', 'prepare') -and [string]::IsNullOrWhiteSpace($AccessId)) {
@@ -181,7 +181,7 @@ try {
             $validated
         }
         'validate-human-mutation' {
-            Invoke-MO2ValidateHumanMutation -Config $config -LeaseId $LeaseId -Profile $Profile
+            Invoke-MO2ValidateHumanMutation -Config $config -HumanMutationId $HumanMutationId -Profile $Profile -TaskId $TaskId
         }
         'request-access' {
             $requestParameters = @{
@@ -222,7 +222,7 @@ try {
             Invoke-MO2Status -Config $config -SessionId $SessionId
         }
         'refresh' {
-            Invoke-MO2Refresh -Config $config -SessionId $SessionId -LeaseId $LeaseId -Profile $Profile -TimeoutSeconds $TimeoutSeconds -WhatIf:$WhatIf
+            Invoke-MO2Refresh -Config $config -SessionId $SessionId -HumanMutationId $HumanMutationId -Profile $Profile -TaskId $TaskId -TimeoutSeconds $TimeoutSeconds -WhatIf:$WhatIf
         }
         'stop-game' {
             Invoke-MO2StopGame -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -WhatIf:$WhatIf
