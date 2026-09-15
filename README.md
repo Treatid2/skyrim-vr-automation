@@ -17,6 +17,9 @@ optional integration rather than the identity or boundary of the toolkit.
   single-owner launch lifecycle.
 - `tools/mo2-profile-control` — transactional toggling of an exact MO2
   `modlist.txt` marker and guarded registration of a newly deployed mod.
+- `tools/mo2-mod-package-control` — safe ZIP inspection and deterministic MO2
+  install-package creation from an explicit Skyrim Data root, without relying
+  on installer flattening heuristics.
 - `tools/mo2-workspace-control` — stable-source ShaderCache evacuation plus
   unique task profiles cloned from that explicit source, with a verified copy
   of its complete saves tree, a mandatory integrity-verified world-entry save, and
@@ -65,6 +68,8 @@ new task to the bundled implementations and their operational contracts:
   enhancement requests in a durable local queue; it never publishes them.
 - `$mo2-control` routes MO2 inspection, exact-profile lifecycle management,
   and transactional profile edits.
+- `$mo2-mod-packaging` packages and diagnoses MO2 archives without guessed
+  wrapper flattening, and routes exact-profile mod activation work.
 - `$steamvr-null-hmd` routes backed-up SteamVR null-HMD apply/restore and
   bounded runtime shutdown.
 - `$devbench-control` discovers and calls the exact loopback DevBench MCP API.

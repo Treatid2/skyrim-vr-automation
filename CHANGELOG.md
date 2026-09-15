@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Add deterministic MO2 ZIP packaging from an explicit Skyrim Data root plus
+  safe archive inspection that distinguishes direct layouts, flatten-dependent
+  wrappers, the quick-installer `Data`-plus-docs special case, and wrapper
+  layouts blocked by sibling files.
 - Keep the synchronous-completion public-call fixtures composable with the
   integrated workspace-isolation gate by supplying the real access identity
   and session-lock evidence, and replacing that unrelated dependency inside
