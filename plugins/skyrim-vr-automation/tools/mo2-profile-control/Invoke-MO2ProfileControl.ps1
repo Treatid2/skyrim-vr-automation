@@ -30,6 +30,13 @@ param(
 
     [string]$EvidenceDirectory,
 
+    [string]$ConfigPath,
+
+    [string]$HumanLeaseId,
+
+    [ValidateRange(1, 600)]
+    [int]$RefreshTimeoutSeconds = 90,
+
     [ValidateNotNullOrEmpty()]
     [string[]]$BlockingProcessNames = @('ModOrganizer', 'SkyrimVR', 'sksevr_loader'),
 
@@ -515,6 +522,26 @@ if (-not (Test-Path -LiteralPath $resolvedProfile -PathType Leaf)) {
 }
 Assert-NoReparsePointPath -Path $resolvedProfile -Purpose 'Profile modlist'
 $profileName = [IO.Path]::GetFileName($profileDirectory)
+$humanMutationAuthority = $null
+$humanMutationConfig = $null
+if (-not [string]::IsNullOrWhiteSpace($HumanLeaseId)) {
+    $mo2ControlRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\mo2-control'))
+    Import-Module (Join-Path $mo2ControlRoot 'ConfigResolution.psm1') -Force -ErrorAction Stop
+    Import-Module (Join-Path $mo2ControlRoot 'MO2Control.psm1') -Force -ErrorAction Stop
+    $configuration = Resolve-MO2ControlConfigPath -ConfigPath $ConfigPath -PackageRoot $mo2ControlRoot
+    if (-not $configuration.exists) { throw "MO2 configuration was not found at '$($configuration.path)' (source: $($configuration.source))." }
+    $humanMutationConfig = Read-MO2ControlConfig -ConfigPath $configuration.path
+    $authorizedProfileDirectory = [IO.Path]::GetFullPath((Join-Path ([string]$humanMutationConfig.mo2.profilesDirectory) $profileName)).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    if ($profileDirectory -cne $authorizedProfileDirectory) {
+        throw "Human lease mutation must target the configured exact profile directory '$authorizedProfileDirectory', not '$profileDirectory'."
+    }
+    if ($Command -ne 'inspect') {
+        $humanMutationAuthority = Invoke-MO2ValidateHumanMutation -Config $humanMutationConfig -LeaseId $HumanLeaseId -Profile $profileName
+        if (-not $humanMutationAuthority.ok) {
+            throw "Human lease mutation preflight failed ($($humanMutationAuthority.state)): $($humanMutationAuthority.errors -join ' ')"
+        }
+    }
+}
 
 if ($Command -ne 'inspect') {
     if ($WhatIfPreference) {
@@ -533,7 +560,13 @@ $beforeBytes = [IO.File]::ReadAllBytes($resolvedProfile)
 $beforeMatches = @(Get-ModLineMatches -Bytes $beforeBytes -Name $ModName)
 $beforeLine = if ($beforeMatches.Count -eq 1) { Get-ModLineRecord -Bytes $beforeBytes -Name $ModName } else { $null }
 $beforeHash = Get-Sha256 $resolvedProfile
-$processes = @(Get-LiveProcesses -Names $BlockingProcessNames)
+$effectiveBlockingProcessNames = if ($humanMutationAuthority) {
+    @($BlockingProcessNames | Where-Object { $_ -notin @($humanMutationConfig.mo2.processNames) })
+}
+else {
+    @($BlockingProcessNames)
+}
+$processes = @(Get-LiveProcesses -Names $effectiveBlockingProcessNames)
 
 if ($Command -eq 'inspect') {
     if ($beforeMatches.Count -ne 1) { throw "Expected exactly one modlist line for '$ModName'; found $($beforeMatches.Count)." }
@@ -558,7 +591,7 @@ if ($Command -eq 'inspect') {
 }
 
 if ($processes.Count -gt 0) {
-    throw "MO2 profile mutation requires MO2 and Skyrim to be closed. Active: $($processes.name -join ', ')."
+    throw "MO2 profile mutation has a blocking process. Active: $($processes.name -join ', ')."
 }
 if ([string]::IsNullOrWhiteSpace($EvidenceDirectory)) {
     throw '-EvidenceDirectory is required for every profile mutation and restore.'
@@ -567,6 +600,7 @@ if ([string]::IsNullOrWhiteSpace($EvidenceDirectory)) {
 $resolvedEvidence = [IO.Path]::GetFullPath($EvidenceDirectory)
 $backupPath = Join-Path $resolvedEvidence 'modlist.before.bin'
 $receiptPath = Join-Path $resolvedEvidence 'modlist-control.receipt.json'
+$mutationApplied = $false
 
 if ($Command -in @('register', 'register-winning')) {
     if ($beforeMatches.Count -ne 0) {
@@ -607,6 +641,7 @@ if ($Command -in @('register', 'register-winning')) {
             return [pscustomobject]@{ verified = $true; marker = $line.marker }
         }
         $null = Invoke-ProfileMutationTransaction -Path $resolvedProfile -ExpectedBeforeBytes $beforeBytes -AfterBytes $afterBytes -EvidenceRoot $resolvedEvidence -BackupPath $backupPath -ReceiptPath $receiptPath -Receipt $receipt -Postcondition $postcondition
+        $mutationApplied = $true
     }
 }
 elseif ($Command -eq 'ensure-winner') {
@@ -629,6 +664,7 @@ elseif ($Command -eq 'ensure-winner') {
         }
         $postcondition = { param([byte[]]$liveBytes) Test-WinningPostcondition -Bytes $liveBytes -TargetName $ModName -TargetDirectory $resolvedModDirectory -ModRoot $ModsDirectory -Paths $resolvedWinningPaths }
         $null = Invoke-ProfileMutationTransaction -Path $resolvedProfile -ExpectedBeforeBytes $beforeBytes -AfterBytes $afterBytes -EvidenceRoot $resolvedEvidence -BackupPath $backupPath -ReceiptPath $receiptPath -Receipt $receipt -Postcondition $postcondition
+        $mutationApplied = $true
     }
 }
 elseif ($Command -in @('enable', 'disable')) {
@@ -671,6 +707,7 @@ elseif ($Command -in @('enable', 'disable')) {
             return [pscustomobject]@{ verified = $true; enabled = $line.enabled; marker = $line.marker }
         }
         $null = Invoke-ProfileMutationTransaction -Path $resolvedProfile -ExpectedBeforeBytes $beforeBytes -AfterBytes $afterBytes -EvidenceRoot $resolvedEvidence -BackupPath $backupPath -ReceiptPath $receiptPath -Receipt $receipt -Postcondition $postcondition
+        $mutationApplied = $true
     }
 }
 elseif ($Command -eq 'restore') {
@@ -701,14 +738,21 @@ elseif ($Command -eq 'restore') {
     $restoreBytes = [IO.File]::ReadAllBytes($backupPath)
     if (Test-ProfileShouldProcess -Caller $PSCmdlet -Target $resolvedProfile -Action "Restore exact MO2 modlist bytes for '$ModName'") {
         $null = Invoke-ProfileRestoreTransaction -Path $resolvedProfile -CurrentBytes $beforeBytes -RestoreBytes $restoreBytes -EvidenceRoot $resolvedEvidence -ExpectedCurrentHash $expectedResultHash -ExpectedRestoreHash ([string]$receipt.beforeSha256)
+        $mutationApplied = $true
     }
 }
 
+$refreshResult = $null
+if ($mutationApplied -and $humanMutationAuthority -and [bool]$humanMutationAuthority.data.refreshRequiredAfterMutation) {
+    $refreshResult = Invoke-MO2Refresh -Config $humanMutationConfig -LeaseId $HumanLeaseId -Profile $profileName -TimeoutSeconds $RefreshTimeoutSeconds
+}
 $finalBytes = [IO.File]::ReadAllBytes($resolvedProfile)
 $finalMatches = @(Get-ModLineMatches -Bytes $finalBytes -Name $ModName)
 $finalLine = if ($finalMatches.Count -eq 1) { Get-ModLineRecord -Bytes $finalBytes -Name $ModName } else { $null }
+$refreshSucceeded = $null -eq $refreshResult -or [bool]$refreshResult.ok
 $finalResult = [pscustomobject][ordered]@{
-    ok = $true
+    ok = $refreshSucceeded
+    state = if (-not $refreshSucceeded) { 'committed-refresh-required' } elseif ($mutationApplied -and $refreshResult) { 'committed-and-refreshed' } elseif ($mutationApplied) { 'committed' } else { 'preview' }
     command = $Command
     whatIf = [bool]$WhatIfPreference
     profilePath = $resolvedProfile
@@ -721,6 +765,8 @@ $finalResult = [pscustomobject][ordered]@{
     sha256 = Get-Sha256 $resolvedProfile
     backupPath = $backupPath
     receiptPath = $receiptPath
+    humanLeaseId = if ([string]::IsNullOrWhiteSpace($HumanLeaseId)) { $null } else { $HumanLeaseId }
+    refresh = $refreshResult
     approval = New-ProfileApprovalMetadata -Subcommand $Command
 }
 $jsonParameters = @{ InputObject = $finalResult; Depth = 7 }

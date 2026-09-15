@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 Set-StrictMode -Version Latest
-$script:MO2ControlContractVersion = '1.0.0'
+$script:MO2ControlContractVersion = '1.1.0'
 
 if (-not ('SkyrimVRAutomation.Native.DirectoryIdentity' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -2182,7 +2182,7 @@ function Write-MO2OwnedSessionAtomic {
         }
 
         $updated = $Value
-        foreach ($propertyName in @('contractVersion', 'accessId', 'leaseId', 'acquisitionMode', 'label', 'requestedUtc', 'lastRenewedUtc', 'estimatedDurationMinutes', 'estimatedReleaseUtc', 'ownerRequestPid', 'ownerRequestStartTime', 'runtimeRoute')) {
+        foreach ($propertyName in @('contractVersion', 'accessId', 'leaseId', 'acquisitionMode', 'accessKind', 'label', 'requestedUtc', 'lastRenewedUtc', 'estimatedDurationMinutes', 'estimatedReleaseUtc', 'ownerRequestPid', 'ownerRequestStartTime', 'runtimeRoute')) {
             if ($current.data.PSObject.Properties[$propertyName]) {
                 $updated | Add-Member -NotePropertyName $propertyName -NotePropertyValue $current.data.$propertyName -Force
             }
@@ -2431,6 +2431,8 @@ function Get-MO2AccessLeaseSummary {
         sessionId = $Lock.sessionId
         label = $(if ($Lock.data.PSObject.Properties['label']) { [string]$Lock.data.label } else { $null })
         ownerTaskId = $(if ($Lock.data.PSObject.Properties['ownerTaskId']) { [string]$Lock.data.ownerTaskId } else { $null })
+        accessKind = $(if ($Lock.data.PSObject.Properties['accessKind']) { [string]$Lock.data.accessKind } else { 'automation' })
+        profile = $(if ($Lock.data.PSObject.Properties['profile']) { [string]$Lock.data.profile } else { $null })
         acquisitionMode = $Lock.acquisitionMode
         requestedUtc = $(if ($Lock.data.PSObject.Properties['requestedUtc']) { [string]$Lock.data.requestedUtc } else { $null })
         lastRenewedUtc = $(if ($Lock.data.PSObject.Properties['lastRenewedUtc']) { [string]$Lock.data.lastRenewedUtc } else { $null })
@@ -2475,7 +2477,9 @@ function Invoke-MO2RequestAccess {
         [Parameter(Mandatory)]$Config,
         [string]$Label = 'automation',
         [string]$TaskId,
-        [Parameter(Mandatory)]
+        [ValidateSet('automation', 'human')]
+        [string]$AccessKind = 'automation',
+        [string]$Profile,
         [ValidateSet('OCU', 'SteamVR', 'SteamVRNull')]
         [string]$RuntimeRoute,
         [Nullable[int]]$EstimatedMinutes,
@@ -2485,6 +2489,12 @@ function Invoke-MO2RequestAccess {
 
     if ($null -ne $EstimatedMinutes -and ($EstimatedMinutes -lt 1 -or $EstimatedMinutes -gt 1440)) {
         throw 'EstimatedMinutes must be between 1 and 1440 when supplied.'
+    }
+    if ($AccessKind -eq 'automation' -and [string]::IsNullOrWhiteSpace($RuntimeRoute)) {
+        throw 'Automation access requires exactly one RuntimeRoute: OCU, SteamVR, or SteamVRNull.'
+    }
+    if ($AccessKind -eq 'human' -and -not [string]::IsNullOrWhiteSpace($RuntimeRoute)) {
+        throw 'Human access reserves MO2/Skyrim independent of runtime route; do not supply RuntimeRoute.'
     }
     if ([string]::IsNullOrWhiteSpace($TaskId)) {
         $TaskId = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_THREAD_ID)) { $env:CODEX_THREAD_ID } elseif (-not [string]::IsNullOrWhiteSpace($env:CODEX_TASK_ID)) { $env:CODEX_TASK_ID } else { $null }
@@ -2498,12 +2508,24 @@ function Invoke-MO2RequestAccess {
     $accessId = 'access-{0}-{1}' -f $now.ToString('yyyyMMddTHHmmssZ'), ([guid]::NewGuid().ToString('N').Substring(0, 12))
     $leaseId = 'lease-{0}-{1}' -f $now.ToString('yyyyMMddTHHmmssZ'), ([guid]::NewGuid().ToString('N').Substring(0, 8))
     $estimatedReleaseUtc = if ($null -ne $EstimatedMinutes) { $now.AddMinutes([int]$EstimatedMinutes).ToString('o') } else { $null }
-    $runtimeRouteContract = Resolve-MO2RuntimeRouteContract -RuntimeRoute $RuntimeRoute
+    $runtimeRouteContract = if ($AccessKind -eq 'automation') { Resolve-MO2RuntimeRouteContract -RuntimeRoute $RuntimeRoute } else { $null }
+    $leaseProfile = $null
+    if ($AccessKind -eq 'human') {
+        $inspection = Get-MO2InspectionData -Config $Config
+        $leaseProfile = if ([string]::IsNullOrWhiteSpace($Profile)) { [string]$inspection.selectedProfile } else { [string]$Profile }
+        if ([string]::IsNullOrWhiteSpace($leaseProfile) -or @($inspection.profiles | Where-Object { $_ -ceq $leaseProfile }).Count -ne 1) {
+            throw "Human access requires one exact existing profile; requested '$leaseProfile'."
+        }
+        if ([string]$inspection.selectedProfile -cne $leaseProfile) {
+            throw "Human access profile '$leaseProfile' is not MO2's exact selected profile '$($inspection.selectedProfile)'."
+        }
+    }
     $lease = [pscustomobject][ordered]@{
         contractVersion = $script:MO2ControlContractVersion
         accessId = $accessId
         leaseId = $leaseId
         acquisitionMode = 'explicit-access'
+        accessKind = $AccessKind
         status = 'access-held'
         label = $safeLabel
         ownerTaskId = $TaskId
@@ -2514,6 +2536,7 @@ function Invoke-MO2RequestAccess {
         ownerRequestPid = $PID
         ownerRequestStartTime = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
         runtimeRoute = $runtimeRouteContract
+        profile = $leaseProfile
         generation = 1L
         sessionId = $null
         sessionPath = $null
@@ -2611,12 +2634,13 @@ function Invoke-MO2ReleaseAccess {
         return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $false -State 'session-release-required' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $owned } -Errors @('The access lease still has a bound session. Stop MO2/the game and release that exact SessionId first.')
     }
     $inspection = Get-MO2InspectionData -Config $Config
+    $accessKind = if ($owned.data.PSObject.Properties['accessKind']) { [string]$owned.data.accessKind } else { 'automation' }
     $activeBuildData = @($inspection.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
-    if ($inspection.processes.mo2.Count -gt 0 -or $inspection.processes.game.Count -gt 0 -or $activeBuildData.Count -gt 0) {
+    if ($accessKind -ne 'human' -and ($inspection.processes.mo2.Count -gt 0 -or $inspection.processes.game.Count -gt 0 -or $activeBuildData.Count -gt 0)) {
         return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $false -State 'blocked' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $owned; processes = $inspection.processes; activeBuildData = $activeBuildData } -Errors @('Access cannot be released while MO2, the game, or a RootBuilder deployment transaction remains active.')
     }
     if ($WhatIf) {
-        return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $true -State 'dry-run' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $owned; wouldRemoveLock = $true }
+        return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $true -State 'dry-run' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $owned; wouldRemoveLock = $true; liveStateRetained = $accessKind -eq 'human'; processes = $inspection.processes; activeBuildData = $activeBuildData }
     }
     $lockPath = Resolve-MO2ControlPath ([string]$Config.session.lockFile)
     return Invoke-WithMO2LeaseTransitionLock -LockPath $lockPath -Action {
@@ -2625,7 +2649,7 @@ function Invoke-MO2ReleaseAccess {
             return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $false -State 'session-release-required' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $current } -Errors @('The access lease acquired a session before release; release that exact SessionId first.')
         }
         Remove-Item -LiteralPath $current.path -Force
-        return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $true -State 'access-released' -Data @{ accessId = $AccessId; lockPath = $current.path; lockRemoved = $true }
+        return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $true -State 'access-released' -Data @{ accessId = $AccessId; leaseId = $current.leaseId; accessKind = $accessKind; lockPath = $current.path; lockRemoved = $true; liveStateRetained = $accessKind -eq 'human'; processes = $inspection.processes; activeBuildData = $activeBuildData }
     }
 }
 
@@ -3471,6 +3495,12 @@ function Invoke-MO2Prepare {
         return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'missing-access-id' -Data @{ requiredParameter = 'AccessId'; supplied = $false } -Errors @('Prepare requires -AccessId from a route-qualified request-access lease.')
     }
 
+    $accessLock = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
+    $accessKind = if ($accessLock.data.PSObject.Properties['accessKind']) { [string]$accessLock.data.accessKind } else { 'automation' }
+    if ($accessKind -eq 'human') {
+        return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'human-lease-session-forbidden' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $accessLock } -Errors @('A human lease reserves the live environment and may authorize bounded mutations, but it cannot be bound to an automation launch session.')
+    }
+
     $validation = Invoke-MO2Validate -Config $Config -Profile $Profile -Executable $Executable -RequireSKSE:$RequireSKSE -RequireClosed -RequireRuntimeRoute -OwnedAccessId $AccessId
     if (-not $validation.ok) {
         return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'blocked' -Data @{ validation = $validation } -Warnings $validation.warnings -Errors $validation.errors
@@ -3489,7 +3519,6 @@ function Invoke-MO2Prepare {
     $lockPath = Resolve-MO2ControlPath ([string]$Config.session.lockFile)
     $arguments = @('--profile', $profileName, 'run', '--executable', $executableName)
     $explicitAccess = $true
-    $accessLock = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
     if (-not [string]::IsNullOrWhiteSpace([string]$accessLock.sessionId)) {
         return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'blocked' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $accessLock } -Errors @('The access lease already has a bound session. Release that session before preparing another one.')
     }
@@ -3637,6 +3666,206 @@ function Test-MO2OpeningReady {
     if ([string]$Owned.data.status -cne 'opening' -or $GameProcesses.Count -ne 0 -or $MO2Processes.Count -ne 1) { return $false }
     if ($null -eq $OwnershipResolution -or -not [bool]$OwnershipResolution.ok -or @($OwnershipResolution.targets).Count -ne 1) { return $false }
     return @($Windows | Where-Object { $_.visible -and [string]$_.automationId -ceq 'MainWindow' }).Count -eq 1
+}
+
+function Get-MO2HumanLeaseById {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$LeaseId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($LeaseId)) { throw 'LeaseId is required for a human-authorized mutation.' }
+    $lock = Get-MO2SessionLockRecord -Path (Resolve-MO2ControlPath ([string]$Config.session.lockFile))
+    if (-not $lock.exists) { throw 'No MO2 access lease exists.' }
+    if (-not $lock.valid) { throw "The MO2 access lock is invalid: $($lock.error)" }
+    if ([string]$lock.leaseId -cne $LeaseId) { throw "Human lease '$LeaseId' is not the active lease." }
+    $accessKind = if ($lock.data.PSObject.Properties['accessKind']) { [string]$lock.data.accessKind } else { 'automation' }
+    if ($accessKind -cne 'human') { throw "Lease '$LeaseId' is not a human lease." }
+    if (-not [string]::IsNullOrWhiteSpace([string]$lock.sessionId)) { throw 'A human lease must not be bound to an automation session.' }
+    if (-not $lock.data.PSObject.Properties['profile'] -or [string]::IsNullOrWhiteSpace([string]$lock.data.profile)) { throw 'The human lease has no exact profile binding.' }
+    return $lock
+}
+
+function Invoke-MO2ValidateHumanMutation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$LeaseId,
+        [Parameter(Mandatory)][string]$Profile
+    )
+
+    $lockPath = Resolve-MO2ControlPath ([string]$Config.session.lockFile)
+    return Invoke-WithMO2LeaseTransitionLock -LockPath $lockPath -Action {
+        $owned = Get-MO2HumanLeaseById -Config $Config -LeaseId $LeaseId
+        $expectedProfile = [string]$owned.data.profile
+        if ([string]$Profile -cne $expectedProfile) {
+            return New-MO2ActionResult -Config $Config -Command 'validate-human-mutation' -Ok $false -State 'profile-mismatch' -Data @{ leaseId = $LeaseId; authorizedProfile = $expectedProfile; requestedProfile = $Profile } -Errors @("Human lease '$LeaseId' is bound to profile '$expectedProfile', not '$Profile'.")
+        }
+
+        $inspection = Get-MO2InspectionData -Config $Config -RequestedProfile $expectedProfile
+        $activeBuildData = @($inspection.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
+        if ($inspection.processes.game.Count -gt 0) {
+            return New-MO2ActionResult -Config $Config -Command 'validate-human-mutation' -Ok $false -State 'game-close-required' -Data @{ leaseId = $LeaseId; profile = $expectedProfile; processes = $inspection.processes } -Errors @('Human-authorized profile mutation requires Skyrim and its loader to be closed.')
+        }
+        if ($activeBuildData.Count -gt 0) {
+            return New-MO2ActionResult -Config $Config -Command 'validate-human-mutation' -Ok $false -State 'known-ground-state-required' -Data @{ leaseId = $LeaseId; profile = $expectedProfile; activeBuildData = @($activeBuildData | ForEach-Object path); recovery = 'Close or recover-close the exact MO2 state, then recover RootBuilder before mutation.' } -Errors @('Active RootBuilder deployment makes the live MO2 state uncertain; establish a known closed state before mutation.')
+        }
+        if ([string]$inspection.selectedProfile -cne $expectedProfile) {
+            return New-MO2ActionResult -Config $Config -Command 'validate-human-mutation' -Ok $false -State 'profile-drift' -Data @{ leaseId = $LeaseId; authorizedProfile = $expectedProfile; selectedProfile = [string]$inspection.selectedProfile } -Errors @('MO2 selected a different profile after the human lease was established.')
+        }
+        if ($inspection.processes.mo2.Count -gt 1) {
+            return New-MO2ActionResult -Config $Config -Command 'validate-human-mutation' -Ok $false -State 'known-ground-state-required' -Data @{ leaseId = $LeaseId; profile = $expectedProfile; processes = $inspection.processes; recovery = 'Use the exact close/recover-close route before mutation.' } -Errors @("Human-authorized profile mutation permits zero or one exact MO2 process; found $($inspection.processes.mo2.Count).")
+        }
+
+        $windows = @()
+        if ($inspection.processes.mo2.Count -eq 1) {
+            $primary = $inspection.processes.mo2[0]
+            Assert-MO2ExactProcessTargets -Config $Config -Processes @($primary)
+            $windows = @(Get-MO2WindowSnapshot -Processes @($primary))
+            $mainWindows = @($windows | Where-Object { $_.visible -and $_.automationAvailable -and [string]$_.automationId -ceq 'MainWindow' })
+            $otherVisible = @($windows | Where-Object { $_.visible -and [string]$_.automationId -cne 'MainWindow' })
+            if ($mainWindows.Count -ne 1 -or $otherVisible.Count -gt 0) {
+                return New-MO2ActionResult -Config $Config -Command 'validate-human-mutation' -Ok $false -State 'known-ground-state-required' -Data @{ leaseId = $LeaseId; profile = $expectedProfile; windows = $windows; recovery = 'Resolve the exact modal/Unlock state or use close/recover-close before mutation.' } -Errors @('The live MO2 window state is not one unblocked exact MainWindow; a known ground state is required.')
+            }
+        }
+
+        return New-MO2ActionResult -Config $Config -Command 'validate-human-mutation' -Ok $true -State 'human-mutation-authorized' -Data @{ leaseId = $LeaseId; profile = $expectedProfile; mo2Open = $inspection.processes.mo2.Count -eq 1; refreshRequiredAfterMutation = $inspection.processes.mo2.Count -eq 1; processes = $inspection.processes; windows = $windows }
+    }
+}
+
+function Invoke-MO2RefreshHelperProcess {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        [ValidateRange(1, 600)][int]$TimeoutSeconds
+    )
+
+    $process = Start-Process -FilePath $Path -ArgumentList 'refresh' -WorkingDirectory $WorkingDirectory -PassThru
+    $exited = $process.WaitForExit($TimeoutSeconds * 1000)
+    return [pscustomobject][ordered]@{
+        pid = [int]$process.Id
+        exited = [bool]$exited
+        exitCode = if ($exited) { [int]$process.ExitCode } else { $null }
+    }
+}
+
+function Invoke-MO2Refresh {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Config,
+        [string]$SessionId,
+        [string]$LeaseId,
+        [string]$Profile,
+        [ValidateRange(1, 600)][int]$TimeoutSeconds = 90,
+        [switch]$WhatIf
+    )
+
+    $hasSession = -not [string]::IsNullOrWhiteSpace($SessionId)
+    $hasHumanLease = -not [string]::IsNullOrWhiteSpace($LeaseId)
+    if ($hasSession -eq $hasHumanLease) {
+        return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'missing-or-ambiguous-refresh-authority' -Data @{ required = 'exactly one of SessionId or human LeaseId'; sessionIdSupplied = $hasSession; leaseIdSupplied = $hasHumanLease } -Errors @('Refresh requires exactly one authority: an owned automation SessionId or the public LeaseId of the active human lease.')
+    }
+
+    $lockPath = Resolve-MO2ControlPath ([string]$Config.session.lockFile)
+    return Invoke-WithMO2LeaseTransitionLock -LockPath $lockPath -Action {
+        $owned = $null
+        $authorityKind = $null
+        $expectedProfile = $null
+        if ($hasSession) {
+            $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
+            $authorityKind = 'automation-session'
+            $expectedProfile = [string]$owned.data.profile
+        }
+        else {
+            $owned = Get-MO2HumanLeaseById -Config $Config -LeaseId $LeaseId
+            $authorityKind = 'human-lease'
+            $expectedProfile = [string]$owned.data.profile
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($Profile) -and [string]$Profile -cne $expectedProfile) {
+            return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'profile-mismatch' -Data @{ authorityKind = $authorityKind; authorizedProfile = $expectedProfile; requestedProfile = $Profile } -Errors @("Refresh authority is bound to profile '$expectedProfile', not '$Profile'.")
+        }
+
+        $inspection = Get-MO2InspectionData -Config $Config -RequestedProfile $expectedProfile
+        $activeBuildData = @($inspection.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
+        if ($inspection.processes.game.Count -gt 0) {
+            return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'game-close-required' -Data @{ authorityKind = $authorityKind; profile = $expectedProfile; processes = $inspection.processes } -Errors @('Refresh refuses while Skyrim or its loader is running. Close Skyrim first so the next launch begins from the changed mod state.')
+        }
+        if ($activeBuildData.Count -gt 0) {
+            return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'known-ground-state-required' -Data @{ authorityKind = $authorityKind; profile = $expectedProfile; activeBuildData = @($activeBuildData | ForEach-Object path); recovery = 'Use the owned close/recover-close and RootBuilder recovery route before refreshing.' } -Errors @('Active RootBuilder deployment makes the live MO2 state uncertain; establish a known closed state before mutation or refresh.')
+        }
+        if ([string]$inspection.selectedProfile -cne $expectedProfile) {
+            return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'profile-drift' -Data @{ authorityKind = $authorityKind; authorizedProfile = $expectedProfile; selectedProfile = [string]$inspection.selectedProfile } -Errors @('MO2 selected a different profile after authority was established; coordinate the exact profile before refreshing.')
+        }
+        if ($inspection.processes.mo2.Count -ne 1) {
+            return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'known-ground-state-required' -Data @{ authorityKind = $authorityKind; profile = $expectedProfile; processes = $inspection.processes; recovery = 'Use close/recover-close to classify zero, multiple, or stranded MO2 processes.' } -Errors @("Refresh requires exactly one configured MO2 process; found $($inspection.processes.mo2.Count).")
+        }
+
+        $primary = $inspection.processes.mo2[0]
+        Assert-MO2ExactProcessTargets -Config $Config -Processes @($primary)
+        if ($hasSession) {
+            $resolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @($inspection.processes.mo2) -AdoptDetachedOwner
+            if (-not $resolution.ok -or @($resolution.targets).Count -ne 1) {
+                return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'known-ground-state-required' -Data @{ authorityKind = $authorityKind; profile = $expectedProfile; ownershipResolution = $resolution; recovery = 'Use status or close/recover-close to re-establish exact process ownership.' } -Errors @('The automation session cannot prove the one running MO2 process is its exact owner.')
+            }
+            $primary = $resolution.targets[0]
+        }
+
+        $windows = @(Get-MO2WindowSnapshot -Processes @($primary))
+        $mainWindows = @($windows | Where-Object { $_.visible -and $_.automationAvailable -and [string]$_.automationId -ceq 'MainWindow' })
+        $otherVisible = @($windows | Where-Object { $_.visible -and [string]$_.automationId -cne 'MainWindow' })
+        if ($mainWindows.Count -ne 1 -or $otherVisible.Count -gt 0) {
+            return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'known-ground-state-required' -Data @{ authorityKind = $authorityKind; profile = $expectedProfile; windows = $windows; recovery = 'Resolve the exact modal/Unlock state or use close/recover-close before refreshing.' } -Errors @('The MO2 window state is not one unblocked exact MainWindow; a known ground state is required.')
+        }
+
+        $mo2Path = [IO.Path]::GetFullPath([string]$Config.mo2.executable)
+        $workingDirectory = Split-Path -Parent $mo2Path
+        $profileDirectory = Join-Path (Resolve-MO2ControlPath ([string]$Config.mo2.profilesDirectory)) $expectedProfile
+        $modListPath = Join-Path $profileDirectory 'modlist.txt'
+        $beforeModListSha256 = if (Test-Path -LiteralPath $modListPath -PathType Leaf) { (Get-FileHash -LiteralPath $modListPath -Algorithm SHA256).Hash } else { $null }
+        $plan = [pscustomobject][ordered]@{ path = $mo2Path; arguments = @('refresh'); argumentLine = 'refresh'; workingDirectory = $workingDirectory; upstreamSemantics = 'refreshes MO (same as F5); forwarded to the primary instance' }
+        if ($WhatIf) {
+            return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $true -State 'dry-run' -Data @{ authorityKind = $authorityKind; sessionId = $SessionId; leaseId = $LeaseId; profile = $expectedProfile; primaryProcess = $primary; windows = $windows; plan = $plan; beforeModListSha256 = $beforeModListSha256; wouldRetainMO2 = $true; wouldLaunchGame = $false }
+        }
+
+        $startedUtc = [DateTime]::UtcNow
+        $helper = Invoke-MO2RefreshHelperProcess -Path $mo2Path -WorkingDirectory $workingDirectory -TimeoutSeconds $TimeoutSeconds
+        if (-not $helper.exited) {
+            return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'refresh-helper-timeout' -Data @{ authorityKind = $authorityKind; sessionId = $SessionId; leaseId = $LeaseId; profile = $expectedProfile; primaryProcess = $primary; helper = $helper; plan = $plan; timeoutSeconds = $TimeoutSeconds; recovery = 'Classify the exact helper and primary process before retrying or closing MO2.' } -Errors @('The exact MO2 refresh helper did not exit within the bounded timeout; no retry or forced termination was attempted.')
+        }
+        if ([int]$helper.exitCode -ne 0) {
+            return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'refresh-forward-failed' -Data @{ authorityKind = $authorityKind; sessionId = $SessionId; leaseId = $LeaseId; profile = $expectedProfile; primaryProcess = $primary; helper = $helper; plan = $plan } -Errors @("ModOrganizer.exe refresh exited with code $($helper.exitCode).")
+        }
+
+        $after = Get-MO2InspectionData -Config $Config -RequestedProfile $expectedProfile
+        $afterPrimary = @($after.processes.mo2 | Where-Object {
+            [int]$_.id -eq [int]$primary.id -and
+            [string]$_.path -ceq [string]$primary.path -and
+            [string]$_.startTime -ceq [string]$primary.startTime
+        })
+        $afterBuildData = @($after.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
+        $afterModListSha256 = if (Test-Path -LiteralPath $modListPath -PathType Leaf) { (Get-FileHash -LiteralPath $modListPath -Algorithm SHA256).Hash } else { $null }
+        $postconditionOk = $afterPrimary.Count -eq 1 -and $after.processes.mo2.Count -eq 1 -and $after.processes.game.Count -eq 0 -and $afterBuildData.Count -eq 0 -and [string]$after.selectedProfile -ceq $expectedProfile
+        $receiptRoot = if ($hasSession) { [string]$owned.data.sessionPath } else { Join-Path (Resolve-MO2ControlPath ([string]$Config.storage.sessionStaging)) ("human-lease-$LeaseId") }
+        $receiptPath = Join-Path $receiptRoot ('mo2-refresh.' + $startedUtc.ToString('yyyyMMddTHHmmssfffZ') + '.json')
+        $receipt = [pscustomobject][ordered]@{
+            contractVersion = $script:MO2ControlContractVersion
+            operation = 'refresh'
+            authorityKind = $authorityKind
+            sessionId = $SessionId
+            leaseId = $LeaseId
+            profile = $expectedProfile
+            primaryProcessBefore = $primary
+            helper = $helper
+            command = $plan
+            beforeModListSha256 = $beforeModListSha256
+            afterModListSha256 = $afterModListSha256
+            postconditionVerified = $postconditionOk
+            completedUtc = [DateTime]::UtcNow.ToString('o')
+        }
+        Write-MO2JsonAtomic -Path $receiptPath -Value $receipt -CreateNew
+        return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $postconditionOk -State $(if ($postconditionOk) { 'refreshed' } else { 'refresh-postcondition-failed' }) -Data @{ authorityKind = $authorityKind; sessionId = $SessionId; leaseId = $LeaseId; profile = $expectedProfile; helper = $helper; plan = $plan; beforeModListSha256 = $beforeModListSha256; afterModListSha256 = $afterModListSha256; primaryRetained = $afterPrimary.Count -eq 1; postconditionVerified = $postconditionOk; receiptPath = $receiptPath; processes = $after.processes } -Errors $(if ($postconditionOk) { @() } else { @('The refresh helper returned success, but exact primary-process, profile, closed-game, or RootBuilder postconditions were not all retained.') })
+    }
 }
 
 function Invoke-MO2Status {
@@ -4497,15 +4726,17 @@ function Get-MO2ControlHelp {
         commands = @(
             [pscustomobject]@{ name = 'inspect'; mutation = $false; description = 'Inspect MO2 paths, profiles, registered executables, processes, RootBuilder state, overwrite usage, storage and locks.' },
             [pscustomobject]@{ name = 'validate'; mutation = $false; description = 'Validate an exact profile and registered executable. Add -RequireClosed before future state-changing operations.' },
-            [pscustomobject]@{ name = 'request-access'; mutation = $true; description = 'Atomically request the shared MO2 access lease for exactly one runtime route: OCU, SteamVR, or SteamVRNull.' },
+            [pscustomobject]@{ name = 'validate-human-mutation'; mutation = $false; description = 'Validate a public human LeaseId for an exact selected-profile mutation with Skyrim closed and either zero MO2 processes or one unblocked exact instance.' },
+            [pscustomobject]@{ name = 'request-access'; mutation = $true; description = 'Atomically request automation access for one runtime route, or human access bound to the exact selected profile.' },
             [pscustomobject]@{ name = 'access-status'; mutation = $false; description = 'Report whether access is available, held, bound to a session, or owned by the supplied AccessId.' },
             [pscustomobject]@{ name = 'renew-access'; mutation = $true; description = 'Refresh an owned access lease and optionally replace its advisory duration estimate. Never extends an automatic expiry because leases do not expire automatically.' },
-            [pscustomobject]@{ name = 'release-access'; mutation = $true; description = 'Release an access-only lease after proving MO2, the game, and RootBuilder deployment are inactive.' },
+            [pscustomobject]@{ name = 'release-access'; mutation = $true; description = 'Release an access-only lease. Automation access requires closed state; human access releases coordination only and leaves live applications untouched.' },
             [pscustomobject]@{ name = 'recover-access'; mutation = $true; description = 'Explicitly recover a confirmed abandoned access lease after closed-state proof. Requires AccessId and ConfirmAbandoned; estimates never authorize recovery.' },
             [pscustomobject]@{ name = 'prepare'; mutation = $true; description = 'Validate closed state and bind a route-qualified explicit access lease to a durable evidence session. Requires AccessId.' },
             [pscustomobject]@{ name = 'open'; mutation = $true; description = 'Open only the exact configured MO2 executable and profile in an owned session. Does not launch the game. -StartOnly returns after the durable receipt is written.' },
             [pscustomobject]@{ name = 'launch'; mutation = $true; description = 'Launch one exact registered executable under one exact profile. Requires -SessionId; -StartOnly returns after the durable receipt is written.' },
             [pscustomobject]@{ name = 'status'; mutation = $false; description = 'Report bounded MO2, game and runtime process state, optionally verifying -SessionId ownership.' },
+            [pscustomobject]@{ name = 'refresh'; mutation = $true; description = 'Invoke the supported ModOrganizer.exe refresh command (same as F5) against one exact running primary instance under an automation SessionId or active human LeaseId.' },
             [pscustomobject]@{ name = 'stop-game'; mutation = $true; description = 'Request graceful game shutdown while retaining the exact owned MO2 process for controlled relaunch. Never force-terminates.' },
             [pscustomobject]@{ name = 'terminate-game'; mutation = $true; description = 'Terminate only launch-recorded exact game/loader PIDs after a deadlock, retain MO2, invoke exact Unlock, and require RootBuilder restoration.' },
             [pscustomobject]@{ name = 'close'; mutation = $true; description = 'Cooperatively close only exact session-owned MO2, including its exact Unlock control and MO2-owned modal windows. Never force-terminates.' },
@@ -4519,7 +4750,10 @@ function Get-MO2ControlHelp {
         examples = @(
             '.\Invoke-MO2Control.ps1 inspect',
             '.\Invoke-MO2Control.ps1 request-access -Label "api-test" -RuntimeRoute OCU -EstimatedMinutes 20',
+            '.\Invoke-MO2Control.ps1 request-access -AccessKind human -Profile "Real Human''s Profile" -Label "human"',
+            '.\Invoke-MO2Control.ps1 validate-human-mutation -LeaseId $humanLeaseId -Profile "Real Human''s Profile"',
             '.\Invoke-MO2Control.ps1 prepare -AccessId $accessId -Label "api-test-run"',
+            '.\Invoke-MO2Control.ps1 refresh -LeaseId $humanLeaseId -Profile "Real Human''s Profile"',
             '.\Invoke-MO2Control.ps1 validate -RequireClosed',
             '.\Invoke-MO2Control.ps1 validate -Profile "Codex" -Executable "Launch MGO - Do Not Unlock" -Compact'
         )
@@ -4529,7 +4763,7 @@ function Get-MO2ControlHelp {
             Resolve-MO2RuntimeRouteContract -RuntimeRoute SteamVRNull
         )
         runtimeRouteRule = 'A lease selects exactly one route. OCU cannot coexist with either SteamVR route; SteamVRNull is the null-HMD mode of SteamVR and cannot coexist with physical SteamVR.'
-        note = 'Version 1.0.0 requires an explicit route-bound access lease, adds durable session controllers and profile identity, binds task output to MO2 Overwrite, and retains failed-to-run dialog classification.'
+        note = 'Version 1.1.0 adds exact-profile human access and bounded CLI refresh while retaining route-bound automation sessions and known-ground-state recovery.'
     }
 
     return [pscustomobject][ordered]@{
@@ -4545,4 +4779,4 @@ function Get-MO2ControlHelp {
     }
 }
 
-Export-ModuleMember -Function Read-MO2ControlConfig, Get-MO2TaskWorkspaceIsolation, Invoke-MO2Inspect, Invoke-MO2Validate, Invoke-MO2RequestAccess, Invoke-MO2AccessStatus, Invoke-MO2RenewAccess, Invoke-MO2ReleaseAccess, Invoke-MO2RecoverAccess, Invoke-MO2Prepare, Invoke-MO2Open, Invoke-MO2Launch, Invoke-MO2Status, Invoke-MO2StopGame, Invoke-MO2TerminateGame, Invoke-MO2Close, Invoke-MO2RecoverClose, Invoke-MO2RecoverRootBuilder, Invoke-MO2Stop, Invoke-MO2Terminate, Invoke-MO2Release, Get-MO2ControlHelp
+Export-ModuleMember -Function Read-MO2ControlConfig, Get-MO2TaskWorkspaceIsolation, Invoke-MO2Inspect, Invoke-MO2Validate, Invoke-MO2ValidateHumanMutation, Invoke-MO2RequestAccess, Invoke-MO2AccessStatus, Invoke-MO2RenewAccess, Invoke-MO2ReleaseAccess, Invoke-MO2RecoverAccess, Invoke-MO2Prepare, Invoke-MO2Open, Invoke-MO2Launch, Invoke-MO2Status, Invoke-MO2Refresh, Invoke-MO2StopGame, Invoke-MO2TerminateGame, Invoke-MO2Close, Invoke-MO2RecoverClose, Invoke-MO2RecoverRootBuilder, Invoke-MO2Stop, Invoke-MO2Terminate, Invoke-MO2Release, Get-MO2ControlHelp

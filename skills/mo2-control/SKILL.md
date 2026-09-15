@@ -67,6 +67,17 @@ are:
    leaves the maintained source profile untouched. Resuming a retained profile
    never makes that correction silently; an incompatible retained profile is
    blocked until its owner explicitly repairs it or requests a fresh clone.
+   The human code word `Lease` selects the separate `request-access -AccessKind
+   human` flow: bind the lease to the exact currently selected profile and
+   return the public `leaseId`. A task acting under that human delegation calls
+   `validate-human-mutation -LeaseId -Profile` before any write. Skyrim and its
+   loader must be closed. MO2 may remain open only when there is one exact
+   configured process, one unblocked `MainWindow`, no other visible modal, no
+   profile drift, and no active RootBuilder deployment. After `modlist.txt` or
+   mod-directory membership changes, invoke `refresh -LeaseId -Profile`; the
+   profile controller does this automatically after a committed live marker
+   transaction. The code word `Release` removes only the human coordination
+   lease and does not close live applications.
 3. Use `-WhatIf` when the command supports it and the requested change has not
    already been proven in an isolated fixture.
 4. For a live run, call `prepare -AccessId` with the owned lease, retain its
@@ -140,8 +151,12 @@ are:
   authorize profile, package, process, or filesystem mutation.
 - Never accept a fallback profile or executable. Use the exact configured
   names and report a mismatch as a failed precondition.
-- Require MO2 and Skyrim closed before changing a profile, mod package, or
-  other MO2-owned state.
+- Require Skyrim and its loader closed before changing a profile, mod package,
+  or other MO2-owned state. Autonomous task setup retains the closed-MO2
+  default. A public human lease permits exact selected-profile or explicitly
+  authorized mod-content mutation while one unblocked exact MO2 instance is
+  open; validate first and refresh after membership/list changes. Uncertain
+  state must use close/recover-close rather than being guessed through.
 - Do not launch a second owner while the first session is unresolved. Do not
   retry a crash or failed launch before classifying the evidence.
 - Do not retain an access lease during compilation, source editing, offline
@@ -156,11 +171,17 @@ are:
   prove ownership and game/loader absence.
 - Never delete or replace a mod that existed when a test workspace was created.
   A task may clean only uniquely named mods explicitly registered as its own.
-- A task may enable or disable existing mods only in its own cloned profile.
-  It must not edit an existing shared mod directory. Update the maintained
-  primary list additively: install a new version under a new mod name, disable
-  the old marker, and enable the new marker. Retained task profiles remain
-  unchanged until their owner explicitly requests a fresh clone.
+- An autonomous task may enable or disable existing mods only in its own cloned
+  profile. A task acting under the human's public lease may instead change the
+  exact leased selected profile when that specific change is in scope. It must
+  not edit an existing shared mod directory without separate content authority.
+  Update the maintained primary list additively: install a new version under a
+  new mod name, disable the old marker, and enable the new marker. Retained task
+  profiles remain unchanged until their owner explicitly requests a fresh
+  clone.
+- Dump Management has standing user authority to install, update, configure,
+  and enable Tullius. It still obeys closed-Skyrim and lease/known-state gates;
+  when a human lease is active it targets only that lease's exact profile.
 - Register a task DLL with its exact relative path in `-WinningPaths`. Treat
   the returned loose-file provider proof as scoped: overwrite, unmanaged game
   files, and archives still require separate VFS evidence.
