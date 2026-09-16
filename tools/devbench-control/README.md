@@ -127,7 +127,15 @@ positive. Only non-empty `message`, `description`, and `label` fields are
 treated as outcome metadata rather than checks.
 Nested `error.code`, `status`, and `result.state` values are classified. Use
 `-ExpectedErrorCode producer_mismatch` when a guarded rejection is the intended
-test outcome. Transient HTTP 429/502/503/504 responses and timeouts use bounded
+test outcome. Acceptance requires one exclusive typed error envelope with that
+exact top-level error code; additional outcomes, receipts, errors or contradictory
+flags veto acceptance. Original guard rejection reasons remain retained separately.
+Runtime health and producer identity content must be positively semantically
+qualified before its fields contribute to mutation admission. Retryable semantic
+identity failures use the same cleanup-qualified bounded rebind path as transport
+retirement; failed ordinary producer candidates remain attributable and contribute
+no producer identity while discovery may continue to a qualified sibling.
+Transient HTTP 429/502/503/504 responses and timeouts use bounded
 exponential retry and are preserved under `transportRetries`.
 
 Menu and current-state waits qualify each contributing read response before

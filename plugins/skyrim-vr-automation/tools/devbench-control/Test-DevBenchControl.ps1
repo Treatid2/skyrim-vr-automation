@@ -18,6 +18,27 @@ $scenario = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ ok = $false
 Assert-Test ($scenario.known -and -not $scenario.ok -and $scenario.reasons.Count -eq 2) 'semantic status preserves scenario failure reasons'
 $producerMismatch = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ error = [pscustomobject]@{ code = 'producer_mismatch'; message = 'wrong build' } })
 Assert-Test ($producerMismatch.known -and -not $producerMismatch.ok -and $producerMismatch.guarded -and $producerMismatch.outcome -eq 'guard-rejected') 'producer mismatch is a known guarded rejection'
+$guardArguments = @{ action = 'registry' }
+$exclusiveGuard = [pscustomobject]@{ error = [pscustomobject]@{ code = 'producer_mismatch'; message = 'wrong build' } }
+$guardOnly = Get-DevBenchExpectedGuardStatus -ToolName 'communityshaders.test_api' -Arguments $guardArguments -Content @($exclusiveGuard) -ExpectedErrorCode 'producer_mismatch'
+Assert-Test ($guardOnly.known -and $guardOnly.ok -and $guardOnly.expectedErrorMatched -and $guardOnly.guardRejectionReasons.Count -gt 0) 'exclusive expected guard qualifies while retaining original rejection provenance'
+foreach ($sibling in @($false, $null, @(), 'unsupported', [pscustomobject]@{ status = 'success'; nested = $false })) {
+    $mixedGuard = [pscustomobject]@{ error = $exclusiveGuard.error; postconditions = $sibling }
+    $result = Get-DevBenchExpectedGuardStatus -ToolName 'communityshaders.test_api' -Arguments $guardArguments -Content @($mixedGuard) -ExpectedErrorCode 'producer_mismatch'
+    Assert-Test (-not $result.ok -and -not $result.expectedErrorMatched -and $result.reasons.Count -gt 0) 'expected guard never overrides a false/null/empty/unsupported/nested outcome sibling'
+}
+foreach ($payload in @(
+    [pscustomobject]@{ error = $exclusiveGuard.error; errors = @('other error') },
+    [pscustomobject]@{ error = $exclusiveGuard.error; result = [pscustomobject]@{ action = 'wrong'; ok = $false } },
+    [pscustomobject]@{ result = [pscustomobject]@{ code = 'producer_mismatch' } },
+    [pscustomobject]@{ error = $exclusiveGuard.error; ok = $true },
+    [pscustomobject]@{ error = $exclusiveGuard.error; ok = 'false' },
+    [pscustomobject]@{ error = [pscustomobject]@{ code = 'other_error' } }
+)) {
+    $result = Get-DevBenchExpectedGuardStatus -ToolName 'communityshaders.test_api' -Arguments $guardArguments -Content @($payload) -ExpectedErrorCode 'producer_mismatch'
+    Assert-Test (-not $result.ok -and -not $result.expectedErrorMatched -and $result.reasons.Count -gt 0) 'expected guard rejects additional error/action receipt/nested code/contradictory flags/wrong code'
+}
+Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.test_api' -Arguments $guardArguments -Content @($exclusiveGuard)).ok) 'ordinary unrequested guard remains a rejection'
 $transient = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ result = [pscustomobject]@{ state = 'service_unavailable' } })
 Assert-Test ($transient.transient -and $transient.states -contains 'service_unavailable') 'transient service state is classified recursively'
 $unknown = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ playerLoaded = $true })
@@ -934,6 +955,8 @@ $retryableExceptionAst = @($entryPointAst.FindAll({ param($node) $node -is [Mana
 $identityProbeResult = & {
     param([string]$RuntimeIdentityFunction, [string]$RetryableFunction)
     Invoke-Expression $RetryableFunction
+    $identityContentAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-RuntimeIdentityContent' }, $true))[0]
+    Invoke-Expression $identityContentAst.Extent.Text
     function Get-DevBenchRuntimeExpectations {
         [pscustomobject]@{ port = 1; pid = $PID; exe = $null; buildId = $null; artifactPath = $null; artifactSha256 = $null }
     }
@@ -941,9 +964,9 @@ $identityProbeResult = & {
     function Test-DevBenchExecutableIdentityMatch { return $true }
     function Invoke-ToolRpc {
         param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers)
-        if ($Name -eq 'inspect') { return [pscustomobject]@{ content = @([pscustomobject]@{ pid = $PID; exe = 'pwsh.exe' }) } }
+        if ($Name -eq 'inspect') { return [pscustomobject]@{ content = @([pscustomobject]@{ ok = $true; pid = $PID; exe = 'pwsh.exe' }) } }
         if ($Name -eq 'communityshaders.first_api') { throw [InvalidOperationException]::new('main thread busy') }
-        return [pscustomobject]@{ content = @([pscustomobject]@{ producer = [pscustomobject]@{ buildId = 'fixture-build' } }) }
+        return [pscustomobject]@{ content = @([pscustomobject]@{ ok = $true; producer = [pscustomobject]@{ buildId = 'fixture-build' } }) }
     }
     $ArtifactPath = ''
     $ExpectedBuildId = ''
@@ -958,8 +981,54 @@ $identityProbeResult = & {
     catch { $waitPropagated = $_.Exception.Message -eq 'main thread busy' }
     [pscustomobject]@{ nonWait = $nonWait; waitPropagated = $waitPropagated }
 } $runtimeIdentityAst.Extent.Text $retryableExceptionAst.Extent.Text
-Assert-Test ($identityProbeResult.nonWait.errors.Count -eq 0 -and $identityProbeResult.nonWait.build.buildId -eq 'fixture-build' -and $identityProbeResult.nonWait.build.sources[0].error -eq 'main thread busy') 'non-wait identity discovery retains one transient candidate failure and continues to a valid sibling producer'
+Assert-Test ($identityProbeResult.nonWait.errors.Count -eq 0 -and $identityProbeResult.nonWait.build.buildId -eq 'fixture-build' -and $identityProbeResult.nonWait.build.sources[0].error -match 'main thread busy') 'non-wait identity discovery retains one transient candidate failure and continues to a valid sibling producer'
 Assert-Test $identityProbeResult.waitPropagated 'wait identity discovery propagates a retryable producer failure into the bounded rebind loop'
+$identitySemanticCases = & {
+    Invoke-Expression $retryableExceptionAst.Extent.Text
+    $contentAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-RuntimeIdentityContent' }, $true))[0]
+    Invoke-Expression $contentAst.Extent.Text
+    Invoke-Expression $runtimeIdentityAst.Extent.Text
+    $ArtifactPath = (Get-Process -Id $PID).Path
+    $ExpectedBuildId = 'fixture-build'
+    $ExpectedArtifactSha256 = ''
+    function Get-DevBenchRuntimeExpectations {
+        [pscustomobject]@{ port = 1; pid = $PID; exe = $null; buildId = $null; artifactPath = $null; artifactSha256 = $null }
+    }
+    function Get-ListenerPid { $PID }
+    $mode = 'valid'
+    function Invoke-ToolRpc {
+        param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers)
+        $payload = if ($Name -eq 'inspect') {
+            [pscustomobject]@{ ok = $true; pid = $PID; exe = 'pwsh.exe' }
+        } else { [pscustomobject]@{ ok = $true; producer = [pscustomobject]@{ buildId = 'fixture-build' } } }
+        if (($mode -like 'health-*' -and $Name -eq 'inspect') -or
+            ($mode -like 'producer-*' -and $Name -eq 'communityshaders.first_api')) {
+            $payload.ok = $false
+            $payload | Add-Member retryable ($mode -like '*retryable')
+            $payload | Add-Member error 'identity unavailable'
+            if ($mode -like '*malformed') { $payload.ok = 'false' }
+            if ($mode -like '*unknown') { $payload.PSObject.Properties.Remove('ok'); $payload.PSObject.Properties.Remove('error') }
+        }
+        [pscustomobject]@{ content = @($payload) }
+    }
+    $tools = @([pscustomobject]@{ name = 'inspect' }, [pscustomobject]@{ name = 'communityshaders.first_api' }, [pscustomobject]@{ name = 'communityshaders.second_api' })
+    $runtime = [pscustomobject]@{ port = 1 }
+    $valid = Get-RuntimeIdentity -Runtime $runtime -Headers @{} -Tools $tools
+    Assert-Test ($valid.verified -and $valid.complete) 'positive qualified health/producer/artifact form a verified complete identity'
+    foreach ($case in @('health-retryable', 'health-terminal', 'health-malformed', 'health-unknown', 'producer-retryable', 'producer-terminal', 'producer-malformed')) {
+        $mode = $case
+        $ordinary = Get-RuntimeIdentity -Runtime $runtime -Headers @{} -Tools $tools
+        if ($case -like 'health-*') {
+            Assert-Test (-not $ordinary.verified -and -not $ordinary.complete -and $null -eq $ordinary.health -and $ordinary.errors.Count -gt 0) "negative/malformed/unknown health cannot authorize mutation: $case"
+        } else {
+            Assert-Test ($ordinary.verified -and $ordinary.build.buildId -eq 'fixture-build' -and $null -eq $ordinary.build.sources[0].producer -and $ordinary.build.sources[0].error -match 'Unqualified') "failed ordinary producer contributes no identity, retains errors and permits valid sibling: $case"
+        }
+        $propagated = $false
+        try { $null = Get-RuntimeIdentity -Runtime $runtime -Headers @{} -Tools $tools -PropagateRetryable }
+        catch { $propagated = Test-WaitRetryableException -Exception $_.Exception }
+        Assert-Test ($propagated -eq ($case -like '*retryable')) "only semantically retryable identity enters shared bounded rebind: $case"
+    }
+}
 $terminalWriterAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Write-TerminalInvocationEvidence' }, $true))[0]
 Invoke-Expression $terminalWriterAst.Extent.Text
 $headerReaderAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-McpSessionHeaderValue' }, $true))[0]
@@ -976,7 +1045,7 @@ Assert-Test ($entryPointText -match '\$Command -eq ''wait'' -and \$statusCode -e
 Assert-Test ($entryPointText -match 'full-runtime-rebind-required') 'bounded waits route invalidated MCP sessions through a full runtime rebind'
 Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$RequirePerformanceNeutral\) -and -not \$semantic\.known') 'required semantic outcomes reject unknown responses'
 Assert-Test ($entryPointText -match '\$waitCompletion = Get-DevBenchWaitCompletion -Observation \$observation' -and $entryPointText -match '\$semantic = \$waitCompletion\.semantic') 'wait semantics preserve terminal service failures and qualify ordinary expiry through one completion classifier'
-Assert-Test ($entryPointText -match '\$Command -eq ''call'' -and -not \$readOnlyCall -and -not \$runtimeIdentity\.complete') 'only mutation-capable calls require complete runtime identity'
+Assert-Test ($entryPointText -match '-not \$runtimeIdentity\.complete -or -not \$runtimeIdentity\.verified') 'mutation-capable calls require complete and positively verified runtime identity'
 Assert-Test ($entryPointText -match '\[string\]\$ExpectedRuntimeIdentityJson') 'controller accepts an exact prior runtime identity for pre-dispatch continuity'
 Assert-Test ($entryPointText.IndexOf('Expected runtime identity is invalid:') -lt $entryPointText.IndexOf("Update-InvocationEvidence -State 'dispatching'")) 'runtime identity continuity is verified before mutation dispatch'
 Assert-Test ($entryPointText -match 'if \(\$Command -eq ''call''\) \{[\s\S]{0,100}-not \$semantic\.known -or -not \$semantic\.ok') 'mutation-capable calls fail closed on unknown semantic outcomes'
