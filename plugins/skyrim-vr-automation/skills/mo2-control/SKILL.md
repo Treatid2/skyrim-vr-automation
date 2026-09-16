@@ -192,6 +192,10 @@ are:
   are controller-derived. Treat the returned loose-file provider proof as
   scoped: overwrite, unmanaged game files, and archives still require separate
   VFS evidence.
+- If explicitly using `register-mod` rather than `add-enable`, use
+  `-WinningPathsFile` for multiple paths in a native `pwsh -File` invocation;
+  comma-separated quoted arguments can bind as one path. A single exact path
+  can use inline `-WinningPaths`.
 - Never treat `coc APStartCell` as a genuine New Game. Copied ordinary saves
   are conveniences, not deterministic baselines; use only an exact
   hash-verified fixture when baseline provenance matters.

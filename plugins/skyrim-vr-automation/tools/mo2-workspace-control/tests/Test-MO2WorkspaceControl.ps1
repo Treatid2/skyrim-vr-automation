@@ -100,6 +100,61 @@ try {
     Import-Module (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'mo2-control\MO2Control.psm1') -Force
     $config = Read-MO2ControlConfig -ConfigPath $configPath
     $access = Invoke-MO2RequestAccess -Config $config -Label fixture -RuntimeRoute SteamVRNull; $accessId = [string]$access.data.access.accessId
+    $discoveryRoot = Join-Path $sessions 'workspaces'
+    $emptyList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact -NoExit | ConvertFrom-Json
+    if (-not $emptyList.ok -or $emptyList.data.count -ne 0) { throw 'Normal empty-root discovery did not succeed.' }
+    foreach ($emptyCase in @('empty-root', 'empty-evidence-directory')) {
+        if ($emptyCase -eq 'empty-evidence-directory') {
+            New-Item -ItemType Directory -Path (Join-Path $discoveryRoot 'empty-create-select') -Force | Out-Null
+        }
+        $expiredList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -InternalTestFailurePoint tree-operation-deadline -Compact -NoExit | ConvertFrom-Json
+        if ($expiredList.ok -or $expiredList.errors[0] -notmatch 'shared .*tree-operation deadline') { throw "Expired $emptyCase discovery silently succeeded." }
+    }
+    $discoveryIniHash = (Get-FileHash -LiteralPath $ini -Algorithm SHA256).Hash
+    $externalJournalDirectory = Join-Path $fixture 'external-journal-evidence'
+    New-Item -ItemType Directory -Path $externalJournalDirectory -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $externalJournalDirectory 'outside.selected-profile.journal.json'), '{"phase":"selection-applied-uncommitted"}')
+    $externalDiscoveryHash = (Get-FileHash -LiteralPath (Join-Path $externalJournalDirectory 'outside.selected-profile.journal.json') -Algorithm SHA256).Hash
+    foreach ($hiddenDirectory in @($false, $true)) {
+        $evidenceLink = Join-Path $discoveryRoot 'unsafe-create-select'
+        try {
+            New-Item -ItemType Junction -Path $evidenceLink -Target $externalJournalDirectory -ErrorAction Stop | Out-Null
+            if ($hiddenDirectory) { [IO.File]::SetAttributes($evidenceLink, ([IO.File]::GetAttributes($evidenceLink) -bor [IO.FileAttributes]::Hidden)) }
+            $unsafeList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact -NoExit | ConvertFrom-Json
+            if ($unsafeList.ok -or $unsafeList.errors[0] -notmatch 'reparse point' -or
+                (Get-FileHash -LiteralPath $ini -Algorithm SHA256).Hash -cne $discoveryIniHash -or
+                (Get-FileHash -LiteralPath (Join-Path $externalJournalDirectory 'outside.selected-profile.journal.json') -Algorithm SHA256).Hash -cne $externalDiscoveryHash) {
+                throw "Visible/hidden reparse evidence directory was not refused without recovery changes ($hiddenDirectory)."
+            }
+        }
+        finally { if (Test-Path -LiteralPath $evidenceLink) { Remove-Item -LiteralPath $evidenceLink -Force } }
+    }
+    foreach ($rootCase in @('root', 'ancestor')) {
+        $alternateBase = Join-Path $fixture ("unsafe-$rootCase")
+        $alternateTarget = Join-Path $fixture ("unsafe-$rootCase-target")
+        New-Item -ItemType Directory -Path $alternateTarget -Force | Out-Null
+        $alternateConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+        if ($rootCase -eq 'root') {
+            New-Item -ItemType Directory -Path $alternateBase -Force | Out-Null
+            $rootLink = Join-Path $alternateBase 'workspaces'
+            $alternateConfig.storage.sessionStaging = $alternateBase
+        }
+        else {
+            New-Item -ItemType Directory -Path (Join-Path $alternateTarget 'sessions\workspaces') -Force | Out-Null
+            $rootLink = $alternateBase
+            $alternateConfig.storage.sessionStaging = Join-Path $alternateBase 'sessions'
+        }
+        $alternateConfig.session.lockFile = Join-Path $alternateConfig.storage.sessionStaging 'lock.json'
+        $alternateConfigPath = Join-Path $fixture ("unsafe-$rootCase-config.json")
+        $alternateConfig | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $alternateConfigPath -Encoding utf8
+        try {
+            New-Item -ItemType Junction -Path $rootLink -Target $alternateTarget -ErrorAction Stop | Out-Null
+            $unsafeList = & $entry list-task -ConfigPath $alternateConfigPath -TaskId $taskId -Compact -NoExit | ConvertFrom-Json
+            if ($unsafeList.ok -or $unsafeList.errors[0] -notmatch 'reparse point' -or
+                (Get-FileHash -LiteralPath $ini -Algorithm SHA256).Hash -cne $discoveryIniHash) { throw "Reparse control $rootCase was not refused before recovery." }
+        }
+        finally { if (Test-Path -LiteralPath $rootLink) { Remove-Item -LiteralPath $rootLink -Force } }
+    }
     $escapedSource = Join-Path $mo2 'outside'
     New-Item -ItemType Directory -Path $escapedSource -Force | Out-Null
     '+Loader' | Set-Content -LiteralPath (Join-Path $escapedSource 'modlist.txt') -Encoding utf8
@@ -553,6 +608,57 @@ try {
     $partialManifest = Join-Path $workspaceControlRoot 'interrupted-create.workspace.json'
     $partialJournal = Join-Path $workspaceControlRoot 'interrupted-create.creation.journal.json'
     [ordered]@{contractVersion='2.0.0';operation='create';phase='profile-copy-uncommitted';workspaceId='interrupted-create';ownershipId='interrupted-owner';profilePath=$partialProfile;manifestPath=$partialManifest} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $partialJournal -Encoding utf8
+    $externalOperationJournal = Join-Path $fixture 'external-operation-journal.json'
+    Move-Item -LiteralPath $partialJournal -Destination $externalOperationJournal
+    $externalOperationHash = (Get-FileHash -LiteralPath $externalOperationJournal -Algorithm SHA256).Hash
+    $journalFileLinkTestsAvailable = $true
+    try {
+        try { New-Item -ItemType SymbolicLink -Path $partialJournal -Target $externalOperationJournal -ErrorAction Stop | Out-Null }
+        catch {
+            if ($_.Exception.Message -notmatch 'Administrator privilege required') { throw }
+            $journalFileLinkTestsAvailable = $false
+        }
+        if ($journalFileLinkTestsAvailable) {
+            $linkedList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact -NoExit | ConvertFrom-Json
+            if ($linkedList.ok -or $linkedList.errors[0] -notmatch 'reparse point' -or
+                -not (Test-Path -LiteralPath $partialProfile) -or
+                (Get-FileHash -LiteralPath $externalOperationJournal -Algorithm SHA256).Hash -cne $externalOperationHash) { throw 'Operation journal file link drove recovery or altered external evidence.' }
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $partialJournal) { Remove-Item -LiteralPath $partialJournal -Force }
+        Move-Item -LiteralPath $externalOperationJournal -Destination $partialJournal
+    }
+    # Execute the production resolver definitions in an isolated metadata fixture.
+    # This always runs, including hosts unable to create actual file symlinks.
+    $workspaceAst = [Management.Automation.Language.Parser]::ParseFile($entry, [ref]$null, [ref]$null)
+    $guardNames = @('Assert-NoWorkspaceReparsePoint', 'Resolve-SelectedProfileJournal', 'Resolve-PendingWorkspaceJournal')
+    $guardText = @($workspaceAst.FindAll({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $guardNames
+    }, $true) | ForEach-Object { $_.Extent.Text }) -join "`n"
+    $guardModule = New-Module -ArgumentList $guardText -ScriptBlock {
+        param($SourceFunctions)
+        $script:journalReads = 0
+        function Get-Item { param($LiteralPath, [switch]$Force, $ErrorAction)
+            [pscustomobject]@{ Attributes = [IO.FileAttributes]::ReparsePoint; FullName = $LiteralPath }
+        }
+        function Get-Content { $script:journalReads++; throw 'Journal content must not be read.' }
+        . ([scriptblock]::Create($SourceFunctions))
+        Export-ModuleMember -Function @()
+    }
+    $leafGuardResult = & $guardModule {
+        $rejected = 0
+        foreach ($resolver in @('Resolve-SelectedProfileJournal', 'Resolve-PendingWorkspaceJournal')) {
+            try { & $resolver -Config @{} -JournalPath 'fixture-reparse-journal.json' }
+            catch { if ($_.Exception.Message -match 'reparse point') { $rejected++ } else { throw } }
+        }
+        [pscustomobject]@{ rejected = $rejected; reads = $script:journalReads }
+    }
+    if ($leafGuardResult.rejected -ne 2 -or $leafGuardResult.reads -ne 0) { throw 'Production recovery resolvers consumed reparse journal authority before qualification.' }
+    Remove-Module -ModuleInfo $guardModule -Force
+    [IO.File]::SetAttributes($partialJournal, ([IO.File]::GetAttributes($partialJournal) -bor [IO.FileAttributes]::Hidden))
+    $expiredJournalList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -InternalTestFailurePoint tree-operation-deadline -Compact -NoExit | ConvertFrom-Json
+    if ($expiredJournalList.ok -or $expiredJournalList.errors[0] -notmatch 'shared .*tree-operation deadline' -or -not (Test-Path -LiteralPath $partialProfile)) { throw "Expired nonempty discovery changed pending recovery state: $($expiredJournalList | ConvertTo-Json -Depth 8 -Compress); profileExists=$(Test-Path -LiteralPath $partialProfile)" }
     $recoveryList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
     $partialJournalResult = Get-Content -LiteralPath $partialJournal -Raw | ConvertFrom-Json
     if (-not $recoveryList.ok -or (Test-Path -LiteralPath $partialProfile) -or (Test-Path -LiteralPath $partialManifest) -or $partialJournalResult.phase -ne 'rolled-back') { throw 'Startup recovery did not remove and terminally record an interrupted workspace creation.' }
@@ -567,6 +673,27 @@ try {
     $interruptedSelection.phase = 'selection-applied-uncommitted'
     $interruptedSelection | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $selectionJournalPath -Encoding utf8
     Remove-Item -LiteralPath $selectionReceiptPath -Force
+    $externalSelectionJournal = Join-Path $fixture 'external-selection-journal.json'
+    Move-Item -LiteralPath $selectionJournalPath -Destination $externalSelectionJournal
+    $externalSelectionHash = (Get-FileHash -LiteralPath $externalSelectionJournal -Algorithm SHA256).Hash
+    $selectionIniHash = (Get-FileHash -LiteralPath $ini -Algorithm SHA256).Hash
+    try {
+        if ($journalFileLinkTestsAvailable) {
+            New-Item -ItemType SymbolicLink -Path $selectionJournalPath -Target $externalSelectionJournal -ErrorAction Stop | Out-Null
+            $linkedList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact -NoExit | ConvertFrom-Json
+            if ($linkedList.ok -or $linkedList.errors[0] -notmatch 'reparse point' -or
+                (Test-Path -LiteralPath $selectionReceiptPath) -or
+                (Get-FileHash -LiteralPath $ini -Algorithm SHA256).Hash -cne $selectionIniHash -or
+                (Get-FileHash -LiteralPath $externalSelectionJournal -Algorithm SHA256).Hash -cne $externalSelectionHash) { throw 'Selected-profile journal file link drove recovery or altered external/pre-state evidence.' }
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $selectionJournalPath) { Remove-Item -LiteralPath $selectionJournalPath -Force }
+        Move-Item -LiteralPath $externalSelectionJournal -Destination $selectionJournalPath
+    }
+    [IO.File]::SetAttributes($selectionJournalPath, ([IO.File]::GetAttributes($selectionJournalPath) -bor [IO.FileAttributes]::Hidden))
+    $selectionEvidenceDirectory = Split-Path -Parent $selectionJournalPath
+    [IO.File]::SetAttributes($selectionEvidenceDirectory, ([IO.File]::GetAttributes($selectionEvidenceDirectory) -bor [IO.FileAttributes]::Hidden))
     $localWorkIdsPath = Join-Path $fixture 'requested-local-work-mods.json'
     '["csx-aio-local-devbench"]' | Set-Content -LiteralPath $localWorkIdsPath -Encoding utf8
     $verified = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label verified -SavePolicy VerifiedFixture -WorkspaceContent ModlistPlusLocalWorkMods -LocalWorkModIdsFile $localWorkIdsPath -Confirm:$false | ConvertFrom-Json
@@ -768,6 +895,7 @@ try {
     $resumeDrift | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $resumeManifestPath -Encoding utf8
     $resumeRecoveryJournal = Join-Path $workspaceControlRoot ($created.data.workspaceId + '.resume.' + $resumeRecoveryId + '.journal.json')
     [ordered]@{contractVersion='2.0.0';operation='resume';phase='manifest-write-uncommitted';operationId=$resumeRecoveryId;workspaceId=$created.data.workspaceId;ownershipId=$created.data.ownershipId;manifestPath=$resumeManifestPath;manifestPreimagePath=$resumeRecoveryPreimage;manifestPreimageSha256=$resumePreimageHash;profilePath=$created.data.profilePath} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $resumeRecoveryJournal -Encoding utf8
+    [IO.File]::SetAttributes($resumeRecoveryJournal, ([IO.File]::GetAttributes($resumeRecoveryJournal) -bor [IO.FileAttributes]::Hidden))
     $null = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
     $resumeRecoveredJournal = Get-Content -LiteralPath $resumeRecoveryJournal -Raw | ConvertFrom-Json
     if ((Get-FileHash -LiteralPath $resumeManifestPath -Algorithm SHA256).Hash -cne $resumePreimageHash -or $resumeRecoveredJournal.phase -ne 'rolled-back') { throw 'Startup recovery did not restore the exact persisted resume manifest preimage.' }
@@ -792,6 +920,7 @@ try {
     Move-Item -LiteralPath $newMod -Destination $modQuarantine
     $retireRecoveryJournal = Join-Path $workspaceControlRoot ($created.data.workspaceId + '.retire.' + $retireRecoveryId + '.journal.json')
     [ordered]@{contractVersion='2.0.0';operation='retire';phase='profile-move-uncommitted';operationId=$retireRecoveryId;workspaceId=$created.data.workspaceId;ownershipId=$created.data.ownershipId;manifestPath=$retireManifestPath;manifestPreimagePath=$retirePreimagePath;manifestPreimageSha256=$retirePreimageHash;profilePath=$created.data.profilePath;profileQuarantine=$profileQuarantine;modMoves=@([ordered]@{source=$newMod;quarantine=$modQuarantine;moved=$true})} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $retireRecoveryJournal -Encoding utf8
+    [IO.File]::SetAttributes($retireRecoveryJournal, ([IO.File]::GetAttributes($retireRecoveryJournal) -bor [IO.FileAttributes]::Hidden))
     $null = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
     $retireRecoveredJournal = Get-Content -LiteralPath $retireRecoveryJournal -Raw | ConvertFrom-Json
     if (-not (Test-Path -LiteralPath $created.data.profilePath -PathType Container) -or -not (Test-Path -LiteralPath $newMod -PathType Container) -or $retireRecoveredJournal.phase -ne 'rolled-back' -or (Get-FileHash -LiteralPath $retireManifestPath -Algorithm SHA256).Hash -cne $retirePreimageHash) { throw 'Startup recovery did not restore an interrupted retirement profile, mod, and exact manifest preimage.' }
@@ -807,7 +936,11 @@ try {
     if (-not (Test-Path -LiteralPath $source) -or -not (Test-Path -LiteralPath $loaderMod)) { throw 'Workspace cleanup damaged stable state.' }
     $releasedAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $nextAccessId
     if (-not $releasedAccess.ok) { throw 'Resumed access release failed.' }
-    [pscustomobject]@{ok=$true; assertions=100; workspaceId=$created.data.workspaceId} | ConvertTo-Json
+    [pscustomobject]@{ok=$true; assertions=100; workspaceId=$created.data.workspaceId; recoveryDiscovery=[ordered]@{
+        junctionCases=4; hiddenControlEvidence=$true; emptyDeadlineCases=2
+        productionLeafGuards=$leafGuardResult; actualJournalFileLinksAvailable=$journalFileLinkTestsAvailable
+        fileLinkLimitation=$(if (-not $journalFileLinkTestsAvailable) { 'Windows requires administrator privilege for file symlink creation.' } else { $null })
+    }} | ConvertTo-Json -Depth 5
 }
 finally {
     $env:CSX_MO2_PROFILE_CONTROL_ROOT = $priorProfileControlRoot
