@@ -121,7 +121,9 @@ function Get-CommonDirectoryPrefix([string[]]$Paths) {
     $split = [Collections.Generic.List[object]]::new()
     foreach ($path in $Paths) {
         $segments = @($path -split '/')
-        $directories = if ($segments.Count -gt 1) { @($segments[0..($segments.Count - 2)]) } else { @() }
+        # Capture the whole conditional so a root-level file retains an empty
+        # array instead of PowerShell unrolling the branch result to $null.
+        $directories = @(if ($segments.Count -gt 1) { $segments[0..($segments.Count - 2)] })
         $split.Add($directories)
     }
     $minimum = [int]::MaxValue
