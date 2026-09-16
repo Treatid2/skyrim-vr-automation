@@ -330,6 +330,59 @@ function Test-DevBenchReadOnlyRequest {
     return $false
 }
 
+function Get-DevBenchExpectedGuardStatus {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ToolName,
+        [Parameter(Mandatory)][Collections.IDictionary]$Arguments,
+        [AllowEmptyCollection()][object[]]$Content,
+        [Parameter(Mandatory)][string]$ExpectedErrorCode)
+
+    $semantic = Get-DevBenchCallSemanticStatus -ToolName $ToolName -Arguments $Arguments -Content $Content
+    $matched = $false
+    # An expected rejection is an exclusive error envelope, never a code found
+    # recursively in an unrelated receipt. Unknown envelope extensions fail closed.
+    $payloads = @($Content)
+    if ($payloads.Count -eq 1 -and $payloads[0] -is [pscustomobject]) {
+        $payload = $payloads[0]
+        $errorProperty = $payload.PSObject.Properties['error']
+        $errorValue = if ($errorProperty) { $errorProperty.Value } else { $null }
+        $allowedEnvelope = @('error', 'ok', 'success', 'retryable')
+        $allowedError = @('code', 'message')
+        $unknownEnvelope = @($payload.PSObject.Properties | Where-Object Name -notin $allowedEnvelope)
+        if ($errorValue -is [pscustomobject] -and
+            $errorValue.PSObject.Properties['code'] -and
+            $errorValue.code -is [string] -and $errorValue.code -ceq $ExpectedErrorCode -and
+            @($errorValue.PSObject.Properties | Where-Object Name -notin $allowedError).Count -eq 0 -and
+            $unknownEnvelope.Count -eq 0) {
+            $matched = $true
+            foreach ($property in $payload.PSObject.Properties) {
+                if ($property.Name -eq 'error') { continue }
+                # Rejection flags must be typed and consistent; success is contradictory.
+                if ($property.Value -isnot [bool] -or $property.Value -ne $false) { $matched = $false }
+            }
+            $message = $errorValue.PSObject.Properties['message']
+            if ($message -and ($message.Value -isnot [string] -or
+                [string]::IsNullOrWhiteSpace($message.Value))) { $matched = $false }
+        }
+    }
+    $semantic | Add-Member -NotePropertyName expectedErrorCode -NotePropertyValue $ExpectedErrorCode -Force
+    $semantic | Add-Member -NotePropertyName expectedErrorMatched -NotePropertyValue $matched -Force
+    if ($matched) {
+        $semantic | Add-Member -NotePropertyName guardRejectionReasons -NotePropertyValue @($semantic.reasons) -Force
+        $semantic.known = $true
+        $semantic.ok = $true
+        $semantic.outcome = 'expected-guard'
+        $semantic.reasons = @()
+    }
+    else {
+        $semantic.ok = $false
+        $semantic.reasons = @($semantic.reasons) + 'Response is not an exclusive, typed expected-error envelope.'
+    }
+    return $semantic
+}
+
+Export-ModuleMember -Function Get-DevBenchExpectedGuardStatus
+
 function Get-DevBenchCallSemanticStatus {
     [CmdletBinding()]
     param(

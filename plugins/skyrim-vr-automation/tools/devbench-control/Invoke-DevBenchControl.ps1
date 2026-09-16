@@ -577,6 +577,9 @@ function Test-WaitRetryableException {
         return $false
     }
     $message = [string]$Exception.Message
+    if ([bool]$Exception.Data['DevBenchIdentitySemanticFailure']) {
+        return [bool]$Exception.Data['DevBenchIdentityRetryable']
+    }
     if ($message -eq 'The DevBench operation deadline expired before another request could start.') {
         return $false
     }
@@ -823,6 +826,23 @@ function Get-ListenerPid([int]$Port) {
     return [int]$records[0]
 }
 
+function Assert-RuntimeIdentityContent {
+    param([object[]]$Content, [string]$Source)
+    $semantic = Get-DevBenchSemanticStatus -Content $Content
+    if (@($Content).Count -ne 1 -or $Content[0] -isnot [pscustomobject] -or
+        -not $semantic.known -or -not $semantic.ok -or -not $semantic.affirmative) {
+        $exception = [InvalidOperationException]::new(
+            "Unqualified runtime identity from ${Source}: $(@($semantic.reasons) -join '; ')")
+        $exception.Data['DevBenchIdentitySemanticFailure'] = $true
+        $exception.Data['DevBenchIdentityRetryable'] = $semantic.known -and -not $semantic.ok -and
+            $semantic.transient -and -not $semantic.guarded -and -not $semantic.affirmative -and
+            @($semantic.rejectedOutcomeEvidence).Count -eq 0 -and
+            @($semantic.reasons | Where-Object { $_ -match 'not Boolean|not a non-empty string|not a supported' }).Count -eq 0
+        throw $exception
+    }
+    return $Content[0]
+}
+
 function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [switch]$AllowDeferredBuildIdentity, [switch]$PropagateRetryable) {
     $expectations = Get-DevBenchRuntimeExpectations -Runtime $Runtime
     if (-not [string]::IsNullOrWhiteSpace($ArtifactPath)) { $expectations.artifactPath = [IO.Path]::GetFullPath($ArtifactPath) }
@@ -833,7 +853,17 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
     $health = $null
     $errors = [Collections.Generic.List[string]]::new()
     if ($inspectAvailable) {
-        try { $health = @(Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'health' } -Headers $Headers).content | Select-Object -First 1 }
+        try {
+            $healthContent = @(Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'health' } -Headers $Headers).content
+            $qualifiedHealth = Assert-RuntimeIdentityContent -Content @($healthContent) -Source 'inspect health'
+            if (-not $qualifiedHealth.PSObject.Properties['pid'] -or
+                $qualifiedHealth.pid -isnot [int] -or $qualifiedHealth.pid -le 0 -or
+                -not $qualifiedHealth.PSObject.Properties['exe'] -or
+                $qualifiedHealth.exe -isnot [string] -or [string]::IsNullOrWhiteSpace($qualifiedHealth.exe)) {
+                throw 'DevBench health requires a positive integer PID and non-empty executable.'
+            }
+            $health = $qualifiedHealth
+        }
         catch {
             if ($PropagateRetryable -and (Test-WaitRetryableException -Exception $_.Exception)) { throw }
             $errors.Add($_.Exception.Message)
@@ -873,7 +903,8 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
         foreach ($action in @('registry', 'capabilities')) {
             try {
                 $arguments = @{ contractMajor = 1; clientId = 'devbench-runtime-identity'; commandId = "identity-$([guid]::NewGuid().ToString('N'))"; action = $action }
-                $payload = @(Invoke-ToolRpc -Name ([string]$candidate.name) -Arguments $arguments -Headers $Headers).content | Select-Object -First 1
+                $identityContent = @(Invoke-ToolRpc -Name ([string]$candidate.name) -Arguments $arguments -Headers $Headers).content
+                $payload = Assert-RuntimeIdentityContent -Content @($identityContent) -Source "$($candidate.name) $action"
                 if ($payload) {
                     if ($payload.PSObject.Properties['producer']) { $producer = $payload.producer }
                     elseif ($payload.PSObject.Properties['registry'] -and $payload.registry.PSObject.Properties['producer']) { $producer = $payload.registry.producer }
@@ -884,7 +915,7 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
             }
             catch {
                 if ($PropagateRetryable -and (Test-WaitRetryableException -Exception $_.Exception)) { throw }
-                $candidateError = $_.Exception.Message
+                $candidateError = (@($candidateError | Where-Object { $_ }) + $_.Exception.Message) -join '; '
             }
         }
         if ($producer) { $producers.Add($producer) }
@@ -923,7 +954,7 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
     if (-not $artifact) { $missing.Add('artifact.path+sha256') }
     return [pscustomobject][ordered]@{
         verified = $errors.Count -eq 0 -and $null -ne $listenerPid -and $null -ne $health
-        complete = $missing.Count -eq 0
+        complete = $missing.Count -eq 0 -and $errors.Count -eq 0 -and $null -ne $health
         expectations = $expectations
         listenerPid = $listenerPid
         process = $processIdentity
@@ -1004,7 +1035,7 @@ try {
         $tools = @($session.tools)
         $runtimeIdentity = $session.runtimeIdentity
         if (-not $SkipRuntimeIdentityVerification) {
-            if ($Command -eq 'call' -and -not $readOnlyCall -and -not $runtimeIdentity.complete) {
+            if ($Command -eq 'call' -and -not $readOnlyCall -and (-not $runtimeIdentity.complete -or -not $runtimeIdentity.verified)) {
                 throw "Mutation-capable DevBench calls require complete runtime identity. Missing: $($runtimeIdentity.missing -join ', ')."
             }
         }
@@ -1098,14 +1129,7 @@ try {
                 }
             }
             if (-not [string]::IsNullOrWhiteSpace($ExpectedErrorCode)) {
-                $matched = @($semantic.codes | Where-Object { $_ -eq $ExpectedErrorCode }).Count -gt 0
-                $semantic | Add-Member -NotePropertyName expectedErrorCode -NotePropertyValue $ExpectedErrorCode -Force
-                $semantic | Add-Member -NotePropertyName expectedErrorMatched -NotePropertyValue $matched -Force
-                if ($matched) {
-                    $semantic.ok = $true
-                    $semantic.outcome = 'expected-guard'
-                    $semantic.reasons = @()
-                }
+                $semantic = Get-DevBenchExpectedGuardStatus -ToolName $Tool -Arguments $arguments -Content @($data.content) -ExpectedErrorCode $ExpectedErrorCode
             }
             if ($performanceGuard) {
                 $performanceGuardAfter = Get-PerformanceMeasurementGuard -Tools $tools -Headers $headers
