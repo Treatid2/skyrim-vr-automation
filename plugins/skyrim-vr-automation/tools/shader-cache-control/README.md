@@ -87,8 +87,9 @@ tags, and—by default—exact shader-source SHA-256. Supply
 `-FeatureSetSha256` whenever an effective feature-set fingerprint is available;
 then an absent or different fingerprint is a hard exclusion. Among compatible
 candidates, exact source, feature-set, build, preset, and observed render-path
-matches rank first, followed by broader verified coverage and
-recency. `select` returns both the ranking and explicit exclusion reasons.
+matches rank first. Within one render family, the request's provenance class
+(`vr-steamvr-*` or legacy `steamvr-*`) ranks ahead of broader verified coverage
+and recency. `select` returns both the ranking and explicit exclusion reasons.
 
 The exact render path remains immutable provenance and an exact-match ranking
 signal. The default `skyrimvr-d3d11` class deliberately permits reuse across
@@ -179,7 +180,10 @@ After the game and MO2 are closed, complete the cache transaction:
 and records a completion receipt. Promotion is opt-in and is refused unless the
 caller explicitly classifies the task result as `known-working`. An unverified
 or failed task result is still preserved as evidence but is not added to the
-catalog. A shader-source mismatch remains excluded unless
+catalog. If the failed or unverified run left the live cache byte-for-byte equal
+to its prepared baseline, `complete` verifies both trees and commits a
+`restore-noop` receipt instead of moving or rebuilding identical data. A
+shader-source mismatch remains excluded unless
 `-AllowSourceMismatch` is accompanied by a concrete `-CompatibilityReason`;
 this exception does not bypass ABI, runtime, bytecode-class, feature-set, status,
 or tag gates.
@@ -189,7 +193,12 @@ restore receipt and committed journal proving the exact snapshot lineage, restor
 identity, cache path, live baseline, and physical preserved working tree. A
 stored receipt pointer is revalidated to the same standard. Malformed, foreign,
 missing, drifted, or ambiguous receipt-shaped evidence leaves the plan pending
-for recovery and never triggers a replacement restore.
+for recovery and never triggers a replacement restore. Receipt-only no-op
+recovery is an explicit validator mode and accepts only the canonical
+`restore-noop` operation spelling; operation casing cannot select a weaker
+proof path. Its receipt and journal must also name the exact preserved-baseline
+path recorded by the original snapshot; another evidence-root directory with
+identical bytes cannot substitute for that snapshot-bound identity.
 
 `seed` requires the existing snapshot receipt for the same live cache and
 evidence directory, verifies the exact source tree, stages it, swaps it into

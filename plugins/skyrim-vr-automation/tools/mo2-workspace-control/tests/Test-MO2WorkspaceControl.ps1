@@ -179,6 +179,8 @@ try {
     if (-not $noLocalWorkStatus.ok -or $noLocalWorkStatus.state -ne 'catalog-not-configured' -or $noLocalWorkStatus.data.availableCount -ne 0) { throw 'A missing optional catalog did not preserve the modlist-only discovery contract.' }
     $boundedStatus = & $entry fixture-status -ConfigPath $configPath -MaxProfileFiles 2 -Compact -NoExit | ConvertFrom-Json
     if ($boundedStatus.ok -or $boundedStatus.errors[0] -notmatch 'maximum file count') { throw 'Profile traversal did not enforce its declared file-count bound.' }
+    $entryPointText = Get-Content -LiteralPath $entry -Raw
+    if ($entryPointText -notmatch '\[int\]\$MaxProfileFiles\s*=\s*100000') { throw 'Workspace traversal did not retain the representative maintained-profile file-count default.' }
     $deadlineStatus = & $entry fixture-status -ConfigPath $configPath -InternalTestFailurePoint tree-operation-deadline -Compact -NoExit | ConvertFrom-Json
     if ($deadlineStatus.ok -or $deadlineStatus.errors[0] -notmatch 'shared .*tree-operation deadline') { throw 'Profile traversal did not enforce its shared total deadline.' }
     if (-not $fixtureStatus.data.approval.reusableApprovalEligible -or @($fixtureStatus.data.approval.reusablePrefix).Count -ne 6 -or $fixtureStatus.data.approval.reusablePrefix[4] -ne [IO.Path]::GetFullPath($entry) -or $fixtureStatus.data.approval.reusablePrefix[5] -ne 'fixture-status') { throw 'Fixture status did not expose its exact reusable approval prefix.' }
@@ -708,8 +710,9 @@ try {
     if (-not $verifiedPreparedCache.ok -or -not $verifiedCompletedCache.ok -or -not $verifiedCompletedOutput.ok) { throw 'Verified fixture workspace output transactions did not complete.' }
     if ((Test-Path -LiteralPath $verified.data.runtimeOutput.cachePath) -or (Test-Path -LiteralPath $verified.data.runtimeOutput.backupPath)) { throw 'Completion did not restore both originally absent Overwrite trees to absence.' }
     foreach ($mixedCase in @(
-        [pscustomobject]@{ label = 'backup-present'; cachePresent = $false; backupPresent = $true; invalidRestore = $false },
-        [pscustomobject]@{ label = 'backup-invalid-restore'; cachePresent = $false; backupPresent = $true; invalidRestore = $true }
+        [pscustomobject]@{ label = 'backup-present'; cachePresent = $false; backupPresent = $true; invalidRestore = $false; hiddenConflict = $false },
+        [pscustomobject]@{ label = 'backup-invalid-restore'; cachePresent = $false; backupPresent = $true; invalidRestore = $true; hiddenConflict = $false },
+        [pscustomobject]@{ label = 'backup-hidden-conflict'; cachePresent = $false; backupPresent = $true; invalidRestore = $false; hiddenConflict = $true }
     )) {
         $mixedCachePath = Join-Path $mo2 'overwrite\ShaderCache'
         $mixedBackupPath = Join-Path $mo2 'overwrite\backup'
@@ -746,6 +749,21 @@ try {
         $mixedBackupPlan | Add-Member -NotePropertyName restoredTreeSha256 -NotePropertyValue ([string]$mixedInterruptedRestore.data.baseline.treeSha256) -Force
         $mixedBackupPlan.state = 'restored'
         $mixedBackupPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $mixedBackupPlanPath -Encoding utf8
+        if ($mixedCase.hiddenConflict) {
+            $hiddenConflictPath = Join-Path ([string]$mixedWorkspace.data.runtimeOutput.backupEvidenceDirectory) 'shader-cache-restore.hidden-conflict.receipt.json'
+            Set-Content -LiteralPath $hiddenConflictPath -Value '{' -Encoding utf8
+            [IO.File]::SetAttributes($hiddenConflictPath, ([IO.File]::GetAttributes($hiddenConflictPath) -bor [IO.FileAttributes]::Hidden))
+            $hiddenConflictCompletion = & $entry complete-output -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $mixedWorkspace.data.workspaceId -NoExit -Confirm:$false | ConvertFrom-Json
+            if ($hiddenConflictCompletion.ok -or $hiddenConflictCompletion.errors[0] -notmatch 'conflicts with other recovery evidence' -or
+                (Test-Path -LiteralPath ([string]$mixedWorkspace.data.runtimeOutput.backupCompletionPath)) -or
+                -not (Test-Path -LiteralPath ([string]$mixedWorkspace.data.runtimeOutput.ownerMarkerPath) -PathType Leaf)) {
+                throw 'Workspace backup recovery did not fail closed on a hidden competing restore receipt.'
+            }
+            Remove-Item -LiteralPath ([string]$mixedWorkspace.data.runtimeOutput.ownerMarkerPath) -Force
+            Remove-Item -LiteralPath ([string]$mixedWorkspace.data.profilePath) -Recurse -Force
+            Remove-Item -LiteralPath (Join-Path $workspaceControlRoot ([string]$mixedWorkspace.data.workspaceId + '.json')) -Force
+            continue
+        }
         if ($mixedCase.invalidRestore) {
             $invalidReceipt = Get-Content -LiteralPath ([string]$mixedInterruptedRestore.data.restoreReceiptPath) -Raw | ConvertFrom-Json -Depth 30
             $invalidReceipt.operation = 'seed'

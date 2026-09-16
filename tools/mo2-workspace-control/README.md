@@ -14,7 +14,9 @@ verification share one command-wide tree-operation deadline. The controller
 also enforces explicit file, directory, depth, and aggregate-byte limits and
 rejects reparse points. Exceeding any budget returns a bounded failure before a
 new clone is committed; the limits are configurable through the corresponding
-`-MaxProfile*` and `-TreeOperationTimeoutSeconds` parameters.
+`-MaxProfile*` and `-TreeOperationTimeoutSeconds` parameters. The default file
+budget is 100,000 so the maintained MGO profile fits with safety headroom;
+callers may still select a lower explicit bound for smaller profiles.
 
 `prepare-source` performs the one-time legacy-cache migration. With an owned
 lease and all MO2/runtime processes closed, it moves every Overwrite
