@@ -1522,6 +1522,7 @@ function Write-SelectedProfileReceipt([Collections.IDictionary]$Journal) {
 }
 
 function Resolve-SelectedProfileJournal($Config, [string]$JournalPath) {
+    Assert-NoWorkspaceReparsePoint -Path $JournalPath -Purpose 'Selected-profile recovery journal'
     $journal = Get-Content -LiteralPath $JournalPath -Raw | ConvertFrom-Json -AsHashtable
     $phase = [string]$journal['phase']
     if ($phase -in @('committed', 'recovered-committed', 'rolled-back', 'recovered-preimage', 'aborted-before-mutation', 'compensated-by-parent')) { return $journal }
@@ -1552,13 +1553,36 @@ function Resolve-SelectedProfileJournal($Config, [string]$JournalPath) {
 }
 
 function Resolve-PendingSelectedProfileJournals($Config) {
+    Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
     $root = Get-WorkspaceControlRoot -Config $Config
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
-    $inventory = Get-BoundedTreeInventory -Path $root -Purpose 'Workspace selected-profile journal discovery'
-    $resolved = @()
-    foreach ($file in @($inventory.files | Where-Object { [IO.Path]::GetFileName([string]$_.path) -like '*.selected-profile.journal.json' })) {
-        $resolved += Resolve-SelectedProfileJournal -Config $Config -JournalPath ([string]$file.fullPath)
+    Assert-NoWorkspaceReparsePoint -Path $root -Purpose 'Workspace selected-profile control root'
+    $evidenceDirectories = @(
+        @(Get-ChildItem -LiteralPath $root -Directory -Force -Filter '*-create-select'),
+        @(Get-ChildItem -LiteralPath $root -Directory -Force -Filter '*-resume-*'),
+        @(Get-ChildItem -LiteralPath $root -Directory -Force -Filter '*-retire-*')
+    ) | ForEach-Object { $_ } | Sort-Object FullName -Unique
+    Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
+    $journalFiles = @()
+    foreach ($directory in $evidenceDirectories) {
+        Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
+        if ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Workspace selected-profile evidence directory is a reparse point: $($directory.FullName)"
+        }
+        Assert-NoWorkspaceReparsePoint -Path $directory.FullName -Purpose 'Workspace selected-profile evidence directory'
+        $journalFiles += @(Get-ChildItem -LiteralPath $directory.FullName -Filter '*.selected-profile.journal.json' -File -Force)
+        Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
     }
+    foreach ($file in $journalFiles) {
+        Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
+        Assert-NoWorkspaceReparsePoint -Path $file.FullName -Purpose 'Selected-profile recovery journal'
+    }
+    $resolved = @()
+    foreach ($file in $journalFiles) {
+        Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
+        $resolved += Resolve-SelectedProfileJournal -Config $Config -JournalPath $file.FullName
+    }
+    Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
     return @($resolved)
 }
 
@@ -1598,6 +1622,7 @@ function Assert-WorkspaceRecoveryPath([string]$Path, [string]$Root, [string]$Pur
 }
 
 function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
+    Assert-NoWorkspaceReparsePoint -Path $JournalPath -Purpose 'Workspace operation recovery journal'
     $journal = Get-Content -LiteralPath $JournalPath -Raw | ConvertFrom-Json -AsHashtable
     if ([string]$journal['phase'] -in @('committed', 'rolled-back', 'recovered-committed', 'recovered-preimage')) { return $journal }
     $profilesRoot = [IO.Path]::GetFullPath([string]$Config.mo2.profilesDirectory)
@@ -1725,13 +1750,22 @@ function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
 }
 
 function Resolve-PendingWorkspaceJournals($Config) {
+    Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
     $root = Get-WorkspaceControlRoot -Config $Config
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
-    $inventory = Get-BoundedTreeInventory -Path $root -Purpose 'Workspace operation journal discovery'
+    Assert-NoWorkspaceReparsePoint -Path $root -Purpose 'Workspace operation control root'
     $resolved = @()
-    foreach ($file in @($inventory.files | Where-Object { [IO.Path]::GetFileName([string]$_.path) -match '\.(creation|resume\.[^.]+|retire\.[^.]+)\.journal\.json$' })) {
-        $resolved += Resolve-PendingWorkspaceJournal -Config $Config -JournalPath ([string]$file.fullPath)
+    $journalFiles = @(Get-ChildItem -LiteralPath $root -Filter '*.journal.json' -File -Force | Where-Object { $_.Name -match '\.(creation|resume\.[^.]+|retire\.[^.]+)\.journal\.json$' })
+    Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
+    foreach ($file in $journalFiles) {
+        Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
+        Assert-NoWorkspaceReparsePoint -Path $file.FullName -Purpose 'Workspace operation recovery journal'
     }
+    foreach ($file in $journalFiles) {
+        Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
+        $resolved += Resolve-PendingWorkspaceJournal -Config $Config -JournalPath $file.FullName
+    }
+    Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
     return @($resolved)
 }
 

@@ -218,7 +218,9 @@ mod already proven task-owned by that workspace. Winner proof intentionally
 covers enabled loose-file providers in the exact profile. Overwrite, unmanaged
 game files, and archives still require separate VFS evidence.
 
-Use `-WinningPathsFile` for multiple paths in a direct approval-compatible
+Use inline `-WinningPaths` for one path only. Native `pwsh -File` argument
+binding can collapse comma-separated quoted values into one string, so use
+`-WinningPathsFile` for every multi-path direct or approval-compatible
 invocation; the format matches the profile controller. Every result also
 reports `data.configuration` with the exact selected config path, source, and
 candidate precedence.
