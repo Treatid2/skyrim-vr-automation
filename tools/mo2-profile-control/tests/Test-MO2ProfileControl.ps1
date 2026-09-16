@@ -67,7 +67,14 @@ try {
     [IO.File]::WriteAllText((Join-Path $mixedOld 'SKSE\Plugins\Shared.ini'), 'functional configuration')
 
     $automaticEvidence = Join-Path $fixture 'automatic-evidence'
+    $automaticPreviewEvidence = Join-Path $fixture 'automatic-preview-evidence'
+    $automaticPreview = & $script add-enable -ProfilePath $automaticProfile -ModName 'Automatic Target' -ModDirectory $automaticTarget -ModsDirectory $mods -EvidenceDirectory $automaticPreviewEvidence -BlockingProcessNames $fixtureProcessNames -WhatIf | ConvertFrom-Json
+    $previewPlan = $automaticPreview.operationResult.automaticDllPlan
+    if (@($previewPlan.targetDllPaths).Count -ne 1 -or $previewPlan.targetDllPaths[0] -ne 'SKSE\Plugins\Shared.dll') { throw 'WhatIf lost target DLL discovery.' }
+    if ($automaticPreview.operationResult.relativeToMod -ne 'Mixed Old' -or @($previewPlan.providers).Count -ne 2 -or @($previewPlan.disableMods).Count -ne 1 -or $previewPlan.disableMods[0] -ne 'DLL Only Old' -or @($previewPlan.providers | Where-Object { $_.modName -eq 'Mixed Old' -and $_.retainedFunctionalPaths -contains 'SKSE\Plugins\Shared.ini' }).Count -ne 1) { throw 'WhatIf changed winner placement or provider-retirement classification.' }
+    if ((Get-FileHash -LiteralPath $automaticProfile -Algorithm SHA256).Hash -ne $automaticOriginalHash -or (Test-Path -LiteralPath $automaticPreviewEvidence)) { throw 'Add-enable WhatIf changed profile or created evidence.' }
     $automatic = & $script add-enable -ProfilePath $automaticProfile -ModName 'Automatic Target' -ModDirectory $automaticTarget -ModsDirectory $mods -EvidenceDirectory $automaticEvidence -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
+    if (($previewPlan | ConvertTo-Json -Depth 15 -Compress) -cne ($automatic.operationResult.automaticDllPlan | ConvertTo-Json -Depth 15 -Compress)) { throw 'Preview and actual add-enable plan differ for identical preimage and providers.' }
     $automaticLines = Get-Content -LiteralPath $automaticProfile
     if (-not $automatic.enabled -or -not $automatic.operationResult.registered -or @($automatic.operationResult.automaticDllPlan.targetDllPaths).Count -ne 1) { throw 'Add-enable did not register the target and discover its DLL path.' }
     if ($automaticLines[1] -ne '-DLL Only Old' -or $automaticLines[2] -ne '+Automatic Target' -or $automaticLines[3] -ne '+Mixed Old') { throw 'Add-enable did not disable only the exact DLL-only provider and place the target above the retained mixed provider.' }
@@ -222,7 +229,7 @@ try {
         $null = Invoke-MO2ReleaseAccess -Config $humanConfig -AccessId $humanAccess.data.access.accessId
     }
 
-    [pscustomobject]@{ ok = $true; assertions = 40; restoredSha256 = $enableRestored.sha256 } | ConvertTo-Json
+    [pscustomobject]@{ ok = $true; assertions = 44; restoredSha256 = $enableRestored.sha256 } | ConvertTo-Json
 }
 finally {
     $env:CSX_MO2_PROFILE_CONTROL_ROOT = $priorControlRoot
