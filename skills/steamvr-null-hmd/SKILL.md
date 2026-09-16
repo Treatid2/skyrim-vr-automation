@@ -46,8 +46,10 @@ particular drive letter for the plugin itself.
 5. Create or select one attributable evidence directory for the test. The
    target-owned transaction journal, rather than this caller-selected folder,
    is authoritative. Preview
-   `apply` or `restore` with `-WhatIf`, then perform the authorized operation
-   using the same `-EvidenceDirectory`. For an MO2-backed `apply` or `start`,
+   Create the exact task-scoped evidence directory before preview; `-WhatIf`
+   deliberately never creates it. Preview `apply` or `restore` with `-WhatIf`,
+   then perform the authorized operation using the same `-EvidenceDirectory`.
+   For an MO2-backed `apply` or `start`,
    pass the exact admitted `-MO2AccessId <literal-access-id>` and
    `-MO2Profile <literal-profile-name>` on every call. The controller repeats
    the closed-state `SteamVRNull` provider admission and binds its public proof

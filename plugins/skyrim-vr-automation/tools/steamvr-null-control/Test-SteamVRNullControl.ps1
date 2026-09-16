@@ -138,6 +138,10 @@ try {
     $poseView.Write(112, [uint32]$PID)
     $poseView.Write(120, [uint64][DateTime]::UtcNow.ToFileTimeUtc())
 
+    $absentEvidence = Join-Path $fixture 'absent-evidence'
+    $absentEvidencePreview = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $absentEvidence -Standalone -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $absentEvidencePreview.ok -and $absentEvidencePreview.errors[0] -match 'Create this exact task-scoped directory before preview/apply' -and -not (Test-Path -LiteralPath $absentEvidence)) 'apply preview explains the evidence-directory precondition without mutating the requested path'
+
     $inspectBefore = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json
     Assert-Test ($inspectBefore.ok -and $inspectBefore.state -eq 'null-inactive') 'inspect identifies inactive null profile'
     Assert-Test ($inspectBefore.data.runtime.headPoseState.qualified -and $inspectBefore.data.runtime.headPoseState.protocolValid -and $inspectBefore.data.runtime.headPoseState.driverIdentityVerified) 'inspect accepts a fully acknowledged v2 head-pose provider with verified live-process identity'

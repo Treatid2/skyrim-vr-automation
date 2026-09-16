@@ -95,6 +95,24 @@ Assert-Test (-not $mixedDismissal.permitted -and $mixedDismissal.retainedMenus[0
 $modalDismissal = Get-DevBenchMenuDismissalPlan -MenuObservation $modal -DismissBlockingMenus @('InventoryMenu')
 Assert-Test (-not $modalDismissal.permitted -and $modalDismissal.reason -eq 'message-box-requires-explicit-answer') 'message boxes are never auto-dismissed'
 
+Assert-Test (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $false -IssuedSessionId '' -StatusCode 404) 'only an initial sessionless MCP 404 proves capability absence'
+Assert-Test (-not (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $true -IssuedSessionId 'session-1' -StatusCode 404)) 'a post-initialization MCP 404 cannot authorize REST fallback'
+Assert-Test (-not (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $false -IssuedSessionId '' -StatusCode 503)) 'a non-404 MCP initialization failure cannot authorize REST fallback'
+Assert-Test (Test-DevBenchMcpRestFallbackAllowed -InitialCapabilityMiss $true -McpCapabilityPreviouslyProven $false) 'the first genuine sessionless MCP capability miss may select REST compatibility'
+Assert-Test (-not (Test-DevBenchMcpRestFallbackAllowed -InitialCapabilityMiss $true -McpCapabilityPreviouslyProven $true)) 'a sessionless replacement handshake cannot forget previously proven MCP capability'
+$mcpDecodeFailure = Get-DevBenchMutationFailureDisposition -Mutation $true -RequestAttempted $true -ResponseReceived $true -StatusCode $null -Transient $false
+Assert-Test ($mcpDecodeFailure.indeterminate -and $mcpDecodeFailure.reason -eq 'response-outcome-undecodable') 'an undecodable MCP mutation response remains indeterminate after one dispatch'
+$mcpPreDispatchFailure = Get-DevBenchMutationFailureDisposition -Mutation $true -RequestAttempted $false -ResponseReceived $false -StatusCode $null -Transient $false
+Assert-Test (-not $mcpPreDispatchFailure.indeterminate -and $mcpPreDispatchFailure.reason -eq 'pre-dispatch-failure') 'an MCP pre-dispatch failure remains definite and is not mislabeled as committed'
+$restDecodeFailure = Get-DevBenchRestMutationFailureDisposition -Mutation $true -RequestAttempted $true -ResponseReceived $true -StatusCode $null -Transient $false
+Assert-Test ($restDecodeFailure.indeterminate -and $restDecodeFailure.reason -eq 'response-outcome-undecodable') 'an undecodable REST mutation response remains indeterminate after one dispatch'
+$restConnectionFailure = Get-DevBenchRestMutationFailureDisposition -Mutation $true -RequestAttempted $true -ResponseReceived $false -StatusCode $null -Transient $false
+Assert-Test ($restConnectionFailure.indeterminate -and $restConnectionFailure.reason -eq 'dispatch-outcome-unknown') 'an unclassified post-dispatch REST mutation failure remains indeterminate'
+$restPreDispatchFailure = Get-DevBenchRestMutationFailureDisposition -Mutation $true -RequestAttempted $false -ResponseReceived $false -StatusCode $null -Transient $false
+Assert-Test (-not $restPreDispatchFailure.indeterminate -and $restPreDispatchFailure.reason -eq 'pre-dispatch-failure') 'a pre-dispatch REST serialization failure is not falsely classified as possibly committed'
+$restRejectedMutation = Get-DevBenchRestMutationFailureDisposition -Mutation $true -RequestAttempted $true -ResponseReceived $false -StatusCode 400 -Transient $false
+Assert-Test (-not $restRejectedMutation.indeterminate -and $restRejectedMutation.definitiveHttpRejection) 'an observed non-transient HTTP rejection remains a definite failed mutation'
+
 function New-TestUpscalingProfile([string]$Method = 'dlss', [bool]$RenderScale = $true) {
     [pscustomobject]@{
         method = [pscustomobject]@{ name = $Method; value = $(if ($Method -eq 'dlss') { 3 } elseif ($Method -eq 'fsr') { 2 } else { 1 }) }
@@ -376,6 +394,10 @@ Assert-Test ($expectations.port -eq 8921 -and $expectations.pid -eq 123 -and $ex
 Assert-Test ($expectations.buildId -eq 'build-1' -and $expectations.artifactPath -like '*CommunityShaders.dll' -and $expectations.artifactSha256 -eq 'ABC') 'runtime expectations preserve build and deployed artifact identity'
 $legacy = Get-DevBenchRuntimeExpectations -Runtime ([pscustomobject]@{ port = 8921 })
 Assert-Test ($null -eq $legacy.pid -and $null -eq $legacy.exe) 'legacy port-only runtime metadata remains supported'
+Assert-Test (Test-DevBenchExecutableIdentityMatch -Expected 'D:\SteamLibrary\steamapps\common\SkyrimVR\SkyrimVR.exe' -Actual 'SkyrimVR.exe') 'canonical runtime executable paths match the health basename'
+Assert-Test (Test-DevBenchExecutableIdentityMatch -Expected 'SkyrimVR.exe' -Actual 'D:\SteamLibrary\steamapps\common\SkyrimVR\SkyrimVR.exe') 'health and process executable comparison is symmetric across path and basename forms'
+Assert-Test (-not (Test-DevBenchExecutableIdentityMatch -Expected 'D:\SteamLibrary\steamapps\common\SkyrimVR\SkyrimVR.exe' -Actual 'OtherGame.exe')) 'different executable basenames remain rejected'
+Assert-Test (-not (Test-DevBenchExecutableIdentityMatch -Expected 'D:\One\SkyrimVR.exe' -Actual 'E:\Two\SkyrimVR.exe')) 'two canonical executable paths must identify the same location'
 
 $versionedTool = [pscustomobject]@{
     name = 'communityshaders.profiler'
@@ -465,18 +487,20 @@ Assert-Test ($entryPointText -match '\$requestedAction -eq ''disable''[\s\S]{0,1
 Assert-Test ($entryPointText -match 'outcome = ''profiler-contract-satisfied''') 'accepted profiler responses report their contract-specific outcome'
 Assert-Test ($entryPointText -match 'Invoke-ToolRpc -Name \$Tool -Arguments \$arguments -Headers \$headers -Mutation:\(-not \$readOnlyCall\)') 'user calls carry their explicit retry-safety classification'
 Assert-Test ($entryPointText -match 'not-retried-indeterminate') 'ambiguous mutation transport failures are not replayed'
-Assert-Test ($entryPointText -match 'Update-InvocationEvidence -State \$\(if \(\$outcomeIndeterminate\) \{ ''indeterminate'' \}') 'indeterminate mutation outcomes are durably journaled'
-Assert-Test ($entryPointText -match '-Semantic \$semantic -Data \$data -Errors') 'post-dispatch failures preserve accepted data in the invocation journal when possible'
+Assert-Test ($entryPointText -match '\$failureState = if[\s\S]{0,300}\$outcomeIndeterminate\) \{ ''indeterminate'' \}' -and $entryPointText -match 'Update-InvocationEvidence -State \$failureState') 'indeterminate mutation outcomes are durably journaled'
+Assert-Test ($entryPointText -match '-Semantic \$semantic -Data \$failureData -Errors') 'post-dispatch failures preserve accepted data in the invocation journal when possible'
 Assert-Test (
     $entryPointText -match 'acceptedDataRetained = \[bool\]\$dispatch\.acceptedDataRetained' -and
     $entryPointText -match 'responseDataRetained = \[bool\]\$dispatch\.responseDataRetained' -and
-    $entryPointText -match 'data = \$data'
+    $entryPointText -match 'data = \$failureData'
 ) 'post-dispatch failure envelopes retain accepted response data and expose its provenance'
 Assert-Test ($entryPointText -match '\$headers = \$null[\s\S]{0,300}probeError') 'wait probe transport failures force full session and identity rebind'
-Assert-Test ($entryPointText -match '-TimeoutSec \(Get-RequestTimeoutSeconds\)') 'wait requests consume only their remaining operation budget'
+Assert-Test ($entryPointText -match '\$requestTimeoutSeconds = Get-RequestTimeoutSeconds' -and $entryPointText -match '-TimeoutSec \$requestTimeoutSeconds') 'wait requests consume only their remaining operation budget before dispatch begins'
 Assert-Test ($entryPointText -match '\$operationStartedUtc = \[DateTime\]::UtcNow' -and $entryPointText -match '\$operationDeadlineUtc = \$operationStartedUtc.AddSeconds\(\$TimeoutSeconds\)' -and $entryPointText -notmatch '\[Math\]::Min\(15,') 'blocking calls use the declared operation budget instead of a fixed 15-second transport cap'
 Assert-Test ($entryPointText -notmatch 'Start-Sleep -Milliseconds \$currentDelay') 'wait poll delays cannot exceed the operation deadline'
 Assert-Test ($entryPointText -match 'mcp-session-reinitialized') 'bounded waits reinitialize invalidated MCP sessions'
+Assert-Test ($entryPointText -match '\[int\]\$MaxSessionRebinds = 3' -and $entryPointText -match 'DevBenchPersistentSessionInvalidation') 'bounded waits terminate repeated MCP session churn before exhausting the full outer deadline'
+Assert-Test ($entryPointText -match "persistentSessionInvalidation\) \{ 'persistent-session-invalidated'" -and $entryPointText -match 'lastSuccessfulObservation = \$lastSuccessfulWaitObservation' -and $entryPointText -match 'Update-InvocationEvidence -State \$failureState -Semantic \$semantic -Data \$failureData') 'persistent session invalidation returns and journals a distinct state with the last successfully decoded observation'
 Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$Command -eq ''wait''\)') 'unsatisfied waits fail even without RequireSuccess'
 Assert-Test ($entryPointText -match 'function Close-McpSession') 'entry point defines deterministic MCP session cleanup'
 Assert-Test ($entryPointText -match '-Method Delete') 'owned MCP sessions are closed through the server lifecycle endpoint'
@@ -500,7 +524,7 @@ Assert-Test ($entryPointText -match "invocationRecord\['sessionCleanup'\]") 'fin
 Assert-Test ($entryPointText -match "Session cleanup evidence could not be journaled" -and $entryPointText -match 'evidenceJournalFinalized') 'a final journal failure is reported without suppressing the completed controller result'
 Assert-Test ($entryPointText -match "outcome = 'tool-unavailable'" -and $entryPointText -match "codes = @\('tool_unavailable'\)") 'missing optional tools retain a structured unavailable outcome without dispatch'
 Assert-Test ($entryPointText -match 'method = ''tools/list''[\s\S]{0,400}currentTools') 'performance boundaries refresh the live tool registry'
-Assert-Test ($entryPointText -match 'function Invoke-ToolRpc[\s\S]{0,300}Invoke-McpRequest') 'tool calls use the shared deadline-bounded request path'
+Assert-Test ($entryPointText -match 'function Invoke-ToolRpc[\s\S]{0,1200}Invoke-McpRequest' -and $entryPointText -match 'function Invoke-ToolRpc[\s\S]{0,500}Invoke-RestRequest') 'tool calls use the shared deadline-bounded request path for both negotiated transports'
 Assert-Test ($entryPointText -match 'requestTimeoutSeconds = \$script:requestTimeoutSecondsForRpc') 'receipts expose the effective request timeout'
 Assert-Test ($entryPointText -match '\[string\]\$EvidenceLabel') 'runtime binding evidence accepts an explicit invocation label'
 Assert-Test ($entryPointText -match 'devbench-runtime-binding\.\$safeLabel\.\$stamp\.\$PID\.json') 'parallel runtime bindings use invocation-unique filenames'
@@ -509,8 +533,18 @@ Assert-Test ($entryPointText -match "state = 'transport_retry'") 'serviceReady c
 Assert-Test ($entryPointText -match 'probeError = \$_.Exception.Message') 'wait observations preserve the transient probe error'
 Assert-Test ($entryPointText -match "phase = 'initialize'; recovery = 'outer-wait-retry'") 'wait initialization failures remain inside the outer timeout state machine'
 Assert-Test ($entryPointText -match '\$null -eq \$headers') 'bounded waits establish or re-establish the MCP session inside the polling loop'
-Assert-Test ($entryPointText -match '\[switch\]\$AcceptAlreadyLoaded') 'playerLoaded exposes an explicit compatibility opt-out for freshness'
-Assert-Test ($entryPointText -match '\$playerTransitionObserved') 'playerLoaded requires an observed unloaded-to-loaded transition by default'
+Assert-Test ($entryPointText -match 'function Open-DevBenchSession' -and $entryPointText -match "DevBenchMcpCapabilityAbsent" -and $entryPointText -match "recovery = 'rest-capability-negotiation'") 'transport negotiation falls back only after an explicitly classified initial MCP capability miss'
+Assert-Test ($entryPointText -match '\$script:mcpCapabilityPreviouslyProven = \$true' -and $entryPointText -match 'Test-DevBenchMcpRestFallbackAllowed' -and $entryPointText -match 'Refusing REST downgrade') 'same-runtime rebinds retain prior MCP capability evidence and reject a later REST downgrade'
+Assert-Test ($entryPointText -match "DevBenchMcpCapabilityRegression" -and $entryPointText -match "'mcp-capability-regression'" -and $entryPointText -match 'restFallbackRefused = \$true') 'a rejected replacement handshake returns and journals an explicit non-retryable MCP capability regression'
+Assert-Test ($entryPointText -match '\$responseReceived = \$true' -and $entryPointText -match 'Get-DevBenchMutationFailureDisposition -Mutation' -and $entryPointText -match 'disposition = \$mutationDisposition\.reason') 'MCP post-dispatch decode failures flow into the durable indeterminate-mutation result'
+Assert-Test ($entryPointText -match '/api/tools' -and $entryPointText -match '/api/tool/\$escapedName') 'REST fallback uses DevBench discovery and exact tool endpoints'
+Assert-Test ($entryPointText -match 'DevBench REST mutation transport failed after dispatch' -and $entryPointText -match 'DevBenchIndeterminateMutation') 'REST mutations preserve the no-replay indeterminate contract'
+Assert-Test ($entryPointText -match 'transport = \$transport') 'runtime and invocation evidence identify the negotiated transport'
+Assert-Test (([regex]::Matches($entryPointText, '\$AcceptAlreadyLoaded')).Count -eq 1 -and ([regex]::Matches($entryPointText, '\$LoadAlreadyQueued')).Count -eq 1 -and $entryPointText -notmatch '\$playerTransitionObserved') 'legacy load switches are accepted without retaining a transient load-edge dependency'
+Assert-Test ($entryPointText -match 'Condition ''playerLoaded'' requires -ExpectedCell') 'playerLoaded requires an exact destination cell'
+Assert-Test ($entryPointText -match 'elseif \(\$Condition -eq ''playerLoaded''\)[\s\S]+?kind = ''state''[\s\S]+?kind = ''scene''') 'playerLoaded polls authoritative player and scene state'
+Assert-Test ($entryPointText -match 'completionBasis = ''current-state''') 'playerLoaded receipts identify state-based completion'
+Assert-Test ($entryPointText -match 'satisfied = \[bool\]\$state\.playerLoaded -and \$cellMatches') 'playerLoaded requires loaded state in the expected cell'
 Assert-Test ($entryPointText -match '\[string\[\]\]\$DismissBlockingMenus') 'menu recovery requires an explicit menu allowlist'
 Assert-Test ($entryPointText -match 'action = ''close''; name = \$menuName') 'menu recovery uses the registered menu close action'
 Assert-Test ($entryPointText -match '\[int\]\$MinimumMenuStableSeconds') 'menu recovery can require a continuous stable window'
