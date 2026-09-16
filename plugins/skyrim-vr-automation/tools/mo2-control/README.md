@@ -165,8 +165,10 @@ overrides the profile's actual runtime files.
 never expires, steals, or transfers a lease because its estimate elapsed.
 `renew-access` refreshes the recorded activity time and can replace the
 estimate. `access-status` reports availability and exact ownership.
-Session owner liveness is bound to both process ID and process start time, so a
-reused PID cannot make an abandoned session appear live.
+Session owner liveness is bound to process ID, process start time, and executable
+path, so a reused PID cannot make an abandoned session appear live. The same
+complete lifetime proof gates cooperative `close`, `stop`, dialog cleanup, and
+RootBuilder recovery actions; a matching PID alone never authorizes UI control.
 
 Every task must call `release-access` as soon as it no longer needs MO2. This
 includes compilation, source editing, result analysis, report writing, and any

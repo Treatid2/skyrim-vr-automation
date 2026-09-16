@@ -70,6 +70,7 @@ $runtimeIdentity = $null
 $transportRetries = [Collections.Generic.List[object]]::new()
 $ownedMcpSessions = [Collections.Generic.List[object]]::new()
 $mcpSessionInvalidationCount = 0
+$mcpCapabilityPreviouslyProven = $false
 $lastSuccessfulWaitObservation = $null
 $invocationEvidencePath = $null
 $invocationRecord = $null
@@ -374,8 +375,13 @@ function Invoke-McpRequest {
     $delay = [Math]::Max(50, $PollMilliseconds)
     while ($true) {
         $attempt++
+        $requestAttempted = $false
+        $responseReceived = $false
         try {
-            $response = Invoke-WebRequest -UseBasicParsing -Method Post -Uri $Endpoint -Headers $Headers -Body $body -TimeoutSec (Get-RequestTimeoutSeconds)
+            $requestTimeoutSeconds = Get-RequestTimeoutSeconds
+            $requestAttempted = $true
+            $response = Invoke-WebRequest -UseBasicParsing -Method Post -Uri $Endpoint -Headers $Headers -Body $body -TimeoutSec $requestTimeoutSeconds
+            $responseReceived = $true
             try {
                 $json = $response.Content | ConvertFrom-Json -Depth 50 -ErrorAction Stop
             }
@@ -398,10 +404,12 @@ function Invoke-McpRequest {
                 ($Command -eq 'wait' -and $statusCode -eq 404 -and -not $Probe) -or
                 $_.Exception -is [System.TimeoutException] -or
                 $_.Exception.Message -match 'timed out|temporarily unavailable|connection.*closed'
-            if ($Mutation -and $transient) {
+            $mutationDisposition = Get-DevBenchMutationFailureDisposition -Mutation ([bool]$Mutation) -RequestAttempted $requestAttempted -ResponseReceived $responseReceived -StatusCode $statusCode -Transient $transient
+            if ($mutationDisposition.indeterminate) {
                 $transportRetries.Add([pscustomobject][ordered]@{
                     attempt = $attempt; statusCode = $statusCode; delayMilliseconds = 0
-                    recovery = 'not-retried-indeterminate'; message = $_.Exception.Message; timestampUtc = [DateTime]::UtcNow.ToString('o')
+                    recovery = 'not-retried-indeterminate'; disposition = $mutationDisposition.reason
+                    responseReceived = $responseReceived; message = $_.Exception.Message; timestampUtc = [DateTime]::UtcNow.ToString('o')
                 })
                 $indeterminate = [InvalidOperationException]::new('DevBench mutation transport failed after dispatch; the command may already have committed and was not replayed. Reconcile by commandId and runtime state before any retry.', $_.Exception)
                 $indeterminate.Data['DevBenchIndeterminateMutation'] = $true
@@ -571,6 +579,7 @@ function Get-PerformanceMeasurementGuard {
 function Test-WaitRetryableException {
     param([Parameter(Mandatory)]$Exception)
     if ([bool]$Exception.Data['DevBenchCleanupUncertain'] -or
+        [bool]$Exception.Data['DevBenchMcpCapabilityRegression'] -or
         [string]$Exception.Message -match 'cleanup is uncertain|refusing automatic rebind') {
         return $false
     }
@@ -725,13 +734,22 @@ function Open-DevBenchSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
         $script:transport = 'mcp'
         $script:endpoint = "$script:baseEndpoint/mcp"
         $session = Open-McpSession -Runtime $Runtime -AllowDeferredBuildIdentity:$AllowDeferredBuildIdentity
+        $script:mcpCapabilityPreviouslyProven = $true
         $session | Add-Member -NotePropertyName transport -NotePropertyValue 'mcp'
         return $session
     }
     catch {
         $statusCode = $null
         try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = $null }
-        if (-not [bool]$_.Exception.Data['DevBenchMcpCapabilityAbsent']) { throw }
+        $initialCapabilityMiss = [bool]$_.Exception.Data['DevBenchMcpCapabilityAbsent']
+        if (-not $initialCapabilityMiss) { throw }
+        if (-not (Test-DevBenchMcpRestFallbackAllowed -InitialCapabilityMiss $initialCapabilityMiss -McpCapabilityPreviouslyProven $script:mcpCapabilityPreviouslyProven)) {
+            $capabilityRegression = [InvalidOperationException]::new(
+                'DevBench MCP capability was proven earlier in this invocation, but the replacement initialization returned a sessionless 404. Refusing REST downgrade; retain the failed MCP rebind evidence and retry only in a new bounded operation.',
+                $_.Exception)
+            $capabilityRegression.Data['DevBenchMcpCapabilityRegression'] = $true
+            throw $capabilityRegression
+        }
         $transportRetries.Add([pscustomobject][ordered]@{
             attempt = 1; statusCode = 404; delayMilliseconds = 0; recovery = 'rest-capability-negotiation'
             transport = 'mcp'; message = $_.Exception.Message; timestampUtc = [DateTime]::UtcNow.ToString('o')
@@ -1472,15 +1490,22 @@ catch {
     $failureMessage = $caughtException.Message
     $indeterminateMutation = [bool]$caughtException.Data['DevBenchIndeterminateMutation']
     $persistentSessionInvalidation = [bool]$caughtException.Data['DevBenchPersistentSessionInvalidation']
-    $failureState = if ($indeterminateMutation) { 'indeterminate' } elseif ($persistentSessionInvalidation) { 'persistent-session-invalidated' } else { 'failed' }
-    $failureData = if ($persistentSessionInvalidation) { [pscustomobject][ordered]@{ sessionInvalidationCount = [int]$caughtException.Data['DevBenchSessionInvalidationCount']; maxSessionRebinds = $MaxSessionRebinds; lastSuccessfulObservation = $lastSuccessfulWaitObservation } } else { $null }
+    $mcpCapabilityRegression = [bool]$caughtException.Data['DevBenchMcpCapabilityRegression']
+    $failureState = if ($indeterminateMutation) { 'indeterminate' } elseif ($persistentSessionInvalidation) { 'persistent-session-invalidated' } elseif ($mcpCapabilityRegression) { 'mcp-capability-regression' } else { 'failed' }
+    $failureData = if ($persistentSessionInvalidation) {
+        [pscustomobject][ordered]@{ sessionInvalidationCount = [int]$caughtException.Data['DevBenchSessionInvalidationCount']; maxSessionRebinds = $MaxSessionRebinds; lastSuccessfulObservation = $lastSuccessfulWaitObservation }
+    }
+    elseif ($mcpCapabilityRegression) {
+        [pscustomobject][ordered]@{ mcpCapabilityPreviouslyProven = $true; restFallbackRefused = $true; lastSuccessfulObservation = $lastSuccessfulWaitObservation }
+    }
+    else { $null }
     if ($invocationRecord -and $invocationRecord.state -ne 'guard-rejected') {
         try { Update-InvocationEvidence -State $failureState -Data $failureData -Errors @($failureMessage) } catch { $failureMessage = "$failureMessage Evidence update also failed: $($_.Exception.Message)" }
     }
     $result = [pscustomobject][ordered]@{
         ok = $false
         transportOk = $false
-        state = if ($indeterminateMutation) { 'indeterminate-mutation' } elseif ($persistentSessionInvalidation) { 'persistent-session-invalidated' } else { 'failed' }
+        state = if ($indeterminateMutation) { 'indeterminate-mutation' } elseif ($persistentSessionInvalidation) { 'persistent-session-invalidated' } elseif ($mcpCapabilityRegression) { 'mcp-capability-regression' } else { 'failed' }
         indeterminate = $indeterminateMutation
         command = $Command
         endpoint = $endpoint
