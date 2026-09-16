@@ -1385,6 +1385,7 @@ async function runRenderScaleTuningLive(context) {
         const recovered = assessment.decision.satisfied;
         const evidence = {
             status: recovered ? "RECOVERED" : "FAILED",
+            receiptKey,
             scenarioReceiptKey: `${receiptKey}:scenario`,
             scenario: diagnostic,
             target,
@@ -2683,6 +2684,13 @@ async function runRenderScaleTuningLive(context) {
                         transitionId: identifiers.transitionId,
                         ownerId: identifiers.ownerId,
                         target: waiterTarget(target),
+                        recovery: {
+                            ...recoveryIds(laneIndex + 1, pass, row.ordinal),
+                            target: waiterTarget(targetFor(positioning.boundary,
+                                matrix.destinations[matrix.initialDestination], lane.configuredFsrRuntime)),
+                            declaredTarget: targetFor(positioning.boundary,
+                                matrix.destinations[matrix.initialDestination], lane.configuredFsrRuntime),
+                        },
                         laneContract: {
                             id: lane.id,
                             configuredFsrRuntime: lane.configuredFsrRuntime,

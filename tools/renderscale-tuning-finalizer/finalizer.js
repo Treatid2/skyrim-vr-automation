@@ -603,11 +603,16 @@ function evidenceValues(root) {
         "json_pointer", "value_type", "value_json"];
     const lines = [columns.join(",")];
     const stats = { rawJsonFiles: files.length, values: 0, nullValues: 0,
-        emptyContainers: 0 };
+        emptyContainers: 0, parseErrors: [] };
     for (const file of files) {
         const source = relative(root, file);
         const identity = rawIdentity(root, file);
-        flattenJson(readJson(file), "", (pointer, type, valueJson) => {
+        let value;
+        try { value = readJson(file); } catch {
+            stats.parseErrors.push({ path: source, error: "invalid_json" });
+            continue;
+        }
+        flattenJson(value, "", (pointer, type, valueJson) => {
             stats.values += 1;
             if (type === "null") stats.nullValues += 1;
             if (type === "empty_array" || type === "empty_object") {
@@ -897,7 +902,9 @@ function scenarioSucceeded(value) {
     }
     return !value.results.some((entry) => entry && (entry.ok === false ||
         entry.isError === true || entry.result &&
-        (entry.result.ok === false || entry.result.isError === true)));
+        (entry.result.ok === false || entry.result.isError === true))) &&
+        value.results.every((entry) => entry && typeof entry.label === "string" && entry.label) &&
+        new Set(value.results.map((entry) => entry.label)).size === value.results.length;
 }
 
 function producerBuildMatches(value, buildId) {
@@ -907,32 +914,36 @@ function producerBuildMatches(value, buildId) {
 function rawPassEvidence(root) {
     const rawRoot = path.join(root, "raw");
     if (!fs.existsSync(rawRoot)) {
-        return { scenarios: [], cleanup: [], transitions: [] };
+        return { scenarios: [], cleanup: [], transitions: [], originals: [] };
     }
     const scenarios = [];
     const cleanup = [];
     const transitions = [];
+    const originals = [];
     for (const file of walk(rawRoot).filter((candidate) =>
         path.extname(candidate).toLowerCase() === ".json" &&
         path.basename(candidate) !== "live-result.json")) {
         let value;
+        let parseError = false;
         try {
             value = readJson(file);
         } catch {
-            continue;
+            value = null;
+            parseError = true;
         }
         const scope = retainedPassScope(root, file);
         if (path.basename(file) === "retained.json" && rowIdentity(root, file)) {
             transitions.push({ value, scope, identity: rowIdentity(root, file) });
         }
-        const rootValue = decodedScenarioRoot(value);
+        const rootValue = decodedScenarioRoot(decodedEnvelopePayload(value));
+        originals.push({ value, scenario: rootValue, scope, parseError });
         if (rootValue) scenarios.push({ value: rootValue, scope });
         if (value && value.status === "CONFIRMED_INACTIVE" &&
             Array.isArray(value.knownSessionIds) && value.after) {
             cleanup.push({ value, scope });
         }
     }
-    return { scenarios, cleanup, transitions };
+    return { scenarios, cleanup, transitions, originals };
 }
 
 function scenarioResult(root, label) {
@@ -955,7 +966,7 @@ function successfulScenarioEntry(entry) {
 function decodedEnvelopePayload(value) {
     if (value && Array.isArray(value.content) && value.content[0] &&
         typeof value.content[0].text === "string") {
-        if (value.isError === true) return null;
+        if (value.isError === true || value.content.length !== 1) return null;
         try {
             return decodedEnvelopePayload(JSON.parse(value.content[0].text));
         } catch {
@@ -1051,8 +1062,95 @@ function stressSession(value) {
     };
 }
 
+function recoveryBoundaryEvidence(raw, row, retained, planned, runId, buildId) {
+    const reasons = [];
+    const laneId = planned && planned.laneContract && planned.laneContract.id;
+    const key = `${runId}:${laneId}:pass-${row.pass}:transition-${row.ordinal}:recovery`;
+    const directory = path.posix.dirname(row.rawRetained);
+    const artifactPath = `${directory}/recovery.json`;
+    const scenarioPath = `${directory}/recovery-scenario.json`;
+    const expected = planned && planned.recovery;
+    const artifacts = raw.originals.filter((candidate) =>
+        candidate.scope.relativePath === artifactPath ||
+        candidate.value && (candidate.value.receiptKey === key ||
+            candidate.value.scenarioReceiptKey === `${key}:scenario`));
+    const originals = raw.originals.filter((candidate) =>
+        candidate.scope.relativePath === scenarioPath ||
+        candidate.scenario && candidate.scenario.results.some((entry) =>
+            entry && entry.label === "recovery-profile-apply" &&
+            ((candidate.scope.lane === (row.lane || "default") &&
+                candidate.scope.pass === row.pass &&
+                path.posix.dirname(candidate.scope.relativePath) === directory) ||
+                expected && scenarioResult(candidate.scenario, "qualification-wait") &&
+                scenarioResult(candidate.scenario, "qualification-wait").ownerId === expected.ownerId)));
+    if (!retained.recovery && !retained.recoveryReceiptKey && artifacts.length === 0 && originals.length === 0) {
+        return { complete: true, successful: false, reasons, paths: [] };
+    }
+    if (retained.recoveryReceiptKey !== key || !retained.recovery ||
+        retained.recovery.receiptKey !== key) reasons.push("recovery_derived_key_mismatch");
+    if (!expected || !Number.isSafeInteger(expected.transitionId) ||
+        expected.transitionId <= 0 || typeof expected.ownerId !== "string" ||
+        !expected.ownerId || expected.transitionId === planned.transitionId ||
+        expected.ownerId === planned.ownerId) reasons.push("recovery_plan_identity_missing_or_reused");
+    if (artifacts.length !== 1 || originals.length !== 1) {
+        reasons.push("recovery_original_missing_or_ambiguous");
+    }
+    const artifact = artifacts.length === 1 && artifacts[0].value;
+    const original = originals.length === 1 && originals[0].scenario;
+    if (!artifact || artifacts[0].scope.relativePath !== artifactPath ||
+        artifact.receiptKey !== key || artifact.scenarioReceiptKey !== `${key}:scenario` ||
+        !original || originals[0].scope.relativePath !== scenarioPath ||
+        !scenarioSucceeded(original) || originals[0].value.isError === true) {
+        reasons.push("recovery_original_invalid");
+    }
+    const steps = original && original.results || [];
+    const exactStep = (label) => {
+        const candidates = steps.filter((entry) => entry && entry.label === label);
+        return candidates.length === 1 && successfulScenarioEntry(candidates[0]) ?
+            candidates[0].result : null;
+    };
+    const apply = exactStep("recovery-profile-apply");
+    const waiter = exactStep("qualification-wait");
+    const begin = exactStep("recovery-qualification-begin");
+    const dispatch = exactStep("recovery-qualification-dispatch");
+    if (!apply || apply.action !== "apply" || apply.accepted !== true ||
+        !producerBuildMatches(apply, buildId)) reasons.push("recovery_apply_invalid");
+    for (const [value, action] of [[begin, "qualification_begin"],
+        [dispatch, "qualification_dispatch"], [waiter, "qualification_wait"]]) {
+        if (!expected || !value || value.action !== action ||
+            !producerBuildMatches(value, buildId) ||
+            value.transitionId !== expected.transitionId || value.ownerId !== expected.ownerId) {
+            reasons.push("recovery_original_owner_action_build_mismatch");
+        }
+    }
+    const facts = waiter && waiter.observation && waiter.observation.facts;
+    if (!waiter || waiter.satisfied !== true || waiter.strictSatisfied === false ||
+        waiter.presentationStable === false || waiter.cleanupDrained === false ||
+        !waiter.milestoneTimings || !waiter.replacementTimeline ||
+        !waiter.upscalingSnapshot || waiter.upscalingSnapshot.activeOperationId !== 0 ||
+        !waiter.baseline || waiter.baseline.stressSessionId !== row.terminalStressSessionId ||
+        !facts || ["stressSession", "exactCell", "loadedInWorld", "terminalClear"].some(
+            (name) => facts[name] !== true) ||
+        ["apiOperationClear", "physicalMutationClear"].some(
+            (name) => facts && Object.hasOwn(facts, name) && facts[name] !== true)) {
+        reasons.push("recovery_strict_terminal_unsafe");
+    }
+    if (!expected || !targetsMatch(waiter && waiter.target, expected.target) ||
+        !artifact || JSON.stringify(artifact.target) !== JSON.stringify(expected.declaredTarget) ||
+        !retained.recovery || JSON.stringify(retained.recovery.target) !==
+            JSON.stringify(artifact && artifact.target)) reasons.push("recovery_target_mismatch");
+    if (!artifact || JSON.stringify(artifact.apply) !== JSON.stringify(apply) ||
+        JSON.stringify(artifact.waiter) !== JSON.stringify(waiter) ||
+        artifact.status !== "RECOVERED" || !retained.recovery || retained.recovery.status !== artifact.status) {
+        reasons.push("recovery_derived_original_mismatch");
+    }
+    return { complete: reasons.length === 0, successful: reasons.length === 0,
+        receiptKey: key, reasons: unique(reasons),
+        paths: [...artifacts, ...originals].map((candidate) => candidate.scope.relativePath) };
+}
+
 function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
-    buildId) {
+    buildId, raw) {
     const reasons = [];
     if (!liveResult || liveResult.ok !== true ||
         liveResult.status !== "COMPLETE" || !Array.isArray(liveResult.lanes)) {
@@ -1061,7 +1159,6 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
     }
     const passKeys = unique(planEntries.map((entry) =>
         `${entry.lane || "default"}|${entry.pass}`));
-    const raw = rawPassEvidence(root);
     const results = [];
     const ownerPairs = [];
     for (const key of passKeys) {
@@ -1072,11 +1169,15 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
         const liveLaneIds = unique(plannedPass.map((entry) =>
             entry.laneContract && entry.laneContract.id || entry.lane || "default"));
         const liveLaneId = liveLaneIds.length === 1 ? liveLaneIds[0] : null;
-        const lane = liveResult.lanes.find((candidate) => candidate &&
+        const lanes = liveResult.lanes.filter((candidate) => candidate &&
             (candidate.id || "default") === liveLaneId);
-        const pass = lane && Array.isArray(lane.passes) ? lane.passes.find(
-            (candidate) => candidate && candidate.pass === passNumber) : null;
+        const lane = lanes.length === 1 ? lanes[0] : null;
+        const passes = lane && Array.isArray(lane.passes) ? lane.passes.filter(
+            (candidate) => candidate && candidate.pass === passNumber) : [];
+        const pass = passes.length === 1 ? passes[0] : null;
         const passReasons = [];
+        if (lanes.length !== 1) passReasons.push("live_lane_original_missing_or_ambiguous");
+        if (passes.length !== 1) passReasons.push("live_pass_original_missing_or_ambiguous");
         const ownership = pass && pass.ownership || {};
         const baseline = ownership.baseline || {};
         const measured = ownership.measured || {};
@@ -1230,12 +1331,53 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
         const scopeMatches = (candidate, phase) => candidate.scope.pass === passNumber &&
             candidate.scope.lane === laneId &&
             candidate.scope.relativePath.toLowerCase().includes(`/${phase}/`);
+        const phasePrefix = `raw/${laneId === "default" ? "" : `lane-${laneId}/`}pass-${passNumber}`;
+        const originalFor = (phase, filename, labels) => {
+            const expectedPath = `${phasePrefix}/${phase}/${filename}`;
+            const candidates = raw.originals.filter((candidate) => {
+                if (!scopeMatches(candidate, phase)) {
+                    // A path relabel cannot detach a second original that claims
+                    // this pass's globally unique lifecycle owners.
+                    const scenario = candidate.scenario;
+                    if (filename === "baseline.json") return baseline.startSessionId &&
+                        stressSession(scenarioResult(scenario, "baseline-stress-start")).id === baseline.startSessionId;
+                    if (filename === "handoff.json") return measured.sessionId &&
+                        stressSession(scenarioResult(scenario, "measured-stress-start")).id === measured.sessionId;
+                    if (filename === "decision.json") return candidate.value &&
+                        Array.isArray(candidate.value.knownSessionIds) &&
+                        candidate.value.knownSessionIds.includes(baseline.startSessionId) &&
+                        candidate.value.knownSessionIds.includes(measured.sessionId);
+                    return scenario && labels.every((label) =>
+                        scenario.results.some((entry) => entry && entry.label === label)) &&
+                        stressSession(scenarioResult(scenario, "render-status")).id === measured.sessionId;
+                }
+                const name = path.posix.basename(candidate.scope.relativePath);
+                if (phase !== "cleanup" || !candidate.value || name === filename ||
+                    name.includes(filename.replace(".json", ""))) return true;
+                if (filename === "decision.json") {
+                    return Object.hasOwn(candidate.value, "knownSessionIds") ||
+                        Object.hasOwn(candidate.value, "knownCpuSessionIds");
+                }
+                return candidate.scenario && labels.every((label) =>
+                    candidate.scenario.results.some((entry) => entry && entry.label === label));
+            });
+            if (candidates.length !== 1 || candidates[0].scope.relativePath !== expectedPath) {
+                passReasons.push(`retained_${filename.replace(".json", "")}_original_missing_or_ambiguous`);
+                return null;
+            }
+            return candidates[0];
+        };
+        const baselineOriginal = originalFor("baseline", "baseline.json", []);
+        const handoffOriginal = originalFor("handoff", "handoff.json", []);
+        const cleanupOriginal = originalFor("cleanup", "decision.json", []);
+        const statusOriginal = originalFor("cleanup", "final-status-after-cleanup.json",
+            ["render-status", "cpu-status", "gpu-status", "texture-status", "profiler-status"]);
         const baselineReceipt = raw.scenarios.find((candidate) => {
             const startResult = scenarioResult(candidate.value,
                 "baseline-stress-start");
             const start = stressSession(startResult);
             const waiter = scenarioResult(candidate.value, "qualification-wait");
-            return scopeMatches(candidate, "baseline") &&
+            return baselineOriginal && candidate.scope.relativePath === baselineOriginal.scope.relativePath &&
                 scenarioSucceeded(candidate.value) &&
                 producerBuildMatches(startResult, buildId) &&
                 producerBuildMatches(waiter, buildId) &&
@@ -1255,7 +1397,7 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
                 "measured-stress-start");
             const stopped = stressSession(stopResult);
             const started = stressSession(startResult);
-            return scopeMatches(candidate, "handoff") &&
+            return handoffOriginal && candidate.scope.relativePath === handoffOriginal.scope.relativePath &&
                 scenarioSucceeded(candidate.value) &&
                 producerBuildMatches(stopResult, buildId) &&
                 producerBuildMatches(startResult, buildId) &&
@@ -1269,7 +1411,7 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
         }
         const cleanupReceipt = raw.cleanup.find((candidate) => {
             const value = candidate.value;
-            return scopeMatches(candidate, "cleanup") &&
+            return cleanupOriginal && candidate.scope.relativePath === cleanupOriginal.scope.relativePath &&
                 value.knownSessionIds.includes(baseline.startSessionId) &&
                 value.knownSessionIds.includes(measured.sessionId) &&
                 Array.isArray(value.knownCpuSessionIds) &&
@@ -1290,7 +1432,7 @@ function passFinalizationEvidence(root, liveResult, planEntries, rows, variant,
             passReasons.push("retained_cleanup_receipt_missing");
         }
         const statusReceipt = raw.scenarios.find((candidate) => {
-            if (!scopeMatches(candidate, "cleanup") ||
+            if (!statusOriginal || candidate.scope.relativePath !== statusOriginal.scope.relativePath ||
                 !candidate.scope.relativePath.toLowerCase().includes(
                     "final-status-after-cleanup") ||
                 !scenarioSucceeded(candidate.value)) {
@@ -1955,6 +2097,7 @@ function finalizeEvidence(options) {
         planState.plan.entries : [];
     const planByIdentity = new Map(planEntries.map((entry) =>
         [identityKey(entry), entry]));
+    const rawEvidence = rawPassEvidence(root);
     const rows = retained.map(({ file, value }) => {
         const identity = rowIdentity(root, file);
         return transitionRow(root, file, value,
@@ -2003,6 +2146,25 @@ function finalizeEvidence(options) {
         .filter((value, index, values) => value !== null &&
             values.indexOf(value) !== index));
     const executionPlanConflicts = [...planState.reasons];
+    if (rawEvidence.originals.some((candidate) => candidate.parseError)) {
+        executionPlanConflicts.push("raw_original_invalid_json");
+    }
+    for (const row of rows) {
+        const record = retained.find((entry) => relative(root, entry.file) === row.rawRetained);
+        row.recoveryEvidence = recoveryBoundaryEvidence(rawEvidence, row, record.value,
+            planByIdentity.get(identityKey(row)), runIds[0], buildIds[0]);
+        if (!row.recoveryEvidence.complete) executionPlanConflicts.push(...row.recoveryEvidence.reasons);
+        const previous = rows.find((candidate) => candidate.lane === row.lane &&
+            candidate.pass === row.pass && candidate.ordinal === row.ordinal - 1);
+        const requiredKey = previous && previous.recoveryEvidence &&
+            previous.recoveryEvidence.successful ? previous.recoveryEvidence.receiptKey : null;
+        if ((row.sourceRecoveryReceiptKey || null) !== requiredKey ||
+            previous && previous.recoveryReceiptKey && !previous.recoveryEvidence.successful) {
+            executionPlanConflicts.push("recovery_next_row_boundary_mismatch");
+            row.recoveryEvidence.complete = false;
+            row.recoveryEvidence.reasons.push("recovery_next_row_boundary_mismatch");
+        }
+    }
     if (duplicatePlanIdentities.length > 0 ||
         duplicatePlanTransitionIds.length > 0 || duplicatePlanOwnerIds.length > 0) {
         executionPlanConflicts.push("execution_plan_duplicate_identity");
@@ -2054,7 +2216,7 @@ function finalizeEvidence(options) {
         }
     }
     const passFinalization = passFinalizationEvidence(
-        root, liveResult, planEntries, rows, variant, buildIds[0]);
+        root, liveResult, planEntries, rows, variant, buildIds[0], rawEvidence);
     const assayStatus = interrupted ? "INTERRUPTED" :
         executionScopeComplete && rows.length === declaredExpectedRows &&
             passFinalization.complete ?
@@ -2184,7 +2346,7 @@ function finalizeEvidence(options) {
         memoryConfirmation: baselineOnlyInterrupted ?
             baselineOnlyMemoryConfirmation() : existing.memoryConfirmation,
         baselineInterruptionEvidence,
-        evidenceExtraction: { complete: true,
+        evidenceExtraction: { complete: extraction.stats.parseErrors.length === 0,
             path: "evidence-values.csv",
             format: "rfc6901-json-pointer-long-form-csv",
             ...extraction.stats },

@@ -2426,6 +2426,15 @@ async function testUnsafeTransitionRestoresBaselineAndContinues() {
         retained.recovery.status === "RECOVERED" &&
         retained.recoveryReceiptKey,
     "The failed row was not linked to its baseline recovery evidence.");
+    const recoveryOriginal = mock.stores.get(retained.recoveryReceiptKey);
+    const planned = mock.stores.get("recover-unsafe-transition:execution-plan").entries.find(
+        (entry) => entry.pass === 1 && entry.ordinal === 13);
+    assert(recoveryOriginal.receiptKey === retained.recoveryReceiptKey &&
+        recoveryOriginal.waiter.transitionId === planned.recovery.transitionId &&
+        recoveryOriginal.waiter.ownerId === planned.recovery.ownerId &&
+        recoveryOriginal.waiter.transitionId !== planned.transitionId &&
+        JSON.stringify(recoveryOriginal.target) === JSON.stringify(planned.recovery.declaredTarget),
+        "Recovery original does not corroborate the preconstructed fresh plan owner/target");
 }
 
 async function testAmdUnsafeTransitionUsesLaneBaseline() {
