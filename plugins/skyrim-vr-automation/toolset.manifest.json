@@ -59,6 +59,16 @@
       "entryPoint": "tools/render-scale-qualification/Start-CSXRenderScaleQualification.ps1"
     },
     {
+      "name": "renderscale-tuning-live",
+      "version": "1.0.0",
+      "entryPoint": "tools/renderscale-tuning-live/runner.js"
+    },
+    {
+      "name": "renderscale-tuning-finalizer",
+      "version": "1.0.0",
+      "entryPoint": "tools/renderscale-tuning-finalizer/finalizer.js"
+    },
+    {
       "name": "shader-cache-control",
       "version": "3.1.0",
       "entryPoint": "tools/shader-cache-control/Invoke-CSXShaderCacheCatalog.ps1"
