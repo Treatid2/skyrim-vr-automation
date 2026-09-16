@@ -397,6 +397,36 @@ function validatePreBaselineInterruption(root, variant, runId, liveResult) {
     }
 }
 
+function validatePreBaselineInterruption(root, variant, runId, liveResult) {
+    if (variant !== "amd" || !liveResult || liveResult.status !== "INTERRUPTED" ||
+        liveResult.variant !== variant || liveResult.runId !== runId ||
+        !Array.isArray(liveResult.lanes) || liveResult.lanes.length !== 0 ||
+        typeof liveResult.error !== "string" || liveResult.error.length === 0 ||
+        !liveResult.failure || typeof liveResult.failure !== "object") {
+        throw new Error("pre_baseline_interruption_evidence_invalid");
+    }
+    const cleanup = liveResult.failure.traceCleanup || liveResult.failure.cleanup;
+    if (!cleanup || !["CONFIRMED_INACTIVE", "UNRESOLVED"].includes(cleanup.status)) {
+        throw new Error("pre_baseline_interruption_cleanup_missing");
+    }
+    if (liveResult.error === "amd_dlss_trace_not_empty") {
+        const contamination = liveResult.failure.contamination;
+        if (liveResult.failure.reason !== "amd_dlss_trace_not_empty" ||
+            cleanup.status !== "CONFIRMED_INACTIVE" ||
+            !Number.isSafeInteger(cleanup.acquiredSessionId) ||
+            cleanup.acquiredSessionId < 1 || !cleanup.stop ||
+            cleanup.stop.id !== cleanup.acquiredSessionId ||
+            cleanup.stop.active !== false || !contamination ||
+            !["records", "totalRecords", "setConstantsCalls", "evaluateCalls"]
+                .every((name) => Number.isSafeInteger(contamination[name]) &&
+                    contamination[name] >= 0) ||
+            typeof liveResult.failure.traceLifecycleReceiptKey !== "string" ||
+            liveResult.failure.traceLifecycleReceiptKey.length === 0) {
+            throw new Error("pre_baseline_trace_contamination_evidence_invalid");
+        }
+    }
+}
+
 function baselineOnlyMemoryConfirmation() {
     return {
         passesCompleted: 0,
@@ -1041,7 +1071,6 @@ function terminalSourceEvidence(root, file, retained, planned, buildId) {
         reasons: unique(reasons),
     };
 }
-
 function stressSession(value) {
     const session = value && value.status && value.status.session;
     return {

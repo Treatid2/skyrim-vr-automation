@@ -961,6 +961,68 @@ function testTraceContaminatedPreBaselineFinalization() {
     }
 }
 
+function testPreBaselineInterruptedFinalization() {
+    const evidence = createPreBaselineEvidenceRoot();
+    try {
+        const options = { ...evidence, variant: "amd", expectedRows: 186,
+            generatedUtc: "2026-08-31T01:00:00.000Z" };
+        let result = finalizeEvidence(options);
+        assert(result.summary.assayExecution.status === "INTERRUPTED" &&
+            result.summary.assayExecution.transitionsDispatched === 0 &&
+            result.summary.assayExecution.interruption.phase === "pre_baseline" &&
+            result.summary.reporting.status === "INCOMPLETE" &&
+            result.summary.reporting.reasons.includes("pre_baseline_interrupted") &&
+            !result.summary.reporting.reasons.includes("baseline_only_interrupted"),
+        "A pre-baseline AMD interruption was not finalized distinctly.");
+        const outputs = ["report.md", "summary.json", "transitions.csv",
+            "evidence-values.csv", "receipt-index.json"];
+        const firstHashes = outputs.map((name) => sha(path.join(evidence.root, name)));
+        result = finalizeEvidence(options);
+        const secondHashes = outputs.map((name) => sha(path.join(evidence.root, name)));
+        assert(JSON.stringify(firstHashes) === JSON.stringify(secondHashes),
+            "Pre-baseline finalization is not deterministic.");
+    } finally {
+        fs.rmSync(evidence.root, { recursive: true, force: true });
+    }
+}
+
+function testTraceContaminatedPreBaselineFinalization() {
+    const cases = [
+        { records: 1, totalRecords: 1, setConstantsCalls: 0,
+            evaluateCalls: 0 },
+        { records: 0, totalRecords: 0, setConstantsCalls: 1,
+            evaluateCalls: 1 },
+    ];
+    for (const contamination of cases) {
+        const evidence =
+            createTraceContaminatedPreBaselineEvidenceRoot(contamination);
+        try {
+            const options = { ...evidence, variant: "amd", expectedRows: 186,
+                generatedUtc: "2026-08-31T01:00:00.000Z" };
+            let result = finalizeEvidence(options);
+            assert(result.summary.assayExecution.status === "INTERRUPTED" &&
+                result.summary.assayExecution.transitionsDispatched === 0 &&
+                result.summary.assayExecution.interruption.phase ===
+                    "pre_baseline" &&
+                result.summary.reporting.status === "INCOMPLETE" &&
+                result.summary.reporting.reasons.includes(
+                    "pre_baseline_interrupted"),
+            "A cleanup-qualified AMD trace-contamination interruption was not finalized.");
+            const outputs = ["report.md", "summary.json", "transitions.csv",
+                "evidence-values.csv", "receipt-index.json"];
+            const firstHashes = outputs.map((name) =>
+                sha(path.join(evidence.root, name)));
+            result = finalizeEvidence(options);
+            const secondHashes = outputs.map((name) =>
+                sha(path.join(evidence.root, name)));
+            assert(JSON.stringify(firstHashes) === JSON.stringify(secondHashes),
+                "Trace-contaminated pre-baseline finalization is not deterministic.");
+        } finally {
+            fs.rmSync(evidence.root, { recursive: true, force: true });
+        }
+    }
+}
+
 function testPartialInterruptedFinalization() {
     const root = createEvidenceRoot("nvidia");
     const runId = "nvidia-test-run";

@@ -10,6 +10,7 @@ $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $sourceSkill = Join-Path $repositoryRoot 'skills\simple-coc\SKILL.md'
 $sourceProtocol = Join-Path $repositoryRoot 'skills\simple-coc\references\protocol.md'
 $sourceDevBench = Join-Path $repositoryRoot 'skills\devbench-control\SKILL.md'
+$sourceDevBenchReadme = Join-Path $repositoryRoot 'tools\devbench-control\README.md'
 $sourceForensics = Join-Path $repositoryRoot (
     'skills\simple-coc\scripts\Start-FrozenGhidra.ps1'
 )
@@ -22,6 +23,9 @@ $pluginProtocol = Join-Path $repositoryRoot (
 $pluginDevBench = Join-Path $repositoryRoot (
     'plugins\skyrim-vr-automation\skills\devbench-control\SKILL.md'
 )
+$pluginDevBenchReadme = Join-Path $repositoryRoot (
+    'plugins\skyrim-vr-automation\tools\devbench-control\README.md'
+)
 $pluginForensics = Join-Path $repositoryRoot (
     'plugins\skyrim-vr-automation\skills\simple-coc\scripts\Start-FrozenGhidra.ps1'
 )
@@ -30,6 +34,7 @@ foreach ($pair in @(
     @($sourceSkill, $pluginSkill),
     @($sourceProtocol, $pluginProtocol),
     @($sourceDevBench, $pluginDevBench),
+    @($sourceDevBenchReadme, $pluginDevBenchReadme),
     @($sourceForensics, $pluginForensics)
 )) {
     foreach ($path in $pair) {
@@ -40,6 +45,71 @@ foreach ($pair in @(
     if ((Get-FileHash -LiteralPath $pair[0] -Algorithm SHA256).Hash -ne
         (Get-FileHash -LiteralPath $pair[1] -Algorithm SHA256).Hash) {
         throw 'Simple COC package content is stale.'
+    }
+}
+$devBench = Get-Content -LiteralPath $sourceDevBench -Raw
+$catalogGuards = [ordered]@{
+    initialization = @('connection initialization', 'not before every healthy call')
+    sameNameReplacement = @('Known runtime replacement or concrete schema drift invalidates retained action/input schemas even when the tool name is unchanged')
+    supportedRefresh = @('supported direct host refresh/rebind', 'expected answering runtime')
+    refusal = @('`toolSchemaUnresolved`', 'perform no further stateful dispatch using that schema', 'missing/malformed')
+    history = @('Preserve historical metadata and mismatch evidence')
+    noRestart = @('Do not restart MO2, Skyrim, SteamVR, or Virtual Desktop to refresh a catalog')
+    errorIsNotProof = @('text alone does not prove zero handler entry')
+    correlation = @('trusted structured error envelope', 'requested tool/request identity', 'answering runtime identity')
+    dispatchProof = @('version-bound server/connector evidence proving pre-dispatch rejection for that correlated request')
+    noUncertainReplay = @('`executionStateUnresolved`', 'do not switch lanes or replay the uncertain call')
+    freshReplacementLane = @('explicit runtime', '`list`', 'exact action and current input schema')
+}
+function Get-MissingCatalogGuards([string]$Text) {
+    $normalized = [regex]::Replace($Text, '\s+', ' ')
+    foreach ($guard in $catalogGuards.GetEnumerator()) {
+        foreach ($required in $guard.Value) {
+            if (-not $normalized.Contains($required, [StringComparison]::OrdinalIgnoreCase)) {
+                $guard.Key
+                break
+            }
+        }
+    }
+}
+
+$devBenchReadme = Get-Content -LiteralPath $sourceDevBenchReadme -Raw
+foreach ($document in @($devBench, $devBenchReadme)) {
+    $missing = @(Get-MissingCatalogGuards $document)
+    if ($missing.Count) { throw "DevBench catalog authority safeguards missing: $($missing -join ', ')" }
+    foreach ($guard in $catalogGuards.GetEnumerator()) {
+        $normalized = [regex]::Replace($document, '\s+', ' ')
+        $mutated = $normalized.Replace([string]$guard.Value[0], '')
+        if ($mutated -ceq $normalized -or $guard.Key -notin @(Get-MissingCatalogGuards $mutated)) {
+            throw "Removing catalog guard '$($guard.Key)' was not detected."
+        }
+    }
+}
+# Bounded documentation/specification fixtures: each staleness scenario must
+# retain its complete decision boundary, not merely an error-name fragment.
+$catalogScenarios = [ordered]@{
+    sameNameRuntimeReplacement = @('sameNameReplacement', 'supportedRefresh', 'refusal', 'history', 'noRestart')
+    schemaDriftWithoutNameError = @('sameNameReplacement', 'refusal', 'noUncertainReplay')
+    unavailableMalformedOrAbsentRefresh = @('supportedRefresh', 'refusal')
+    exactErrorWithoutDispatchProof = @('errorIsNotProof', 'correlation', 'dispatchProof', 'noUncertainReplay')
+    provenExactErrorReplacement = @('correlation', 'dispatchProof', 'freshReplacementLane', 'refusal')
+    timeoutLostResponseOrSemanticFailure = @('noUncertainReplay')
+}
+foreach ($scenario in $catalogScenarios.GetEnumerator()) {
+    foreach ($guardName in $scenario.Value) {
+        $normalized = [regex]::Replace($devBench, '\s+', ' ')
+        $mutated = $normalized.Replace([string]$catalogGuards[$guardName][0], '')
+        if ($guardName -notin @(Get-MissingCatalogGuards $mutated)) {
+            throw "Unsafe specification fixture '$($scenario.Key)' escaped its '$guardName' boundary."
+        }
+    }
+}
+foreach ($pair in @(@($sourceDevBench, $pluginDevBench), @($sourceDevBenchReadme, $pluginDevBenchReadme))) {
+    $original = [IO.File]::ReadAllText($pair[0])
+    $mirror = [IO.File]::ReadAllText($pair[1])
+    if (-not [string]::Equals($original, $mirror, [StringComparison]::Ordinal) -or
+        [string]::Equals($original, ($mirror + 'fixture divergence'), [StringComparison]::Ordinal)) {
+        throw 'DevBench documentation mirror divergence was not detected.'
     }
 }
 
@@ -205,4 +275,5 @@ if ($measurementAdmissionPosition -le $positioningPosition) {
     debugLogging = $true
     runtimeOnly = $true
     sourceAndPluginMatch = $true
+    catalogAuthority = [ordered]@{ guards = $catalogGuards.Count; scenarios = $catalogScenarios.Count; guardRemovalCases = ($catalogGuards.Count * 2); liveReplacementExecuted = $false }
 } | ConvertTo-Json

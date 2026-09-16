@@ -2142,7 +2142,6 @@ async function testMeasuredTerminalRequiresQualifiedReceiptBeforeNextMutation() 
         }
     }
 }
-
 async function testCleanupStatusesRequireQualifiedReceipts() {
     const matrix = JSON.parse(fs.readFileSync(path.join(
         repositoryRoot, "skills", "renderscale-tuning-nvidia", "references",

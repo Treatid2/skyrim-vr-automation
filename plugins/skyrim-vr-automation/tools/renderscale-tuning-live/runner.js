@@ -86,7 +86,6 @@ async function runRenderScaleTuningLive(context) {
             response.envelope.isError !== true &&
             resultQualified(response.root, null, action));
     }
-
     function reportedError(value) {
         if (!value || typeof value !== "object") return null;
         for (const name of ["error", "message", "reason"]) {
