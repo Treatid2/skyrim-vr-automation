@@ -913,7 +913,8 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
             $healthContent = @(Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'health' } -Headers $Headers).content
             $qualifiedHealth = Assert-RuntimeIdentityContent -Content @($healthContent) -Source 'inspect health'
             if (-not $qualifiedHealth.PSObject.Properties['pid'] -or
-                $qualifiedHealth.pid -isnot [int] -or $qualifiedHealth.pid -le 0 -or
+                ($qualifiedHealth.pid -isnot [int] -and $qualifiedHealth.pid -isnot [long]) -or
+                $qualifiedHealth.pid -le 0 -or $qualifiedHealth.pid -gt [int]::MaxValue -or
                 -not $qualifiedHealth.PSObject.Properties['exe'] -or
                 $qualifiedHealth.exe -isnot [string] -or [string]::IsNullOrWhiteSpace($qualifiedHealth.exe)) {
                 throw 'DevBench health requires a positive integer PID and non-empty executable.'

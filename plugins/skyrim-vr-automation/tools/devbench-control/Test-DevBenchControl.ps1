@@ -1010,7 +1010,8 @@ $identitySemanticCases = & {
             if ($mode -like '*malformed') { $payload.ok = 'false' }
             if ($mode -like '*unknown') { $payload.PSObject.Properties.Remove('ok'); $payload.PSObject.Properties.Remove('error') }
         }
-        [pscustomobject]@{ content = @($payload) }
+        # Real MCP and REST content is JSON-decoded; PID integers become Int64.
+        [pscustomobject]@{ content = @(($payload | ConvertTo-Json -Depth 8) | ConvertFrom-Json) }
     }
     $tools = @([pscustomobject]@{ name = 'inspect' }, [pscustomobject]@{ name = 'communityshaders.first_api' }, [pscustomobject]@{ name = 'communityshaders.second_api' })
     $runtime = [pscustomobject]@{ port = 1 }
