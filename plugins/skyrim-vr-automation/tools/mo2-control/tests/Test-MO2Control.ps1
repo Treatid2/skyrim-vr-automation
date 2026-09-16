@@ -895,6 +895,10 @@ catch [IO.IOException] {
 
     $currentHostProcess = Get-Process -Id $PID
     $currentHostRecord = [pscustomobject]@{ id = $PID; path = $currentHostProcess.Path; startTime = $currentHostProcess.StartTime.ToUniversalTime().ToString('o') }
+    # These lifetime-only fixtures intentionally use this test's live host,
+    # not the separate MO2 fixture executable configured by the wider suite.
+    $hostOwnerConfig = $config | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $hostOwnerConfig.mo2.executable = $currentHostRecord.path
     [ordered]@{
         contractVersion = 'fixture'; sessionId = 'session-pid-reuse'; status = 'running'; ownerPid = $PID
         processStartTime = [DateTime]::UtcNow.AddDays(-1).ToString('o'); processPath = $currentHostRecord.path
@@ -909,8 +913,8 @@ catch [IO.IOException] {
     $pidReuseControlAdmission = & $mo2Module {
         param($fixtureConfig, $ownedLock, $processRecord)
         Resolve-MO2OwnedProcessTarget -Config $fixtureConfig -Owned $ownedLock -Processes @($processRecord) -AdoptDetachedOwner
-    } $config $pidReuseInspection.data.sessionLock $currentHostRecord
-    Assert-MO2Test (-not $pidReuseControlAdmission.ok -and $pidReuseControlAdmission.reason -eq 'recorded-owner-identity-mismatch' -and -not $pidReuseControlAdmission.ownerStartTimeMatched -and $pidReuseControlAdmission.ownerPathMatched -and @($pidReuseControlAdmission.targets).Count -eq 0) 'complete same-PID and path evidence with a different start time cannot authorize cooperative process control'
+    } $hostOwnerConfig $pidReuseInspection.data.sessionLock $currentHostRecord
+    Assert-MO2Test (-not $pidReuseControlAdmission.ok -and $pidReuseControlAdmission.reason -eq 'recorded-owner-start-time-mismatch' -and $pidReuseControlAdmission.identity.expectedStartTime -cne $pidReuseControlAdmission.identity.actualStartTime -and $pidReuseControlAdmission.identity.expectedPath -ceq $pidReuseControlAdmission.identity.actualPath -and @($pidReuseControlAdmission.targets).Count -eq 0) 'complete same-PID and path evidence with a different start time cannot authorize cooperative process control'
     [ordered]@{
         contractVersion = 'fixture'; sessionId = 'session-path-reuse'; status = 'game-stopped'; ownerPid = $PID
         processStartTime = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
@@ -921,8 +925,8 @@ catch [IO.IOException] {
     $pathMismatchControlAdmission = & $mo2Module {
         param($fixtureConfig, $ownedLock, $processRecord)
         Resolve-MO2OwnedProcessTarget -Config $fixtureConfig -Owned $ownedLock -Processes @($processRecord) -AdoptDetachedOwner
-    } $config $pathMismatchInspection.data.sessionLock $currentHostRecord
-    Assert-MO2Test (-not $pathMismatchControlAdmission.ok -and $pathMismatchControlAdmission.reason -eq 'recorded-owner-identity-mismatch' -and -not $pathMismatchControlAdmission.ownerPathMatched) 'same-PID same-start but wrong-path evidence blocks cooperative close and stop targets'
+    } $hostOwnerConfig $pathMismatchInspection.data.sessionLock $currentHostRecord
+    Assert-MO2Test (-not $pathMismatchControlAdmission.ok -and $pathMismatchControlAdmission.reason -eq 'recorded-owner-path-mismatch' -and $pathMismatchControlAdmission.identity.expectedPath -cne $pathMismatchControlAdmission.identity.actualPath -and @($pathMismatchControlAdmission.targets).Count -eq 0) 'same-PID same-start but wrong-path evidence blocks cooperative close and stop targets'
     [ordered]@{
         contractVersion = 'fixture'; sessionId = 'session-legacy-owner'; status = 'game-stopped'; ownerPid = $PID
     } | ConvertTo-Json | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
@@ -931,8 +935,8 @@ catch [IO.IOException] {
     $legacyControlAdmission = & $mo2Module {
         param($fixtureConfig, $ownedLock, $processRecord)
         Resolve-MO2OwnedProcessTarget -Config $fixtureConfig -Owned $ownedLock -Processes @($processRecord) -AdoptDetachedOwner
-    } $config $legacyOwnerInspection.data.sessionLock $currentHostRecord
-    Assert-MO2Test (-not $legacyControlAdmission.ok -and $legacyControlAdmission.reason -eq 'recorded-owner-identity-incomplete' -and @($legacyControlAdmission.targets).Count -eq 0) 'legacy incomplete lifetime evidence cannot authorize cooperative process control'
+    } $hostOwnerConfig $legacyOwnerInspection.data.sessionLock $currentHostRecord
+    Assert-MO2Test (-not $legacyControlAdmission.ok -and $legacyControlAdmission.reason -eq 'recorded-owner-identity-unbound' -and @($legacyControlAdmission.targets).Count -eq 0) 'legacy incomplete lifetime evidence cannot authorize cooperative process control'
     [ordered]@{
         contractVersion = 'fixture'; sessionId = 'session-qualified-owner'; status = 'game-stopped'; ownerPid = $PID
         processStartTime = $currentHostRecord.startTime; processPath = $currentHostRecord.path
@@ -941,7 +945,7 @@ catch [IO.IOException] {
     $qualifiedControlAdmission = & $mo2Module {
         param($fixtureConfig, $ownedLock, $processRecord)
         Resolve-MO2OwnedProcessTarget -Config $fixtureConfig -Owned $ownedLock -Processes @($processRecord) -AdoptDetachedOwner
-    } $config $qualifiedOwnerInspection.data.sessionLock $currentHostRecord
+    } $hostOwnerConfig $qualifiedOwnerInspection.data.sessionLock $currentHostRecord
     Assert-MO2Test ($qualifiedControlAdmission.ok -and $qualifiedControlAdmission.reason -eq 'recorded-owner' -and @($qualifiedControlAdmission.targets).Count -eq 1) 'complete matching PID, start-time, and path evidence admits the exact retained owner'
     Remove-Item -LiteralPath $config.session.lockFile -Force
 
