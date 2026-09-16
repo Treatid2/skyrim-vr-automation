@@ -293,7 +293,7 @@ function Test-NonFunctionalProviderFile([string]$Path) {
 
 function Get-AutomaticDllPlan([byte[]]$Bytes, [string]$TargetName, [string]$TargetDirectory, [string]$ModRoot) {
     $targetInventory = @(Get-BoundedModFileInventory -Root $TargetDirectory -Purpose "Target mod '$TargetName'")
-    $targetDlls = @($targetInventory | Where-Object { [IO.Path]::GetExtension([string]$_.path) -ieq '.dll' } | ForEach-Object path | Sort-Object -Unique)
+    $targetDlls = @($targetInventory | Where-Object { [IO.Path]::GetExtension([string]$_.path) -ieq '.dll' } | ForEach-Object { $_.path } | Sort-Object -Unique)
     if ($targetDlls.Count -eq 0) {
         return [pscustomobject][ordered]@{
             targetDllPaths = @()
@@ -305,7 +305,7 @@ function Get-AutomaticDllPlan([byte[]]$Bytes, [string]$TargetName, [string]$Targ
     }
 
     $winnerPlan = Resolve-WinningPlan -Bytes $Bytes -TargetName $TargetName -TargetDirectory $TargetDirectory -ModRoot $ModRoot -Paths $targetDlls
-    $providerNames = @($winnerPlan.otherEnabledProviders | ForEach-Object modName | Sort-Object -Unique)
+    $providerNames = @($winnerPlan.otherEnabledProviders | ForEach-Object { $_.modName } | Sort-Object -Unique)
     if ($providerNames.Count -gt $MaximumMatchingProviders) { throw "Matching DLL providers exceed limit $MaximumMatchingProviders." }
     $providerAssessments = [Collections.Generic.List[object]]::new()
     foreach ($providerName in $providerNames) {
@@ -315,14 +315,14 @@ function Get-AutomaticDllPlan([byte[]]$Bytes, [string]$TargetName, [string]$Targ
         $unmatchedFunctional = @($functional | Where-Object {
             [IO.Path]::GetExtension([string]$_.path) -ine '.dll' -or $targetDlls -inotcontains [string]$_.path
         })
-        $matchingDlls = @($inventory | Where-Object { [IO.Path]::GetExtension([string]$_.path) -ieq '.dll' -and $targetDlls -icontains [string]$_.path } | ForEach-Object path | Sort-Object -Unique)
+        $matchingDlls = @($inventory | Where-Object { [IO.Path]::GetExtension([string]$_.path) -ieq '.dll' -and $targetDlls -icontains [string]$_.path } | ForEach-Object { $_.path } | Sort-Object -Unique)
         $eligible = $matchingDlls.Count -gt 0 -and $functional.Count -gt 0 -and $unmatchedFunctional.Count -eq 0
         $providerAssessments.Add([pscustomobject][ordered]@{
             modName = $providerName
             modDirectory = $providerRoot
             matchingDllPaths = $matchingDlls
             functionalFileCount = $functional.Count
-            retainedFunctionalPaths = @($unmatchedFunctional | ForEach-Object path)
+            retainedFunctionalPaths = @($unmatchedFunctional | ForEach-Object { $_.path })
             exactDllOnly = $eligible
             action = if ($RetirementPolicy -eq 'DisableExactDllOnly' -and $eligible) { 'disable' } else { 'keep-enabled' }
             reason = if (-not $eligible) { 'Provider has functional content not completely replaced by the target, so it remains enabled.' } elseif ($RetirementPolicy -eq 'DisableExactDllOnly') { 'Every functional file is an exact DLL path supplied by the target.' } else { 'RetirementPolicy keeps previous providers enabled.' }
@@ -332,7 +332,7 @@ function Get-AutomaticDllPlan([byte[]]$Bytes, [string]$TargetName, [string]$Targ
         targetDllPaths = $targetDlls
         initialProviderPlan = $winnerPlan
         providers = @($providerAssessments)
-        disableMods = @($providerAssessments | Where-Object action -eq 'disable' | ForEach-Object modName)
+        disableMods = @($providerAssessments | Where-Object action -eq 'disable' | ForEach-Object { $_.modName })
         scopeNote = 'Automatic winner proof covers exact relative DLL paths from enabled loose-file providers in this modlist. Mixed-content providers stay enabled.'
     }
 }
