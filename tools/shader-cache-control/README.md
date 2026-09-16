@@ -202,8 +202,11 @@ identical bytes cannot substitute for that snapshot-bound identity.
 
 `prepare` and `complete` return bounded output by default: cache identities,
 file and byte counts, tree hashes, state, and receipt paths remain inline, while
-per-file `entries` arrays remain only in the durable plan, provider-shadow,
-transaction, and completion receipts. `-Compact` additionally removes JSON
+per-file `entries`, provider-shadow `copied`, and `alreadyPresent` arrays remain
+only in the durable plan, provider-shadow, transaction, and completion receipts.
+Omission flags distinguish absent detail from zero files; aggregate coverage
+counts remain inline on fresh and already-prepared responses.
+`-Compact` additionally removes JSON
 whitespace. Use `-IncludeInventoryEntries` only for a caller that explicitly
 needs the potentially very large per-file arrays in the command response.
 
