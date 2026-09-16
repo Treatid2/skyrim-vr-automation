@@ -10,6 +10,13 @@ it cannot be accepted. Stop reverses that order so the state trace encloses all
 captured frames. `none`, `on-demand`, and `sequence` visual modes all retain the
 same interaction and state contract.
 
+Partial-start recovery distinguishes a pre-dispatch refusal, a retained
+accepted receipt, and a dispatched request whose result was lost. Accepted
+screenshot receipts remain available for exact cancel-and-wait cleanup even if
+the controller's final evidence write fails. A dispatched screenshot or
+recording without a retained identity remains `cleanup-uncertain`; stopping the
+other lane does not manufacture terminal proof for it.
+
 ```powershell
 pwsh -NoProfile -File .\Invoke-CaptureInteraction.ps1 start `
   -SessionDirectory D:\CodexScratch\...\interaction `
