@@ -174,6 +174,33 @@ The initial MCP initialize/initialized/tools-list exchange is part of that same
 outer wait state machine, so a temporarily unavailable listener cannot exhaust
 the short transport budget before the requested timeout begins.
 
+Codex can retain a direct MCP tool schema across replacement of the game and
+DevBench runtime at the same loopback endpoint. Establish catalog currency at
+connection initialization and after concrete staleness evidence, not before
+every healthy call. Known runtime replacement or concrete schema drift
+invalidates retained action/input schemas even when the tool name is unchanged.
+Preserve historical metadata and mismatch evidence. Use a supported direct host
+refresh/rebind only if actually available and bound to the expected answering
+runtime; otherwise report `toolSchemaUnresolved` and perform no further stateful
+dispatch using that schema. Missing/malformed discovery, absent action/schema,
+or unproven identity also requires that refusal. Do not restart MO2, Skyrim,
+SteamVR, or Virtual Desktop to refresh a catalog. Same-name replacement and
+argument/schema mismatch do not themselves authorize a switch or replay.
+
+Exact MCP error `-32602 Tool not found: <requested-name>` is staleness evidence,
+but its text alone does not prove zero handler entry. Preserve the trusted
+structured error envelope, requested tool/request identity, and answering
+runtime identity; make no direct retry. Require version-bound server/connector
+evidence proving pre-dispatch rejection for that correlated request. If proof
+is unavailable, report `executionStateUnresolved`; do not switch lanes or
+replay the uncertain call. Only with that proof, and where the governing
+protocol permits the bundled lane, may the task select this controller as the
+sole replacement lane: use the explicit runtime file, run `list`, verify
+expected process/build identity, and proceed only when the fresh registry
+contains the exact action and current input schema. Otherwise return
+`toolSchemaUnresolved` without dispatch. No other error permits a
+transport-lane switch; stricter direct-only protocols retain precedence.
+
 `playerLoaded` is transition-fresh by default: the wait must observe an
 unloaded state before accepting loaded. This prevents the prior world's cached
 `true` from satisfying an asynchronous load. Use `-AcceptAlreadyLoaded` only

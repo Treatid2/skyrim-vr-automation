@@ -9,10 +9,12 @@ Choose exactly one live transport before the first live call. When the
 plugin-provided direct MCP tools are callable, they are the mandatory and
 exclusive lane for live discovery, calls, waits, screenshots, and performance
 capture. Treat their exposed tool descriptions as the live callable action and
-input-schema inventory, not as an output schema. Validate result fields in the
+input-schema inventory for that runtime connection, not as an output schema.
+Validate result fields in the
 structured action response that owns them;
 do not run the bundled controller's `list`, open another loopback MCP session,
-or switch transport lanes during that run. A generic scenario dispatcher does
+or switch transport lanes during that run except for the exact stale-catalog
+rejection below. A generic scenario dispatcher does
 not prove that an ownership-bearing or intrusive custom action is callable. If
 the exact typed action is
 absent, report that protocol action unavailable; do not send it through the
@@ -24,9 +26,39 @@ Do not infer absence from an abbreviated initial tool list. A protocol may
 require this plugin lane and prohibit the bundled client; that stricter rule
 always wins.
 
+Establish catalog currency at connection initialization and after concrete
+staleness evidence, not before every healthy call. Known runtime replacement
+or concrete schema drift invalidates retained action/input schemas even when
+the tool name is unchanged. Preserve historical metadata and mismatch evidence;
+do not delete task context or treat it as current authority. Use a supported
+direct host refresh/rebind only if that facility is actually available and can
+bind the fresh catalog to the expected answering runtime. If no supported
+refresh exists, discovery is unavailable/malformed, the expected action/schema
+is absent, or current identity cannot be established, report
+`toolSchemaUnresolved` and perform no further stateful dispatch using that
+schema. Do not restart MO2, Skyrim, SteamVR, or Virtual Desktop to refresh a
+catalog. Same-name replacement and argument/schema mismatch do not themselves
+authorize a lane switch or replay of an earlier call.
+
 Use the bundled client as the sole live lane only when direct MCP is unavailable
 before the first live call. It also remains available for offline validation or
-a required durable receipt that direct MCP cannot expose. Never choose the
+a required durable receipt that direct MCP cannot expose. A direct invocation
+that returns exact MCP error `-32602 Tool not found: <requested-name>` is
+staleness evidence, but its text alone does not prove zero handler entry.
+Preserve the trusted structured error envelope, requested tool/request identity,
+and answering runtime identity; make no direct retry. Require version-bound
+server/connector evidence proving pre-dispatch rejection for that correlated
+request before using the exception. If that proof is unavailable, report
+`executionStateUnresolved`; do not switch lanes or replay the uncertain call.
+With proven pre-dispatch rejection, treat the direct lane as invalidated.
+The bundled client may then become the sole lane for the rest of the run: bind
+it to the explicit runtime path, call `list`, verify runtime/build identity, and
+continue only if that fresh list contains the exact action and current input
+schema. If discovery is missing/malformed or identity/action/schema cannot be
+proved, return `toolSchemaUnresolved` without dispatch. This is the only
+post-call lane-switch exception. Invalid arguments, semantic failures,
+timeouts, lost responses, or any error other than that exact pre-dispatch name
+rejection do not authorize switching. Never choose the
 loopback HTTP path merely for convenience, mix it with a healthy direct lane,
 or construct HTTP or MCP requests ad hoc.
 
@@ -42,7 +74,10 @@ or construct HTTP or MCP requests ad hoc.
    direct lane, use its bound tools and do not create or resolve a controller
    runtime file.
 4. On the direct lane, use the exposed direct tool definitions as authoritative
-   action and input-schema inventory. They do not prove output-field presence.
+   action and input-schema inventory for the connected runtime. They do not
+   prove output-field presence. Known runtime replacement or concrete schema
+   drift invalidates retained definitions regardless of tool-name continuity;
+   apply the supported refresh or explicit refusal boundary above.
    On the selected controller lane, call `list` before using a tool whose
    current name or input schema has not been established.
 5. On the direct lane, call the exact exposed tool with structured arguments.
