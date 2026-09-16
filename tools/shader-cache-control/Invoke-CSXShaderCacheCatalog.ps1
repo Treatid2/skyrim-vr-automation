@@ -108,11 +108,17 @@ function ConvertTo-BoundedCatalogOutput($Value) {
         $properties = @($Value.PSObject.Properties)
     }
     $bounded = [ordered]@{}
+    $isProviderShadowReceipt = @($properties.Name) -contains 'requiredLowerProviderFiles' -and
+        @($properties.Name) -contains 'copiedFiles' -and @($properties.Name) -contains 'alreadyPresentFiles'
     foreach ($property in $properties) {
         $name = [string]$property.Name
         if ($name -eq 'entries' -and $null -ne $property.Value) {
             $bounded['inventoryEntryCount'] = @($property.Value).Count
             $bounded['inventoryEntriesOmitted'] = $true
+            continue
+        }
+        if ($isProviderShadowReceipt -and $name -in @('copied', 'alreadyPresent')) {
+            $bounded["${name}RecordsOmitted"] = $true
             continue
         }
         $bounded[$name] = ConvertTo-BoundedCatalogOutput $property.Value
