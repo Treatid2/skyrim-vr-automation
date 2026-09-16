@@ -279,6 +279,20 @@ after the reset's strict waiter is satisfied and safe. Device loss, OOM, lost
 scene/ownership/build or transport, missing terminal evidence, or a
 rejected/unstable reset stops future mutations.
 
+The execution plan preconstructs each row's distinct recovery owner and lane
+baseline target before mutation. Export its reset receipt as the row directory's
+`recovery.json` and the independent original reset scenario envelope as
+`recovery-scenario.json`, preserving their exact receipt/scenario keys. Offline
+finalization requires one qualified original of each, reconciles apply/waiter,
+build, owner, target and strict safety, and requires the immediately succeeding
+row to name that exact validated reset boundary. A derived recovery summary alone
+cannot complete reporting. Missing, failed, malformed, aliased or duplicate reset
+or pass-lifecycle originals remain retained and make reporting incomplete; no
+original is replayed or rewritten to repair a report. Pass phases use the exact
+canonical baseline/baseline.json, handoff/handoff.json, cleanup/decision.json and
+cleanup/final-status-after-cleanup.json paths beneath their lane/pass directory.
+Duplicates are rejected even when byte-identical or one copy appears successful.
+
 That stop is terminal for the current attempt. A variant protocol may permit a
 separate replacement attempt only after the runner returns, retained cleanup is
 complete, and the user explicitly authorizes replay after a named obstruction

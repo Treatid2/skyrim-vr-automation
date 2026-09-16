@@ -1403,6 +1403,181 @@ function testRecoveryIsReportedWithoutRewritingFailure() {
     }
 }
 
+function installRecoveryFixture(root, variant) {
+    const runId = `${variant}-test-run`;
+    const buildId = "e".repeat(64);
+    const directory = path.join(root, "raw", "pass-1", "transitions", "01");
+    const retainedPath = path.join(directory, "retained.json");
+    const receipt = readJson(retainedPath);
+    const planPath = path.join(root, "raw", "execution-plan.json");
+    const plan = readJson(planPath);
+    if (variant === "amd") for (const entry of plan.entries) entry.laneContract.id = "default";
+    const expected = { transitionId: 500141, ownerId: `${runId}-fresh-recovery-owner`,
+        target: { method: variant === "amd" ? "fsr" : "dlss", qualityMode: 2,
+            renderScaleMode: true, ...(variant === "amd" ? { fsrRuntime: "fsr3" } : { dlssProfile: "K" }) } };
+    expected.declaredTarget = { ...expected.target, qualityMode: "balanced" };
+    plan.entries[0].recovery = expected;
+    writeJson(planPath, plan);
+    const key = `${runId}:${plan.entries[0].laneContract.id}:pass-1:transition-1:recovery`;
+    const waiter = structuredClone(receipt.waiter);
+    Object.assign(waiter, { transitionId: expected.transitionId, ownerId: expected.ownerId,
+        target: expected.target, satisfied: true, strictSatisfied: true,
+        presentationStable: true, cleanupDrained: true,
+        upscalingSnapshot: { ...waiter.upscalingSnapshot, activeOperationId: 0 },
+        observation: { facts: { stressSession: true, exactCell: true,
+            loadedInWorld: true, terminalClear: true, apiOperationClear: true,
+            physicalMutationClear: true } } });
+    const apply = { action: "apply", accepted: true, producer: { buildId } };
+    const ownerResult = (action) => ({ action, transitionId: expected.transitionId,
+        ownerId: expected.ownerId, producer: { buildId } });
+    const original = { ok: true, aborted: false, stepsRun: 4, results: [
+        { label: "recovery-qualification-begin", result: ownerResult("qualification_begin") },
+        { label: "recovery-qualification-dispatch", result: ownerResult("qualification_dispatch") },
+        { label: "recovery-profile-apply", result: apply },
+        { label: "qualification-wait", result: waiter },
+    ] };
+    const artifact = { receiptKey: key, scenarioReceiptKey: `${key}:scenario`,
+        status: "RECOVERED", target: expected.declaredTarget, apply, waiter };
+    writeJson(path.join(directory, "recovery-scenario.json"), original);
+    writeJson(path.join(directory, "recovery.json"), artifact);
+    receipt.recoveryReceiptKey = key;
+    receipt.recovery = { status: "RECOVERED", receiptKey: key, target: artifact.target };
+    // Preserve a failed rendering observation independently of a safe reset.
+    receipt.projection.renderVerdict = "FAIL";
+    writeJson(retainedPath, receipt);
+    const nextPath = path.join(root, "raw", "pass-1", "transitions", "02", "retained.json");
+    const next = readJson(nextPath);
+    next.sourceRecoveryReceiptKey = key;
+    writeJson(nextPath, next);
+    return { directory, retainedPath, nextPath, key };
+}
+
+function testRecoveryOriginalsAndBoundaryLinks() {
+    const cases = [
+        ["positive", () => {}, true],
+        ["missing-artifact", ({ directory }) => fs.unlinkSync(path.join(directory, "recovery.json"))],
+        ["missing-scenario", ({ directory }) => fs.unlinkSync(path.join(directory, "recovery-scenario.json"))],
+        ["failed-wrapper", ({ directory }) => writeJson(path.join(directory, "recovery-scenario.json"),
+            { isError: true, content: [{ text: JSON.stringify(readJson(path.join(directory, "recovery-scenario.json"))) }] })],
+        ["failed-payload", ({ directory }) => {
+            const file = path.join(directory, "recovery-scenario.json"); const value = readJson(file);
+            value.results[2].result.ok = false; writeJson(file, value);
+        }],
+        ...["action", "build", "owner", "transition", "target", "strict"].map((field) => [
+            `wrong-${field}`, ({ directory }) => {
+                const file = path.join(directory, "recovery-scenario.json"); const value = readJson(file);
+                const waiter = value.results[3].result;
+                if (field === "action") value.results[2].result.action = "status";
+                if (field === "build") waiter.producer.buildId = "foreign";
+                if (field === "owner") waiter.ownerId = "foreign";
+                if (field === "transition") waiter.transitionId++;
+                if (field === "target") waiter.target.qualityMode++;
+                if (field === "strict") waiter.observation.facts.terminalClear = false;
+                writeJson(file, value);
+            }]),
+        ["altered-derived", ({ retainedPath }) => {
+            const value = readJson(retainedPath); value.recovery.target.qualityMode = "wrong"; writeJson(retainedPath, value);
+        }],
+        ["removed-derived", ({ retainedPath }) => {
+            const value = readJson(retainedPath); delete value.recovery; delete value.recoveryReceiptKey; writeJson(retainedPath, value);
+        }],
+        ["duplicate-artifact", ({ directory }) => fs.copyFileSync(path.join(directory, "recovery.json"), path.join(directory, "aaa-copy.json"))],
+        ["duplicate-scenario", ({ directory }) => fs.copyFileSync(path.join(directory, "recovery-scenario.json"), path.join(directory, "zzz-copy.json"))],
+        ["malformed-original", ({ directory }) => fs.writeFileSync(path.join(directory, "recovery-scenario.json"), "{")],
+        ...[null, "foreign", "stale"].map((key) => [`source-${key}`, ({ nextPath }) => {
+            const value = readJson(nextPath); value.sourceRecoveryReceiptKey = key; writeJson(nextPath, value);
+        }]),
+        ["failed-reset", ({ directory }) => {
+            const file = path.join(directory, "recovery.json"); const value = readJson(file);
+            value.status = "FAILED"; writeJson(file, value);
+        }],
+    ];
+    for (const variant of ["nvidia", "amd"]) for (const [name, mutate, positive = false] of cases) {
+        const root = createEvidenceRoot(variant);
+        try {
+            const fixture = installRecoveryFixture(root, variant);
+            mutate(fixture);
+            const rawBefore = walkFixtureFiles(path.join(root, "raw")).map((file) =>
+                [file, crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")]);
+            const options = { root, variant, runId: `${variant}-test-run`, buildId: "e".repeat(64), expectedRows: 2 };
+            for (let repeat = 0; repeat < 2; repeat++) {
+                const result = finalizeEvidence(options);
+                assert((result.summary.assayExecution.status === "COMPLETE") === positive &&
+                    (result.summary.reporting.status === "COMPLETE") === positive,
+                    `Recovery authority/boundary completed incorrectly: ${variant} ${name}: ${JSON.stringify(result.summary.assayExecution)}`);
+                assert(result.summary.transitions[0].renderVerdict === "FAIL",
+                    "Recovery qualification rewrote a failed rendering observation");
+                if (!positive) assert(result.summary.assayExecution.executionScope.conflicts.some(
+                    (reason) => reason.startsWith("recovery_")), "Missing attributable recovery reason");
+                assert(fs.readFileSync(path.join(root, "report.md"), "utf8").includes("| FAIL |") &&
+                    fs.readFileSync(path.join(root, "transitions.csv"), "utf8").includes("FAIL"),
+                    "Failed observation disappeared from report/CSV");
+            }
+            assert(rawBefore.every(([file, hash]) => crypto.createHash("sha256").update(
+                fs.readFileSync(file)).digest("hex") === hash), "Finalizer replayed or rewrote original evidence");
+        } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    }
+}
+
+function walkFixtureFiles(root) {
+    return fs.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+        const file = path.join(root, entry.name);
+        return entry.isDirectory() ? walkFixtureFiles(file) : [file];
+    });
+}
+
+function testLifecycleDuplicateOriginalsFailClosed() {
+    for (const variant of ["nvidia", "amd"]) for (const phase of ["baseline", "handoff", "decision", "status", "lane", "pass"])
+        for (const order of ["aaa", "zzz", "foreign"]) for (const contradictory of [false, true, "canonical"]) {
+            const root = createEvidenceRoot(variant);
+            try {
+                if (variant === "amd") {
+                    const file = path.join(root, "raw", "execution-plan.json");
+                    const value = readJson(file);
+                    for (const entry of value.entries) entry.laneContract.id = "default";
+                    writeJson(file, value);
+                }
+                if (phase === "baseline" && order === "aaa" && contradictory === false) {
+                    assert(finalizeEvidence({ root, variant, runId: `${variant}-test-run`,
+                        buildId: "e".repeat(64), expectedRows: 2 }).summary.reporting.status === "COMPLETE",
+                        "Canonical vendor lifecycle control is not complete");
+                }
+                if (phase === "lane" || phase === "pass") {
+                    const file = path.join(root, "raw", "live-result.json"); const value = readJson(file);
+                    const copy = structuredClone(phase === "lane" ? value.lanes[0] : value.lanes[0].passes[0]);
+                    if (contradictory) copy.status = "FAILED";
+                    const list = phase === "lane" ? value.lanes : value.lanes[0].passes;
+                    if (order === "aaa") list.unshift(copy); else list.push(copy);
+                    writeJson(file, value);
+                } else {
+                    const directory = phase === "baseline" || phase === "handoff" ? phase : "cleanup";
+                    const filename = phase === "status" ? "final-status-after-cleanup.json" : `${phase}.json`;
+                    const file = path.join(root, "raw", "pass-1", directory, filename);
+                    const copy = readJson(file);
+                    if (contradictory) {
+                        if (phase === "decision") copy.status = "UNRESOLVED";
+                        else { copy.ok = false; copy.results[0].result.producer.buildId = "foreign"; }
+                    }
+                    const copyPath = path.join(order === "foreign" ? path.join(root, "raw") : path.dirname(file), `${order}-copy.json`);
+                    if (contradictory === "canonical") {
+                        writeJson(copyPath, readJson(file));
+                        writeJson(file, copy);
+                    } else writeJson(copyPath, copy);
+                }
+                const options = { root, variant, runId: `${variant}-test-run`, buildId: "e".repeat(64), expectedRows: 2 };
+                for (let repeat = 0; repeat < 2; repeat++) {
+                    const result = finalizeEvidence(options);
+                    assert(result.summary.assayExecution.status === "INCOMPLETE" &&
+                        result.summary.reporting.status === "INCOMPLETE" &&
+                        result.summary.assayExecution.passFinalization.reasons.some(
+                            (reason) => reason.includes("ambiguous")) &&
+                        result.summary.transitions.length === 2,
+                        `Duplicate original escaped: ${variant} ${phase} ${order} ${contradictory}`);
+                }
+            } finally { fs.rmSync(root, { recursive: true, force: true }); }
+        }
+}
+
 function testValidationLeavesEvidenceUntouched() {
     const root = createEvidenceRoot();
     try {
@@ -2407,6 +2582,8 @@ Promise.resolve().then(testBoundedPaging).then(testPagingValidation)
     .then(testAmdParity)
     .then(testAmdTraceCapabilityOnlyAffectsReporting)
     .then(testRecoveryIsReportedWithoutRewritingFailure)
+    .then(testRecoveryOriginalsAndBoundaryLinks)
+    .then(testLifecycleDuplicateOriginalsFailClosed)
     .then(testBaselineOnlyInterruptedFinalization)
     .then(testTerminalOriginalsControlCompletion)
     .then(testPreBaselineInterruptedFinalization)
