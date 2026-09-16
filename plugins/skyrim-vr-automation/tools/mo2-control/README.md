@@ -232,6 +232,8 @@ process start time, so a reused PID cannot make an abandoned session appear
 live. Readable legacy PID/start-time records are labelled separately from the
 modern path-bound identity contract; PID presence alone is never reported as an
 identity match.
+The same complete lifetime proof gates cooperative close, stop, dialog cleanup,
+and RootBuilder recovery; a matching PID alone never authorizes UI control.
 
 Cooperative close re-resolves that exact owner after game shutdown and retains
 an open kernel process handle across each `Unlock`, `Exit`, or window-close UI

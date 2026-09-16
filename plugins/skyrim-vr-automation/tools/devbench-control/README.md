@@ -3,7 +3,10 @@
 `Invoke-DevBenchControl.ps1` lists and calls the tools exposed by a running
 CSX DevBench server. It prefers streamable-HTTP MCP and negotiates the REST
 `/api/tools` and `/api/tool/<name>` facade when an older host returns 404 for
-`/mcp`. Supply runtime metadata with `-RuntimePath` or set
+the invocation's first sessionless `/mcp` initialization. Once MCP succeeds,
+that capability remains proven for the invocation: a later replacement
+initialization cannot downgrade to REST and returns
+`mcp-capability-regression` instead. Supply runtime metadata with `-RuntimePath` or set
 `CSX_DEVBENCH_RUNTIME_PATH`; no machine-specific path is compiled into the
 client.
 
@@ -217,7 +220,10 @@ The same `-TimeoutSeconds` value is the total transport budget for `list`,
 `call`, and `wait`. Blocking calls such as a scenario with declared server-side
 waits may therefore use the caller's full bounded budget instead of failing at
 an unrelated fixed 15-second HTTP timeout. Mutation transport failures remain
-indeterminate and are never replayed automatically.
+indeterminate and are never replayed automatically. This includes a dispatched
+MCP mutation whose HTTP response arrives but cannot be decoded; it returns the
+same `indeterminate-mutation` reconciliation boundary as other unknown
+post-dispatch outcomes.
 
 All bounded waits keep explicitly transient 404/429/502/503/504, timeout, and
 main-thread-busy probe failures as unsatisfied observations after the short

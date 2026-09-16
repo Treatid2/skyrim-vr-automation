@@ -1970,7 +1970,17 @@ function Test-DevBenchInitialMcpCapabilityMiss {
         [int]$StatusCode -eq 404
 }
 
-function Get-DevBenchRestMutationFailureDisposition {
+function Test-DevBenchMcpRestFallbackAllowed {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][bool]$InitialCapabilityMiss,
+        [Parameter(Mandatory)][bool]$McpCapabilityPreviouslyProven
+    )
+
+    return $InitialCapabilityMiss -and -not $McpCapabilityPreviouslyProven
+}
+
+function Get-DevBenchMutationFailureDisposition {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][bool]$Mutation,
@@ -1999,4 +2009,17 @@ function Get-DevBenchRestMutationFailureDisposition {
     }
 }
 
-Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchWaitDeadlineAcceptance, Get-DevBenchWaitProbeAssessment, Select-DevBenchWaitProbeFailure, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Test-DevBenchExecutableIdentityMatch, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow, Test-DevBenchInitialMcpCapabilityMiss, Get-DevBenchRestMutationFailureDisposition
+function Get-DevBenchRestMutationFailureDisposition {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][bool]$Mutation,
+        [Parameter(Mandatory)][bool]$RequestAttempted,
+        [Parameter(Mandatory)][bool]$ResponseReceived,
+        [Nullable[int]]$StatusCode,
+        [Parameter(Mandatory)][bool]$Transient
+    )
+
+    return Get-DevBenchMutationFailureDisposition @PSBoundParameters
+}
+
+Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchWaitDeadlineAcceptance, Get-DevBenchWaitProbeAssessment, Select-DevBenchWaitProbeFailure, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Test-DevBenchExecutableIdentityMatch, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow, Test-DevBenchInitialMcpCapabilityMiss, Test-DevBenchMcpRestFallbackAllowed, Get-DevBenchMutationFailureDisposition, Get-DevBenchRestMutationFailureDisposition

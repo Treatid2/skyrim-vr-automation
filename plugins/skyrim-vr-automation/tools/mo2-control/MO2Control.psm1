@@ -5975,25 +5975,26 @@ function Invoke-MO2Stop {
     }
 
     $remainingSeconds = [math]::Max(1, [int][math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds))
-    $currentOwnerResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @($after.processes.mo2)
-    $currentMO2 = @($currentOwnerResolution.targets)
-    $close = if ($currentOwnerResolution.ok -and $currentMO2.Count -eq 1) {
-        Invoke-MO2CooperativeClose -Config $Config -Owned $owned -InitialProcesses $currentMO2 -EvidenceDirectory ([string]$owned.data.sessionPath) -TimeoutSeconds $remainingSeconds
+    $currentOwned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
+    $currentResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $currentOwned -Processes @($after.processes.mo2)
+    $currentMO2 = @($currentResolution.targets)
+    $close = if ($currentResolution.ok -and $currentMO2.Count -eq 1) {
+        Invoke-MO2CooperativeClose -Config $Config -Owned $currentOwned -InitialProcesses $currentMO2 -EvidenceDirectory ([string]$currentOwned.data.sessionPath) -TimeoutSeconds $remainingSeconds
     }
     elseif ($after.processes.mo2.Count -eq 0) {
         [pscustomobject][ordered]@{ closed = $true; targetProcessIds = @(); beforeWindows = @(); actions = @(); remaining = @(); remainingWindows = @(); forceTermination = $false; unrelatedProcessesTouched = @() }
     }
     else {
-        [pscustomobject][ordered]@{ closed = $false; ownerIdentityVerified = $false; blockedReason = [string]$currentOwnerResolution.reason; ownershipResolution = $currentOwnerResolution; targetProcessIds = @(); beforeWindows = @(); actions = @(); remaining = @($after.processes.mo2); remainingWindows = @(); forceTermination = $false; unrelatedProcessesTouched = @() }
+        [pscustomobject][ordered]@{ closed = $false; ownerIdentityVerified = $false; blockedReason = [string]$currentResolution.reason; ownershipResolution = $currentResolution; targetProcessIds = @(); beforeWindows = @(); actions = @(); remaining = @($after.processes.mo2); remainingWindows = @(); forceTermination = $false; unrelatedProcessesTouched = @() }
     }
     $final = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$owned.data.profile) -RequestedExecutable ([string]$owned.data.executable)
     $activeBuildData = @($final.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
     $closed = $final.processes.game.Count -eq 0 -and $final.processes.mo2.Count -eq 0 -and $close.closed -and $activeBuildData.Count -eq 0
     $status = if ($closed) { 'stopped' } elseif ($final.processes.game.Count -eq 0 -and $final.processes.mo2.Count -eq 0 -and $activeBuildData.Count -gt 0) { 'rootbuilder-recovery-required' } else { 'stop-incomplete' }
-    Set-MO2OwnedSessionStatus -Owned $owned -Status $status -TimestampProperty 'stoppedUtc'
-    Write-MO2JsonAtomic -Path (Join-Path ([string]$owned.data.sessionPath) 'mo2-stop.json') -Value $close
+    Set-MO2OwnedSessionStatus -Owned $currentOwned -Status $status -TimestampProperty 'stoppedUtc'
+    Write-MO2JsonAtomic -Path (Join-Path ([string]$currentOwned.data.sessionPath) 'mo2-stop.json') -Value $close
 
-    return New-MO2ActionResult -Config $Config -Command 'stop' -Ok $closed -State $status -Data @{ before = $before.processes; afterGameClose = $after.processes; after = $final.processes; activeBuildData = $activeBuildData; mo2Close = $close; forceTermination = $false; unrelatedProcessesTouched = @(); sessionPath = $owned.data.sessionPath } -Errors $(if ($closed) { @() } elseif ($status -eq 'rootbuilder-recovery-required') { @('All owned processes closed, but RootBuilder BuildData.json remains active. Use recover-rootbuilder for this exact session; do not delete deployment metadata.') } else { @('One or more exact owned processes remained after graceful game close and cooperative MO2 dialogue resolution; no force termination was attempted.') })
+    return New-MO2ActionResult -Config $Config -Command 'stop' -Ok $closed -State $status -Data @{ before = $before.processes; afterGameClose = $after.processes; after = $final.processes; ownershipResolution = $currentResolution; activeBuildData = $activeBuildData; mo2Close = $close; forceTermination = $false; unrelatedProcessesTouched = @(); sessionPath = $currentOwned.data.sessionPath } -Errors $(if ($closed) { @() } elseif ($status -eq 'rootbuilder-recovery-required') { @('All owned processes closed, but RootBuilder BuildData.json remains active. Use recover-rootbuilder for this exact session; do not delete deployment metadata.') } else { @('One or more exact owned processes remained after graceful game close and cooperative MO2 dialogue resolution; no force termination was attempted.') })
 }
 
 function Invoke-MO2ReleaseTransition {
