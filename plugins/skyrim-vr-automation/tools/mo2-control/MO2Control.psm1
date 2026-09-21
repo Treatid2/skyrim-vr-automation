@@ -3087,27 +3087,77 @@ function Assert-MO2ExactProcessTargets {
     }
 }
 
+function Test-MO2ProcessRecordIdentity {
+    param(
+        [Parameter(Mandatory)]$Expected,
+        [Parameter(Mandatory)]$Actual
+    )
+    try {
+        $expectedPath = [IO.Path]::GetFullPath([string]$Expected.path)
+        $actualPath = [IO.Path]::GetFullPath([string]$Actual.path)
+        $expectedStart = [DateTimeOffset]::Parse([string]$Expected.startTime, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+        $actualStart = [DateTimeOffset]::Parse([string]$Actual.startTime, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+    }
+    catch {
+        return [pscustomobject][ordered]@{ ok=$false; reason='process-identity-malformed'; detail=$_.Exception.Message }
+    }
+    $pidMatches = [int]$Expected.id -eq [int]$Actual.id
+    $pathMatches = [string]::Equals($expectedPath, $actualPath, [StringComparison]::OrdinalIgnoreCase)
+    $startMatches = [math]::Abs(($expectedStart - $actualStart).TotalMilliseconds) -lt 1.0
+    return [pscustomobject][ordered]@{
+        ok = $pidMatches -and $pathMatches -and $startMatches
+        reason = if (-not $pidMatches) { 'process-pid-mismatch' } elseif (-not $pathMatches) { 'process-path-mismatch' } elseif (-not $startMatches) { 'process-start-time-mismatch' } else { 'process-identity-matched' }
+    }
+}
+
 function Invoke-MO2CooperativeCloseCore {
     param(
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)][object[]]$InitialProcesses,
-        [ValidateRange(1, 600)][int]$TimeoutSeconds = 90
+        [ValidateRange(1, 600)][int]$TimeoutSeconds = 90,
+        [scriptblock]$ProcessInventoryFactory
     )
 
     Assert-MO2ExactProcessTargets -Config $Config -Processes $InitialProcesses
-    $targetIds = @($InitialProcesses | ForEach-Object { [int]$_.id } | Select-Object -Unique)
+    $authorizedProcesses = @($InitialProcesses)
+    $targetIds = @($authorizedProcesses | ForEach-Object { [int]$_.id } | Select-Object -Unique)
+    if ($targetIds.Count -ne $authorizedProcesses.Count) { throw 'The cooperative-close target set contains duplicate process identities.' }
     $actions = [System.Collections.Generic.List[object]]::new()
     $beforeWindows = @(Get-MO2WindowSnapshot -Processes $InitialProcesses)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $blockedReason = $null
+    if (-not $ProcessInventoryFactory) {
+        $ProcessInventoryFactory = { param($fixtureConfig) @(Get-MO2ProcessRecords -Names @($fixtureConfig.mo2.processNames)) }
+    }
 
     do {
-        $liveRecords = @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames) | Where-Object { $targetIds -contains [int]$_.id })
+        $inventory = @(& $ProcessInventoryFactory $Config)
+        $liveRecords = [Collections.Generic.List[object]]::new()
+        foreach ($authorized in $authorizedProcesses) {
+            $matches = @($inventory | Where-Object { [int]$_.id -eq [int]$authorized.id })
+            if ($matches.Count -eq 0) { continue }
+            if ($matches.Count -ne 1) { $blockedReason = 'owner-pid-ambiguous'; break }
+            $identity = Test-MO2ProcessRecordIdentity -Expected $authorized -Actual $matches[0]
+            if (-not $identity.ok) { $blockedReason = [string]$identity.reason; break }
+            $liveRecords.Add($matches[0])
+        }
+        if ($blockedReason) { break }
+        $liveRecords = @($liveRecords)
         if ($liveRecords.Count -eq 0) { break }
         Assert-MO2ExactProcessTargets -Config $Config -Processes $liveRecords
 
         foreach ($record in $liveRecords) {
             $process = Get-Process -Id ([int]$record.id) -ErrorAction SilentlyContinue
             if (-not $process) { continue }
+            try {
+                $handle = $process.SafeHandle
+                if ($handle.IsInvalid -or $handle.IsClosed) { throw 'The cooperative-close process handle is unavailable.' }
+                $boundRecord = [pscustomobject][ordered]@{
+                    id=$process.Id; path=[IO.Path]::GetFullPath($process.Path)
+                    startTime=$process.StartTime.ToUniversalTime().ToString('o')
+                }
+                $boundIdentity = Test-MO2ProcessRecordIdentity -Expected $record -Actual $boundRecord
+                if (-not $boundIdentity.ok) { $blockedReason = [string]$boundIdentity.reason; break }
             $nativeVisibility = @{}
             foreach ($native in @(Get-MO2NativeWindows -ProcessId ([int]$record.id))) {
                 $nativeVisibility[[string][int64]$native.handle] = [bool]$native.visible
@@ -3252,16 +3302,26 @@ function Invoke-MO2CooperativeCloseCore {
                     accepted = [bool]$accepted
                 })
             }
+            }
+            finally {
+                $process.Dispose()
+            }
+            if ($blockedReason) { break }
         }
+        if ($blockedReason) { break }
         Start-Sleep -Milliseconds 500
     } while ([DateTime]::UtcNow -lt $deadline)
 
-    $remaining = @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames) | Where-Object { $targetIds -contains [int]$_.id })
-    if ($remaining.Count -gt 0) {
-        Assert-MO2ExactProcessTargets -Config $Config -Processes $remaining
+    $remaining = @(& $ProcessInventoryFactory $Config | Where-Object { $targetIds -contains [int]$_.id })
+    foreach ($record in $remaining) {
+        $authorized = @($authorizedProcesses | Where-Object { [int]$_.id -eq [int]$record.id })
+        if ($authorized.Count -ne 1) { $blockedReason = 'owner-pid-ambiguous'; break }
+        $identity = Test-MO2ProcessRecordIdentity -Expected $authorized[0] -Actual $record
+        if (-not $identity.ok) { $blockedReason = [string]$identity.reason; break }
     }
     return [pscustomobject][ordered]@{
-        closed = $remaining.Count -eq 0
+        closed = $null -eq $blockedReason -and $remaining.Count -eq 0
+        blockedReason = $blockedReason
         targetProcessIds = @($targetIds)
         beforeWindows = @($beforeWindows)
         actions = @($actions)
@@ -3427,6 +3487,14 @@ function Resolve-MO2OwnedProcessTarget {
                 reason = 'recorded-owner-identity-mismatch'; ownerIdentityEvidenceComplete = $true; ownerIdentityMatched = $false
                 ownerStartTimeMatched = $Owned.ownerStartTimeMatched; ownerPathMatched = $Owned.ownerPathMatched
             }
+        }
+        if (-not $Owned.data.PSObject.Properties['processPath'] -or -not $Owned.data.PSObject.Properties['processStartTime']) {
+            return [pscustomobject][ordered]@{ ok=$false; ownerPid=$ownerPid; targets=@(); adopted=$false; adoption=$null; reason='recorded-owner-identity-incomplete' }
+        }
+        $expected = [pscustomobject][ordered]@{ id=$ownerPid; path=[string]$Owned.data.processPath; startTime=[string]$Owned.data.processStartTime }
+        $currentIdentity = Test-MO2ProcessRecordIdentity -Expected $expected -Actual $ownedTargets[0]
+        if (-not $currentIdentity.ok) {
+            return [pscustomobject][ordered]@{ ok=$false; ownerPid=$ownerPid; targets=@(); adopted=$false; adoption=$null; reason=[string]$currentIdentity.reason; currentIdentity=$currentIdentity }
         }
         return [pscustomobject][ordered]@{
             ok = $true; ownerPid = $ownerPid; targets = @($ownedTargets); adopted = $false; adoption = $null

@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Retain MO2's complete PID, executable-path, and start-time identity through
+  every cooperative-close loop and process handle so a reused PID cannot
+  receive Unlock, Exit, Cancel, or window-close actions.
 - Normalize the evidence-directory boundary before validating snapshot
   containment so an equivalent trailing-separator spelling cannot block task
   completion or receipt-only recovery.

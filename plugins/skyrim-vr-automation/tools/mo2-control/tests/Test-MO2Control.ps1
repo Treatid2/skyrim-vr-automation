@@ -423,6 +423,14 @@ selected_profile=@ByteArray(Codex)
         Resolve-MO2OwnedProcessTarget -Config $fixtureConfig -Owned $ownedLock -Processes @($processRecord) -AdoptDetachedOwner
     } $config $qualifiedOwnerInspection.data.sessionLock $currentHostRecord
     Assert-MO2Test ($qualifiedControlAdmission.ok -and $qualifiedControlAdmission.reason -eq 'recorded-owner' -and @($qualifiedControlAdmission.targets).Count -eq 1) 'complete matching PID, start-time, and path evidence admits the exact retained owner'
+    $replacementAfterAdmission = [pscustomobject]@{ id=777; path=$mo2Exe; startTime=[DateTime]::UtcNow.AddMinutes(1).ToString('o') }
+    $admittedBeforeReplacement = [pscustomobject]@{ id=777; path=$mo2Exe; startTime=[DateTime]::UtcNow.ToString('o') }
+    $replacementInventory = { param($unusedConfig) @($replacementAfterAdmission) }.GetNewClosure()
+    $replacementClose = & $mo2Module {
+        param($fixtureConfig, $initial, $factory)
+        Invoke-MO2CooperativeCloseCore -Config $fixtureConfig -InitialProcesses @($initial) -TimeoutSeconds 1 -ProcessInventoryFactory $factory
+    } $config $admittedBeforeReplacement $replacementInventory
+    Assert-MO2Test (-not $replacementClose.closed -and $replacementClose.blockedReason -eq 'process-start-time-mismatch' -and @($replacementClose.actions).Count -eq 0) 'cooperative close rejects a same-PID same-path replacement after successful admission before any UI action'
     Remove-Item -LiteralPath $config.session.lockFile -Force
 
     $missingPrepareAccess = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -WhatIf
