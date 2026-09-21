@@ -565,6 +565,12 @@ Assert-Test (-not $failedRenderScaleProbe.ok -and $failedRenderScaleProbe.termin
 Assert-Test (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $false -IssuedSessionId '' -StatusCode 404) 'only an initial sessionless MCP 404 proves capability absence'
 Assert-Test (-not (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $true -IssuedSessionId 'session-1' -StatusCode 404)) 'a post-initialization MCP 404 cannot authorize REST fallback'
 Assert-Test (-not (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $false -IssuedSessionId '' -StatusCode 503)) 'a non-404 MCP initialization failure cannot authorize REST fallback'
+Assert-Test (Test-DevBenchMcpRestFallbackAllowed -InitialCapabilityMiss $true -McpCapabilityPreviouslyProven $false) 'the first genuine sessionless MCP capability miss may select REST compatibility'
+Assert-Test (-not (Test-DevBenchMcpRestFallbackAllowed -InitialCapabilityMiss $true -McpCapabilityPreviouslyProven $true)) 'a sessionless replacement handshake cannot forget previously proven MCP capability'
+$mcpDecodeFailure = Get-DevBenchMutationFailureDisposition -Mutation $true -RequestAttempted $true -ResponseReceived $true -StatusCode $null -Transient $false
+Assert-Test ($mcpDecodeFailure.indeterminate -and $mcpDecodeFailure.reason -eq 'response-outcome-undecodable') 'an undecodable MCP mutation response remains indeterminate after one dispatch'
+$mcpPreDispatchFailure = Get-DevBenchMutationFailureDisposition -Mutation $true -RequestAttempted $false -ResponseReceived $false -StatusCode $null -Transient $false
+Assert-Test (-not $mcpPreDispatchFailure.indeterminate -and $mcpPreDispatchFailure.reason -eq 'pre-dispatch-failure') 'an MCP pre-dispatch failure remains definite and is not mislabeled as committed'
 $restDecodeFailure = Get-DevBenchRestMutationFailureDisposition -Mutation $true -RequestAttempted $true -ResponseReceived $true -StatusCode $null -Transient $false
 Assert-Test ($restDecodeFailure.indeterminate -and $restDecodeFailure.reason -eq 'response-outcome-undecodable') 'an undecodable REST mutation response remains indeterminate after one dispatch'
 $restConnectionFailure = Get-DevBenchRestMutationFailureDisposition -Mutation $true -RequestAttempted $true -ResponseReceived $false -StatusCode $null -Transient $false
@@ -1014,9 +1020,15 @@ Assert-Test ($entryPointText -match '\$requestedAction -eq ''disable''[\s\S]{0,1
 Assert-Test ($entryPointText -match 'outcome = ''profiler-contract-satisfied''') 'accepted profiler responses report their contract-specific outcome'
 Assert-Test ($entryPointText -match 'Invoke-ToolRpc -Name \$Tool -Arguments \$arguments -Headers \$headers -Mutation:\(-not \$readOnlyCall\)') 'user calls carry their explicit retry-safety classification'
 Assert-Test ($entryPointText -match 'not-retried-indeterminate') 'ambiguous mutation transport failures are not replayed'
-Assert-Test ($entryPointText -match 'failureState = if \(\$indeterminateMutation\) \{ ''indeterminate'' \}' -and $entryPointText -match 'Update-InvocationEvidence -State \$failureState') 'indeterminate mutation outcomes are durably journaled'
+Assert-Test ($entryPointText -match '\$failureState = if[\s\S]{0,300}\$outcomeIndeterminate\) \{ ''indeterminate'' \}' -and $entryPointText -match 'Update-InvocationEvidence -State \$failureState') 'indeterminate mutation outcomes are durably journaled'
+Assert-Test ($entryPointText -match '-Semantic \$semantic -Data \$failureData -Errors') 'post-dispatch failures preserve accepted data in the invocation journal when possible'
+Assert-Test (
+    $entryPointText -match 'acceptedDataRetained = \[bool\]\$dispatch\.acceptedDataRetained' -and
+    $entryPointText -match 'responseDataRetained = \[bool\]\$dispatch\.responseDataRetained' -and
+    $entryPointText -match 'data = \$failureData'
+) 'post-dispatch failure envelopes retain accepted response data and expose its provenance'
 Assert-Test ($entryPointText -match '\$headers = \$null[\s\S]{0,300}probeError') 'wait probe transport failures force full session and identity rebind'
-Assert-Test ($entryPointText -match '-TimeoutSec \(Get-RequestTimeoutSeconds\)') 'wait requests consume only their remaining operation budget'
+Assert-Test ($entryPointText -match '\$requestTimeoutSeconds = Get-RequestTimeoutSeconds' -and $entryPointText -match '-TimeoutSec \$requestTimeoutSeconds') 'wait requests consume only their remaining operation budget before dispatch begins'
 Assert-Test ($entryPointText -match '\$operationStartedUtc = \[DateTime\]::UtcNow' -and $entryPointText -match '\$operationDeadlineUtc = \$operationStartedUtc.AddSeconds\(\$TimeoutSeconds\)' -and $entryPointText -notmatch '\[Math\]::Min\(15,') 'blocking calls use the declared operation budget instead of a fixed 15-second transport cap'
 Assert-Test ($entryPointText -notmatch 'Start-Sleep -Milliseconds \$currentDelay') 'wait poll delays cannot exceed the operation deadline'
 Assert-Test ($entryPointText -match 'mcp-session-reinitialized') 'bounded waits reinitialize invalidated MCP sessions'
@@ -1068,6 +1080,9 @@ Assert-Test ($entryPointText -match "classification = 'late-positive-observation
 Assert-Test ($entryPointText -match "phase = 'initialize'; recovery = 'outer-wait-retry'") 'wait initialization failures remain inside the outer timeout state machine'
 Assert-Test ($entryPointText -match '\$null -eq \$headers') 'bounded waits establish or re-establish the MCP session inside the polling loop'
 Assert-Test ($entryPointText -match 'function Open-DevBenchSession' -and $entryPointText -match "DevBenchMcpCapabilityAbsent" -and $entryPointText -match "recovery = 'rest-capability-negotiation'") 'transport negotiation falls back only after an explicitly classified initial MCP capability miss'
+Assert-Test ($entryPointText -match '\$script:mcpCapabilityPreviouslyProven = \$true' -and $entryPointText -match 'Test-DevBenchMcpRestFallbackAllowed' -and $entryPointText -match 'Refusing REST downgrade') 'same-runtime rebinds retain prior MCP capability evidence and reject a later REST downgrade'
+Assert-Test ($entryPointText -match "DevBenchMcpCapabilityRegression" -and $entryPointText -match "'mcp-capability-regression'" -and $entryPointText -match 'restFallbackRefused = \$true') 'a rejected replacement handshake returns and journals an explicit non-retryable MCP capability regression'
+Assert-Test ($entryPointText -match '\$responseReceived = \$true' -and $entryPointText -match 'Get-DevBenchMutationFailureDisposition -Mutation' -and $entryPointText -match 'disposition = \$mutationDisposition\.reason') 'MCP post-dispatch decode failures flow into the durable indeterminate-mutation result'
 Assert-Test ($entryPointText -match '/api/tools' -and $entryPointText -match '/api/tool/\$escapedName') 'REST fallback uses DevBench discovery and exact tool endpoints'
 Assert-Test ($entryPointText -match 'DevBench REST mutation transport failed after dispatch' -and $entryPointText -match 'DevBenchIndeterminateMutation') 'REST mutations preserve the no-replay indeterminate contract'
 Assert-Test ($entryPointText -match 'transport = \$transport') 'runtime and invocation evidence identify the negotiated transport'

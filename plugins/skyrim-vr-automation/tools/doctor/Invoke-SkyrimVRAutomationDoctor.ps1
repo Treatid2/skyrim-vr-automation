@@ -130,8 +130,10 @@ try {
                 }
                 $fixtureInput = if ($machineConfig.defaults.PSObject.Properties['newGameFixtureManifest']) { [string]$machineConfig.defaults.newGameFixtureManifest } else { '' }
                 if ([string]::IsNullOrWhiteSpace($fixtureInput)) {
-                    $checks.Add((New-DoctorCheck 'prime-profile-world-entry-integrity' 'fail' 'The maintained source profile has no configured world-entry save. Set defaults.newGameFixtureManifest and verify its default fixture before creating task profiles.' ([pscustomobject][ordered]@{
+                    $checks.Add((New-DoctorCheck 'prime-profile-world-entry-integrity' 'fail' 'The maintained source profile has no configured world-entry save. Set defaults.newGameFixtureManifest before creating VerifiedFixture task profiles; MainMenuOnly and FreshGame creation do not consume this fixture.' ([pscustomobject][ordered]@{
                         configurationProperty = 'defaults.newGameFixtureManifest'
+                        requiredForSavePolicy = 'VerifiedFixture'
+                        unaffectedSavePolicies = @('MainMenuOnly', 'FreshGame')
                         exampleManifestPath = [IO.Path]::GetFullPath((Join-Path $repositoryRoot 'tools\mo2-workspace-control\save-fixtures.example.json'))
                     })))
                 }
@@ -155,7 +157,9 @@ try {
                         exampleManifestPath = [IO.Path]::GetFullPath((Join-Path $repositoryRoot 'tools\mo2-workspace-control\save-fixtures.example.json'))
                         fixtureStatus = $fixtureStatus
                     }
-                    $checks.Add((New-DoctorCheck 'prime-profile-world-entry-integrity' $(if ($fixtureValid) { 'pass' } else { 'fail' }) $(if ($fixtureValid) { "The maintained source profile has an integrity-verified world-entry save fixture '$($fixtureStatus.data.fixtureId)'. No live-load qualification is inferred." } else { 'The maintained source profile world-entry save is missing, stale, or invalid. Run fixture-status and repair or refresh it before creating task profiles.' }) $fixtureEvidence))
+                    $fixtureEvidence | Add-Member -NotePropertyName requiredForSavePolicy -NotePropertyValue 'VerifiedFixture'
+                    $fixtureEvidence | Add-Member -NotePropertyName unaffectedSavePolicies -NotePropertyValue @('MainMenuOnly', 'FreshGame')
+                    $checks.Add((New-DoctorCheck 'prime-profile-world-entry-integrity' $(if ($fixtureValid) { 'pass' } else { 'fail' }) $(if ($fixtureValid) { "The maintained source profile has an integrity-verified world-entry save fixture '$($fixtureStatus.data.fixtureId)'. No live-load qualification is inferred." } else { 'The maintained source profile world-entry save is missing, stale, or invalid. Run fixture-status before creating VerifiedFixture task profiles; MainMenuOnly and FreshGame creation remain available.' }) $fixtureEvidence))
                 }
             }
             catch {

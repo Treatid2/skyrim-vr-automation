@@ -48,6 +48,7 @@ param(
     [string]$Tool,
     [string]$ArgumentsJson,
     [string]$RuntimePath,
+    [string]$ExpectedRuntimeIdentityJson,
     [switch]$RequireSuccess,
     [switch]$Compact,
     [switch]$NoExit,
@@ -55,6 +56,47 @@ param(
 )
 Import-Module $env:CAPTURE_INTERACTION_SEMANTIC_MODULE -Force
 $argsObject = $ArgumentsJson | ConvertFrom-Json -Depth 80
+$listenerPid = if ($env:CAPTURE_INTERACTION_RUNTIME_PID) { [int]$env:CAPTURE_INTERACTION_RUNTIME_PID } else { 101 }
+$processStartTimeUtc = if ($env:CAPTURE_INTERACTION_RUNTIME_START) { [string]$env:CAPTURE_INTERACTION_RUNTIME_START } else { "2026-09-11T00:00:$('{0:d2}' -f ($listenerPid % 60)).0000000Z" }
+$buildId = if ($env:CAPTURE_INTERACTION_RUNTIME_BUILD) { [string]$env:CAPTURE_INTERACTION_RUNTIME_BUILD } else { ('a' * 64) -join '' }
+$artifactSha256 = if ($env:CAPTURE_INTERACTION_RUNTIME_ARTIFACT_SHA) { [string]$env:CAPTURE_INTERACTION_RUNTIME_ARTIFACT_SHA } else { ('b' * 64) -join '' }
+$runtimeIdentity = [pscustomobject]@{
+  complete=$true; verified=$true; listenerPid=$listenerPid
+  process=[pscustomobject]@{path='C:\fixture\SkyrimVR.exe';startTimeUtc=$processStartTimeUtc}
+  build=[pscustomobject]@{buildId=$buildId}
+  artifact=[pscustomobject]@{path='C:\fixture\CommunityShaders.dll';sha256=$artifactSha256}
+}
+if ($ExpectedRuntimeIdentityJson) {
+  $expectedIdentity = $ExpectedRuntimeIdentityJson | ConvertFrom-Json -Depth 20
+  $identityMatches = [int]$expectedIdentity.listenerPid -eq $runtimeIdentity.listenerPid -and
+    [string]$expectedIdentity.processPath -ceq [string]$runtimeIdentity.process.path -and
+    ([DateTime]$expectedIdentity.processStartTimeUtc).ToUniversalTime() -eq ([DateTime]$runtimeIdentity.process.startTimeUtc).ToUniversalTime() -and
+    [string]$expectedIdentity.buildId -ceq [string]$runtimeIdentity.build.buildId -and
+    [string]$expectedIdentity.artifactPath -ceq [string]$runtimeIdentity.artifact.path -and
+    [string]$expectedIdentity.artifactSha256 -ceq [string]$runtimeIdentity.artifact.sha256
+  if (-not $identityMatches) {
+    [pscustomobject]@{ok=$false;transportOk=$false;state='failed';indeterminate=$false;dispatchReached=$false;acceptedDataRetained=$false;runtimeIdentity=$runtimeIdentity;data=$null;errors=@('fixture expected runtime identity mismatch')} | ConvertTo-Json -Depth 20 -Compress
+    return
+  }
+}
+[IO.File]::AppendAllText((Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'calls.log'), "$Tool/$($argsObject.action)`n")
+if ($Tool -eq 'record' -and $argsObject.action -eq 'start' -and $env:CAPTURE_INTERACTION_REJECT_RECORD_RECEIPT -eq '1') {
+  $rejected=[pscustomobject]@{action='start';recording=$true;correlationId='foreign-capture'}
+  [pscustomobject]@{ok=$false;transportOk=$true;state='semantic-failed';indeterminate=$false;dispatchReached=$true;responseDataRetained=$true;acceptedDataRetained=$false;runtimeIdentity=$runtimeIdentity;semantic=[pscustomobject]@{known=$true;ok=$false};data=[pscustomobject]@{content=@($rejected)};errors=@('fixture correlation mismatch')} | ConvertTo-Json -Depth 20 -Compress
+  return
+}
+if ($Tool -eq 'record' -and $argsObject.action -eq 'start' -and $env:CAPTURE_INTERACTION_LOSE_RECORD_RESULT -eq '1') {
+  [pscustomobject]@{ok=$false;transportOk=$false;state='indeterminate-mutation';indeterminate=$true;dispatchReached=$true;acceptedDataRetained=$false;invocationEvidencePath='record-start-invocation.json';data=$null;errors=@('fixture lost recording result after dispatch')} | ConvertTo-Json -Depth 20 -Compress
+  return
+}
+if ($Tool -eq 'record' -and $argsObject.action -eq 'stop' -and $env:CAPTURE_INTERACTION_FAIL_CLEANUP -eq '1') {
+  [pscustomobject]@{ok=$false;data=$null;errors=@('fixture record stop failure')} | ConvertTo-Json -Compress
+  return
+}
+if ($Tool -eq 'communityshaders.screenshot' -and $argsObject.action -eq 'request_cancel' -and $env:CAPTURE_INTERACTION_FAIL_CLEANUP -eq '1') {
+  [pscustomobject]@{ok=$false;data=$null;errors=@('fixture screenshot cancel failure')} | ConvertTo-Json -Compress
+  return
+}
 $frame = [pscustomobject]@{
   tMs=0; seq=1; originCode=1
   hmd=[pscustomobject]@{available=$true;connected=$true;valid=$true;index=0;trackingResult=200;matrix=@(1,0,0,0,0,1,0,0,0,0,1,0);velocity=@(0,0,0);angularVelocity=@(0,0,0)}

@@ -373,9 +373,11 @@ selected_profile=@ByteArray(Codex)
     $recoveredAccess = Invoke-MO2RecoverAccess -Config $config -AccessId $abandonedAccessId -ConfirmAbandoned -Label 'fixture confirmed abandoned'
     Assert-MO2Test ($recoveredAccess.ok -and $recoveredAccess.state -eq 'access-recovered') 'confirmed abandoned access can be recovered in proven closed state'
 
+    $currentHostProcess = Get-Process -Id $PID
+    $currentHostRecord = [pscustomobject]@{ id = $PID; path = $currentHostProcess.Path; startTime = $currentHostProcess.StartTime.ToUniversalTime().ToString('o') }
     [ordered]@{
         contractVersion = 'fixture'; sessionId = 'session-pid-reuse'; status = 'running'; ownerPid = $PID
-        processStartTime = [DateTime]::UtcNow.AddDays(-1).ToString('o')
+        processStartTime = [DateTime]::UtcNow.AddDays(-1).ToString('o'); processPath = $currentHostRecord.path
     } | ConvertTo-Json | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
     $pidReuseInspection = Invoke-MO2Inspect -Config $config
     Assert-MO2Test (-not $pidReuseInspection.data.sessionLock.ownerRunning -and -not $pidReuseInspection.data.sessionLock.ownerIdentityMatched) 'session ownership rejects a reused PID with a different process start time'
@@ -384,6 +386,11 @@ selected_profile=@ByteArray(Codex)
         Get-MO2LaunchResumeDisposition -SessionStatus 'game-stopped' -GameProcesses @() -MO2Processes @([pscustomobject]@{ id = $ownerProcessId }) -OwnerPid $ownerProcessId -OwnerIdentityMatched ([bool]$inspection.data.sessionLock.ownerIdentityMatched)
     } $pidReuseInspection $PID
     Assert-MO2Test (-not $pidReuseLaunchAdmission.ok -and $pidReuseLaunchAdmission.reason -eq 'owner-identity-mismatch') 'same-PID different-start-time evidence blocks launch admission before dispatch'
+    $pidReuseControlAdmission = & $mo2Module {
+        param($fixtureConfig, $ownedLock, $processRecord)
+        Resolve-MO2OwnedProcessTarget -Config $fixtureConfig -Owned $ownedLock -Processes @($processRecord) -AdoptDetachedOwner
+    } $config $pidReuseInspection.data.sessionLock $currentHostRecord
+    Assert-MO2Test (-not $pidReuseControlAdmission.ok -and $pidReuseControlAdmission.reason -eq 'recorded-owner-identity-mismatch' -and -not $pidReuseControlAdmission.ownerStartTimeMatched -and $pidReuseControlAdmission.ownerPathMatched -and @($pidReuseControlAdmission.targets).Count -eq 0) 'complete same-PID and path evidence with a different start time cannot authorize cooperative process control'
     [ordered]@{
         contractVersion = 'fixture'; sessionId = 'session-path-reuse'; status = 'game-stopped'; ownerPid = $PID
         processStartTime = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
@@ -391,11 +398,39 @@ selected_profile=@ByteArray(Codex)
     } | ConvertTo-Json | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
     $pathMismatchInspection = Invoke-MO2Inspect -Config $config
     Assert-MO2Test (-not $pathMismatchInspection.data.sessionLock.ownerIdentityMatched -and $pathMismatchInspection.data.sessionLock.ownerStartTimeMatched -and -not $pathMismatchInspection.data.sessionLock.ownerPathMatched) 'session ownership requires the recorded executable path as well as PID and start time'
+    $pathMismatchControlAdmission = & $mo2Module {
+        param($fixtureConfig, $ownedLock, $processRecord)
+        Resolve-MO2OwnedProcessTarget -Config $fixtureConfig -Owned $ownedLock -Processes @($processRecord) -AdoptDetachedOwner
+    } $config $pathMismatchInspection.data.sessionLock $currentHostRecord
+    Assert-MO2Test (-not $pathMismatchControlAdmission.ok -and $pathMismatchControlAdmission.reason -eq 'recorded-owner-identity-mismatch' -and -not $pathMismatchControlAdmission.ownerPathMatched) 'same-PID same-start but wrong-path evidence blocks cooperative close and stop targets'
     [ordered]@{
         contractVersion = 'fixture'; sessionId = 'session-legacy-owner'; status = 'game-stopped'; ownerPid = $PID
     } | ConvertTo-Json | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
     $legacyOwnerInspection = Invoke-MO2Inspect -Config $config
     Assert-MO2Test (-not $legacyOwnerInspection.data.sessionLock.ownerIdentityEvidenceComplete -and -not $legacyOwnerInspection.data.sessionLock.ownerIdentityMatched) 'a legacy PID-only lock remains readable but cannot authorize live-process reuse'
+    $legacyControlAdmission = & $mo2Module {
+        param($fixtureConfig, $ownedLock, $processRecord)
+        Resolve-MO2OwnedProcessTarget -Config $fixtureConfig -Owned $ownedLock -Processes @($processRecord) -AdoptDetachedOwner
+    } $config $legacyOwnerInspection.data.sessionLock $currentHostRecord
+    Assert-MO2Test (-not $legacyControlAdmission.ok -and $legacyControlAdmission.reason -eq 'recorded-owner-identity-incomplete' -and @($legacyControlAdmission.targets).Count -eq 0) 'legacy incomplete lifetime evidence cannot authorize cooperative process control'
+    [ordered]@{
+        contractVersion = 'fixture'; sessionId = 'session-qualified-owner'; status = 'game-stopped'; ownerPid = $PID
+        processStartTime = $currentHostRecord.startTime; processPath = $currentHostRecord.path
+    } | ConvertTo-Json | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    $qualifiedOwnerInspection = Invoke-MO2Inspect -Config $config
+    $qualifiedControlAdmission = & $mo2Module {
+        param($fixtureConfig, $ownedLock, $processRecord)
+        Resolve-MO2OwnedProcessTarget -Config $fixtureConfig -Owned $ownedLock -Processes @($processRecord) -AdoptDetachedOwner
+    } $config $qualifiedOwnerInspection.data.sessionLock $currentHostRecord
+    Assert-MO2Test ($qualifiedControlAdmission.ok -and $qualifiedControlAdmission.reason -eq 'recorded-owner' -and @($qualifiedControlAdmission.targets).Count -eq 1) 'complete matching PID, start-time, and path evidence admits the exact retained owner'
+    $replacementAfterAdmission = [pscustomobject]@{ id=777; path=$mo2Exe; startTime=[DateTime]::UtcNow.AddMinutes(1).ToString('o') }
+    $admittedBeforeReplacement = [pscustomobject]@{ id=777; path=$mo2Exe; startTime=[DateTime]::UtcNow.ToString('o') }
+    $replacementInventory = { param($unusedConfig) @($replacementAfterAdmission) }.GetNewClosure()
+    $replacementClose = & $mo2Module {
+        param($fixtureConfig, $initial, $factory)
+        Invoke-MO2CooperativeCloseCore -Config $fixtureConfig -InitialProcesses @($initial) -TimeoutSeconds 1 -ProcessInventoryFactory $factory
+    } $config $admittedBeforeReplacement $replacementInventory
+    Assert-MO2Test (-not $replacementClose.closed -and $replacementClose.blockedReason -eq 'process-start-time-mismatch' -and @($replacementClose.actions).Count -eq 0) 'cooperative close rejects a same-PID same-path replacement after successful admission before any UI action'
     Remove-Item -LiteralPath $config.session.lockFile -Force
 
     $missingPrepareAccess = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -WhatIf
@@ -469,6 +504,8 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test (Test-Path -LiteralPath (Join-Path $prepared.data.sessionPath 'session.json') -PathType Leaf) 'prepare creates a durable session manifest'
     Assert-MO2Test ([bool]$prepared.data.session.requirements.skseLoader) 'prepare persists the SKSE requirement for launch revalidation'
     Assert-MO2Test (Test-Path -LiteralPath $prepared.data.controllerPath -PathType Leaf) 'prepare snapshots a durable session controller outside the plugin cache'
+    Assert-MO2Test (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $prepared.data.controllerPath) 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1') -PathType Leaf) 'durable session controller retains its shader-cache provider verifier'
+    Assert-MO2Test (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $prepared.data.controllerPath) 'shader-cache-control\ShaderCacheInventory.ps1') -PathType Leaf) 'durable session controller retains the shader-cache inventory dependency'
     $durableStatus = & $prepared.data.controllerPath status -SessionId ([string]$prepared.data.session.sessionId) -Compact -NoExit | ConvertFrom-Json
     Assert-MO2Test ($durableStatus.ok -and $durableStatus.state -eq 'prepared') 'durable session controller can resume the owned lifecycle independently'
     Assert-MO2Test ($durableStatus.data.approval.entryPoint -eq [IO.Path]::GetFullPath([string]$prepared.data.controllerPath) -and $durableStatus.data.approval.reusablePrefix[5] -eq 'status') 'durable controller advertises its own stable literal approval prefix'

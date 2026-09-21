@@ -2023,7 +2023,17 @@ function Test-DevBenchInitialMcpCapabilityMiss {
         [int]$StatusCode -eq 404
 }
 
-function Get-DevBenchRestMutationFailureDisposition {
+function Test-DevBenchMcpRestFallbackAllowed {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][bool]$InitialCapabilityMiss,
+        [Parameter(Mandatory)][bool]$McpCapabilityPreviouslyProven
+    )
+
+    return $InitialCapabilityMiss -and -not $McpCapabilityPreviouslyProven
+}
+
+function Get-DevBenchMutationFailureDisposition {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][bool]$Mutation,
