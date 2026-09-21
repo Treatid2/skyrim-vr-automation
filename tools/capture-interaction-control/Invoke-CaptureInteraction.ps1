@@ -169,6 +169,7 @@ function Invoke-DevBench([string]$Tool, [hashtable]$Arguments, [string]$Runtime,
                 $details.Add("controller returned ok=false with state '$state' and no diagnostic detail")
             }
             $failure = [InvalidOperationException]::new("DevBench tool '$Tool' failed: $($details -join '; ')")
+            $failure.Data['DevBenchResponse'] = $response
             $failure.Data['DevBenchFailureEnvelope'] = $response
             $failure.Data['DevBenchAttempt'] = $attempt
             throw $failure
@@ -178,9 +179,7 @@ function Invoke-DevBench([string]$Tool, [hashtable]$Arguments, [string]$Runtime,
         return [pscustomobject][ordered]@{ value = $content[0]; envelope = $response; attempt = $attempt }
     }
     catch {
-        if (-not $_.Exception.Data.Contains('DevBenchAttempt')) {
-            $_.Exception.Data['DevBenchAttempt'] = $attempt
-        }
+        if (-not $_.Exception.Data.Contains('DevBenchAttempt')) { $_.Exception.Data['DevBenchAttempt'] = $attempt }
         throw
     }
 }
@@ -229,96 +228,6 @@ function New-ScreenshotCommand([string]$SessionId, [string]$Action) {
         clientId = "capture-interaction/$SessionId"
         commandId = [guid]::NewGuid().ToString('N')
     }
-}
-
-function Throw-CaptureStartFailure {
-    param(
-        [Parameter(Mandatory)][string]$Phase,
-        [Parameter(Mandatory)][string]$Cause,
-        [Parameter(Mandatory)][string]$SessionId,
-        [Parameter(Mandatory)][string]$SessionDirectory,
-        [Parameter(Mandatory)][string]$StatePath,
-        [Parameter(Mandatory)][string]$Runtime,
-        $RecordStartReceipt,
-        $RecordStartAttempt,
-        $RecordStartFailureEnvelope,
-        $ScreenshotState,
-        $ScreenshotAttemptReceipt,
-        $ScreenshotStartAttempt,
-        $ScreenshotStartFailureEnvelope
-    )
-    $cleanupErrors = [Collections.Generic.List[string]]::new()
-    $screenshotTerminalReceipt = $null
-    $recordStopReceipt = $null
-    $requestId = if ($ScreenshotState -and $ScreenshotState.PSObject.Properties['requestId']) { [string]$ScreenshotState.requestId } else { $null }
-    if (-not [string]::IsNullOrWhiteSpace($requestId)) {
-        try {
-            $cancel = New-ScreenshotCommand $SessionId 'request_cancel'
-            $cancel['requestId'] = $requestId
-            $null = Invoke-DevBench -Tool $screenshotTool -Arguments $cancel -Runtime $Runtime -RequireSuccess
-            $rollbackState = [pscustomobject]@{ sessionId = $SessionId; runtimePath = [IO.Path]::GetFullPath($Runtime) }
-            $screenshotTerminalReceipt = Wait-ScreenshotTerminal -RequestId $requestId -State $rollbackState
-        }
-        catch { $cleanupErrors.Add("Screenshot request '$requestId' cleanup failed: $($_.Exception.Message)") }
-    }
-    elseif ($null -ne $ScreenshotAttemptReceipt -or
-        ($ScreenshotStartAttempt -and [bool]$ScreenshotStartAttempt.dispatchAttempted -and
-            -not (Test-DefiniteDevBenchMutationRejection $ScreenshotStartFailureEnvelope))) {
-        $cleanupErrors.Add('Screenshot start may have dispatched, but no qualified requestId was available for cancellation.')
-    }
-    if ($null -ne $RecordStartReceipt) {
-        try {
-            $recordStopReceipt = (Invoke-DevBench -Tool 'record' -Arguments @{ action = 'stop' } -Runtime $Runtime -RequireSuccess).value
-        }
-        catch { $cleanupErrors.Add("Recording cleanup failed: $($_.Exception.Message)") }
-    }
-    elseif ($RecordStartAttempt -and [bool]$RecordStartAttempt.dispatchAttempted -and
-        -not (Test-DefiniteDevBenchMutationRejection $RecordStartFailureEnvelope)) {
-        $cleanupErrors.Add('Recording start may have dispatched, but no correlation-qualified stop operation is available for safe reconciliation.')
-    }
-
-    $rolledBack = $cleanupErrors.Count -eq 0
-    $recovery = [pscustomobject][ordered]@{
-        contractVersion = '1.0.0'
-        phase = $Phase
-        cause = $Cause
-        sessionId = $SessionId
-        sessionDirectory = $SessionDirectory
-        statePath = $StatePath
-        runtimePath = [IO.Path]::GetFullPath($Runtime)
-        ownership = if ($rolledBack) { 'released' } else { 'cleanup-uncertain' }
-        rolledBack = $rolledBack
-        recording = [pscustomobject][ordered]@{
-            startReceipt = $RecordStartReceipt
-            startAttempt = $RecordStartAttempt
-            failureEnvelope = $RecordStartFailureEnvelope
-            stopReceipt = $recordStopReceipt
-        }
-        screenshot = [pscustomobject][ordered]@{
-            requestId = $requestId
-            startReceipt = if ($ScreenshotState) { $ScreenshotState.startReceipt } else { $null }
-            attemptReceipt = $ScreenshotAttemptReceipt
-            startAttempt = $ScreenshotStartAttempt
-            failureEnvelope = $ScreenshotStartFailureEnvelope
-            terminalReceipt = $screenshotTerminalReceipt
-        }
-        cleanupErrors = @($cleanupErrors)
-        capturedUtc = [DateTime]::UtcNow.ToString('o')
-    }
-    $recoveryPath = Join-Path $SessionDirectory ('capture-interaction.start-failure.' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ') + '.json')
-    try {
-        Write-JsonAtomic -Path $recoveryPath -Value $recovery
-        $recovery | Add-Member -NotePropertyName recoveryReceiptPath -NotePropertyValue $recoveryPath -Force
-    }
-    catch {
-        $recovery | Add-Member -NotePropertyName recoveryReceiptPath -NotePropertyValue $null -Force
-        $recovery | Add-Member -NotePropertyName recoveryReceiptError -NotePropertyValue $_.Exception.Message -Force
-    }
-    $summary = if ($rolledBack) { 'started services were successfully rolled back' } else { 'started-service ownership is uncertain because cleanup did not fully qualify' }
-    $failure = [InvalidOperationException]::new("Capture start failed during $Phase; $summary. $Cause")
-    $failure.Data['CaptureInteractionFailureState'] = if ($rolledBack) { 'start-failed-rolled-back' } else { 'start-failed-cleanup-uncertain' }
-    $failure.Data['CaptureInteractionFailureData'] = $recovery
-    throw $failure
 }
 
 function Get-ScreenshotSequencePreflight([string]$SessionId, [string]$Runtime, [int]$FrameCount, [int]$IntervalMs) {
@@ -532,24 +441,75 @@ try {
         New-Item -ItemType Directory -Path $resolvedSessionDirectory -Force | Out-Null
         $framesDirectory = Join-Path $resolvedSessionDirectory 'frames'
         if ($VisualMode -ne 'none') { New-Item -ItemType Directory -Path $framesDirectory -Force | Out-Null }
-        $recordCall = $null
-        $recordStartAttempt = $null
-        $recordStartFailureEnvelope = $null
+        $failureData = [pscustomobject][ordered]@{
+            contractVersion = '1.0.0'; operation = 'capture-start-recovery'; sessionId = $sessionId
+            runtimePath = [IO.Path]::GetFullPath($RuntimePath); sessionDirectory = $resolvedSessionDirectory
+            intendedStatePath = $resolvedStatePath; receiptPath = (Join-Path $resolvedSessionDirectory 'capture-start-recovery.json')
+            runtimeIdentity = $null; runtimeIdentityObservation = $null
+            recordAccepted = $false; recordOutcomeUncertain = $false; recordStartReceipt = $null; recordStartAttempt = $null; recordRejectedReceipt = $null; recordFailureEnvelope = $null; recordInvocationEvidencePath = $null
+            screenshotRequestId = $null; screenshotOutcomeUncertain = $false; screenshotStartReceipt = $null; screenshotStartAttempt = $null; screenshotAttemptReceipt = $null; screenshotRejectedReceipt = $null; screenshotFailureEnvelope = $null; screenshotInvocationEvidencePath = $null
+            cleanup = $null
+        }
         try {
             $recordCall = Invoke-DevBench -Tool 'record' -Arguments @{ action = 'start'; intervalMs = $RecordIntervalMs; allowNoPlayer = [bool]$AllowNoPlayer; correlationId = $sessionId } -Runtime $RuntimePath -RequireSuccess
-            $recordStartAttempt = $recordCall.attempt
+            $failureData.recordStartAttempt = $recordCall.attempt
+            if ($recordCall.envelope.PSObject.Properties['runtimeIdentity']) {
+                $failureData.runtimeIdentityObservation = $recordCall.envelope.runtimeIdentity
+                $failureData.runtimeIdentity = ConvertTo-CaptureRuntimeIdentity -Identity $recordCall.envelope.runtimeIdentity
+            }
+            $failureData.recordAccepted = $true
+            $failureData.recordStartReceipt = $recordCall.value
+            if (-not (Test-CaptureRecordingStartReceipt -Receipt $recordCall.value -SessionId $sessionId)) {
+                throw 'Recording start did not return an accepted receipt bound to this capture session.'
+            }
+            if (-not $SkipRuntimeIdentityVerification -and -not (Test-CaptureRuntimeIdentity -Identity $failureData.runtimeIdentity)) {
+                throw 'Recording start did not retain the complete identity of its accepting runtime.'
+            }
+            if ($recordCall.envelope.PSObject.Properties['invocationEvidencePath']) {
+                $failureData.recordInvocationEvidencePath = [string]$recordCall.envelope.invocationEvidencePath
+            }
         }
         catch {
-            $recordStartAttempt = $_.Exception.Data['DevBenchAttempt']
-            $recordStartFailureEnvelope = $_.Exception.Data['DevBenchFailureEnvelope']
-            Throw-CaptureStartFailure -Phase 'record-start' -Cause $_.Exception.Message -SessionId $sessionId `
-                -SessionDirectory $resolvedSessionDirectory -StatePath $resolvedStatePath -Runtime $RuntimePath `
-                -RecordStartAttempt $recordStartAttempt -RecordStartFailureEnvelope $recordStartFailureEnvelope
+            $recordFailure = $_.Exception.Message
+            $failedResponse = $_.Exception.Data['DevBenchResponse']
+            $failureData.recordStartAttempt = $_.Exception.Data['DevBenchAttempt']
+            $failureData.recordFailureEnvelope = $failedResponse
+            if ($failedResponse) {
+                if ($failedResponse.PSObject.Properties['runtimeIdentity']) {
+                    $failureData.runtimeIdentityObservation = $failedResponse.runtimeIdentity
+                    $failureData.runtimeIdentity = ConvertTo-CaptureRuntimeIdentity -Identity $failedResponse.runtimeIdentity
+                }
+                if ($failedResponse.PSObject.Properties['invocationEvidencePath']) {
+                    $failureData.recordInvocationEvidencePath = [string]$failedResponse.invocationEvidencePath
+                }
+                [object[]]$retainedRecordContent = @()
+                if ($failedResponse.PSObject.Properties['data'] -and $failedResponse.data -and $failedResponse.data.PSObject.Properties['content']) { $retainedRecordContent = @($failedResponse.data.content) }
+                $semanticAccepted = $failedResponse.PSObject.Properties['semantic'] -and $failedResponse.semantic -and
+                    $failedResponse.semantic.PSObject.Properties['known'] -and [bool]$failedResponse.semantic.known -and
+                    $failedResponse.semantic.PSObject.Properties['ok'] -and [bool]$failedResponse.semantic.ok
+                if ($retainedRecordContent.Count -gt 0 -and $semanticAccepted -and
+                    $failedResponse.PSObject.Properties['acceptedDataRetained'] -and [bool]$failedResponse.acceptedDataRetained -and
+                    (Test-CaptureRecordingStartReceipt -Receipt $retainedRecordContent[0] -SessionId $sessionId)) {
+                    $failureData.recordAccepted = $true
+                    $failureData.recordStartReceipt = $retainedRecordContent[0]
+                }
+                elseif ($retainedRecordContent.Count -gt 0 -and
+                    (Test-DefiniteDevBenchMutationRejection -FailureEnvelope $failedResponse)) {
+                    $failureData.recordRejectedReceipt = $retainedRecordContent[0]
+                }
+                elseif (($failedResponse.PSObject.Properties['dispatchReached'] -and [bool]$failedResponse.dispatchReached) -or
+                    ($failureData.recordStartAttempt -and [bool]$failureData.recordStartAttempt.dispatchAttempted)) {
+                    $failureData.recordOutcomeUncertain = $true
+                }
+            }
+            elseif ($failureData.recordStartAttempt -and [bool]$failureData.recordStartAttempt.dispatchAttempted) {
+                $failureData.recordOutcomeUncertain = $true
+            }
+            $failureData = Invoke-CaptureStartupCleanup -Recovery $failureData
+            throw "Recording start failed; cleanup is '$($failureData.cleanup.state)'. $recordFailure"
         }
         $screenshotState = [pscustomobject][ordered]@{ requestId = $null; startReceipt = $null; preflight = $sequencePreflight }
         $screenshotAttemptReceipt = $null
-        $screenshotStartAttempt = $null
-        $screenshotStartFailureEnvelope = $null
         try {
             if ($VisualMode -eq 'sequence') {
                 $arguments = New-ScreenshotCommand $sessionId 'sequence_start'
@@ -562,9 +522,10 @@ try {
                     capture = New-CaptureDescriptor $framesDirectory 'frame' $sessionId
                     packaging = [ordered]@{ frameManifest = $true; previewVideo = [ordered]@{ requested = $false; required = $false; framesPerSecond = [Math]::Max(1, [int](1000 / $FrameIntervalMs)) } }
                 }
-                $started = Invoke-DevBench -Tool $screenshotTool -Arguments $arguments -Runtime $RuntimePath -RequireSuccess
-                $screenshotStartAttempt = $started.attempt
+                $started = Invoke-DevBench -Tool $screenshotTool -Arguments $arguments -Runtime $RuntimePath -ExpectedRuntimeIdentity $failureData.runtimeIdentity -RequireSuccess
+                $failureData.screenshotStartAttempt = $started.attempt
                 $screenshotAttemptReceipt = $started.value
+                $failureData.screenshotAttemptReceipt = $started.value
                 $receipt = @(Find-CaptureInteractionScreenshotReceipt -Value $started.value | Select-Object -First 1)
                 if ($receipt.Count -ne 1) { throw 'Screenshot sequence did not expose an accepted request receipt.' }
                 $screenshotState.requestId = [string]$receipt[0].requestId
@@ -574,13 +535,43 @@ try {
             }
         }
         catch {
-            if ($_.Exception.Data.Contains('DevBenchAttempt')) { $screenshotStartAttempt = $_.Exception.Data['DevBenchAttempt'] }
-            if ($_.Exception.Data.Contains('DevBenchFailureEnvelope')) { $screenshotStartFailureEnvelope = $_.Exception.Data['DevBenchFailureEnvelope'] }
-            Throw-CaptureStartFailure -Phase 'visual-start' -Cause $_.Exception.Message -SessionId $sessionId `
-                -SessionDirectory $resolvedSessionDirectory -StatePath $resolvedStatePath -Runtime $RuntimePath `
-                -RecordStartReceipt $recordCall.value -RecordStartAttempt $recordStartAttempt `
-                -ScreenshotState $screenshotState -ScreenshotAttemptReceipt $screenshotAttemptReceipt `
-                -ScreenshotStartAttempt $screenshotStartAttempt -ScreenshotStartFailureEnvelope $screenshotStartFailureEnvelope
+            $startupFailure = $_.Exception.Message
+            $failedResponse = $_.Exception.Data['DevBenchResponse']
+            $failureData.screenshotStartAttempt = $_.Exception.Data['DevBenchAttempt']
+            $failureData.screenshotFailureEnvelope = $failedResponse
+            if ($failedResponse) {
+                if ($failedResponse.PSObject.Properties['invocationEvidencePath']) {
+                    $failureData.screenshotInvocationEvidencePath = [string]$failedResponse.invocationEvidencePath
+                }
+                [object[]]$retainedScreenshotContent = @()
+                if ($failedResponse.PSObject.Properties['data'] -and $failedResponse.data -and $failedResponse.data.PSObject.Properties['content']) { $retainedScreenshotContent = @($failedResponse.data.content) }
+                [object[]]$retainedReceipt = @()
+                if ($retainedScreenshotContent.Count -gt 0) { $retainedReceipt = @(Find-CaptureInteractionScreenshotReceipt -Value $retainedScreenshotContent | Select-Object -First 1) }
+                $semanticAccepted = $failedResponse.PSObject.Properties['semantic'] -and $failedResponse.semantic -and
+                    $failedResponse.semantic.PSObject.Properties['known'] -and [bool]$failedResponse.semantic.known -and
+                    $failedResponse.semantic.PSObject.Properties['ok'] -and [bool]$failedResponse.semantic.ok
+                if ($retainedReceipt.Count -eq 1 -and $semanticAccepted -and
+                    $failedResponse.PSObject.Properties['acceptedDataRetained'] -and [bool]$failedResponse.acceptedDataRetained -and
+                    -not [string]::IsNullOrWhiteSpace([string]$retainedReceipt[0].requestId)) {
+                    $failureData.screenshotRequestId = [string]$retainedReceipt[0].requestId
+                    $failureData.screenshotStartReceipt = $retainedReceipt[0]
+                }
+                elseif ($retainedReceipt.Count -eq 1 -and
+                    (Test-DefiniteDevBenchMutationRejection -FailureEnvelope $failedResponse)) {
+                    $failureData.screenshotRejectedReceipt = $retainedReceipt[0]
+                }
+                elseif (($failedResponse.PSObject.Properties['dispatchReached'] -and [bool]$failedResponse.dispatchReached) -or
+                    ($failureData.screenshotStartAttempt -and [bool]$failureData.screenshotStartAttempt.dispatchAttempted)) {
+                    $failureData.screenshotOutcomeUncertain = $true
+                }
+            }
+            elseif (($null -ne $screenshotAttemptReceipt -or
+                ($failureData.screenshotStartAttempt -and [bool]$failureData.screenshotStartAttempt.dispatchAttempted)) -and
+                [string]::IsNullOrWhiteSpace([string]$failureData.screenshotRequestId)) {
+                $failureData.screenshotOutcomeUncertain = $true
+            }
+            $failureData = Invoke-CaptureStartupCleanup -Recovery $failureData
+            throw "Visual capture start failed after recording began; cleanup is '$($failureData.cleanup.state)'. $startupFailure"
         }
         $state = [pscustomobject][ordered]@{
             contractVersion = '1.0.0'; sessionId = $sessionId; status = 'active'
@@ -593,11 +584,9 @@ try {
         }
         try { Write-JsonAtomic -Path $resolvedStatePath -Value $state }
         catch {
-            Throw-CaptureStartFailure -Phase 'state-publication' -Cause $_.Exception.Message -SessionId $sessionId `
-                -SessionDirectory $resolvedSessionDirectory -StatePath $resolvedStatePath -Runtime $RuntimePath `
-                -RecordStartReceipt $recordCall.value -RecordStartAttempt $recordStartAttempt `
-                -ScreenshotState $screenshotState -ScreenshotAttemptReceipt $screenshotAttemptReceipt `
-                -ScreenshotStartAttempt $screenshotStartAttempt
+            $startupFailure = $_.Exception.Message
+            $failureData = Invoke-CaptureStartupCleanup -Recovery $failureData
+            throw "Session-state persistence failed after capture start; cleanup is '$($failureData.cleanup.state)'. $startupFailure"
         }
         $failureData = $null
         $result = [pscustomobject][ordered]@{ ok = $true; command = $Command; state = 'session-started'; data = $state; errors = @() }
@@ -713,15 +702,8 @@ try {
     }
 }
 catch {
-    $failureState = [string]$_.Exception.Data['CaptureInteractionFailureState']
-    $failureData = $_.Exception.Data['CaptureInteractionFailureData']
-    $result = [pscustomobject][ordered]@{
-        ok = $false
-        command = $Command
-        state = if ([string]::IsNullOrWhiteSpace($failureState)) { 'tool-error' } else { $failureState }
-        data = $failureData
-        errors = @($_.Exception.Message)
-    }
+    $failureState = if ($failureData -and $failureData.cleanup -and [string]$failureData.cleanup.state -eq 'uncertain') { 'cleanup-uncertain' } else { 'tool-error' }
+    $result = [pscustomobject][ordered]@{ ok = $false; command = $Command; state = $failureState; data = $failureData; errors = @($_.Exception.Message) }
 }
 
 $json = @{ InputObject = $result; Depth = 100 }

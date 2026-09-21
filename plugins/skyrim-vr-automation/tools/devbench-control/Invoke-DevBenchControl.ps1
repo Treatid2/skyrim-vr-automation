@@ -825,6 +825,7 @@ function Open-DevBenchSession($Runtime, [switch]$AllowDeferredBuildIdentity, [sw
         $script:transport = 'mcp'
         $script:endpoint = "$script:baseEndpoint/mcp"
         $session = Open-McpSession -Runtime $Runtime -AllowDeferredBuildIdentity:$AllowDeferredBuildIdentity -PropagateRetryable:$PropagateRetryable
+        $script:mcpCapabilityPreviouslyProven = $true
         $session | Add-Member -NotePropertyName transport -NotePropertyValue 'mcp'
         return $session
     }
@@ -871,6 +872,14 @@ function Get-ListenerPid([int]$Port) {
     }
     if ($records.Count -ne 1) { return $null }
     return [int]$records[0]
+}
+
+function ConvertTo-DevBenchRuntimeIdentityUtc($Value) {
+    if ($Value -is [DateTime]) { return ([DateTime]$Value).ToUniversalTime().ToString('o') }
+    return [DateTime]::Parse(
+        [string]$Value,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime().ToString('o')
 }
 
 function Assert-RuntimeIdentityContent {
@@ -1715,13 +1724,12 @@ try {
     $result = [pscustomobject][ordered]@{
         ok = -not $semanticFailure
         transportOk = $true
-        state = $(if ($semanticFailure) { 'semantic-failed' } else { 'completed' })
+        state = $(if ($Command -eq 'wait') { [string]$waitCompletion.state } elseif ($semanticFailure) { 'semantic-failed' } else { 'completed' })
         indeterminate = $false
         dispatchReached = [bool]$dispatch.dispatchReached
         responseDataRetained = [bool]$dispatch.responseDataRetained
         acceptedDataRetained = [bool]$dispatch.acceptedDataRetained
         command = $Command
-        state = if ($Command -eq 'wait') { [string]$waitCompletion.state } else { 'completed' }
         endpoint = $endpoint
         transport = $transport
         timestampUtc = [DateTime]::UtcNow.ToString('o')
@@ -1747,11 +1755,17 @@ catch {
     $failureMessage = $caughtException.Message
     $indeterminateMutation = [bool]$caughtException.Data['DevBenchIndeterminateMutation']
     $persistentSessionInvalidation = [bool]$caughtException.Data['DevBenchPersistentSessionInvalidation']
+    $mcpCapabilityRegression = [bool]$caughtException.Data['DevBenchMcpCapabilityRegression']
     $waitDeadlineExpired = $Command -eq 'wait' -and $caughtException -is [TimeoutException] -and
         $null -ne $script:operationDeadlineUtc -and [DateTime]::UtcNow -ge $script:operationDeadlineUtc
-    $failureState = if ($indeterminateMutation) { 'indeterminate' } elseif ($persistentSessionInvalidation) { 'persistent-session-invalidated' } elseif ($waitDeadlineExpired) { 'timeout' } else { 'failed' }
+    $dispatch = Get-DevBenchDispatchProvenance -InvocationRecord $invocationRecord -Data $data -Semantic $semantic
+    $outcomeIndeterminate = [bool]($indeterminateMutation -or ((-not $readOnlyCall) -and $dispatch.dispatchReached -and -not $dispatch.acceptedDataRetained -and -not $dispatch.semanticRejected))
+    $failureState = if ($outcomeIndeterminate) { 'indeterminate' } elseif ($persistentSessionInvalidation) { 'persistent-session-invalidated' } elseif ($mcpCapabilityRegression) { 'mcp-capability-regression' } elseif ($waitDeadlineExpired) { 'timeout' } else { 'failed' }
     $failureData = if ($persistentSessionInvalidation) {
         [pscustomobject][ordered]@{ sessionInvalidationCount = [int]$caughtException.Data['DevBenchSessionInvalidationCount']; maxSessionRebinds = $MaxSessionRebinds; lastSuccessfulObservation = $lastSuccessfulWaitObservation }
+    }
+    elseif ($mcpCapabilityRegression) {
+        [pscustomobject][ordered]@{ mcpCapabilityPreviouslyProven = $true; restFallbackRefused = $true; lastSuccessfulObservation = $lastSuccessfulWaitObservation }
     }
     elseif ($waitDeadlineExpired) {
         [pscustomobject][ordered]@{
@@ -1771,20 +1785,23 @@ catch {
             cause = $failureMessage
         }
     }
-    else { $null }
+    else { $data }
     $failureSemantic = if ($waitDeadlineExpired) {
         New-DevBenchWaitTimeoutSemantic -Condition $Condition -TimeoutSeconds $TimeoutSeconds
     }
-    else { $null }
+    else { $semantic }
     if ($waitDeadlineExpired) { $failureMessage = [string]$failureSemantic.reasons[0] }
     if ($invocationRecord -and $invocationRecord.state -ne 'guard-rejected') {
         try { Update-InvocationEvidence -State $failureState -Semantic $failureSemantic -Data $failureData -Errors @($failureMessage) } catch { $failureMessage = "$failureMessage Evidence update also failed: $($_.Exception.Message)" }
     }
     $result = [pscustomobject][ordered]@{
         ok = $false
-        transportOk = $waitDeadlineExpired
-        state = if ($indeterminateMutation) { 'indeterminate-mutation' } elseif ($persistentSessionInvalidation) { 'persistent-session-invalidated' } elseif ($waitDeadlineExpired) { 'timeout' } else { 'failed' }
-        indeterminate = $indeterminateMutation
+        transportOk = [bool]($waitDeadlineExpired -or $dispatch.responseDataRetained)
+        state = if ($outcomeIndeterminate) { 'indeterminate-mutation' } elseif ($persistentSessionInvalidation) { 'persistent-session-invalidated' } elseif ($mcpCapabilityRegression) { 'mcp-capability-regression' } elseif ($waitDeadlineExpired) { 'timeout' } elseif ($dispatch.acceptedDataRetained) { 'post-dispatch-evidence-failed' } elseif ($dispatch.semanticRejected) { 'semantic-failed' } else { 'failed' }
+        indeterminate = $outcomeIndeterminate
+        dispatchReached = [bool]$dispatch.dispatchReached
+        responseDataRetained = [bool]$dispatch.responseDataRetained
+        acceptedDataRetained = [bool]$dispatch.acceptedDataRetained
         command = $Command
         endpoint = $endpoint
         transport = $transport
