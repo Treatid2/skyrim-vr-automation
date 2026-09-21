@@ -3414,7 +3414,9 @@ function Invoke-MO2CooperativeCloseCore {
     )
 
     Assert-MO2ExactProcessTargets -Config $Config -Processes $InitialProcesses
-    $targetIds = @($InitialProcesses | ForEach-Object { [int]$_.id } | Select-Object -Unique)
+    $authorizedProcesses = @($InitialProcesses)
+    $targetIds = @($authorizedProcesses | ForEach-Object { [int]$_.id } | Select-Object -Unique)
+    if ($targetIds.Count -ne $authorizedProcesses.Count) { throw 'The cooperative-close target set contains duplicate process identities.' }
     $actions = [System.Collections.Generic.List[object]]::new()
     $beforeWindows = @(Get-MO2WindowSnapshot -Processes $InitialProcesses)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
