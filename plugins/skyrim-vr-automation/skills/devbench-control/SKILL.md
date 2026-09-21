@@ -63,8 +63,14 @@ or construct HTTP or MCP requests ad hoc.
    only the unresolved read-only health or action call within its explicit
    bounded deadline and return on its first success. On the controller fallback
    lane, use `wait -Condition toolAvailable -Tool <exact-name>` or
-   `serviceReady` with a read-only `-ArgumentsJson` action and an explicit
-   bounded timeout. Never cross transports to perform a readiness wait.
+   `wait -Condition serviceReady -Tool <exact-name>` with an explicit bounded
+   timeout. Do not pass `-ArgumentsJson` to `serviceReady`: the controller
+   derives its qualified read-only probe from the authoritative input schema
+   and rejects caller-supplied probe actions.
+   Never cross transports to perform a readiness wait. A retryable failure
+   remains unsatisfied, and a positive
+   response received at or after the absolute deadline remains timeout evidence,
+   never readiness success.
 9. On the selected controller lane, use `-ExpectedErrorCode` for deliberate
    guard tests such as `producer_mismatch`; do not reinterpret an unrequested
    API failure as a pass on either lane.
@@ -106,6 +112,18 @@ or construct HTTP or MCP requests ad hoc.
     unloaded-to-loaded edge; either can be missed between polls. On the bundled
     lane, follow it with `wait -Condition playerLoaded -ExpectedCell <exact>`.
     That barrier polls current player and scene state and never replays the load.
+    The wrapper reports the accepted mutation as `game-load-dispatch-queued`
+    with `completionBasis=dispatch-only`; only the later state barrier proves
+    load completion.
+18. Before `communityshaders.render_map start`, call the bundled
+    `New-CSXRenderMapCapturePlan.ps1` with the retained live registry response
+    and an explicit positive-integer workload estimate. Require a successful
+    registry envelope bound to the exact service, contract major, producer
+    build, and retained snapshot hash. Use only a successful planner result's
+    headroom-sized arguments and retain its immutable plan receipt. Do not use
+    conservative defaults for a broad evidence run. Treat any limit hit as
+    incomplete evidence unless the experiment is specifically measuring
+    saturation.
 
 The bundled fallback entry point is:
 

@@ -18,6 +18,27 @@ $scenario = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ ok = $false
 Assert-Test ($scenario.known -and -not $scenario.ok -and $scenario.reasons.Count -eq 2) 'semantic status preserves scenario failure reasons'
 $producerMismatch = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ error = [pscustomobject]@{ code = 'producer_mismatch'; message = 'wrong build' } })
 Assert-Test ($producerMismatch.known -and -not $producerMismatch.ok -and $producerMismatch.guarded -and $producerMismatch.outcome -eq 'guard-rejected') 'producer mismatch is a known guarded rejection'
+$guardArguments = @{ action = 'registry' }
+$exclusiveGuard = [pscustomobject]@{ error = [pscustomobject]@{ code = 'producer_mismatch'; message = 'wrong build' } }
+$guardOnly = Get-DevBenchExpectedGuardStatus -ToolName 'communityshaders.test_api' -Arguments $guardArguments -Content @($exclusiveGuard) -ExpectedErrorCode 'producer_mismatch'
+Assert-Test ($guardOnly.known -and $guardOnly.ok -and $guardOnly.expectedErrorMatched -and $guardOnly.guardRejectionReasons.Count -gt 0) 'exclusive expected guard qualifies while retaining original rejection provenance'
+foreach ($sibling in @($false, $null, @(), 'unsupported', [pscustomobject]@{ status = 'success'; nested = $false })) {
+    $mixedGuard = [pscustomobject]@{ error = $exclusiveGuard.error; postconditions = $sibling }
+    $result = Get-DevBenchExpectedGuardStatus -ToolName 'communityshaders.test_api' -Arguments $guardArguments -Content @($mixedGuard) -ExpectedErrorCode 'producer_mismatch'
+    Assert-Test (-not $result.ok -and -not $result.expectedErrorMatched -and $result.reasons.Count -gt 0) 'expected guard never overrides a false/null/empty/unsupported/nested outcome sibling'
+}
+foreach ($payload in @(
+    [pscustomobject]@{ error = $exclusiveGuard.error; errors = @('other error') },
+    [pscustomobject]@{ error = $exclusiveGuard.error; result = [pscustomobject]@{ action = 'wrong'; ok = $false } },
+    [pscustomobject]@{ result = [pscustomobject]@{ code = 'producer_mismatch' } },
+    [pscustomobject]@{ error = $exclusiveGuard.error; ok = $true },
+    [pscustomobject]@{ error = $exclusiveGuard.error; ok = 'false' },
+    [pscustomobject]@{ error = [pscustomobject]@{ code = 'other_error' } }
+)) {
+    $result = Get-DevBenchExpectedGuardStatus -ToolName 'communityshaders.test_api' -Arguments $guardArguments -Content @($payload) -ExpectedErrorCode 'producer_mismatch'
+    Assert-Test (-not $result.ok -and -not $result.expectedErrorMatched -and $result.reasons.Count -gt 0) 'expected guard rejects additional error/action receipt/nested code/contradictory flags/wrong code'
+}
+Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.test_api' -Arguments $guardArguments -Content @($exclusiveGuard)).ok) 'ordinary unrequested guard remains a rejection'
 $transient = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ result = [pscustomobject]@{ state = 'service_unavailable' } })
 Assert-Test ($transient.transient -and $transient.states -contains 'service_unavailable') 'transient service state is classified recursively'
 $unknown = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ playerLoaded = $true })
@@ -46,23 +67,424 @@ Assert-Test (-not $schedulerOnly.known -and $schedulerOnly.ok -and $schedulerOnl
 $verifiedReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 3; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; postconditions = [pscustomobject]@{ ok = $true } })
 Assert-Test ($verifiedReplay.known -and $verifiedReplay.ok -and -not $verifiedReplay.schedulerOnly) 'explicit replay postconditions establish semantic evidence'
 $nullEvidenceReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 4; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; semantic = $null; assertions = @() })
-Assert-Test (-not $nullEvidenceReplay.known -and $nullEvidenceReplay.schedulerOnly) 'null or empty outcome fields do not verify replay semantics'
+Assert-Test ($nullEvidenceReplay.known -and -not $nullEvidenceReplay.ok -and -not $nullEvidenceReplay.schedulerOnly) 'present null or empty outcome fields reject replay semantics'
 $failedAssertionReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 5; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; assertions = @([pscustomobject]@{ passed = $false }) })
 Assert-Test ($failedAssertionReplay.known -and -not $failedAssertionReplay.ok -and -not $failedAssertionReplay.schedulerOnly) 'explicit failed assertions reject replay semantics'
+$falseOutcomeReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 6; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; postconditions = $false })
+Assert-Test ($falseOutcomeReplay.known -and -not $falseOutcomeReplay.ok -and -not $falseOutcomeReplay.schedulerOnly) 'a false Boolean postcondition is a global semantic veto'
+$falseOutcomeArrayReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 7; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; outcomeChecks = @($false) })
+Assert-Test ($falseOutcomeArrayReplay.known -and -not $falseOutcomeArrayReplay.ok -and -not $falseOutcomeArrayReplay.schedulerOnly) 'an array containing a false outcome rejects replay semantics'
+$neutralOutcomeReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 8; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; postconditions = [pscustomobject]@{ failed = $false } })
+Assert-Test ($neutralOutcomeReplay.known -and -not $neutralOutcomeReplay.ok -and -not $neutralOutcomeReplay.schedulerOnly -and $neutralOutcomeReplay.explicitOutcomeEvidence.Count -eq 0 -and $neutralOutcomeReplay.rejectedOutcomeEvidence.Count -gt 0) 'a neutral failed-false outcome object rejects replay semantics'
+foreach ($mixedCase in @(
+    [pscustomobject]@{ values = @($true, $false) },
+    [pscustomobject]@{ values = @($false, $true) }
+)) {
+    $mixedOutcomeReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 9; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; outcomeChecks = $mixedCase.values })
+    Assert-Test ($mixedOutcomeReplay.known -and -not $mixedOutcomeReplay.ok -and -not $mixedOutcomeReplay.schedulerOnly -and $mixedOutcomeReplay.explicitOutcomeEvidence.Count -eq 0) 'mixed true/false replay evidence is rejected in either order'
+}
+$nestedMixedReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 10; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; semantic = [pscustomobject]@{ checks = @([pscustomobject]@{ passed = $true }, $false) } })
+Assert-Test ($nestedMixedReplay.known -and -not $nestedMixedReplay.ok -and -not $nestedMixedReplay.schedulerOnly -and $nestedMixedReplay.rejectedOutcomeEvidence.Count -gt 0) 'nested mixed Boolean evidence cannot be neutralized by a positive sibling'
+$crossContainerMixedReplay = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 11; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; postconditions = $false; assertions = @([pscustomobject]@{ passed = $true }) })
+Assert-Test ($crossContainerMixedReplay.known -and -not $crossContainerMixedReplay.ok -and -not $crossContainerMixedReplay.schedulerOnly -and $crossContainerMixedReplay.explicitOutcomeEvidence.Count -eq 0) 'a positive assertion cannot neutralize a false sibling outcome container'
+foreach ($namedOutcomeCase in @(
+    [pscustomobject]@{ label = 'false'; value = $false },
+    [pscustomobject]@{ label = 'null'; value = $null },
+    [pscustomobject]@{ label = 'empty-object'; value = [pscustomobject]@{} },
+    [pscustomobject]@{ label = 'neutral-object'; value = [pscustomobject]@{ failed = $false } },
+    [pscustomobject]@{ label = 'unsupported-scalar'; value = 'unknown' }
+)) {
+    $namedOutcome = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ done = $true; ok = $true; runId = 12; result = [pscustomobject]@{ ok = $true; stepsRun = 10 }; postconditions = [pscustomobject]@{ saved = [pscustomobject]@{ passed = $true }; restored = $namedOutcomeCase.value } })
+    Assert-Test ($namedOutcome.known -and -not $namedOutcome.ok -and $namedOutcome.rejectedOutcomeEvidence.Count -gt 0) "named outcome maps reject a positive sibling paired with $($namedOutcomeCase.label) evidence"
+}
+$namedMetadataOutcome = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ ok = $true; postconditions = [pscustomobject]@{ saved = [pscustomobject]@{ passed = $true }; message = 'saved' } })
+Assert-Test ($namedMetadataOutcome.known -and $namedMetadataOutcome.ok) 'explicit non-empty outcome metadata does not become a required outcome member'
+$recordRejectedOutcome = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ ok = $true; action = 'stop'; path = 'C:\captures\recording.json'; postconditions = $false })
+Assert-Test ($recordRejectedOutcome.known -and -not $recordRejectedOutcome.ok -and $recordRejectedOutcome.reasons -match 'Explicit outcome evidence rejected') 'detected rejected outcomes veto action-specific non-replay success'
+foreach ($structuredStatusName in @('status', 'resultStatus')) {
+    foreach ($extraFirst in @($false, $true)) {
+        $structuredStatus = [ordered]@{}
+        if ($extraFirst) { $structuredStatus['restored'] = $false }
+        $structuredStatus['name'] = 'success'
+        $structuredStatus['value'] = 0
+        if (-not $extraFirst) { $structuredStatus['restored'] = $false }
+        $outcomeCollection = [ordered]@{}
+        $outcomeCollection[$structuredStatusName] = $structuredStatus
+        $structuredStatusFailure = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ ok = $true; postconditions = $outcomeCollection })
+        Assert-Test ($structuredStatusFailure.known -and -not $structuredStatusFailure.ok -and $structuredStatusFailure.rejectedOutcomeEvidence -match 'restored') "structured $structuredStatusName rejects a false extra member in either property order"
+    }
+    foreach ($structuredExtraCase in @(
+        [pscustomobject]@{ label = 'null'; value = $null },
+        [pscustomobject]@{ label = 'empty-string'; value = '' },
+        [pscustomobject]@{ label = 'neutral-object'; value = [pscustomobject]@{ failed = $false } },
+        [pscustomobject]@{ label = 'unsupported-scalar'; value = 'unknown' },
+        [pscustomobject]@{ label = 'nested-false'; value = [pscustomobject]@{ nested = [pscustomobject]@{ passed = $false } } }
+    )) {
+        $statusWithExtra = [ordered]@{ name = 'success'; value = 0; restored = $structuredExtraCase.value }
+        $collectionWithExtra = [ordered]@{}
+        $collectionWithExtra[$structuredStatusName] = $statusWithExtra
+        $structuredExtraFailure = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ ok = $true; postconditions = $collectionWithExtra })
+        Assert-Test ($structuredExtraFailure.known -and -not $structuredExtraFailure.ok -and $structuredExtraFailure.rejectedOutcomeEvidence -match 'restored') "structured $structuredStatusName rejects $($structuredExtraCase.label) extra evidence"
+    }
+}
+$validStructuredStatus = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ ok = $true; postconditions = [pscustomobject]@{ status = [pscustomobject]@{ name = 'success'; value = 0; message = 'restored' } } })
+Assert-Test ($validStructuredStatus.known -and $validStructuredStatus.ok) 'structured status accepts its recognized fields plus non-empty outcome metadata'
+$recordStructuredStatusFailure = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ ok = $true; action = 'stop'; path = 'C:\captures\recording.json'; postconditions = [pscustomobject]@{ status = [pscustomobject]@{ name = 'success'; value = 0; restored = $false } } })
+Assert-Test ($recordStructuredStatusFailure.known -and -not $recordStructuredStatusFailure.ok -and $recordStructuredStatusFailure.reasons -match 'restored') 'structured status sibling veto reaches the non-replay record-stop adapter'
 $readOnlyInspect = Test-DevBenchReadOnlyRequest -ToolName inspect -Arguments @{ kind = 'scene' }
 $readOnlyMenu = Test-DevBenchReadOnlyRequest -ToolName menu -Arguments @{ action = 'list' }
 $mutatingMenu = Test-DevBenchReadOnlyRequest -ToolName menu -Arguments @{ action = 'open'; name = 'InventoryMenu' }
 Assert-Test ($readOnlyInspect -and $readOnlyMenu -and -not $mutatingMenu) 'read-only request classification is explicit and action-sensitive'
 $inspectSemantic = Get-DevBenchCallSemanticStatus -ToolName inspect -Arguments @{ kind = 'state' } -Content @([pscustomobject]@{ playerLoaded = $true; frame = 42 })
 Assert-Test ($inspectSemantic.known -and $inspectSemantic.ok -and $inspectSemantic.outcome -eq 'read-contract-satisfied') 'structured read-only responses satisfy RequireSuccess semantics'
+$renderScaleSemantic = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.renderscale' -Arguments @{ action = 'status' } -Content @([pscustomobject]@{ action = 'status'; status = [pscustomobject]@{ controller = [pscustomobject]@{ state = 'Active'; revision = 42 } } })
+Assert-Test ($renderScaleSemantic.known -and $renderScaleSemantic.ok -and $renderScaleSemantic.outcome -eq 'read-contract-satisfied') 'render-scale status recognizes its explicit structured read contract'
+$renderScaleMissingStatus = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.renderscale' -Arguments @{ action = 'status' } -Content @([pscustomobject]@{ action = 'status' })
+Assert-Test (-not $renderScaleMissingStatus.known) 'render-scale status rejects a response without structured status telemetry'
+$renderScaleArrayStatus = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.renderscale' -Arguments @{ action = 'status' } -Content @([pscustomobject]@{ action = 'status'; status = [object[]]@() })
+Assert-Test (-not $renderScaleArrayStatus.ok -and $renderScaleArrayStatus.outcome -ne 'read-contract-satisfied') 'render-scale status rejects an array replacing its required status object'
+$screenshotCapabilities = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = 3600000 } })
+Assert-Test ($screenshotCapabilities.known -and $screenshotCapabilities.ok -and $screenshotCapabilities.outcome -eq 'read-contract-satisfied') 'screenshot capabilities recognize exact sequence limits as a read contract'
+$screenshotFractionalLimit = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = 3600000.5 } })
+Assert-Test ($screenshotFractionalLimit.known -and -not $screenshotFractionalLimit.ok) 'screenshot capabilities reject a fractional sequence limit'
+$screenshotBooleanLimit = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = $true; maximumSequenceDurationMs = 3600000 } })
+Assert-Test ($screenshotBooleanLimit.known -and -not $screenshotBooleanLimit.ok) 'screenshot capabilities reject a Boolean sequence limit'
+$screenshotNullLimit = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = $null } })
+Assert-Test ($screenshotNullLimit.known -and -not $screenshotNullLimit.ok) 'screenshot capabilities reject a null sequence limit without a strict-mode exception'
+$screenshotNegativeFrameLimit = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = -1; maximumSequenceDurationMs = 3600000 } })
+Assert-Test ($screenshotNegativeFrameLimit.known -and -not $screenshotNegativeFrameLimit.ok -and $screenshotNegativeFrameLimit.reasons -match 'maximumSequenceFrames is not a positive integer') 'screenshot capabilities reject a signed negative frame limit without throwing'
+$screenshotNegativeDurationLimit = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = [int64]-1 } })
+Assert-Test ($screenshotNegativeDurationLimit.known -and -not $screenshotNegativeDurationLimit.ok -and $screenshotNegativeDurationLimit.reasons -match 'maximumSequenceDurationMs is not a positive integer') 'screenshot capabilities reject a signed negative duration limit without throwing'
+$screenshotGenericWrongSchema = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ ok = $true; schema = 'wrong'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = 3600000 } })
+Assert-Test ($screenshotGenericWrongSchema.known -and -not $screenshotGenericWrongSchema.ok) 'generic success cannot bypass the screenshot capabilities schema'
+$screenshotGenericValid = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ ok = $true; schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = 3600000 } })
+Assert-Test ($screenshotGenericValid.known -and $screenshotGenericValid.ok) 'generic success remains compatible with a valid screenshot capabilities contract'
+$screenshotArrayLimits = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [object[]]@() })
+Assert-Test ($screenshotArrayLimits.known -and -not $screenshotArrayLimits.ok -and $screenshotArrayLimits.reasons -match 'not a structured screenshot limits object') 'screenshot capabilities rejects an array replacing its limits object'
+$screenshotRequest = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_get'; requestId = 'req-1' } -Content @([pscustomobject]@{ ok = $true; result = [pscustomobject]@{ requestId = 'req-1'; state = 'completed'; terminal = $true } })
+Assert-Test ($screenshotRequest.known -and $screenshotRequest.ok -and $screenshotRequest.outcome -eq 'read-contract-satisfied') 'screenshot request_get accepts one exact terminal request receipt through the real semantic classifier'
+$screenshotRunningRequest = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_get'; requestId = 'req-1' } -Content @([pscustomobject]@{ requestId = 'req-1'; state = 'running'; terminal = $false })
+Assert-Test ($screenshotRunningRequest.known -and $screenshotRunningRequest.ok) 'screenshot request_get accepts an exact nonterminal receipt for continued polling'
+$screenshotMismatchedRequest = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_get'; requestId = 'req-1' } -Content @([pscustomobject]@{ ok = $true; result = [pscustomobject]@{ requestId = 'foreign'; state = 'completed'; terminal = $true } })
+Assert-Test ($screenshotMismatchedRequest.known -and -not $screenshotMismatchedRequest.ok -and $screenshotMismatchedRequest.reasons -match 'does not match') 'screenshot request_get rejects a foreign request identity despite generic success'
+$screenshotFailedRequest = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_get'; requestId = 'req-1' } -Content @([pscustomobject]@{ ok = $false; retryable = $true; result = [pscustomobject]@{ requestId = 'req-1'; state = 'completed'; terminal = $true } })
+Assert-Test ($screenshotFailedRequest.known -and -not $screenshotFailedRequest.ok -and $screenshotFailedRequest.transient) 'screenshot request_get never promotes retryable negative evidence to a valid receipt'
+$screenshotStatus = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'status' } -Content @([pscustomobject]@{ feature = [pscustomobject]@{}; dispatcher = [pscustomobject]@{}; journal = [pscustomobject]@{} })
+Assert-Test ($screenshotStatus.known -and $screenshotStatus.ok) 'screenshot status accepts its exact structured sections'
+$screenshotSettings = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'settings_get' } -Content @([pscustomobject]@{ settingsSchemaVersion = 2; effective = [pscustomobject]@{}; persisted = [pscustomobject]@{} })
+Assert-Test ($screenshotSettings.known -and $screenshotSettings.ok) 'screenshot settings_get accepts its versioned settings receipt'
+$screenshotNegativeSettings = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'settings_get' } -Content @([pscustomobject]@{ settingsSchemaVersion = [int16]-1; effective = [pscustomobject]@{}; persisted = [pscustomobject]@{} })
+Assert-Test ($screenshotNegativeSettings.known -and -not $screenshotNegativeSettings.ok -and $screenshotNegativeSettings.reasons -match 'settingsSchemaVersion is not a positive integer') 'screenshot settings_get rejects a signed negative schema version without throwing'
+$screenshotList = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_list' } -Content @([pscustomobject]@{ requests = [object[]]@(); retained = 0 })
+Assert-Test ($screenshotList.known -and $screenshotList.ok) 'screenshot request_list accepts an empty bounded collection receipt'
+$screenshotEvents = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'events_poll' } -Content @([pscustomobject]@{ events = [object[]]@(); oldestRetainedEventId = 1; latestEventId = 0; nextEventId = 0; cursorExpired = $false; moreAvailable = $false })
+Assert-Test ($screenshotEvents.known -and $screenshotEvents.ok) 'screenshot events_poll accepts its exact cursor and collection receipt'
+foreach ($readAction in @('status', 'settings_get', 'request_get', 'request_list', 'events_poll')) {
+    $arguments = @{ action = $readAction }
+    if ($readAction -eq 'request_get') { $arguments.requestId = 'req-1' }
+    $emptyResult = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments $arguments -Content @([pscustomobject]@{ result = [object[]]@() })
+    Assert-Test ($emptyResult.known -and -not $emptyResult.ok -and $emptyResult.reasons -match 'not a structured') "screenshot $readAction rejects an array replacing its result object"
+}
+$screenshotArraySection = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'status' } -Content @([pscustomobject]@{ feature = [object[]]@(); dispatcher = [pscustomobject]@{}; journal = [pscustomobject]@{} })
+Assert-Test (-not $screenshotArraySection.ok) 'screenshot status rejects an array replacing a required section object'
+foreach ($pair in @(
+    @{ state = 'running'; terminal = $true },
+    @{ state = 'queued'; terminal = $true },
+    @{ state = 'completed'; terminal = $false },
+    @{ state = 'invented'; terminal = $false }
+)) {
+    $contradictory = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_get'; requestId = 'req-1' } -Content @([pscustomobject]@{ requestId = 'req-1'; state = $pair.state; terminal = $pair.terminal })
+    Assert-Test ($contradictory.known -and -not $contradictory.ok) "screenshot request_get rejects unsupported or contradictory state '$($pair.state)' / terminal '$($pair.terminal)'"
+}
+$negativeRetained = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'request_list' } -Content @([pscustomobject]@{ requests = [object[]]@(); retained = -1 })
+Assert-Test (-not $negativeRetained.ok) 'screenshot request_list rejects a negative retained count'
+foreach ($cursorName in @('oldestRetainedEventId', 'latestEventId', 'nextEventId')) {
+    $cursorPayload = [ordered]@{ events = [object[]]@(); oldestRetainedEventId = 0; latestEventId = 0; nextEventId = 0; cursorExpired = $false; moreAvailable = $false }
+    $cursorPayload[$cursorName] = -1
+    $negativeCursor = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'events_poll' } -Content @([pscustomobject]$cursorPayload)
+    Assert-Test (-not $negativeCursor.ok) "screenshot events_poll rejects negative $cursorName"
+}
 $recordSemantic = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ action = 'start'; recording = $true; correlationId = 'capture-1' })
 Assert-Test ($recordSemantic.known -and $recordSemantic.ok -and $recordSemantic.outcome -eq 'record-start-contract-satisfied') 'record start validates the running receipt and correlation identity'
 $recordMismatch = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ action = 'start'; recording = $true; correlationId = 'other' })
 Assert-Test ($recordMismatch.known -and -not $recordMismatch.ok) 'record start rejects a mismatched correlation identity'
+$recordGenericMismatch = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ ok = $true; action = 'start'; recording = $true; correlationId = 'other' })
+Assert-Test ($recordGenericMismatch.known -and -not $recordGenericMismatch.ok) 'generic success cannot bypass the record-start correlation contract'
+$recordArrayStart = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content (,@([pscustomobject]@{ action = 'start'; recording = $true; correlationId = 'capture-1' }))
+Assert-Test ($recordArrayStart.known -and -not $recordArrayStart.ok -and $recordArrayStart.reasons -match 'structured record start receipt') 'record start rejects a collection replacing its receipt object'
+foreach ($malformedOk in @('false', 0, $null, [pscustomobject]@{ value = $false })) {
+    $malformedRecord = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'start'; correlationId = 'capture-1' } -Content @([pscustomobject]@{ ok = $malformedOk; action = 'start'; recording = $true; correlationId = 'capture-1' })
+    Assert-Test ($malformedRecord.known -and -not $malformedRecord.ok -and $malformedRecord.reasons -match 'not Boolean') 'record start rejects a present malformed generic outcome indicator'
+}
+$recordStop = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ action = 'stop'; sampleCount = 12; path = 'recording.json' })
+Assert-Test ($recordStop.known -and $recordStop.ok -and $recordStop.outcome -eq 'record-stop-contract-satisfied') 'record stop recognizes its exact persisted recording receipt without a generic ok field'
+foreach ($malformedPath in @(
+    [pscustomobject]@{ value = $false; name = 'Boolean false' },
+    [pscustomobject]@{ value = $true; name = 'Boolean true' },
+    [pscustomobject]@{ value = 42; name = 'numeric' },
+    [pscustomobject]@{ value = [object[]]@(); name = 'array' },
+    [pscustomobject]@{ value = [pscustomobject]@{ file = 'recording.json' }; name = 'object' },
+    [pscustomobject]@{ value = $null; name = 'null' },
+    [pscustomobject]@{ value = ''; name = 'empty string' },
+    [pscustomobject]@{ value = '   '; name = 'whitespace string' }
+)) {
+    $malformedRecordStop = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ action = 'stop'; path = $malformedPath.value })
+    Assert-Test ($malformedRecordStop.known -and -not $malformedRecordStop.ok -and $malformedRecordStop.reasons -match 'non-empty string') "record stop rejects a $($malformedPath.name) persisted locator"
+}
+$missingRecordStopPath = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ action = 'stop' })
+Assert-Test ($missingRecordStopPath.known -and -not $missingRecordStopPath.ok -and $missingRecordStopPath.reasons -match 'non-empty string') 'record stop rejects a missing persisted locator'
+$recordStopError = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ error = 'not recording'; state = 'idle' })
+Assert-Test ($recordStopError.known -and -not $recordStopError.ok -and $recordStopError.reasons -match 'not recording') 'record stop preserves its structured not-recording diagnostic'
+$recordStopErrors = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ action = 'stop'; path = 'recording.json'; errors = @('flush failed') })
+Assert-Test ($recordStopErrors.known -and -not $recordStopErrors.ok -and $recordStopErrors.reasons -match 'flush failed') 'record stop rejects a non-empty errors array despite an exact stop path'
+$recordStopFailedStatus = Get-DevBenchCallSemanticStatus -ToolName record -Arguments @{ action = 'stop' } -Content @([pscustomobject]@{ action = 'stop'; path = 'recording.json'; status = 'failed' })
+Assert-Test ($recordStopFailedStatus.known -and -not $recordStopFailedStatus.ok -and $recordStopFailedStatus.reasons -match 'failed') 'record stop rejects a scalar failed status despite an exact persisted path'
+$vrReleaseInactive = Get-DevBenchCallSemanticStatus -ToolName input -Arguments @{ action = 'releaseAll'; device = 'vrTrackedSet'; owner = 'capture:1' } -Content @([pscustomobject]@{ action = 'stop'; device = 'vrTrackedSet'; stopped = $false; notActive = $true })
+Assert-Test ($vrReleaseInactive.known -and $vrReleaseInactive.ok -and $vrReleaseInactive.outcome -eq 'vr-tracked-set-stop-contract-satisfied') 'VR releaseAll accepts an exact already-inactive receipt'
+$vrReleaseInactivePending = Get-DevBenchCallSemanticStatus -ToolName input -Arguments @{ action = 'releaseAll'; device = 'vrTrackedSet'; owner = 'capture:1' } -Content @([pscustomobject]@{ action = 'stop'; device = 'vrTrackedSet'; notActive = $true; restorationPending = $true })
+Assert-Test ($vrReleaseInactivePending.known -and -not $vrReleaseInactivePending.ok) 'VR releaseAll cannot use notActive to bypass pending restoration'
+$vrReleaseRestored = Get-DevBenchCallSemanticStatus -ToolName input -Arguments @{ action = 'releaseAll'; device = 'vrTrackedSet'; owner = 'capture:1' } -Content @([pscustomobject]@{ action = 'stop'; device = 'vrTrackedSet'; stopped = $true; restored = $true; restorationPending = $false; owner = 'capture:1'; reason = 'releaseAll' })
+Assert-Test ($vrReleaseRestored.known -and $vrReleaseRestored.ok) 'VR releaseAll accepts exact completed restoration evidence'
+$vrReleasePending = Get-DevBenchCallSemanticStatus -ToolName input -Arguments @{ action = 'releaseAll'; device = 'vrTrackedSet'; owner = 'capture:1' } -Content @([pscustomobject]@{ action = 'stop'; device = 'vrTrackedSet'; stopped = $false; restored = $false; restorationPending = $true; owner = 'capture:1'; reason = 'releaseAll' })
+Assert-Test ($vrReleasePending.known -and -not $vrReleasePending.ok -and $vrReleasePending.reasons.Count -eq 3) 'VR releaseAll rejects incomplete restoration evidence'
+$vrReleaseForeign = Get-DevBenchCallSemanticStatus -ToolName input -Arguments @{ action = 'releaseAll'; device = 'vrTrackedSet'; owner = 'capture:1' } -Content @([pscustomobject]@{ action = 'stop'; device = 'vrTrackedSet'; stopped = $true; restored = $true; restorationPending = $false; owner = 'foreign'; reason = 'releaseAll' })
+Assert-Test ($vrReleaseForeign.known -and -not $vrReleaseForeign.ok -and $vrReleaseForeign.reasons -match 'owner') 'VR releaseAll never accepts completed restoration attributed to another owner'
+$vrReleaseArray = Get-DevBenchCallSemanticStatus -ToolName input -Arguments @{ action = 'releaseAll'; device = 'vrTrackedSet'; owner = 'capture:1' } -Content (,@([pscustomobject]@{ action = 'stop'; device = 'vrTrackedSet'; notActive = $true }))
+Assert-Test ($vrReleaseArray.known -and -not $vrReleaseArray.ok -and $vrReleaseArray.reasons -match 'structured VR tracked-set stop receipt') 'VR releaseAll rejects a collection replacing its ownership receipt object'
+$weatherSuccess = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.weather_api' -Arguments @{ action = 'execute' } -Content @([pscustomobject]@{ ok = $true; command = [pscustomobject]@{ action = 'execute' }; result = [pscustomobject]@{ status = 'success'; applied = $true; changed = $false } })
+Assert-Test ($weatherSuccess.known -and $weatherSuccess.ok -and $weatherSuccess.outcome -eq 'weather-execute-contract-satisfied') 'weather execute requires and accepts explicit applied success even when the state was unchanged'
+$weatherArrayCommand = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.weather_api' -Arguments @{ action = 'execute' } -Content @([pscustomobject]@{ ok = $true; command = @([pscustomobject]@{ action = 'execute' }); result = [pscustomobject]@{ status = 'success'; applied = $true } })
+Assert-Test ($weatherArrayCommand.known -and -not $weatherArrayCommand.ok -and $weatherArrayCommand.reasons -match 'command.action') 'weather execute rejects a collection replacing its command object'
+foreach ($guardStatus in @('preflight_required', 'preflight_expired', 'state_revision_mismatch')) {
+    $weatherGuard = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.weather_api' -Arguments @{ action = 'execute' } -Content @([pscustomobject]@{ ok = $true; command = [pscustomobject]@{ action = 'execute' }; result = [pscustomobject]@{ status = $guardStatus; applied = $false; changed = $false } })
+    Assert-Test ($weatherGuard.known -and -not $weatherGuard.ok -and $weatherGuard.guarded -and $weatherGuard.codes -contains $guardStatus) "weather execute rejects guarded non-applied status $guardStatus despite top-level ok"
+}
+$weatherNotApplied = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.weather_api' -Arguments @{ action = 'execute' } -Content @([pscustomobject]@{ ok = $true; command = [pscustomobject]@{ action = 'execute' }; result = [pscustomobject]@{ status = 'success'; applied = $false; changed = $false } })
+Assert-Test ($weatherNotApplied.known -and -not $weatherNotApplied.ok -and $weatherNotApplied.outcome -eq 'weather-execute-contract-failed') 'weather execute never promotes status success without Boolean applied success'
+$weatherNestedError = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.weather_api' -Arguments @{ action = 'execute' } -Content @([pscustomobject]@{ ok = $true; command = [pscustomobject]@{ action = 'execute' }; result = [pscustomobject]@{ status = 'success'; applied = $true; error = 'commit failed' } })
+Assert-Test ($weatherNestedError.known -and -not $weatherNestedError.ok -and $weatherNestedError.reasons -match 'commit failed') 'weather execute rejects nested scalar failure evidence despite success and applied fields'
+foreach ($malformedWeatherResult in @(
+    [pscustomobject]@{ value = [object[]]@(); name = 'empty array' },
+    [pscustomobject]@{ value = @([pscustomobject]@{ status = 'success'; applied = $true }); name = 'non-empty array' }
+)) {
+    $weatherArray = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.weather_api' -Arguments @{ action = 'execute' } -Content @([pscustomobject]@{ ok = $true; command = [pscustomobject]@{ action = 'execute' }; result = $malformedWeatherResult.value })
+    Assert-Test ($weatherArray.known -and -not $weatherArray.ok -and $weatherArray.reasons -match 'not a structured weather execute result') "weather execute rejects a $($malformedWeatherResult.name) replacing the result object"
+}
+$loadSemantic = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ action = 'load'; name = 'Save-1'; queued = $true })
+Assert-Test ($loadSemantic.known -and $loadSemantic.ok -and $loadSemantic.outcome -eq 'game-load-dispatch-queued' -and $loadSemantic.completionBasis -eq 'dispatch-only') 'game load recognizes an exact queued dispatch without claiming current-state completion'
+$loadMismatch = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ action = 'load'; name = 'Save-2'; queued = $true })
+Assert-Test ($loadMismatch.known -and -not $loadMismatch.ok -and $loadMismatch.outcome -eq 'game-load-dispatch-rejected') 'game load rejects a queued receipt for a different save'
+$loadNotQueued = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ action = 'load'; name = 'Save-1'; queued = $false })
+Assert-Test ($loadNotQueued.known -and -not $loadNotQueued.ok) 'game load never promotes a non-queued receipt'
+$loadGenericSuccess = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ ok = $true; action = 'load'; name = 'Save-1'; queued = $true })
+Assert-Test ($loadGenericSuccess.ok -and $loadGenericSuccess.outcome -eq 'game-load-dispatch-queued' -and $loadGenericSuccess.completionBasis -eq 'dispatch-only') 'generic success metadata cannot bypass or replace the exact load receipt classification'
+$loadGenericMismatch = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ success = $true; action = 'load'; name = 'Save-2'; queued = $true })
+Assert-Test (-not $loadGenericMismatch.ok -and $loadGenericMismatch.outcome -eq 'game-load-dispatch-rejected') 'generic success metadata cannot promote a mismatched save receipt'
+$loadWrongAction = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ ok = $true; action = 'save'; name = 'Save-1'; queued = $true })
+Assert-Test (-not $loadWrongAction.ok) 'game load rejects a generic-success receipt for the wrong action'
+$loadTypedQueue = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ ok = $true; action = 'load'; name = 'Save-1'; queued = 1 })
+Assert-Test (-not $loadTypedQueue.ok) 'game load requires Boolean true queue evidence'
+$loadMissingRequestName = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load' } -Content @([pscustomobject]@{ ok = $true; action = 'load'; name = 'Save-1'; queued = $true })
+Assert-Test (-not $loadMissingRequestName.ok) 'game load requires a nonempty requested save identity'
+$loadScalarError = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ ok = $true; action = 'load'; name = 'Save-1'; queued = $true; error = 'queue rejected' })
+Assert-Test (-not $loadScalarError.ok) 'game load preserves contradictory scalar error evidence'
+$loadMultiple = Get-DevBenchCallSemanticStatus -ToolName game -Arguments @{ action = 'load'; name = 'Save-1' } -Content @([pscustomobject]@{ ok = $true; action = 'load'; name = 'Save-1'; queued = $true }, [pscustomobject]@{ ok = $true })
+Assert-Test (-not $loadMultiple.ok) 'game load requires exactly one structured receipt even with generic success metadata'
 $readFailure = Get-DevBenchCallSemanticStatus -ToolName inspect -Arguments @{ kind = 'state' } -Content @([pscustomobject]@{ error = 'main thread busy' })
 Assert-Test ($readFailure.known -and -not $readFailure.ok -and $readFailure.outcome -eq 'read-contract-failed') 'read-only adapters never promote a structured error to success'
 $incompleteMenu = Get-DevBenchCallSemanticStatus -ToolName menu -Arguments @{ action = 'list' } -Content @([pscustomobject]@{ openMenus = @() })
 Assert-Test (-not $incompleteMenu.known) 'read-only adapters require the tool-specific response shape'
+
+$planFixture = Join-Path ([IO.Path]::GetTempPath()) "csx-render-map-plan-test-$([guid]::NewGuid().ToString('N'))"
+try {
+    New-Item -ItemType Directory -Path $planFixture | Out-Null
+    $registryPath = Join-Path $planFixture 'registry.json'
+    $workloadPath = Join-Path $planFixture 'workload.json'
+    $planPath = Join-Path $planFixture 'plan.json'
+    [pscustomobject]@{
+        ok = $true
+        result = [pscustomobject]@{
+            service = 'communityshaders.render_map'
+            major = 1
+            defaults = [pscustomobject]@{ fixedCatalogueBytes = 1000 }
+            limits = [pscustomobject]@{
+                maximumBytes = 100000; maximumDurationMs = 10000; maximumEvents = 10000; maximumFrames = 100
+                maximumScopeDepth = 32; maximumGeometryObservations = 1000; maximumMaterialStateObservations = 1000
+                maximumResourceObservations = 1000; maximumSceneObjectObservations = 1000; maximumShaderObservations = 1000
+                maximumStageShaderObservations = 1000; maximumTargetBindingObservations = 1000; maximumTargetViewObservations = 1000
+            }
+        }
+        server = [pscustomobject]@{ buildId = 'fixture-build' }
+    } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $registryPath -Encoding utf8
+    [pscustomobject]@{
+        expectedDurationMs = 1000; expectedFrames = 4; expectedEvents = 100; expectedEventBytes = 10000; expectedScopeDepth = 3
+        expectedObservations = [pscustomobject]@{ geometry = 10; materialState = 10; resource = 10; sceneObject = 10; shader = 10; stageShader = 10; targetBinding = 10; targetView = 10 }
+    } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $workloadPath -Encoding utf8
+    $plannerPath = Join-Path $PSScriptRoot 'New-CSXRenderMapCapturePlan.ps1'
+    $plan = & $plannerPath -RegistryPath $registryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId fixture-command -OutputPath $planPath -HeadroomFactor 2 -NoExit -Compact | ConvertFrom-Json
+    $planReceipt = Get-Content -LiteralPath $plan.receiptPath -Raw | ConvertFrom-Json
+    Assert-Test ($plan.ok -and $plan.arguments.maxEvents -eq 200 -and $plan.arguments.maxBytes -eq 21000 -and (Test-Path -LiteralPath $plan.receiptPath -PathType Leaf) -and $planReceipt.service -eq 'communityshaders.render_map' -and $planReceipt.producerBuildId -eq 'fixture-build' -and $planReceipt.registrySha256 -eq (Get-FileHash -LiteralPath $registryPath -Algorithm SHA256).Hash) 'render-map planner sizes every bound from workload plus headroom and retains an exact registry-bound receipt'
+    $rawRegistryPath = Join-Path $planFixture 'raw-registry.json'
+    $rawRegistry = (Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json).result
+    $rawRegistry | Add-Member -NotePropertyName producerBuildId -NotePropertyValue 'fixture-build'
+    $rawRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $rawRegistryPath -Encoding utf8
+    $rawPlan = & $plannerPath -RegistryPath $rawRegistryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId raw-registry -OutputPath (Join-Path $planFixture 'raw-registry-plan.json') -NoExit -Compact | ConvertFrom-Json
+    Assert-Test ($rawPlan.ok -and $rawPlan.arguments.contractMajor -eq 1) 'explicit raw-registry mode requires and preserves service, contract, and producer provenance'
+    $oversizedPath = Join-Path $planFixture 'oversized.json'
+    $oversizedWorkload = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
+    $oversizedWorkload.expectedEvents = 6000
+    $oversizedWorkload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $oversizedPath -Encoding utf8
+    $refused = & $plannerPath -RegistryPath $registryPath -WorkloadPath $oversizedPath -ClientId fixture-client -CommandId oversized-command -OutputPath (Join-Path $planFixture 'oversized-plan.json') -HeadroomFactor 2 -NoExit -Compact | ConvertFrom-Json
+    Assert-Test (-not $refused.ok -and $null -eq $refused.arguments -and $refused.exceededCeilings.Count -ge 1) 'render-map planner refuses workload bounds beyond the live service ceilings'
+
+    $failedRegistryPath = Join-Path $planFixture 'failed-registry.json'
+    $failedRegistry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+    $failedRegistry.ok = $false
+    $failedRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $failedRegistryPath -Encoding utf8
+    $failedRegistryPlan = & $plannerPath -RegistryPath $failedRegistryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId failed-registry -OutputPath (Join-Path $planFixture 'failed-registry-plan.json') -NoExit -Compact | ConvertFrom-Json
+    Assert-Test (-not $failedRegistryPlan.ok -and $null -eq $failedRegistryPlan.arguments -and -not $failedRegistryPlan.receiptPublished) 'render-map planner rejects explicit registry-envelope failure before issuing start arguments'
+    $innerFailurePath = Join-Path $planFixture 'inner-failed-registry.json'
+    $innerFailure = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+    $innerFailure.result | Add-Member -NotePropertyName failed -NotePropertyValue $true
+    $innerFailure | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $innerFailurePath -Encoding utf8
+    $innerFailurePlan = & $plannerPath -RegistryPath $innerFailurePath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId inner-failed-registry -OutputPath (Join-Path $planFixture 'inner-failed-registry-plan.json') -NoExit -Compact | ConvertFrom-Json
+    Assert-Test (-not $innerFailurePlan.ok -and $null -eq $innerFailurePlan.arguments -and -not $innerFailurePlan.receiptPublished) 'render-map planner preserves explicit inner registry failure before issuing start arguments'
+
+    foreach ($negativeStatus in @('producer_mismatch', 'idempotency_conflict')) {
+        $negativeStatusPath = Join-Path $planFixture "$negativeStatus-registry.json"
+        $negativeStatusRegistry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+        $negativeStatusRegistry.result | Add-Member -NotePropertyName status -NotePropertyValue ([pscustomobject]@{ name = $negativeStatus; value = 0 })
+        $negativeStatusRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $negativeStatusPath -Encoding utf8
+        $negativeStatusPlan = & $plannerPath -RegistryPath $negativeStatusPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId $negativeStatus -OutputPath (Join-Path $planFixture "$negativeStatus-plan.json") -NoExit -Compact | ConvertFrom-Json
+        Assert-Test (-not $negativeStatusPlan.ok -and $null -eq $negativeStatusPlan.arguments -and -not $negativeStatusPlan.receiptPublished) "render-map planner rejects named negative status $negativeStatus"
+    }
+
+    foreach ($nullStatusCase in @(
+        [pscustomobject]@{ label = 'envelope-status'; layer = 'envelope'; name = 'status' },
+        [pscustomobject]@{ label = 'result-status'; layer = 'result'; name = 'resultStatus' }
+    )) {
+        $nullStatusPath = Join-Path $planFixture "$($nullStatusCase.label)-registry.json"
+        $nullStatusRegistry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+        $target = if ($nullStatusCase.layer -eq 'envelope') { $nullStatusRegistry } else { $nullStatusRegistry.result }
+        $target | Add-Member -NotePropertyName $nullStatusCase.name -NotePropertyValue $null -Force
+        $nullStatusRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $nullStatusPath -Encoding utf8
+        $nullStatusPlan = & $plannerPath -RegistryPath $nullStatusPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId $nullStatusCase.label -OutputPath (Join-Path $planFixture "$($nullStatusCase.label)-plan.json") -NoExit -Compact | ConvertFrom-Json
+        Assert-Test (-not $nullStatusPlan.ok -and $null -eq $nullStatusPlan.arguments -and -not $nullStatusPlan.receiptPublished) "render-map planner rejects present-null $($nullStatusCase.label) before issuing start arguments"
+    }
+
+    foreach ($missingBinding in @('service', 'major', 'producerBuildId')) {
+        $bindingPath = Join-Path $planFixture "missing-$missingBinding-registry.json"
+        $bindingRegistry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+        if ($missingBinding -eq 'producerBuildId') {
+            $bindingRegistry.server.PSObject.Properties.Remove('buildId')
+        } else {
+            $bindingRegistry.result.PSObject.Properties.Remove($missingBinding)
+        }
+        $bindingRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $bindingPath -Encoding utf8
+        $bindingPlan = & $plannerPath -RegistryPath $bindingPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId "missing-$missingBinding" -OutputPath (Join-Path $planFixture "missing-$missingBinding-plan.json") -NoExit -Compact | ConvertFrom-Json
+        Assert-Test (-not $bindingPlan.ok -and $null -eq $bindingPlan.arguments) "render-map planner requires explicit registry $missingBinding binding"
+    }
+
+    foreach ($invalidScope in @($null, 0, -1, $true, 1.5)) {
+        $scopePath = Join-Path $planFixture "scope-$([guid]::NewGuid().ToString('N')).json"
+        $scopeWorkload = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
+        $scopeWorkload.expectedScopeDepth = $invalidScope
+        $scopeWorkload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $scopePath -Encoding utf8
+        $scopePlan = & $plannerPath -RegistryPath $registryPath -WorkloadPath $scopePath -ClientId fixture-client -CommandId invalid-scope -OutputPath "$scopePath.plan.json" -NoExit -Compact | ConvertFrom-Json
+        Assert-Test (-not $scopePlan.ok -and $null -eq $scopePlan.arguments) 'render-map planner rejects a missing or malformed explicit scope estimate'
+    }
+    $explicitOnePath = Join-Path $planFixture 'scope-one.json'
+    $explicitOne = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
+    $explicitOne.expectedScopeDepth = 1
+    $explicitOne | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $explicitOnePath -Encoding utf8
+    $explicitOnePlan = & $plannerPath -RegistryPath $registryPath -WorkloadPath $explicitOnePath -ClientId fixture-client -CommandId explicit-one -OutputPath (Join-Path $planFixture 'scope-one-plan.json') -NoExit -Compact | ConvertFrom-Json
+    Assert-Test ($explicitOnePlan.ok -and $explicitOnePlan.arguments.maxScopeDepth -eq 2) 'render-map planner accepts an explicitly stated scope depth of one'
+
+    foreach ($invalidCase in @(
+            [pscustomobject]@{ area = 'workload'; property = 'expectedEvents'; value = $true },
+            [pscustomobject]@{ area = 'workload'; property = 'expectedFrames'; value = 1.5 },
+            [pscustomobject]@{ area = 'limit'; property = 'maximumEvents'; value = $true },
+            [pscustomobject]@{ area = 'limit'; property = 'maximumFrames'; value = 1.5 },
+            [pscustomobject]@{ area = 'default'; property = 'fixedCatalogueBytes'; value = 1.5 }
+        )) {
+        $invalidRegistryPath = $registryPath
+        $invalidWorkloadPath = $workloadPath
+        if ($invalidCase.area -eq 'workload') {
+            $invalidWorkloadPath = Join-Path $planFixture "invalid-$($invalidCase.property).json"
+            $invalidWorkload = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
+            $invalidWorkload.($invalidCase.property) = $invalidCase.value
+            $invalidWorkload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $invalidWorkloadPath -Encoding utf8
+        } else {
+            $invalidRegistryPath = Join-Path $planFixture "invalid-$($invalidCase.property)-registry.json"
+            $invalidRegistry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+            if ($invalidCase.area -eq 'limit') {
+                $invalidRegistry.result.limits.($invalidCase.property) = $invalidCase.value
+            } else {
+                $invalidRegistry.result.defaults.($invalidCase.property) = $invalidCase.value
+            }
+            $invalidRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $invalidRegistryPath -Encoding utf8
+        }
+        $invalidPlan = & $plannerPath -RegistryPath $invalidRegistryPath -WorkloadPath $invalidWorkloadPath -ClientId fixture-client -CommandId "invalid-$($invalidCase.property)" -OutputPath (Join-Path $planFixture "invalid-$($invalidCase.property)-plan.json") -NoExit -Compact | ConvertFrom-Json
+        Assert-Test (-not $invalidPlan.ok -and $null -eq $invalidPlan.arguments) "render-map planner rejects malformed positive-integer field $($invalidCase.property)"
+    }
+
+    $allWorkloadNumbers = @('expectedDurationMs', 'expectedFrames', 'expectedEvents', 'expectedEventBytes', 'expectedScopeDepth')
+    $allObservationNumbers = @('geometry', 'materialState', 'resource', 'sceneObject', 'shader', 'stageShader', 'targetBinding', 'targetView')
+    foreach ($property in $allWorkloadNumbers + $allObservationNumbers) {
+        foreach ($badValue in @($true, 1.5)) {
+            $invalidWorkloadPath = Join-Path $planFixture "all-workload-$property-$([guid]::NewGuid().ToString('N')).json"
+            $invalidWorkload = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
+            if ($property -in $allObservationNumbers) {
+                $invalidWorkload.expectedObservations.$property = $badValue
+            } else {
+                $invalidWorkload.$property = $badValue
+            }
+            $invalidWorkload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $invalidWorkloadPath -Encoding utf8
+            $invalidPlan = & $plannerPath -RegistryPath $registryPath -WorkloadPath $invalidWorkloadPath -ClientId fixture-client -CommandId all-workload-invalid -OutputPath "$invalidWorkloadPath.plan.json" -NoExit -Compact | ConvertFrom-Json
+            Assert-Test (-not $invalidPlan.ok -and $null -eq $invalidPlan.arguments) "render-map planner rejects Boolean and fractional workload field $property"
+        }
+    }
+    $allLimitNumbers = @(
+        'maximumBytes', 'maximumDurationMs', 'maximumEvents', 'maximumFrames',
+        'maximumScopeDepth', 'maximumGeometryObservations',
+        'maximumMaterialStateObservations', 'maximumResourceObservations',
+        'maximumSceneObjectObservations', 'maximumShaderObservations',
+        'maximumStageShaderObservations', 'maximumTargetBindingObservations',
+        'maximumTargetViewObservations'
+    )
+    foreach ($property in $allLimitNumbers) {
+        foreach ($badValue in @($true, 1.5)) {
+            $invalidRegistryPath = Join-Path $planFixture "all-limit-$property-$([guid]::NewGuid().ToString('N')).json"
+            $invalidRegistry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+            $invalidRegistry.result.limits.$property = $badValue
+            $invalidRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $invalidRegistryPath -Encoding utf8
+            $invalidPlan = & $plannerPath -RegistryPath $invalidRegistryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId all-limit-invalid -OutputPath "$invalidRegistryPath.plan.json" -NoExit -Compact | ConvertFrom-Json
+            Assert-Test (-not $invalidPlan.ok -and $null -eq $invalidPlan.arguments) "render-map planner rejects Boolean and fractional registry ceiling $property"
+        }
+    }
+    foreach ($badValue in @($true, 1.5)) {
+        $invalidDefaultPath = Join-Path $planFixture "all-default-$([guid]::NewGuid().ToString('N')).json"
+        $invalidDefault = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+        $invalidDefault.result.defaults.fixedCatalogueBytes = $badValue
+        $invalidDefault | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $invalidDefaultPath -Encoding utf8
+        $invalidPlan = & $plannerPath -RegistryPath $invalidDefaultPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId all-default-invalid -OutputPath "$invalidDefaultPath.plan.json" -NoExit -Compact | ConvertFrom-Json
+        Assert-Test (-not $invalidPlan.ok -and $null -eq $invalidPlan.arguments) 'render-map planner rejects Boolean and fractional fixed catalogue allocation'
+    }
+
+    $overflowPath = Join-Path $planFixture 'overflow-workload.json'
+    $overflowWorkload = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
+    $overflowWorkload.expectedEvents = [long]::MaxValue
+    $overflowWorkload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $overflowPath -Encoding utf8
+    $overflowPlan = & $plannerPath -RegistryPath $registryPath -WorkloadPath $overflowPath -ClientId fixture-client -CommandId overflow -OutputPath (Join-Path $planFixture 'overflow-plan.json') -NoExit -Compact | ConvertFrom-Json
+    Assert-Test (-not $overflowPlan.ok -and $null -eq $overflowPlan.arguments) 'render-map planner rejects headroom arithmetic beyond its 64-bit bound'
+
+    $hashFailurePath = Join-Path $planFixture 'hash-failure-plan.json'
+    $hashFailure = & $plannerPath -RegistryPath $registryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId hash-failure -OutputPath $hashFailurePath -InternalTestFailurePoint receipt-hash -NoExit -Compact | ConvertFrom-Json
+    Assert-Test (-not $hashFailure.ok -and $hashFailure.state -eq 'plan-finalization-error' -and $hashFailure.receiptPublished -and $hashFailure.receiptPath -eq $hashFailurePath -and $null -eq $hashFailure.receiptSha256 -and $null -eq $hashFailure.arguments -and (Test-Path -LiteralPath $hashFailurePath -PathType Leaf)) 'post-publication hash failure preserves the immutable receipt path without issuing arguments'
+}
+finally {
+    if (Test-Path -LiteralPath $planFixture) { Remove-Item -LiteralPath $planFixture -Recurse -Force }
+}
 
 $ready = Test-DevBenchServiceReady -Content @([pscustomobject]@{ ok = $true; result = [pscustomobject]@{ state = 'ready' } })
 Assert-Test ($ready.ready -and -not $ready.retryable -and $ready.statePath -eq 'content.result.state') 'service readiness prefers result.state'
@@ -72,6 +494,27 @@ $dispatchWaiting = Test-DevBenchServiceReady -Content @([pscustomobject]@{ error
 Assert-Test (-not $dispatchWaiting.ready -and $dispatchWaiting.retryable -and -not $dispatchWaiting.terminalFailure) 'explicitly retryable dispatch failure remains retryable'
 $guarded = Test-DevBenchServiceReady -Content @([pscustomobject]@{ error = [pscustomobject]@{ code = 'producer_mismatch' } })
 Assert-Test (-not $guarded.ready -and $guarded.terminalFailure) 'guard rejection terminates readiness wait'
+$contradictoryReady = Test-DevBenchServiceReady -Content @([pscustomobject]@{ ok = $false; result = [pscustomobject]@{ state = 'ready' } })
+Assert-Test (-not $contradictoryReady.ready -and $contradictoryReady.terminalFailure) 'negative semantic evidence vetoes a simultaneously ready service state'
+$retryableContradictoryReady = Test-DevBenchServiceReady -Content @([pscustomobject]@{ ok = $false; retryable = $true; result = [pscustomobject]@{ state = 'ready' } })
+Assert-Test (-not $retryableContradictoryReady.ready -and $retryableContradictoryReady.retryable -and -not $retryableContradictoryReady.terminalFailure) 'retryability controls continued polling but never converts negative semantic evidence into readiness'
+$nestedRetryableContradictoryReady = Test-DevBenchServiceReady -Content @([pscustomobject]@{ result = [pscustomobject]@{ state = 'ready'; error = [pscustomobject]@{ code = 'service_unavailable'; retryable = $true } } })
+Assert-Test (-not $nestedRetryableContradictoryReady.ready -and $nestedRetryableContradictoryReady.retryable) 'nested retryable failure evidence vetoes an otherwise accepted readiness state'
+foreach ($neutral in @(
+    [pscustomobject]@{ retryable = $false },
+    [pscustomobject]@{ failed = $false },
+    [pscustomobject]@{ aborted = $false }
+)) {
+    $neutralReady = Test-DevBenchServiceReady -Content @($neutral)
+    Assert-Test (-not $neutralReady.ready -and $neutralReady.semantic.known -and
+        -not $neutralReady.semantic.affirmative) 'a negative-control flag alone never establishes service readiness'
+}
+$affirmativeReady = Test-DevBenchServiceReady -Content @([pscustomobject]@{ ok = $true })
+Assert-Test ($affirmativeReady.ready -and $affirmativeReady.semantic.affirmative) 'an explicitly successful probe remains affirmative readiness evidence'
+$deadline = [DateTime]'2026-09-13T04:00:00Z'
+Assert-Test (Test-DevBenchWaitDeadlineAcceptance -Satisfied $true -ObservedUtc $deadline.AddTicks(-1) -DeadlineUtc $deadline) 'a valid observation immediately before the absolute deadline may satisfy a wait'
+Assert-Test (-not (Test-DevBenchWaitDeadlineAcceptance -Satisfied $true -ObservedUtc $deadline -DeadlineUtc $deadline)) 'an observation exactly at the absolute deadline cannot satisfy a wait'
+Assert-Test (-not (Test-DevBenchWaitDeadlineAcceptance -Satisfied $true -ObservedUtc $deadline.AddTicks(1) -DeadlineUtc $deadline)) 'a late positive observation remains diagnostic evidence rather than wait success'
 $inspectReady = Test-DevBenchServiceReady -Content @([pscustomobject]@{ playerLoaded = $true; cell = 'Whiterun' })
 Assert-Test (-not $inspectReady.ready -and $inspectReady.probeReturnedContent -and -not $inspectReady.semantic.known) 'a successful unclassified response never proves service readiness'
 $textUnknown = Test-DevBenchServiceReady -Content @('answered')
@@ -94,6 +537,30 @@ $mixedDismissal = Get-DevBenchMenuDismissalPlan -MenuObservation $mixedMenus -Di
 Assert-Test (-not $mixedDismissal.permitted -and $mixedDismissal.retainedMenus[0] -eq 'MapMenu') 'unlisted blocking menus prevent partial dismissal'
 $modalDismissal = Get-DevBenchMenuDismissalPlan -MenuObservation $modal -DismissBlockingMenus @('InventoryMenu')
 Assert-Test (-not $modalDismissal.permitted -and $modalDismissal.reason -eq 'message-box-requires-explicit-answer') 'message boxes are never auto-dismissed'
+$validMenuProbe = Get-DevBenchWaitProbeAssessment -ProbeKind menu -Content @([pscustomobject]@{ openMenus = @('HUD Menu'); messageBoxOpen = $false })
+Assert-Test $validMenuProbe.ok 'wait menu probes require and retain a complete action-specific read contract'
+$failedMenuProbe = Get-DevBenchWaitProbeAssessment -ProbeKind menu -Content @([pscustomobject]@{ ok = $false; errors = @('menu snapshot unavailable'); openMenus = @(); messageBoxOpen = $false })
+Assert-Test (-not $failedMenuProbe.ok -and $failedMenuProbe.terminalFailure -and -not $failedMenuProbe.semantic.ok) 'negative menu semantics cannot satisfy a nonblocking-menu barrier'
+$missingMenuProbe = Get-DevBenchWaitProbeAssessment -ProbeKind menu -Content @([pscustomobject]@{ openMenus = @() })
+Assert-Test (-not $missingMenuProbe.ok -and $missingMenuProbe.terminalFailure) 'missing menu response fields cannot fabricate a successful barrier'
+$failedPlayerProbe = Get-DevBenchWaitProbeAssessment -ProbeKind player-state -Content @([pscustomobject]@{ ok = $false; playerLoaded = $true })
+Assert-Test (-not $failedPlayerProbe.ok -and $failedPlayerProbe.terminalFailure) 'negative player-state semantics veto apparently loaded state'
+$missingPlayerProbe = Get-DevBenchWaitProbeAssessment -ProbeKind player-state -Content @([pscustomobject]@{ ok = $true })
+Assert-Test (-not $missingPlayerProbe.ok -and $missingPlayerProbe.terminalFailure) 'missing playerLoaded evidence cannot satisfy a current-state barrier'
+$failedSceneProbe = Get-DevBenchWaitProbeAssessment -ProbeKind scene -Content @([pscustomobject]@{ ok = $false; cell = 'Whiterun' })
+Assert-Test (-not $failedSceneProbe.ok -and $failedSceneProbe.terminalFailure) 'negative scene semantics veto an otherwise matching cell identity'
+$retryablePlayerProbe = Get-DevBenchWaitProbeAssessment -ProbeKind player-state -Content @([pscustomobject]@{ ok = $false; retryable = $true; playerLoaded = $false })
+$terminalSceneProbe = Get-DevBenchWaitProbeAssessment -ProbeKind scene -Content @([pscustomobject]@{ ok = $false; retryable = $false; errors = @('scene snapshot rejected'); cell = 'Whiterun' })
+$mixedProbeFailure = Select-DevBenchWaitProbeFailure -Probes @($retryablePlayerProbe, $terminalSceneProbe)
+Assert-Test ($mixedProbeFailure.found -and $mixedProbeFailure.terminalFailure -and -not $mixedProbeFailure.retryable -and $mixedProbeFailure.semantic.reasons -match 'scene snapshot rejected') 'terminal wait-probe evidence dominates and retains a retryable sibling'
+$validUpscalingProbe = Get-DevBenchWaitProbeAssessment -ProbeKind upscaling-snapshot -Content @([pscustomobject]@{ stateRevision = 12 })
+Assert-Test $validUpscalingProbe.ok 'upscaling snapshot wait probes require a structured state revision'
+$failedUpscalingProbe = Get-DevBenchWaitProbeAssessment -ProbeKind upscaling-snapshot -Content @([pscustomobject]@{ ok = $false; errors = @('snapshot rejected'); stateRevision = 12 })
+Assert-Test (-not $failedUpscalingProbe.ok -and $failedUpscalingProbe.terminalFailure) 'negative upscaling snapshot semantics veto plausible telemetry'
+$validRenderScaleProbe = Get-DevBenchWaitProbeAssessment -ProbeKind render-scale -Content @([pscustomobject]@{ action = 'status'; status = [pscustomobject]@{ controller = [pscustomobject]@{ state = 'Active' } } })
+Assert-Test $validRenderScaleProbe.ok 'render-scale wait probes require their action-specific status response'
+$failedRenderScaleProbe = Get-DevBenchWaitProbeAssessment -ProbeKind render-scale -Content @([pscustomobject]@{ ok = $false; action = 'status'; status = [pscustomobject]@{ controller = [pscustomobject]@{ state = 'Active' } } })
+Assert-Test (-not $failedRenderScaleProbe.ok -and $failedRenderScaleProbe.terminalFailure) 'negative render-scale semantics veto plausible status telemetry'
 
 Assert-Test (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $false -IssuedSessionId '' -StatusCode 404) 'only an initial sessionless MCP 404 proves capability absence'
 Assert-Test (-not (Test-DevBenchInitialMcpCapabilityMiss -InitializeCompleted $true -IssuedSessionId 'session-1' -StatusCode 404)) 'a post-initialization MCP 404 cannot authorize REST fallback'
@@ -460,6 +927,110 @@ $attemptedProvenance = Get-DevBenchDispatchProvenance -InvocationRecord ([pscust
 Assert-Test ($attemptedError -match 'target lost response' -and $targetInvocations -eq 1 -and
     -not [string]::IsNullOrWhiteSpace([string]$attemptedRecord.dispatchIntentUtc) -and
     -not [string]::IsNullOrWhiteSpace([string]$attemptedRecord.dispatchedUtc) -and $attemptedProvenance.dispatchReached) 'entered target with a lost response remains an attempted unknown mutation'
+$waitTimeoutSemanticAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'New-DevBenchWaitTimeoutSemantic' }, $true))[0]
+Invoke-Expression $waitTimeoutSemanticAst.Extent.Text
+$waitCompletionAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-DevBenchWaitCompletion' }, $true))[0]
+Invoke-Expression $waitCompletionAst.Extent.Text
+$requestTimeoutAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-RequestTimeoutSeconds' }, $true))[0]
+Invoke-Expression $requestTimeoutAst.Extent.Text
+$script:requestTimeoutSecondsForRpc = 15
+$script:operationDeadlineUtc = [DateTime]::UtcNow.AddMilliseconds(500)
+$positiveSubsecondTimeout = Get-RequestTimeoutSeconds
+Assert-Test ($positiveSubsecondTimeout -eq 1) 'a positive subsecond operation budget remains eligible for one bounded request'
+$script:operationDeadlineUtc = [DateTime]::UtcNow.AddMilliseconds(-1)
+$expiredBudgetRejected = $false
+try { $null = Get-RequestTimeoutSeconds } catch { $expiredBudgetRejected = $_.Exception -is [TimeoutException] }
+Assert-Test $expiredBudgetRejected 'request admission reports expiry only after the absolute deadline has elapsed'
+$ordinaryTimeoutSemantic = New-DevBenchWaitTimeoutSemantic -Condition 'serviceReady' -TimeoutSeconds 42
+Assert-Test (-not $ordinaryTimeoutSemantic.ok -and $ordinaryTimeoutSemantic.outcome -eq 'wait-timeout' -and $ordinaryTimeoutSemantic.codes -contains 'wait_timeout' -and $ordinaryTimeoutSemantic.states -contains 'timeout') 'ordinary and exceptional wait expiry share one structured timeout semantic contract'
+$terminalServiceSemantic = [pscustomobject][ordered]@{ known = $true; ok = $false; outcome = 'guard-rejected'; codes = @('guard_rejected'); states = @('rejected'); reasons = @('fixture guard rejection') }
+$terminalServiceCompletion = Get-DevBenchWaitCompletion -Condition 'serviceReady' -TimeoutSeconds 42 -Observation ([pscustomobject]@{ satisfied = $false; service = [pscustomobject]@{ terminalFailure = $true; semantic = $terminalServiceSemantic } })
+Assert-Test ($terminalServiceCompletion.state -eq 'semantic-failed' -and $terminalServiceCompletion.terminalServiceFailure -and $terminalServiceCompletion.semantic.outcome -eq 'guard-rejected' -and $terminalServiceCompletion.semantic.codes -contains 'guard_rejected' -and $terminalServiceCompletion.semantic.states -contains 'rejected') 'terminal service failure preserves its semantic evidence and is not rewritten as a timeout'
+$terminalMenuCompletion = Get-DevBenchWaitCompletion -Condition 'noBlockingMenu' -TimeoutSeconds 42 -Observation ([pscustomobject]@{ satisfied = $false; terminalFailure = $true; semantic = $failedMenuProbe.semantic })
+Assert-Test ($terminalMenuCompletion.state -eq 'semantic-failed' -and $terminalMenuCompletion.terminalProbeFailure -and -not $terminalMenuCompletion.semantic.ok) 'terminal menu probe failure remains attributable instead of becoming a timeout'
+$deadlineCompletion = Get-DevBenchWaitCompletion -Condition 'serviceReady' -TimeoutSeconds 42 -Observation ([pscustomobject]@{ satisfied = $false; service = [pscustomobject]@{ terminalFailure = $false; semantic = [pscustomobject]@{ known = $true; ok = $true } } })
+Assert-Test ($deadlineCompletion.state -eq 'timeout' -and -not $deadlineCompletion.terminalServiceFailure -and $deadlineCompletion.semantic.outcome -eq 'wait-timeout') 'ordinary unsatisfied service wait remains a deadline timeout'
+$runtimeIdentityAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-RuntimeIdentity' }, $true))[0]
+$retryableExceptionAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-WaitRetryableException' }, $true))[0]
+$identityProbeResult = & {
+    param([string]$RuntimeIdentityFunction, [string]$RetryableFunction)
+    Invoke-Expression $RetryableFunction
+    $identityContentAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-RuntimeIdentityContent' }, $true))[0]
+    Invoke-Expression $identityContentAst.Extent.Text
+    function Get-DevBenchRuntimeExpectations {
+        [pscustomobject]@{ port = 1; pid = $PID; exe = $null; buildId = $null; artifactPath = $null; artifactSha256 = $null }
+    }
+    function Get-ListenerPid { return $PID }
+    function Test-DevBenchExecutableIdentityMatch { return $true }
+    function Invoke-ToolRpc {
+        param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers)
+        if ($Name -eq 'inspect') { return [pscustomobject]@{ content = @([pscustomobject]@{ ok = $true; pid = $PID; exe = 'pwsh.exe' }) } }
+        if ($Name -eq 'communityshaders.first_api') { throw [InvalidOperationException]::new('main thread busy') }
+        return [pscustomobject]@{ content = @([pscustomobject]@{ ok = $true; producer = [pscustomobject]@{ buildId = 'fixture-build' } }) }
+    }
+    $ArtifactPath = ''
+    $ExpectedBuildId = ''
+    $ExpectedArtifactSha256 = ''
+    $ExpectedRuntimeIdentityJson = ''
+    Invoke-Expression $RuntimeIdentityFunction
+    $tools = @([pscustomobject]@{ name = 'inspect' }, [pscustomobject]@{ name = 'communityshaders.first_api' }, [pscustomobject]@{ name = 'communityshaders.second_api' })
+    $runtime = [pscustomobject]@{ port = 1 }
+    $nonWait = Get-RuntimeIdentity -Runtime $runtime -Headers @{} -Tools $tools
+    $waitPropagated = $false
+    try { $null = Get-RuntimeIdentity -Runtime $runtime -Headers @{} -Tools $tools -PropagateRetryable }
+    catch { $waitPropagated = $_.Exception.Message -eq 'main thread busy' }
+    [pscustomobject]@{ nonWait = $nonWait; waitPropagated = $waitPropagated }
+} $runtimeIdentityAst.Extent.Text $retryableExceptionAst.Extent.Text
+Assert-Test ($identityProbeResult.nonWait.errors.Count -eq 0 -and $identityProbeResult.nonWait.build.buildId -eq 'fixture-build' -and $identityProbeResult.nonWait.build.sources[0].error -match 'main thread busy') 'non-wait identity discovery retains one transient candidate failure and continues to a valid sibling producer'
+Assert-Test $identityProbeResult.waitPropagated 'wait identity discovery propagates a retryable producer failure into the bounded rebind loop'
+$identitySemanticCases = & {
+    $ExpectedRuntimeIdentityJson = ''
+    Invoke-Expression $retryableExceptionAst.Extent.Text
+    $contentAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-RuntimeIdentityContent' }, $true))[0]
+    Invoke-Expression $contentAst.Extent.Text
+    Invoke-Expression $runtimeIdentityAst.Extent.Text
+    $ArtifactPath = (Get-Process -Id $PID).Path
+    $ExpectedBuildId = 'fixture-build'
+    $ExpectedArtifactSha256 = ''
+    function Get-DevBenchRuntimeExpectations {
+        [pscustomobject]@{ port = 1; pid = $PID; exe = $null; buildId = $null; artifactPath = $null; artifactSha256 = $null }
+    }
+    function Get-ListenerPid { $PID }
+    $mode = 'valid'
+    function Invoke-ToolRpc {
+        param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers)
+        $payload = if ($Name -eq 'inspect') {
+            [pscustomobject]@{ ok = $true; pid = $PID; exe = 'pwsh.exe' }
+        } else { [pscustomobject]@{ ok = $true; producer = [pscustomobject]@{ buildId = 'fixture-build' } } }
+        if (($mode -like 'health-*' -and $Name -eq 'inspect') -or
+            ($mode -like 'producer-*' -and $Name -eq 'communityshaders.first_api')) {
+            $payload.ok = $false
+            $payload | Add-Member retryable ($mode -like '*retryable')
+            $payload | Add-Member error 'identity unavailable'
+            if ($mode -like '*malformed') { $payload.ok = 'false' }
+            if ($mode -like '*unknown') { $payload.PSObject.Properties.Remove('ok'); $payload.PSObject.Properties.Remove('error') }
+        }
+        # Real MCP and REST content is JSON-decoded; PID integers become Int64.
+        [pscustomobject]@{ content = @(($payload | ConvertTo-Json -Depth 8) | ConvertFrom-Json) }
+    }
+    $tools = @([pscustomobject]@{ name = 'inspect' }, [pscustomobject]@{ name = 'communityshaders.first_api' }, [pscustomobject]@{ name = 'communityshaders.second_api' })
+    $runtime = [pscustomobject]@{ port = 1 }
+    $valid = Get-RuntimeIdentity -Runtime $runtime -Headers @{} -Tools $tools
+    Assert-Test ($valid.verified -and $valid.complete) 'positive qualified health/producer/artifact form a verified complete identity'
+    foreach ($case in @('health-retryable', 'health-terminal', 'health-malformed', 'health-unknown', 'producer-retryable', 'producer-terminal', 'producer-malformed')) {
+        $mode = $case
+        $ordinary = Get-RuntimeIdentity -Runtime $runtime -Headers @{} -Tools $tools
+        if ($case -like 'health-*') {
+            Assert-Test (-not $ordinary.verified -and -not $ordinary.complete -and $null -eq $ordinary.health -and $ordinary.errors.Count -gt 0) "negative/malformed/unknown health cannot authorize mutation: $case"
+        } else {
+            Assert-Test ($ordinary.verified -and $ordinary.build.buildId -eq 'fixture-build' -and $null -eq $ordinary.build.sources[0].producer -and $ordinary.build.sources[0].error -match 'Unqualified') "failed ordinary producer contributes no identity, retains errors and permits valid sibling: $case"
+        }
+        $propagated = $false
+        try { $null = Get-RuntimeIdentity -Runtime $runtime -Headers @{} -Tools $tools -PropagateRetryable }
+        catch { $propagated = Test-WaitRetryableException -Exception $_.Exception }
+        Assert-Test ($propagated -eq ($case -like '*retryable')) "only semantically retryable identity enters shared bounded rebind: $case"
+    }
+}
 $terminalWriterAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Write-TerminalInvocationEvidence' }, $true))[0]
 Invoke-Expression $terminalWriterAst.Extent.Text
 $headerReaderAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-McpSessionHeaderValue' }, $true))[0]
@@ -475,8 +1046,8 @@ Assert-Test ($entryPointText -match '\$expectations\.buildId\s+-and\s+\$actualBu
 Assert-Test ($entryPointText -match '\$Command -eq ''wait'' -and \$statusCode -eq 404') 'transient MCP 404 recovery is restricted to bounded waits'
 Assert-Test ($entryPointText -match 'full-runtime-rebind-required') 'bounded waits route invalidated MCP sessions through a full runtime rebind'
 Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$RequirePerformanceNeutral\) -and -not \$semantic\.known') 'required semantic outcomes reject unknown responses'
-Assert-Test ($entryPointText -match 'ok = \[bool\]\$observation\.satisfied') 'wait semantics retain the observed unsatisfied condition'
-Assert-Test ($entryPointText -match '\$Command -eq ''call'' -and -not \$readOnlyCall -and -not \$runtimeIdentity\.complete') 'only mutation-capable calls require complete runtime identity'
+Assert-Test ($entryPointText -match '\$waitCompletion = Get-DevBenchWaitCompletion -Observation \$observation' -and $entryPointText -match '\$semantic = \$waitCompletion\.semantic') 'wait semantics preserve terminal service failures and qualify ordinary expiry through one completion classifier'
+Assert-Test ($entryPointText -match '-not \$runtimeIdentity\.complete -or -not \$runtimeIdentity\.verified') 'mutation-capable calls require complete and positively verified runtime identity'
 Assert-Test ($entryPointText -match '\[string\]\$ExpectedRuntimeIdentityJson') 'controller accepts an exact prior runtime identity for pre-dispatch continuity'
 Assert-Test ($entryPointText.IndexOf('Expected runtime identity is invalid:') -lt $entryPointText.IndexOf("Update-InvocationEvidence -State 'dispatching'")) 'runtime identity continuity is verified before mutation dispatch'
 Assert-Test ($entryPointText -match 'if \(\$Command -eq ''call''\) \{[\s\S]{0,100}-not \$semantic\.known -or -not \$semantic\.ok') 'mutation-capable calls fail closed on unknown semantic outcomes'
@@ -487,8 +1058,8 @@ Assert-Test ($entryPointText -match '\$requestedAction -eq ''disable''[\s\S]{0,1
 Assert-Test ($entryPointText -match 'outcome = ''profiler-contract-satisfied''') 'accepted profiler responses report their contract-specific outcome'
 Assert-Test ($entryPointText -match 'Invoke-ToolRpc -Name \$Tool -Arguments \$arguments -Headers \$headers -Mutation:\(-not \$readOnlyCall\)') 'user calls carry their explicit retry-safety classification'
 Assert-Test ($entryPointText -match 'not-retried-indeterminate') 'ambiguous mutation transport failures are not replayed'
-Assert-Test ($entryPointText -match '\$failureState = if[\s\S]{0,300}\$outcomeIndeterminate\) \{ ''indeterminate'' \}' -and $entryPointText -match 'Update-InvocationEvidence -State \$failureState') 'indeterminate mutation outcomes are durably journaled'
-Assert-Test ($entryPointText -match '-Semantic \$semantic -Data \$failureData -Errors') 'post-dispatch failures preserve accepted data in the invocation journal when possible'
+Assert-Test ($entryPointText -match 'failureState = if \(\$outcomeIndeterminate\) \{ ''indeterminate'' \}' -and $entryPointText -match 'Update-InvocationEvidence -State \$failureState') 'indeterminate mutation outcomes are durably journaled'
+Assert-Test ($entryPointText -match '-Semantic \$failureSemantic -Data \$failureData -Errors' -and $entryPointText -match 'else \{ \$semantic \}') 'post-dispatch failures preserve accepted data and semantics in the invocation journal when possible'
 Assert-Test (
     $entryPointText -match 'acceptedDataRetained = \[bool\]\$dispatch\.acceptedDataRetained' -and
     $entryPointText -match 'responseDataRetained = \[bool\]\$dispatch\.responseDataRetained' -and
@@ -499,8 +1070,10 @@ Assert-Test ($entryPointText -match '\$requestTimeoutSeconds = Get-RequestTimeou
 Assert-Test ($entryPointText -match '\$operationStartedUtc = \[DateTime\]::UtcNow' -and $entryPointText -match '\$operationDeadlineUtc = \$operationStartedUtc.AddSeconds\(\$TimeoutSeconds\)' -and $entryPointText -notmatch '\[Math\]::Min\(15,') 'blocking calls use the declared operation budget instead of a fixed 15-second transport cap'
 Assert-Test ($entryPointText -notmatch 'Start-Sleep -Milliseconds \$currentDelay') 'wait poll delays cannot exceed the operation deadline'
 Assert-Test ($entryPointText -match 'mcp-session-reinitialized') 'bounded waits reinitialize invalidated MCP sessions'
-Assert-Test ($entryPointText -match '\[int\]\$MaxSessionRebinds = 3' -and $entryPointText -match 'DevBenchPersistentSessionInvalidation') 'bounded waits terminate repeated MCP session churn before exhausting the full outer deadline'
-Assert-Test ($entryPointText -match "persistentSessionInvalidation\) \{ 'persistent-session-invalidated'" -and $entryPointText -match 'lastSuccessfulObservation = \$lastSuccessfulWaitObservation' -and $entryPointText -match 'Update-InvocationEvidence -State \$failureState -Semantic \$semantic -Data \$failureData') 'persistent session invalidation returns and journals a distinct state with the last successfully decoded observation'
+Assert-Test ($entryPointText -match '\[ValidateRange\(0, 1000\)\][\s\S]{0,80}\[int\]\$MaxSessionRebinds = 0' -and $entryPointText -match '\$MaxSessionRebinds -gt 0') 'bounded waits rely on the caller deadline by default and expose an optional explicit session-churn cap'
+Assert-Test ($entryPointText -match '\[ValidateRange\(1, 3600\)\][\s\S]{0,80}\[int\]\$TimeoutSeconds = 30') 'readiness waits admit explicit task-proportional deadlines up to one hour'
+Assert-Test ($entryPointText -match 'state = \$\(if \(\$Command -eq ''wait''\) \{ \[string\]\$waitCompletion\.state \}' -and $entryPointText -match 'lastSuccessfulObservation = if \(\$observation\.satisfied\)' -and $entryPointText -match 'outcome = ''wait-timeout''') 'wait completion returns the classified top-level state and preserves the last successful observation'
+Assert-Test ($entryPointText -match "persistentSessionInvalidation\) \{ 'persistent-session-invalidated'" -and $entryPointText -match 'lastSuccessfulObservation = \$lastSuccessfulWaitObservation' -and $entryPointText -match 'Update-InvocationEvidence -State \$failureState .* -Data \$failureData') 'persistent session invalidation returns and journals a distinct state with the last successfully decoded observation'
 Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$Command -eq ''wait''\)') 'unsatisfied waits fail even without RequireSuccess'
 Assert-Test ($entryPointText -match 'function Close-McpSession') 'entry point defines deterministic MCP session cleanup'
 Assert-Test ($entryPointText -match '-Method Delete') 'owned MCP sessions are closed through the server lifecycle endpoint'
@@ -529,8 +1102,19 @@ Assert-Test ($entryPointText -match 'requestTimeoutSeconds = \$script:requestTim
 Assert-Test ($entryPointText -match '\[string\]\$EvidenceLabel') 'runtime binding evidence accepts an explicit invocation label'
 Assert-Test ($entryPointText -match 'devbench-runtime-binding\.\$safeLabel\.\$stamp\.\$PID\.json') 'parallel runtime bindings use invocation-unique filenames'
 Assert-Test ($entryPointText -match 'function Test-WaitRetryableException') 'bounded waits classify exhausted transient probe failures'
-Assert-Test ($entryPointText -match "state = 'transport_retry'") 'serviceReady carries transient probe exhaustion into the outer wait'
+Assert-Test ($entryPointText -match "classification = 'session-rebind-required'" -and $entryPointText -match "phase = 'discovery-identity-or-probe'") 'serviceReady carries transient discovery, identity, or probe exhaustion into the outer wait'
+$fullWaitRecoveryTry = @($entryPointAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.TryStatementAst] -and
+    $node.Body.Extent.Text -match 'Get-ToolDescriptors -Headers \$headers' -and
+    $node.Body.Extent.Text -match 'Get-RuntimeIdentity -Runtime \$runtime' -and
+    $node.Body.Extent.Text -match 'Invoke-ToolRpc -Name \$Tool' -and
+    @($node.CatchClauses | Where-Object { $_.Body.Extent.Text -match 'Close-McpSessionForRebind -Headers \$headers' }).Count -eq 1
+}, $true))
+Assert-Test ($fullWaitRecoveryTry.Count -eq 1) 'tool discovery, post-registration identity, and the read-only readiness probe share one cleanup-qualified rebind boundary'
+Assert-Test ($entryPointText -match 'Get-RuntimeIdentity[\s\S]+?catch \{\s*if \(\$PropagateRetryable -and \(Test-WaitRetryableException -Exception \$_\.Exception\)\) \{ throw \}' -and $entryPointText -match 'Open-DevBenchSession -Runtime \$runtime[\s\S]{0,160}-PropagateRetryable' -and $entryPointText -match 'Get-RuntimeIdentity -Runtime \$runtime -Headers \$headers -Tools \$currentTools -PropagateRetryable') 'runtime identity propagates retryable probe failures only into the shared bounded wait rebind state machine'
 Assert-Test ($entryPointText -match 'probeError = \$_.Exception.Message') 'wait observations preserve the transient probe error'
+Assert-Test ($entryPointText -match "classification = 'late-positive-observation'" -and $entryPointText -match 'lateObservation = \$lateObservation' -and $entryPointText -match 'Test-DevBenchWaitDeadlineAcceptance') 'late positive observations are retained but cannot cross the absolute wait deadline as success'
 Assert-Test ($entryPointText -match "phase = 'initialize'; recovery = 'outer-wait-retry'") 'wait initialization failures remain inside the outer timeout state machine'
 Assert-Test ($entryPointText -match '\$null -eq \$headers') 'bounded waits establish or re-establish the MCP session inside the polling loop'
 Assert-Test ($entryPointText -match 'function Open-DevBenchSession' -and $entryPointText -match "DevBenchMcpCapabilityAbsent" -and $entryPointText -match "recovery = 'rest-capability-negotiation'") 'transport negotiation falls back only after an explicitly classified initial MCP capability miss'
@@ -543,6 +1127,8 @@ Assert-Test ($entryPointText -match 'transport = \$transport') 'runtime and invo
 Assert-Test (([regex]::Matches($entryPointText, '\$AcceptAlreadyLoaded')).Count -eq 1 -and ([regex]::Matches($entryPointText, '\$LoadAlreadyQueued')).Count -eq 1 -and $entryPointText -notmatch '\$playerTransitionObserved') 'legacy load switches are accepted without retaining a transient load-edge dependency'
 Assert-Test ($entryPointText -match 'Condition ''playerLoaded'' requires -ExpectedCell') 'playerLoaded requires an exact destination cell'
 Assert-Test ($entryPointText -match 'elseif \(\$Condition -eq ''playerLoaded''\)[\s\S]+?kind = ''state''[\s\S]+?kind = ''scene''') 'playerLoaded polls authoritative player and scene state'
+Assert-Test ($entryPointText -match 'if \(-not \$stateProbe\.terminalFailure\)[\s\S]+?kind = ''scene''') 'playerLoaded does not let a later scene acquisition erase an established terminal player-state failure'
+Assert-Test ($entryPointText -match 'Select-DevBenchWaitProbeFailure -Probes @\(\$stateProbe, \$sceneProbe\)') 'playerLoaded combines all acquired probe failures with terminal precedence'
 Assert-Test ($entryPointText -match 'completionBasis = ''current-state''') 'playerLoaded receipts identify state-based completion'
 Assert-Test ($entryPointText -match 'satisfied = \[bool\]\$state\.playerLoaded -and \$cellMatches') 'playerLoaded requires loaded state in the expected cell'
 Assert-Test ($entryPointText -match '\[string\[\]\]\$DismissBlockingMenus') 'menu recovery requires an explicit menu allowlist'
@@ -595,6 +1181,10 @@ Assert-Test ($entryPointText -match 'ExpectedProfile \$expectedUpscalingProfile'
 Assert-Test ($entryPointText -match "scene\.cell\.PSObject\.Properties\['editorId'\]") 'upscalingStable reads the structured live scene cell editor ID'
 Assert-Test ($entryPointText -match '\$stableCandidateCount -ge \$StableSamples') 'upscalingStable requires consecutive stable observations'
 Assert-Test ($entryPointText -match '\$stableFrameAdvance -ge \$MinimumStableFrameAdvance') 'upscalingStable requires advancing world frames'
+foreach ($requiredStableProbe in @('player-state', 'scene', 'menu', 'upscaling-snapshot', 'render-scale')) {
+    Assert-Test ($entryPointText -match "Get-DevBenchWaitProbeAssessment -ProbeKind $requiredStableProbe") "upscalingStable qualifies its $requiredStableProbe contribution before stability evidence"
+}
+Assert-Test ($entryPointText -match 'Select-DevBenchWaitProbeFailure -Probes @\(\$stateProbe, \$sceneProbe, \$menuProbe, \$upscalingProbe, \$renderScaleProbe\)') 'upscalingStable applies terminal-preserving failure precedence across every contributing read'
 Assert-Test ($entryPointText -match 'elapsedMs = \[Math\]::Round') 'bounded waits report measured elapsed time'
 
 [pscustomobject][ordered]@{ ok = $failures.Count -eq 0; passed = $passes.Count; failed = $failures.Count; passes = @($passes); failures = @($failures) } | ConvertTo-Json -Depth 10
