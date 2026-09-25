@@ -82,6 +82,7 @@ try {
     @"
 [General]
 selected_profile=@ByteArray(Codex)
+executable_blacklist="Steam.exe;notepad++.exe"
 [customExecutables]
 1\title=@ByteArray(Launch MGO - Do Not Unlock)
 1\binary=@ByteArray($loader)
@@ -167,6 +168,25 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test ($unlockDialogKind -eq 'unlock-required') 'Unlock dialog is classified structurally even when titled with a child executable'
     $failedRunDialogKind = & (Get-Module MO2Control) { Get-MO2KnownDialogKind -Title 'Mod Organizer' -Texts @('Failed to run SkyrimVR.exe') -Buttons @([pscustomobject]@{name='OK'}) }
     Assert-MO2Test ($failedRunDialogKind -eq 'failed-to-run') 'retained failed-to-run dialog is classified without matching the main window'
+    $usvfsWaitFixture = & $mo2Module {
+        param($fixtureConfig, $fixtureMO2Root)
+        $window = [pscustomobject]@{
+            dialogKind = 'usvfs-participant-wait'
+            title = 'Mod Organizer is waiting on an application to close before exiting.'
+            texts = @('notepad++.exe (36128)')
+        }
+        $resolver = {
+            param([int]$ProcessId)
+            [pscustomobject]@{
+                name = 'notepad++'; id = $ProcessId; path = 'C:\Tools\notepad++.exe'
+                startTime = [DateTime]::UtcNow.AddDays(-2).ToString('o')
+                commandLine = 'notepad++.exe crash.log'
+                modules = @([pscustomobject]@{ name='usvfs_x86.dll'; path=(Join-Path $fixtureMO2Root 'usvfs_x86.dll'); version='0.5.6.1' })
+            }
+        }.GetNewClosure()
+        Get-MO2USVFSWaitDiagnostics -Config $fixtureConfig -Windows @($window) -MO2Processes @([pscustomobject]@{ startTime=[DateTime]::UtcNow.AddHours(-1).ToString('o') }) -ProcessResolver $resolver
+    } $config $mo2Root
+    Assert-MO2Test ($usvfsWaitFixture.active -and $usvfsWaitFixture.participants.Count -eq 1 -and $usvfsWaitFixture.participants[0].processId -eq 36128 -and $usvfsWaitFixture.participants[0].injectedMO2USVFS -and $usvfsWaitFixture.participants[0].startedBeforeMO2 -and $usvfsWaitFixture.participants[0].executableBlacklisted -and -not $usvfsWaitFixture.automaticTerminationAllowed) 'inspection attributes a stale external editor wait to exact USVFS participation without making it an automation close target'
     $transientWindow = [pscustomobject]@{ callCount = 0 }
     $transientWindow | Add-Member -MemberType ScriptMethod -Name FindAll -Value {
         param($scope, $condition)

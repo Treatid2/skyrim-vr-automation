@@ -1833,11 +1833,21 @@ function Invoke-MO2Inspect {
 
     $data = Get-MO2InspectionData -Config $Config -RequestedProfile $Profile -RequestedExecutable $Executable
     $checks = @()
+    $windows = @(Get-MO2WindowSnapshot -Processes @($data.processes.mo2))
+    $usvfsWait = Get-MO2USVFSWaitDiagnostics -Config $Config -Windows $windows -MO2Processes @($data.processes.mo2)
+    $data | Add-Member -NotePropertyName windows -NotePropertyValue $windows -Force
+    $data | Add-Member -NotePropertyName usvfsWait -NotePropertyValue $usvfsWait -Force
 
     $checks += New-MO2Check -Name 'mo2-root' -Status $(if (Test-Path -LiteralPath $data.config.mo2Root -PathType Container) { 'pass' } else { 'fail' }) -Message $(if (Test-Path -LiteralPath $data.config.mo2Root -PathType Container) { 'MO2 root exists.' } else { "MO2 root does not exist: $($data.config.mo2Root)" })
     $checks += New-MO2Check -Name 'mo2-executable' -Status $(if (Test-Path -LiteralPath $data.config.mo2Executable -PathType Leaf) { 'pass' } else { 'fail' }) -Message $(if (Test-Path -LiteralPath $data.config.mo2Executable -PathType Leaf) { 'MO2 executable exists.' } else { "MO2 executable does not exist: $($data.config.mo2Executable)" })
     $checks += New-MO2Check -Name 'mo2-ini' -Status $(if (Test-Path -LiteralPath $data.config.mo2Ini -PathType Leaf) { 'pass' } else { 'fail' }) -Message $(if (Test-Path -LiteralPath $data.config.mo2Ini -PathType Leaf) { 'MO2 INI exists and was read.' } else { "MO2 INI does not exist: $($data.config.mo2Ini)" })
     $checks += New-MO2Check -Name 'process-state' -Status 'info' -Message "MO2=$($data.processes.mo2.Count), game=$($data.processes.game.Count), runtime=$($data.processes.runtime.Count)."
+    if ($usvfsWait.active) {
+        $checks += New-MO2Check -Name 'usvfs-wait' -Status 'warn' -Message "MO2 is waiting for $($usvfsWait.participants.Count) external USVFS participant(s), not an application dependency. Exit those applications under user control; automation will not terminate them." -Details $usvfsWait
+    }
+    else {
+        $checks += New-MO2Check -Name 'usvfs-wait' -Status 'pass' -Message 'No MO2 exit dialog is waiting on an external USVFS participant.' -Details $usvfsWait
+    }
     $selectedTaskWorkspaceCheck = New-MO2SelectedTaskWorkspaceCheck -SelectedTaskWorkspace $data.selectedTaskWorkspace
     if ($null -ne $selectedTaskWorkspaceCheck) { $checks += $selectedTaskWorkspaceCheck }
     $overwriteNeedsAttention = (
@@ -2882,6 +2892,7 @@ function Get-MO2KnownDialogKind {
     })
     if (@($buttonNames | Where-Object { $_ -ieq 'Unlock' }).Count -eq 1) { return 'unlock-required' }
     $combined = ((@($Title) + @($Texts)) -join "`n")
+    if ($combined -match '(?i)waiting on an application to close before exiting') { return 'usvfs-participant-wait' }
     if ($combined -match '(?i)failed to write settings') { return 'failed-to-write-settings' }
     if ($combined -match '(?i)failed to (run|start|launch)') { return 'failed-to-run' }
     return $null
@@ -2970,6 +2981,100 @@ function Get-MO2WindowSnapshot {
         }
     }
     return @($records)
+}
+
+function Get-MO2ExecutableBlacklist {
+    param([Parameter(Mandatory)]$Ini)
+
+    $raw = [string](Find-MO2IniValue -Ini $Ini -Key 'executable_blacklist')
+    if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+    $raw = $raw.Trim()
+    if ($raw.Length -ge 2 -and $raw[0] -eq '"' -and $raw[$raw.Length - 1] -eq '"') {
+        $raw = $raw.Substring(1, $raw.Length - 2)
+    }
+    return @($raw -split ';' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+}
+
+function Get-MO2USVFSWaitDiagnostics {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Windows,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$MO2Processes,
+        [scriptblock]$ProcessResolver
+    )
+
+    $mo2Root = [IO.Path]::GetFullPath((Resolve-MO2ControlPath ([string]$Config.mo2.root))).TrimEnd('\', '/')
+    $iniPath = Resolve-MO2ControlPath ([string]$Config.mo2.ini)
+    $ini = if (Test-Path -LiteralPath $iniPath -PathType Leaf) { Read-MO2IniFile -Path $iniPath } else { [ordered]@{} }
+    $blacklist = @(Get-MO2ExecutableBlacklist -Ini $ini)
+    if (-not $ProcessResolver) {
+        $ProcessResolver = {
+            param([int]$ProcessId)
+            $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+            if ($null -eq $process) { return $null }
+            try {
+                $commandLine = $(try { [string](Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop).CommandLine } catch { $null })
+                $modules = $(try {
+                    @($process.Modules | ForEach-Object {
+                        [pscustomobject][ordered]@{ name = [string]$_.ModuleName; path = [string]$_.FileName; version = [string]$_.FileVersionInfo.FileVersion }
+                    })
+                } catch { @() })
+                return [pscustomobject][ordered]@{
+                    name = [string]$process.ProcessName
+                    id = [int]$process.Id
+                    path = $(try { [IO.Path]::GetFullPath([string]$process.Path) } catch { $null })
+                    startTime = $(try { $process.StartTime.ToUniversalTime().ToString('o') } catch { $null })
+                    commandLine = $commandLine
+                    modules = @($modules)
+                }
+            }
+            finally { $process.Dispose() }
+        }
+    }
+
+    $dialogs = @($Windows | Where-Object { [string]$_.dialogKind -ceq 'usvfs-participant-wait' })
+    $participants = [Collections.Generic.List[object]]::new()
+    $seen = [Collections.Generic.HashSet[int]]::new()
+    $oldestMO2Start = @($MO2Processes | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.startTime) } | ForEach-Object { [DateTimeOffset]::Parse([string]$_.startTime).UtcDateTime } | Sort-Object | Select-Object -First 1)
+    foreach ($dialog in $dialogs) {
+        $combined = ((@([string]$dialog.title) + @($dialog.texts | ForEach-Object { [string]$_ })) -join "`n")
+        foreach ($match in [regex]::Matches($combined, '(?im)(?<name>[\w.+-]+\.exe)\s*\((?<pid>\d+)\)')) {
+            $pidValue = [int]$match.Groups['pid'].Value
+            if (-not $seen.Add($pidValue)) { continue }
+            $reportedName = [string]$match.Groups['name'].Value
+            $processRecord = & $ProcessResolver $pidValue
+            $modules = if ($null -ne $processRecord) { @($processRecord.modules) } else { @() }
+            $usvfsModules = @($modules | Where-Object {
+                $leaf = [IO.Path]::GetFileName([string]$_.path)
+                $modulePath = $(try { [IO.Path]::GetFullPath([string]$_.path) } catch { '' })
+                $leaf -match '(?i)^usvfs_(?:x86|x64)\.dll$' -and $modulePath.StartsWith($mo2Root + '\', [StringComparison]::OrdinalIgnoreCase)
+            })
+            $startedUtc = if ($null -ne $processRecord -and -not [string]::IsNullOrWhiteSpace([string]$processRecord.startTime)) { [DateTimeOffset]::Parse([string]$processRecord.startTime).UtcDateTime } else { $null }
+            $participants.Add([pscustomobject][ordered]@{
+                reportedExecutable = $reportedName
+                processFound = $null -ne $processRecord
+                processId = $pidValue
+                processName = $(if ($null -ne $processRecord) { [string]$processRecord.name } else { $null })
+                path = $(if ($null -ne $processRecord) { [string]$processRecord.path } else { $null })
+                commandLine = $(if ($null -ne $processRecord) { [string]$processRecord.commandLine } else { $null })
+                startTime = $(if ($null -ne $processRecord) { [string]$processRecord.startTime } else { $null })
+                ageSeconds = $(if ($null -ne $startedUtc) { [math]::Max(0, [math]::Round(([DateTime]::UtcNow - $startedUtc).TotalSeconds, 3)) } else { $null })
+                startedBeforeMO2 = $(if ($null -ne $startedUtc -and $oldestMO2Start.Count -eq 1) { $startedUtc -lt $oldestMO2Start[0] } else { $null })
+                executableBlacklisted = @($blacklist | Where-Object { $_ -ieq $reportedName }).Count -gt 0
+                injectedMO2USVFS = $usvfsModules.Count -gt 0
+                usvfsModules = @($usvfsModules)
+            })
+        }
+    }
+    return [pscustomobject][ordered]@{
+        active = $dialogs.Count -gt 0
+        explanation = 'MO2 waits because the external process is a live USVFS participant, not because MO2 has an application dependency on it.'
+        automaticTerminationAllowed = $false
+        recovery = 'Exit the reported external application under user control. Blacklisting prevents future launches through MO2 from joining USVFS; it does not detach an already injected process.'
+        executableBlacklist = @($blacklist)
+        dialogs = @($dialogs)
+        participants = @($participants)
+    }
 }
 
 function Invoke-MO2AutomationButton {
