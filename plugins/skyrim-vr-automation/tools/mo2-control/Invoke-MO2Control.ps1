@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('inspect', 'validate', 'validate-closed', 'request-access', 'access-status', 'renew-access', 'release-access', 'recover-access', 'prepare', 'open', 'launch', 'status', 'stop-game', 'terminate-game', 'close', 'recover-close', 'recover-rootbuilder', 'stop', 'terminate', 'release', 'help')]
+    [ValidateSet('inspect', 'validate', 'validate-closed', 'validate-human-mutation', 'request-access', 'access-status', 'renew-access', 'release-access', 'recover-access', 'prepare', 'open', 'launch', 'status', 'refresh', 'stop-game', 'terminate-game', 'close', 'recover-close', 'recover-rootbuilder', 'stop', 'terminate', 'release', 'help')]
     [string]$Command = 'help',
 
     [string]$ConfigPath,
@@ -16,10 +16,15 @@ param(
 
     [string]$AccessId,
 
+    [string]$HumanMutationId,
+
     [Alias('ReporterTaskId')]
     [string]$TaskId,
 
     [string]$Label = 'automation',
+
+    [ValidateSet('automation', 'human')]
+    [string]$AccessKind = 'automation',
 
     [ValidateSet('OCU', 'SteamVR', 'SteamVRNull')]
     [string]$RuntimeRoute,
@@ -59,7 +64,7 @@ function New-MO2ApprovalMetadata {
     }
     $entryPoint = [IO.Path]::GetFullPath($PSCommandPath)
     $oneShotCommands = @('recover-access', 'terminate-game', 'terminate')
-    $readOnlyCommands = @('inspect', 'validate', 'validate-closed', 'access-status', 'status', 'help')
+    $readOnlyCommands = @('inspect', 'validate', 'validate-closed', 'validate-human-mutation', 'access-status', 'status', 'help')
     return [pscustomobject][ordered]@{
         hostExecutable = $hostExecutable
         entryPoint = $entryPoint
@@ -113,7 +118,7 @@ try {
     $sessionCommands = @('open', 'launch', 'stop-game', 'terminate-game', 'close', 'recover-rootbuilder', 'stop', 'terminate', 'release')
     if ($Command -in $sessionCommands -and [string]::IsNullOrWhiteSpace($SessionId)) {
         $result = [pscustomobject][ordered]@{
-            contractVersion = '1.0.0'
+            contractVersion = '1.1.0'
             command = $Command
             ok = $false
             state = 'missing-session-id'
@@ -124,9 +129,9 @@ try {
             data = [pscustomobject]@{ requiredParameter = 'SessionId'; supplied = $false }
         }
     }
-    elseif ($Command -eq 'request-access' -and [string]::IsNullOrWhiteSpace($RuntimeRoute)) {
+    elseif ($Command -eq 'request-access' -and $AccessKind -eq 'automation' -and [string]::IsNullOrWhiteSpace($RuntimeRoute)) {
         $result = [pscustomobject][ordered]@{
-            contractVersion = '1.0.0'
+            contractVersion = '1.1.0'
             command = $Command
             ok = $false
             state = 'missing-runtime-route'
@@ -137,9 +142,22 @@ try {
             data = [pscustomobject]@{ requiredParameter = 'RuntimeRoute'; allowedValues = @('OCU', 'SteamVR', 'SteamVRNull'); supplied = $false }
         }
     }
+    elseif ($Command -eq 'validate-human-mutation' -and [string]::IsNullOrWhiteSpace($HumanMutationId)) {
+        $result = [pscustomobject][ordered]@{
+            contractVersion = '1.1.0'
+            command = $Command
+            ok = $false
+            state = 'missing-human-mutation-id'
+            timestampUtc = [DateTime]::UtcNow.ToString('o')
+            checks = @()
+            warnings = @()
+            errors = @("Command '$Command' requires the private -HumanMutationId capability returned with human access and its matching -TaskId routing metadata.")
+            data = [pscustomobject]@{ requiredParameter = 'HumanMutationId'; supplied = $false }
+        }
+    }
     elseif ($Command -in @('renew-access', 'release-access', 'recover-access', 'prepare') -and [string]::IsNullOrWhiteSpace($AccessId)) {
         $result = [pscustomobject][ordered]@{
-            contractVersion = '1.0.0'
+            contractVersion = '1.1.0'
             command = $Command
             ok = $false
             state = 'missing-access-id'
@@ -162,8 +180,22 @@ try {
             $validated.command = 'validate-closed'
             $validated
         }
+        'validate-human-mutation' {
+            Invoke-MO2ValidateHumanMutation -Config $config -HumanMutationId $HumanMutationId -Profile $Profile -TaskId $TaskId
+        }
         'request-access' {
-            Invoke-MO2RequestAccess -Config $config -Label $Label -TaskId $TaskId -RuntimeRoute $RuntimeRoute -EstimatedMinutes $EstimatedMinutes -WaitSeconds $WaitSeconds -WhatIf:$WhatIf
+            $requestParameters = @{
+                Config = $config
+                Label = $Label
+                TaskId = $TaskId
+                AccessKind = $AccessKind
+                Profile = $Profile
+                EstimatedMinutes = $EstimatedMinutes
+                WaitSeconds = $WaitSeconds
+                WhatIf = $WhatIf
+            }
+            if (-not [string]::IsNullOrWhiteSpace($RuntimeRoute)) { $requestParameters.RuntimeRoute = $RuntimeRoute }
+            Invoke-MO2RequestAccess @requestParameters
         }
         'access-status' {
             Invoke-MO2AccessStatus -Config $config -AccessId $AccessId
@@ -188,6 +220,9 @@ try {
         }
         'status' {
             Invoke-MO2Status -Config $config -SessionId $SessionId
+        }
+        'refresh' {
+            Invoke-MO2Refresh -Config $config -SessionId $SessionId -HumanMutationId $HumanMutationId -Profile $Profile -TaskId $TaskId -TimeoutSeconds $TimeoutSeconds -WhatIf:$WhatIf
         }
         'stop-game' {
             Invoke-MO2StopGame -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -WhatIf:$WhatIf
@@ -223,7 +258,7 @@ try {
 }
 catch {
     $result = [pscustomobject][ordered]@{
-        contractVersion = '1.0.0'
+        contractVersion = '1.1.0'
         command = $Command
         ok = $false
         state = 'tool-error'
@@ -238,6 +273,10 @@ catch {
             approval = New-MO2ApprovalMetadata -Subcommand $Command
         }
     }
+}
+
+if ($Command -ne 'request-access') {
+    $result = ConvertTo-MO2PublicResult -Result $result
 }
 
 $jsonParameters = @{
