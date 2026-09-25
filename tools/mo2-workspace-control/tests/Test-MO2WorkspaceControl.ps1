@@ -140,6 +140,7 @@ try {
     $unconfigured | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $missingPath -Encoding utf8
     $missingStatus = & $entry fixture-status -ConfigPath $missingPath -Compact | ConvertFrom-Json
     if (-not $missingStatus.ok -or $missingStatus.state -ne 'fixture-manifest-missing' -or -not $missingStatus.data.configured -or $missingStatus.data.manifestExists) { throw 'Fixture discovery did not distinguish a configured missing manifest.' }
+    if (($missingStatus.data.guidance -join ' ') -notmatch 'Only VerifiedFixture workspace creation is blocked.*MainMenuOnly and FreshGame remain available') { throw 'Missing-fixture guidance did not state the exact save-policy boundary.' }
     if ($DiscoveryOnly) {
         $releasedAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
         if (-not $releasedAccess.ok) { throw 'Discovery-only access release failed.' }
@@ -200,6 +201,7 @@ try {
     'stable-profile-drift' | Set-Content -LiteralPath (Join-Path $source 'fixture-drift.txt') -Encoding utf8
     $staleStatus = & $entry fixture-status -ConfigPath $configPath -Compact | ConvertFrom-Json
     if ($staleStatus.state -ne 'fixture-stale' -or $staleStatus.data.expectedProfileFingerprintSha256 -eq $staleStatus.data.actualProfileFingerprintSha256) { throw 'Fixture drift did not report expected and actual fingerprints.' }
+    if (($staleStatus.data.guidance -join ' ') -notmatch 'Only VerifiedFixture workspace creation is blocked.*MainMenuOnly and FreshGame remain available') { throw 'Stale-fixture guidance did not state the exact save-policy boundary.' }
     $staleMainMenuPreview = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label stale-main-menu -SavePolicy MainMenuOnly -WorkspaceContent Modlist -WhatIf -Confirm:$false -NoExit | ConvertFrom-Json
     if (-not $staleMainMenuPreview.ok -or $staleMainMenuPreview.state -ne 'dry-run' -or $null -ne $staleMainMenuPreview.data.worldEntryFixture) { throw 'MainMenuOnly creation was blocked by an unrelated stale fixture.' }
     $staleVerifiedPreview = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label stale-verified -SavePolicy VerifiedFixture -WorkspaceContent Modlist -WhatIf -Confirm:$false -NoExit | ConvertFrom-Json

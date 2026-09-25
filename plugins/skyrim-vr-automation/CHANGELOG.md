@@ -95,10 +95,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   nonterminal captures from a deterministic runtime-owned journal without ever
   mutating a replacement process.
 
-- Require every fresh MO2 task clone to inherit a hash- and
-  profile-fingerprint-verified default world-entry save, make the doctor fail
-  invalid setup, keep static integrity distinct from runtime qualification, and
-  preserve resumed task profiles without making a post-edit save warranty.
+- Copy and hash-verify the complete source save tree into every fresh MO2 task
+  clone. Require the profile-fingerprint-verified default world-entry save and
+  fail doctor admission only for explicit `VerifiedFixture` work; keep missing
+  or stale fixture state advisory for `MainMenuOnly` and `FreshGame`, retain
+  static integrity as distinct from runtime qualification, and preserve resumed
+  task profiles without making a post-edit save warranty.
   Bound all related traversal, hashing, copy, and verification work with one
   total deadline plus file, byte, depth, directory, and reparse-point limits.
 - Make deprecated workspace `release` fail closed, add collision-resistant

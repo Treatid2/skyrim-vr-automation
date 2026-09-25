@@ -1864,7 +1864,7 @@ function Get-VerifiedSaveFixtureStatus($Config, [string]$SourceName, [string]$So
         'Copy and adapt tools/mo2-workspace-control/save-fixtures.example.json outside the checkout.',
         'Set defaults.newGameFixtureManifest in the stable per-user machine configuration, or pass -FixtureManifestPath explicitly.',
         'Declare one .ess save plus any matching co-save files, then run fixture-status again to validate exact hashes and the stable-profile fingerprint.',
-        'Fresh workspace creation is blocked until the manifest default fixture is valid.'
+        'Only VerifiedFixture workspace creation is blocked until the manifest default fixture is valid; MainMenuOnly and FreshGame remain available without it.'
     )
     if ([string]::IsNullOrWhiteSpace($manifestInput)) {
         return [pscustomobject][ordered]@{
