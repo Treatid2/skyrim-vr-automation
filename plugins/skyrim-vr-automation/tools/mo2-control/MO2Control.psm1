@@ -148,7 +148,7 @@ function Test-MO2SamePath {
 function Test-MO2Sha256Equal {
     param([string]$Left, [string]$Right)
 
-    if ($Left -notmatch '^[0-9A-Fa-f]{64}$' -or $Right -notmatch '^[0-9A-Fa-f]{64}$') {
+    if ($Left -notmatch '\A[0-9A-Fa-f]{64}\z' -or $Right -notmatch '\A[0-9A-Fa-f]{64}\z') {
         return $false
     }
     return [string]::Equals($Left, $Right, [StringComparison]::OrdinalIgnoreCase)
@@ -400,7 +400,7 @@ function Resolve-MO2CommunityShadersBuildBinding {
     $declaredHash = if ($null -ne $artifact -and $artifact.PSObject.Properties['sha256']) { [string]$artifact.sha256 } else { '' }
     $declaredBytes = if ($null -ne $artifact -and $artifact.PSObject.Properties['sizeBytes']) { [long]$artifact.sizeBytes } else { -1 }
     $cacheAbi = if ($null -ne $cacheIdentity -and $cacheIdentity.PSObject.Properties['abiId']) { [string]$cacheIdentity.abiId } else { '' }
-    if ([string]::IsNullOrWhiteSpace($buildId) -or $declaredHash -notmatch '^[0-9A-Fa-f]{64}$' -or [string]::IsNullOrWhiteSpace($cacheAbi)) {
+    if ([string]::IsNullOrWhiteSpace($buildId) -or $declaredHash -notmatch '\A[0-9A-Fa-f]{64}\z' -or [string]::IsNullOrWhiteSpace($cacheAbi)) {
         throw 'The winning Community Shaders build manifest lacks an exact build ID, DLL hash, or shader-cache ABI.'
     }
     $plugin = Get-Item -LiteralPath $pluginPath

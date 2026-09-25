@@ -187,7 +187,7 @@ function Remove-WorkspaceCreatedOutputTree([string]$Path, [string]$OverwritePath
 }
 
 function Test-WorkspaceSha256Equal([string]$Left, [string]$Right) {
-    if ($Left -notmatch '^[0-9A-Fa-f]{64}$' -or $Right -notmatch '^[0-9A-Fa-f]{64}$') { return $false }
+    if ($Left -notmatch '\A[0-9A-Fa-f]{64}\z' -or $Right -notmatch '\A[0-9A-Fa-f]{64}\z') { return $false }
     return [string]::Equals($Left, $Right, [StringComparison]::OrdinalIgnoreCase)
 }
 
@@ -211,7 +211,7 @@ function Resolve-WorkspaceCommunityShadersBuildBinding([string]$ProfilePath, [st
     $identity = if ($buildManifest.PSObject.Properties['identity']) { $buildManifest.identity } else { $null }
     $shaderCache = if ($null -ne $identity -and $identity.PSObject.Properties['shaderCache']) { $identity.shaderCache } else { $null }
     $shaderCacheAbi = if ($null -ne $shaderCache -and $shaderCache.PSObject.Properties['abiId']) { [string]$shaderCache.abiId } else { '' }
-    if ([string]::IsNullOrWhiteSpace($buildId) -or $artifactHash -notmatch '^[0-9A-Fa-f]{64}$' -or [string]::IsNullOrWhiteSpace($shaderCacheAbi)) {
+    if ([string]::IsNullOrWhiteSpace($buildId) -or $artifactHash -notmatch '\A[0-9A-Fa-f]{64}\z' -or [string]::IsNullOrWhiteSpace($shaderCacheAbi)) {
         throw 'The winning Community Shaders build manifest lacks an exact build ID, DLL hash, or shader-cache ABI.'
     }
     $plugin = Get-Item -LiteralPath $pluginPath

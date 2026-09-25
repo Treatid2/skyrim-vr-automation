@@ -364,6 +364,12 @@ try {
     $mismatchedArtifactIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
     if ($mismatchedArtifactIsolation.ok -or @($mismatchedArtifactIsolation.errors | Where-Object { $_ -match 'DLL does not match its build manifest' }).Count -ne 1) { throw 'MO2 launch isolation accepted a genuinely different manifest artifact digest.' }
     [IO.File]::WriteAllBytes($buildManifestPath, $buildManifestBytes)
+    $newlineBuildManifest = Get-Content -LiteralPath $buildManifestPath -Raw | ConvertFrom-Json -Depth 40
+    $newlineBuildManifest.artifact.sha256 = ([string]$newlineBuildManifest.artifact.sha256 + "`n")
+    $newlineBuildManifest | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $buildManifestPath -Encoding utf8
+    $newlineArtifactIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
+    if ($newlineArtifactIsolation.ok -or @($newlineArtifactIsolation.errors | Where-Object { $_ -match 'lacks an exact build ID, DLL hash, or shader-cache ABI' }).Count -ne 1) { throw 'MO2 launch isolation accepted a manifest artifact digest with trailing data.' }
+    [IO.File]::WriteAllBytes($buildManifestPath, $buildManifestBytes)
     $shadowedLowerCache = Join-Path $created.data.runtimeOutput.cachePath 'Lighting\later-area.pso'
     $shadowedLowerBytes = [IO.File]::ReadAllBytes($shadowedLowerCache)
     Remove-Item -LiteralPath $shadowedLowerCache -Force
