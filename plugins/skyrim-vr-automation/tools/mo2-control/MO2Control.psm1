@@ -2263,6 +2263,23 @@ function Invoke-MO2OwnedProcessAction {
     } -ArgumentList @($payload)
 }
 
+function Test-MO2AcceptedExitBindingEnded {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Actions,
+        [Parameter(Mandatory)][int]$ProcessId,
+        [Parameter(Mandatory)][string]$ErrorMessage
+    )
+
+    if ($ErrorMessage -cne 'The retained MO2 process binding is no longer available.') {
+        return $false
+    }
+    return @($Actions | Where-Object {
+        [int]$_.processId -eq $ProcessId -and
+        [bool]$_.accepted -and
+        [string]$_.action -in @('invoke-exact-exit', 'invoke-exact-exit-after-expand')
+    }).Count -gt 0
+}
+
 function Invoke-MO2CooperativeCloseCore {
     param(
         [Parameter(Mandatory)]$Config,
@@ -2279,6 +2296,7 @@ function Invoke-MO2CooperativeCloseCore {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $blockedReason = $null
     $ownershipResolution = $null
+    $acceptedExitBindingEnded = $false
     if (-not $ProcessInventoryFactory) {
         $ProcessInventoryFactory = { param($fixtureConfig) @(Get-MO2ProcessRecords -Names @($fixtureConfig.mo2.processNames)) }
     }
@@ -2460,7 +2478,17 @@ function Invoke-MO2CooperativeCloseCore {
             }
             }
             catch {
-                $blockedReason = if ($_.Exception.Message -match 'lease transition is stale') { 'stale-session-generation' } else { $_.Exception.Message }
+                if (Test-MO2AcceptedExitBindingEnded -Actions @($actions) -ProcessId ([int]$record.id) -ErrorMessage $_.Exception.Message) {
+                    # A successful exact Exit can destroy the retained process
+                    # handle before later window cleanup reaches its next
+                    # authority check.  Treat that race as a terminal-exit
+                    # observation, then prove closure from the fresh inventory
+                    # below.  Every other authority failure remains blocking.
+                    $acceptedExitBindingEnded = $true
+                }
+                else {
+                    $blockedReason = if ($_.Exception.Message -match 'lease transition is stale') { 'stale-session-generation' } else { $_.Exception.Message }
+                }
                 break
             }
             finally {
@@ -2482,6 +2510,7 @@ function Invoke-MO2CooperativeCloseCore {
         closed = $remaining.Count -eq 0 -and [string]::IsNullOrWhiteSpace($blockedReason)
         ownerIdentityVerified = [string]::IsNullOrWhiteSpace($blockedReason)
         blockedReason = $blockedReason
+        acceptedExitBindingEnded = $acceptedExitBindingEnded
         ownershipResolution = $ownershipResolution
         targetProcessIds = @($targetIds)
         beforeWindows = @($beforeWindows)

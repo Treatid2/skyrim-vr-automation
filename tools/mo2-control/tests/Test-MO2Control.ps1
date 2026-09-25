@@ -40,6 +40,19 @@ $retentionFixture = & $mo2Module {
 }
 Assert-MO2Test (-not $retentionFixture.stable -and $retentionFixture.samples.Count -eq 2 -and -not $retentionFixture.samples[-1].ownerPresent) 'MO2 retention stability detects an owner that exits immediately after game shutdown'
 
+$acceptedExitRace = & $mo2Module {
+    $actions = @(
+        [pscustomobject]@{ processId = 4123; action = 'expand-exact-file-menu'; accepted = $true },
+        [pscustomobject]@{ processId = 4123; action = 'invoke-exact-exit-after-expand'; accepted = $true }
+    )
+    [pscustomobject]@{
+        terminal = Test-MO2AcceptedExitBindingEnded -Actions $actions -ProcessId 4123 -ErrorMessage 'The retained MO2 process binding is no longer available.'
+        wrongProcess = Test-MO2AcceptedExitBindingEnded -Actions $actions -ProcessId 4124 -ErrorMessage 'The retained MO2 process binding is no longer available.'
+        staleAuthority = Test-MO2AcceptedExitBindingEnded -Actions $actions -ProcessId 4123 -ErrorMessage 'The lease transition is stale.'
+    }
+}
+Assert-MO2Test ($acceptedExitRace.terminal -and -not $acceptedExitRace.wrongProcess -and -not $acceptedExitRace.staleAuthority) 'an accepted exact Exit distinguishes terminal process departure from an authority failure'
+
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('mo2-control-test-' + [guid]::NewGuid().ToString('N'))
 try {
     $mo2Root = Join-Path $fixture 'MO2'
