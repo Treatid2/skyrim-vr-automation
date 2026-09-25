@@ -3,11 +3,13 @@
 `Invoke-SkyrimVRAutomationDoctor.ps1 inspect` performs read-only checks for the
 supported PowerShell runtime, resolved MO2 configuration, MO2 validation,
 SteamVR paths, the bundled null-HMD profile, and optional DevBench discovery.
-It also verifies static integrity for the maintained MO2 source profile's
-mandatory default world-entry save. The check passes only when `fixture-status` validates the
-profile fingerprint, one declared `.ess`, its co-save files, and all recorded
-hashes. This does not assert a successful live load. Missing or stale fixture metadata is a setup failure because fresh task
-profiles may not be cloned without a known route into the loaded game world.
+It also reports static integrity for the maintained MO2 source profile's
+optional default world-entry save. The check passes when `fixture-status`
+validates the profile fingerprint, one declared `.ess`, its co-save files, and
+all recorded hashes. This does not assert a successful live load. Missing or
+stale fixture metadata is a warning by default and for `MainMenuOnly` or
+`FreshGame`; pass `-SavePolicy VerifiedFixture` when that fixture is a required
+prerequisite and the doctor must fail closed.
 
 MO2 configuration is resolved in strict precedence order: explicit
 `-ConfigPath`, `SKYRIM_VR_AUTOMATION_CONFIG`, an exact

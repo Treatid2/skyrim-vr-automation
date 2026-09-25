@@ -4,9 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
-- Retain MO2's complete PID, executable-path, and start-time identity through
-  every cooperative-close loop and process handle so a reused PID cannot
-  receive Unlock, Exit, Cancel, or window-close actions.
+- Revalidate MO2 and game PID, executable-path, and start-time identity on a
+  retained process handle immediately before every individual UI, close, or
+  termination action so a replacement cannot receive any later action.
+- Scope doctor fixture failures to an explicit `VerifiedFixture` requirement;
+  missing or stale fixture state remains advisory for `MainMenuOnly` and
+  `FreshGame`.
 - Normalize the evidence-directory boundary before validating snapshot
   containment so an equivalent trailing-separator spelling cannot block task
   completion or receipt-only recovery.
@@ -144,8 +147,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   task identity, preserve saves and profile-local state across lease yields,
   and enforce additive shared-mod update guidance.
 - Copy and hash-verify the maintained source profile's complete save tree into
-  every task profile while retaining `SavePolicy` as an authorization marker
-  and verified fixtures as the only deterministic baseline contract.
+  every task profile while retaining `SavePolicy` as an authorization marker;
+  only `VerifiedFixture` requires a declared deterministic baseline contract.
 - Exclude local `.fixture-refresh-*` evidence from generated marketplace
   packages.
 - Treat physical-headset and Valve null-HMD SteamVR shader caches as one

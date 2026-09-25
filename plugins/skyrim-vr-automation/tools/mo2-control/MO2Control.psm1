@@ -3028,7 +3028,8 @@ function Invoke-MO2RetainedSessionDialogCleanup {
     param(
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Processes,
-        [ValidateRange(1, 60)][int]$TimeoutSeconds = 10
+        [ValidateRange(1, 60)][int]$TimeoutSeconds = 10,
+        [scriptblock]$ProcessBindingFactory
     )
     if ($Processes.Count -eq 0) {
         return [pscustomobject][ordered]@{ cleared = $true; before = @(); actions = @(); remaining = @(); needsAttention = @() }
@@ -3037,6 +3038,7 @@ function Invoke-MO2RetainedSessionDialogCleanup {
     $before = @(Get-MO2WindowSnapshot -Processes $Processes)
     $actions = [Collections.Generic.List[object]]::new()
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $blockedReason = $null
     do {
         $handled = $false
         foreach ($record in $Processes) {
@@ -3047,10 +3049,24 @@ function Invoke-MO2RetainedSessionDialogCleanup {
                 $accepted = $false
                 foreach ($name in @('OK', 'Close')) {
                     foreach ($button in @(Get-MO2NamedButtons -Window $window -Name $name)) {
-                        $accepted = (Invoke-MO2AutomationButton -Button $button -ExpectedName $name) -or $accepted
+                        $guard = Invoke-MO2ExactProcessAction -Expected $record -ProcessBindingFactory $ProcessBindingFactory -Action {
+                            param($boundProcess)
+                            Invoke-MO2AutomationButton -Button $button -ExpectedName $name
+                        }
+                        if (-not $guard.ok) { $blockedReason = [string]$guard.reason; break }
+                        $accepted = [bool]$guard.value -or $accepted
                     }
+                    if ($blockedReason) { break }
                 }
-                if (-not $accepted) { $accepted = Request-MO2AutomationWindowClose -Window $window }
+                if ($blockedReason) { break }
+                if (-not $accepted) {
+                    $guard = Invoke-MO2ExactProcessAction -Expected $record -ProcessBindingFactory $ProcessBindingFactory -Action {
+                        param($boundProcess)
+                        Request-MO2AutomationWindowClose -Window $window
+                    }
+                    if (-not $guard.ok) { $blockedReason = [string]$guard.reason; break }
+                    $accepted = [bool]$guard.value
+                }
                 $actions.Add([pscustomobject][ordered]@{
                     timestampUtc = [DateTime]::UtcNow.ToString('o'); processId = [int]$record.id
                     windowHandle = [int64]$window.Current.NativeWindowHandle; windowTitle = [string]$window.Current.Name
@@ -3058,7 +3074,9 @@ function Invoke-MO2RetainedSessionDialogCleanup {
                 })
                 $handled = $true
             }
+            if ($blockedReason) { break }
         }
+        if ($blockedReason) { break }
         if (-not $handled) { break }
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
@@ -3068,7 +3086,7 @@ function Invoke-MO2RetainedSessionDialogCleanup {
         $_.visible -and $_.automationId -ine 'MainWindow' -and $_.dialogKind -ne 'unlock-required' -and $_.dialogKind -ne 'failed-to-run'
     })
     return [pscustomobject][ordered]@{
-        cleared = $remainingKnown.Count -eq 0; before = $before; actions = @($actions)
+        cleared = $null -eq $blockedReason -and $remainingKnown.Count -eq 0; blockedReason = $blockedReason; before = $before; actions = @($actions)
         remaining = $remaining; remainingKnown = $remainingKnown; needsAttention = $needsAttention
     }
 }
@@ -3110,12 +3128,62 @@ function Test-MO2ProcessRecordIdentity {
     }
 }
 
+function Invoke-MO2ExactProcessAction {
+    param(
+        [Parameter(Mandatory)]$Expected,
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [scriptblock]$ProcessBindingFactory
+    )
+
+    $binding = $null
+    $disposeProcess = $false
+    try {
+        if ($ProcessBindingFactory) {
+            $binding = & $ProcessBindingFactory $Expected
+        }
+        else {
+            $process = Get-Process -Id ([int]$Expected.id) -ErrorAction SilentlyContinue
+            if (-not $process) {
+                return [pscustomobject][ordered]@{ ok=$false; reason='process-unavailable'; value=$null }
+            }
+            $disposeProcess = $true
+            $handle = $process.SafeHandle
+            if ($handle.IsInvalid -or $handle.IsClosed) {
+                return [pscustomobject][ordered]@{ ok=$false; reason='process-handle-unavailable'; value=$null }
+            }
+            $binding = [pscustomobject][ordered]@{
+                process = $process
+                record = [pscustomobject][ordered]@{
+                    id = $process.Id
+                    path = [IO.Path]::GetFullPath($process.Path)
+                    startTime = $process.StartTime.ToUniversalTime().ToString('o')
+                }
+            }
+        }
+        if ($null -eq $binding -or -not $binding.PSObject.Properties['process'] -or -not $binding.PSObject.Properties['record']) {
+            return [pscustomobject][ordered]@{ ok=$false; reason='process-binding-unavailable'; value=$null }
+        }
+        $identity = Test-MO2ProcessRecordIdentity -Expected $Expected -Actual $binding.record
+        if (-not $identity.ok) {
+            return [pscustomobject][ordered]@{ ok=$false; reason=[string]$identity.reason; value=$null }
+        }
+        $value = & $Action $binding.process
+        return [pscustomobject][ordered]@{ ok=$true; reason='process-action-completed'; value=$value }
+    }
+    finally {
+        if ($disposeProcess -and $binding -and $binding.PSObject.Properties['process'] -and $binding.process) {
+            $binding.process.Dispose()
+        }
+    }
+}
+
 function Invoke-MO2CooperativeCloseCore {
     param(
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)][object[]]$InitialProcesses,
         [ValidateRange(1, 600)][int]$TimeoutSeconds = 90,
-        [scriptblock]$ProcessInventoryFactory
+        [scriptblock]$ProcessInventoryFactory,
+        [scriptblock]$ProcessBindingFactory
     )
 
     Assert-MO2ExactProcessTargets -Config $Config -Processes $InitialProcesses
@@ -3183,7 +3251,12 @@ function Invoke-MO2CooperativeCloseCore {
                 $unlockButtons = @(Get-MO2UnlockButtons -Window $window)
                 if ($unlockButtons.Count -gt 0) {
                     foreach ($button in $unlockButtons) {
-                        $invoked = Invoke-MO2AutomationButton -Button $button -ExpectedName 'Unlock'
+                        $guard = Invoke-MO2ExactProcessAction -Expected $record -ProcessBindingFactory $ProcessBindingFactory -Action {
+                            param($boundProcess)
+                            Invoke-MO2AutomationButton -Button $button -ExpectedName 'Unlock'
+                        }
+                        if (-not $guard.ok) { $blockedReason = [string]$guard.reason; break }
+                        $invoked = [bool]$guard.value
                         $actions.Add([pscustomobject][ordered]@{
                             timestampUtc = [DateTime]::UtcNow.ToString('o')
                             processId = [int]$record.id
@@ -3193,6 +3266,7 @@ function Invoke-MO2CooperativeCloseCore {
                             accepted = $invoked
                         })
                     }
+                    if ($blockedReason) { break }
                     continue
                 }
                 $windowTexts = @(Get-MO2WindowTextElements -Window $window)
@@ -3200,7 +3274,12 @@ function Invoke-MO2CooperativeCloseCore {
                 $dialogKind = Get-MO2KnownDialogKind -Title ([string]$window.Current.Name) -Texts $windowTexts -Buttons $cancelButtons
                 if ($dialogKind -eq 'preparing-vfs') {
                     foreach ($button in $cancelButtons) {
-                        $invoked = Invoke-MO2AutomationButton -Button $button -ExpectedName 'Cancel'
+                        $guard = Invoke-MO2ExactProcessAction -Expected $record -ProcessBindingFactory $ProcessBindingFactory -Action {
+                            param($boundProcess)
+                            Invoke-MO2AutomationButton -Button $button -ExpectedName 'Cancel'
+                        }
+                        if (-not $guard.ok) { $blockedReason = [string]$guard.reason; break }
+                        $invoked = [bool]$guard.value
                         $actions.Add([pscustomobject][ordered]@{
                             timestampUtc = [DateTime]::UtcNow.ToString('o')
                             processId = [int]$record.id
@@ -3210,10 +3289,16 @@ function Invoke-MO2CooperativeCloseCore {
                             accepted = $invoked
                         })
                     }
+                    if ($blockedReason) { break }
                     continue
                 }
                 foreach ($menuItem in @(Get-MO2NamedMenuItems -Window $window -Name 'Exit')) {
-                    $invoked = Invoke-MO2AutomationButton -Button $menuItem -ExpectedName 'Exit'
+                    $guard = Invoke-MO2ExactProcessAction -Expected $record -ProcessBindingFactory $ProcessBindingFactory -Action {
+                        param($boundProcess)
+                        Invoke-MO2AutomationButton -Button $menuItem -ExpectedName 'Exit'
+                    }
+                    if (-not $guard.ok) { $blockedReason = [string]$guard.reason; break }
+                    $invoked = [bool]$guard.value
                     $exitRequested = $exitRequested -or $invoked
                     $actions.Add([pscustomobject][ordered]@{
                         timestampUtc = [DateTime]::UtcNow.ToString('o')
@@ -3224,10 +3309,16 @@ function Invoke-MO2CooperativeCloseCore {
                         accepted = $invoked
                     })
                 }
+                if ($blockedReason) { break }
                 if ($mainHandle -ne 0 -and [int64]$window.Current.NativeWindowHandle -eq $mainHandle) {
                     if (-not $exitRequested) {
                         foreach ($fileMenu in @(Get-MO2NamedMenuItems -Window $window -Name 'File')) {
-                            $expanded = Expand-MO2AutomationMenu -MenuItem $fileMenu
+                            $guard = Invoke-MO2ExactProcessAction -Expected $record -ProcessBindingFactory $ProcessBindingFactory -Action {
+                                param($boundProcess)
+                                Expand-MO2AutomationMenu -MenuItem $fileMenu
+                            }
+                            if (-not $guard.ok) { $blockedReason = [string]$guard.reason; break }
+                            $expanded = [bool]$guard.value
                             $exitRequested = $exitRequested -or $expanded
                             $actions.Add([pscustomobject][ordered]@{
                                 timestampUtc = [DateTime]::UtcNow.ToString('o')
@@ -3239,10 +3330,16 @@ function Invoke-MO2CooperativeCloseCore {
                             })
                         }
                     }
+                    if ($blockedReason) { break }
                     if ($exitRequested) {
                         Start-Sleep -Milliseconds 100
                         foreach ($menuItem in @(Get-MO2NamedMenuItems -Window $window -Name 'Exit')) {
-                            $invoked = Invoke-MO2AutomationButton -Button $menuItem -ExpectedName 'Exit'
+                            $guard = Invoke-MO2ExactProcessAction -Expected $record -ProcessBindingFactory $ProcessBindingFactory -Action {
+                                param($boundProcess)
+                                Invoke-MO2AutomationButton -Button $menuItem -ExpectedName 'Exit'
+                            }
+                            if (-not $guard.ok) { $blockedReason = [string]$guard.reason; break }
+                            $invoked = [bool]$guard.value
                             $exitRequested = $exitRequested -or $invoked
                             $actions.Add([pscustomobject][ordered]@{
                                 timestampUtc = [DateTime]::UtcNow.ToString('o')
@@ -3254,11 +3351,17 @@ function Invoke-MO2CooperativeCloseCore {
                             })
                         }
                     }
+                    if ($blockedReason) { break }
                     continue
                 }
                 if ($dialogKind -eq 'failed-to-write-settings') {
                     foreach ($button in @(Get-MO2NamedButtons -Window $window -Name 'OK')) {
-                        $invoked = Invoke-MO2AutomationButton -Button $button -ExpectedName 'OK'
+                        $guard = Invoke-MO2ExactProcessAction -Expected $record -ProcessBindingFactory $ProcessBindingFactory -Action {
+                            param($boundProcess)
+                            Invoke-MO2AutomationButton -Button $button -ExpectedName 'OK'
+                        }
+                        if (-not $guard.ok) { $blockedReason = [string]$guard.reason; break }
+                        $invoked = [bool]$guard.value
                         $actions.Add([pscustomobject][ordered]@{
                             timestampUtc = [DateTime]::UtcNow.ToString('o')
                             processId = [int]$record.id
@@ -3268,8 +3371,11 @@ function Invoke-MO2CooperativeCloseCore {
                             accepted = $invoked
                         })
                     }
+                    if ($blockedReason) { break }
                 }
             }
+
+            if ($blockedReason) { break }
 
             if ($windows.Count -gt 0) {
                 $secondary = @($windows | Where-Object {
@@ -3279,7 +3385,12 @@ function Invoke-MO2CooperativeCloseCore {
                     [int64]$_.Current.NativeWindowHandle -ne $mainHandle -and @(Get-MO2UnlockButtons -Window $_).Count -eq 0 -and $candidateKind -ne 'preparing-vfs'
                 })
                 foreach ($window in $secondary) {
-                    $requested = Request-MO2AutomationWindowClose -Window $window
+                    $guard = Invoke-MO2ExactProcessAction -Expected $record -ProcessBindingFactory $ProcessBindingFactory -Action {
+                        param($boundProcess)
+                        Request-MO2AutomationWindowClose -Window $window
+                    }
+                    if (-not $guard.ok) { $blockedReason = [string]$guard.reason; break }
+                    $requested = [bool]$guard.value
                     $actions.Add([pscustomobject][ordered]@{
                         timestampUtc = [DateTime]::UtcNow.ToString('o')
                         processId = [int]$record.id
@@ -3291,8 +3402,15 @@ function Invoke-MO2CooperativeCloseCore {
                 }
             }
 
+            if ($blockedReason) { break }
+
             if (-not $exitRequested) {
-                $accepted = $process.CloseMainWindow()
+                $guard = Invoke-MO2ExactProcessAction -Expected $record -ProcessBindingFactory $ProcessBindingFactory -Action {
+                    param($boundProcess)
+                    $boundProcess.CloseMainWindow()
+                }
+                if (-not $guard.ok) { $blockedReason = [string]$guard.reason; break }
+                $accepted = [bool]$guard.value
                 $actions.Add([pscustomobject][ordered]@{
                     timestampUtc = [DateTime]::UtcNow.ToString('o')
                     processId = [int]$record.id
@@ -3727,30 +3845,44 @@ function Invoke-MO2UnlockOnly {
     param(
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)][object[]]$MO2Processes,
-        [ValidateRange(1, 600)][int]$TimeoutSeconds = 90
+        [ValidateRange(1, 600)][int]$TimeoutSeconds = 90,
+        [scriptblock]$ProcessBindingFactory
     )
     Assert-MO2ExactProcessTargets -Config $Config -Processes $MO2Processes
     $targetIds = @($MO2Processes | ForEach-Object { [int]$_.id })
     $actions = [Collections.Generic.List[object]]::new()
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $blockedReason = $null
     do {
         $inspection = Get-MO2InspectionData -Config $Config
         $buildData = @($inspection.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
         if ($buildData.Count -eq 0) { break }
         $live = @($inspection.processes.mo2 | Where-Object { $targetIds -contains [int]$_.id })
         foreach ($record in $live) {
+            $expected = @($MO2Processes | Where-Object { [int]$_.id -eq [int]$record.id })
+            if ($expected.Count -ne 1) { $blockedReason = 'owner-pid-ambiguous'; break }
+            $identity = Test-MO2ProcessRecordIdentity -Expected $expected[0] -Actual $record
+            if (-not $identity.ok) { $blockedReason = [string]$identity.reason; break }
             foreach ($window in @(Get-MO2AutomationWindows -ProcessId ([int]$record.id))) {
                 foreach ($button in @(Get-MO2UnlockButtons -Window $window)) {
-                    $invoked = Invoke-MO2AutomationButton -Button $button -ExpectedName 'Unlock'
+                    $guard = Invoke-MO2ExactProcessAction -Expected $expected[0] -ProcessBindingFactory $ProcessBindingFactory -Action {
+                        param($boundProcess)
+                        Invoke-MO2AutomationButton -Button $button -ExpectedName 'Unlock'
+                    }
+                    if (-not $guard.ok) { $blockedReason = [string]$guard.reason; break }
+                    $invoked = [bool]$guard.value
                     $actions.Add([pscustomobject][ordered]@{ timestampUtc=[DateTime]::UtcNow.ToString('o'); processId=[int]$record.id; windowTitle=[string]$window.Current.Name; action='invoke-exact-unlock'; accepted=$invoked })
                 }
+                if ($blockedReason) { break }
             }
+            if ($blockedReason) { break }
         }
+        if ($blockedReason) { break }
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
     $final = Get-MO2InspectionData -Config $Config
     $remainingBuildData = @($final.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
-    return [pscustomobject][ordered]@{ restored = $remainingBuildData.Count -eq 0; actions=@($actions); remainingBuildData=@($remainingBuildData | ForEach-Object path); mo2Processes=@($final.processes.mo2); gameProcesses=@($final.processes.game) }
+    return [pscustomobject][ordered]@{ restored = $null -eq $blockedReason -and $remainingBuildData.Count -eq 0; blockedReason=$blockedReason; actions=@($actions); remainingBuildData=@($remainingBuildData | ForEach-Object path); mo2Processes=@($final.processes.mo2); gameProcesses=@($final.processes.game) }
 }
 
 function Test-MO2OpeningReady {
@@ -4389,8 +4521,13 @@ function Invoke-MO2StopGame {
     }
 
     foreach ($record in $targets) {
-        $process = Get-Process -Id ([int]$record.id) -ErrorAction SilentlyContinue
-        if ($process) { $null = $process.CloseMainWindow() }
+        $guard = Invoke-MO2ExactProcessAction -Expected $record -Action {
+            param($boundProcess)
+            $boundProcess.CloseMainWindow()
+        }
+        if (-not $guard.ok) {
+            return New-MO2ActionResult -Config $Config -Command 'stop-game' -Ok $false -State 'blocked' -Data @{ sessionId=$SessionId; targets=$targets; blockedReason=[string]$guard.reason; forceTermination=$false } -Errors @('A game process lifetime changed before its graceful-close action. No later process action was dispatched.')
+        }
     }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
@@ -4476,7 +4613,17 @@ function Invoke-MO2TerminateGame {
     if (-not (Test-MO2InteractiveDesktop)) {
         return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $false -State 'interactive-desktop-required' -Data @{ sessionId=$SessionId; targets=$targets } -Errors @('Exact Unlock handling after game termination requires the logged-on interactive desktop.')
     }
-    foreach ($target in $targets) { Stop-Process -Id ([int]$target.id) -Force -ErrorAction Stop }
+    $terminatedTargets = [Collections.Generic.List[object]]::new()
+    foreach ($target in $targets) {
+        $guard = Invoke-MO2ExactProcessAction -Expected $target -Action {
+            param($boundProcess)
+            $boundProcess.Kill()
+        }
+        if (-not $guard.ok) {
+            return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $false -State 'blocked' -Data @{ sessionId=$SessionId; targets=$targets; terminatedTargets=@($terminatedTargets); blockedReason=[string]$guard.reason } -Errors @('A recorded game process lifetime changed before forced termination. No later process action was dispatched.')
+        }
+        $terminatedTargets.Add($target)
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         Start-Sleep -Milliseconds 250
@@ -4526,8 +4673,14 @@ function Invoke-MO2Stop {
     }
 
     foreach ($record in $gameTargets) {
-        $process = Get-Process -Id ([int]$record.id) -ErrorAction SilentlyContinue
-        if ($process) { $null = $process.CloseMainWindow() }
+        $guard = Invoke-MO2ExactProcessAction -Expected $record -Action {
+            param($boundProcess)
+            $boundProcess.CloseMainWindow()
+        }
+        if (-not $guard.ok) {
+            Set-MO2OwnedSessionStatus -Owned $owned -Status 'game-owner-identity-mismatch' -TimestampProperty 'stoppedUtc'
+            return New-MO2ActionResult -Config $Config -Command 'stop' -Ok $false -State 'blocked' -Data @{ before=$before.processes; blockedReason=[string]$guard.reason; mo2CloseAttempted=$false; forceTermination=$false; unrelatedProcessesTouched=@(); sessionPath=$owned.data.sessionPath } -Errors @('A game process lifetime changed before its graceful-close action. No later process action was dispatched.')
+        }
     }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
@@ -4650,12 +4803,13 @@ function Invoke-MO2Terminate {
         return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $true -State 'dry-run' -Data @{ sessionId = $SessionId; wouldForceTerminate = @($targets); gameProcesses = @(); activeRootBuilderBuildData = @() }
     }
 
-    $expectedMO2Path = Resolve-MO2ControlPath ([string]$Config.mo2.executable)
     foreach ($record in $targets) {
-        $process = Get-Process -Id ([int]$record.id) -ErrorAction SilentlyContinue
-        $exactPath = Test-MO2ExactProcessPath -Record $record -ExpectedPath $expectedMO2Path
-        if ($process -and @($Config.mo2.processNames) -contains $process.ProcessName -and $exactPath) {
-            Stop-Process -Id $process.Id -Force -ErrorAction Stop
+        $guard = Invoke-MO2ExactProcessAction -Expected $record -Action {
+            param($boundProcess)
+            $boundProcess.Kill()
+        }
+        if (-not $guard.ok) {
+            return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $false -State 'blocked' -Data @{ targets=$targets; blockedReason=[string]$guard.reason; gameProcesses=@(); activeRootBuilderBuildData=@(); sessionPath=$owned.data.sessionPath } -Errors @('The MO2 process lifetime changed before forced termination. No process action was dispatched.')
         }
     }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)

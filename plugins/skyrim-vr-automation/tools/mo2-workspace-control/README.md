@@ -4,10 +4,12 @@ This tool gives each automation task a unique MO2 profile cloned from an
 explicitly configured, known-good `defaults.testProfileSource`. It never uses
 the ordinary session default as an implicit template. The complete `saves`
 tree from that maintained source profile is copied and verified into every new
-task profile so ordinary access requests remain usable. Fresh creation is
-fail-closed unless that source also has one valid default world-entry fixture.
-The fixture is the maintained route into the loaded game world; alternate
-locations may then be reached with guarded `coc`/`cow` commands.
+task profile so ordinary access requests remain usable. A valid default
+world-entry fixture is required only when creation requests
+`-SavePolicy VerifiedFixture`; `MainMenuOnly` and `FreshGame` remain available
+without one. The fixture is the maintained deterministic route into the loaded
+game world; alternate locations may then be reached with guarded `coc`/`cow`
+commands.
 
 Profile discovery, hashing, fixture verification, copying, and post-copy
 verification share one command-wide tree-operation deadline. The controller

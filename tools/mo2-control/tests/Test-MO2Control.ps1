@@ -431,6 +431,29 @@ selected_profile=@ByteArray(Codex)
         Invoke-MO2CooperativeCloseCore -Config $fixtureConfig -InitialProcesses @($initial) -TimeoutSeconds 1 -ProcessInventoryFactory $factory
     } $config $admittedBeforeReplacement $replacementInventory
     Assert-MO2Test (-not $replacementClose.closed -and $replacementClose.blockedReason -eq 'process-start-time-mismatch' -and @($replacementClose.actions).Count -eq 0) 'cooperative close rejects a same-PID same-path replacement after successful admission before any UI action'
+    $betweenActionState = [pscustomobject]@{ bindingIndex=0; actionCount=0 }
+    $betweenActionBindings = @(
+        [pscustomobject]@{ process=[pscustomobject]@{ marker='original' }; record=$admittedBeforeReplacement },
+        [pscustomobject]@{ process=[pscustomobject]@{ marker='replacement' }; record=$replacementAfterAdmission }
+    )
+    $betweenActionFactory = {
+        param($expected)
+        $binding = $betweenActionBindings[$betweenActionState.bindingIndex]
+        $betweenActionState.bindingIndex++
+        return $binding
+    }.GetNewClosure()
+    $countedAction = {
+        param($boundProcess)
+        $betweenActionState.actionCount++
+        return $boundProcess.marker
+    }.GetNewClosure()
+    $betweenActionResult = & $mo2Module {
+        param($expected, $factory, $action)
+        $first = Invoke-MO2ExactProcessAction -Expected $expected -ProcessBindingFactory $factory -Action $action
+        $second = Invoke-MO2ExactProcessAction -Expected $expected -ProcessBindingFactory $factory -Action $action
+        [pscustomobject]@{ first=$first; second=$second }
+    } $admittedBeforeReplacement $betweenActionFactory $countedAction
+    Assert-MO2Test ($betweenActionResult.first.ok -and $betweenActionResult.first.value -eq 'original' -and -not $betweenActionResult.second.ok -and $betweenActionResult.second.reason -eq 'process-start-time-mismatch' -and $betweenActionState.actionCount -eq 1) 'a same-PID replacement between admitted process actions receives zero later actions'
     Remove-Item -LiteralPath $config.session.lockFile -Force
 
     $missingPrepareAccess = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -WhatIf
