@@ -1701,7 +1701,7 @@ function ConvertTo-MO2PublicValue {
     if ($null -eq $Value) { return $null }
     if ($Value -is [string] -or $Value.GetType().IsValueType) { return $Value }
 
-    $privateNames = @('accessId', 'humanMutationId', 'humanMutationHash')
+    $privateNames = @('accessId', 'accessCredentialSha256', 'humanMutationId', 'humanMutationHash')
     if ($Value -is [Collections.IDictionary]) {
         $public = [ordered]@{}
         foreach ($key in $Value.Keys) {

@@ -219,6 +219,23 @@ selected_profile=@ByteArray(Codex)
     $entryHumanDryRun = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') request-access -ConfigPath $configPath -AccessKind human -Profile Codex -TaskId 'human-fixture-task' -Label 'human fixture' -WhatIf -Compact -NoExit | ConvertFrom-Json
     Assert-MO2Test ($entryHumanDryRun.ok -and $entryHumanDryRun.data.access.accessKind -eq 'human' -and $entryHumanDryRun.data.access.profile -eq 'Codex' -and $entryHumanDryRun.data.access.humanMutationTaskId -eq 'human-fixture-task' -and -not [string]::IsNullOrWhiteSpace([string]$entryHumanDryRun.data.access.humanMutationId) -and $null -eq $entryHumanDryRun.data.access.runtimeRoute) 'human access binds the exact selected profile and records TaskId routing metadata without inventing a runtime route'
 
+    $legacyCredentialSha256 = ('A5' * 32)
+    [ordered]@{
+        contractVersion = '0.9.0'
+        accessCredentialSha256 = $legacyCredentialSha256
+        acquisitionMode = 'explicit-access'
+        status = 'access-held'
+        label = 'legacy credential fixture'
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    $legacyPublicInspection = Invoke-MO2Inspect -Config $config
+    $legacyPublicValidation = Invoke-MO2Validate -Config $config
+    $legacyPublicControllerStatus = Invoke-MO2Status -Config $config
+    $legacyPublicCliFailure = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') recover-close -ConfigPath $configPath -NoExit | ConvertFrom-Json
+    $legacyPublicJson = @($legacyPublicInspection, $legacyPublicValidation, $legacyPublicControllerStatus, $legacyPublicCliFailure) | ConvertTo-Json -Depth 16 -Compress
+    Assert-MO2Test (-not ($legacyPublicJson -match [regex]::Escape($legacyCredentialSha256))) 'legacy credential verifier value is absent from inspect, validation, status, and CLI failure output'
+    Assert-MO2Test ($legacyPublicJson -notmatch '"accessCredentialSha256"\s*:') 'legacy credential verifier field is removed recursively from every public output boundary'
+    Remove-Item -LiteralPath $config.session.lockFile -Force
+
     $humanProcess = Start-Process -FilePath $mo2Exe -ArgumentList @('/d', '/c', 'ping -n 30 127.0.0.1 >nul') -WindowStyle Hidden -PassThru
     try {
         $humanProcessDeadline = [DateTime]::UtcNow.AddSeconds(5)
