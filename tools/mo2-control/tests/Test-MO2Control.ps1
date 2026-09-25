@@ -40,6 +40,19 @@ $retentionFixture = & $mo2Module {
 }
 Assert-MO2Test (-not $retentionFixture.stable -and $retentionFixture.samples.Count -eq 2 -and -not $retentionFixture.samples[-1].ownerPresent) 'MO2 retention stability detects an owner that exits immediately after game shutdown'
 
+$acceptedExitRace = & $mo2Module {
+    $actions = @(
+        [pscustomobject]@{ processId = 4123; action = 'expand-exact-file-menu'; accepted = $true },
+        [pscustomobject]@{ processId = 4123; action = 'invoke-exact-exit-after-expand'; accepted = $true }
+    )
+    [pscustomobject]@{
+        terminal = Test-MO2AcceptedExitBindingEnded -Actions $actions -ProcessId 4123 -ErrorMessage 'The retained MO2 process binding is no longer available.'
+        wrongProcess = Test-MO2AcceptedExitBindingEnded -Actions $actions -ProcessId 4124 -ErrorMessage 'The retained MO2 process binding is no longer available.'
+        staleAuthority = Test-MO2AcceptedExitBindingEnded -Actions $actions -ProcessId 4123 -ErrorMessage 'The lease transition is stale.'
+    }
+}
+Assert-MO2Test ($acceptedExitRace.terminal -and -not $acceptedExitRace.wrongProcess -and -not $acceptedExitRace.staleAuthority) 'an accepted exact Exit distinguishes terminal process departure from an authority failure'
+
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('mo2-control-test-' + [guid]::NewGuid().ToString('N'))
 try {
     $mo2Root = Join-Path $fixture 'MO2'
@@ -64,7 +77,9 @@ try {
     $mo2Exe = Join-Path $mo2Root 'MO2ControlFixtureProcess.exe'
     $loader = Join-Path $loaderMod 'sksevr_loader.exe'
     $plainGame = Join-Path $gameRoot 'SkyrimVR.exe'
+    $fixtureGame = Join-Path $gameRoot 'MO2ControlImpossibleFixtureGame.exe'
     Copy-Item -LiteralPath $env:ComSpec -Destination $mo2Exe -Force
+    Copy-Item -LiteralPath $env:ComSpec -Destination $fixtureGame -Force
     New-Item -ItemType File -Path $loader -Force | Out-Null
     New-Item -ItemType File -Path $plainGame -Force | Out-Null
     New-Item -ItemType File -Path (Join-Path $ocuMod 'root\openvr_api.dll') -Force | Out-Null
@@ -182,6 +197,360 @@ selected_profile=@ByteArray(Codex)
     $openingReady = & $mo2Module { param($owned, $resolution) Test-MO2OpeningReady -Owned $owned -OwnershipResolution $resolution -MO2Processes @([pscustomobject]@{ id = 101 }) -GameProcesses @() -Windows @([pscustomobject]@{ visible = $true; automationId = 'MainWindow' }) } $openingOwned $openingResolution
     Assert-MO2Test $openingReady 'an exact adopted StartOnly MO2 main window is eligible for durable mo2-open promotion'
 
+    $completionSupersession = & $mo2Module {
+        param($cfg, $gameRecord)
+        $originalOwnedSession = (Get-Command Get-MO2OwnedSession -CommandType Function).ScriptBlock
+        $initiating = [pscustomobject]@{ sessionId='supersession-session'; data=[pscustomobject]@{ generation=4L; status='launching' } }
+        $current = [pscustomobject]@{ sessionId='supersession-session'; data=[pscustomobject]@{
+            generation=5L; status='running'; launchAttemptId='launch-attempt'; gameProcessesLaunchAttemptId='launch-attempt'; gameProcesses=@($gameRecord)
+            ownerTransition=[pscustomobject]@{ kind='launch'; attemptId='launch-attempt' }
+        } }
+        try {
+            Set-Item Function:script:Get-MO2OwnedSession -Value ({ $current }.GetNewClosure())
+            $launch = Get-MO2SynchronousCompletionSupersession -Config $cfg -Owned $initiating -SessionId 'supersession-session' -Operation launch -AttemptId 'launch-attempt'
+            $launchResult = New-MO2SynchronousCompletionSupersededResult -Config $cfg -Supersession $launch -SessionId 'supersession-session'
+            $current.data.status = 'mo2-closed'
+            $current.data.ownerTransition = [pscustomobject]@{ kind='open'; attemptId='open-attempt' }
+            $open = Get-MO2SynchronousCompletionSupersession -Config $cfg -Owned $initiating -SessionId 'supersession-session' -Operation open -AttemptId 'open-attempt'
+            $openResult = New-MO2SynchronousCompletionSupersededResult -Config $cfg -Supersession $open -SessionId 'supersession-session'
+            [pscustomobject]@{ launch=$launch; launchResult=$launchResult; open=$open; openResult=$openResult; finalStatus=[string]$current.data.status; finalGeneration=[long]$current.data.generation }
+        }
+        finally { Set-Item Function:script:Get-MO2OwnedSession -Value $originalOwnedSession }
+    } $config ([pscustomobject]@{ id=202; name='MO2ControlImpossibleFixtureGame' })
+    Assert-MO2Test ($completionSupersession.launch.superseded -and $completionSupersession.launch.equivalentSuccess -and
+        $completionSupersession.launchResult.ok -and $completionSupersession.launchResult.state -eq 'game-running' -and
+        $completionSupersession.launchResult.data.completionSuperseded) 'a synchronous launch overtaken by status adoption recognizes only the same exact completed launch without rewriting it'
+    Assert-MO2Test ($completionSupersession.open.superseded -and -not $completionSupersession.open.equivalentSuccess -and
+        -not $completionSupersession.openResult.ok -and $completionSupersession.openResult.state -eq 'open-superseded' -and
+        $completionSupersession.finalStatus -eq 'mo2-closed' -and $completionSupersession.finalGeneration -eq 5L) 'a synchronous open overtaken by a newer lifecycle reports supersession and preserves the newer generation'
+
+    $publicLaunchInterleaving = & $mo2Module {
+        param($cfg, $ownerPath, $gamePath)
+        $functionNames = @('Get-MO2OwnedSession','Invoke-MO2Validate','Get-MO2ProcessRecords','Get-MO2DispatchBoundChildEvidence','Write-MO2JsonAtomic','Invoke-MO2OwnedSessionMutation','Get-MO2InspectionData','Get-MO2WindowSnapshot','Resolve-MO2OwnedProcessTarget','Get-MO2ObservedGameProcessAdoption')
+        if (Get-Command Get-MO2TaskWorkspaceIsolation -CommandType Function -ErrorAction SilentlyContinue) { $functionNames += 'Get-MO2TaskWorkspaceIsolation' }
+        $originals = @{}
+        foreach ($name in $functionNames) { $originals[$name] = (Get-Command $name -CommandType Function).ScriptBlock }
+        $ownerStart = [DateTimeOffset]::UtcNow.AddSeconds(-2).ToString('o')
+        $gameStart = [DateTimeOffset]::UtcNow.ToString('o')
+        $ownerRecord = [pscustomobject]@{ id=501; name='MO2ControlFixtureProcess'; path=$ownerPath; startTime=$ownerStart }
+        $gameRecord = [pscustomobject]@{ id=502; name='MO2ControlImpossibleFixtureGame'; path=$gamePath; startTime=$gameStart }
+        $script:PublicLaunchGetCalls = 0
+        $script:PublicLaunchMutationCalls = 0
+        $script:PublicLaunchInitial = [pscustomobject]@{ path='fixture-lock'; sessionId='public-launch'; accessId='access'; data=[pscustomobject]@{ generation=0L; accessId='access'; status='prepared'; profile='Codex'; executable='Launch MGO - Do Not Unlock'; sessionPath='fixture-session'; requirements=[pscustomobject]@{ skseLoader=$false }; gameProcesses=@([pscustomobject]@{ id=400 }) } }
+        $script:PublicLaunchCurrent = $null
+        try {
+            Set-Item Function:script:Get-MO2OwnedSession { $script:PublicLaunchGetCalls++; if ($script:PublicLaunchGetCalls -eq 1) { $script:PublicLaunchInitial } else { $script:PublicLaunchCurrent } }
+            Set-Item Function:script:Invoke-MO2Validate { [pscustomobject]@{ ok=$true; warnings=@(); errors=@(); data=[pscustomobject]@{ config=[pscustomobject]@{ mo2Executable=$ownerPath }; processes=[pscustomobject]@{ mo2=@(); game=@() }; sessionLock=[pscustomobject]@{ ownerIdentityMatched=$false } } } }
+            if ($functionNames -contains 'Get-MO2TaskWorkspaceIsolation') { Set-Item Function:script:Get-MO2TaskWorkspaceIsolation { [pscustomobject]@{ ok=$true; errors=@() } } }
+            Set-Item Function:script:Get-MO2ProcessRecords { @($ownerRecord) }
+            Set-Item Function:script:Get-MO2DispatchBoundChildEvidence { @() }
+            Set-Item Function:script:Write-MO2JsonAtomic { }
+            Set-Item Function:script:Invoke-MO2OwnedSessionMutation {
+                param($Owned, $Action)
+                $script:PublicLaunchMutationCalls++
+                if ($script:PublicLaunchMutationCalls -eq 1) {
+                    $outcome = & $Action $Owned.data
+                    $outcome.sessionData | Add-Member -NotePropertyName generation -NotePropertyValue 1L -Force
+                    $Owned.data = $outcome.sessionData
+                    return $outcome.result
+                }
+                $newer = $Owned.data | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+                $newer.generation = 2L
+                $newer.status = 'running'
+                $newer | Add-Member -NotePropertyName gameProcesses -NotePropertyValue @($gameRecord) -Force
+                $newer | Add-Member -NotePropertyName gameProcessesLaunchAttemptId -NotePropertyValue ([string]$newer.launchAttemptId) -Force
+                $script:PublicLaunchCurrent = [pscustomobject]@{ path=$Owned.path; sessionId=$Owned.sessionId; accessId=$Owned.accessId; data=$newer }
+                throw "Session '$($Owned.sessionId)' lease transition is stale: expected generation 1, current generation 2."
+            }
+            Set-Item Function:script:Get-MO2InspectionData { [pscustomobject]@{ processes=[pscustomobject]@{ mo2=@($ownerRecord); game=@($gameRecord) } } }
+            Set-Item Function:script:Get-MO2WindowSnapshot { @() }
+            Set-Item Function:script:Resolve-MO2OwnedProcessTarget { [pscustomobject]@{ ok=$true; adopted=$false; ownerPid=501; targets=@($ownerRecord); reason='recorded-owner' } }
+            Set-Item Function:script:Get-MO2ObservedGameProcessAdoption { [pscustomobject]@{ eligible=$true; records=@($gameRecord); reasons=@() } }
+            Set-Item Function:script:Start-Process { [pscustomobject]@{ Id=501; ProcessName='MO2ControlFixtureProcess'; StartTime=[DateTime]::UtcNow.AddSeconds(-2); HasExited=$false; ExitCode=$null } }
+            Set-Item Function:script:Start-Sleep { }
+            $result = Invoke-MO2Launch -Config $cfg -SessionId 'public-launch' -TimeoutSeconds 1
+            [pscustomobject]@{ result=$result; mutationCalls=$script:PublicLaunchMutationCalls; status=[string]$script:PublicLaunchCurrent.data.status; generation=[long]$script:PublicLaunchCurrent.data.generation }
+        }
+        finally {
+            foreach ($name in $functionNames) { Set-Item "Function:script:$name" -Value $originals[$name] }
+            Remove-Item Function:script:Start-Process, Function:script:Start-Sleep -ErrorAction SilentlyContinue
+            Remove-Variable -Scope Script -Name PublicLaunchGetCalls,PublicLaunchMutationCalls,PublicLaunchInitial,PublicLaunchCurrent -ErrorAction SilentlyContinue
+        }
+    } $config $mo2Exe $fixtureGame
+    Assert-MO2Test ($publicLaunchInterleaving.result.ok -and $publicLaunchInterleaving.result.state -eq 'game-running' -and
+        $publicLaunchInterleaving.result.data.completionSuperseded -and $publicLaunchInterleaving.mutationCalls -eq 2 -and
+        $publicLaunchInterleaving.status -eq 'running' -and $publicLaunchInterleaving.generation -eq 2L) 'public synchronous launch preserves a concurrent same-attempt status adoption instead of writing launch-failed'
+
+    $publicOpenInterleaving = & $mo2Module {
+        param($cfg, $ownerPath)
+        $functionNames = @('Get-MO2OwnedSession','Test-MO2InteractiveDesktop','Invoke-MO2Validate','Get-MO2ProcessRecords','Get-MO2DispatchBoundChildEvidence','Write-MO2JsonAtomic','Invoke-MO2OwnedSessionMutation','Resolve-MO2OwnedProcessTarget','Get-MO2WindowSnapshot','Write-MO2OwnedSessionAtomic')
+        if (Get-Command Get-MO2TaskWorkspaceIsolation -CommandType Function -ErrorAction SilentlyContinue) { $functionNames += 'Get-MO2TaskWorkspaceIsolation' }
+        $originals = @{}
+        foreach ($name in $functionNames) { $originals[$name] = (Get-Command $name -CommandType Function).ScriptBlock }
+        $ownerStart = [DateTimeOffset]::UtcNow.AddSeconds(-2).ToString('o')
+        $ownerRecord = [pscustomobject]@{ id=601; name='MO2ControlFixtureProcess'; path=$ownerPath; startTime=$ownerStart }
+        $script:PublicOpenGetCalls = 0
+        $script:PublicOpenMutationCalls = 0
+        $script:PublicOpenInitial = [pscustomobject]@{ path='fixture-lock'; sessionId='public-open'; accessId='access'; data=[pscustomobject]@{ generation=0L; accessId='access'; status='prepared'; profile='Codex'; executable='Launch MGO - Do Not Unlock'; sessionPath='fixture-session' } }
+        $script:PublicOpenCurrent = $null
+        try {
+            Set-Item Function:script:Get-MO2OwnedSession { $script:PublicOpenGetCalls++; if ($script:PublicOpenGetCalls -eq 1) { $script:PublicOpenInitial } else { $script:PublicOpenCurrent } }
+            Set-Item Function:script:Test-MO2InteractiveDesktop { $true }
+            Set-Item Function:script:Invoke-MO2Validate { [pscustomobject]@{ ok=$true; warnings=@(); errors=@(); data=[pscustomobject]@{ config=[pscustomobject]@{ mo2Executable=$ownerPath } } } }
+            if ($functionNames -contains 'Get-MO2TaskWorkspaceIsolation') { Set-Item Function:script:Get-MO2TaskWorkspaceIsolation { [pscustomobject]@{ ok=$true; errors=@() } } }
+            Set-Item Function:script:Get-MO2ProcessRecords { @($ownerRecord) }
+            Set-Item Function:script:Get-MO2DispatchBoundChildEvidence { @() }
+            Set-Item Function:script:Write-MO2JsonAtomic { }
+            Set-Item Function:script:Invoke-MO2OwnedSessionMutation {
+                param($Owned, $Action)
+                $script:PublicOpenMutationCalls++
+                $outcome = & $Action $Owned.data
+                $outcome.sessionData | Add-Member -NotePropertyName generation -NotePropertyValue 1L -Force
+                $Owned.data = $outcome.sessionData
+                return $outcome.result
+            }
+            Set-Item Function:script:Resolve-MO2OwnedProcessTarget { [pscustomobject]@{ ok=$true; adopted=$false; ownerPid=601; targets=@($ownerRecord); reason='recorded-owner' } }
+            Set-Item Function:script:Get-MO2WindowSnapshot { @([pscustomobject]@{ visible=$true; automationAvailable=$true; automationId='MainWindow' }) }
+            Set-Item Function:script:Write-MO2OwnedSessionAtomic {
+                param($Owned, $Value)
+                $newer = $Value | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+                $newer.generation = 2L
+                $newer.status = 'mo2-closed'
+                $script:PublicOpenCurrent = [pscustomobject]@{ path=$Owned.path; sessionId=$Owned.sessionId; accessId=$Owned.accessId; data=$newer }
+                throw "Session '$($Owned.sessionId)' lease transition is stale: expected generation 1, current generation 2."
+            }
+            Set-Item Function:script:Start-Process { [pscustomobject]@{ Id=601; ProcessName='MO2ControlFixtureProcess'; StartTime=[DateTime]::UtcNow.AddSeconds(-2); HasExited=$false; ExitCode=$null } }
+            Set-Item Function:script:Start-Sleep { }
+            $result = Invoke-MO2Open -Config $cfg -SessionId 'public-open' -TimeoutSeconds 1
+            [pscustomobject]@{ result=$result; mutationCalls=$script:PublicOpenMutationCalls; status=[string]$script:PublicOpenCurrent.data.status; generation=[long]$script:PublicOpenCurrent.data.generation }
+        }
+        finally {
+            foreach ($name in $functionNames) { Set-Item "Function:script:$name" -Value $originals[$name] }
+            Remove-Item Function:script:Start-Process, Function:script:Start-Sleep -ErrorAction SilentlyContinue
+            Remove-Variable -Scope Script -Name PublicOpenGetCalls,PublicOpenMutationCalls,PublicOpenInitial,PublicOpenCurrent -ErrorAction SilentlyContinue
+        }
+    } $config $mo2Exe
+    Assert-MO2Test (-not $publicOpenInterleaving.result.ok -and $publicOpenInterleaving.result.state -eq 'open-superseded' -and
+        $publicOpenInterleaving.result.data.completionSuperseded -and $publicOpenInterleaving.mutationCalls -eq 1 -and
+        $publicOpenInterleaving.status -eq 'mo2-closed' -and $publicOpenInterleaving.generation -eq 2L) 'public synchronous open preserves a concurrent newer closed lifecycle instead of rewriting mo2-open'
+
+    $launchUtc = [DateTimeOffset]::UtcNow.AddSeconds(-1)
+    $ownerStartUtc = [DateTimeOffset]::UtcNow.AddSeconds(-2)
+    $launchingOwned = [pscustomobject]@{ data = [pscustomobject]@{ status = 'launching'; executable = 'Launch MGO - Do Not Unlock'; launchedUtc = $launchUtc.ToString('o'); launchDispatchedUtc = $launchUtc.ToString('o'); launchAttemptId = 'launch-1'; preLaunchGameProcesses = @(); ownerPid = 101; ownerProcessPath = $mo2Exe; ownerProcessStartTime = $ownerStartUtc.ToString('o'); gameProcesses = @() } }
+    $launchOwner = [pscustomobject]@{ ok = $true; ownerPid = 101; targets = @([pscustomobject]@{ id = 101; name = 'MO2ControlFixtureProcess'; path = $mo2Exe; startTime = $ownerStartUtc.ToString('o') }) }
+    $observedGame = [pscustomobject]@{ id = 202; name = 'MO2ControlImpossibleFixtureGame'; path = $fixtureGame; startTime = [DateTimeOffset]::UtcNow.UtcDateTime.ToString('o') }
+    $gameAdoption = & $mo2Module { param($cfg, $owned, $owner, $processes) $factory = { @($owner.targets[0]) }.GetNewClosure(); Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -Processes $processes -OwnerProcessInventoryFactory $factory } $config $launchingOwned $launchOwner @($observedGame)
+    Assert-MO2Test ($gameAdoption.eligible -and $gameAdoption.records.Count -eq 1 -and $gameAdoption.records[0].id -eq 202 -and $gameAdoption.records[0].path -eq $fixtureGame) 'StartOnly status can adopt one exact configured post-launch game identity under a freshly proven MO2 owner'
+    $stagedConfig = $config | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $stagedConfig.mo2.gameProcessNames = @('MO2ControlImpossibleFixtureGame', 'MO2ControlImpossibleFixtureLoader')
+    $fixtureLoader = Join-Path $gameRoot 'MO2ControlImpossibleFixtureLoader.exe'
+    New-Item -ItemType File -Path $fixtureLoader -Force | Out-Null
+    $observedLoader = [pscustomobject]@{ id = 212; name = 'MO2ControlImpossibleFixtureLoader'; path = $fixtureLoader; startTime = [DateTimeOffset]::UtcNow.UtcDateTime.ToString('o') }
+    $loaderOnlyAdoption = & $mo2Module { param($cfg, $owned, $owner, $processes) $factory = { @($owner.targets[0]) }.GetNewClosure(); Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -Processes $processes -OwnerProcessInventoryFactory $factory } $stagedConfig $launchingOwned $launchOwner @($observedLoader)
+    $loaderThenGameAdoption = & $mo2Module { param($cfg, $owned, $owner, $processes) $factory = { @($owner.targets[0]) }.GetNewClosure(); Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -Processes $processes -OwnerProcessInventoryFactory $factory } $stagedConfig $launchingOwned $launchOwner @($observedLoader, $observedGame)
+    $gameOnlyAdoption = & $mo2Module { param($cfg, $owned, $owner, $processes) $factory = { @($owner.targets[0]) }.GetNewClosure(); Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -Processes $processes -OwnerProcessInventoryFactory $factory } $stagedConfig $launchingOwned $launchOwner @($observedGame)
+    Assert-MO2Test (-not $loaderOnlyAdoption.eligible -and $loaderOnlyAdoption.reasons -contains 'primary-game-not-observed') 'a loader-only observation remains pending instead of permanently closing the launch identity set'
+    Assert-MO2Test ($loaderThenGameAdoption.eligible -and @($loaderThenGameAdoption.records).Count -eq 2 -and $gameOnlyAdoption.eligible) 'the same launch can adopt the primary game with or without its configured loader once the primary role appears'
+    $predatingGame = [pscustomobject]@{ id = 203; name = 'MO2ControlImpossibleFixtureGame'; path = $fixtureGame; startTime = $launchUtc.AddMilliseconds(-1).ToString('o') }
+    $predatingAdoption = & $mo2Module { param($cfg, $owned, $owner, $processes) $factory = { @($owner.targets[0]) }.GetNewClosure(); Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -Processes $processes -OwnerProcessInventoryFactory $factory } $config $launchingOwned $launchOwner @($predatingGame)
+    Assert-MO2Test (-not $predatingAdoption.eligible -and $predatingAdoption.reasons -contains 'game-predates-launch:203') 'status refuses to assign a pre-existing game process to a StartOnly launch'
+    $wrongPathGame = [pscustomobject]@{ id = 204; name = 'MO2ControlImpossibleFixtureGame'; path = (Join-Path $fixture 'wrong\MO2ControlImpossibleFixtureGame.exe'); startTime = [DateTimeOffset]::UtcNow.ToString('o') }
+    $wrongPathAdoption = & $mo2Module { param($cfg, $owned, $owner, $processes) $factory = { @($owner.targets[0]) }.GetNewClosure(); Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -Processes $processes -OwnerProcessInventoryFactory $factory } $config $launchingOwned $launchOwner @($wrongPathGame)
+    Assert-MO2Test (-not $wrongPathAdoption.eligible -and $wrongPathAdoption.reasons -contains 'unconfigured-game-identity:204') 'StartOnly adoption rejects a configured basename from the wrong executable directory'
+    $duplicateRoleGame = [pscustomobject]@{ id = 205; name = $observedGame.name; path = $observedGame.path; startTime = $observedGame.startTime }
+    $ambiguousGameAdoption = & $mo2Module { param($cfg, $owned, $owner, $processes) $factory = { @($owner.targets[0]) }.GetNewClosure(); Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -Processes $processes -OwnerProcessInventoryFactory $factory } $config $launchingOwned $launchOwner @($observedGame, $duplicateRoleGame)
+    Assert-MO2Test (-not $ambiguousGameAdoption.eligible -and $ambiguousGameAdoption.reasons -contains 'ambiguous-game-role:MO2ControlImpossibleFixtureGame') 'StartOnly adoption rejects two distinct candidates for one configured game role'
+    $extraOwner = [pscustomobject]@{ id = 102; name = 'MO2ControlFixtureProcess'; path = $mo2Exe; startTime = $ownerStartUtc.AddSeconds(1).ToString('o') }
+    $extraOwnerAdoption = & $mo2Module { param($cfg, $owned, $owner, $extra, $processes) $factory = { @($owner.targets[0], $extra) }.GetNewClosure(); Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -Processes $processes -OwnerProcessInventoryFactory $factory } $config $launchingOwned $launchOwner $extraOwner @($observedGame)
+    Assert-MO2Test (-not $extraOwnerAdoption.eligible -and $extraOwnerAdoption.reasons -contains 'mo2-owner-not-exact') 'StartOnly adoption rejects the recorded owner when an additional MO2 process makes attribution ambiguous'
+    $transitionSession = Join-Path $fixture 'transition-session'
+    New-Item -ItemType Directory -Path $transitionSession -Force | Out-Null
+    $transitionReceiptPath = Join-Path $transitionSession 'mo2-launch-started.json'
+    $transitionDispatch = [DateTimeOffset]::UtcNow.AddSeconds(-2)
+    $transitionRequestedStart = $transitionDispatch.AddMilliseconds(100)
+    $transitionAttemptId = [guid]::NewGuid().ToString('D')
+    [pscustomobject][ordered]@{ sessionId = 'transition-session'; attemptId = $transitionAttemptId; requestedPid = 777; requestedProcessStartTime = $transitionRequestedStart.ToString('o'); mo2Path = $mo2Exe; dispatchStartedUtc = $transitionDispatch.ToString('o'); preDispatchProcesses = @() } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $transitionReceiptPath -Encoding utf8
+    $transitionOwned = [pscustomobject]@{ sessionId = 'transition-session'; data = [pscustomobject]@{ sessionId = 'transition-session'; sessionPath = $transitionSession; status = 'launching'; ownerPid = 777; ownerProcessPath = $mo2Exe; ownerProcessStartTime = $transitionRequestedStart.ToString('o'); ownerTransition = [pscustomobject]@{ kind = 'launch'; attemptId = $transitionAttemptId; dispatchStartedUtc = $transitionDispatch.ToString('o'); requestedPid = 777; requestedProcessPath = $mo2Exe; requestedProcessStartTime = $transitionRequestedStart.ToString('o'); preDispatchProcesses = @(); receiptPath = $transitionReceiptPath; detachedAdoptionAllowed = $true } } }
+    $unrelatedOwner = [pscustomobject]@{ id = 778; parentId = 123; name = 'MO2ControlFixtureProcess'; path = $mo2Exe; startTime = $transitionDispatch.AddSeconds(1).ToString('o') }
+    $handoffOwner = [pscustomobject]@{ id = 778; parentId = 777; parentStartTime = $transitionRequestedStart.ToString('o'); name = 'MO2ControlFixtureProcess'; path = $mo2Exe; startTime = $transitionDispatch.AddSeconds(1).ToString('o') }
+    $unrelatedOwnerResolution = & $mo2Module { param($cfg, $owned, $process) Resolve-MO2OwnedProcessTarget -Config $cfg -Owned $owned -Processes @($process) -AdoptDetachedOwner } $config $transitionOwned $unrelatedOwner
+    $handoffEvidence = & $mo2Module { param($cfg, $owned, $process) Test-MO2DetachedOwnerAdoptionEvidence -Config $cfg -Owned $owned -Candidate $process } $config $transitionOwned $handoffOwner
+    $legacyTransitionOwned = $transitionOwned | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $legacyTransitionOwned.data.PSObject.Properties.Remove('ownerTransition')
+    $legacyEvidence = & $mo2Module { param($cfg, $owned, $process) Test-MO2DetachedOwnerAdoptionEvidence -Config $cfg -Owned $owned -Candidate $process } $config $legacyTransitionOwned $handoffOwner
+    $unboundTransitionOwned = $transitionOwned | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $unboundTransitionOwned.data.PSObject.Properties.Remove('ownerProcessStartTime')
+    $unboundEvidence = & $mo2Module { param($cfg, $owned, $process) Test-MO2DetachedOwnerAdoptionEvidence -Config $cfg -Owned $owned -Candidate $process } $config $unboundTransitionOwned $handoffOwner
+    $reusedParentOwner = $handoffOwner | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+    $reusedParentOwner.parentStartTime = $transitionRequestedStart.AddMinutes(1).ToString('o')
+    $reusedParentEvidence = & $mo2Module { param($cfg, $owned, $process) Test-MO2DetachedOwnerAdoptionEvidence -Config $cfg -Owned $owned -Candidate $process } $config $transitionOwned $reusedParentOwner
+    $postExitHandoffOwner = [pscustomobject]@{ id=778; parentId=777; name='MO2ControlFixtureProcess'; path=$mo2Exe; startTime=$transitionDispatch.AddSeconds(1).ToString('o') }
+    $durableChild = [pscustomobject]@{ id=778; parentId=777; parentStartTime=$transitionRequestedStart.ToString('o'); name='MO2ControlFixtureProcess'; path=$mo2Exe; startTime=$transitionDispatch.AddSeconds(1).ToString('o') }
+    $transitionOwned.data.ownerTransition | Add-Member -NotePropertyName dispatchBoundChildren -NotePropertyValue @($durableChild) -Force
+    $transitionReceipt = Get-Content -LiteralPath $transitionReceiptPath -Raw | ConvertFrom-Json
+    $transitionReceipt | Add-Member -NotePropertyName dispatchBoundChildren -NotePropertyValue @($durableChild) -Force
+    $transitionReceipt | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $transitionReceiptPath -Encoding utf8
+    $postExitHandoffEvidence = & $mo2Module { param($cfg, $owned, $process) Test-MO2DetachedOwnerAdoptionEvidence -Config $cfg -Owned $owned -Candidate $process } $config $transitionOwned $postExitHandoffOwner
+    Assert-MO2Test (-not $unrelatedOwnerResolution.ok -and $unrelatedOwnerResolution.reason -eq 'detached-owner-handoff-unproven') 'an unrelated later configured MO2 process cannot replace launch-recorded ownership'
+    Assert-MO2Test ($handoffEvidence.ok -and $handoffEvidence.reason -eq 'dispatch-bound-detached-owner') 'a direct requested-process handoff remains eligible under matching durable dispatch evidence'
+    Assert-MO2Test (-not $legacyEvidence.ok -and $legacyEvidence.reason -eq 'detached-owner-transition-unavailable') 'legacy or missing transition fields remain readable but cannot manufacture live owner authority'
+    Assert-MO2Test (-not $unboundEvidence.ok -and $unboundEvidence.reason -eq 'detached-owner-original-identity-unbound') 'detached adoption refuses a missing original owner tuple instead of replacing it with the candidate identity'
+    Assert-MO2Test (-not $reusedParentEvidence.ok -and $reusedParentEvidence.reason -eq 'detached-owner-handoff-unproven') 'a matching parent PID from a different process lifetime cannot authorize detached adoption'
+    Assert-MO2Test ($postExitHandoffEvidence.ok -and $postExitHandoffEvidence.reason -eq 'dispatch-bound-detached-owner') 'a direct child captured while the original helper handle was retained remains adoptable after that parent exits'
+    $reusedOwnerRecord = [pscustomobject]@{ id = 101; name = 'MO2ControlFixtureProcess'; path = $mo2Exe; startTime = $ownerStartUtc.AddMinutes(1).ToString('o') }
+    $reusedOwnerResolution = & $mo2Module { param($cfg, $owned, $process) Resolve-MO2OwnedProcessTarget -Config $cfg -Owned $owned -Processes @($process) } $config $launchingOwned $reusedOwnerRecord
+    $reusedOwnerAdoption = & $mo2Module { param($cfg, $owned, $process, $processes) $factory = { @($process) }.GetNewClosure(); Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -Processes $processes -OwnerProcessInventoryFactory $factory } $config $launchingOwned $reusedOwnerRecord @($observedGame)
+    Assert-MO2Test (-not $reusedOwnerResolution.ok -and $reusedOwnerResolution.reason -eq 'recorded-owner-start-time-mismatch') 'recorded MO2 ownership rejects a reused PID with a different process start time'
+    Assert-MO2Test (-not $reusedOwnerAdoption.eligible -and $reusedOwnerAdoption.reasons -contains 'mo2-owner-not-exact') 'StartOnly status cannot adopt game identities under a stale or replaced MO2 owner snapshot'
+    $unlockCalls = [Collections.Generic.List[int]]::new()
+    $activeBuildDataInspection = [pscustomobject]@{ processes = [pscustomobject]@{ mo2 = @($reusedOwnerRecord); game = @() }; rootBuilder = [pscustomobject]@{ active = @([pscustomobject]@{ path = (Join-Path $fixture 'BuildData.json') }) } }
+    $replacementInspectionFactory = { $activeBuildDataInspection }.GetNewClosure()
+    $unlockCallback = { param($process) $unlockCalls.Add([int]$process.id); return $true }.GetNewClosure()
+    $replacementUnlock = & $mo2Module { param($cfg, $owned, $factory, $action) Invoke-MO2UnlockOnly -Config $cfg -Owned $owned -TimeoutSeconds 1 -PollMilliseconds 0 -InspectionFactory $factory -UnlockAction $action } $config $launchingOwned $replacementInspectionFactory $unlockCallback
+    Assert-MO2Test (-not $replacementUnlock.restored -and -not $replacementUnlock.ownerIdentityVerified -and $replacementUnlock.blockedReason -eq 'recorded-owner-start-time-mismatch' -and $unlockCalls.Count -eq 0) 'RootBuilder Unlock refuses a reused MO2 owner identity before invoking any UI action'
+    $testUnlockBindingFactory = { param([int]$processId) [pscustomobject]@{ available=$true; reason='bound'; process=[pscustomobject]@{ Id=$processId } } }
+    $exactUnlockIdentityFactory = { param($binding) $launchOwner.targets[0] }.GetNewClosure()
+    $exactUnlockState = [pscustomobject]@{ calls = 0 }
+    $exactUnlockFactory = { $exactUnlockState.calls++; [pscustomobject]@{ processes = [pscustomobject]@{ mo2 = @($launchOwner.targets[0]); game = @() }; rootBuilder = [pscustomobject]@{ active = $(if ($exactUnlockState.calls -eq 1) { @([pscustomobject]@{ path = (Join-Path $fixture 'BuildData.json') }) } else { @() }) } } }.GetNewClosure()
+    $exactUnlock = & $mo2Module { param($cfg, $owned, $factory, $action, $bindingFactory, $identityFactory) Invoke-MO2UnlockOnly -Config $cfg -Owned $owned -TimeoutSeconds 1 -PollMilliseconds 0 -InspectionFactory $factory -UnlockAction $action -BindingFactory $bindingFactory -OwnerIdentityFactory $identityFactory } $config $launchingOwned $exactUnlockFactory $unlockCallback $testUnlockBindingFactory $exactUnlockIdentityFactory
+    Assert-MO2Test ($exactUnlock.restored -and $exactUnlock.ownerIdentityVerified -and $unlockCalls.Count -eq 1) 'RootBuilder Unlock acts only on the exact current owner and revalidates it for final success'
+    $actionBoundaryIdentityState = [pscustomobject]@{ calls = 0 }
+    $replacementAtActionIdentityFactory = { param($binding) $actionBoundaryIdentityState.calls++; if ($actionBoundaryIdentityState.calls -eq 1) { $launchOwner.targets[0] } else { $reusedOwnerRecord } }.GetNewClosure()
+    $replacementAtActionInspection = { [pscustomobject]@{ processes = [pscustomobject]@{ mo2 = @($launchOwner.targets[0]); game = @() }; rootBuilder = [pscustomobject]@{ active = @([pscustomobject]@{ path = (Join-Path $fixture 'BuildData.json') }) } } }.GetNewClosure()
+    $callsBeforeActionBoundaryTest = $unlockCalls.Count
+    $replacementAtAction = & $mo2Module { param($cfg, $owned, $factory, $action, $bindingFactory, $identityFactory) Invoke-MO2UnlockOnly -Config $cfg -Owned $owned -TimeoutSeconds 1 -PollMilliseconds 0 -InspectionFactory $factory -UnlockAction $action -BindingFactory $bindingFactory -OwnerIdentityFactory $identityFactory } $config $launchingOwned $replacementAtActionInspection $unlockCallback $testUnlockBindingFactory $replacementAtActionIdentityFactory
+    Assert-MO2Test (-not $replacementAtAction.restored -and $replacementAtAction.blockedReason -eq 'recorded-owner-start-time-mismatch' -and $unlockCalls.Count -eq $callsBeforeActionBoundaryTest) 'RootBuilder Unlock revalidates the retained exact owner after window selection and immediately before invoking Unlock'
+    $betweenControlsIdentityState = [pscustomobject]@{ calls = 0 }
+    $betweenControlsIdentityFactory = { param($binding) $betweenControlsIdentityState.calls++; if ($betweenControlsIdentityState.calls -le 2) { $launchOwner.targets[0] } else { $reusedOwnerRecord } }.GetNewClosure()
+    $twoUnlockControls = { param($binding) @([pscustomobject]@{ windowTitle='first'; button='first' }, [pscustomobject]@{ windowTitle='second'; button='second' }) }
+    $controlActions = [Collections.Generic.List[string]]::new()
+    $controlAction = { param($control) $controlActions.Add([string]$control.button); $true }.GetNewClosure()
+    $replacementBetweenControls = & $mo2Module { param($cfg, $owned, $factory, $bindingFactory, $identityFactory, $controlFactory, $controlAction) Invoke-MO2UnlockOnly -Config $cfg -Owned $owned -TimeoutSeconds 1 -PollMilliseconds 0 -InspectionFactory $factory -BindingFactory $bindingFactory -OwnerIdentityFactory $identityFactory -UnlockControlFactory $controlFactory -UnlockControlAction $controlAction } $config $launchingOwned $replacementAtActionInspection $testUnlockBindingFactory $betweenControlsIdentityFactory $twoUnlockControls $controlAction
+    Assert-MO2Test (-not $replacementBetweenControls.restored -and $replacementBetweenControls.blockedReason -eq 'recorded-owner-start-time-mismatch' -and @($controlActions).Count -eq 1 -and $controlActions[0] -eq 'first') 'RootBuilder Unlock revalidates the retained owner between multiple eligible Unlock controls and stops before acting on a replacement lifetime'
+    $replacementCloseInventory = { param($fixtureConfig) @($reusedOwnerRecord) }.GetNewClosure()
+    $replacementClose = & $mo2Module { param($cfg, $owned, $initial, $factory) Invoke-MO2CooperativeCloseCore -Config $cfg -Owned $owned -InitialProcesses @($initial) -TimeoutSeconds 1 -ProcessInventoryFactory $factory } $config $launchingOwned $launchOwner.targets[0] $replacementCloseInventory
+    Assert-MO2Test (-not $replacementClose.closed -and -not $replacementClose.ownerIdentityVerified -and $replacementClose.blockedReason -eq 'recorded-owner-start-time-mismatch' -and @($replacementClose.actions).Count -eq 0) 'cooperative close refuses a reused MO2 owner identity before invoking any UI action'
+    $preLaunchOwned = $launchingOwned | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $preLaunchOwned.data.ownerProcessStartTime = $ownerStartUtc.ToString('o')
+    $preLaunchOwned.data.preLaunchGameProcesses = @($observedGame)
+    $presentBeforeDispatch = & $mo2Module { param($cfg, $owned, $owner, $processes) $factory = { @($owner.targets[0]) }.GetNewClosure(); Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned $owned -Processes $processes -OwnerProcessInventoryFactory $factory } $config $preLaunchOwned $launchOwner @($observedGame)
+    Assert-MO2Test (-not $presentBeforeDispatch.eligible -and $presentBeforeDispatch.reasons -contains 'game-present-before-dispatch:202') 'StartOnly adoption rejects an exact game identity captured before dispatch'
+    $relaunchState = [pscustomobject]@{ status = 'launching'; executable = 'Launch MGO - Do Not Unlock'; ownerPid = 101; ownerProcessPath = $mo2Exe; ownerProcessStartTime = $ownerStartUtc.ToString('o'); gameProcesses = @($observedGame); gameProcessesRecordedUtc = $launchUtc.ToString('o'); gameProcessesLaunchAttemptId = 'launch-1'; launchAttemptId = 'launch-1'; launchDispatchedUtc = $launchUtc.ToString('o') }
+    & $mo2Module { param($state, $boundary) Reset-MO2GameProcessStateForLaunch -Data $state -LaunchAttemptId 'launch-2' -LaunchDispatchedUtc $boundary -PreLaunchGameProcesses @() } $relaunchState ([DateTimeOffset]::UtcNow.ToString('o'))
+    Assert-MO2Test (@($relaunchState.gameProcesses).Count -eq 0 -and @($relaunchState.gameProcessHistory).Count -eq 1 -and $relaunchState.gameProcessHistory[0].launchAttemptId -eq 'launch-1' -and $relaunchState.launchAttemptId -eq 'launch-2') 'retained relaunch archives prior game identities and opens a distinct current-launch identity set'
+    $nextObservedGame = [pscustomobject]@{ id = 206; name = $observedGame.name; path = $observedGame.path; startTime = [DateTimeOffset]::UtcNow.AddSeconds(1).UtcDateTime.ToString('o') }
+    $nextLaunchAdoption = & $mo2Module { param($cfg, $state, $owner, $processes) $factory = { @($owner.targets[0]) }.GetNewClosure(); Get-MO2ObservedGameProcessAdoption -Config $cfg -Owned ([pscustomobject]@{ data = $state }) -Processes $processes -OwnerProcessInventoryFactory $factory } $config $relaunchState $launchOwner @($nextObservedGame)
+    Assert-MO2Test ($nextLaunchAdoption.eligible -and $nextLaunchAdoption.records[0].id -eq 206) 'a retained second launch can adopt its new exact game identity without reusing the archived active set'
+    $offsetRecorded = $observedGame | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+    $offsetRecorded.startTime = ([DateTimeOffset]::Parse([string]$observedGame.startTime)).ToUniversalTime().ToString('o')
+    $roundTripResolution = & $mo2Module { param($recorded, $current) Resolve-MO2RecordedGameProcessTargets -Recorded @($recorded) -Current @($current) } $offsetRecorded $observedGame
+    $changedInstant = $observedGame | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+    $changedInstant.startTime = ([DateTimeOffset]::Parse([string]$observedGame.startTime)).AddSeconds(1).UtcDateTime.ToString('o')
+    $changedInstantResolution = & $mo2Module { param($recorded, $current) Resolve-MO2RecordedGameProcessTargets -Recorded @($recorded) -Current @($current) } $offsetRecorded $changedInstant
+    Assert-MO2Test ($roundTripResolution.ok -and -not $changedInstantResolution.ok -and $changedInstantResolution.reason -eq 'process-start-time-mismatch') 'game identity compares the normalized persisted instant while still rejecting a genuinely changed start time'
+    $moduleSource = Get-Content -LiteralPath (Join-Path $packageRoot 'MO2Control.psm1') -Raw
+    $qualifiedGameCommitCalls = @([regex]::Matches($moduleSource, "[$]null = Set-MO2OwnedSessionGameProcesses[^`r`n]+-Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc'"))
+    $allGameCommitCalls = @([regex]::Matches($moduleSource, '[$]null = Set-MO2OwnedSessionGameProcesses[^`r`n]+'))
+    Assert-MO2Test ($qualifiedGameCommitCalls.Count -eq 2 -and $allGameCommitCalls.Count -eq 2) 'both status and synchronous launch durably co-write verified game identity with the running transition'
+    Assert-MO2Test ($moduleSource -match 'ownerProcessPath' -and $moduleSource -match 'ownerProcessStartTime') 'launch and detached-owner adoption persist exact MO2 path and start-time identity'
+    Assert-MO2Test (@([regex]::Matches($moduleSource, 'Invoke-MO2OwnedSessionMutation -Owned [$]owned -Action')).Count -eq 4) 'launch, open, terminate-game, and terminate all serialize current lifecycle authority before process mutation'
+    Assert-MO2Test ($moduleSource -match 'param\([$]CurrentOwned, [$]MutationAction\)' -and $moduleSource -match 'Invoke-WithMO2LeaseTransitionLock[^\r\n]+-Action [$]lockedMutation -ArgumentList @\([$]Owned, [$]Action\)') 'serialized lifecycle mutation passes its caller action explicitly without colliding with the lock wrapper Action parameter'
+    Assert-MO2Test ($moduleSource -notmatch "Set-MO2OwnedSessionOwner -Owned[^`r`n]+exact MO2 process observed after open" -and $moduleSource -match 'Resolve-MO2OwnedProcessTarget[^\r\n]+-AdoptDetachedOwner') 'synchronous open preserves its dispatch-bound owner tuple unless the explicit detached-owner proof succeeds'
+    $launchSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Launch \{.*?\n\}').Value
+    $openSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Open \{.*?\n\}').Value
+    Assert-MO2Test ($launchSource -notmatch 'if \([$]ownerResolution[.]adopted\) \{\s*[$]owned = Get-MO2OwnedSession' -and
+        $openSource -notmatch 'if \([$]observedResolution[.]adopted\) \{\s*[$]owned = Get-MO2OwnedSession' -and
+        @([regex]::Matches($launchSource, 'Get-MO2SynchronousCompletionSupersession')).Count -eq 2 -and
+        @([regex]::Matches($openSource, 'Get-MO2SynchronousCompletionSupersession')).Count -eq 2) 'synchronous launch/open keep their initiating post-handoff generation and classify stale terminal writes without adopting newer authority'
+    Assert-MO2Test ($moduleSource -match 'Write-MO2SessionManifestProjection -SessionData [$]updated' -and $moduleSource -notmatch '(?s)Write-MO2OwnedSessionAtomic[^}]+Write-MO2JsonAtomic -Path [$]manifestPath') 'ownership-lock and session-manifest lifecycle projection share one serialized generation boundary'
+    $gamePersistenceSource = [regex]::Match($moduleSource, '(?s)function Set-MO2OwnedSessionGameProcesses \{.*?\n\}').Value
+    Assert-MO2Test ($gamePersistenceSource -match 'Invoke-MO2OwnedSessionMutation' -and $gamePersistenceSource -match 'Resolve-MO2OwnedProcessTarget' -and $gamePersistenceSource.IndexOf('Resolve-MO2OwnedProcessTarget', [StringComparison]::Ordinal) -lt $gamePersistenceSource.IndexOf('gameProcesses -NotePropertyValue', [StringComparison]::Ordinal)) 'game-process persistence resolves one exact live MO2 owner inside the serialized transition before changing running state'
+    $terminationCalls = [Collections.Generic.List[string]]::new()
+    $changedLiveOwner = [pscustomobject]@{ id = 101; name = 'MO2ControlFixtureProcess'; path = $mo2Exe; startTime = $ownerStartUtc.AddMinutes(1).ToString('o') }
+    $replacementBinding = { param($processId) [pscustomobject]@{ available = $true; reason = 'bound'; process = [pscustomobject]@{ id = $processId }; record = $changedLiveOwner } }.GetNewClosure()
+    $replacementTerminator = { param($process) $terminationCalls.Add([string]$process.id) }.GetNewClosure()
+    $replacementRace = & $mo2Module { param($cfg, $owned, $target, $binding, $terminator) Invoke-MO2VerifiedForceTermination -Config $cfg -Owned $owned -Target $target -BindingFactory $binding -TerminationAction $terminator } $config $launchingOwned $launchOwner.targets[0] $replacementBinding $replacementTerminator
+    Assert-MO2Test (-not $replacementRace.ok -and $replacementRace.reason -eq 'recorded-owner-start-time-mismatch' -and $terminationCalls.Count -eq 0) 'force termination rejects a changed live identity after the earlier inspection without invoking termination'
+    Assert-MO2Test ($moduleSource -match 'Invoke-MO2VerifiedForceTermination .* -Target \$targets\[0\]' -and $moduleSource -match '\$binding[.]process[.]Kill\(\)') 'terminate rebinds the live process and kills only through its retained exact process handle'
+    $gameTerminationCalls = [Collections.Generic.List[string]]::new()
+    $changedLiveGame = [pscustomobject]@{ id = [int]$observedGame.id; name = [string]$observedGame.name; path = [string]$observedGame.path; startTime = ([DateTimeOffset]::Parse([string]$observedGame.startTime)).AddMinutes(1).UtcDateTime.ToString('o') }
+    $gameReplacementBinding = { param($processId) [pscustomobject]@{ available = $true; reason = 'bound'; process = [pscustomobject]@{ id = $processId }; record = $changedLiveGame } }.GetNewClosure()
+    $gameReplacementTerminator = { param($process) $gameTerminationCalls.Add([string]$process.id) }.GetNewClosure()
+    $gameReplacementRace = & $mo2Module { param($cfg, $owned, $target, $binding, $terminator) Invoke-MO2VerifiedGameTerminationSet -Config $cfg -Owned $owned -Targets @($target) -BindingFactory $binding -TerminationAction $terminator } $config $launchingOwned $observedGame $gameReplacementBinding $gameReplacementTerminator
+    Assert-MO2Test (-not $gameReplacementRace.ok -and $gameReplacementRace.reason -eq 'process-start-time-mismatch' -and $gameTerminationCalls.Count -eq 0) 'terminate-game rejects a changed live game identity after inspection without invoking termination'
+    Assert-MO2Test ($moduleSource -match 'Invoke-MO2VerifiedGameTerminationSet .* -Targets \$targets' -and $moduleSource -notmatch 'Stop-Process -Id \(\[int\]\$target[.]id\)') 'terminate-game rebinds every game process and terminates only through retained exact process handles'
+    $gameCloseCalls = [Collections.Generic.List[string]]::new()
+    $gameReplacementCloser = { param($process) $gameCloseCalls.Add([string]$process.id) }.GetNewClosure()
+    $gameCloseReplacementRace = & $mo2Module { param($cfg, $owned, $target, $binding, $closer) Invoke-MO2VerifiedGameCloseRequestSet -Config $cfg -Owned $owned -Targets @($target) -BindingFactory $binding -CloseAction $closer } $config $launchingOwned $observedGame $gameReplacementBinding $gameReplacementCloser
+    Assert-MO2Test (-not $gameCloseReplacementRace.ok -and $gameCloseReplacementRace.reason -eq 'process-start-time-mismatch' -and $gameCloseCalls.Count -eq 0) 'graceful game close rejects a changed live identity after inspection without invoking CloseMainWindow'
+    $recordedCloseOwned = $launchingOwned | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $recordedCloseOwned.data.gameProcesses = @($observedGame)
+    $unrecordedGame = $observedGame | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $unrecordedGame.id = [int]$observedGame.id + 1
+    $unrecordedGame.startTime = ([DateTimeOffset]::Parse([string]$observedGame.startTime)).AddSeconds(1).UtcDateTime.ToString('o')
+    $unrecordedInspection = [pscustomobject]@{ processes = [pscustomobject]@{ game = @($observedGame, $unrecordedGame); mo2 = @($launchOwner.targets) } }
+    $unrecordedCloseCalls = [Collections.Generic.List[string]]::new()
+    $unrecordedCloser = { param($process) $unrecordedCloseCalls.Add([string]$process.id) }.GetNewClosure()
+    $unrecordedClose = & $mo2Module { param($cfg, $owned, $data, $inspection, $closer) Invoke-MO2CurrentGameCloseRequest -Config $cfg -Owned $owned -CurrentData $data -CurrentInspection $inspection -CloseAction $closer } $config $recordedCloseOwned $recordedCloseOwned.data $unrecordedInspection $unrecordedCloser
+    Assert-MO2Test (-not $unrecordedClose.ok -and $unrecordedClose.reason -eq 'unrecorded-game-process-present' -and $unrecordedCloseCalls.Count -eq 0) 'graceful game close refuses a configured but session-unrecorded process without invoking CloseMainWindow'
+    $missingOwnerInspection = [pscustomobject]@{ processes = [pscustomobject]@{ game = @($observedGame); mo2 = @() } }
+    $missingOwnerClose = & $mo2Module { param($cfg, $owned, $data, $inspection, $closer) Invoke-MO2CurrentGameCloseRequest -Config $cfg -Owned $owned -CurrentData $data -CurrentInspection $inspection -CloseAction $closer } $config $recordedCloseOwned $recordedCloseOwned.data $missingOwnerInspection $unrecordedCloser
+    Assert-MO2Test (-not $missingOwnerClose.ok -and $missingOwnerClose.reason -eq 'mo2-owner-changed-before-game-close' -and $unrecordedCloseCalls.Count -eq 0) 'graceful game close requires the exact current MO2 owner before invoking CloseMainWindow'
+
+    $dialogAuthority = & $mo2Module {
+        param($cfg, $owned, $ownerRecord)
+        $originalSnapshot = (Get-Command Get-MO2WindowSnapshot -CommandType Function).ScriptBlock
+        $originalTexts = (Get-Command Get-MO2WindowTextElements -CommandType Function).ScriptBlock
+        $originalKind = (Get-Command Get-MO2KnownDialogKind -CommandType Function).ScriptBlock
+        $originalButtons = (Get-Command Get-MO2NamedButtons -CommandType Function).ScriptBlock
+        $script:DialogAuthorityAttempts = 0
+        $script:DialogAuthorityExecutions = 0
+        try {
+            Set-Item Function:script:Get-MO2WindowSnapshot { @() }
+            Set-Item Function:script:Get-MO2WindowTextElements { @('fixture') }
+            Set-Item Function:script:Get-MO2KnownDialogKind { 'failed-to-run' }
+            Set-Item Function:script:Get-MO2NamedButtons { param($Window, $Name) @([pscustomobject]@{ Name=$Name }) }
+            $window = [pscustomobject]@{ Current=[pscustomobject]@{ AutomationId='Dialog'; Name='fixture failed to run'; NativeWindowHandle=42 } }
+            $binding = { param($ProcessId) [pscustomobject]@{ available=$true; reason='bound'; process=[pscustomobject]@{ id=$ProcessId }; record=$ownerRecord } }.GetNewClosure()
+            $windows = { param($Binding) @($window) }.GetNewClosure()
+            $guardedAction = {
+                param($AuthorityOwned, $Binding, $Action, [object[]]$Arguments)
+                $script:DialogAuthorityAttempts++
+                if ($script:DialogAuthorityAttempts -gt 1) { throw 'lease transition is stale: fixture' }
+                $script:DialogAuthorityExecutions++
+                return $true
+            }
+            $result = Invoke-MO2RetainedSessionDialogCleanup -Config $cfg -Owned $owned -Processes @($ownerRecord) -TimeoutSeconds 1 -BindingFactory $binding -WindowFactory $windows -OwnedAction $guardedAction
+            [pscustomobject]@{ result=$result; attempts=$script:DialogAuthorityAttempts; executions=$script:DialogAuthorityExecutions }
+        }
+        finally {
+            Set-Item Function:script:Get-MO2WindowSnapshot -Value $originalSnapshot
+            Set-Item Function:script:Get-MO2WindowTextElements -Value $originalTexts
+            Set-Item Function:script:Get-MO2KnownDialogKind -Value $originalKind
+            Set-Item Function:script:Get-MO2NamedButtons -Value $originalButtons
+            Remove-Variable -Scope Script -Name DialogAuthorityAttempts, DialogAuthorityExecutions -ErrorAction SilentlyContinue
+        }
+    } $config $launchingOwned $launchOwner.targets[0]
+    Assert-MO2Test (-not $dialogAuthority.result.cleared -and $dialogAuthority.result.blockedReason -eq 'stale-session-generation' -and $dialogAuthority.attempts -eq 2 -and $dialogAuthority.executions -eq 1) 'retained dialog cleanup revalidates current generation before every UI action and stops between controls when authority changes'
+    $stopGameSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2StopGame \{.*?\n\}').Value
+    $stopSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Stop \{.*?\n\}').Value
+    $ownedCloseSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2OwnedGameCloseRequest \{.*?\n\}').Value
+    Assert-MO2Test ($stopGameSource -match 'Invoke-MO2OwnedGameCloseRequest -Config \$Config -Owned \$owned' -and
+        $stopSource -match 'Invoke-MO2OwnedGameCloseRequest -Config \$Config -Owned \$owned' -and
+        $stopGameSource -notmatch 'Invoke-MO2OwnedGameCloseRequest[^\r\n]+-Targets' -and
+        $stopSource -notmatch 'Invoke-MO2OwnedGameCloseRequest[^\r\n]+-Targets' -and
+        $ownedCloseSource -match 'Invoke-MO2CurrentGameCloseRequest[^\r\n]+-CurrentData \$currentData' -and
+        $moduleSource -match 'Resolve-MO2OwnedProcessTarget -Config \$Config -Owned \$Owned -Processes @\(\$CurrentInspection[.]processes[.]mo2\)' -and
+        $moduleSource -match 'Resolve-MO2RecordedGameProcessTargets -Recorded @\(\$CurrentData[.]gameProcesses\)' -and
+        $stopGameSource -notmatch 'Get-Process -Id' -and $stopSource -notmatch 'Get-Process -Id') 'stop-game and stop close only the serialized session-recorded game set through retained live handles'
+    $recoverCloseSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2RecoverClose \{.*?\n\}').Value
+    Assert-MO2Test (@([regex]::Matches($recoverCloseSource, '\$owned = Get-MO2OwnedSession -Config \$Config -SessionId \$sessionId')).Count -eq 1 -and $recoverCloseSource -match 'Invoke-MO2CooperativeClose -Config \$Config -Owned \$owned' -and $recoverCloseSource -match 'Set-MO2OwnedSessionStatus -Owned \$owned') 'recovery close preserves one initiating owned-session generation through process action and completion write'
+    $terminateGameSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2TerminateGame \{.*?\n\}').Value
+    $serializedTerminationIndex = $terminateGameSource.IndexOf('Invoke-MO2OwnedSessionMutation', [StringComparison]::Ordinal)
+    $currentOwnerGuardIndex = $terminateGameSource.IndexOf('$currentOwnerResolution = Resolve-MO2OwnedProcessTarget', [StringComparison]::Ordinal)
+    $gameMutationIndex = $terminateGameSource.IndexOf('$verified = Invoke-MO2VerifiedGameTerminationSet', [StringComparison]::Ordinal)
+    Assert-MO2Test ($serializedTerminationIndex -ge 0 -and $currentOwnerGuardIndex -gt $serializedTerminationIndex -and $gameMutationIndex -gt $currentOwnerGuardIndex) 'terminate-game revalidates the exact live MO2 owner inside the serialized transition before requesting game termination'
+
     $missingProfile = Invoke-MO2Validate -Config $config -Profile 'Does Not Exist'
     Assert-MO2Test (-not $missingProfile.ok) 'missing exact profile blocks validation'
     Assert-MO2Test (@($missingProfile.checks | Where-Object { $_.name -eq 'requested-profile' -and $_.status -eq 'fail' }).Count -eq 1) 'profile fallback is never accepted'
@@ -259,19 +628,43 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test ($explicitPrepared.ok -and $explicitPrepared.data.explicitAccess -and $explicitPrepared.data.accessId -eq $accessId -and $explicitPrepared.data.session.runtimeRoute.id -eq 'SteamVRNull') 'prepare binds an explicitly owned access lease and preserves its runtime route'
     $boundAccessStatus = Invoke-MO2AccessStatus -Config $config -AccessId $accessId
     Assert-MO2Test ([long]$boundAccessStatus.data.access.generation -eq 3L -and $boundAccessStatus.data.access.sessionId -eq $explicitSessionId) 'session binding advances generation without losing lease identity'
+    $boundSessionManifest = Get-Content -LiteralPath (Join-Path ([string]$explicitPrepared.data.sessionPath) 'session.json') -Raw | ConvertFrom-Json
+    Assert-MO2Test ([long]$boundSessionManifest.generation -eq [long]$boundAccessStatus.data.access.generation -and $boundSessionManifest.sessionId -eq $explicitSessionId) 'initial session binding projects the authoritative generation into the retained manifest before returning success'
     $staleOwnedSession = & $mo2Module { param($fixtureConfig, $fixtureSessionId) Get-MO2OwnedSession -Config $fixtureConfig -SessionId $fixtureSessionId } $config $explicitSessionId
     $inSessionRenewal = Invoke-MO2RenewAccess -Config $config -AccessId $accessId -EstimatedMinutes 45
-    $staleOwnedSession.data.status = 'fixture-stale-writer'
-    $null = & $mo2Module { param($fixtureOwned) Write-MO2OwnedSessionAtomic -Owned $fixtureOwned -Value $fixtureOwned.data } $staleOwnedSession
+    $renewedSessionManifest = Get-Content -LiteralPath (Join-Path ([string]$explicitPrepared.data.sessionPath) 'session.json') -Raw | ConvertFrom-Json
+    Assert-MO2Test ([long]$renewedSessionManifest.generation -eq [long]$inSessionRenewal.data.access.generation -and $renewedSessionManifest.estimatedDurationMinutes -eq 45) 'in-session access renewal projects the same generation and advisory metadata before returning success'
+    $staleGameRecord = [pscustomobject]@{ id = 9191; name = 'MO2ControlImpossibleFixtureGame'; path = $fixtureGame; startTime = [DateTimeOffset]::UtcNow.ToString('o') }
+    $staleWriterRejected = $false
+    try { $null = & $mo2Module { param($fixtureConfig, $fixtureOwned, $game) Set-MO2OwnedSessionGameProcesses -Config $fixtureConfig -Owned $fixtureOwned -Processes @($game) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc' } $config $staleOwnedSession $staleGameRecord }
+    catch { $staleWriterRejected = $_.Exception.Message -match 'lease transition is stale' }
     $postStaleWriteStatus = Invoke-MO2AccessStatus -Config $config -AccessId $accessId
-    Assert-MO2Test ($inSessionRenewal.ok -and $postStaleWriteStatus.data.access.estimatedDurationMinutes -eq 45 -and [long]$postStaleWriteStatus.data.access.generation -eq 5L -and $postStaleWriteStatus.data.access.runtimeRoute.id -eq 'SteamVRNull') 'a stale session writer preserves a concurrent serialized lease renewal and runtime route'
+    $postStaleWriteLock = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+    $postStaleGameCount = if ($postStaleWriteLock.PSObject.Properties['gameProcesses']) { @($postStaleWriteLock.gameProcesses).Count } else { 0 }
+    Assert-MO2Test ($staleWriterRejected -and $inSessionRenewal.ok -and $postStaleWriteStatus.data.access.estimatedDurationMinutes -eq 45 -and [long]$postStaleWriteStatus.data.access.generation -eq 4L -and $postStaleWriteStatus.data.access.runtimeRoute.id -eq 'SteamVRNull' -and $postStaleWriteLock.status -ne 'running' -and $postStaleGameCount -eq 0) 'a stale game-adoption writer is rejected without replacing a concurrent lease renewal or lifecycle state'
+    $staleMutationState = [pscustomobject]@{ calls = 0 }
+    $staleMutationRejected = $false
+    try {
+        $null = & $mo2Module { param($fixtureOwned, $state) $action = { param($data) $state.calls++; [pscustomobject]@{ sessionData=$data; result=$true } }.GetNewClosure(); Invoke-MO2OwnedSessionMutation -Owned $fixtureOwned -Action $action } $staleOwnedSession $staleMutationState
+    }
+    catch { $staleMutationRejected = $_.Exception.Message -match 'lease transition is stale' }
+    Assert-MO2Test ($staleMutationRejected -and $staleMutationState.calls -eq 0) 'renewal-stale launch or termination authority is rejected before its external process-action callback'
+    $emptyReleaseInspection = { param($fixtureConfig, $currentData) [pscustomobject]@{ processes = [pscustomobject]@{ mo2 = @(); game = @() }; rootBuilder = [pscustomobject]@{ active = @() } } }
+    $staleRelease = & $mo2Module { param($fixtureConfig, $owned, $sessionPath, $factory) Invoke-MO2ReleaseTransition -Config $fixtureConfig -Owned $owned -SessionId ([string]$owned.sessionId) -SessionPath $sessionPath -InspectionFactory $factory } $config $staleOwnedSession ([string]$explicitPrepared.data.sessionPath) $emptyReleaseInspection
+    $lockAfterStaleRelease = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+    Assert-MO2Test (-not $staleRelease.ok -and $staleRelease.state -eq 'blocked' -and $lockAfterStaleRelease.sessionId -eq $explicitSessionId -and [long]$lockAfterStaleRelease.generation -eq [long]$inSessionRenewal.data.access.generation) 'a stale release cannot unbind a newer same-session lifecycle generation'
+    $currentReleaseOwned = & $mo2Module { param($fixtureConfig, $fixtureSessionId) Get-MO2OwnedSession -Config $fixtureConfig -SessionId $fixtureSessionId } $config $explicitSessionId
+    $activeReleaseInspection = { param($fixtureConfig, $currentData) [pscustomobject]@{ processes = [pscustomobject]@{ mo2 = @(); game = @([pscustomobject]@{ id = 9192; name = 'MO2ControlImpossibleFixtureGame'; path = $fixtureGame; startTime = [DateTimeOffset]::UtcNow.ToString('o') }) }; rootBuilder = [pscustomobject]@{ active = @() } } }.GetNewClosure()
+    $activeRelease = & $mo2Module { param($fixtureConfig, $owned, $sessionPath, $factory) Invoke-MO2ReleaseTransition -Config $fixtureConfig -Owned $owned -SessionId ([string]$owned.sessionId) -SessionPath $sessionPath -InspectionFactory $factory } $config $currentReleaseOwned ([string]$explicitPrepared.data.sessionPath) $activeReleaseInspection
+    $lockAfterActiveRelease = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+    Assert-MO2Test (-not $activeRelease.ok -and $activeRelease.state -eq 'blocked' -and $lockAfterActiveRelease.sessionId -eq $explicitSessionId) 'release repeats its live-process veto inside the serialized transition and retains a lifecycle that became active'
     $prematureAccessRelease = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
     Assert-MO2Test (-not $prematureAccessRelease.ok -and $prematureAccessRelease.state -eq 'session-release-required') 'access cannot be released while a session is bound'
     $explicitReleased = Invoke-MO2Release -Config $config -SessionId $explicitSessionId
     Assert-MO2Test ($explicitReleased.ok -and $explicitReleased.state -eq 'session-released-access-retained' -and $explicitReleased.data.releaseAccessRequired) 'session release retains explicitly requested access'
     $accessOnlyStatus = Invoke-MO2AccessStatus -Config $config -AccessId $accessId
     Assert-MO2Test ($accessOnlyStatus.state -eq 'access-owned' -and $accessOnlyStatus.data.access.state -eq 'access-held' -and [string]::IsNullOrWhiteSpace([string]$accessOnlyStatus.data.access.sessionId)) 'released session returns the lock to access-only state'
-    Assert-MO2Test ([long]$accessOnlyStatus.data.access.generation -eq 6L) 'session release advances the serialized lease generation'
+    Assert-MO2Test ([long]$accessOnlyStatus.data.access.generation -eq 5L) 'session release advances the serialized lease generation'
     $releasedAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
     Assert-MO2Test ($releasedAccess.ok -and $releasedAccess.state -eq 'access-released') 'task explicitly releases access when MO2 is no longer needed'
     Assert-MO2Test (-not (Test-Path -LiteralPath $config.session.lockFile -PathType Leaf)) 'explicit access release removes the shared lock'
@@ -346,12 +739,26 @@ selected_profile=@ByteArray(Codex)
     $recoveredAccess = Invoke-MO2RecoverAccess -Config $config -AccessId $abandonedAccessId -ConfirmAbandoned -Label 'fixture confirmed abandoned'
     Assert-MO2Test ($recoveredAccess.ok -and $recoveredAccess.state -eq 'access-recovered') 'confirmed abandoned access can be recovered in proven closed state'
 
+    $currentProcess = Get-Process -Id $PID
+    [ordered]@{
+        contractVersion = 'fixture'; sessionId = 'session-modern-owner'; status = 'running'; ownerPid = $PID
+        ownerProcessPath = [IO.Path]::GetFullPath($currentProcess.Path)
+        ownerProcessStartTime = $currentProcess.StartTime.ToUniversalTime().ToString('o')
+    } | ConvertTo-Json | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    $modernOwnerInspection = Invoke-MO2Inspect -Config $config
+    Assert-MO2Test ($modernOwnerInspection.data.sessionLock.ownerRunning -and $modernOwnerInspection.data.sessionLock.ownerIdentityMatched -and $modernOwnerInspection.data.sessionLock.ownerIdentityMode -eq 'modern-path-and-start-time') 'session-lock liveness consumes the modern owner path/start tuple written by launch and adoption'
+    $modernReused = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+    $modernReused.ownerProcessStartTime = $currentProcess.StartTime.AddMinutes(-1).ToUniversalTime().ToString('o')
+    $modernReused | ConvertTo-Json | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    $modernReusedInspection = Invoke-MO2Inspect -Config $config
+    Assert-MO2Test (-not $modernReusedInspection.data.sessionLock.ownerRunning -and -not $modernReusedInspection.data.sessionLock.ownerIdentityMatched -and $modernReusedInspection.data.sessionLock.ownerIdentityMode -eq 'modern-path-and-start-time') 'modern session-lock liveness rejects a changed owner start instant'
+
     [ordered]@{
         contractVersion = 'fixture'; sessionId = 'session-pid-reuse'; status = 'running'; ownerPid = $PID
         processStartTime = [DateTime]::UtcNow.AddDays(-1).ToString('o')
     } | ConvertTo-Json | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
     $pidReuseInspection = Invoke-MO2Inspect -Config $config
-    Assert-MO2Test (-not $pidReuseInspection.data.sessionLock.ownerRunning -and -not $pidReuseInspection.data.sessionLock.ownerIdentityMatched) 'session ownership rejects a reused PID with a different process start time'
+    Assert-MO2Test (-not $pidReuseInspection.data.sessionLock.ownerRunning -and -not $pidReuseInspection.data.sessionLock.ownerIdentityMatched -and $pidReuseInspection.data.sessionLock.ownerIdentityMode -eq 'legacy-start-time') 'legacy session ownership remains readable and rejects a reused PID with a different process start time'
     Remove-Item -LiteralPath $config.session.lockFile -Force
 
     $missingPrepareAccess = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -WhatIf
@@ -425,6 +832,60 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test (Test-Path -LiteralPath (Join-Path $prepared.data.sessionPath 'session.json') -PathType Leaf) 'prepare creates a durable session manifest'
     Assert-MO2Test ([bool]$prepared.data.session.requirements.skseLoader) 'prepare persists the SKSE requirement for launch revalidation'
     Assert-MO2Test (Test-Path -LiteralPath $prepared.data.controllerPath -PathType Leaf) 'prepare snapshots a durable session controller outside the plugin cache'
+    $atomicManifestPath = Join-Path $prepared.data.sessionPath 'session.json'
+    $atomicLockBefore = Get-Content -LiteralPath $config.session.lockFile -Raw
+    $atomicManifestBefore = Get-Content -LiteralPath $atomicManifestPath -Raw
+    try {
+        $atomicOwned = & $mo2Module { param($cfg, $sessionId) Get-MO2OwnedSession -Config $cfg -SessionId $sessionId } $config ([string]$prepared.data.session.sessionId)
+        $atomicOwnerProcess = Get-Process -Id $PID -ErrorAction Stop
+        $atomicConfig = $config | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+        $atomicConfig.mo2.executable = [IO.Path]::GetFullPath([string]$atomicOwnerProcess.Path)
+        $atomicConfig.mo2.processNames = @([string]$atomicOwnerProcess.ProcessName)
+        $atomicOwnerRecord = [pscustomobject]@{ id = [int]$atomicOwnerProcess.Id; name = [string]$atomicOwnerProcess.ProcessName; path = [IO.Path]::GetFullPath([string]$atomicOwnerProcess.Path); startTime = $atomicOwnerProcess.StartTime.ToUniversalTime().ToString('o') }
+        $null = & $mo2Module { param($owned, $owner) Set-MO2OwnedSessionOwner -Owned $owned -ProcessRecord $owner -Reason 'test-owned exact MO2 owner' } $atomicOwned $atomicOwnerRecord
+        $atomicStaleOwned = $atomicOwned | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+        $ownerGuardLockBefore = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+        $changedAtomicOwner = [pscustomobject]@{ id = [int]$atomicOwnerRecord.id; name = [string]$atomicOwnerRecord.name; path = [string]$atomicOwnerRecord.path; startTime = ([DateTimeOffset]::Parse([string]$atomicOwnerRecord.startTime)).AddSeconds(1).ToString('o') }
+        $ownerCommitRejected = $false
+        try {
+            $null = & $mo2Module { param($cfg, $owned, $process, $changedOwner) $inventory = { @($changedOwner) }.GetNewClosure(); Set-MO2OwnedSessionGameProcesses -Config $cfg -Owned $owned -Processes @($process) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc' -OwnerProcessInventoryFactory $inventory } $atomicConfig $atomicOwned $observedGame $changedAtomicOwner
+        }
+        catch { $ownerCommitRejected = $_.Exception.Message -match 'exact live MO2 owner changed before game-process persistence' }
+        $ownerGuardLockAfter = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+        $ownerGuardGameCount = if ($ownerGuardLockAfter.PSObject.Properties['gameProcesses']) { @($ownerGuardLockAfter.gameProcesses).Count } else { 0 }
+        Assert-MO2Test ($ownerCommitRejected -and [long]$ownerGuardLockAfter.generation -eq [long]$ownerGuardLockBefore.generation -and $ownerGuardLockAfter.status -ne 'running' -and $ownerGuardGameCount -eq 0) 'game-process persistence revalidates the exact live MO2 owner inside the serialized transition and refuses an owner replacement without committing'
+        $null = & $mo2Module { param($cfg, $owned, $process, $owner) $inventory = { @($owner) }.GetNewClosure(); Set-MO2OwnedSessionGameProcesses -Config $cfg -Owned $owned -Processes @($process) -Status 'running' -TimestampProperty 'gameProcessesAdoptedUtc' -OwnerProcessInventoryFactory $inventory } $atomicConfig $atomicOwned $observedGame $atomicOwnerRecord
+        $atomicLock = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+        $atomicManifest = Get-Content -LiteralPath $atomicManifestPath -Raw | ConvertFrom-Json
+        Assert-MO2Test ($atomicLock.status -eq 'running' -and @($atomicLock.gameProcesses).Count -eq 1 -and -not [string]::IsNullOrWhiteSpace([string]$atomicLock.gameProcessesAdoptedUtc)) 'game identity and running state are coherent in the durable ownership record'
+        Assert-MO2Test ($atomicManifest.status -eq 'running' -and @($atomicManifest.gameProcesses).Count -eq 1 -and -not [string]::IsNullOrWhiteSpace([string]$atomicManifest.gameProcessesAdoptedUtc) -and [long]$atomicManifest.generation -eq [long]$atomicLock.generation) 'game identity, running state, and generation are coherent in the serialized durable session manifest projection'
+        $competingMutationState = [pscustomobject]@{ calls = 0 }
+        $competingMutationRejected = $false
+        try {
+            $null = & $mo2Module { param($fixtureOwned, $state) $action = { param($data) $state.calls++; [pscustomobject]@{ sessionData=$data; result=$true } }.GetNewClosure(); Invoke-MO2OwnedSessionMutation -Owned $fixtureOwned -Action $action } $atomicStaleOwned $competingMutationState
+        }
+        catch { $competingMutationRejected = $_.Exception.Message -match 'lease transition is stale' }
+        $manifestAfterCompetingMutation = Get-Content -LiteralPath $atomicManifestPath -Raw | ConvertFrom-Json
+        Assert-MO2Test ($competingMutationRejected -and $competingMutationState.calls -eq 0 -and $manifestAfterCompetingMutation.status -eq 'running' -and [long]$manifestAfterCompetingMutation.generation -eq [long]$atomicLock.generation) 'a competing lifecycle generation refuses before mutation and cannot overtake the newer manifest projection'
+        $projectionFailureOwned = & $mo2Module { param($cfg, $sessionId) Get-MO2OwnedSession -Config $cfg -SessionId $sessionId } $config ([string]$prepared.data.session.sessionId)
+        $projectionFailureOwned.data.status = 'projection-failure-fixture'
+        $projectionFailureReported = $false
+        try {
+            $null = & $mo2Module { param($owned) $failProjection = { param($data) throw 'injected manifest projection failure' }; Write-MO2OwnedSessionAtomic -Owned $owned -Value $owned.data -ManifestProjectionAction $failProjection } $projectionFailureOwned
+        }
+        catch { $projectionFailureReported = $_.Exception.Message -match 'ownership lock committed generation' -and $_.Exception.Message -match 'must be reconciled' }
+        $lockAfterProjectionFailure = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+        $manifestAfterProjectionFailure = Get-Content -LiteralPath $atomicManifestPath -Raw | ConvertFrom-Json
+        Assert-MO2Test ($projectionFailureReported -and $lockAfterProjectionFailure.status -eq 'projection-failure-fixture' -and [long]$projectionFailureOwned.data.generation -eq [long]$lockAfterProjectionFailure.generation -and $manifestAfterProjectionFailure.status -eq 'running' -and [long]$manifestAfterProjectionFailure.generation -lt [long]$lockAfterProjectionFailure.generation) 'a manifest projection failure is attributable while the authoritative committed generation remains recoverable'
+        $projectionRecovery = Invoke-MO2RenewAccess -Config $config -AccessId ([string]$atomicOwned.accessId) -EstimatedMinutes 60
+        $lockAfterProjectionRecovery = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+        $manifestAfterProjectionRecovery = Get-Content -LiteralPath $atomicManifestPath -Raw | ConvertFrom-Json
+        Assert-MO2Test ($projectionRecovery.ok -and $manifestAfterProjectionRecovery.status -eq 'projection-failure-fixture' -and [long]$manifestAfterProjectionRecovery.generation -eq [long]$lockAfterProjectionRecovery.generation -and $manifestAfterProjectionRecovery.estimatedDurationMinutes -eq 60) 'the next bound access renewal reconciles a failed manifest projection from the authoritative ownership lock'
+    }
+    finally {
+        $atomicLockBefore | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+        $atomicManifestBefore | Set-Content -LiteralPath $atomicManifestPath -Encoding utf8
+    }
     $durableStatus = & $prepared.data.controllerPath status -SessionId ([string]$prepared.data.session.sessionId) -Compact -NoExit | ConvertFrom-Json
     Assert-MO2Test ($durableStatus.ok -and $durableStatus.state -eq 'prepared') 'durable session controller can resume the owned lifecycle independently'
     Assert-MO2Test ($durableStatus.data.approval.entryPoint -eq [IO.Path]::GetFullPath([string]$prepared.data.controllerPath) -and $durableStatus.data.approval.reusablePrefix[5] -eq 'status') 'durable controller advertises its own stable literal approval prefix'
@@ -485,6 +946,71 @@ selected_profile=@ByteArray(Codex)
     $terminateGameWithoutRecordedIdentity = Invoke-MO2TerminateGame -Config $config -SessionId $sessionId -WhatIf
     Assert-MO2Test (-not $terminateGameWithoutRecordedIdentity.ok -and $terminateGameWithoutRecordedIdentity.state -eq 'blocked') 'terminate-game refuses process-name recovery without launch-recorded identities and a retained MO2 owner'
 
+    $ownerFixtureProcess = $null
+    $preTerminateIdentityLock = Get-Content -LiteralPath $config.session.lockFile -Raw
+    try {
+        $ownerFixtureProcess = Start-Process -FilePath $mo2Exe -ArgumentList '/c', 'ping -n 30 127.0.0.1 > nul' -PassThru -WindowStyle Hidden
+        Start-Sleep -Milliseconds 100
+        $ownerFixtureProcess.Refresh()
+        $exactResumeLock = $preTerminateIdentityLock | ConvertFrom-Json
+        $exactResumeLock.status = 'mo2-open'
+        $exactResumeLock | Add-Member -NotePropertyName ownerPid -NotePropertyValue ([int]$ownerFixtureProcess.Id) -Force
+        $exactResumeLock | Add-Member -NotePropertyName ownerProcessPath -NotePropertyValue $mo2Exe -Force
+        $exactResumeLock | Add-Member -NotePropertyName ownerProcessStartTime -NotePropertyValue $ownerFixtureProcess.StartTime.ToUniversalTime().ToString('o') -Force
+        $exactResumeLock | Add-Member -NotePropertyName gameProcesses -NotePropertyValue @() -Force
+        $exactResumeLock | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+        $exactOwnerRecord = [pscustomobject]@{ id = [int]$ownerFixtureProcess.Id; name = $ownerFixtureProcess.ProcessName; path = $mo2Exe; startTime = $ownerFixtureProcess.StartTime.ToUniversalTime().ToString('o') }
+        $staleCloseOwned = & $mo2Module { param($fixtureConfig, $fixtureSessionId) Get-MO2OwnedSession -Config $fixtureConfig -SessionId $fixtureSessionId } $config $sessionId
+        $advancedCloseLock = $exactResumeLock | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+        $advancedCloseLock.generation = [long]$advancedCloseLock.generation + 1L
+        $advancedCloseLock | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+        $exactCloseInventory = { param($fixtureConfig) @($exactOwnerRecord) }.GetNewClosure()
+        $staleCooperativeClose = & $mo2Module { param($fixtureConfig, $owned, $record, $factory) Invoke-MO2CooperativeCloseCore -Config $fixtureConfig -Owned $owned -InitialProcesses @($record) -TimeoutSeconds 1 -ProcessInventoryFactory $factory } $config $staleCloseOwned $exactOwnerRecord $exactCloseInventory
+        $ownerFixtureProcess.Refresh()
+        Assert-MO2Test (-not $staleCooperativeClose.closed -and $staleCooperativeClose.blockedReason -eq 'stale-session-generation' -and @($staleCooperativeClose.actions).Count -eq 0 -and -not $ownerFixtureProcess.HasExited) 'cooperative close rejects a stale generation at the UI-action boundary without touching the still-exact owner'
+        $exactResumeLock | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+        $delayedGameState = [pscustomobject]@{ calls = 0 }
+        $delayedGameInspection = {
+            param($fixtureConfig, $currentData)
+            $delayedGameState.calls++
+            $games = if ($delayedGameState.calls -gt 1) { @([pscustomobject]@{ id = 9193; name = 'MO2ControlImpossibleFixtureGame'; path = $fixtureGame; startTime = [DateTimeOffset]::UtcNow.ToString('o') }) } else { @() }
+            [pscustomobject]@{ processes = [pscustomobject]@{ mo2 = @($exactOwnerRecord); game = $games }; rootBuilder = [pscustomobject]@{ active = @() } }
+        }.GetNewClosure()
+        $delayedGameTerminate = & $mo2Module { param($fixtureConfig, $fixtureSessionId, $factory) Invoke-MO2Terminate -Config $fixtureConfig -SessionId $fixtureSessionId -InspectionFactory $factory } $config $sessionId $delayedGameInspection
+        $ownerFixtureProcess.Refresh()
+        Assert-MO2Test (-not $delayedGameTerminate.ok -and $delayedGameTerminate.data.forceTermination.reason -eq 'game-or-loader-became-active' -and -not $ownerFixtureProcess.HasExited) 'force termination rechecks the no-game veto inside the serialized mutation before touching the exact owner'
+        $delayedBuildState = [pscustomobject]@{ calls = 0 }
+        $delayedBuildInspection = {
+            param($fixtureConfig, $currentData)
+            $delayedBuildState.calls++
+            $active = if ($delayedBuildState.calls -gt 1) { @([pscustomobject]@{ path = (Join-Path $fixture 'delayed-rootbuilder/BuildData.json') }) } else { @() }
+            [pscustomobject]@{ processes = [pscustomobject]@{ mo2 = @($exactOwnerRecord); game = @() }; rootBuilder = [pscustomobject]@{ active = $active } }
+        }.GetNewClosure()
+        $delayedBuildTerminate = & $mo2Module { param($fixtureConfig, $fixtureSessionId, $factory) Invoke-MO2Terminate -Config $fixtureConfig -SessionId $fixtureSessionId -InspectionFactory $factory } $config $sessionId $delayedBuildInspection
+        $ownerFixtureProcess.Refresh()
+        Assert-MO2Test (-not $delayedBuildTerminate.ok -and $delayedBuildTerminate.data.forceTermination.reason -eq 'rootbuilder-builddata-became-active' -and -not $ownerFixtureProcess.HasExited) 'force termination rechecks active RootBuilder evidence inside the serialized mutation before touching the exact owner'
+        $exactResumeDryRun = Invoke-MO2Launch -Config $config -SessionId $sessionId -StartOnly -WhatIf
+        Assert-MO2Test ($exactResumeDryRun.ok -and $exactResumeDryRun.state -eq 'dry-run' -and $exactResumeDryRun.data.ownershipResolution.ok) 'retained launch dry-run requires and accepts the current exact MO2 owner tuple'
+        $reusedPidLock = $preTerminateIdentityLock | ConvertFrom-Json
+        $reusedPidLock.status = 'mo2-open'
+        $reusedPidLock | Add-Member -NotePropertyName ownerPid -NotePropertyValue ([int]$ownerFixtureProcess.Id) -Force
+        $reusedPidLock | Add-Member -NotePropertyName ownerProcessPath -NotePropertyValue $mo2Exe -Force
+        $reusedPidLock | Add-Member -NotePropertyName ownerProcessStartTime -NotePropertyValue ([DateTimeOffset]$ownerFixtureProcess.StartTime.AddMinutes(-1)).ToString('o') -Force
+        $reusedPidLock | Add-Member -NotePropertyName gameProcesses -NotePropertyValue @() -Force
+        $reusedPidLock | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+        $reusedPidLaunch = Invoke-MO2Launch -Config $config -SessionId $sessionId -StartOnly -WhatIf
+        Assert-MO2Test (-not $reusedPidLaunch.ok -and $reusedPidLaunch.state -eq 'blocked' -and $reusedPidLaunch.data.ownershipResolution.reason -eq 'recorded-owner-start-time-mismatch') 'retained launch refuses a reused owner PID before dry-run authorization or dispatch'
+        $reusedPidTerminate = Invoke-MO2Terminate -Config $config -SessionId $sessionId -WhatIf
+        Assert-MO2Test (-not $reusedPidTerminate.ok -and $reusedPidTerminate.state -eq 'blocked' -and $reusedPidTerminate.data.ownerIdentity.reason -eq 'recorded-owner-start-time-mismatch') 'terminate refuses a configured MO2 process whose reused PID does not match the recorded start time'
+    }
+    finally {
+        $preTerminateIdentityLock | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+        if ($ownerFixtureProcess -and -not $ownerFixtureProcess.HasExited) {
+            Stop-Process -Id $ownerFixtureProcess.Id -Force -ErrorAction SilentlyContinue
+            $ownerFixtureProcess.WaitForExit(5000) | Out-Null
+        }
+    }
+
     $terminateDryRun = Invoke-MO2Terminate -Config $config -SessionId $sessionId -WhatIf
     Assert-MO2Test ($terminateDryRun.ok -and $terminateDryRun.state -eq 'dry-run') 'terminate dry-run succeeds only after game/rootbuilder absence'
     Assert-MO2Test (@($terminateDryRun.errors).Count -eq 0 -and @($terminateDryRun.warnings).Count -eq 0) 'action results omit null warning and error entries'
@@ -533,7 +1059,7 @@ selected_profile=@ByteArray(Codex)
             try {
                 Set-Item -Path Function:script:Test-MO2InteractiveDesktop -Value { $true }
                 Set-Item -Path Function:script:Invoke-MO2CooperativeClose -Value {
-                    param($Config, $InitialProcesses, $EvidenceDirectory, $TimeoutSeconds)
+                    param($Config, $Owned, $InitialProcesses, $EvidenceDirectory, $TimeoutSeconds)
                     [pscustomobject][ordered]@{
                         closed = $true
                         initialProcesses = @($InitialProcesses)
@@ -564,6 +1090,7 @@ selected_profile=@ByteArray(Codex)
     $boundRecoveryRouteFingerprint = & $mo2Module { param($route) Get-MO2RuntimeRouteContractFingerprint $route } $recoveryBoundLease.runtimeRoute
     Assert-MO2Test ($recoveryManifest.sessionId -eq $recoverySessionId -and $manifestRecoveryRouteFingerprint -ceq $expectedRecoveryRouteFingerprint -and $recoveryManifest.status -eq 'mo2-closed') 'recovery manifest durably retains the complete canonical route and closed state'
     Assert-MO2Test ($recoveryBoundLease.sessionId -eq $recoverySessionId -and $boundRecoveryRouteFingerprint -ceq $expectedRecoveryRouteFingerprint -and $recoveryBoundLease.accessId -eq $recoveryAccessId) 'recovery binding durably retains matching session, access, and complete route identities'
+    Assert-MO2Test ([long]$recoveryManifest.generation -eq [long]$recoveryBoundLease.generation) 'recovery binding projects its authoritative lease generation into the retained manifest before cooperative control'
     '{}' | Set-Content -LiteralPath $buildData -Encoding utf8
     $recoveredRootBuilder = Invoke-MO2RecoverRootBuilder -Config $config -SessionId $recoverySessionId -StartOnly -WhatIf
     Assert-MO2Test ($recoveredRootBuilder.ok -and $recoveredRootBuilder.state -eq 'dry-run' -and $recoveredRootBuilder.data.rootBuilderRecovery -and ($recoveredRootBuilder.data.arguments -join '|') -eq '--profile|Codex|run|--executable|Launch MGO - Do Not Unlock') 'RootBuilder launch admission consumes the persisted recovered-session route'

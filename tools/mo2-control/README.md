@@ -31,10 +31,41 @@ Notepad++, or another editor and never force-terminates. Existing retained-MO2
 game cycling and explicit safe-gated termination remain available.
 
 `open` and `launch` accept `-StartOnly`: they write their exact session receipt,
-start only the intended process, return immediately with the session/evidence
-path, and direct the caller to poll `status`. When `status` proves the one exact
+start only the intended process, and commit the resulting process identity while
+holding the same generation transition that authorized dispatch. A stale renewal
+or competing lifecycle transition therefore refuses before process creation,
+not after it. They then return with the session/evidence path and direct the
+caller to poll `status`. When `status` proves the one exact
 adopted MO2 process and its visible `MainWindow`, it advances an `opening`
-session to durable `mo2-open` so a later game launch is valid. A missing session
+session to durable `mo2-open` so a later game launch is valid. After a
+`launch -StartOnly`, `status` also adopts only configured game/loader identities
+whose PID, process name, executable path, and start time bind them to the
+recorded launch and a freshly revalidated exact MO2 owner. The launch records a
+pre-dispatch process set and dispatch boundary, so a recent pre-existing process
+cannot enter through a timing allowance. A loader-only observation remains
+pending until the configured primary game appears, so polling cannot finalize
+an incomplete launch set. Helper-to-runtime owner adoption is allowed only once,
+while the session is still opening or launching, and requires the candidate to
+be the exact requested process or its direct child whose parent PID and start
+time match the dispatched helper under a matching durable dispatch receipt.
+Launch/open capture an eligible direct child's exact identity while retaining
+the original helper handle, so the lifetime proof survives a later helper exit
+without treating a recycled parent PID as authority. A merely configured later
+process cannot become session
+authority. Synchronous compatibility callers keep the generation produced by
+their own handoff through terminal completion. If `status` or another lifecycle
+writer wins that race, the older caller preserves the newer state and recognizes
+success only when that durable record proves the same exact attempt completed.
+Later `terminate-game` rebinds every
+recorded game identity to a retained live process handle, revalidates its full
+identity, configured path, and current serialized session generation immediately
+before mutation, and never reopens a PID for termination. This makes exact
+termination and RootBuilder recovery
+available without reissuing the launch. RootBuilder `Unlock` revalidates that
+same recorded MO2 PID, executable path, and start time through one retained
+process handle before window selection, before every UI action, and again before
+reporting recovery success. Each action also checks current session-generation
+authority. A missing session
 ID is a structured `missing-session-id` precondition instead of a PowerShell
 binding failure. Launch classifies the exact `Failed to write settings` dialog
 and cooperative close acknowledges only its exact `OK` button.
@@ -158,8 +189,29 @@ overrides the profile's actual runtime files.
 never expires, steals, or transfers a lease because its estimate elapsed.
 `renew-access` refreshes the recorded activity time and can replace the
 estimate. `access-status` reports availability and exact ownership.
-Session owner liveness is bound to both process ID and process start time, so a
-reused PID cannot make an abandoned session appear live.
+Every lifecycle commit writes the ownership lock as the authoritative state and
+projects that same generation into `session.json` before releasing the transition
+lock. An older writer cannot overtake a newer manifest. If projection itself
+fails, the error identifies the already committed lock generation; the next
+serialized commit reconciles the manifest from that authoritative state.
+Initial preparation, recovery-session binding, and in-session `renew-access`
+use the same projection rule; access-only renewal has no session manifest to
+update.
+Game-identity persistence also resolves one exact live MO2 owner inside that
+same serialized transition before it may publish `running`. Exact game
+termination repeats that owner proof inside its serialized transition before
+requesting any game-process termination, preserving the owner required for
+RootBuilder restoration.
+Modern session owner liveness is bound to process ID, executable path, and
+process start time, so a reused PID cannot make an abandoned session appear
+live. Readable legacy PID/start-time records are labelled separately from the
+modern path-bound identity contract; PID presence alone is never reported as an
+identity match.
+
+Cooperative close re-resolves that exact owner after game shutdown and retains
+an open kernel process handle across each `Unlock`, `Exit`, or window-close UI
+action. If the owner exits or its PID, path, or start time changes, close stops
+without acting on the replacement process.
 
 Every task must call `release-access` as soon as it no longer needs MO2. This
 includes compilation, source editing, result analysis, report writing, and any
@@ -210,22 +262,37 @@ Immediately after process creation it writes `mo2-open-started.json` and marks
 the owned session `opening`. If the caller's outer timeout expires before UIA
 readiness, a later `status`, `close`, or `recover-close` still has durable PID,
 path, argument, and timestamp evidence for exact-process adoption.
-`status` is bounded and mutates only the durable `opening` to `mo2-open`
-transition after exact process and visible-main-window proof. `stop-game`
-requests normal closure of the owned game/loader while preserving the exact
-owner MO2 PID, allowing controlled relaunches. After the game exits it first
+`status` is bounded and mutates only proven lifecycle transitions: `opening` to
+`mo2-open`, or `launching` to `running` with exact post-launch process identities.
+Each retained relaunch archives the preceding active game identities with their
+launch-attempt provenance before opening a new active identity set; it does not
+discard the earlier evidence or reuse it as authority for the new game.
+`stop-game` derives its complete graceful-close target set from the game
+identities recorded in the current serialized session, vetoes the action when
+the live inventory contains any additional configured game or loader process,
+binds every owned target to a retained live process handle, and revalidates its
+PID, name, executable path, start instant, and current session generation before
+requesting normal closure; the same serialized boundary must still contain the
+exact recorded MO2 owner. `stop` uses the same helper and never reopens an
+earlier PID. After the game exits `stop-game` first
 observes the exact session-owned MO2 PID for a bounded stability window,
 allowing a delayed post-stop dialog to arrive. It then acknowledges only a
 structurally classified retained `Failed to run` dialog; an unknown modal returns
-`game-stopped-needs-attention` without touching it. If MO2 exits immediately
+`game-stopped-needs-attention` without touching it. Each retained-dialog action
+rechecks the initiating generation and exact retained owner handle. If MO2 exits immediately
 after the game, `stop-game` returns `mo2-exited-after-game-stop`, sets
 `releaseRequired`, and refuses to represent the session as relaunchable. `close`
 refuses while a game/loader exists and cooperatively resolves
 MO2's structured `File` → `Exit` path and visible modal chain, including the VFS
 `Unlock` prompt. `stop` first closes the game and then uses the same MO2
-resolver. `release` ends only the exactly owned session after proving MO2 and
-the game are closed, while retaining the evidence directory. It returns the
-explicit lease to access-only state. All mutation commands have `-WhatIf`.
+resolver. Every cooperative UI action rechecks the caller's current lease
+generation while retaining the exact owner handle. Recovery close also carries
+one initiating generation through its close result and completion write rather
+than reacquiring newer authority for an older result. `release` repeats current
+generation and live-process checks inside its serialized transition, then ends
+only the exactly owned session while retaining the evidence directory. It
+returns the explicit lease to access-only state. All mutation commands have
+`-WhatIf`.
 Evidence
 collection, archive verification, profile mutation, cache management, and
 recovery remain deferred until separately bounded.
@@ -241,11 +308,16 @@ The retained cycle is:
 ```
 
 Resume is accepted only from a bounded stopped/failure state, with no game
-process and exactly one MO2 process matching the session's original owner PID.
+process and exactly one MO2 process matching the session's recorded owner PID,
+configured executable path, and process start instant. That exact identity is
+checked again immediately before dispatch; legacy PID-only records cannot
+authorize dry-run or live relaunch.
 
 `terminate` is intentionally distinct from `stop`: it force-terminates only
 MO2 processes owned by the active session, and only after proving that no game
-or loader process is running and no RootBuilder `BuildData.json` remains.
+or loader process is running and no RootBuilder `BuildData.json` remains. Those
+vetoes are reobserved inside the same serialized boundary that revalidates the
+exact owner and requests termination.
 
 Visible `open`, `close`, `recover-close`, `stop-game`, and `stop` operations must
 run as the logged-on user on the interactive Windows desktop. In Codex this
