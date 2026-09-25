@@ -37,6 +37,7 @@ function Get-StableRuntimePath {
     $configurationPath = Join-Path $env:LOCALAPPDATA 'SkyrimVRAutomation\machine.local.json'
     if (-not (Test-Path -LiteralPath $configurationPath -PathType Leaf)) { return $null }
     $configuration = Get-Content -LiteralPath $configurationPath -Raw | ConvertFrom-Json -Depth 20
+    if (-not $configuration.PSObject.Properties['devBenchRuntimePath']) { return $null }
     $configuredPath = [string]$configuration.devBenchRuntimePath
     if ([string]::IsNullOrWhiteSpace($configuredPath)) { return $null }
     return [IO.Path]::GetFullPath($configuredPath)
@@ -206,11 +207,35 @@ catch {
     if ($packageWatch.IsRunning) { $packageWatch.Stop() }
     $boundedAttempt = $script:lastBoundedAttempt
     $boundedChildLaunched = $null -ne $boundedAttempt -and $null -ne $boundedAttempt.pid
+    $preflightReceiptPath = $null
+    if ([string]::IsNullOrWhiteSpace($resolvedEvidence) -and
+        -not [string]::IsNullOrWhiteSpace($EvidenceDirectory)) {
+        $resolvedEvidence = [IO.Path]::GetFullPath($EvidenceDirectory)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($resolvedEvidence) -and
+        -not (Test-Path -LiteralPath $resolvedEvidence)) {
+        try {
+            New-Item -ItemType Directory -Path $resolvedEvidence -ErrorAction Stop | Out-Null
+            $preflightReceiptPath = Join-Path $resolvedEvidence 'qualification-preflight.failure.json'
+            [pscustomobject][ordered]@{
+                schema = 'csx-render-scale-qualification-preflight-failure-v1'
+                status = 'INFRASTRUCTURE_ERROR'
+                timestampUtc = [DateTimeOffset]::UtcNow.ToString('o')
+                packageElapsedMs = [Math]::Round($packageWatch.Elapsed.TotalMilliseconds, 3)
+                childLaunched = [bool]$boundedChildLaunched
+                error = $_.Exception.Message
+            } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $preflightReceiptPath -Encoding utf8 -ErrorAction Stop
+        }
+        catch {
+            $preflightReceiptPath = $null
+        }
+    }
     Write-PackageResult ([pscustomobject][ordered]@{
         ok = $false
         status = 'INFRASTRUCTURE_ERROR'
         packageElapsedMs = [Math]::Round($packageWatch.Elapsed.TotalMilliseconds, 3)
         evidenceDirectory = $resolvedEvidence
+        preflightReceiptPath = $preflightReceiptPath
         processId = $(if ($null -ne $boundedAttempt) { $boundedAttempt.pid } else { $null })
         exitCode = $(if ($null -ne $boundedAttempt) { $boundedAttempt.exitCode } else { $null })
         timedOut = [bool]($null -ne $boundedAttempt -and $boundedAttempt.timedOut)
