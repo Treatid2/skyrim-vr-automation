@@ -33,6 +33,40 @@ Assert-EntrypointFailure -Arguments @{
 Assert-EntrypointFailure -Arguments @{ PrMode = $true } `
     -ExpectedError 'PR mode requires -BaselinePath and -ExpectedBaselineBuildId.'
 
+$missingPropertyRoot = Join-Path ([IO.Path]::GetTempPath()) "csx-qualification-missing-runtime-$([guid]::NewGuid().ToString('N'))"
+$missingPropertyEvidence = Join-Path $missingPropertyRoot 'evidence'
+$priorLocalAppData = $env:LOCALAPPDATA
+$priorRuntimePath = $env:CSX_DEVBENCH_RUNTIME_PATH
+try {
+    $configDirectory = Join-Path $missingPropertyRoot 'SkyrimVRAutomation'
+    New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
+    '{}' | Set-Content -LiteralPath (Join-Path $configDirectory 'machine.local.json') -Encoding utf8
+    $env:LOCALAPPDATA = $missingPropertyRoot
+    $env:CSX_DEVBENCH_RUNTIME_PATH = $null
+    $preflightText = & (Get-Command pwsh -ErrorAction Stop).Source -NoProfile -NonInteractive -File $entrypoint `
+        -EvidenceDirectory $missingPropertyEvidence -Compact | Out-String
+    $preflightExitCode = $LASTEXITCODE
+    $preflightResult = $preflightText | ConvertFrom-Json -Depth 20
+    if ($preflightExitCode -ne 4 -or
+        [string]$preflightResult.status -ne 'INFRASTRUCTURE_ERROR' -or
+        $null -ne $preflightResult.processId -or
+        [string]$preflightResult.runtimeCleanup.state -cne 'not_applicable') {
+        throw "Missing optional runtime property did not produce a no-child infrastructure exit 4: $preflightText"
+    }
+    if ('No running DevBench runtime was selected. Pass -RuntimePath, set CSX_DEVBENCH_RUNTIME_PATH, or configure devBenchRuntimePath in %LOCALAPPDATA%\SkyrimVRAutomation\machine.local.json before saying start.' -notin @($preflightResult.errors)) {
+        throw "Missing optional runtime property did not produce actionable guidance: $preflightText"
+    }
+    if ([string]$preflightResult.preflightReceiptPath -cne (Join-Path $missingPropertyEvidence 'qualification-preflight.failure.json') -or
+        -not (Test-Path -LiteralPath ([string]$preflightResult.preflightReceiptPath) -PathType Leaf)) {
+        throw "Missing optional runtime property did not retain its preflight receipt: $preflightText"
+    }
+}
+finally {
+    $env:LOCALAPPDATA = $priorLocalAppData
+    $env:CSX_DEVBENCH_RUNTIME_PATH = $priorRuntimePath
+    if (Test-Path -LiteralPath $missingPropertyRoot) { Remove-Item -LiteralPath $missingPropertyRoot -Recurse -Force }
+}
+
 $runnerCommon = @{
     EvidenceDirectory = Join-Path ([IO.Path]::GetTempPath()) "csx-runner-admission-$([guid]::NewGuid().ToString('N'))"
     RuntimePath = 'C:\missing-runtime.json'
