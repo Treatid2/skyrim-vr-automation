@@ -20,8 +20,12 @@ edit `modlist.txt` ad hoc.
   executable, entry point, or subcommand behind a variable or `-Command`.
 - For enabling, disabling, or restoring one exact mod marker, read
   `../../tools/mo2-profile-control/README.md` and inspect the entry point's
-  parameter block before acting. For a DLL deployment, prefer the workspace
-  controller's `-WinningPaths` transaction; do not guess MO2 priority order.
+  parameter block before acting. For a deployed mod, prefer `add-enable`: pass
+  its exact directory and let the controller discover matching DLL paths,
+  choose sufficient priority, and conservatively retire only exact DLL-only
+  providers. Do not calculate priority from names or disable a mixed-content
+  provider manually. Select `KeepProviders` when an older DLL-only provider
+  must remain enabled.
 - For every independent test task, read
   `../../tools/mo2-workspace-control/README.md` and use the stable task ID to
   discover, resume, or create its task profile before preparing a session.
@@ -161,9 +165,10 @@ are:
   primary list additively: install a new version under a new mod name, disable
   the old marker, and enable the new marker. Retained task profiles remain
   unchanged until their owner explicitly requests a fresh clone.
-- Register a task DLL with its exact relative path in `-WinningPaths`. Treat
-  the returned loose-file provider proof as scoped: overwrite, unmanaged game
-  files, and archives still require separate VFS evidence.
+- Prefer `add-enable` for a deployed task mod so exact DLL paths and priority
+  are controller-derived. Treat the returned loose-file provider proof as
+  scoped: overwrite, unmanaged game files, and archives still require separate
+  VFS evidence.
 - Never treat `coc APStartCell` as a genuine New Game. Copied ordinary saves
   are conveniences, not deterministic baselines; use only an exact
   hash-verified fixture when baseline provenance matters.
