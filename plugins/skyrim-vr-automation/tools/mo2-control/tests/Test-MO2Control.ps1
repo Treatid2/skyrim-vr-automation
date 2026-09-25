@@ -283,6 +283,171 @@ executable_blacklist="Steam.exe;notepad++.exe"
     $entryAccessDryRun = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') request-access -ConfigPath $configPath -Label 'approval fixture' -TaskId 'entry-fixture-task' -RuntimeRoute SteamVR -EstimatedMinutes 5 -WhatIf -Compact -NoExit | ConvertFrom-Json
     Assert-MO2Test ($entryAccessDryRun.ok -and $entryAccessDryRun.data.access.ownerTaskId -eq 'entry-fixture-task' -and $entryAccessDryRun.data.configuration.exists -and $entryAccessDryRun.data.approval.reusableApprovalEligible -and $entryAccessDryRun.data.approval.reusablePrefix[5] -eq 'request-access') 'dictionary-backed entry-point results retain task identity, configuration, and approval metadata'
 
+    $entryHumanDryRun = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') request-access -ConfigPath $configPath -AccessKind human -Profile Codex -TaskId 'human-fixture-task' -Label 'human fixture' -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-MO2Test ($entryHumanDryRun.ok -and $entryHumanDryRun.data.access.accessKind -eq 'human' -and $entryHumanDryRun.data.access.profile -eq 'Codex' -and $entryHumanDryRun.data.access.humanMutationTaskId -eq 'human-fixture-task' -and -not [string]::IsNullOrWhiteSpace([string]$entryHumanDryRun.data.access.humanMutationId) -and $null -eq $entryHumanDryRun.data.access.runtimeRoute) 'human access binds the exact selected profile and records TaskId routing metadata without inventing a runtime route'
+
+    $legacyCredentialSha256 = ('A5' * 32)
+    [ordered]@{
+        contractVersion = '0.9.0'
+        accessCredentialSha256 = $legacyCredentialSha256
+        acquisitionMode = 'explicit-access'
+        status = 'access-held'
+        label = 'legacy credential fixture'
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    $legacyPublicInspection = Invoke-MO2Inspect -Config $config
+    $legacyPublicValidation = Invoke-MO2Validate -Config $config
+    $legacyPublicControllerStatus = Invoke-MO2Status -Config $config
+    $legacyPublicCliFailure = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') recover-close -ConfigPath $configPath -NoExit | ConvertFrom-Json
+    $legacyPublicJson = @($legacyPublicInspection, $legacyPublicValidation, $legacyPublicControllerStatus, $legacyPublicCliFailure) | ConvertTo-Json -Depth 16 -Compress
+    Assert-MO2Test (-not ($legacyPublicJson -match [regex]::Escape($legacyCredentialSha256))) 'legacy credential verifier value is absent from inspect, validation, status, and CLI failure output'
+    Assert-MO2Test ($legacyPublicJson -notmatch '"accessCredentialSha256"\s*:') 'legacy credential verifier field is removed recursively from every public output boundary'
+    Remove-Item -LiteralPath $config.session.lockFile -Force
+
+    $humanProcess = Start-Process -FilePath $mo2Exe -ArgumentList @('/d', '/c', 'ping -n 30 127.0.0.1 >nul') -WindowStyle Hidden -PassThru
+    try {
+        $humanProcessDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        do {
+            $humanInspection = Invoke-MO2Inspect -Config $config
+            if (@($humanInspection.data.processes.mo2 | Where-Object id -eq $humanProcess.Id).Count -eq 1) { break }
+            Start-Sleep -Milliseconds 50
+        } while ([DateTime]::UtcNow -lt $humanProcessDeadline)
+
+        $humanAccess = Invoke-MO2RequestAccess -Config $config -AccessKind human -Profile Codex -TaskId 'human-fixture-task' -Label 'human fixture'
+        $humanAccessId = [string]$humanAccess.data.access.accessId
+        $humanLeaseId = [string]$humanAccess.data.access.leaseId
+        $humanMutationId = [string]$humanAccess.data.access.humanMutationId
+        Assert-MO2Test ($humanAccess.ok -and $humanAccess.data.access.accessKind -eq 'human' -and $humanAccess.data.access.profile -eq 'Codex') 'human access can reserve an already-open exact MO2 profile'
+        $humanLockText = Get-Content -LiteralPath $config.session.lockFile -Raw
+        $humanMutationHash = [string](($humanLockText | ConvertFrom-Json).humanMutationHash)
+        Assert-MO2Test (-not ($humanLockText -match [regex]::Escape($humanMutationId)) -and ($humanLockText | ConvertFrom-Json).humanMutationHash.Length -eq 64) 'durable human lease stores only the private credential hash'
+        $humanStatus = Invoke-MO2AccessStatus -Config $config
+        Assert-MO2Test (-not (($humanStatus | ConvertTo-Json -Depth 16 -Compress) -match [regex]::Escape($humanMutationId))) 'public access status never discloses the private human mutation credential'
+        $humanPublicInspection = Invoke-MO2Inspect -Config $config
+        $humanPublicValidation = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') validate -ConfigPath $configPath -NoExit | ConvertFrom-Json
+        $humanPublicControllerStatus = Invoke-MO2Status -Config $config
+        $humanPublicBlockedRecovery = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') recover-close -ConfigPath $configPath -NoExit | ConvertFrom-Json
+        $humanPublicJson = @($humanPublicInspection, $humanPublicValidation, $humanPublicControllerStatus, $humanPublicBlockedRecovery) | ConvertTo-Json -Depth 16 -Compress
+        Assert-MO2Test (-not ($humanPublicJson -match [regex]::Escape($humanAccessId)) -and -not ($humanPublicJson -match [regex]::Escape($humanMutationId)) -and -not ($humanPublicJson -match [regex]::Escape($humanMutationHash))) 'human inspect, validation, status, and blocked recovery outputs never disclose private capability material'
+        Assert-MO2Test ($humanPublicJson -notmatch '"accessId"\s*:' -and $humanPublicJson -notmatch '"humanMutation(Id|Hash)"\s*:') 'human public output removes private capability fields recursively, including nested lock details'
+        $humanPrepare = Invoke-MO2Prepare -Config $config -AccessId $humanAccessId -Profile Codex -WhatIf
+        Assert-MO2Test (-not $humanPrepare.ok -and $humanPrepare.state -eq 'human-lease-session-forbidden') 'human access cannot be converted into an automation launch session'
+
+        $publicLeaseRejected = $false
+        try { Invoke-MO2ValidateHumanMutation -Config $config -HumanMutationId $humanLeaseId -Profile Codex -TaskId 'human-fixture-task' | Out-Null }
+        catch { $publicLeaseRejected = $_.Exception.Message -eq 'The supplied human mutation credential is not authorized for this task.' }
+        Assert-MO2Test $publicLeaseRejected 'public LeaseId is coordination metadata and cannot authorize mutation'
+        $wrongTaskRejected = $false
+        try { Invoke-MO2ValidateHumanMutation -Config $config -HumanMutationId $humanMutationId -Profile Codex -TaskId 'other-task' | Out-Null }
+        catch { $wrongTaskRejected = $_.Exception.Message -eq 'The supplied human mutation credential is not authorized for this task.' }
+        Assert-MO2Test $wrongTaskRejected 'private human mutation capability requires the matching recorded TaskId routing label'
+
+        $unclassifiedRefresh = Invoke-MO2Refresh -Config $config -HumanMutationId $humanMutationId -Profile Codex -TaskId 'human-fixture-task' -WhatIf
+        Assert-MO2Test (-not $unclassifiedRefresh.ok -and $unclassifiedRefresh.state -eq 'known-ground-state-required') 'human refresh refuses an unclassified non-MO2 fixture window state'
+
+        $originalMO2Executable = [string]$config.mo2.executable
+        $env:MO2_REFRESH_FIXTURE_EXE = $mo2Exe
+        $config.mo2.executable = '%MO2_REFRESH_FIXTURE_EXE%'
+        $humanLiveActions = & $mo2Module {
+            param($fixtureConfig, $fixtureMutationId)
+            $originalWindowSnapshot = (Get-Command Get-MO2WindowSnapshot -CommandType Function).ScriptBlock
+            $originalRefreshHelper = (Get-Command Invoke-MO2RefreshHelperProcess -CommandType Function).ScriptBlock
+            try {
+                Set-Item -Path Function:script:Get-MO2WindowSnapshot -Value {
+                    param($Processes)
+                    @([pscustomobject][ordered]@{ processId=[int]$Processes[0].id; handle=101; title='Mod Organizer'; className='Qt'; visible=$true; automationAvailable=$true; automationId='MainWindow'; buttons=@(); texts=@(); dialogKind=$null })
+                }
+                Set-Item -Path Function:script:Invoke-MO2RefreshHelperProcess -Value {
+                    param($Path, $WorkingDirectory, $TimeoutSeconds)
+                    [pscustomobject][ordered]@{ pid=9911; exited=$true; exitCode=0 }
+                }
+                [pscustomobject]@{
+                    validation = Invoke-MO2ValidateHumanMutation -Config $fixtureConfig -HumanMutationId $fixtureMutationId -Profile Codex -TaskId 'human-fixture-task'
+                    refresh = Invoke-MO2Refresh -Config $fixtureConfig -HumanMutationId $fixtureMutationId -Profile Codex -TaskId 'human-fixture-task'
+                }
+            }
+            finally {
+                Set-Item -Path Function:script:Get-MO2WindowSnapshot -Value $originalWindowSnapshot
+                Set-Item -Path Function:script:Invoke-MO2RefreshHelperProcess -Value $originalRefreshHelper
+            }
+        } $config $humanMutationId
+        $humanValidation = $humanLiveActions.validation
+        $humanRefresh = $humanLiveActions.refresh
+        $config.mo2.executable = $originalMO2Executable
+        Remove-Item Env:MO2_REFRESH_FIXTURE_EXE -ErrorAction SilentlyContinue
+        Assert-MO2Test ($humanValidation.ok -and $humanValidation.state -eq 'human-mutation-authorized' -and $humanValidation.data.mo2Open -and $humanValidation.data.refreshRequiredAfterMutation) 'human lease authorizes exact-profile mutation while one unblocked exact MO2 process is open'
+        Assert-MO2Test ($humanRefresh.ok -and $humanRefresh.state -eq 'refreshed' -and $humanRefresh.data.authorityKind -eq 'human-mutation' -and $humanRefresh.data.primaryRetained -and $humanRefresh.data.postconditionVerified) 'private human capability with matching routing metadata authorizes exact-primary CLI refresh with closed-game postconditions'
+        Assert-MO2Test ([string]$humanRefresh.data.plan.path -ceq [IO.Path]::GetFullPath($mo2Exe)) 'refresh expands environment variables in the configured MO2 executable path'
+        Assert-MO2Test ((Test-Path -LiteralPath $humanRefresh.data.receiptPath -PathType Leaf) -and (Get-Content -LiteralPath $humanRefresh.data.receiptPath -Raw | ConvertFrom-Json).command.arguments[0] -eq 'refresh') 'human refresh preserves a durable exact-command receipt'
+        Assert-MO2Test (-not ((Get-Content -LiteralPath $humanRefresh.data.receiptPath -Raw) -match [regex]::Escape($humanMutationId))) 'human refresh receipt records only public lease identity and never the private mutation credential'
+
+        $buildData = Join-Path $rootBuilderData 'BuildData.json'
+        '{}' | Set-Content -LiteralPath $buildData -Encoding utf8
+        $uncertainRefresh = Invoke-MO2Refresh -Config $config -HumanMutationId $humanMutationId -Profile Codex -TaskId 'human-fixture-task' -WhatIf
+        Assert-MO2Test (-not $uncertainRefresh.ok -and $uncertainRefresh.state -eq 'known-ground-state-required') 'refresh routes active RootBuilder deployment to the known-ground-state recovery path'
+        Remove-Item -LiteralPath $buildData -Force
+
+        $releaseStdOut = Join-Path $fixture 'human-release.stdout.json'
+        $releaseStdErr = Join-Path $fixture 'human-release.stderr.txt'
+        $releaseProbePath = Join-Path $fixture 'human-release.probe.json'
+        $releaseProbeScript = Join-Path $fixture 'Invoke-HumanReleaseProbe.ps1'
+        @'
+param(
+    [Parameter(Mandatory)][string]$TransitionLockPath,
+    [Parameter(Mandatory)][string]$ProbePath,
+    [Parameter(Mandatory)][string]$EntryPoint,
+    [Parameter(Mandatory)][string]$ConfigPath,
+    [Parameter(Mandatory)][string]$AccessId
+)
+$ErrorActionPreference = 'Stop'
+try {
+    $unexpected = [IO.File]::Open($TransitionLockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $unexpected.Dispose()
+    [IO.File]::WriteAllText($ProbePath, '{"state":"lock-acquired-unexpected"}', [Text.UTF8Encoding]::new($false))
+    exit 23
+}
+catch [IO.IOException] {
+    [IO.File]::WriteAllText($ProbePath, '{"state":"transition-lock-contended"}', [Text.UTF8Encoding]::new($false))
+}
+& $EntryPoint release-access -ConfigPath $ConfigPath -AccessId $AccessId -Compact -NoExit
+'@ | Set-Content -LiteralPath $releaseProbeScript -Encoding utf8
+        $releaseAction = {
+            $transitionLockPath = ([string]$config.session.lockFile) + '.transition.lock'
+            $releaseProcess = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $releaseProbeScript, '-TransitionLockPath', $transitionLockPath, '-ProbePath', $releaseProbePath, '-EntryPoint', (Join-Path $packageRoot 'Invoke-MO2Control.ps1'), '-ConfigPath', $configPath, '-AccessId', $humanAccessId) -RedirectStandardOutput $releaseStdOut -RedirectStandardError $releaseStdErr -PassThru
+            $probeDeadline = [DateTime]::UtcNow.AddSeconds(5)
+            while (-not (Test-Path -LiteralPath $releaseProbePath -PathType Leaf) -and [DateTime]::UtcNow -lt $probeDeadline) { Start-Sleep -Milliseconds 25 }
+            if (-not (Test-Path -LiteralPath $releaseProbePath -PathType Leaf)) { throw 'Release child did not reach the exact transition-lock probe.' }
+            $probe = Get-Content -LiteralPath $releaseProbePath -Raw | ConvertFrom-Json
+            Start-Sleep -Milliseconds 150
+            [pscustomobject][ordered]@{ pid = $releaseProcess.Id; lockProbeState = [string]$probe.state; blockedDuringMutation = -not $releaseProcess.HasExited }
+        }
+        $guardedReleaseProbe = & $mo2Module {
+            param($fixtureConfig, $fixtureMutationId, $fixtureAction)
+            $originalWindowSnapshot = (Get-Command Get-MO2WindowSnapshot -CommandType Function).ScriptBlock
+            try {
+                Set-Item -Path Function:script:Get-MO2WindowSnapshot -Value {
+                    param($Processes)
+                    @([pscustomobject][ordered]@{ processId=[int]$Processes[0].id; handle=101; title='Mod Organizer'; className='Qt'; visible=$true; automationAvailable=$true; automationId='MainWindow'; buttons=@(); texts=@(); dialogKind=$null })
+                }
+                Invoke-MO2HumanMutationTransaction -Config $fixtureConfig -HumanMutationId $fixtureMutationId -Profile Codex -TaskId 'human-fixture-task' -Action $fixtureAction
+            }
+            finally {
+                Set-Item -Path Function:script:Get-MO2WindowSnapshot -Value $originalWindowSnapshot
+            }
+        } $config $humanMutationId $releaseAction
+        $releaseProbe = @($guardedReleaseProbe.actionResult)[0]
+        Assert-MO2Test ($guardedReleaseProbe.ok -and $releaseProbe.lockProbeState -eq 'transition-lock-contended' -and $releaseProbe.blockedDuringMutation) 'release child reaches and contends on the exact transition lock before the authorized profile mutation returns'
+        $releaseDeadline = [DateTime]::UtcNow.AddSeconds(10)
+        while ((-not (Test-Path -LiteralPath $releaseStdOut -PathType Leaf) -or (Get-Item -LiteralPath $releaseStdOut).Length -eq 0) -and [DateTime]::UtcNow -lt $releaseDeadline) {
+            Start-Sleep -Milliseconds 50
+        }
+        if (-not (Test-Path -LiteralPath $releaseStdOut -PathType Leaf) -or (Get-Item -LiteralPath $releaseStdOut).Length -eq 0) { throw 'Guarded release fixture did not complete after the human mutation released the transition lock.' }
+        $humanRelease = Get-Content -LiteralPath $releaseStdOut -Raw | ConvertFrom-Json
+        Assert-MO2Test ($humanRelease.ok -and $humanRelease.state -eq 'access-released' -and $humanRelease.data.liveStateRetained -and @($humanRelease.data.processes.mo2).Count -eq 1) 'human Release removes only coordination state while leaving the live MO2 process untouched'
+    }
+    finally {
+        if (-not $humanProcess.HasExited) { $humanProcess.Kill($true); $humanProcess.WaitForExit(5000) | Out-Null }
+    }
+
     $access = Invoke-MO2RequestAccess -Config $config -Label 'first task' -RuntimeRoute SteamVRNull -EstimatedMinutes 15
     $accessId = [string]$access.data.access.accessId
     $leaseId = [string]$access.data.access.leaseId
@@ -312,6 +477,10 @@ executable_blacklist="Steam.exe;notepad++.exe"
     Assert-MO2Test ($unownedAccess.state -eq 'access-busy' -and -not $unownedAccess.data.owned -and (($unownedAccess | ConvertTo-Json -Depth 12) -notmatch 'access-wrong-credential')) 'status rejects a wrong credential without echoing it'
     $ownedValidation = (& (Join-Path $packageRoot 'Invoke-MO2Control.ps1') validate -ConfigPath $configPath -AccessId $accessId -RequireClosed -NoExit | ConvertFrom-Json)
     Assert-MO2Test ($ownedValidation.ok -and @($ownedValidation.checks | Where-Object { $_.name -eq 'session-lock' -and $_.status -eq 'pass' }).Count -eq 1) 'validation accepts the exact owned access lease'
+    $automationPublicInspection = Invoke-MO2Inspect -Config $config
+    $automationPublicStatus = Invoke-MO2Status -Config $config
+    $automationPublicJson = @($automationPublicInspection, $ownedValidation, $automationPublicStatus) | ConvertTo-Json -Depth 16 -Compress
+    Assert-MO2Test (-not ($automationPublicJson -match [regex]::Escape($accessId)) -and $automationPublicJson -notmatch '"accessId"\s*:') 'automation inspect, validation, and status outputs recursively remove the bearer access credential'
     $closedAlias = (& (Join-Path $packageRoot 'Invoke-MO2Control.ps1') validate-closed -ConfigPath $configPath -AccessId $accessId -NoExit | ConvertFrom-Json)
     Assert-MO2Test ($closedAlias.ok -and $closedAlias.command -eq 'validate-closed') 'validate-closed is a working explicit alias for the closed-state precondition'
     $validationApproval = $ownedValidation.data.approval
