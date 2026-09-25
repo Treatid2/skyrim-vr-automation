@@ -145,6 +145,15 @@ function Test-MO2SamePath {
         [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Test-MO2Sha256Equal {
+    param([string]$Left, [string]$Right)
+
+    if ($Left -notmatch '\A[0-9A-Fa-f]{64}\z' -or $Right -notmatch '\A[0-9A-Fa-f]{64}\z') {
+        return $false
+    }
+    return [string]::Equals($Left, $Right, [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Resolve-MO2ShaderCacheTransactionTool {
     $candidates = @(
         (Join-Path (Split-Path -Parent $PSScriptRoot) 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'),
@@ -391,12 +400,12 @@ function Resolve-MO2CommunityShadersBuildBinding {
     $declaredHash = if ($null -ne $artifact -and $artifact.PSObject.Properties['sha256']) { [string]$artifact.sha256 } else { '' }
     $declaredBytes = if ($null -ne $artifact -and $artifact.PSObject.Properties['sizeBytes']) { [long]$artifact.sizeBytes } else { -1 }
     $cacheAbi = if ($null -ne $cacheIdentity -and $cacheIdentity.PSObject.Properties['abiId']) { [string]$cacheIdentity.abiId } else { '' }
-    if ([string]::IsNullOrWhiteSpace($buildId) -or $declaredHash -notmatch '^[0-9A-Fa-f]{64}$' -or [string]::IsNullOrWhiteSpace($cacheAbi)) {
+    if ([string]::IsNullOrWhiteSpace($buildId) -or $declaredHash -notmatch '\A[0-9A-Fa-f]{64}\z' -or [string]::IsNullOrWhiteSpace($cacheAbi)) {
         throw 'The winning Community Shaders build manifest lacks an exact build ID, DLL hash, or shader-cache ABI.'
     }
     $plugin = Get-Item -LiteralPath $pluginPath
     $actualHash = (Get-FileHash -LiteralPath $pluginPath -Algorithm SHA256).Hash
-    if ($actualHash -cne $declaredHash -or ($declaredBytes -ge 0 -and [long]$plugin.Length -ne $declaredBytes)) {
+    if (-not (Test-MO2Sha256Equal $actualHash $declaredHash) -or ($declaredBytes -ge 0 -and [long]$plugin.Length -ne $declaredBytes)) {
         throw 'The winning Community Shaders DLL does not match its build manifest.'
     }
     return [pscustomobject][ordered]@{
@@ -415,14 +424,14 @@ function Test-MO2CommunityShadersBuildBinding($Expected, $Current) {
         if (-not $Expected.PSObject.Properties[$required] -or -not $Current.PSObject.Properties[$required]) { return $false }
     }
     return (Test-MO2SamePath ([string]$Expected.profilePath) ([string]$Current.profilePath)) -and
-        [string]$Expected.profileSha256 -ceq [string]$Current.profileSha256 -and
+        (Test-MO2Sha256Equal ([string]$Expected.profileSha256) ([string]$Current.profileSha256)) -and
         (Test-MO2SamePath ([string]$Expected.modsPath) ([string]$Current.modsPath)) -and
         [string]$Expected.modName -ceq [string]$Current.modName -and
         (Test-MO2SamePath ([string]$Expected.pluginPath) ([string]$Current.pluginPath)) -and
         (Test-MO2SamePath ([string]$Expected.manifestPath) ([string]$Current.manifestPath)) -and
-        [string]$Expected.manifestSha256 -ceq [string]$Current.manifestSha256 -and
+        (Test-MO2Sha256Equal ([string]$Expected.manifestSha256) ([string]$Current.manifestSha256)) -and
         [string]$Expected.buildId -ceq [string]$Current.buildId -and
-        [string]$Expected.artifactSha256 -ceq [string]$Current.artifactSha256 -and
+        (Test-MO2Sha256Equal ([string]$Expected.artifactSha256) ([string]$Current.artifactSha256)) -and
         [long]$Expected.artifactBytes -eq [long]$Current.artifactBytes -and
         [string]$Expected.shaderCacheAbi -ceq [string]$Current.shaderCacheAbi
 }

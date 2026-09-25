@@ -67,7 +67,7 @@ try {
         buildId = 'workspace-build-fixture'
         artifact = [pscustomobject]@{
             fileName = 'CommunityShaders.dll'
-            sha256 = (Get-FileHash -LiteralPath $communityShadersPluginPath -Algorithm SHA256).Hash
+            sha256 = (Get-FileHash -LiteralPath $communityShadersPluginPath -Algorithm SHA256).Hash.ToLowerInvariant()
             sizeBytes = $communityShadersPluginBytes.Length
         }
         identity = [pscustomobject]@{ shaderCache = [pscustomobject]@{ abiId = 'fixture-v1' } }
@@ -357,6 +357,18 @@ try {
     Add-Content -LiteralPath $buildManifestPath -Value ' ' -Encoding utf8
     $buildDriftIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
     if ($buildDriftIsolation.ok -or @($buildDriftIsolation.errors | Where-Object { $_ -match 'manifest, build ID, or shader-cache ABI changed' }).Count -ne 1) { throw 'MO2 launch isolation did not reject a changed build manifest.' }
+    [IO.File]::WriteAllBytes($buildManifestPath, $buildManifestBytes)
+    $mismatchedBuildManifest = Get-Content -LiteralPath $buildManifestPath -Raw | ConvertFrom-Json -Depth 40
+    $mismatchedBuildManifest.artifact.sha256 = ('0' * 64)
+    $mismatchedBuildManifest | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $buildManifestPath -Encoding utf8
+    $mismatchedArtifactIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
+    if ($mismatchedArtifactIsolation.ok -or @($mismatchedArtifactIsolation.errors | Where-Object { $_ -match 'DLL does not match its build manifest' }).Count -ne 1) { throw 'MO2 launch isolation accepted a genuinely different manifest artifact digest.' }
+    [IO.File]::WriteAllBytes($buildManifestPath, $buildManifestBytes)
+    $newlineBuildManifest = Get-Content -LiteralPath $buildManifestPath -Raw | ConvertFrom-Json -Depth 40
+    $newlineBuildManifest.artifact.sha256 = ([string]$newlineBuildManifest.artifact.sha256 + "`n")
+    $newlineBuildManifest | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $buildManifestPath -Encoding utf8
+    $newlineArtifactIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
+    if ($newlineArtifactIsolation.ok -or @($newlineArtifactIsolation.errors | Where-Object { $_ -match 'lacks an exact build ID, DLL hash, or shader-cache ABI' }).Count -ne 1) { throw 'MO2 launch isolation accepted a manifest artifact digest with trailing data.' }
     [IO.File]::WriteAllBytes($buildManifestPath, $buildManifestBytes)
     $shadowedLowerCache = Join-Path $created.data.runtimeOutput.cachePath 'Lighting\later-area.pso'
     $shadowedLowerBytes = [IO.File]::ReadAllBytes($shadowedLowerCache)
