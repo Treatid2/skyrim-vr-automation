@@ -1,0 +1,4 @@
+interface:
+  display_name: "Static COC"
+  short_description: "Run the preserved strict-milestone COC assay."
+  default_prompt: "Use $static-coc to run the 20-transition Skyrim VR static COC protocol."
