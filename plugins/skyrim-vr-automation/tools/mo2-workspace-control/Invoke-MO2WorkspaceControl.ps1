@@ -1522,6 +1522,7 @@ function Write-SelectedProfileReceipt([Collections.IDictionary]$Journal) {
 }
 
 function Resolve-SelectedProfileJournal($Config, [string]$JournalPath) {
+    Assert-NoWorkspaceReparsePoint -Path $JournalPath -Purpose 'Selected-profile recovery journal'
     $journal = Get-Content -LiteralPath $JournalPath -Raw | ConvertFrom-Json -AsHashtable
     $phase = [string]$journal['phase']
     if ($phase -in @('committed', 'recovered-committed', 'rolled-back', 'recovered-preimage', 'aborted-before-mutation', 'compensated-by-parent')) { return $journal }
@@ -1552,13 +1553,36 @@ function Resolve-SelectedProfileJournal($Config, [string]$JournalPath) {
 }
 
 function Resolve-PendingSelectedProfileJournals($Config) {
+    Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
     $root = Get-WorkspaceControlRoot -Config $Config
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
-    $inventory = Get-BoundedTreeInventory -Path $root -Purpose 'Workspace selected-profile journal discovery'
-    $resolved = @()
-    foreach ($file in @($inventory.files | Where-Object { [IO.Path]::GetFileName([string]$_.path) -like '*.selected-profile.journal.json' })) {
-        $resolved += Resolve-SelectedProfileJournal -Config $Config -JournalPath ([string]$file.fullPath)
+    Assert-NoWorkspaceReparsePoint -Path $root -Purpose 'Workspace selected-profile control root'
+    $evidenceDirectories = @(
+        @(Get-ChildItem -LiteralPath $root -Directory -Force -Filter '*-create-select'),
+        @(Get-ChildItem -LiteralPath $root -Directory -Force -Filter '*-resume-*'),
+        @(Get-ChildItem -LiteralPath $root -Directory -Force -Filter '*-retire-*')
+    ) | ForEach-Object { $_ } | Sort-Object FullName -Unique
+    Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
+    $journalFiles = @()
+    foreach ($directory in $evidenceDirectories) {
+        Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
+        if ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Workspace selected-profile evidence directory is a reparse point: $($directory.FullName)"
+        }
+        Assert-NoWorkspaceReparsePoint -Path $directory.FullName -Purpose 'Workspace selected-profile evidence directory'
+        $journalFiles += @(Get-ChildItem -LiteralPath $directory.FullName -Filter '*.selected-profile.journal.json' -File -Force)
+        Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
     }
+    foreach ($file in $journalFiles) {
+        Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
+        Assert-NoWorkspaceReparsePoint -Path $file.FullName -Purpose 'Selected-profile recovery journal'
+    }
+    $resolved = @()
+    foreach ($file in $journalFiles) {
+        Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
+        $resolved += Resolve-SelectedProfileJournal -Config $Config -JournalPath $file.FullName
+    }
+    Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
     return @($resolved)
 }
 
@@ -1598,6 +1622,7 @@ function Assert-WorkspaceRecoveryPath([string]$Path, [string]$Root, [string]$Pur
 }
 
 function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
+    Assert-NoWorkspaceReparsePoint -Path $JournalPath -Purpose 'Workspace operation recovery journal'
     $journal = Get-Content -LiteralPath $JournalPath -Raw | ConvertFrom-Json -AsHashtable
     if ([string]$journal['phase'] -in @('committed', 'rolled-back', 'recovered-committed', 'recovered-preimage')) { return $journal }
     $profilesRoot = [IO.Path]::GetFullPath([string]$Config.mo2.profilesDirectory)
@@ -1725,13 +1750,22 @@ function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
 }
 
 function Resolve-PendingWorkspaceJournals($Config) {
+    Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
     $root = Get-WorkspaceControlRoot -Config $Config
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
-    $inventory = Get-BoundedTreeInventory -Path $root -Purpose 'Workspace operation journal discovery'
+    Assert-NoWorkspaceReparsePoint -Path $root -Purpose 'Workspace operation control root'
     $resolved = @()
-    foreach ($file in @($inventory.files | Where-Object { [IO.Path]::GetFileName([string]$_.path) -match '\.(creation|resume\.[^.]+|retire\.[^.]+)\.journal\.json$' })) {
-        $resolved += Resolve-PendingWorkspaceJournal -Config $Config -JournalPath ([string]$file.fullPath)
+    $journalFiles = @(Get-ChildItem -LiteralPath $root -Filter '*.journal.json' -File -Force | Where-Object { $_.Name -match '\.(creation|resume\.[^.]+|retire\.[^.]+)\.journal\.json$' })
+    Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
+    foreach ($file in $journalFiles) {
+        Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
+        Assert-NoWorkspaceReparsePoint -Path $file.FullName -Purpose 'Workspace operation recovery journal'
     }
+    foreach ($file in $journalFiles) {
+        Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
+        $resolved += Resolve-PendingWorkspaceJournal -Config $Config -JournalPath $file.FullName
+    }
+    Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
     return @($resolved)
 }
 
@@ -1975,6 +2009,30 @@ function Read-OwnedWorkspace($Config, [string]$Id, [string]$OwnedAccessId, [stri
     return $workspace
 }
 
+function Get-WorkspaceResumeClassification($Manifest) {
+    $status = [string]$Manifest.status
+    $profilePath = [IO.Path]::GetFullPath([string]$Manifest.profilePath)
+    $profileExists = Test-Path -LiteralPath $profilePath -PathType Container
+    if ($status -notin @('ready', 'retained')) {
+        return [pscustomobject]@{ resumable = $false; reason = "status-$status"; profileExists = $profileExists; runtimeOutputCompatible = $false }
+    }
+    if (-not $profileExists) {
+        return [pscustomobject]@{ resumable = $false; reason = 'profile-directory-missing'; profileExists = $false; runtimeOutputCompatible = $false }
+    }
+    if (-not $Manifest.PSObject.Properties['runtimeOutput'] -or $null -eq $Manifest.runtimeOutput) {
+        return [pscustomobject]@{ resumable = $false; reason = 'legacy-runtime-output-contract-missing'; profileExists = $true; runtimeOutputCompatible = $false }
+    }
+    $requiredOutputProperties = @('mode', 'executable', 'overwritePath', 'ownerMarkerPath', 'ownerMarkerSha256', 'cacheCompletionPath', 'backupCompletionPath')
+    $missingOutputProperties = @($requiredOutputProperties | Where-Object {
+        -not $Manifest.runtimeOutput.PSObject.Properties[$_] -or [string]::IsNullOrWhiteSpace([string]$Manifest.runtimeOutput.$_)
+    })
+    if ($missingOutputProperties.Count -gt 0 -or [string]$Manifest.runtimeOutput.mode -cne 'mo2-overwrite-output') {
+        $reason = if ($missingOutputProperties.Count -gt 0) { 'legacy-runtime-output-contract-incomplete: ' + ($missingOutputProperties -join ', ') } else { 'unsupported-runtime-output-mode' }
+        return [pscustomobject]@{ resumable = $false; reason = $reason; profileExists = $true; runtimeOutputCompatible = $false }
+    }
+    return [pscustomobject]@{ resumable = $true; reason = $null; profileExists = $true; runtimeOutputCompatible = $true }
+}
+
 function Get-TaskWorkspaces($Config, [string]$ResolvedTaskId) {
     $root = Join-Path ([string]$Config.storage.sessionStaging) 'workspaces'
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
@@ -1984,6 +2042,7 @@ function Get-TaskWorkspaces($Config, [string]$ResolvedTaskId) {
             $manifest = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
             if ($manifest.PSObject.Properties['ownerTaskId'] -and [string]$manifest.ownerTaskId -ceq $ResolvedTaskId) {
                 $profilePath = [IO.Path]::GetFullPath([string]$manifest.profilePath)
+                $resumeClassification = Get-WorkspaceResumeClassification -Manifest $manifest
                 [string[]]$selectedLocalWorkModIds = @()
                 if ($manifest.PSObject.Properties['localWorkMods'] -and @($manifest.localWorkMods.requestedIds).Count -gt 0) {
                     $selectedLocalWorkModIds = @($manifest.localWorkMods.requestedIds | ForEach-Object { [string]$_ })
@@ -1991,8 +2050,10 @@ function Get-TaskWorkspaces($Config, [string]$ResolvedTaskId) {
                 $items += [pscustomobject][ordered]@{
                     workspaceId = [string]$manifest.workspaceId; status = [string]$manifest.status
                     profileName = [string]$manifest.profileName; profileDirectory = $profilePath
-                    profileExists = Test-Path -LiteralPath $profilePath -PathType Container
-                    resumable = ([string]$manifest.status -in @('ready', 'retained')) -and (Test-Path -LiteralPath $profilePath -PathType Container)
+                    profileExists = $resumeClassification.profileExists
+                    resumable = $resumeClassification.resumable
+                    resumeBlockReason = $resumeClassification.reason
+                    runtimeOutputCompatible = $resumeClassification.runtimeOutputCompatible
                     sourceProfile = [string]$manifest.sourceProfile; accessId = [string]$manifest.accessId
                     workspaceContent = if ($manifest.PSObject.Properties['localWorkMods']) { [string]$manifest.localWorkMods.workspaceContent } else { 'legacy-unspecified' }
                     selectedLocalWorkModIds = $selectedLocalWorkModIds
@@ -2669,12 +2730,11 @@ try {
         }
         $workspace = Read-Workspace -Config $config -Id $WorkspaceId
         Assert-WorkspaceTaskOwner -Workspace $workspace -ResolvedTaskId $resolvedTaskId
-        if ([string]$workspace.data.status -notin @('ready', 'retained')) { throw "Workspace '$WorkspaceId' is not resumable; status is '$($workspace.data.status)'." }
-        $profilePath = [IO.Path]::GetFullPath([string]$workspace.data.profilePath)
-        if (-not (Test-Path -LiteralPath $profilePath -PathType Container)) {
-            $available = @(Get-TaskWorkspaces -Config $config -ResolvedTaskId $resolvedTaskId | Where-Object profileExists)
-            throw "Retained workspace '$WorkspaceId' has no profile directory at '$profilePath'. Valid retained workspaces: $((@($available.workspaceId) -join ', ') ?? '<none>'). Request a fresh workspace if none remain."
+        $resumeClassification = Get-WorkspaceResumeClassification -Manifest $workspace.data
+        if (-not $resumeClassification.resumable) {
+            throw "Workspace '$WorkspaceId' is safely retained but not resumable: $($resumeClassification.reason). Its profile and task-owned mods were not changed. A separately reviewed migration is required; do not silently recreate the environment."
         }
+        $profilePath = [IO.Path]::GetFullPath([string]$workspace.data.profilePath)
         $null = Assert-AccessAndClosed -Config $config -OwnedAccessId $AccessId -Profile ([string]$workspace.data.profile) -AllowOverwriteShaderCaches -RequireRuntimeRoute
         $approved = $PSCmdlet.ShouldProcess($profilePath, "bind retained workspace to access '$AccessId' and select profile '$($workspace.data.profile)'")
         if ($approved) {

@@ -58,6 +58,13 @@ resume also publishes a fresh owner marker, snapshots, evidence paths, and
 completion paths before returning ready. See
 `../../docs/MO2-TASK-WORKSPACES.md`.
 
+`list-task` advertises a workspace as resumable only when its profile exists and
+its retained manifest contains the complete supported runtime-output contract.
+Older workspaces without that contract remain preserved under
+`unavailableWorkspaces` with `resumeBlockReason`; `resume` fails before lease
+validation, profile selection, or manifest/profile mutation. Do not silently
+recreate such an environment. It requires a separately reviewed migration.
+
 Creation binds the task to MO2 Overwrite with an exact owner marker. It removes
 both the selected game executable and `Synthesis` entries from the cloned
 profile's `custom_overwrites` section. It snapshots the pre-task `backup` tree
@@ -218,7 +225,9 @@ mod already proven task-owned by that workspace. Winner proof intentionally
 covers enabled loose-file providers in the exact profile. Overwrite, unmanaged
 game files, and archives still require separate VFS evidence.
 
-Use `-WinningPathsFile` for multiple paths in a direct approval-compatible
+Use inline `-WinningPaths` for one path only. Native `pwsh -File` argument
+binding can collapse comma-separated quoted values into one string, so use
+`-WinningPathsFile` for every multi-path direct or approval-compatible
 invocation; the format matches the profile controller. Every result also
 reports `data.configuration` with the exact selected config path, source, and
 candidate precedence.
