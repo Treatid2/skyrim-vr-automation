@@ -661,6 +661,35 @@ try {
     foreach ($index in 1..101) { [IO.File]::WriteAllBytes((Join-Path $unrelatedPayload ("payload-$index.bin")), [byte[]]$index) }
     $boundedList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -MaxProfileFiles 100 -Compact | ConvertFrom-Json
     if (-not $boundedList.ok -or $boundedList.data.count -ne 1 -or $boundedList.data.workspaces[0].workspaceId -ne $created.data.workspaceId) { throw 'Exact list-task was gated by unrelated workspace payload volume.' }
+    $legacyWorkspaceId = 'workspace-legacy-runtime-output-fixture'
+    $legacyProfileName = 'Codex Task - ' + $legacyWorkspaceId
+    $legacyProfilePath = Join-Path $profiles $legacyProfileName
+    New-Item -ItemType Directory -Path $legacyProfilePath -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $legacyProfilePath 'modlist.txt'), "+Legacy Owned Mod`r`n")
+    $legacyManifestPath = Join-Path $workspaceControlRoot ($legacyWorkspaceId + '.json')
+    $legacyManifest = $created.data | ConvertTo-Json -Depth 80 | ConvertFrom-Json -Depth 80
+    $legacyManifest.workspaceId = $legacyWorkspaceId
+    $legacyManifest.profile = $legacyProfileName
+    $legacyManifest.profileName = $legacyProfileName
+    $legacyManifest.profilePath = $legacyProfilePath
+    $legacyManifest.status = 'retained'
+    $legacyManifest.PSObject.Properties.Remove('runtimeOutput')
+    $legacyManifest | ConvertTo-Json -Depth 80 | Set-Content -LiteralPath $legacyManifestPath -Encoding utf8
+    $legacyJournalPath = Join-Path $workspaceControlRoot ($legacyWorkspaceId + '.creation.journal.json')
+    [ordered]@{ contractVersion='2.0.0'; operation='create'; phase='committed'; workspaceId=$legacyWorkspaceId; ownershipId=[string]$legacyManifest.ownershipId; profilePath=$legacyProfilePath; manifestPath=$legacyManifestPath } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $legacyJournalPath -Encoding utf8
+    $legacyList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
+    $legacyUnavailable = @($legacyList.data.unavailableWorkspaces | Where-Object workspaceId -eq $legacyWorkspaceId)
+    if ($legacyList.data.count -ne 1 -or $legacyUnavailable.Count -ne 1 -or $legacyUnavailable[0].resumable -or $legacyUnavailable[0].runtimeOutputCompatible -or $legacyUnavailable[0].resumeBlockReason -ne 'legacy-runtime-output-contract-missing') { throw 'Legacy workspace without runtimeOutput was advertised as resumable or lacked its explicit compatibility reason.' }
+    $legacyIniBefore = [IO.File]::ReadAllBytes($ini)
+    $legacyProfileBefore = (Get-FileHash -LiteralPath (Join-Path $legacyProfilePath 'modlist.txt') -Algorithm SHA256).Hash
+    $legacyManifestBefore = (Get-FileHash -LiteralPath $legacyManifestPath -Algorithm SHA256).Hash
+    $legacyResume = & $entry resume -ConfigPath $configPath -AccessId 'fixture-unused-access' -TaskId $taskId -WorkspaceId $legacyWorkspaceId -Confirm:$false -Compact -NoExit | ConvertFrom-Json
+    if ($legacyResume.ok -or $legacyResume.errors[0] -notmatch 'legacy-runtime-output-contract-missing' -or
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($ini)) -cne [Convert]::ToBase64String($legacyIniBefore) -or
+        (Get-FileHash -LiteralPath (Join-Path $legacyProfilePath 'modlist.txt') -Algorithm SHA256).Hash -cne $legacyProfileBefore -or
+        (Get-FileHash -LiteralPath $legacyManifestPath -Algorithm SHA256).Hash -cne $legacyManifestBefore) {
+        throw 'Legacy workspace resume did not fail before mutation with its profile, manifest, and MO2 selection retained.'
+    }
     $selectionJournalPath = [string]$created.data.selectedProfileTransaction.journalPath
     $selectionReceiptPath = [string]$created.data.selectedProfileTransaction.receiptPath
     $interruptedSelection = Get-Content -LiteralPath $selectionJournalPath -Raw | ConvertFrom-Json

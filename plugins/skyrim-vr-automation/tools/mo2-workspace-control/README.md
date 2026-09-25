@@ -58,6 +58,13 @@ resume also publishes a fresh owner marker, snapshots, evidence paths, and
 completion paths before returning ready. See
 `../../docs/MO2-TASK-WORKSPACES.md`.
 
+`list-task` advertises a workspace as resumable only when its profile exists and
+its retained manifest contains the complete supported runtime-output contract.
+Older workspaces without that contract remain preserved under
+`unavailableWorkspaces` with `resumeBlockReason`; `resume` fails before lease
+validation, profile selection, or manifest/profile mutation. Do not silently
+recreate such an environment. It requires a separately reviewed migration.
+
 Creation binds the task to MO2 Overwrite with an exact owner marker. It removes
 both the selected game executable and `Synthesis` entries from the cloned
 profile's `custom_overwrites` section. It snapshots the pre-task `backup` tree
