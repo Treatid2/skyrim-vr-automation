@@ -61,6 +61,19 @@ $ambiguousDisposition = & $mo2Module {
 }
 Assert-MO2Test (-not $ambiguousDisposition.ok -and $ambiguousDisposition.reason -eq 'ambiguous-mo2-owner') 'launch refuses to adopt an unrelated MO2 process during exact-session resume'
 
+$acceptedExitRace = & $mo2Module {
+    $actions = @(
+        [pscustomobject]@{ processId = 4123; action = 'expand-exact-file-menu'; accepted = $true },
+        [pscustomobject]@{ processId = 4123; action = 'invoke-exact-exit-after-expand'; accepted = $true }
+    )
+    [pscustomobject]@{
+        terminal = Test-MO2AcceptedExitBindingEnded -Actions $actions -ProcessId 4123 -ErrorMessage 'The retained MO2 process binding is no longer available.'
+        wrongProcess = Test-MO2AcceptedExitBindingEnded -Actions $actions -ProcessId 4124 -ErrorMessage 'The retained MO2 process binding is no longer available.'
+        staleAuthority = Test-MO2AcceptedExitBindingEnded -Actions $actions -ProcessId 4123 -ErrorMessage 'The lease transition is stale.'
+    }
+}
+Assert-MO2Test ($acceptedExitRace.terminal -and -not $acceptedExitRace.wrongProcess -and -not $acceptedExitRace.staleAuthority) 'an accepted exact Exit distinguishes terminal process departure from an authority failure'
+
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('mo2-control-test-' + [guid]::NewGuid().ToString('N'))
 try {
     $mo2Root = Join-Path $fixture 'MO2'
