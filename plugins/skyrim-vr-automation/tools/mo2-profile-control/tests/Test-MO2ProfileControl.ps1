@@ -219,6 +219,12 @@ try {
     $humanConfig = Read-MO2ControlConfig -ConfigPath $humanConfigPath
     $humanAccess = Invoke-MO2RequestAccess -Config $humanConfig -AccessKind human -Profile Codex -TaskId 'profile-control-fixture-task' -Label 'profile-control fixture'
     try {
+        $humanAddTarget = Join-Path $humanModsRoot 'Human Add Enable Target'
+        New-Item -ItemType Directory -Path (Join-Path $humanAddTarget 'SKSE\Plugins') -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $humanAddTarget 'SKSE\Plugins\HumanTarget.dll'), 'fixture')
+        $humanAddEvidence = Join-Path $humanRoot 'add-enable-evidence'
+        $humanAdded = & $script add-enable -ProfilePath $humanProfileRoot -ModName 'Human Add Enable Target' -ModDirectory $humanAddTarget -ModsDirectory $humanModsRoot -EvidenceDirectory $humanAddEvidence -ConfigPath $humanConfigPath -HumanMutationId $humanAccess.data.access.humanMutationId -TaskId 'profile-control-fixture-task' -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
+        if (-not $humanAdded.ok -or $humanAdded.state -ne 'committed' -or -not $humanAdded.operationResult.changed -or -not $humanAdded.enabled -or $null -ne $humanAdded.refresh -or -not (Test-Path -LiteralPath (Join-Path $humanAddEvidence 'modlist-control.receipt.json') -PathType Leaf)) { throw 'Closed-MO2 human add-enable did not use authorized mutation and report its real commit.' }
         $humanEvidence = Join-Path $humanRoot 'evidence'
         $humanDisabled = & $script disable -ProfilePath $humanProfileRoot -ModName 'Human Lease Test Mod' -EvidenceDirectory $humanEvidence -ConfigPath $humanConfigPath -HumanMutationId $humanAccess.data.access.humanMutationId -TaskId 'profile-control-fixture-task' -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
         if ($humanDisabled.ok -ne $true -or $humanDisabled.state -ne 'committed' -or $humanDisabled.enabled -or $humanDisabled.humanLeaseId -ne $humanAccess.data.access.leaseId -or $null -ne $humanDisabled.refresh) { throw 'Closed-MO2 human lease mutation did not commit without requesting a refresh.' }
@@ -229,7 +235,7 @@ try {
         $null = Invoke-MO2ReleaseAccess -Config $humanConfig -AccessId $humanAccess.data.access.accessId
     }
 
-    [pscustomobject]@{ ok = $true; assertions = 44; restoredSha256 = $enableRestored.sha256 } | ConvertTo-Json
+    [pscustomobject]@{ ok = $true; assertions = 45; restoredSha256 = $enableRestored.sha256 } | ConvertTo-Json
 }
 finally {
     $env:CSX_MO2_PROFILE_CONTROL_ROOT = $priorControlRoot

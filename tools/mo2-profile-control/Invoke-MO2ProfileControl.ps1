@@ -815,7 +815,8 @@ if ($Command -eq 'add-enable') {
             resultMarker = '+'; placement = $effectivePlacement; relativeToMod = $effectiveRelative
             retirementPolicy = $RetirementPolicy; automaticDllPlan = $automaticPlan; finalWinnerPlan = $finalWinnerPlan; postcondition = $plannedProof
         }
-        $null = Invoke-ProfileMutationTransaction -Path $resolvedProfile -ExpectedBeforeBytes $beforeBytes -AfterBytes $afterBytes -EvidenceRoot $resolvedEvidence -BackupPath $backupPath -ReceiptPath $receiptPath -Receipt $receipt -Postcondition $postcondition
+        $null = Invoke-AuthorizedProfileMutation -Action { Invoke-ProfileMutationTransaction -Path $resolvedProfile -ExpectedBeforeBytes $beforeBytes -AfterBytes $afterBytes -EvidenceRoot $resolvedEvidence -BackupPath $backupPath -ReceiptPath $receiptPath -Receipt $receipt -Postcondition $postcondition }
+        $mutationApplied = $true
     }
 }
 elseif ($Command -in @('register', 'register-winning')) {
