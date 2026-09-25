@@ -33,7 +33,7 @@
 - Require Skyrim and its loader to be closed before profile or package
   mutation. The normal autonomous task flow also closes MO2 to establish a
   known ground state. While the human holds an exact-profile human lease, a
-  task may instead validate that public lease, mutate only the selected leased
+  task may instead validate the private human mutation capability, mutate only the selected leased
   profile or explicitly authorized mod content with MO2 open, and invoke the
   supported exact-instance `refresh` after mod-directory or `modlist.txt`
   changes. Any profile drift, active RootBuilder deployment, extra MO2 process,

@@ -74,8 +74,10 @@ are:
    The human code word `Lease` selects the separate `request-access -AccessKind
    human` flow: bind the lease to the exact currently selected profile and
    return a public coordination `leaseId` plus a private `humanMutationId`
-   bound to the exact recipient `TaskId`. Never expose the private mutation ID
-   in status, logs, receipts, or messages. The recipient task calls
+   associated with the recorded recipient `TaskId`. Possession of that private
+   capability is the local-account authority boundary; `TaskId` is routing and
+   transaction-binding metadata that must match, not independent authentication.
+   Never expose the private mutation ID in status, logs, receipts, or messages. The capability holder calls
    `validate-human-mutation -HumanMutationId -TaskId -Profile` before any write. Skyrim and its
    loader must be closed. MO2 may remain open only when there is one exact
    configured process, one unblocked `MainWindow`, no other visible modal, no
@@ -158,7 +160,7 @@ are:
   names and report a mismatch as a failed precondition.
 - Require Skyrim and its loader closed before changing a profile, mod package,
   or other MO2-owned state. Autonomous task setup retains the closed-MO2
-  default. A private recipient-task-bound human mutation credential permits
+  default. A private human mutation capability with matching task-routing metadata permits
   exact selected-profile or explicitly authorized mod-content mutation while
   one unblocked exact MO2 instance is open; the public lease ID is coordination
   metadata only. Validate first and refresh after membership/list changes. Uncertain
@@ -178,7 +180,7 @@ are:
 - Never delete or replace a mod that existed when a test workspace was created.
   A task may clean only uniquely named mods explicitly registered as its own.
 - An autonomous task may enable or disable existing mods only in its own cloned
-  profile. A task acting under the human's public lease may instead change the
+  profile. A task holding the private human mutation capability may instead change the
   exact leased selected profile when that specific change is in scope. It must
   not edit an existing shared mod directory without separate content authority.
   Update the maintained primary list additively: install a new version under a

@@ -151,7 +151,7 @@ try {
             timestampUtc = [DateTime]::UtcNow.ToString('o')
             checks = @()
             warnings = @()
-            errors = @("Command '$Command' requires the private task-bound -HumanMutationId returned with human access.")
+            errors = @("Command '$Command' requires the private -HumanMutationId capability returned with human access and its matching -TaskId routing metadata.")
             data = [pscustomobject]@{ requiredParameter = 'HumanMutationId'; supplied = $false }
         }
     }
@@ -273,6 +273,10 @@ catch {
             approval = New-MO2ApprovalMetadata -Subcommand $Command
         }
     }
+}
+
+if ($Command -ne 'request-access') {
+    $result = ConvertTo-MO2PublicResult -Result $result
 }
 
 $jsonParameters = @{

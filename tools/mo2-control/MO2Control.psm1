@@ -1784,6 +1784,41 @@ function Get-MO2SessionLockRecord {
     return [pscustomobject]$record
 }
 
+function ConvertTo-MO2PublicValue {
+    param($Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string] -or $Value.GetType().IsValueType) { return $Value }
+
+    $privateNames = @('accessId', 'humanMutationId', 'humanMutationHash')
+    if ($Value -is [Collections.IDictionary]) {
+        $public = [ordered]@{}
+        foreach ($key in $Value.Keys) {
+            if ([string]$key -in $privateNames) { continue }
+            $public[[string]$key] = ConvertTo-MO2PublicValue -Value $Value[$key]
+        }
+        return [pscustomobject]$public
+    }
+    if ($Value -is [Management.Automation.PSCustomObject]) {
+        $public = [ordered]@{}
+        foreach ($property in $Value.PSObject.Properties) {
+            if ($property.Name -in $privateNames) { continue }
+            $public[$property.Name] = ConvertTo-MO2PublicValue -Value $property.Value
+        }
+        return [pscustomobject]$public
+    }
+    if ($Value -is [Collections.IEnumerable]) {
+        return ,@($Value | ForEach-Object { ConvertTo-MO2PublicValue -Value $_ })
+    }
+    return $Value
+}
+
+function ConvertTo-MO2PublicResult {
+    param([Parameter(Mandatory)]$Result)
+
+    return ConvertTo-MO2PublicValue -Value $Result
+}
+
 function New-MO2Check {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -1944,7 +1979,7 @@ function Invoke-MO2Inspect {
         else { "Overwrite contains $($data.overwrite.fileCount) files using $($data.overwrite.bytes) bytes." }
     ) -Details $data.overwrite
 
-    return ConvertTo-MO2Result -Config $Config -Command 'inspect' -Checks $checks -Data $data
+    return ConvertTo-MO2PublicResult -Result (ConvertTo-MO2Result -Config $Config -Command 'inspect' -Checks $checks -Data $data)
 }
 
 function Invoke-MO2Validate {
@@ -1957,7 +1992,8 @@ function Invoke-MO2Validate {
         [switch]$RequireClosed,
         [switch]$RequireRuntimeRoute,
         [string]$OwnedSessionId,
-        [string]$OwnedAccessId
+        [string]$OwnedAccessId,
+        [switch]$IncludePrivateData
     )
 
     $data = Get-MO2InspectionData -Config $Config -RequestedProfile $Profile -RequestedExecutable $Executable
@@ -2070,7 +2106,7 @@ function Invoke-MO2Validate {
         $checks += New-MO2Check -Name 'session-lock' -Status 'pass' -Message "The requested control session owns the lock: $OwnedSessionId" -Details $data.sessionLock
     }
     elseif ($data.sessionLock.exists -and $data.sessionLock.valid -and -not [string]::IsNullOrWhiteSpace($OwnedAccessId) -and $data.sessionLock.accessId -eq $OwnedAccessId) {
-        $checks += New-MO2Check -Name 'session-lock' -Status 'pass' -Message "The requested access lease owns the lock: $OwnedAccessId" -Details $data.sessionLock
+        $checks += New-MO2Check -Name 'session-lock' -Status 'pass' -Message 'The requested access lease owns the lock.' -Details $data.sessionLock
     }
     elseif ($data.sessionLock.exists -and $data.sessionLock.valid) {
         $lockOwner = if (Test-MO2HasAccessLease -Lock $data.sessionLock) { "access lease $($data.sessionLock.leaseId)" } else { "session $($data.sessionLock.sessionId)" }
@@ -2139,7 +2175,9 @@ function Invoke-MO2Validate {
         $checks += New-MO2Check -Name 'closed-state' -Status 'info' -Message "Closed state was not required. MO2=$($data.processes.mo2.Count), game=$($data.processes.game.Count)."
     }
 
-    return ConvertTo-MO2Result -Config $Config -Command 'validate' -Checks $checks -Data $data
+    $result = ConvertTo-MO2Result -Config $Config -Command 'validate' -Checks $checks -Data $data
+    if ($IncludePrivateData) { return $result }
+    return ConvertTo-MO2PublicResult -Result $result
 }
 
 function ConvertTo-MO2SafeLabel {
@@ -4075,7 +4113,7 @@ function Invoke-MO2Prepare {
         return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'human-lease-session-forbidden' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $accessLock } -Errors @('A human lease reserves the live environment and may authorize bounded mutations, but it cannot be bound to an automation launch session.')
     }
 
-    $validation = Invoke-MO2Validate -Config $Config -Profile $Profile -Executable $Executable -RequireSKSE:$RequireSKSE -RequireClosed -RequireRuntimeRoute -OwnedAccessId $AccessId
+    $validation = Invoke-MO2Validate -Config $Config -Profile $Profile -Executable $Executable -RequireSKSE:$RequireSKSE -RequireClosed -RequireRuntimeRoute -OwnedAccessId $AccessId -IncludePrivateData
     if (-not $validation.ok) {
         return New-MO2ActionResult -Config $Config -Command 'prepare' -Ok $false -State 'blocked' -Data @{ validation = $validation } -Warnings $validation.warnings -Errors $validation.errors
     }
@@ -4718,7 +4756,7 @@ function Invoke-MO2Refresh {
     $hasSession = -not [string]::IsNullOrWhiteSpace($SessionId)
     $hasHumanMutation = -not [string]::IsNullOrWhiteSpace($HumanMutationId)
     if ($hasSession -eq $hasHumanMutation) {
-        return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'missing-or-ambiguous-refresh-authority' -Data @{ required = 'exactly one of SessionId or HumanMutationId'; sessionIdSupplied = $hasSession; humanMutationIdSupplied = $hasHumanMutation } -Errors @('Refresh requires exactly one authority: an owned automation SessionId or the private task-bound HumanMutationId of the active human lease.')
+        return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'missing-or-ambiguous-refresh-authority' -Data @{ required = 'exactly one of SessionId or HumanMutationId'; sessionIdSupplied = $hasSession; humanMutationIdSupplied = $hasHumanMutation } -Errors @('Refresh requires exactly one authority: an owned automation SessionId or the private HumanMutationId capability of the active human lease with matching TaskId routing metadata.')
     }
 
     if ($hasSession) {
@@ -4942,7 +4980,7 @@ function Invoke-MO2Status {
         launchGraceRemainingSeconds = if ($launchPending) { [math]::Max(0, [math]::Round($launchGraceSeconds - $launchElapsedSeconds, 3)) } else { 0 }
         recoveryCommand = if ($buildData.Count -gt 0 -and $owned -and -not $launchPending) { "recover-rootbuilder -SessionId $SessionId" } else { $null }
     }) -Force
-    return New-MO2ActionResult -Config $Config -Command 'status' -Ok $true -State $state -Data $data
+    return ConvertTo-MO2PublicResult -Result (New-MO2ActionResult -Config $Config -Command 'status' -Ok $true -State $state -Data $data)
 }
 
 function Get-MO2LaunchResumeDisposition {
@@ -4996,7 +5034,7 @@ function Invoke-MO2Launch {
 
     $resumeSession = [string]$lockData.status -in @('game-stopped', 'mo2-exited-after-game-stop', 'stop-incomplete', 'mo2-open')
     $requireSKSE = $lockData.PSObject.Properties['requirements'] -and $lockData.requirements.PSObject.Properties['skseLoader'] -and [bool]$lockData.requirements.skseLoader
-    $validation = Invoke-MO2Validate -Config $Config -Profile ([string]$lockData.profile) -Executable ([string]$lockData.executable) -RequireSKSE:$requireSKSE -RequireClosed:(-not $resumeSession) -RequireRuntimeRoute -OwnedSessionId $SessionId
+    $validation = Invoke-MO2Validate -Config $Config -Profile ([string]$lockData.profile) -Executable ([string]$lockData.executable) -RequireSKSE:$requireSKSE -RequireClosed:(-not $resumeSession) -RequireRuntimeRoute -OwnedSessionId $SessionId -IncludePrivateData
     if (-not $validation.ok) {
         return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'blocked' -Data @{ validation = $validation; lock = $owned } -Warnings $validation.warnings -Errors $validation.errors
     }
@@ -5233,7 +5271,7 @@ function Invoke-MO2Open {
     if ([string]$owned.data.status -notin @('prepared', 'mo2-closed', 'stopped')) {
         return New-MO2ActionResult -Config $Config -Command 'open' -Ok $false -State 'blocked' -Data @{ lock = $owned } -Errors @("Session status '$($owned.data.status)' cannot open MO2.")
     }
-    $validation = Invoke-MO2Validate -Config $Config -Profile ([string]$owned.data.profile) -Executable ([string]$owned.data.executable) -RequireClosed -OwnedSessionId $SessionId
+    $validation = Invoke-MO2Validate -Config $Config -Profile ([string]$owned.data.profile) -Executable ([string]$owned.data.executable) -RequireClosed -OwnedSessionId $SessionId -IncludePrivateData
     if (-not $validation.ok) {
         return New-MO2ActionResult -Config $Config -Command 'open' -Ok $false -State 'blocked' -Data @{ validation = $validation; lock = $owned } -Warnings $validation.warnings -Errors $validation.errors
     }
@@ -5436,7 +5474,7 @@ function Invoke-MO2RecoverClose {
         }
     }
     elseif ($explicitAccess) {
-        return New-MO2ActionResult -Config $Config -Command 'recover-close' -Ok $false -State 'blocked' -Data @{ processes = $inspection.processes } -Errors @("Access lease '$AccessId' does not exist.")
+        return New-MO2ActionResult -Config $Config -Command 'recover-close' -Ok $false -State 'blocked' -Data @{ processes = $inspection.processes } -Errors @('The supplied access credential does not own an active lease.')
     }
     $targets = @($inspection.processes.mo2)
     if ($targets.Count -eq 0) {
@@ -6276,7 +6314,7 @@ function Get-MO2ControlHelp {
         commands = @(
             [pscustomobject]@{ name = 'inspect'; mutation = $false; description = 'Inspect MO2 paths, profiles, registered executables, processes, RootBuilder state, overwrite usage, storage and locks.' },
             [pscustomobject]@{ name = 'validate'; mutation = $false; description = 'Validate an exact profile and registered executable. Add -RequireClosed before future state-changing operations.' },
-            [pscustomobject]@{ name = 'validate-human-mutation'; mutation = $false; description = 'Validate a private, recipient-task-bound HumanMutationId for an exact selected-profile mutation with Skyrim closed and either zero MO2 processes or one unblocked exact instance. Public LeaseId values are coordination metadata only.' },
+            [pscustomobject]@{ name = 'validate-human-mutation'; mutation = $false; description = 'Validate a private HumanMutationId capability with matching TaskId routing metadata for an exact selected-profile mutation with Skyrim closed and either zero MO2 processes or one unblocked exact instance. Public LeaseId values are coordination metadata only.' },
             [pscustomobject]@{ name = 'request-access'; mutation = $true; description = 'Atomically request automation access for one runtime route, or human access bound to the exact selected profile.' },
             [pscustomobject]@{ name = 'access-status'; mutation = $false; description = 'Report whether access is available, held, bound to a session, or owned by the supplied AccessId.' },
             [pscustomobject]@{ name = 'renew-access'; mutation = $true; description = 'Refresh an owned access lease and optionally replace its advisory duration estimate. Never extends an automatic expiry because leases do not expire automatically.' },
@@ -6286,7 +6324,7 @@ function Get-MO2ControlHelp {
             [pscustomobject]@{ name = 'open'; mutation = $true; description = 'Open only the exact configured MO2 executable and profile in an owned session. Does not launch the game. -StartOnly returns after the durable receipt is written.' },
             [pscustomobject]@{ name = 'launch'; mutation = $true; description = 'Launch one exact registered executable under one exact profile. Requires -SessionId; -StartOnly returns after the durable receipt is written.' },
             [pscustomobject]@{ name = 'status'; mutation = $false; description = 'Report bounded MO2, game and runtime process state, optionally verifying -SessionId ownership.' },
-            [pscustomobject]@{ name = 'refresh'; mutation = $true; description = 'Invoke the supported ModOrganizer.exe refresh command (same as F5) against one exact running primary instance under an automation SessionId or private task-bound HumanMutationId.' },
+            [pscustomobject]@{ name = 'refresh'; mutation = $true; description = 'Invoke the supported ModOrganizer.exe refresh command (same as F5) against one exact running primary instance under an automation SessionId or private HumanMutationId capability with matching TaskId routing metadata.' },
             [pscustomobject]@{ name = 'stop-game'; mutation = $true; description = 'Request graceful game shutdown while retaining the exact owned MO2 process for controlled relaunch. Never force-terminates.' },
             [pscustomobject]@{ name = 'terminate-game'; mutation = $true; description = 'Terminate only launch-recorded exact game/loader PIDs after a deadlock, retain MO2, invoke exact Unlock, and require RootBuilder restoration.' },
             [pscustomobject]@{ name = 'close'; mutation = $true; description = 'Cooperatively close only exact session-owned MO2, including its exact Unlock control and MO2-owned modal windows. Never force-terminates.' },
@@ -6329,4 +6367,4 @@ function Get-MO2ControlHelp {
     }
 }
 
-Export-ModuleMember -Function Read-MO2ControlConfig, Get-MO2TaskWorkspaceIsolation, Invoke-MO2Inspect, Invoke-MO2Validate, Invoke-MO2ValidateHumanMutation, Invoke-MO2HumanMutationTransaction, Invoke-MO2RequestAccess, Invoke-MO2AccessStatus, Invoke-MO2RenewAccess, Invoke-MO2ReleaseAccess, Invoke-MO2RecoverAccess, Invoke-MO2Prepare, Invoke-MO2Open, Invoke-MO2Launch, Invoke-MO2Status, Invoke-MO2Refresh, Invoke-MO2StopGame, Invoke-MO2TerminateGame, Invoke-MO2Close, Invoke-MO2RecoverClose, Invoke-MO2RecoverRootBuilder, Invoke-MO2Stop, Invoke-MO2Terminate, Invoke-MO2Release, Get-MO2ControlHelp
+Export-ModuleMember -Function Read-MO2ControlConfig, Get-MO2TaskWorkspaceIsolation, ConvertTo-MO2PublicResult, Invoke-MO2Inspect, Invoke-MO2Validate, Invoke-MO2ValidateHumanMutation, Invoke-MO2HumanMutationTransaction, Invoke-MO2RequestAccess, Invoke-MO2AccessStatus, Invoke-MO2RenewAccess, Invoke-MO2ReleaseAccess, Invoke-MO2RecoverAccess, Invoke-MO2Prepare, Invoke-MO2Open, Invoke-MO2Launch, Invoke-MO2Status, Invoke-MO2Refresh, Invoke-MO2StopGame, Invoke-MO2TerminateGame, Invoke-MO2Close, Invoke-MO2RecoverClose, Invoke-MO2RecoverRootBuilder, Invoke-MO2Stop, Invoke-MO2Terminate, Invoke-MO2Release, Get-MO2ControlHelp
