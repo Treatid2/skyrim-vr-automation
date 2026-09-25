@@ -56,6 +56,10 @@ are:
    requests, require an explicit
    `resume -TaskId -WorkspaceId` or fresh `create -TaskId`. Never silently
    replace, refresh, or requalify a retained profile after task-local edits.
+   If `list-task` returns a retained workspace under `unavailableWorkspaces`,
+   report its exact `resumeBlockReason`; do not try to resume or recreate it.
+   Legacy contract migration requires separate review while the profile and
+   task-owned mods remain retained.
    Before fresh creation, run `list-local-work-mods`; pass
    `-WorkspaceContent Modlist` for no local build, or
    `ModlistPlusLocalWorkMods` plus exact available candidate IDs. Resume
