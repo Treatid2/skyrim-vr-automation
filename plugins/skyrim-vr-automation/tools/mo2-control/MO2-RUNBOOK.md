@@ -125,13 +125,16 @@ The human code word `Lease` uses this separate flow:
 
 ```text
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> request-access -AccessKind human -Profile <exact-selected-profile> -TaskId <recipient-task-id> -Label human -Compact
-<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate-human-mutation -HumanMutationId <private-task-bound-mutation-id> -TaskId <recipient-task-id> -Profile <exact-selected-profile> -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate-human-mutation -HumanMutationId <private-mutation-capability> -TaskId <matching-routing-id> -Profile <exact-selected-profile> -Compact
 ```
 
 The public lease identity is coordination metadata only. The private
 `humanMutationId` delegates exact selected-profile or separately authorized
-mod-content changes to its bound recipient task and must not appear in status,
-logs, receipts, or task messages. Skyrim and its loader must be closed. MO2 may
+mod-content changes to its capability holder and must not appear in status,
+logs, receipts, or task messages. Its recorded `TaskId` is routing and
+transaction-binding metadata that must match; it is not an independently
+authenticated caller identity. Possession of the high-entropy private
+capability is the local-account authority boundary. Skyrim and its loader must be closed. MO2 may
 be closed or may be one exact process with one unblocked main window, no profile
 drift, and no active RootBuilder deployment. After a live `modlist.txt` or
 mod-directory membership change, call `refresh -HumanMutationId ... -TaskId ... -Profile ...`.
