@@ -13,6 +13,8 @@ param(
     [string]$SteamVRRoot = 'C:\Program Files (x86)\Steam\steamapps\common\SteamVR',
     [string]$RuntimePath = $env:CSX_DEVBENCH_RUNTIME_PATH,
     [string]$EvidenceDirectory,
+    [ValidateSet('None', 'MainMenuOnly', 'FreshGame', 'VerifiedFixture')]
+    [string]$SavePolicy = 'None',
     [ValidateRange(1, 300)][int]$TimeoutSeconds = 60,
     [switch]$WhatIf,
     [switch]$Compact,
@@ -129,9 +131,11 @@ try {
                     $checks.Add((New-DoctorCheck 'prime-profile-launch-readiness' $(if ($primeReady) { 'pass' } else { 'fail' }) $primeMessage $primeEvidence))
                 }
                 $fixtureInput = if ($machineConfig.defaults.PSObject.Properties['newGameFixtureManifest']) { [string]$machineConfig.defaults.newGameFixtureManifest } else { '' }
+                $fixtureRequired = $SavePolicy -eq 'VerifiedFixture'
                 if ([string]::IsNullOrWhiteSpace($fixtureInput)) {
-                    $checks.Add((New-DoctorCheck 'prime-profile-world-entry-integrity' 'fail' 'The maintained source profile has no configured world-entry save. Set defaults.newGameFixtureManifest before creating VerifiedFixture task profiles; MainMenuOnly and FreshGame creation do not consume this fixture.' ([pscustomobject][ordered]@{
+                    $checks.Add((New-DoctorCheck 'prime-profile-world-entry-integrity' $(if ($fixtureRequired) { 'fail' } else { 'warn' }) 'The maintained source profile has no configured world-entry save. Set defaults.newGameFixtureManifest before creating VerifiedFixture task profiles; MainMenuOnly and FreshGame creation do not consume this fixture.' ([pscustomobject][ordered]@{
                         configurationProperty = 'defaults.newGameFixtureManifest'
+                        requestedSavePolicy = $SavePolicy
                         requiredForSavePolicy = 'VerifiedFixture'
                         unaffectedSavePolicies = @('MainMenuOnly', 'FreshGame')
                         exampleManifestPath = [IO.Path]::GetFullPath((Join-Path $repositoryRoot 'tools\mo2-workspace-control\save-fixtures.example.json'))
@@ -153,17 +157,18 @@ try {
                     $fixtureValid = $fixtureStatus.ok -and [string]$fixtureStatus.state -eq 'fixture-valid' -and [bool]$fixtureStatus.data.valid
                     $fixtureEvidence = [pscustomobject][ordered]@{
                         configurationProperty = 'defaults.newGameFixtureManifest'
+                        requestedSavePolicy = $SavePolicy
                         configuredPath = [IO.Path]::GetFullPath($fixtureInput)
                         exampleManifestPath = [IO.Path]::GetFullPath((Join-Path $repositoryRoot 'tools\mo2-workspace-control\save-fixtures.example.json'))
                         fixtureStatus = $fixtureStatus
                     }
                     $fixtureEvidence | Add-Member -NotePropertyName requiredForSavePolicy -NotePropertyValue 'VerifiedFixture'
                     $fixtureEvidence | Add-Member -NotePropertyName unaffectedSavePolicies -NotePropertyValue @('MainMenuOnly', 'FreshGame')
-                    $checks.Add((New-DoctorCheck 'prime-profile-world-entry-integrity' $(if ($fixtureValid) { 'pass' } else { 'fail' }) $(if ($fixtureValid) { "The maintained source profile has an integrity-verified world-entry save fixture '$($fixtureStatus.data.fixtureId)'. No live-load qualification is inferred." } else { 'The maintained source profile world-entry save is missing, stale, or invalid. Run fixture-status before creating VerifiedFixture task profiles; MainMenuOnly and FreshGame creation remain available.' }) $fixtureEvidence))
+                    $checks.Add((New-DoctorCheck 'prime-profile-world-entry-integrity' $(if ($fixtureValid) { 'pass' } elseif ($fixtureRequired) { 'fail' } else { 'warn' }) $(if ($fixtureValid) { "The maintained source profile has an integrity-verified world-entry save fixture '$($fixtureStatus.data.fixtureId)'. No live-load qualification is inferred." } else { 'The maintained source profile world-entry save is missing, stale, or invalid. Run fixture-status before creating VerifiedFixture task profiles; MainMenuOnly and FreshGame creation remain available.' }) $fixtureEvidence))
                 }
             }
             catch {
-                $checks.Add((New-DoctorCheck 'prime-profile-world-entry-integrity' 'fail' "Could not verify the maintained source profile world-entry save integrity: $($_.Exception.Message)"))
+                $checks.Add((New-DoctorCheck 'prime-profile-world-entry-integrity' $(if ($SavePolicy -eq 'VerifiedFixture') { 'fail' } else { 'warn' }) "Could not verify the maintained source profile world-entry save integrity: $($_.Exception.Message)" ([pscustomobject][ordered]@{ requestedSavePolicy=$SavePolicy; requiredForSavePolicy='VerifiedFixture' })))
             }
         }
 
@@ -178,7 +183,7 @@ try {
             schemaVersion = 1; ok = $failed.Count -eq 0; command = 'inspect'; timestampUtc = [DateTime]::UtcNow.ToString('o')
             state = if ($failed.Count -eq 0) { 'ready' } else { 'configuration-required' }
             checks = @($checks); warnings = @($checks | Where-Object status -eq 'warn' | ForEach-Object message); errors = @($failed | ForEach-Object message)
-            data = [pscustomobject][ordered]@{ repositoryRoot = $repositoryRoot; configuration = $resolution; userConfigPath = $targetPath }
+            data = [pscustomobject][ordered]@{ repositoryRoot = $repositoryRoot; configuration = $resolution; userConfigPath = $targetPath; requestedSavePolicy = $SavePolicy }
         }
     }
 }

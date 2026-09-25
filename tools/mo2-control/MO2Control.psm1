@@ -3661,7 +3661,10 @@ function Invoke-MO2CooperativeCloseCore {
                 $dialogKind = Get-MO2KnownDialogKind -Title ([string]$window.Current.Name) -Texts $windowTexts -Buttons $cancelButtons
                 if ($dialogKind -eq 'preparing-vfs') {
                     foreach ($button in $cancelButtons) {
-                        $invoked = Invoke-MO2AutomationButton -Button $button -ExpectedName 'Cancel'
+                        $invoked = Invoke-MO2OwnedProcessAction -Config $Config -Owned $Owned -Process $process -Action {
+                            param($targetButton)
+                            Invoke-MO2AutomationButton -Button $targetButton -ExpectedName 'Cancel'
+                        } -ArgumentList @($button)
                         $actions.Add([pscustomobject][ordered]@{
                             timestampUtc = [DateTime]::UtcNow.ToString('o')
                             processId = [int]$record.id

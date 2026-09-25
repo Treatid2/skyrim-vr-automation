@@ -132,7 +132,9 @@ are:
 5. For repeated measurements, retain the owning MO2 process and cycle Skyrim
    with `stop-game` followed by `launch`.
    If `stop-game` returns `mo2-exited-after-game-stop` or `releaseRequired`, do
-   not relaunch from that session; release it and request access normally.
+   not adopt another MO2 process. When no MO2 or game process exists, `launch`
+   may reopen that same owned session's exact profile and executable; otherwise
+   release it before another task receives MO2.
 6. Use `-StartOnly` when the outer host cannot safely wait for UI/game
    readiness; retain the immediate receipt and poll the exact session with
    `status`.

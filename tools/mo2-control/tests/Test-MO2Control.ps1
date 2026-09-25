@@ -210,6 +210,8 @@ executable_blacklist="Steam.exe;notepad++.exe"
     Assert-MO2Test ($null -eq $preparingVfsWithoutCancel) 'Preparing vfs text without an exact Cancel control is not actioned'
     $cancelWithoutPreparingVfs = & (Get-Module MO2Control) { Get-MO2KnownDialogKind -Title 'Mod Organizer' -Texts @('Ready') -Buttons @([pscustomobject]@{name='Cancel'}) }
     Assert-MO2Test ($null -eq $cancelWithoutPreparingVfs) 'an unrelated Cancel control is not classified as a VFS stall'
+    $cooperativeCloseSource = (& (Get-Module MO2Control) { (Get-Command Invoke-MO2CooperativeCloseCore -CommandType Function).ScriptBlock.ToString() })
+    Assert-MO2Test ($cooperativeCloseSource -match "(?s)dialogKind -eq 'preparing-vfs'.*?Invoke-MO2OwnedProcessAction.*?ExpectedName 'Cancel'") 'Preparing vfs Cancel is reauthorized against the exact retained process and current session generation immediately before UI mutation'
 
     $usvfsWaitFixture = & $mo2Module {
         param($fixtureConfig, $fixtureMO2Root)

@@ -9,6 +9,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Reauthorize the last cooperative-close `Preparing vfs` Cancel control against
+  the exact retained MO2 process and current session generation immediately
+  before mutation; every MO2/game UI, close, and termination action now has an
+  immediate complete-identity boundary.
+- Scope doctor fixture failures to an explicit `VerifiedFixture` requirement;
+  missing or stale fixture state remains advisory for `MainMenuOnly` and
+  `FreshGame`.
 - Add a high-level MO2 `add-enable` transaction that discovers target DLLs,
   registers or enables the deployed mod at sufficient winning priority, and by
   default disables only fully superseded exact DLL-only providers while
@@ -252,8 +259,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   task identity, preserve saves and profile-local state across lease yields,
   and enforce additive shared-mod update guidance.
 - Copy and hash-verify the maintained source profile's complete save tree into
-  every task profile while retaining `SavePolicy` as an authorization marker
-  and verified fixtures as the only deterministic baseline contract.
+  every task profile while retaining `SavePolicy` as an authorization marker;
+  only `VerifiedFixture` requires a declared deterministic baseline contract.
 - Exclude local `.fixture-refresh-*` evidence from generated marketplace
   packages.
 - Treat physical-headset and Valve null-HMD SteamVR shader caches as one
