@@ -186,6 +186,11 @@ function Remove-WorkspaceCreatedOutputTree([string]$Path, [string]$OverwritePath
     Remove-Item -LiteralPath $resolvedPath -Recurse -Force
 }
 
+function Test-WorkspaceSha256Equal([string]$Left, [string]$Right) {
+    if ($Left -notmatch '^[0-9A-Fa-f]{64}$' -or $Right -notmatch '^[0-9A-Fa-f]{64}$') { return $false }
+    return [string]::Equals($Left, $Right, [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Resolve-WorkspaceCommunityShadersBuildBinding([string]$ProfilePath, [string]$ModsPath, [string]$TransactionTool) {
     $relativePluginPath = 'SKSE\Plugins\CommunityShaders.dll'
     $providers = & $TransactionTool providers -ProfilePath $ProfilePath -ModsPath $ModsPath -RelativeCachePath $relativePluginPath -NoExit -Confirm:$false | ConvertFrom-Json -Depth 40
@@ -211,7 +216,7 @@ function Resolve-WorkspaceCommunityShadersBuildBinding([string]$ProfilePath, [st
     }
     $plugin = Get-Item -LiteralPath $pluginPath
     $actualHash = (Get-FileHash -LiteralPath $pluginPath -Algorithm SHA256).Hash
-    if ($actualHash -cne $artifactHash -or ($artifactBytes -ge 0 -and [long]$plugin.Length -ne $artifactBytes)) {
+    if (-not (Test-WorkspaceSha256Equal $actualHash $artifactHash) -or ($artifactBytes -ge 0 -and [long]$plugin.Length -ne $artifactBytes)) {
         throw 'The winning Community Shaders DLL does not match its build manifest.'
     }
     return [pscustomobject][ordered]@{
@@ -231,14 +236,14 @@ function Test-WorkspaceCommunityShadersBuildBinding($Expected, $Current) {
         if (-not $Expected.PSObject.Properties[$required] -or -not $Current.PSObject.Properties[$required]) { return $false }
     }
     return (Test-WorkspaceSamePath ([string]$Expected.profilePath) ([string]$Current.profilePath)) -and
-        [string]$Expected.profileSha256 -ceq [string]$Current.profileSha256 -and
+        (Test-WorkspaceSha256Equal ([string]$Expected.profileSha256) ([string]$Current.profileSha256)) -and
         (Test-WorkspaceSamePath ([string]$Expected.modsPath) ([string]$Current.modsPath)) -and
         [string]$Expected.modName -ceq [string]$Current.modName -and
         (Test-WorkspaceSamePath ([string]$Expected.pluginPath) ([string]$Current.pluginPath)) -and
         (Test-WorkspaceSamePath ([string]$Expected.manifestPath) ([string]$Current.manifestPath)) -and
-        [string]$Expected.manifestSha256 -ceq [string]$Current.manifestSha256 -and
+        (Test-WorkspaceSha256Equal ([string]$Expected.manifestSha256) ([string]$Current.manifestSha256)) -and
         [string]$Expected.buildId -ceq [string]$Current.buildId -and
-        [string]$Expected.artifactSha256 -ceq [string]$Current.artifactSha256 -and
+        (Test-WorkspaceSha256Equal ([string]$Expected.artifactSha256) ([string]$Current.artifactSha256)) -and
         [long]$Expected.artifactBytes -eq [long]$Current.artifactBytes -and
         [string]$Expected.shaderCacheAbi -ceq [string]$Current.shaderCacheAbi
 }
@@ -786,7 +791,7 @@ function Complete-WorkspaceBackupOutput($Config, $Workspace, [switch]$WhatIf) {
     $snapshotTransactionId = [string]$snapshotReceipt.transactionId
     $transactionTool = Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'
     $currentBuild = Resolve-WorkspaceCommunityShadersBuildBinding -ProfilePath $modListPath -ModsPath ([string]$Config.mo2.modsDirectory) -TransactionTool $transactionTool
-    if ([string]$currentBuild.profileSha256 -cne [string]$backupPlan.profileSha256 -or
+    if (-not (Test-WorkspaceSha256Equal ([string]$currentBuild.profileSha256) ([string]$backupPlan.profileSha256)) -or
         -not (Test-WorkspaceCommunityShadersBuildBinding -Expected $backupPlan.communityShadersPlugin -Current $currentBuild)) {
         throw 'Workspace backup plan build or profile identity changed before completion.'
     }
