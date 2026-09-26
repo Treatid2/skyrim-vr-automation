@@ -15,6 +15,11 @@ loopback interface. The runtime metadata path must be supplied explicitly or by
 `profiler-control` uses that same runtime contract to collect and compare the
 resolved CSX GPU/CPU timer block. Its totals are not whole-frame GPU time.
 
+`render-scale-qualification` additionally requires the render-scale,
+upscaling, feature, screenshot, scenario, console, and inspect DevBench tools
+declared by its bundled protocol. It rejects an incomplete or identity-drifting
+runtime before qualification mutations.
+
 ## MO2
 
 MO2 Control reads a configuration matching
