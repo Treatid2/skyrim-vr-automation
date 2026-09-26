@@ -2049,7 +2049,7 @@ function Get-WorkspaceResumeClassification($Manifest) {
         }
         return [pscustomobject]@{ resumable = $true; reason = $null; profileExists = $true; runtimeOutputCompatible = $true; resumeDisposition = 'rebind-active-output'; activeOutputRecoveryRequired = $true }
     }
-    $missingCompletionProperties = @('cacheCompletionPath', 'backupCompletionPath' | Where-Object {
+    $missingCompletionProperties = @(@('cacheCompletionPath', 'backupCompletionPath') | Where-Object {
         -not (Test-Path -LiteralPath ([string]$output.$_) -PathType Leaf)
     })
     if ($missingCompletionProperties.Count -gt 0) {
