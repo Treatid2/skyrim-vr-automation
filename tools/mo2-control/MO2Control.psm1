@@ -4762,6 +4762,8 @@ function Invoke-MO2RecoverClose {
         runtimeRoute = $runtimeRoute
         mo2Path = [string]$inspection.config.mo2Executable
         ownerPid = [int]$targets[0].id
+        processPath = [string]$targets[0].path
+        processStartTime = [string]$targets[0].startTime
         recovery = $true
         accessId = $AccessId
         acquisitionMode = 'explicit-access'
@@ -4794,6 +4796,8 @@ function Invoke-MO2RecoverClose {
         runtimeRoute = $runtimeRoute
         controllerPath = [string]$controller.controllerPath
         ownerPid = [int]$targets[0].id
+        processPath = [string]$targets[0].path
+        processStartTime = [string]$targets[0].startTime
         recovery = $true
     }
     if ($WhatIf) {
@@ -4814,7 +4818,7 @@ function Invoke-MO2RecoverClose {
                 throw "The access lease runtime route changed before recovery-close binding ('$($runtimeRoute.id)' to '$($validatedRuntimeRoute.id)')."
             }
             $bound = $currentAccess.data
-            foreach ($propertyName in @('sessionId', 'sessionPath', 'status', 'createdUtc', 'profile', 'profileName', 'profileDirectory', 'modListPath', 'executable', 'runtimeRoute', 'controllerPath', 'ownerPid', 'recovery')) {
+            foreach ($propertyName in @('sessionId', 'sessionPath', 'status', 'createdUtc', 'profile', 'profileName', 'profileDirectory', 'modListPath', 'executable', 'runtimeRoute', 'controllerPath', 'ownerPid', 'processPath', 'processStartTime', 'recovery')) {
                 $bound | Add-Member -NotePropertyName $propertyName -NotePropertyValue $lock.$propertyName -Force
             }
             $bound | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $currentAccess.data) -Force

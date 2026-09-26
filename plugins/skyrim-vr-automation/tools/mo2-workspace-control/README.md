@@ -103,10 +103,10 @@ replace shared metadata, restore snapshotted Overwrite state, or recursively
 remove exact owned paths. `prepare-source` is also one-shot because it moves
 legacy shader-cache trees out of shared Overwrite state.
 
-`adopt` is also one-shot: it transfers one ready workspace from the exact
-released `-PreviousAccessId` to a distinct active lease only after closed-state,
-stable-source, and task-profile fingerprint proofs. It is the recovery route
-when an otherwise valid workspace outlives its transient access lease.
+`resume` is the supported retained-workspace recovery route. It rebinds one
+exact ready workspace to the caller's new active lease only after closed-state,
+stable-source, task identity, and task-profile fingerprint proofs. It is
+one-shot because it replaces the workspace's retained ownership metadata.
 
 ```text
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> prepare-source -AccessId <literal-access-id> -Confirm:$false -Compact

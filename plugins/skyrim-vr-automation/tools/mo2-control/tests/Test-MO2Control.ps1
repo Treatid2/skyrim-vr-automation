@@ -853,6 +853,65 @@ catch [IO.IOException] {
     $releasedRecoverySession = Invoke-MO2Release -Config $config -SessionId $recoverySessionId
     Assert-MO2Test ($releasedRecoverySession.ok -and $releasedRecoverySession.state -eq 'session-released-access-retained') 'recovered session releases back to its explicit access lease after consumer admission'
 
+    $incompleteRecoveryProcess = Start-Process -FilePath $mo2Exe -ArgumentList @('/d', '/c', 'ping -n 30 127.0.0.1 >nul') -WindowStyle Hidden -PassThru
+    $incompleteRecoverySessionId = $null
+    try {
+        $incompleteDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        do {
+            $incompleteInspection = Invoke-MO2Inspect -Config $config
+            $incompleteProcessRecord = @($incompleteInspection.data.processes.mo2 | Where-Object id -eq $incompleteRecoveryProcess.Id)
+            if ($incompleteProcessRecord.Count -eq 1) { break }
+            Start-Sleep -Milliseconds 50
+        } while ([DateTime]::UtcNow -lt $incompleteDeadline)
+        $incompleteRecovery = & $mo2Module {
+            param($fixtureConfig, $fixtureAccessId)
+            $originalDesktopCheck = (Get-Command Test-MO2InteractiveDesktop -CommandType Function).ScriptBlock
+            $originalCooperativeClose = (Get-Command Invoke-MO2CooperativeClose -CommandType Function).ScriptBlock
+            try {
+                Set-Item -Path Function:script:Test-MO2InteractiveDesktop -Value { $true }
+                Set-Item -Path Function:script:Invoke-MO2CooperativeClose -Value {
+                    param($Config, $InitialProcesses, $EvidenceDirectory, $TimeoutSeconds)
+                    [pscustomobject][ordered]@{
+                        closed = $false
+                        initialProcesses = @($InitialProcesses)
+                        finalProcesses = @($InitialProcesses)
+                        actions = @('fixture-incomplete-close')
+                        remaining = @($InitialProcesses)
+                        forceTermination = $false
+                        unrelatedProcessesTouched = @()
+                    }
+                }
+                Invoke-MO2RecoverClose -Config $fixtureConfig -AccessId $fixtureAccessId -Label 'fixture incomplete recovery'
+            }
+            finally {
+                Set-Item -Path Function:script:Test-MO2InteractiveDesktop -Value $originalDesktopCheck
+                Set-Item -Path Function:script:Invoke-MO2CooperativeClose -Value $originalCooperativeClose
+            }
+        } $config $recoveryAccessId
+        $incompleteRecoverySessionId = [string]$incompleteRecovery.data.sessionId
+        Assert-MO2Test (-not $incompleteRecovery.ok -and $incompleteRecovery.state -eq 'close-incomplete') 'recovery close retains an attributable session when cooperative close is incomplete'
+        $incompleteManifest = Get-Content -LiteralPath (Join-Path ([string]$incompleteRecovery.data.sessionPath) 'session.json') -Raw | ConvertFrom-Json
+        $incompleteLease = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+        Assert-MO2Test ([string]$incompleteManifest.processPath -ceq [string]$incompleteProcessRecord[0].path) 'incomplete recovery manifest persists the adopted process path'
+        Assert-MO2Test (-not [string]::IsNullOrWhiteSpace([string]$incompleteManifest.processStartTime) -and [string]$incompleteManifest.processStartTime -ceq [string]$incompleteLease.processStartTime) 'incomplete recovery manifest persists the adopted process start time'
+        Assert-MO2Test ([string]$incompleteLease.processPath -ceq [string]$incompleteProcessRecord[0].path) 'incomplete recovery lease persists the adopted process path'
+        Assert-MO2Test (-not [string]::IsNullOrWhiteSpace([string]$incompleteLease.processStartTime)) 'incomplete recovery lease persists the adopted process start time'
+        $incompleteStatus = Invoke-MO2Status -Config $config -SessionId $incompleteRecoverySessionId
+        Assert-MO2Test ($incompleteStatus.data.controller.ownershipResolution.ok -and $incompleteStatus.data.controller.ownershipResolution.reason -eq 'recorded-owner') 'retained incomplete recovery accepts the unchanged exact process on a later operation'
+        $retainedStartTime = [string]$incompleteLease.processStartTime
+        $incompleteLease.processStartTime = [DateTime]::UtcNow.AddYears(-1).ToString('o')
+        $incompleteLease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+        $replacementStatus = Invoke-MO2Status -Config $config -SessionId $incompleteRecoverySessionId
+        Assert-MO2Test (-not $replacementStatus.data.controller.ownershipResolution.ok -and $replacementStatus.data.controller.ownershipResolution.reason -eq 'recorded-owner-identity-mismatch') 'retained incomplete recovery rejects a same-PID lifetime replacement'
+        $incompleteLease.processStartTime = $retainedStartTime
+        $incompleteLease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    }
+    finally {
+        if (-not $incompleteRecoveryProcess.HasExited) { $incompleteRecoveryProcess.Kill($true); $incompleteRecoveryProcess.WaitForExit(5000) | Out-Null }
+    }
+    $releasedIncompleteRecovery = Invoke-MO2Release -Config $config -SessionId $incompleteRecoverySessionId
+    Assert-MO2Test ($releasedIncompleteRecovery.ok -and $releasedIncompleteRecovery.state -eq 'session-released-access-retained') 'incomplete recovery session releases normally after the exact owner exits'
+
     $recoverClosedWithAccess = Invoke-MO2RecoverClose -Config $config -AccessId $recoveryAccessId -Label 'fixture recovery' -WhatIf
     Assert-MO2Test ($recoverClosedWithAccess.ok -and $recoverClosedWithAccess.state -eq 'already-closed' -and $recoverClosedWithAccess.data.accessRetained) 'recovery close accepts and retains its exact access-only lease'
     $recoveryAccessStatus = Invoke-MO2AccessStatus -Config $config -AccessId $recoveryAccessId
