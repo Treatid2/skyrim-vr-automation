@@ -13,7 +13,8 @@ optional integration rather than the identity or boundary of the toolkit.
   atomic receipts, lifecycle events, deduplication hints, and explicit
   sanitized export.
 - `tools/mo2-control` — exact-profile MO2 inspection, cooperative cross-task
-  access leases, and a bounded single-owner launch lifecycle.
+  automation and human leases, supported live-instance refresh, and a bounded
+  single-owner launch lifecycle.
 - `tools/mo2-profile-control` — transactional toggling of an exact MO2
   `modlist.txt` marker and guarded registration of a newly deployed mod.
 - `tools/mo2-workspace-control` — stable-source ShaderCache evacuation plus

@@ -200,6 +200,16 @@ proof path. Its receipt and journal must also name the exact preserved-baseline
 path recorded by the original snapshot; another evidence-root directory with
 identical bytes cannot substitute for that snapshot-bound identity.
 
+`prepare` and `complete` return bounded output by default: cache identities,
+file and byte counts, tree hashes, state, and receipt paths remain inline, while
+per-file `entries`, provider-shadow `copied`, and `alreadyPresent` arrays remain
+only in the durable plan, provider-shadow, transaction, and completion receipts.
+Omission flags distinguish absent detail from zero files; aggregate coverage
+counts remain inline on fresh and already-prepared responses.
+`-Compact` additionally removes JSON
+whitespace. Use `-IncludeInventoryEntries` only for a caller that explicitly
+needs the potentially very large per-file arrays in the command response.
+
 `seed` requires the existing snapshot receipt for the same live cache and
 evidence directory, verifies the exact source tree, stages it, swaps it into
 place, and preserves the displaced live tree. A deliberately compatible

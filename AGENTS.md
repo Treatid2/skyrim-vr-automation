@@ -25,7 +25,23 @@
 - A task may delete or replace only uniquely named mods that its workspace
   proves did not predate the task and explicitly records as task-owned.
 - Do not inherit unknown-provenance saves, and do not treat COC as New Game.
-- Require MO2 and Skyrim to be closed before profile or package mutation.
+- Require Skyrim and its loader to be closed before profile or package
+  mutation. The normal autonomous task flow also closes MO2 to establish a
+  known ground state. While the human holds an exact-profile human lease, a
+  task may instead validate the private human mutation capability, mutate only the selected leased
+  profile or explicitly authorized mod content with MO2 open, and invoke the
+  supported exact-instance `refresh` after mod-directory or `modlist.txt`
+  changes. Any profile drift, active RootBuilder deployment, extra MO2 process,
+  modal/Unlock state, or other ambiguity returns to close/recover-close.
+- The human code word `Lease` means acquire human access bound to MO2's exact
+  selected profile and return its public lease identity. `Release` means remove
+  only that human coordination lease; do not close MO2, Skyrim, or another
+  application as part of Release.
+- Dump Management has standing content authority to install, update, configure,
+  and enable the Tullius dump-management mod. That authority does not waive the
+  closed-Skyrim rule or lease/known-state checks. Under a human lease it uses
+  the leased selected profile; otherwise it follows the normal automation
+  access flow.
 - Do not treat Virtual Desktop or `VirtualDesktop.Streamer` as a blocker for
   profile mutation or SteamVR null-HMD. For the null-HMD route, an enabled
   profile-local OCU/OpenComposite provider is the conflicting route.
