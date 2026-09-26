@@ -29,6 +29,11 @@
       "entryPoint": "tools/mo2-profile-control/Invoke-MO2ProfileControl.ps1"
     },
     {
+      "name": "mo2-mod-package-control",
+      "version": "1.0.0",
+      "entryPoint": "tools/mo2-mod-package-control/Invoke-MO2ModPackageControl.ps1"
+    },
+    {
       "name": "mo2-workspace-control",
       "version": "1.4.0",
       "entryPoint": "tools/mo2-workspace-control/Invoke-MO2WorkspaceControl.ps1"
