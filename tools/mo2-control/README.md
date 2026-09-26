@@ -268,8 +268,10 @@ readiness, a later `status`, `close`, or `recover-close` still has durable PID,
 path, argument, and timestamp evidence for exact-process adoption.
 `status` is bounded and mutates only the durable `opening` to `mo2-open`
 transition after exact process and visible-main-window proof. `stop-game`
-requests normal closure of the owned game/loader while preserving the exact
-owner MO2 PID, allowing controlled relaunches. After the game exits it first
+requests normal closure only from the session's launch-recorded game/loader
+PID, executable path, and start time; an unrecorded same-name process blocks
+without receiving a window action. It preserves the exact owner MO2 PID,
+allowing controlled relaunches. After the game exits it first
 observes the exact session-owned MO2 PID for a bounded stability window,
 allowing a delayed post-stop dialog to arrive. It then acknowledges only a
 structurally classified retained `Failed to run` dialog; an unknown modal returns
@@ -308,8 +310,10 @@ exists—reopens the same owned session, profile, and executable. An unrelated,
 reused-PID, or ambiguous MO2 process blocks the launch without being adopted.
 
 `terminate` is intentionally distinct from `stop`: it force-terminates only
-MO2 processes owned by the active session, and only after proving that no game
-or loader process is running and no RootBuilder `BuildData.json` remains.
+the MO2 lifetime whose PID, executable path, and start time match the active
+session's retained owner record, without detached-owner adoption, and only
+after proving that no game or loader process is running and no RootBuilder
+`BuildData.json` remains.
 
 Visible `open`, `close`, `recover-close`, `stop-game`, and `stop` operations must
 run as the logged-on user on the interactive Windows desktop. In Codex this

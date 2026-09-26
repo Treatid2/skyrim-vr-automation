@@ -623,6 +623,27 @@ catch [IO.IOException] {
         [pscustomobject]@{ first=$first; second=$second }
     } $admittedBeforeReplacement $betweenActionFactory $countedAction
     Assert-MO2Test ($betweenActionResult.first.ok -and $betweenActionResult.first.value -eq 'original' -and -not $betweenActionResult.second.ok -and $betweenActionResult.second.reason -eq 'process-start-time-mismatch' -and $betweenActionState.actionCount -eq 1) 'a same-PID replacement between admitted process actions receives zero later actions'
+
+    $recordedGame = [pscustomobject]@{ id=8080; name='SkyrimVR'; path=$plainGame; startTime=[DateTime]::UtcNow.AddMinutes(-2).ToString('o') }
+    $gameOwner = [pscustomobject]@{ data=[pscustomobject]@{ gameProcesses=@($recordedGame) } }
+    $exactGracefulTargets = & $mo2Module {
+        param($ownedSession, $currentGame)
+        Resolve-MO2RecordedGameTargets -Owned $ownedSession -Processes @($currentGame)
+    } $gameOwner $recordedGame
+    Assert-MO2Test ($exactGracefulTargets.ok -and @($exactGracefulTargets.targets).Count -eq 1 -and
+        [object]::ReferenceEquals($exactGracefulTargets.targets[0], $recordedGame)) 'graceful game control derives its action target from the launch-recorded process identity'
+    $samePidGameReplacement = [pscustomobject]@{ id=8080; name='SkyrimVR'; path=$plainGame; startTime=[DateTime]::UtcNow.AddMinutes(-1).ToString('o') }
+    $reusedGracefulTargets = & $mo2Module {
+        param($ownedSession, $currentGame)
+        Resolve-MO2RecordedGameTargets -Owned $ownedSession -Processes @($currentGame)
+    } $gameOwner $samePidGameReplacement
+    Assert-MO2Test (-not $reusedGracefulTargets.ok -and $reusedGracefulTargets.reason -eq 'process-start-time-mismatch' -and @($reusedGracefulTargets.targets).Count -eq 0) 'graceful game control rejects a same-name, same-PID replacement lifetime before dispatch'
+    $sameNameUnrecordedGame = [pscustomobject]@{ id=9090; name='SkyrimVR'; path=$plainGame; startTime=[DateTime]::UtcNow.ToString('o') }
+    $unrecordedGracefulTargets = & $mo2Module {
+        param($ownedSession, $currentGame)
+        Resolve-MO2RecordedGameTargets -Owned $ownedSession -Processes @($currentGame)
+    } $gameOwner $sameNameUnrecordedGame
+    Assert-MO2Test (-not $unrecordedGracefulTargets.ok -and $unrecordedGracefulTargets.reason -eq 'unrecorded-game-process' -and @($unrecordedGracefulTargets.targets).Count -eq 0) 'graceful game control treats an unrelated same-name process as blocking evidence rather than an action target'
     Remove-Item -LiteralPath $config.session.lockFile -Force
 
     $missingPrepareAccess = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -WhatIf
@@ -666,6 +687,18 @@ catch [IO.IOException] {
     $driftedBeforeCapture | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
 
     $moduleSource = [IO.File]::ReadAllText((Join-Path $packageRoot 'MO2Control.psm1'))
+    $stopGameSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2StopGame \{.*?\n\}').Value
+    $stopSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Stop \{.*?\n\}').Value
+    $terminateSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Terminate \{.*?\n\}').Value
+    Assert-MO2Test ($stopGameSource.Contains('Resolve-MO2RecordedGameTargets -Owned $owned -Processes @($before.processes.game)') -and
+        $stopSource.Contains('Resolve-MO2RecordedGameTargets -Owned $owned -Processes @($before.processes.game)') -and
+        $stopGameSource.Contains('Invoke-MO2ExactProcessAction -Expected $record') -and
+        $stopSource.Contains('Invoke-MO2ExactProcessAction -Expected $record')) 'stop-game and stop authorize graceful actions only from exact launch-recorded game identities'
+    Assert-MO2Test ($terminateSource.Contains('Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @($inspection.processes.mo2)') -and
+        -not $terminateSource.Contains('-AdoptDetachedOwner') -and
+        $terminateSource.Contains('path=[string]$owned.data.processPath') -and
+        $terminateSource.Contains('startTime=[string]$owned.data.processStartTime') -and
+        $terminateSource.Contains('Invoke-MO2ExactProcessAction -Expected $expectedOwner')) 'forced MO2 termination binds its kill authority to the persisted owner lifetime without detached adoption'
     $prepareSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Prepare \{.*?\n\}').Value
     $routeAdmissionSource = [regex]::Match($moduleSource, '(?s)function Get-MO2PrepareRouteAdmission \{.*?\n\}').Value
     $validatedSnapshotIndex = $routeAdmissionSource.IndexOf('$Validation.data.sessionLock.data.runtimeRoute', [StringComparison]::Ordinal)

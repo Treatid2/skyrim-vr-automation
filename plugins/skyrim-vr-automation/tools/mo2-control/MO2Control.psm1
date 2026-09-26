@@ -3289,6 +3289,42 @@ function Invoke-MO2ExactProcessAction {
     }
 }
 
+function Resolve-MO2RecordedGameTargets {
+    param(
+        [Parameter(Mandatory)]$Owned,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Processes
+    )
+
+    $current = @($Processes)
+    $recorded = @(
+        if ($Owned.data.PSObject.Properties['gameProcesses']) { @($Owned.data.gameProcesses) }
+    )
+    if ($current.Count -eq 0) {
+        return [pscustomobject][ordered]@{ ok=$true; reason='game-already-stopped'; targets=@(); recorded=$recorded; current=@() }
+    }
+    if ($recorded.Count -eq 0) {
+        return [pscustomobject][ordered]@{ ok=$false; reason='recorded-game-identity-missing'; targets=@(); recorded=@(); current=$current }
+    }
+
+    $targets = [Collections.Generic.List[object]]::new()
+    foreach ($actual in $current) {
+        $matches = @($recorded | Where-Object { [int]$_.id -eq [int]$actual.id })
+        if ($matches.Count -ne 1) {
+            return [pscustomobject][ordered]@{ ok=$false; reason='unrecorded-game-process'; targets=@(); recorded=$recorded; current=$current; unmatched=$actual }
+        }
+        $expected = $matches[0]
+        if (-not $expected.PSObject.Properties['name'] -or [string]$expected.name -cne [string]$actual.name) {
+            return [pscustomobject][ordered]@{ ok=$false; reason='process-name-mismatch'; targets=@(); recorded=$recorded; current=$current; expected=$expected; actual=$actual }
+        }
+        $identity = Test-MO2ProcessRecordIdentity -Expected $expected -Actual $actual
+        if (-not $identity.ok) {
+            return [pscustomobject][ordered]@{ ok=$false; reason=[string]$identity.reason; targets=@(); recorded=$recorded; current=$current; expected=$expected; actual=$actual }
+        }
+        $targets.Add($expected)
+    }
+    return [pscustomobject][ordered]@{ ok=$true; reason='recorded-game-processes'; targets=@($targets); recorded=$recorded; current=$current }
+}
+
 function Invoke-MO2CooperativeCloseCore {
     param(
         [Parameter(Mandatory)]$Config,
@@ -4900,7 +4936,11 @@ function Invoke-MO2StopGame {
         return New-MO2ActionResult -Config $Config -Command 'stop-game' -Ok $false -State 'interactive-desktop-required' -Data @{ sessionId = $SessionId; requiresInteractiveDesktop = $true; forceTermination = $false } -Errors @('Graceful game close requires execution as the logged-on user on the interactive desktop.')
     }
     $before = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$owned.data.profile) -RequestedExecutable ([string]$owned.data.executable)
-    $targets = @($before.processes.game)
+    $gameResolution = Resolve-MO2RecordedGameTargets -Owned $owned -Processes @($before.processes.game)
+    if (-not $gameResolution.ok) {
+        return New-MO2ActionResult -Config $Config -Command 'stop-game' -Ok $false -State 'blocked' -Data @{ sessionId=$SessionId; gameOwnershipResolution=$gameResolution; forceTermination=$false } -Errors @('Graceful game close requires exact launch-recorded PID, path, and start-time identity; no process action was dispatched.')
+    }
+    $targets = @($gameResolution.targets)
     if ($WhatIf) {
         return New-MO2ActionResult -Config $Config -Command 'stop-game' -Ok $true -State 'dry-run' -Data @{ sessionId = $SessionId; wouldRequestClose = $targets; wouldLeaveMO2Running = $true; forceTermination = $false }
     }
@@ -5042,7 +5082,11 @@ function Invoke-MO2Stop {
         return New-MO2ActionResult -Config $Config -Command 'stop' -Ok $false -State 'interactive-desktop-required' -Data @{ sessionId = $SessionId; requiresInteractiveDesktop = $true; forceTermination = $false; unrelatedProcessesTouched = @() } -Errors @('Full graceful stop requires execution as the logged-on user on the interactive desktop.')
     }
     $before = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$owned.data.profile) -RequestedExecutable ([string]$owned.data.executable)
-    $gameTargets = @($before.processes.game)
+    $gameResolution = Resolve-MO2RecordedGameTargets -Owned $owned -Processes @($before.processes.game)
+    if (-not $gameResolution.ok) {
+        return New-MO2ActionResult -Config $Config -Command 'stop' -Ok $false -State 'blocked' -Data @{ processes=$before.processes; gameOwnershipResolution=$gameResolution; mo2CloseAttempted=$false; forceTermination=$false; unrelatedProcessesTouched=@(); sessionPath=$owned.data.sessionPath } -Errors @('Full stop requires exact launch-recorded game PID, path, and start-time identity; no game or MO2 action was dispatched.')
+    }
+    $gameTargets = @($gameResolution.targets)
     $mo2Targets = @($before.processes.mo2)
     $resolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes $mo2Targets -AdoptDetachedOwner
     $ownerPid = [int]$resolution.ownerPid
@@ -5100,7 +5144,7 @@ function Invoke-MO2Stop {
     Set-MO2OwnedSessionStatus -Owned $currentOwned -Status $status -TimestampProperty 'stoppedUtc'
     Write-MO2JsonAtomic -Path (Join-Path ([string]$currentOwned.data.sessionPath) 'mo2-stop.json') -Value $close
 
-    return New-MO2ActionResult -Config $Config -Command 'stop' -Ok $closed -State $status -Data @{ before = $before.processes; afterGameClose = $after.processes; after = $final.processes; ownershipResolution = $currentResolution; activeBuildData = $activeBuildData; mo2Close = $close; forceTermination = $false; unrelatedProcessesTouched = @(); sessionPath = $currentOwned.data.sessionPath } -Errors $(if ($closed) { @() } elseif ($status -eq 'rootbuilder-recovery-required') { @('All owned processes closed, but RootBuilder BuildData.json remains active. Use recover-rootbuilder for this exact session; do not delete deployment metadata.') } else { @('One or more exact owned processes remained after graceful game close and cooperative MO2 dialogue resolution; no force termination was attempted.') })
+    return New-MO2ActionResult -Config $Config -Command 'stop' -Ok $closed -State $status -Data @{ before = $before.processes; afterGameClose = $after.processes; after = $final.processes; gameOwnershipResolution = $gameResolution; ownershipResolution = $currentResolution; activeBuildData = $activeBuildData; mo2Close = $close; forceTermination = $false; unrelatedProcessesTouched = @(); sessionPath = $currentOwned.data.sessionPath } -Errors $(if ($closed) { @() } elseif ($status -eq 'rootbuilder-recovery-required') { @('All owned processes closed, but RootBuilder BuildData.json remains active. Use recover-rootbuilder for this exact session; do not delete deployment metadata.') } else { @('One or more exact owned processes remained after graceful game close and cooperative MO2 dialogue resolution; no force termination was attempted.') })
 }
 
 function Invoke-MO2Release {
@@ -5176,20 +5220,24 @@ function Invoke-MO2Terminate {
     if ($activeBuildData.Count -gt 0) {
         return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $false -State 'blocked' -Data @{ buildData = @($activeBuildData.FullName); processes = $inspection.processes } -Errors @('Refusing forced MO2 termination while RootBuilder BuildData.json remains active.')
     }
-    $ownerPid = if ($owned.data.PSObject.Properties['ownerPid']) { [int]$owned.data.ownerPid } else { 0 }
-    $targets = @($inspection.processes.mo2 | Where-Object { [int]$_.id -eq $ownerPid })
-    if ($inspection.processes.mo2.Count -gt 0 -and ($ownerPid -le 0 -or $targets.Count -ne 1 -or $inspection.processes.mo2.Count -ne 1)) {
-        return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $false -State 'blocked' -Data @{ processes = $inspection.processes; ownerPid = $ownerPid } -Errors @('Forced termination requires exactly one configured MO2 process matching the session owner PID.')
+    $resolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @($inspection.processes.mo2)
+    $ownerPid = [int]$resolution.ownerPid
+    $targets = @($resolution.targets)
+    if (-not $resolution.ok -or ($inspection.processes.mo2.Count -gt 0 -and ($targets.Count -ne 1 -or $inspection.processes.mo2.Count -ne 1))) {
+        return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $false -State 'blocked' -Data @{ processes=$inspection.processes; ownerPid=$ownerPid; ownershipResolution=$resolution } -Errors @('Forced termination requires exactly one current MO2 process matching the session-retained PID, path, and start time.')
     }
     if ($targets.Count -gt 0) {
         Assert-MO2ExactProcessTargets -Config $Config -Processes $targets
     }
     if ($WhatIf) {
-        return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $true -State 'dry-run' -Data @{ sessionId = $SessionId; wouldForceTerminate = @($targets); gameProcesses = @(); activeRootBuilderBuildData = @() }
+        return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $true -State 'dry-run' -Data @{ sessionId = $SessionId; wouldForceTerminate = @($targets); ownershipResolution=$resolution; gameProcesses = @(); activeRootBuilderBuildData = @() }
     }
 
+    $expectedOwner = if ($targets.Count -eq 1) {
+        [pscustomobject][ordered]@{ id=$ownerPid; path=[string]$owned.data.processPath; startTime=[string]$owned.data.processStartTime }
+    }
     foreach ($record in $targets) {
-        $guard = Invoke-MO2ExactProcessAction -Expected $record -Action {
+        $guard = Invoke-MO2ExactProcessAction -Expected $expectedOwner -Action {
             param($boundProcess)
             $boundProcess.Kill()
         }
@@ -5211,7 +5259,7 @@ function Invoke-MO2Terminate {
     $manifest.status = $owned.data.status
     if ($manifest.PSObject.Properties['terminatedUtc']) { $manifest.terminatedUtc = [DateTime]::UtcNow.ToString('o') } else { $manifest | Add-Member -NotePropertyName terminatedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) }
     Write-MO2JsonAtomic -Path $manifestPath -Value $manifest
-    return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $terminated -State $owned.data.status -Data @{ targets = $targets; remaining = $remaining; gameProcesses = @(); activeRootBuilderBuildData = @(); sessionPath = $owned.data.sessionPath } -Errors $(if ($terminated) { @() } else { @('MO2 remained after exact forced termination was requested.') })
+    return New-MO2ActionResult -Config $Config -Command 'terminate' -Ok $terminated -State $owned.data.status -Data @{ targets = $targets; ownershipResolution=$resolution; remaining = $remaining; gameProcesses = @(); activeRootBuilderBuildData = @(); sessionPath = $owned.data.sessionPath } -Errors $(if ($terminated) { @() } else { @('MO2 remained after exact forced termination was requested.') })
 }
 
 function Get-MO2ControlHelp {

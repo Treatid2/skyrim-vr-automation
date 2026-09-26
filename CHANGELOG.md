@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Bind graceful game shutdown to launch-recorded PID, path, and start-time
+  identities, and bind forced MO2 termination to the persisted owner lifetime;
+  unrelated same-name or reused-PID processes now block without receiving an
+  action.
 - Revalidate MO2 and game PID, executable-path, and start-time identity on a
   retained process handle immediately before every individual UI, close, or
   termination action so a replacement cannot receive any later action.
