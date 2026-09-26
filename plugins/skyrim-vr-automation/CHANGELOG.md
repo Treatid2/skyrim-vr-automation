@@ -4,6 +4,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Launch bounded child processes suspended, assign their complete process tree
+  to the kill-on-close job before first execution, and require verified root
+  exit, job quiescence, stream drain, receipt persistence, and absolute-deadline
+  completion before reporting success.
+- Keep qualification acceptance validators and publication fault-injection
+  callbacks module-private, and report cleanup-only warnings without rejecting
+  an already validated public result.
 - Attempt every qualification publication rollback and temporary-file cleanup
   step even when one filesystem operation fails, compose cleanup failures with
   the original error, and retain unrestored backups for manual recovery.

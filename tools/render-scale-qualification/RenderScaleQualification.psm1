@@ -5066,16 +5066,12 @@ function Invoke-CSXQualificationReportUpdate {
 
 function Update-CSXQualificationReport {
     param(
-        [Parameter(Mandatory)][string]$EvidenceDirectory,
-        [scriptblock]$CompletionValidator = {
-            param($EvidenceRoot, $ExpectedRunId)
-            Test-CSXQualificationCompletionReceipt -EvidenceRoot $EvidenceRoot -ExpectedRunId $ExpectedRunId
-        }
+        [Parameter(Mandatory)][string]$EvidenceDirectory
     )
     # Public validation can never create an unsealed success. The sole bypass is
     # module-private and is used only while Complete-CSXSealedQualification owns
     # the subsequent receipt commit.
-    Invoke-CSXQualificationReportUpdate -EvidenceDirectory $EvidenceDirectory -CompletionValidator $CompletionValidator
+    Invoke-CSXQualificationReportUpdate -EvidenceDirectory $EvidenceDirectory
 }
 
 function New-CSXProviderCustodyEvidence($Execution) {
@@ -5196,7 +5192,7 @@ function New-CSXProviderDeadlineCustodyEvidence {
     })
 }
 
-function Complete-CSXSealedQualification {
+function Invoke-CSXSealedQualificationCommit {
     param(
         [Parameter(Mandatory)][string]$EvidenceDirectory,
         [Parameter(Mandatory)][string]$CompletionPath,
@@ -5428,15 +5424,27 @@ function Complete-CSXSealedQualification {
         }
         throw $publicationFailure
     }
-    if ($cleanupErrors.Count -gt 0) {
-        throw "Qualification publication completed, but cleanup failed: $($cleanupErrors -join ' | ')"
-    }
     return [pscustomobject][ordered]@{
         updated = $updated
         completionReceipt = $CompletionReceipt
         completionSha256 = $completionSha256
         finalizationElapsedMs = $terminalFinalizationElapsedMs
+        cleanupWarnings = @($cleanupErrors)
     }
+}
+
+function Complete-CSXSealedQualification {
+    param(
+        [Parameter(Mandatory)][string]$EvidenceDirectory,
+        [Parameter(Mandatory)][string]$CompletionPath,
+        [Parameter(Mandatory)]$CompletionReceipt,
+        [Parameter(Mandatory)][Diagnostics.Stopwatch]$InvocationWatch,
+        [Parameter(Mandatory)][Diagnostics.Stopwatch]$FinalizationWatch,
+        [Parameter(Mandatory)][DateTimeOffset]$ResultDeadlineUtc,
+        [Parameter(Mandatory)][double]$EndToEndBudgetMs,
+        [Parameter(Mandatory)][double]$FinalizationBudgetMs
+    )
+    Invoke-CSXSealedQualificationCommit @PSBoundParameters
 }
 
 Export-ModuleMember -Function Assert-CSXProtocol, Get-CSXQualificationProtocol, Get-CSXFixtureManifest, Write-CSXJsonFile, Write-CSXTextFile, Get-CSXFileSha256,

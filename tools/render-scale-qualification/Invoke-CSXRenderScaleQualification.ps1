@@ -2164,12 +2164,16 @@ try {
         -FinalizationBudgetMs ([double]$script:protocol.timeBudget.evidenceFinalizationMs)
     $updated = $terminal.updated
     $completionReceipt = $terminal.completionReceipt
+    foreach ($cleanupWarning in @($terminal.cleanupWarnings)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$cleanupWarning)) { $warnings.Add([string]$cleanupWarning) }
+    }
     $finalizationWatch.Stop()
     $result = [pscustomobject][ordered]@{
         ok = [string]$updated.report.status -in @('PASS', 'LOCAL_PASS'); status = $updated.report.status
         runPath = $updated.runPath; summaryPath = $updated.summaryPath; reviewPath = (Join-Path $script:evidenceRoot 'visual-review.json')
         completionPath = $completionPath; completionSha256 = $terminal.completionSha256
         providerCustody = $script:providerCustodyEvidence
+        warnings = @($warnings | Select-Object -Unique)
         errors = @($updated.report.errors)
     }
 }
