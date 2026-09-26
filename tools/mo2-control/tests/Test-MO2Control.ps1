@@ -40,6 +40,27 @@ $retentionFixture = & $mo2Module {
 }
 Assert-MO2Test (-not $retentionFixture.stable -and $retentionFixture.samples.Count -eq 2 -and -not $retentionFixture.samples[-1].ownerPresent) 'MO2 retention stability detects an owner that exits immediately after game shutdown'
 
+$lateExitDisposition = & $mo2Module {
+    Get-MO2LaunchResumeDisposition -SessionStatus 'game-stopped' -GameProcesses @() -MO2Processes @() -OwnerPid 4123
+}
+Assert-MO2Test ($lateExitDisposition.ok -and $lateExitDisposition.mode -eq 'reopen-exact-session' -and $lateExitDisposition.reason -eq 'retained-owner-exited') 'launch reopens the exact retained session when its MO2 owner exits after stop-game'
+$detectedExitDisposition = & $mo2Module {
+    Get-MO2LaunchResumeDisposition -SessionStatus 'mo2-exited-after-game-stop' -GameProcesses @() -MO2Processes @() -OwnerPid 4123
+}
+Assert-MO2Test ($detectedExitDisposition.ok -and $detectedExitDisposition.mode -eq 'reopen-exact-session') 'launch reopens an exact session when stop-game observed its MO2 owner exit'
+$retainedDisposition = & $mo2Module {
+    Get-MO2LaunchResumeDisposition -SessionStatus 'game-stopped' -GameProcesses @() -MO2Processes @([pscustomobject]@{ id = 4123 }) -OwnerPid 4123 -OwnerIdentityMatched $true
+}
+Assert-MO2Test ($retainedDisposition.ok -and $retainedDisposition.mode -eq 'retained-owner') 'launch reuses the exact retained MO2 owner when it remains present'
+$reusedPidDisposition = & $mo2Module {
+    Get-MO2LaunchResumeDisposition -SessionStatus 'game-stopped' -GameProcesses @() -MO2Processes @([pscustomobject]@{ id = 4123 }) -OwnerPid 4123 -OwnerIdentityMatched $false
+}
+Assert-MO2Test (-not $reusedPidDisposition.ok -and $reusedPidDisposition.reason -eq 'owner-identity-mismatch') 'launch refuses a matching numeric PID when exact retained-owner identity is unproven'
+$ambiguousDisposition = & $mo2Module {
+    Get-MO2LaunchResumeDisposition -SessionStatus 'game-stopped' -GameProcesses @() -MO2Processes @([pscustomobject]@{ id = 9001 }) -OwnerPid 4123
+}
+Assert-MO2Test (-not $ambiguousDisposition.ok -and $ambiguousDisposition.reason -eq 'ambiguous-mo2-owner') 'launch refuses to adopt an unrelated MO2 process during exact-session resume'
+
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('mo2-control-test-' + [guid]::NewGuid().ToString('N'))
 try {
     $mo2Root = Join-Path $fixture 'MO2'
@@ -167,6 +188,12 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test ($unlockDialogKind -eq 'unlock-required') 'Unlock dialog is classified structurally even when titled with a child executable'
     $failedRunDialogKind = & (Get-Module MO2Control) { Get-MO2KnownDialogKind -Title 'Mod Organizer' -Texts @('Failed to run SkyrimVR.exe') -Buttons @([pscustomobject]@{name='OK'}) }
     Assert-MO2Test ($failedRunDialogKind -eq 'failed-to-run') 'retained failed-to-run dialog is classified without matching the main window'
+    $preparingVfsKind = & (Get-Module MO2Control) { Get-MO2KnownDialogKind -Title 'Mod Organizer' -Texts @('Preparing vfs') -Buttons @([pscustomobject]@{name='Cancel'}) }
+    Assert-MO2Test ($preparingVfsKind -eq 'preparing-vfs') 'Preparing vfs is classified only with one exact Cancel control'
+    $preparingVfsWithoutCancel = & (Get-Module MO2Control) { Get-MO2KnownDialogKind -Title 'Mod Organizer' -Texts @('Preparing vfs') -Buttons @() }
+    Assert-MO2Test ($null -eq $preparingVfsWithoutCancel) 'Preparing vfs text without an exact Cancel control is not actioned'
+    $cancelWithoutPreparingVfs = & (Get-Module MO2Control) { Get-MO2KnownDialogKind -Title 'Mod Organizer' -Texts @('Ready') -Buttons @([pscustomobject]@{name='Cancel'}) }
+    Assert-MO2Test ($null -eq $cancelWithoutPreparingVfs) 'an unrelated Cancel control is not classified as a VFS stall'
     $transientWindow = [pscustomobject]@{ callCount = 0 }
     $transientWindow | Add-Member -MemberType ScriptMethod -Name FindAll -Value {
         param($scope, $condition)
@@ -515,12 +542,87 @@ catch [IO.IOException] {
     $recoveredAccess = Invoke-MO2RecoverAccess -Config $config -AccessId $abandonedAccessId -ConfirmAbandoned -Label 'fixture confirmed abandoned'
     Assert-MO2Test ($recoveredAccess.ok -and $recoveredAccess.state -eq 'access-recovered') 'confirmed abandoned access can be recovered in proven closed state'
 
+    $currentHostProcess = Get-Process -Id $PID
+    $currentHostRecord = [pscustomobject]@{ id = $PID; path = $currentHostProcess.Path; startTime = $currentHostProcess.StartTime.ToUniversalTime().ToString('o') }
     [ordered]@{
         contractVersion = 'fixture'; sessionId = 'session-pid-reuse'; status = 'running'; ownerPid = $PID
-        processStartTime = [DateTime]::UtcNow.AddDays(-1).ToString('o')
+        processStartTime = [DateTime]::UtcNow.AddDays(-1).ToString('o'); processPath = $currentHostRecord.path
     } | ConvertTo-Json | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
     $pidReuseInspection = Invoke-MO2Inspect -Config $config
     Assert-MO2Test (-not $pidReuseInspection.data.sessionLock.ownerRunning -and -not $pidReuseInspection.data.sessionLock.ownerIdentityMatched) 'session ownership rejects a reused PID with a different process start time'
+    $pidReuseLaunchAdmission = & $mo2Module {
+        param($inspection, $ownerProcessId)
+        Get-MO2LaunchResumeDisposition -SessionStatus 'game-stopped' -GameProcesses @() -MO2Processes @([pscustomobject]@{ id = $ownerProcessId }) -OwnerPid $ownerProcessId -OwnerIdentityMatched ([bool]$inspection.data.sessionLock.ownerIdentityMatched)
+    } $pidReuseInspection $PID
+    Assert-MO2Test (-not $pidReuseLaunchAdmission.ok -and $pidReuseLaunchAdmission.reason -eq 'owner-identity-mismatch') 'same-PID different-start-time evidence blocks launch admission before dispatch'
+    $pidReuseControlAdmission = & $mo2Module {
+        param($fixtureConfig, $ownedLock, $processRecord)
+        Resolve-MO2OwnedProcessTarget -Config $fixtureConfig -Owned $ownedLock -Processes @($processRecord) -AdoptDetachedOwner
+    } $config $pidReuseInspection.data.sessionLock $currentHostRecord
+    Assert-MO2Test (-not $pidReuseControlAdmission.ok -and $pidReuseControlAdmission.reason -eq 'recorded-owner-identity-mismatch' -and -not $pidReuseControlAdmission.ownerStartTimeMatched -and $pidReuseControlAdmission.ownerPathMatched -and @($pidReuseControlAdmission.targets).Count -eq 0) 'complete same-PID and path evidence with a different start time cannot authorize cooperative process control'
+    [ordered]@{
+        contractVersion = 'fixture'; sessionId = 'session-path-reuse'; status = 'game-stopped'; ownerPid = $PID
+        processStartTime = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o')
+        processPath = (Join-Path $fixture 'unrelated-process.exe')
+    } | ConvertTo-Json | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    $pathMismatchInspection = Invoke-MO2Inspect -Config $config
+    Assert-MO2Test (-not $pathMismatchInspection.data.sessionLock.ownerIdentityMatched -and $pathMismatchInspection.data.sessionLock.ownerStartTimeMatched -and -not $pathMismatchInspection.data.sessionLock.ownerPathMatched) 'session ownership requires the recorded executable path as well as PID and start time'
+    $pathMismatchControlAdmission = & $mo2Module {
+        param($fixtureConfig, $ownedLock, $processRecord)
+        Resolve-MO2OwnedProcessTarget -Config $fixtureConfig -Owned $ownedLock -Processes @($processRecord) -AdoptDetachedOwner
+    } $config $pathMismatchInspection.data.sessionLock $currentHostRecord
+    Assert-MO2Test (-not $pathMismatchControlAdmission.ok -and $pathMismatchControlAdmission.reason -eq 'recorded-owner-identity-mismatch' -and -not $pathMismatchControlAdmission.ownerPathMatched) 'same-PID same-start but wrong-path evidence blocks cooperative close and stop targets'
+    [ordered]@{
+        contractVersion = 'fixture'; sessionId = 'session-legacy-owner'; status = 'game-stopped'; ownerPid = $PID
+    } | ConvertTo-Json | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    $legacyOwnerInspection = Invoke-MO2Inspect -Config $config
+    Assert-MO2Test (-not $legacyOwnerInspection.data.sessionLock.ownerIdentityEvidenceComplete -and -not $legacyOwnerInspection.data.sessionLock.ownerIdentityMatched) 'a legacy PID-only lock remains readable but cannot authorize live-process reuse'
+    $legacyControlAdmission = & $mo2Module {
+        param($fixtureConfig, $ownedLock, $processRecord)
+        Resolve-MO2OwnedProcessTarget -Config $fixtureConfig -Owned $ownedLock -Processes @($processRecord) -AdoptDetachedOwner
+    } $config $legacyOwnerInspection.data.sessionLock $currentHostRecord
+    Assert-MO2Test (-not $legacyControlAdmission.ok -and $legacyControlAdmission.reason -eq 'recorded-owner-identity-incomplete' -and @($legacyControlAdmission.targets).Count -eq 0) 'legacy incomplete lifetime evidence cannot authorize cooperative process control'
+    [ordered]@{
+        contractVersion = 'fixture'; sessionId = 'session-qualified-owner'; status = 'game-stopped'; ownerPid = $PID
+        processStartTime = $currentHostRecord.startTime; processPath = $currentHostRecord.path
+    } | ConvertTo-Json | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    $qualifiedOwnerInspection = Invoke-MO2Inspect -Config $config
+    $qualifiedControlAdmission = & $mo2Module {
+        param($fixtureConfig, $ownedLock, $processRecord)
+        Resolve-MO2OwnedProcessTarget -Config $fixtureConfig -Owned $ownedLock -Processes @($processRecord) -AdoptDetachedOwner
+    } $config $qualifiedOwnerInspection.data.sessionLock $currentHostRecord
+    Assert-MO2Test ($qualifiedControlAdmission.ok -and $qualifiedControlAdmission.reason -eq 'recorded-owner' -and @($qualifiedControlAdmission.targets).Count -eq 1) 'complete matching PID, start-time, and path evidence admits the exact retained owner'
+    $replacementAfterAdmission = [pscustomobject]@{ id=777; path=$mo2Exe; startTime=[DateTime]::UtcNow.AddMinutes(1).ToString('o') }
+    $admittedBeforeReplacement = [pscustomobject]@{ id=777; path=$mo2Exe; startTime=[DateTime]::UtcNow.ToString('o') }
+    $replacementInventory = { param($unusedConfig) @($replacementAfterAdmission) }.GetNewClosure()
+    $replacementClose = & $mo2Module {
+        param($fixtureConfig, $initial, $factory)
+        Invoke-MO2CooperativeCloseCore -Config $fixtureConfig -InitialProcesses @($initial) -TimeoutSeconds 1 -ProcessInventoryFactory $factory
+    } $config $admittedBeforeReplacement $replacementInventory
+    Assert-MO2Test (-not $replacementClose.closed -and $replacementClose.blockedReason -eq 'process-start-time-mismatch' -and @($replacementClose.actions).Count -eq 0) 'cooperative close rejects a same-PID same-path replacement after successful admission before any UI action'
+    $betweenActionState = [pscustomobject]@{ bindingIndex=0; actionCount=0 }
+    $betweenActionBindings = @(
+        [pscustomobject]@{ process=[pscustomobject]@{ marker='original' }; record=$admittedBeforeReplacement },
+        [pscustomobject]@{ process=[pscustomobject]@{ marker='replacement' }; record=$replacementAfterAdmission }
+    )
+    $betweenActionFactory = {
+        param($expected)
+        $binding = $betweenActionBindings[$betweenActionState.bindingIndex]
+        $betweenActionState.bindingIndex++
+        return $binding
+    }.GetNewClosure()
+    $countedAction = {
+        param($boundProcess)
+        $betweenActionState.actionCount++
+        return $boundProcess.marker
+    }.GetNewClosure()
+    $betweenActionResult = & $mo2Module {
+        param($expected, $factory, $action)
+        $first = Invoke-MO2ExactProcessAction -Expected $expected -ProcessBindingFactory $factory -Action $action
+        $second = Invoke-MO2ExactProcessAction -Expected $expected -ProcessBindingFactory $factory -Action $action
+        [pscustomobject]@{ first=$first; second=$second }
+    } $admittedBeforeReplacement $betweenActionFactory $countedAction
+    Assert-MO2Test ($betweenActionResult.first.ok -and $betweenActionResult.first.value -eq 'original' -and -not $betweenActionResult.second.ok -and $betweenActionResult.second.reason -eq 'process-start-time-mismatch' -and $betweenActionState.actionCount -eq 1) 'a same-PID replacement between admitted process actions receives zero later actions'
     Remove-Item -LiteralPath $config.session.lockFile -Force
 
     $missingPrepareAccess = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -WhatIf
@@ -663,6 +765,12 @@ catch [IO.IOException] {
     $releaseDryRun = Invoke-MO2Release -Config $config -SessionId $sessionId -WhatIf
     Assert-MO2Test ($releaseDryRun.ok -and $releaseDryRun.state -eq 'dry-run') 'release dry-run succeeds'
     Assert-MO2Test (Test-Path -LiteralPath $config.session.lockFile -PathType Leaf) 'release dry-run retains lock'
+    '{}' | Set-Content -LiteralPath $buildData -Encoding utf8
+    $closeWithStrandedBuildData = Invoke-MO2Close -Config $config -SessionId $sessionId
+    Assert-MO2Test (-not $closeWithStrandedBuildData.ok -and $closeWithStrandedBuildData.state -eq 'rootbuilder-recovery-required' -and $closeWithStrandedBuildData.data.activeBuildData.Count -eq 1) 'close does not report success for a closed owner with stranded RootBuilder BuildData'
+    $releaseWithStrandedBuildData = Invoke-MO2Release -Config $config -SessionId $sessionId -WhatIf
+    Assert-MO2Test (-not $releaseWithStrandedBuildData.ok -and $releaseWithStrandedBuildData.state -eq 'rootbuilder-recovery-required' -and $releaseWithStrandedBuildData.data.activeBuildData.Count -eq 1) 'release retains session ownership while RootBuilder BuildData remains active'
+    Remove-Item -LiteralPath $buildData -Force
     $released = Invoke-MO2Release -Config $config -SessionId $sessionId
     Assert-MO2Test ($released.ok -and $released.state -eq 'session-released-access-retained' -and $released.data.sessionRetained) 'release retires the session, retains evidence, and returns the explicit lease to access-only state'
     $releasedSessionAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $sessionAccessId
@@ -705,6 +813,9 @@ catch [IO.IOException] {
                 Set-Item -Path Function:script:Test-MO2InteractiveDesktop -Value { $true }
                 Set-Item -Path Function:script:Invoke-MO2CooperativeClose -Value {
                     param($Config, $InitialProcesses, $EvidenceDirectory, $TimeoutSeconds)
+                    foreach ($record in @($InitialProcesses)) {
+                        Stop-Process -Id ([int]$record.id) -Force -ErrorAction SilentlyContinue
+                    }
                     [pscustomobject][ordered]@{
                         closed = $true
                         initialProcesses = @($InitialProcesses)
@@ -741,6 +852,65 @@ catch [IO.IOException] {
     Remove-Item -LiteralPath $buildData -Force
     $releasedRecoverySession = Invoke-MO2Release -Config $config -SessionId $recoverySessionId
     Assert-MO2Test ($releasedRecoverySession.ok -and $releasedRecoverySession.state -eq 'session-released-access-retained') 'recovered session releases back to its explicit access lease after consumer admission'
+
+    $incompleteRecoveryProcess = Start-Process -FilePath $mo2Exe -ArgumentList @('/d', '/c', 'ping -n 30 127.0.0.1 >nul') -WindowStyle Hidden -PassThru
+    $incompleteRecoverySessionId = $null
+    try {
+        $incompleteDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        do {
+            $incompleteInspection = Invoke-MO2Inspect -Config $config
+            $incompleteProcessRecord = @($incompleteInspection.data.processes.mo2 | Where-Object id -eq $incompleteRecoveryProcess.Id)
+            if ($incompleteProcessRecord.Count -eq 1) { break }
+            Start-Sleep -Milliseconds 50
+        } while ([DateTime]::UtcNow -lt $incompleteDeadline)
+        $incompleteRecovery = & $mo2Module {
+            param($fixtureConfig, $fixtureAccessId)
+            $originalDesktopCheck = (Get-Command Test-MO2InteractiveDesktop -CommandType Function).ScriptBlock
+            $originalCooperativeClose = (Get-Command Invoke-MO2CooperativeClose -CommandType Function).ScriptBlock
+            try {
+                Set-Item -Path Function:script:Test-MO2InteractiveDesktop -Value { $true }
+                Set-Item -Path Function:script:Invoke-MO2CooperativeClose -Value {
+                    param($Config, $InitialProcesses, $EvidenceDirectory, $TimeoutSeconds)
+                    [pscustomobject][ordered]@{
+                        closed = $false
+                        initialProcesses = @($InitialProcesses)
+                        finalProcesses = @($InitialProcesses)
+                        actions = @('fixture-incomplete-close')
+                        remaining = @($InitialProcesses)
+                        forceTermination = $false
+                        unrelatedProcessesTouched = @()
+                    }
+                }
+                Invoke-MO2RecoverClose -Config $fixtureConfig -AccessId $fixtureAccessId -Label 'fixture incomplete recovery'
+            }
+            finally {
+                Set-Item -Path Function:script:Test-MO2InteractiveDesktop -Value $originalDesktopCheck
+                Set-Item -Path Function:script:Invoke-MO2CooperativeClose -Value $originalCooperativeClose
+            }
+        } $config $recoveryAccessId
+        $incompleteRecoverySessionId = [string]$incompleteRecovery.data.sessionId
+        Assert-MO2Test (-not $incompleteRecovery.ok -and $incompleteRecovery.state -eq 'close-incomplete') 'recovery close retains an attributable session when cooperative close is incomplete'
+        $incompleteManifest = Get-Content -LiteralPath (Join-Path ([string]$incompleteRecovery.data.sessionPath) 'session.json') -Raw | ConvertFrom-Json
+        $incompleteLease = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+        Assert-MO2Test ([string]$incompleteManifest.processPath -ceq [string]$incompleteProcessRecord[0].path) 'incomplete recovery manifest persists the adopted process path'
+        Assert-MO2Test (-not [string]::IsNullOrWhiteSpace([string]$incompleteManifest.processStartTime) -and [string]$incompleteManifest.processStartTime -ceq [string]$incompleteLease.processStartTime) 'incomplete recovery manifest persists the adopted process start time'
+        Assert-MO2Test ([string]$incompleteLease.processPath -ceq [string]$incompleteProcessRecord[0].path) 'incomplete recovery lease persists the adopted process path'
+        Assert-MO2Test (-not [string]::IsNullOrWhiteSpace([string]$incompleteLease.processStartTime)) 'incomplete recovery lease persists the adopted process start time'
+        $incompleteStatus = Invoke-MO2Status -Config $config -SessionId $incompleteRecoverySessionId
+        Assert-MO2Test ($incompleteStatus.data.controller.ownershipResolution.ok -and $incompleteStatus.data.controller.ownershipResolution.reason -eq 'recorded-owner') 'retained incomplete recovery accepts the unchanged exact process on a later operation'
+        $retainedStartTime = [string]$incompleteLease.processStartTime
+        $incompleteLease.processStartTime = [DateTime]::UtcNow.AddYears(-1).ToString('o')
+        $incompleteLease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+        $replacementStatus = Invoke-MO2Status -Config $config -SessionId $incompleteRecoverySessionId
+        Assert-MO2Test (-not $replacementStatus.data.controller.ownershipResolution.ok -and @($replacementStatus.data.controller.ownershipResolution.targets).Count -eq 0) 'retained incomplete recovery rejects a same-PID lifetime replacement'
+        $incompleteLease.processStartTime = $retainedStartTime
+        $incompleteLease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
+    }
+    finally {
+        if (-not $incompleteRecoveryProcess.HasExited) { $incompleteRecoveryProcess.Kill($true); $incompleteRecoveryProcess.WaitForExit(5000) | Out-Null }
+    }
+    $releasedIncompleteRecovery = Invoke-MO2Release -Config $config -SessionId $incompleteRecoverySessionId
+    Assert-MO2Test ($releasedIncompleteRecovery.ok -and $releasedIncompleteRecovery.state -eq 'session-released-access-retained') 'incomplete recovery session releases normally after the exact owner exits'
 
     $recoverClosedWithAccess = Invoke-MO2RecoverClose -Config $config -AccessId $recoveryAccessId -Label 'fixture recovery' -WhatIf
     Assert-MO2Test ($recoverClosedWithAccess.ok -and $recoverClosedWithAccess.state -eq 'already-closed' -and $recoverClosedWithAccess.data.accessRetained) 'recovery close accepts and retains its exact access-only lease'

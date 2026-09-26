@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Revalidate MO2 and game PID, executable-path, and start-time identity on a
+  retained process handle immediately before every individual UI, close, or
+  termination action so a replacement cannot receive any later action.
+- Scope doctor fixture failures to an explicit `VerifiedFixture` requirement;
+  missing or stale fixture state remains advisory for `MainMenuOnly` and
+  `FreshGame`.
 - Normalize the evidence-directory boundary before validating snapshot
   containment so an equivalent trailing-separator spelling cannot block task
   completion or receipt-only recovery.
@@ -89,10 +95,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   nonterminal captures from a deterministic runtime-owned journal without ever
   mutating a replacement process.
 
-- Require every fresh MO2 task clone to inherit a hash- and
-  profile-fingerprint-verified default world-entry save, make the doctor fail
-  invalid setup, keep static integrity distinct from runtime qualification, and
-  preserve resumed task profiles without making a post-edit save warranty.
+- Copy and hash-verify the complete source save tree into every fresh MO2 task
+  clone. Require the profile-fingerprint-verified default world-entry save and
+  fail doctor admission only for explicit `VerifiedFixture` work; keep missing
+  or stale fixture state advisory for `MainMenuOnly` and `FreshGame`, retain
+  static integrity as distinct from runtime qualification, and preserve resumed
+  task profiles without making a post-edit save warranty.
   Bound all related traversal, hashing, copy, and verification work with one
   total deadline plus file, byte, depth, directory, and reparse-point limits.
 - Make deprecated workspace `release` fail closed, add collision-resistant
@@ -141,8 +149,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   task identity, preserve saves and profile-local state across lease yields,
   and enforce additive shared-mod update guidance.
 - Copy and hash-verify the maintained source profile's complete save tree into
-  every task profile while retaining `SavePolicy` as an authorization marker
-  and verified fixtures as the only deterministic baseline contract.
+  every task profile while retaining `SavePolicy` as an authorization marker;
+  only `VerifiedFixture` requires a declared deterministic baseline contract.
 - Exclude local `.fixture-refresh-*` evidence from generated marketplace
   packages.
 - Treat physical-headset and Valve null-HMD SteamVR shader caches as one
