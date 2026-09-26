@@ -905,6 +905,20 @@ try {
         throw 'Committed active-output resume did not retain exact transaction-lineage and access-rebind evidence.'
     }
     Complete-RearmedTestOutput -Workspace $reboundActive -OwnedAccessId $nextAccessId
+    $completedActiveManifest = Get-Content -LiteralPath (Join-Path $workspaceControlRoot ($activeRetained.data.workspaceId + '.json')) -Raw | ConvertFrom-Json -Depth 40
+    $cacheCompletionPath = [string]$completedActiveManifest.runtimeOutput.cacheCompletionPath
+    $hiddenCacheCompletionPath = $cacheCompletionPath + '.missing-fixture'
+    Move-Item -LiteralPath $cacheCompletionPath -Destination $hiddenCacheCompletionPath
+    try {
+        $missingCompletionList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
+        $missingCompletionWorkspace = @($missingCompletionList.data.unavailableWorkspaces | Where-Object workspaceId -eq $activeRetained.data.workspaceId)[0]
+        if ($null -eq $missingCompletionWorkspace -or $missingCompletionWorkspace.resumable -or [string]$missingCompletionWorkspace.resumeBlockReason -notmatch 'runtime-output-completion-missing: cacheCompletionPath') {
+            throw 'A completed workspace with one missing completion receipt was still advertised as resumable.'
+        }
+    }
+    finally {
+        Move-Item -LiteralPath $hiddenCacheCompletionPath -Destination $cacheCompletionPath
+    }
     $retiredActive = & $entry retire -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $activeRetained.data.workspaceId -Confirm:$false | ConvertFrom-Json
     if (-not $retiredActive.ok -or (Test-Path -LiteralPath ([string]$activeRetained.data.profilePath))) { throw 'Completed active-output recovery fixture did not retire cleanly.' }
     $overwriteBeforeInterruptedResume = Get-TestProfileFingerprint (Join-Path $mo2 'overwrite')
