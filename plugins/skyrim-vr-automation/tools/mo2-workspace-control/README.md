@@ -53,17 +53,22 @@ Workspaces are durably owned by `-TaskId` (or `CODEX_THREAD_ID` /
 `CODEX_TASK_ID`), not by one access lease. `create` makes and selects a fresh
 profile. `list-task` reports retained profiles. `resume` rebinds one exact
 retained workspace to a newly owned lease and selects it without refreshing it
-from the primary profile. If the prior lease completed its output transaction,
-resume also publishes a fresh owner marker, snapshots, evidence paths, and
+from the primary profile. If the exact retained owner marker still exists,
+resume validates its bytes, task, workspace, immutable ownership ID, and
+Overwrite path, then rebinds that unchanged active transaction to the new
+closed-state lease. If the prior lease completed its output transaction, resume
+instead publishes a fresh owner marker, snapshots, evidence paths, and
 completion paths before returning ready. See
 `../../docs/MO2-TASK-WORKSPACES.md`.
 
-`list-task` advertises a workspace as resumable only when its profile exists and
-its retained manifest contains the complete supported runtime-output contract.
-Older workspaces without that contract remain preserved under
-`unavailableWorkspaces` with `resumeBlockReason`; `resume` fails before lease
-validation, profile selection, or manifest/profile mutation. Do not silently
-recreate such an environment. It requires a separately reviewed migration.
+`list-task` advertises a workspace as resumable only when its profile exists,
+its retained manifest contains the complete supported runtime-output contract,
+and it has one machine-checked transition: `rebind-active-output` for its exact
+live owner marker or `rearm-completed-output` for exact terminal completion
+evidence. Foreign owners, changed markers, incomplete evidence, and legacy
+contracts remain preserved under `unavailableWorkspaces` with a precise
+`resumeBlockReason`; `resume` fails before profile selection or manifest/profile
+mutation. Do not silently recreate such an environment.
 
 Creation binds the task to MO2 Overwrite with an exact owner marker. It removes
 both the selected game executable and `Synthesis` entries from the cloned

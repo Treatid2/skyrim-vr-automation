@@ -4,6 +4,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Rebind an exact retained active MO2 Overwrite transaction to the task's new
+  closed-state access lease instead of dead-ending between obsolete-lease
+  completion and fresh-transaction rearm. Workspace discovery now distinguishes
+  exact active rebind, completed-output rearm, foreign ownership, malformed
+  markers, and incomplete completion evidence.
 - Normalize the evidence-directory boundary before validating snapshot
   containment so an equivalent trailing-separator spelling cannot block task
   completion or receipt-only recovery.
