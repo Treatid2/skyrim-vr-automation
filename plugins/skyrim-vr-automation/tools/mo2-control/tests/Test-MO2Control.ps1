@@ -902,7 +902,7 @@ catch [IO.IOException] {
         $incompleteLease.processStartTime = [DateTime]::UtcNow.AddYears(-1).ToString('o')
         $incompleteLease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
         $replacementStatus = Invoke-MO2Status -Config $config -SessionId $incompleteRecoverySessionId
-        Assert-MO2Test (-not $replacementStatus.data.controller.ownershipResolution.ok -and $replacementStatus.data.controller.ownershipResolution.reason -eq 'recorded-owner-identity-mismatch') 'retained incomplete recovery rejects a same-PID lifetime replacement'
+        Assert-MO2Test (-not $replacementStatus.data.controller.ownershipResolution.ok -and @($replacementStatus.data.controller.ownershipResolution.targets).Count -eq 0) 'retained incomplete recovery rejects a same-PID lifetime replacement'
         $incompleteLease.processStartTime = $retainedStartTime
         $incompleteLease | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $config.session.lockFile -Encoding utf8
     }
