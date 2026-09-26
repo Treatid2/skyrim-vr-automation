@@ -94,6 +94,13 @@ function Invoke-BoundedQualificationScript(
         throw "The bounded qualification process produced no attempt record: $(@($bounded.errors) -join ' ')"
     }
     $script:lastBoundedAttempt = $attempt[0]
+    if (-not [bool]$bounded.ok -or -not [bool]$bounded.deadlineSatisfied -or
+        -not [bool]$attempt[0].processTreeOwned -or -not [bool]$attempt[0].jobQuiescent -or
+        -not [bool]$attempt[0].jobClosed -or -not [bool]$attempt[0].exitVerified -or
+        -not [bool]$attempt[0].streamDrainComplete -or -not [bool]$attempt[0].deadlineSatisfied -or
+        @($attempt[0].terminationErrors).Count -ne 0 -or @($attempt[0].errors).Count -ne 0) {
+        throw "The bounded qualification process did not satisfy complete process custody: $(@($bounded.errors) -join ' | ')"
+    }
     if ([bool]$attempt[0].unresolvedProcess) {
         throw "The bounded qualification process left unresolved child PID $([string]$attempt[0].pid): $ScriptPath"
     }
@@ -185,19 +192,8 @@ try {
     $packageWatch.Stop()
     $endToEndLimit = [int]((Get-Content -LiteralPath $ProtocolPath -Raw | ConvertFrom-Json -Depth 100).timeBudget.endToEndMs)
     $elapsedMs = [Math]::Round($packageWatch.Elapsed.TotalMilliseconds, 3)
-    if ($elapsedMs -gt $endToEndLimit -and [string]$runnerResult.status -in @('PASS', 'LOCAL_PASS')) {
-        if (-not [string]::IsNullOrWhiteSpace($resolvedEvidence) -and
-            (Test-Path -LiteralPath $resolvedEvidence -PathType Container)) {
-            [pscustomobject][ordered]@{
-                schema = 'csx-render-scale-package-deadline-rejection-v1'
-                elapsedMs = $elapsedMs; deadlineMs = $endToEndLimit
-                timestampUtc = [DateTimeOffset]::UtcNow.ToString('o')
-                reason = 'The outer package deadline elapsed after runner completion.'
-            } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $resolvedEvidence 'qualification-package-rejection.json') -Encoding utf8
-        }
-        throw "The unattended package took $elapsedMs ms, exceeding its $endToEndLimit ms limit."
-    }
     $runnerResult | Add-Member -NotePropertyName packageElapsedMs -NotePropertyValue $elapsedMs -Force
+    $runnerResult | Add-Member -NotePropertyName packageDeadlineMs -NotePropertyValue $endToEndLimit -Force
     $runnerResult | Add-Member -NotePropertyName evidenceDirectory -NotePropertyValue $resolvedEvidence -Force
     $runnerResult | Add-Member -NotePropertyName discoveredBuildId -NotePropertyValue $buildId -Force
     $runnerResult | Add-Member -NotePropertyName discoveredGpuVendor -NotePropertyValue $gpuVendor -Force

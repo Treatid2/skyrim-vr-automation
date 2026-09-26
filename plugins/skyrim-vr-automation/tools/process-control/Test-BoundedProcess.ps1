@@ -23,8 +23,49 @@ Write-Output 'second attempt succeeded'
     $pwsh = (Get-Process -Id $PID).Path
     $result = & $tool -FilePath $pwsh -ArgumentList @('-NoProfile', '-File', $fixture, '-StatePath', $state) -WorkingDirectory $root -EvidenceDirectory (Join-Path $root 'evidence') -NoExit | ConvertFrom-Json
     if (-not $result.ok -or $result.attemptsRun -ne 2 -or -not $result.retried) { throw 'Expected one classified retry followed by success.' }
+    $successfulAttempt = @($result.attempts | Select-Object -Last 1)[0]
+    if (-not $successfulAttempt.processTreeOwned -or -not $successfulAttempt.jobQuiescent -or
+        -not $successfulAttempt.jobClosed -or -not $successfulAttempt.exitVerified -or
+        -not $successfulAttempt.streamDrainComplete -or -not $successfulAttempt.deadlineSatisfied) {
+        throw 'Successful completion omitted complete pre-execution ownership, quiescence, stream, or deadline evidence.'
+    }
     $nonRetry = & $tool -FilePath $pwsh -ArgumentList @('-NoProfile', '-Command', 'exit 7') -WorkingDirectory $root -MaxAttempts 3 -NoExit | ConvertFrom-Json
     if ($nonRetry.ok -or $nonRetry.attemptsRun -ne 1) { throw 'Unclassified failures must not be retried.' }
+
+    $detachedFixture = Join-Path $root 'detached-fixture.ps1'
+    $detachedPidPath = Join-Path $root 'detached-child.pid'
+    @'
+param([string]$ChildPidPath)
+$child = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 30') -PassThru -WindowStyle Hidden
+Set-Content -LiteralPath $ChildPidPath -Value $child.Id
+exit 0
+'@ | Set-Content -LiteralPath $detachedFixture -Encoding utf8
+    $detached = & $tool -FilePath $pwsh -ArgumentList @('-NoProfile', '-File', $detachedFixture, '-ChildPidPath', $detachedPidPath) `
+        -WorkingDirectory $root -TimeoutSeconds 2 -TerminationGraceMilliseconds 1000 -StreamDrainGraceMilliseconds 500 -NoExit | ConvertFrom-Json
+    if ($detached.ok -or -not $detached.attempts[0].timedOut -or -not $detached.attempts[0].terminationConfirmed -or
+        -not $detached.attempts[0].jobQuiescent -or $detached.attempts[0].unresolvedProcess) {
+        throw 'A zero-exit root with a live descendant was accepted without verified job quiescence.'
+    }
+    $detachedPid = [int](Get-Content -LiteralPath $detachedPidPath -Raw)
+    if (Get-Process -Id $detachedPid -ErrorAction SilentlyContinue) { throw "Detached descendant remained alive after bounded job cleanup: $detachedPid" }
+
+    $faultEvidence = Join-Path $root 'post-launch-evidence'
+    New-Item -ItemType Directory -Path $faultEvidence | Out-Null
+    $faultFixture = Join-Path $root 'post-launch-fault.ps1'
+    @'
+param([string]$EvidencePath)
+Remove-Item -LiteralPath $EvidencePath -Recurse -Force
+Set-Content -LiteralPath $EvidencePath -Value 'blocks receipt directory recreation'
+Write-Output 'launched-before-evidence-fault'
+exit 0
+'@ | Set-Content -LiteralPath $faultFixture -Encoding utf8
+    $faulted = & $tool -FilePath $pwsh -ArgumentList @('-NoProfile', '-File', $faultFixture, '-EvidencePath', $faultEvidence) `
+        -WorkingDirectory $root -EvidenceDirectory $faultEvidence -MaxAttempts 1 -NoExit | ConvertFrom-Json
+    if ($faulted.ok -or $faulted.attemptsRun -ne 1 -or $null -eq $faulted.attempts[0].pid -or
+        -not $faulted.attempts[0].exitVerified -or
+        (@($faulted.attempts[0].errors) -join ' ') -notmatch 'evidence persistence failed after launch') {
+        throw 'A post-launch evidence failure discarded PID/custody or was reported as pre-launch failure.'
+    }
 
     $treeFixture = Join-Path $root 'tree-fixture.ps1'
     $childPidPath = Join-Path $root 'child.pid'
@@ -54,7 +95,7 @@ Start-Sleep -Seconds 30
         $aggregateText -notmatch 'terminationConfirmed') {
         throw 'Aggregate toolset runner does not preserve bounded per-suite custody and timeout reporting.'
     }
-    [pscustomobject][ordered]@{ ok = $true; assertions = 7; receipt = $result.attemptsRun } | ConvertTo-Json
+    [pscustomobject][ordered]@{ ok = $true; assertions = 14; receipt = $result.attemptsRun } | ConvertTo-Json
 }
 finally {
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }

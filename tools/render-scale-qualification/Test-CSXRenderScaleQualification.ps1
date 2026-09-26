@@ -41,6 +41,47 @@ function Invoke-TestUnsealedQualificationReport([string]$Root) {
     } $Root
 }
 
+function Invoke-TestQualificationReportWithValidator {
+    param(
+        [Parameter(Mandatory)][string]$EvidenceDirectory,
+        [Parameter(Mandatory)][scriptblock]$CompletionValidator
+    )
+    & (Get-Module RenderScaleQualification) {
+        param($EvidenceRoot, $Validator)
+        Invoke-CSXQualificationReportUpdate -EvidenceDirectory $EvidenceRoot -CompletionValidator $Validator
+    } $EvidenceDirectory $CompletionValidator
+}
+
+function Invoke-TestSealedQualification {
+    param(
+        [Parameter(Mandatory)][string]$EvidenceDirectory,
+        [Parameter(Mandatory)][string]$CompletionPath,
+        [Parameter(Mandatory)]$CompletionReceipt,
+        [Parameter(Mandatory)][Diagnostics.Stopwatch]$InvocationWatch,
+        [Parameter(Mandatory)][Diagnostics.Stopwatch]$FinalizationWatch,
+        [Parameter(Mandatory)][DateTimeOffset]$ResultDeadlineUtc,
+        [Parameter(Mandatory)][double]$EndToEndBudgetMs,
+        [Parameter(Mandatory)][double]$FinalizationBudgetMs,
+        [scriptblock]$Finalizer,
+        [scriptblock]$CompletionCommitter,
+        [scriptblock]$CompletionValidator
+    )
+    $arguments = @{}
+    foreach ($entry in $PSBoundParameters.GetEnumerator()) { $arguments[$entry.Key] = $entry.Value }
+    & (Get-Module RenderScaleQualification) {
+        param($InvocationArguments)
+        Invoke-CSXSealedQualificationCommit @InvocationArguments
+    } $arguments
+}
+
+$publicReportCommand = Get-Command Update-CSXQualificationReport -Module RenderScaleQualification
+$publicSealCommand = Get-Command Complete-CSXSealedQualification -Module RenderScaleQualification
+Assert-Test (-not $publicReportCommand.Parameters.ContainsKey('CompletionValidator') -and
+    -not $publicSealCommand.Parameters.ContainsKey('Finalizer') -and
+    -not $publicSealCommand.Parameters.ContainsKey('CompletionCommitter') -and
+    -not $publicSealCommand.Parameters.ContainsKey('CompletionValidator')) `
+    'Exported qualification acceptance functions expose replaceable finalization or validation authority.'
+
 function Assert-FinalizerRejects {
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -1607,7 +1648,7 @@ try {
     $timelyInvocationWatch = [Diagnostics.Stopwatch]::StartNew()
     $timelyFinalizationWatch = [Diagnostics.Stopwatch]::StartNew()
     $script:terminalCallbackOrder = [Collections.Generic.List[string]]::new()
-    $timelyTerminal = Complete-CSXSealedQualification -EvidenceDirectory $timelyRoot -CompletionPath $timelyReceiptPath `
+    $timelyTerminal = Invoke-TestSealedQualification -EvidenceDirectory $timelyRoot -CompletionPath $timelyReceiptPath `
         -CompletionReceipt $timelyReceipt -InvocationWatch $timelyInvocationWatch -FinalizationWatch $timelyFinalizationWatch `
         -ResultDeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) -EndToEndBudgetMs 5000 -FinalizationBudgetMs 5000 `
         -Finalizer {
@@ -1628,6 +1669,50 @@ try {
         ($script:terminalCallbackOrder -join ',') -eq 'finalizer,completion-committer') `
         'A timely mandatory terminal validation was not retained as complete, or its finalizer did not run before its completion committer.'
 
+    $acceptedCleanupRoot = Join-Path $terminalBudgetRoot 'accepted-cleanup-warning'
+    $acceptedCleanupReceipt = New-TerminalCommitFixture -Root $acceptedCleanupRoot -RunId 'accepted-cleanup-warning-run'
+    $acceptedCleanupPath = Join-Path $acceptedCleanupRoot 'qualification-completion.json'
+    $script:acceptedCleanupValidationCalls = 0
+    $script:acceptedCleanupBackupLock = $null
+    try {
+        $acceptedCleanupTerminal = Invoke-TestSealedQualification -EvidenceDirectory $acceptedCleanupRoot -CompletionPath $acceptedCleanupPath `
+            -CompletionReceipt $acceptedCleanupReceipt -InvocationWatch ([Diagnostics.Stopwatch]::StartNew()) `
+            -FinalizationWatch ([Diagnostics.Stopwatch]::StartNew()) -ResultDeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) `
+            -EndToEndBudgetMs 5000 -FinalizationBudgetMs 5000 `
+            -Finalizer {
+                param($root, $runOutputPath, $summaryOutputPath)
+                Copy-Item -LiteralPath (Join-Path $root 'run.json') -Destination $runOutputPath
+                Copy-Item -LiteralPath (Join-Path $root 'summary.md') -Destination $summaryOutputPath
+                [pscustomobject]@{ report = [pscustomobject]@{ status = 'PASS' }; runPath = $runOutputPath; summaryPath = $summaryOutputPath }
+            } `
+            -CompletionValidator {
+                param($root, $runId, $receiptPath, $artifactPaths)
+                $script:acceptedCleanupValidationCalls++
+                if ($script:acceptedCleanupValidationCalls -eq 4) {
+                    $backup = @(Get-ChildItem -LiteralPath $root -Filter '.run.previous-*.json')[0]
+                    $script:acceptedCleanupBackupLock = [IO.File]::Open(
+                        $backup.FullName,
+                        [IO.FileMode]::Open,
+                        [IO.FileAccess]::Read,
+                        [IO.FileShare]::Read)
+                }
+                Test-CSXQualificationCompletionReceipt -EvidenceRoot $root -ExpectedRunId $runId `
+                    -CompletionPath $receiptPath -ArtifactPaths $artifactPaths
+            }
+        $acceptedCleanupValidation = Test-CSXQualificationCompletionReceipt `
+            -EvidenceRoot $acceptedCleanupRoot -ExpectedRunId 'accepted-cleanup-warning-run'
+        Assert-Test ($acceptedCleanupValidation.ok -and
+            @($acceptedCleanupTerminal.cleanupWarnings).Count -eq 1 -and
+            [string]$acceptedCleanupTerminal.cleanupWarnings[0] -match 'remove obsolete run backup') `
+            'A non-authoritative cleanup failure rejected or obscured an already validated public qualification result.'
+    }
+    finally {
+        if ($null -ne $script:acceptedCleanupBackupLock) {
+            $script:acceptedCleanupBackupLock.Dispose()
+            $script:acceptedCleanupBackupLock = $null
+        }
+    }
+
     $lateRoot = Join-Path $terminalBudgetRoot 'late'
     $lateReceipt = New-TerminalCommitFixture -Root $lateRoot -RunId 'late-run'
     $lateReceiptPath = Join-Path $lateRoot 'qualification-completion.json'
@@ -1635,7 +1720,7 @@ try {
     $lateFinalizationWatch = [Diagnostics.Stopwatch]::StartNew()
     $lateTerminalRejected = $false
     try {
-        Complete-CSXSealedQualification -EvidenceDirectory $lateRoot -CompletionPath $lateReceiptPath `
+        Invoke-TestSealedQualification -EvidenceDirectory $lateRoot -CompletionPath $lateReceiptPath `
             -CompletionReceipt $lateReceipt -InvocationWatch $lateInvocationWatch -FinalizationWatch $lateFinalizationWatch `
             -ResultDeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) -EndToEndBudgetMs 5000 -FinalizationBudgetMs 25 `
             -Finalizer { param($root) Start-Sleep -Milliseconds 75; [pscustomobject]@{ report = [pscustomobject]@{ status = 'PASS' }; runPath = (Join-Path $root 'run.json'); summaryPath = (Join-Path $root 'summary.md') } } | Out-Null
@@ -1650,7 +1735,7 @@ try {
     $failedCommitSummaryHash = Get-CSXFileSha256 (Join-Path $failedCommitRoot 'summary.md')
     $failedCommitRejected = $false
     try {
-        Complete-CSXSealedQualification -EvidenceDirectory $failedCommitRoot -CompletionPath $failedCommitPath `
+        Invoke-TestSealedQualification -EvidenceDirectory $failedCommitRoot -CompletionPath $failedCommitPath `
             -CompletionReceipt $failedCommitReceipt -InvocationWatch ([Diagnostics.Stopwatch]::StartNew()) `
             -FinalizationWatch ([Diagnostics.Stopwatch]::StartNew()) -ResultDeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) `
             -EndToEndBudgetMs 5000 -FinalizationBudgetMs 5000 `
@@ -1671,7 +1756,7 @@ try {
     $delayedCommitPath = Join-Path $delayedCommitRoot 'qualification-completion.json'
     $delayedCommitRejected = $false
     try {
-        Complete-CSXSealedQualification -EvidenceDirectory $delayedCommitRoot -CompletionPath $delayedCommitPath `
+        Invoke-TestSealedQualification -EvidenceDirectory $delayedCommitRoot -CompletionPath $delayedCommitPath `
             -CompletionReceipt $delayedCommitReceipt -InvocationWatch ([Diagnostics.Stopwatch]::StartNew()) `
             -FinalizationWatch ([Diagnostics.Stopwatch]::StartNew()) -ResultDeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) `
             -EndToEndBudgetMs 5000 -FinalizationBudgetMs 250 `
@@ -1707,7 +1792,7 @@ try {
             Test-CSXQualificationCompletionReceipt -EvidenceRoot $root -ExpectedRunId $runId -CompletionPath $receiptPath
         }
     }
-    try { Complete-CSXSealedQualification @delayedValidationArgs | Out-Null }
+    try { Invoke-TestSealedQualification @delayedValidationArgs | Out-Null }
     catch { $delayedValidationRejected = $_.Exception.Message -match 'before public acceptance' }
     $delayedValidationResult = Test-CSXQualificationCompletionReceipt -EvidenceRoot $delayedValidationRoot -ExpectedRunId 'delayed-validation-run'
     $delayedValidationSafe = $delayedValidationRejected -and -not $delayedValidationResult.ok -and -not (Test-Path -LiteralPath $delayedValidationPath) -and @(Get-ChildItem -LiteralPath $delayedValidationRoot -Filter '.qualification-completion.*.json').Count -eq 0
@@ -1737,7 +1822,7 @@ try {
             Test-CSXQualificationCompletionReceipt -EvidenceRoot $root -ExpectedRunId $runId -CompletionPath $receiptPath
         }
     }
-    try { Complete-CSXSealedQualification @failedValidationArgs | Out-Null }
+    try { Invoke-TestSealedQualification @failedValidationArgs | Out-Null }
     catch { $failedValidationRejected = $_.Exception.Message -match 'simulated transient committed-receipt read failure' }
     $failedValidationResult = Test-CSXQualificationCompletionReceipt -EvidenceRoot $failedValidationRoot -ExpectedRunId 'failed-validation-run'
     $failedValidationSafe = $failedValidationRejected -and -not $failedValidationResult.ok -and -not (Test-Path -LiteralPath $failedValidationPath) -and @(Get-ChildItem -LiteralPath $failedValidationRoot -Filter '.qualification-completion.*.json').Count -eq 0
@@ -1753,7 +1838,7 @@ try {
     $script:cleanupFailureSummaryLock = $null
     $cleanupFailureMessage = ''
     try {
-        Complete-CSXSealedQualification -EvidenceDirectory $cleanupFailureRoot -CompletionPath $cleanupFailurePath `
+        Invoke-TestSealedQualification -EvidenceDirectory $cleanupFailureRoot -CompletionPath $cleanupFailurePath `
             -CompletionReceipt $cleanupFailureReceipt -InvocationWatch ([Diagnostics.Stopwatch]::StartNew()) `
             -FinalizationWatch ([Diagnostics.Stopwatch]::StartNew()) -ResultDeadlineUtc ([DateTimeOffset]::UtcNow.AddSeconds(5)) `
             -EndToEndBudgetMs 5000 -FinalizationBudgetMs 5000 `
@@ -1816,6 +1901,9 @@ try {
     Assert-Test ($runnerSource.Contains('New-CSXMcpConnection -Runtime $script:runtime -DeadlineUtc $connectionDeadlineUtc') -and
         $runnerSource.Contains("-ClientName 'CSXRenderScaleQualificationCleanup'") -and
         $runnerSource.Contains('-DeadlineUtc $script:resultDeadlineUtc')) 'Runner does not bind normal and cleanup MCP session establishment to the shared result deadline.'
+    Assert-Test ($runnerSource.Contains('foreach ($cleanupWarning in @($terminal.cleanupWarnings))') -and
+        $runnerSource.Contains('warnings = @($warnings | Select-Object -Unique)')) `
+        'Runner does not expose non-authoritative post-publication cleanup warnings to its caller.'
     Assert-Test ($runnerSource -match '(?s)cleanupHealth.*?Assert-AuthoritativeRuntimeBinding' -and
         $runnerSource -match '(?s)qualification\.ownerId.*?script:runId') 'Emergency cleanup is not bound to the runtime and transition owner.'
     $protectedEvidence = Join-Path $fixture 'protected-evidence'
@@ -2154,7 +2242,7 @@ try {
         }
     }
     $script:completionValidationCalls = 0
-    $laterValidationFailure = Update-CSXQualificationReport -EvidenceDirectory $candidateRoot -CompletionValidator {
+    $laterValidationFailure = Invoke-TestQualificationReportWithValidator -EvidenceDirectory $candidateRoot -CompletionValidator {
         param($root, $runId)
         $script:completionValidationCalls++
         if ($script:completionValidationCalls -eq 2) {
@@ -2175,7 +2263,7 @@ try {
     $script:statusMismatchValidationCalls = 0
     $script:statusMismatchCompletion = $null
     try {
-        $statusMismatchFailure = Update-CSXQualificationReport -EvidenceDirectory $candidateRoot -CompletionValidator {
+        $statusMismatchFailure = Invoke-TestQualificationReportWithValidator -EvidenceDirectory $candidateRoot -CompletionValidator {
             param($root, $runId)
             $script:statusMismatchValidationCalls++
             if ($script:statusMismatchValidationCalls -eq 1) {

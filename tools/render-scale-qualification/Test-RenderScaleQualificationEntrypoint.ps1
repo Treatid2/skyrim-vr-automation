@@ -116,6 +116,13 @@ $runnerSource = Get-Content -LiteralPath $runner -Raw
 if ($entrypointText -notmatch 'AddSeconds\(600\)' -or
     $entrypointText -notmatch 'Invoke-BoundedQualificationScript -ScriptPath \$controller' -or
     $entrypointText -notmatch 'Invoke-BoundedQualificationScript -ScriptPath \$runner' -or
+    $entrypointText -notmatch '\$bounded\.deadlineSatisfied' -or
+    $entrypointText -notmatch '\$attempt\[0\]\.processTreeOwned' -or
+    $entrypointText -notmatch '\$attempt\[0\]\.jobQuiescent' -or
+    $entrypointText -notmatch '\$attempt\[0\]\.jobClosed' -or
+    $entrypointText -notmatch '\$attempt\[0\]\.exitVerified' -or
+    $entrypointText -notmatch '\$attempt\[0\]\.streamDrainComplete' -or
+    $entrypointText -match "Write-CSXJsonFile.*qualification-package-rejection\.json" -or
     $entrypointText -notmatch 'unresolvedProcess = \[bool\]' -or
     $entrypointText -notmatch 'boundedProcess = \$boundedAttempt' -or
     $entrypointText -notmatch 'state = \$\(if \(\$boundedChildLaunched\) \{ ''unknown'' \}') {
