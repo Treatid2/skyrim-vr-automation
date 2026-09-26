@@ -889,6 +889,55 @@ $simpleProbe = Resolve-DevBenchServiceProbeArguments -ToolDefinition $simpleTool
 Assert-Test ($simpleProbe.source -eq 'schema-empty-valid' -and $simpleProbe.arguments.Count -eq 0) 'schema-valid empty probes remain empty'
 
 $entryPointText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1') -Raw
+$openMcpStart = $entryPointText.IndexOf('function Open-McpSession')
+$openDevBenchStart = $entryPointText.IndexOf('function Open-DevBenchSession')
+$openMcpText = $entryPointText.Substring($openMcpStart, $openDevBenchStart - $openMcpStart)
+$toolsListIndex = $openMcpText.IndexOf("method = 'tools/list'")
+$stickyProofIndex = $openMcpText.IndexOf('$script:mcpCapabilityPreviouslyProven = $true')
+$identityQualificationIndex = $openMcpText.IndexOf('Get-RuntimeIdentity -Runtime $Runtime')
+Assert-Test ($toolsListIndex -ge 0 -and $stickyProofIndex -gt $toolsListIndex -and $identityQualificationIndex -gt $stickyProofIndex) 'MCP capability becomes sticky immediately after tool discovery and before optional runtime qualification'
+$capabilitySequence = @(
+    [pscustomobject]@{ stage = 'initialize'; proven = $false },
+    [pscustomobject]@{ stage = 'tools-list'; proven = $true },
+    [pscustomobject]@{ stage = 'qualification-failed'; proven = $true },
+    [pscustomobject]@{ stage = 'later-sessionless-404'; proven = $true }
+)
+$restFallbackIssued = Test-DevBenchMcpRestFallbackAllowed -InitialCapabilityMiss $true -McpCapabilityPreviouslyProven ([bool]$capabilitySequence[-1].proven)
+Assert-Test (-not $restFallbackIssued) 'a qualification failure after proven MCP capability cannot permit a later REST request'
+
+$tokens = $null
+$parseErrors = $null
+$entryPointAst = [Management.Automation.Language.Parser]::ParseInput($entryPointText, [ref]$tokens, [ref]$parseErrors)
+$updateEvidenceAst = $entryPointAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Update-InvocationEvidence' }, $true)
+Invoke-Expression $updateEvidenceAst.Extent.Text
+function Write-JsonAtomic { param([string]$Path, $Value) $Value | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $Path -Encoding utf8NoBOM }
+$terminalJournalPath = Join-Path ([IO.Path]::GetTempPath()) ('devbench-terminal-journal-' + [guid]::NewGuid().ToString('N') + '.json')
+try {
+    foreach ($terminalState in @('persistent-session-invalidated', 'mcp-capability-regression')) {
+        $script:invocationRecord = [pscustomobject][ordered]@{
+            state = 'prepared'; endpoint = $null; transport = $null; runtimeIdentity = $null
+            effectiveOperationTimeoutSeconds = $null; operationDeadlineUtc = $null
+            serverTimeoutMilliseconds = $null; serverTimeoutDispatchRemainingSeconds = $null
+            transportRetries = @(); semantic = $null; data = $null; errors = @()
+            dispatchIntentUtc = $null; completedUtc = $null
+        }
+        $script:invocationEvidencePath = $terminalJournalPath
+        $script:endpoint = 'http://127.0.0.1/mcp'
+        $script:transport = 'mcp'
+        $script:runtimeIdentity = $null
+        $script:effectiveOperationTimeoutSeconds = 10
+        $script:operationDeadlineUtc = [DateTime]::UtcNow.AddSeconds(10)
+        $script:serverTimeoutMilliseconds = $null
+        $script:serverTimeoutDispatchRemainingSeconds = $null
+        $script:transportRetries = @()
+        Update-InvocationEvidence -State $terminalState -Errors @('fixture')
+        $terminalJournal = Get-Content -LiteralPath $terminalJournalPath -Raw | ConvertFrom-Json
+        Assert-Test ($terminalJournal.state -eq $terminalState -and -not [string]::IsNullOrWhiteSpace([string]$terminalJournal.completedUtc)) "$terminalState journals an explicit completion timestamp"
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $terminalJournalPath) { Remove-Item -LiteralPath $terminalJournalPath -Force }
+}
 $entryPointPath = Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1'
 $parseErrors = $null
 $tokens = $null

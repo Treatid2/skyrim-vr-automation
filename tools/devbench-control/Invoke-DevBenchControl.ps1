@@ -225,7 +225,7 @@ function Update-InvocationEvidence {
     $script:invocationRecord.data = $Data
     $script:invocationRecord.errors = @($Errors)
     if ($State -eq 'dispatching') { $script:invocationRecord.dispatchIntentUtc = [DateTime]::UtcNow.ToString('o') }
-    if ($State -in @('completed', 'failed', 'guard-rejected', 'indeterminate')) { $script:invocationRecord.completedUtc = [DateTime]::UtcNow.ToString('o') }
+    if ($State -in @('completed', 'failed', 'guard-rejected', 'indeterminate', 'persistent-session-invalidated', 'mcp-capability-regression')) { $script:invocationRecord.completedUtc = [DateTime]::UtcNow.ToString('o') }
     Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord
 }
 
@@ -777,6 +777,7 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity, [switch]
         $listRpc = Invoke-McpRequest -Endpoint $endpoint -Headers $sessionHeaders -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/list'; params = @{} }
         if ($listRpc.json.PSObject.Properties['error']) { throw "DevBench tools/list failed: $($listRpc.json.error | ConvertTo-Json -Compress)" }
         $sessionTools = @($listRpc.json.result.tools)
+        $script:mcpCapabilityPreviouslyProven = $true
         $identity = $null
         if (-not $SkipRuntimeIdentityVerification) {
             $identity = Get-RuntimeIdentity -Runtime $Runtime -Headers $sessionHeaders -Tools $sessionTools -AllowDeferredBuildIdentity:$AllowDeferredBuildIdentity -PropagateRetryable:$PropagateRetryable
@@ -825,7 +826,6 @@ function Open-DevBenchSession($Runtime, [switch]$AllowDeferredBuildIdentity, [sw
         $script:transport = 'mcp'
         $script:endpoint = "$script:baseEndpoint/mcp"
         $session = Open-McpSession -Runtime $Runtime -AllowDeferredBuildIdentity:$AllowDeferredBuildIdentity -PropagateRetryable:$PropagateRetryable
-        $script:mcpCapabilityPreviouslyProven = $true
         $session | Add-Member -NotePropertyName transport -NotePropertyValue 'mcp'
         return $session
     }
