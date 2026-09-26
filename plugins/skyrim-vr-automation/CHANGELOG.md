@@ -9,6 +9,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Rebind an exact retained active MO2 Overwrite transaction to the task's new
+  closed-state access lease instead of dead-ending between obsolete-lease
+  completion and fresh-transaction rearm. Workspace discovery now distinguishes
+  exact active rebind, completed-output rearm, foreign ownership, malformed
+  markers, and incomplete completion evidence.
 - Reauthorize the last cooperative-close `Preparing vfs` Cancel control against
   the exact retained MO2 process and current session generation immediately
   before mutation; every MO2/game UI, close, and termination action now has an

@@ -48,9 +48,12 @@ OCU/OpenComposite provider is the blocker for the `SteamVRNull` route.
   lease release and resume, and `list-task` reports that choice.
 - `resume` verifies stable task ownership, requires the newly owned access
   lease, rebinds the workspace to that lease, and selects the retained profile.
-  When the prior lease completed its output transaction, resume creates a fresh
-  owner marker, evidence directories, snapshots, and completion paths for the
-  new lease before returning ready. It does not refresh the profile from the
+  When the retained workspace still owns an active Overwrite transaction,
+  resume verifies the exact owner-marker hash, task, workspace, immutable
+  ownership ID, and Overwrite path before rebinding that unchanged transaction
+  to the new closed-state lease. When the prior lease already completed its
+  output transaction, resume creates a fresh owner marker, evidence directories,
+  snapshots, and completion paths. It does not refresh the profile from the
   primary profile or requalify a save after task-local edits. A task that needs
   the current known-good baseline must explicitly request a fresh clone.
 

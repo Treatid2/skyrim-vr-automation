@@ -860,19 +860,59 @@ try {
     $preexisting = & $entry register-mod -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -ModName Loader -ModDirectory $loaderMod -NoExit -Confirm:$false | ConvertFrom-Json
     if ($preexisting.ok) { throw 'Workspace claimed a pre-existing mod.' }
     'retained-profile-state' | Set-Content -LiteralPath (Join-Path $created.data.profilePath 'task-state.txt') -Encoding utf8
+    $activeFixtureCache = Join-Path $mo2 'overwrite\ShaderCache'
+    if (Test-Path -LiteralPath $activeFixtureCache) { Remove-Item -LiteralPath $activeFixtureCache -Recurse -Force }
+    $activeRetained = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label active-retained -SavePolicy FreshGame -WorkspaceContent Modlist -Confirm:$false | ConvertFrom-Json
+    if (-not $activeRetained.ok -or -not (Test-Path -LiteralPath ([string]$activeRetained.data.runtimeOutput.ownerMarkerPath) -PathType Leaf)) { throw "Active-output retained workspace fixture was not created with its exact owner marker: $($activeRetained | ConvertTo-Json -Depth 20 -Compress)" }
     $unsafeRelease = & $entry release -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -NoExit -Confirm:$false | ConvertFrom-Json
     if ($unsafeRelease.ok -or $unsafeRelease.errors[0] -notmatch 'explicit retire only after direction to discard or replace' -or $unsafeRelease.errors[0] -match 'finished workspace' -or -not (Test-Path -LiteralPath $created.data.profilePath) -or -not (Test-Path -LiteralPath (Join-Path $created.data.profilePath 'task-state.txt'))) { throw 'Deprecated workspace release did not fail closed with explicit-discard guidance while preserving retained task state.' }
     $listed = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
-    if (-not $listed.ok -or $listed.data.count -ne 2) { throw 'Task workspace discovery did not list both retained profiles.' }
-    $listedModlist = @($listed.data.workspaces | Where-Object workspaceId -eq $created.data.workspaceId)[0]
-    $listedDevBench = @($listed.data.workspaces | Where-Object workspaceId -eq $verified.data.workspaceId)[0]
+    if (-not $listed.ok -or $listed.data.count -ne 1) { throw "Task workspace discovery did not isolate the one currently resumable active-output profile: $($listed | ConvertTo-Json -Depth 20 -Compress)" }
+    $allListed = @($listed.data.workspaces) + @($listed.data.unavailableWorkspaces)
+    $listedModlist = @($allListed | Where-Object workspaceId -eq $created.data.workspaceId)[0]
+    $listedDevBench = @($allListed | Where-Object workspaceId -eq $verified.data.workspaceId)[0]
+    $listedActive = @($listed.data.workspaces | Where-Object workspaceId -eq $activeRetained.data.workspaceId)[0]
     if ($listedModlist.workspaceContent -ne 'Modlist' -or @($listedModlist.selectedLocalWorkModIds).Count -ne 0 -or $listedDevBench.workspaceContent -ne 'ModlistPlusLocalWorkMods' -or @($listedDevBench.selectedLocalWorkModIds)[0] -ne 'csx-aio-local-devbench') { throw 'Retained workspace discovery did not expose each original local-work selection.' }
+    if ($listedModlist.resumeBlockReason -ne 'runtime-output-owned-by-other-workspace' -or $listedDevBench.resumeBlockReason -ne 'runtime-output-owned-by-other-workspace') { throw 'Completed workspaces were not explicitly blocked behind the exact active Overwrite owner.' }
+    if (-not $listedActive.resumable -or $listedActive.resumeDisposition -ne 'rebind-active-output' -or -not $listedActive.activeOutputRecoveryRequired) { throw 'Exact retained active-output ownership was not advertised with its bounded rebind transition.' }
+    $activeMarkerPath = [string]$activeRetained.data.runtimeOutput.ownerMarkerPath
+    $activeMarkerBytes = [IO.File]::ReadAllBytes($activeMarkerPath)
+    Add-Content -LiteralPath $activeMarkerPath -Value 'foreign-marker-drift' -Encoding utf8
+    $invalidMarkerList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
+    $invalidActive = @($invalidMarkerList.data.unavailableWorkspaces | Where-Object workspaceId -eq $activeRetained.data.workspaceId)[0]
+    if ($null -eq $invalidActive -or $invalidActive.resumable -or $invalidActive.resumeBlockReason -ne 'runtime-output-owner-marker-invalid') { throw 'Changed retained owner-marker bytes were still advertised as resumable.' }
+    [IO.File]::WriteAllBytes($activeMarkerPath, $activeMarkerBytes)
     $releasedAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
     if (-not $releasedAccess.ok -or -not (Test-Path -LiteralPath $created.data.profilePath)) { throw 'Yielding MO2 access did not preserve the retained task profile.' }
     $laterSharedMod = Join-Path $mods 'Later Shared Mod'; New-Item -ItemType Directory -Path $laterSharedMod -Force | Out-Null
     $nextAccess = Invoke-MO2RequestAccess -Config $config -Label fixture-resume -RuntimeRoute SteamVRNull; $nextAccessId = [string]$nextAccess.data.access.accessId
     $wrongOwner = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId 'different-task' -WorkspaceId $created.data.workspaceId -NoExit -Confirm:$false | ConvertFrom-Json
     if ($wrongOwner.ok -or $wrongOwner.errors[0] -notmatch 'different task') { throw 'A different task identity was allowed to resume the retained workspace.' }
+    $activeBackupPlanHashBefore = (Get-FileHash -LiteralPath ([string]$activeRetained.data.runtimeOutput.backupPlanPath) -Algorithm SHA256).Hash
+    $reboundActive = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $activeRetained.data.workspaceId -Confirm:$false | ConvertFrom-Json
+    $activeRebindChecks = [ordered]@{
+        ok = [bool]$reboundActive.ok
+        access = [string]$reboundActive.data.accessId -ceq $nextAccessId
+        disposition = [string]$reboundActive.data.lastResumeDisposition -ceq 'rebind-active-output'
+        markerPath = [string]$reboundActive.data.runtimeOutput.ownerMarkerPath -ceq [string]$activeRetained.data.runtimeOutput.ownerMarkerPath
+        markerIdentity = [string]$reboundActive.data.runtimeOutput.ownerMarkerSha256 -ceq [string]$activeRetained.data.runtimeOutput.ownerMarkerSha256
+        cacheEvidence = [string]$reboundActive.data.runtimeOutput.cacheEvidenceDirectory -ceq [string]$activeRetained.data.runtimeOutput.cacheEvidenceDirectory
+        backupEvidence = [string]$reboundActive.data.runtimeOutput.backupEvidenceDirectory -ceq [string]$activeRetained.data.runtimeOutput.backupEvidenceDirectory
+        backupPlan = (Get-FileHash -LiteralPath ([string]$reboundActive.data.runtimeOutput.backupPlanPath) -Algorithm SHA256).Hash -ceq $activeBackupPlanHashBefore
+        history = (-not $reboundActive.data.PSObject.Properties['runtimeOutputHistory'] -or @($reboundActive.data.runtimeOutputHistory).Count -eq 0)
+        liveMarker = (Get-FileHash -LiteralPath $activeMarkerPath -Algorithm SHA256).Hash -ceq [string]$activeRetained.data.runtimeOutput.ownerMarkerSha256
+    }
+    $failedActiveRebindChecks = @($activeRebindChecks.Keys | Where-Object { -not $activeRebindChecks[$_] })
+    if ($failedActiveRebindChecks.Count -gt 0) { throw "Active runtime-output transaction failed unchanged-rebind checks: $($failedActiveRebindChecks -join ', ')." }
+    $activeResumeJournal = Get-ChildItem -LiteralPath $workspaceControlRoot -Filter ($activeRetained.data.workspaceId + '.resume.*.journal.json') -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1 | Get-Content -Raw | ConvertFrom-Json
+    if ($activeResumeJournal.phase -ne 'committed' -or $activeResumeJournal.runtimeOutputRebind.state -ne 'validated' -or
+        [string]$activeResumeJournal.runtimeOutputRebind.transactionIdentity -cne [string]$activeRetained.data.runtimeOutput.ownerMarkerSha256 -or
+        [string]$activeResumeJournal.runtimeOutputRebind.priorAccessId -cne $accessId -or [string]$activeResumeJournal.runtimeOutputRebind.targetAccessId -cne $nextAccessId) {
+        throw 'Committed active-output resume did not retain exact transaction-lineage and access-rebind evidence.'
+    }
+    Complete-RearmedTestOutput -Workspace $reboundActive -OwnedAccessId $nextAccessId
+    $retiredActive = & $entry retire -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $activeRetained.data.workspaceId -Confirm:$false | ConvertFrom-Json
+    if (-not $retiredActive.ok -or (Test-Path -LiteralPath ([string]$activeRetained.data.profilePath))) { throw 'Completed active-output recovery fixture did not retire cleanly.' }
     $overwriteBeforeInterruptedResume = Get-TestProfileFingerprint (Join-Path $mo2 'overwrite')
     & $powerShell -NoProfile -NonInteractive -File $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -InternalTestFailurePoint resume-interrupt-after-output-rearm -Confirm:$false -NoExit | Out-Null
     if ($LASTEXITCODE -ne 91) { throw 'Interrupted resume fixture did not terminate after publishing recoverable output-rearm evidence.' }
