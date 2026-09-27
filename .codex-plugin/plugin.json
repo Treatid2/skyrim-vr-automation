@@ -1,7 +1,7 @@
 {
   "name": "skyrim-vr-automation",
   "version": "0.9.0+codex.20260908013933",
-  "description": "Codex skills for transactional Skyrim VR automation, local feedback, correlated capture and interaction, DevBench profiling, and reusable shader-cache management.",
+  "description": "Codex skills for transactional Skyrim VR automation, local feedback, correlated capture and interaction, DevBench profiling and render-scale qualification, and reusable shader-cache management.",
   "author": {
     "name": "Treatid2",
     "url": "https://github.com/Treatid2"
@@ -24,7 +24,7 @@
   "interface": {
     "displayName": "Skyrim VR Automation",
     "shortDescription": "Safe Skyrim VR test and profiling controls.",
-    "longDescription": "Adds safety-bounded workflows for exact-profile Mod Organizer 2 sessions, correlated state/stereo capture and in-game actions, transactional profile edits, compatibility-ranked compiled shader-cache reuse, backed-up SteamVR null-HMD switching, identity-bound DevBench calls, profiler captures, bounded process retries, and a durable local automation-feedback mailbox.",
+    "longDescription": "Adds safety-bounded workflows for exact-profile Mod Organizer 2 sessions, correlated state/stereo capture and in-game actions, transactional profile edits, compatibility-ranked compiled shader-cache reuse, backed-up SteamVR null-HMD switching, identity-bound DevBench calls, profiler captures and render-scale qualification, bounded process retries, and a durable local automation-feedback mailbox.",
     "developerName": "Treatid2",
     "category": "Developer Tools",
     "capabilities": [
@@ -41,6 +41,7 @@
       "Run a bounded Skyrim VR test session through MO2.",
       "Record and triage local feedback about the automation toolkit.",
       "Capture and compare CSX profiler evidence.",
+      "Run the complete unattended CSX render-scale qualification against my current DevBench session.",
       "Prepare this task with the best compatible known-working compiled shader cache.",
       "Observe and interact with Skyrim VR through one correlated state and stereo capture session."
     ]
