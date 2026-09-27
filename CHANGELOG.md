@@ -12,6 +12,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - Atomically replace a bounded-process receipt when its final persistence
   crosses the absolute deadline, so reopened durable evidence cannot retain a
   success projection after the returned result has failed.
+- Validate every completed runtime-output layer and restored live baseline
+  before discovery or resume can rearm it, rearm completed output even under
+  the same access ID, and report malformed or otherwise unavailable task-owned
+  workspace state without offering fresh-create guidance.
 - Rebind an exact retained active MO2 Overwrite transaction to the task's new
   closed-state access lease instead of dead-ending between obsolete-lease
   completion and fresh-transaction rearm. Workspace discovery now distinguishes
