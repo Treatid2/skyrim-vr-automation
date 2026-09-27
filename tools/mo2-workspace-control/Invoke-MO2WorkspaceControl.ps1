@@ -248,6 +248,23 @@ function Test-WorkspaceCommunityShadersBuildBinding($Expected, $Current) {
         [string]$Expected.shaderCacheAbi -ceq [string]$Current.shaderCacheAbi
 }
 
+function Test-WorkspaceCommunityShadersArtifactBinding($Expected, $Current) {
+    if ($null -eq $Expected -or $null -eq $Current) { return $false }
+    foreach ($required in @('profilePath', 'modsPath', 'modName', 'pluginPath', 'manifestPath', 'manifestSha256', 'buildId', 'artifactSha256', 'artifactBytes', 'shaderCacheAbi')) {
+        if (-not $Expected.PSObject.Properties[$required] -or -not $Current.PSObject.Properties[$required]) { return $false }
+    }
+    return (Test-WorkspaceSamePath ([string]$Expected.profilePath) ([string]$Current.profilePath)) -and
+        (Test-WorkspaceSamePath ([string]$Expected.modsPath) ([string]$Current.modsPath)) -and
+        [string]$Expected.modName -ceq [string]$Current.modName -and
+        (Test-WorkspaceSamePath ([string]$Expected.pluginPath) ([string]$Current.pluginPath)) -and
+        (Test-WorkspaceSamePath ([string]$Expected.manifestPath) ([string]$Current.manifestPath)) -and
+        (Test-WorkspaceSha256Equal ([string]$Expected.manifestSha256) ([string]$Current.manifestSha256)) -and
+        [string]$Expected.buildId -ceq [string]$Current.buildId -and
+        (Test-WorkspaceSha256Equal ([string]$Expected.artifactSha256) ([string]$Current.artifactSha256)) -and
+        [long]$Expected.artifactBytes -eq [long]$Current.artifactBytes -and
+        [string]$Expected.shaderCacheAbi -ceq [string]$Current.shaderCacheAbi
+}
+
 function Get-SafeName([string]$Value) {
     $safe = (($Value.Trim().ToLowerInvariant() -replace '[^a-z0-9]+', '-') -replace '(^-+|-+$)', '')
     if ([string]::IsNullOrWhiteSpace($safe)) { return 'task' }
@@ -607,10 +624,13 @@ function Get-WorkspaceCacheCompletionEvidence($Config, $Workspace, [switch]$Requ
     }
     $transactionTool = Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'
     $currentBuild = Resolve-WorkspaceCommunityShadersBuildBinding -ProfilePath $modListPath -ModsPath ([string]$Config.mo2.modsDirectory) -TransactionTool $transactionTool
-    if (-not (Test-WorkspaceCommunityShadersBuildBinding -Expected $output.communityShadersPlugin -Current $currentBuild) -or
-        -not (Test-WorkspaceCommunityShadersBuildBinding -Expected $binding.communityShadersPlugin -Current $currentBuild) -or
-        -not (Test-WorkspaceCommunityShadersBuildBinding -Expected $completionBinding.communityShadersPlugin -Current $currentBuild)) {
+    if (-not (Test-WorkspaceCommunityShadersBuildBinding -Expected $output.communityShadersPlugin -Current $binding.communityShadersPlugin) -or
+        -not (Test-WorkspaceCommunityShadersBuildBinding -Expected $binding.communityShadersPlugin -Current $completionBinding.communityShadersPlugin) -or
+        -not (Test-WorkspaceCommunityShadersArtifactBinding -Expected $output.communityShadersPlugin -Current $currentBuild)) {
         throw 'Shader-cache completion belongs to a different Community Shaders build identity.'
+    }
+    if (-not $RequireOwnerMarker -and -not [bool]$output.cachePathExistedBefore -and (Test-Path -LiteralPath ([string]$output.cachePath))) {
+        throw 'The task-created ShaderCache path was recreated after completion.'
     }
     if (Test-Path -LiteralPath ([string]$output.cachePath) -PathType Container) {
         $restored = Get-WorkspaceOutputInventory -Path ([string]$output.cachePath) -Purpose 'Restored MO2 Overwrite ShaderCache'
@@ -627,7 +647,8 @@ function Get-WorkspaceCommittedRestoreProof(
     [string]$BaselineTreeSha256,
     [string]$WorkingTreeSha256,
     [string]$SnapshotTransactionId,
-    [string]$TransactionTool) {
+    [string]$TransactionTool,
+    [bool]$PathExistedBefore = $true) {
     if ([string]::IsNullOrWhiteSpace($ReceiptPath) -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) {
         throw 'Committed backup restore receipt is missing; recovery remains required.'
     }
@@ -670,9 +691,15 @@ function Get-WorkspaceCommittedRestoreProof(
     if ([string]$preserved.treeSha256 -cne $WorkingTreeSha256) {
         throw 'Preserved backup task output differs from the recorded working tree.'
     }
-    $live = & $TransactionTool inspect -CachePath $CachePath -RelativeCachePath 'backup' -NoExit -Confirm:$false | ConvertFrom-Json -Depth 30
-    if (-not $live.ok -or [string]$live.data.treeSha256 -cne $BaselineTreeSha256) {
-        throw 'Live backup no longer matches the exact restored baseline; recovery remains required.'
+    if ($PathExistedBefore) {
+        $live = & $TransactionTool inspect -CachePath $CachePath -RelativeCachePath 'backup' -NoExit -Confirm:$false | ConvertFrom-Json -Depth 30
+        if (-not $live.ok -or [string]$live.data.treeSha256 -cne $BaselineTreeSha256) {
+            throw 'Live backup no longer matches the exact restored baseline; recovery remains required.'
+        }
+    }
+    else {
+        if (Test-Path -LiteralPath $CachePath) { throw 'The task-created backup path was recreated after completion.' }
+        $live = [pscustomobject]@{ data = [pscustomobject]@{ exists = $false; treeSha256 = $BaselineTreeSha256 } }
     }
     return [pscustomobject]@{
         receipt = $receipt
@@ -849,6 +876,11 @@ function Complete-WorkspaceBackupOutput($Config, $Workspace, [switch]$WhatIf) {
     $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Workspace.data.workspaceId) -OwnershipId ([string]$Workspace.data.ownershipId) -OverwritePath ([string]$output.overwritePath)
     Write-WorkspaceJsonAtomic -Path ([string]$output.backupPlanPath) -Value $backupPlan
     $restored = Get-WorkspaceCommittedRestoreProof -ReceiptPath ([string]$backupPlan.restoreReceiptPath) -EvidenceRoot ([string]$output.backupEvidenceDirectory) -CachePath ([string]$output.backupPath) -BaselineTreeSha256 ([string]$backupPlan.beforeTreeSha256) -WorkingTreeSha256 ([string]$backupPlan.workingTreeInventory.treeSha256) -SnapshotTransactionId $snapshotTransactionId -TransactionTool $transactionTool
+    if ([bool]$output.backupPathExistedBefore -and -not (Test-Path -LiteralPath ([string]$output.backupPath) -PathType Container)) {
+        New-Item -ItemType Directory -Path ([string]$output.backupPath) -Force | Out-Null
+        $restoredDirectory = Get-WorkspaceOutputInventory -Path ([string]$output.backupPath) -Purpose 'Restored pre-existing MO2 Overwrite backup directory'
+        if ([string]$restoredDirectory.treeSha256 -cne [string]$backupPlan.beforeTreeSha256) { throw 'Recreated pre-existing backup directory does not match the exact restored baseline.' }
+    }
     $completion = [pscustomobject][ordered]@{
         contractVersion = '1.0.0'; state = 'complete'; completedUtc = [DateTime]::UtcNow.ToString('o')
         workspaceId = [string]$Workspace.data.workspaceId; ownershipId = [string]$Workspace.data.ownershipId
@@ -998,28 +1030,78 @@ function Undo-JournaledRuntimeOutputRearm($Config, [string]$WorkspaceId, [string
     Write-WorkspaceJsonAtomic -Path $JournalPath -Value $Journal
 }
 
+function Get-WorkspaceCompletedRuntimeOutputEvidence($Config, $Workspace) {
+    $output = $Workspace.data.runtimeOutput
+    if ([string]$output.mode -cne 'mo2-overwrite-output') { throw 'Workspace does not use the MO2 Overwrite output contract.' }
+    if (Test-Path -LiteralPath ([string]$output.ownerMarkerPath) -PathType Leaf) { throw 'The workspace output transaction remains active.' }
+    $cacheEvidence = Get-WorkspaceCacheCompletionEvidence -Config $Config -Workspace $Workspace
+    $backupCompletion = Complete-WorkspaceBackupOutput -Config $Config -Workspace $Workspace -WhatIf
+    foreach ($path in @([string]$output.backupPlanPath, [string]$output.backupCompletionPath)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required backup completion evidence is missing: $path" }
+    }
+    $backupPlan = Get-Content -LiteralPath ([string]$output.backupPlanPath) -Raw | ConvertFrom-Json -Depth 40
+    foreach ($property in @('state', 'workspaceId', 'ownershipId', 'ownerMarkerPath', 'ownerMarkerSha256', 'overwritePath', 'backupPath', 'pathExistedBefore', 'profilePath', 'profileSha256', 'modsPath', 'communityShadersPlugin', 'transactionReceiptPath', 'beforeTreeSha256', 'preparedTreeSha256', 'shadowReceipt', 'workingTreeInventory', 'restoreReceiptPath', 'restoredTreeSha256')) {
+        if (-not $backupPlan.PSObject.Properties[$property]) { throw "Completed workspace backup plan lacks required field '$property'." }
+    }
+    foreach ($property in @('state', 'workspaceId', 'ownershipId', 'ownerMarkerSha256', 'backupPath', 'backupPlanPath', 'cachePlanTransactionId', 'pathExistedBefore', 'workingTree', 'preservedPath', 'restoredTreeSha256', 'restoreReceiptPath', 'communityShadersPlugin')) {
+        if (-not $backupCompletion.PSObject.Properties[$property]) { throw "Completed workspace backup receipt lacks required field '$property'." }
+    }
+    $modListPath = Join-Path ([string]$Workspace.data.profilePath) 'modlist.txt'
+    if ([string]$backupPlan.state -cne 'restored' -or
+        [string]$backupPlan.workspaceId -cne [string]$Workspace.data.workspaceId -or
+        [string]$backupPlan.ownershipId -cne [string]$Workspace.data.ownershipId -or
+        -not (Test-WorkspaceSamePath ([string]$backupPlan.ownerMarkerPath) ([string]$output.ownerMarkerPath)) -or
+        [string]$backupPlan.ownerMarkerSha256 -cne [string]$output.ownerMarkerSha256 -or
+        -not (Test-WorkspaceSamePath ([string]$backupPlan.overwritePath) ([string]$output.overwritePath)) -or
+        -not (Test-WorkspaceSamePath ([string]$backupPlan.backupPath) ([string]$output.backupPath)) -or
+        [bool]$backupPlan.pathExistedBefore -ne [bool]$output.backupPathExistedBefore -or
+        -not (Test-WorkspaceSamePath ([string]$backupPlan.profilePath) $modListPath) -or
+        -not (Test-WorkspaceSamePath ([string]$backupPlan.modsPath) ([string]$Config.mo2.modsDirectory)) -or
+        [string]$backupPlan.restoredTreeSha256 -cne [string]$backupPlan.beforeTreeSha256 -or
+        -not (Test-WorkspaceCommunityShadersBuildBinding -Expected $output.communityShadersPlugin -Current $backupPlan.communityShadersPlugin) -or
+        -not (Test-WorkspaceCommunityShadersArtifactBinding -Expected $backupPlan.communityShadersPlugin -Current $cacheEvidence.build)) {
+        throw 'Completed workspace backup plan no longer binds the exact output owner, profile, paths, build, and restored baseline.'
+    }
+    if ($null -eq $backupPlan.workingTreeInventory -or -not $backupPlan.workingTreeInventory.PSObject.Properties['treeSha256']) {
+        throw 'Completed workspace backup plan lacks an exact working-tree inventory.'
+    }
+    $snapshotReceipt = Get-Content -LiteralPath ([string]$backupPlan.transactionReceiptPath) -Raw | ConvertFrom-Json -Depth 30
+    foreach ($property in @('operation', 'transactionId', 'cachePath', 'beforeTreeSha256')) {
+        if (-not $snapshotReceipt.PSObject.Properties[$property]) { throw "Workspace backup snapshot receipt lacks required field '$property'." }
+    }
+    if ([string]$snapshotReceipt.operation -cne 'snapshot' -or [string]::IsNullOrWhiteSpace([string]$snapshotReceipt.transactionId) -or
+        -not (Test-WorkspaceSamePath ([string]$snapshotReceipt.cachePath) ([string]$output.backupPath)) -or
+        [string]$snapshotReceipt.beforeTreeSha256 -cne [string]$backupPlan.beforeTreeSha256) {
+        throw 'Workspace backup snapshot receipt no longer binds the completed plan.'
+    }
+    $transactionTool = Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'
+    $restoreProof = Get-WorkspaceCommittedRestoreProof -ReceiptPath ([string]$backupPlan.restoreReceiptPath) -EvidenceRoot ([string]$output.backupEvidenceDirectory) -CachePath ([string]$output.backupPath) -BaselineTreeSha256 ([string]$backupPlan.beforeTreeSha256) -WorkingTreeSha256 ([string]$backupPlan.workingTreeInventory.treeSha256) -SnapshotTransactionId ([string]$snapshotReceipt.transactionId) -TransactionTool $transactionTool -PathExistedBefore ([bool]$output.backupPathExistedBefore)
+    if ([string]$backupCompletion.state -cne 'complete' -or
+        [string]$backupCompletion.workspaceId -cne [string]$Workspace.data.workspaceId -or
+        [string]$backupCompletion.ownershipId -cne [string]$Workspace.data.ownershipId -or
+        [string]$backupCompletion.ownerMarkerSha256 -cne [string]$output.ownerMarkerSha256 -or
+        -not (Test-WorkspaceSamePath ([string]$backupCompletion.backupPath) ([string]$output.backupPath)) -or
+        -not (Test-WorkspaceSamePath ([string]$backupCompletion.backupPlanPath) ([string]$output.backupPlanPath)) -or
+        [string]$backupCompletion.cachePlanTransactionId -cne [string]$cacheEvidence.plan.transactionId -or
+        [bool]$backupCompletion.pathExistedBefore -ne [bool]$output.backupPathExistedBefore -or
+        [string]$backupCompletion.workingTree.treeSha256 -cne [string]$backupPlan.workingTreeInventory.treeSha256 -or
+        -not (Test-WorkspaceSamePath ([string]$backupCompletion.preservedPath) ([string]$restoreProof.data.displacedPath)) -or
+        -not (Test-WorkspaceSamePath ([string]$backupCompletion.restoreReceiptPath) ([string]$backupPlan.restoreReceiptPath)) -or
+        [string]$backupCompletion.restoredTreeSha256 -cne [string]$backupPlan.restoredTreeSha256 -or
+        -not (Test-WorkspaceCommunityShadersBuildBinding -Expected $backupPlan.communityShadersPlugin -Current $backupCompletion.communityShadersPlugin)) {
+        throw 'Workspace backup completion no longer closes the exact completed output plan.'
+    }
+    if (-not [bool]$output.backupPathExistedBefore -and (Test-Path -LiteralPath ([string]$output.backupPath))) {
+        throw 'The task-created backup path was recreated after completion.'
+    }
+    return [pscustomobject][ordered]@{ cache = $cacheEvidence; backupPlan = $backupPlan; backupCompletion = $backupCompletion; restore = $restoreProof }
+}
+
 function New-RearmedWorkspaceRuntimeOutput($Config, $Workspace, [string]$OperationId, $Journal, [string]$JournalPath) {
     $old = $Workspace.data.runtimeOutput
     if ([string]$old.mode -cne 'mo2-overwrite-output') { throw 'Only MO2 Overwrite output transactions can be rearmed.' }
     if (Test-Path -LiteralPath ([string]$old.ownerMarkerPath) -PathType Leaf) { throw 'A retained workspace still owns an active MO2 Overwrite transaction; complete it before resuming.' }
-    foreach ($completionPath in @([string]$old.cacheCompletionPath, [string]$old.backupCompletionPath)) {
-        if (-not (Test-Path -LiteralPath $completionPath -PathType Leaf)) { throw "Retained workspace output is incomplete and cannot be rearmed: $completionPath" }
-    }
-    $cacheCompletion = Get-Content -LiteralPath ([string]$old.cacheCompletionPath) -Raw | ConvertFrom-Json -Depth 40
-    $backupCompletion = Get-Content -LiteralPath ([string]$old.backupCompletionPath) -Raw | ConvertFrom-Json -Depth 40
-    foreach ($completion in @($cacheCompletion, $backupCompletion)) {
-        if (-not $completion.PSObject.Properties['state'] -or [string]$completion.state -cne 'complete' -or
-            -not $completion.PSObject.Properties['restoredTreeSha256']) {
-            throw 'Retained workspace output completion is not terminal and restorable.'
-        }
-    }
-    if ($null -eq $cacheCompletion.cacheBinding -or
-        [string]$cacheCompletion.cacheBinding.workspaceId -cne [string]$Workspace.data.workspaceId -or
-        [string]$cacheCompletion.cacheBinding.ownershipId -cne [string]$Workspace.data.ownershipId -or
-        [string]$backupCompletion.workspaceId -cne [string]$Workspace.data.workspaceId -or
-        [string]$backupCompletion.ownershipId -cne [string]$Workspace.data.ownershipId) {
-        throw 'Retained workspace output completions belong to a different workspace owner.'
-    }
+    $null = Get-WorkspaceCompletedRuntimeOutputEvidence -Config $Config -Workspace $Workspace
 
     $workspaceId = [string]$Workspace.data.workspaceId
     $ownershipId = [string]$Workspace.data.ownershipId
@@ -1527,6 +1609,7 @@ function Write-SelectedProfileReceipt([Collections.IDictionary]$Journal) {
 }
 
 function Resolve-SelectedProfileJournal($Config, [string]$JournalPath) {
+    Assert-NoWorkspaceReparsePoint -Path $JournalPath -Purpose 'Selected-profile recovery journal'
     $journal = Get-Content -LiteralPath $JournalPath -Raw | ConvertFrom-Json -AsHashtable
     $phase = [string]$journal['phase']
     if ($phase -in @('committed', 'recovered-committed', 'rolled-back', 'recovered-preimage', 'aborted-before-mutation', 'compensated-by-parent')) { return $journal }
@@ -1557,13 +1640,36 @@ function Resolve-SelectedProfileJournal($Config, [string]$JournalPath) {
 }
 
 function Resolve-PendingSelectedProfileJournals($Config) {
+    Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
     $root = Get-WorkspaceControlRoot -Config $Config
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
-    $inventory = Get-BoundedTreeInventory -Path $root -Purpose 'Workspace selected-profile journal discovery'
-    $resolved = @()
-    foreach ($file in @($inventory.files | Where-Object { [IO.Path]::GetFileName([string]$_.path) -like '*.selected-profile.journal.json' })) {
-        $resolved += Resolve-SelectedProfileJournal -Config $Config -JournalPath ([string]$file.fullPath)
+    Assert-NoWorkspaceReparsePoint -Path $root -Purpose 'Workspace selected-profile control root'
+    $evidenceDirectories = @(
+        @(Get-ChildItem -LiteralPath $root -Directory -Force -Filter '*-create-select'),
+        @(Get-ChildItem -LiteralPath $root -Directory -Force -Filter '*-resume-*'),
+        @(Get-ChildItem -LiteralPath $root -Directory -Force -Filter '*-retire-*')
+    ) | ForEach-Object { $_ } | Sort-Object FullName -Unique
+    Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
+    $journalFiles = @()
+    foreach ($directory in $evidenceDirectories) {
+        Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
+        if ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Workspace selected-profile evidence directory is a reparse point: $($directory.FullName)"
+        }
+        Assert-NoWorkspaceReparsePoint -Path $directory.FullName -Purpose 'Workspace selected-profile evidence directory'
+        $journalFiles += @(Get-ChildItem -LiteralPath $directory.FullName -Filter '*.selected-profile.journal.json' -File -Force)
+        Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
     }
+    foreach ($file in $journalFiles) {
+        Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
+        Assert-NoWorkspaceReparsePoint -Path $file.FullName -Purpose 'Selected-profile recovery journal'
+    }
+    $resolved = @()
+    foreach ($file in $journalFiles) {
+        Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
+        $resolved += Resolve-SelectedProfileJournal -Config $Config -JournalPath $file.FullName
+    }
+    Assert-TreeOperationBudget -Purpose 'Workspace selected-profile journal discovery'
     return @($resolved)
 }
 
@@ -1603,6 +1709,7 @@ function Assert-WorkspaceRecoveryPath([string]$Path, [string]$Root, [string]$Pur
 }
 
 function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
+    Assert-NoWorkspaceReparsePoint -Path $JournalPath -Purpose 'Workspace operation recovery journal'
     $journal = Get-Content -LiteralPath $JournalPath -Raw | ConvertFrom-Json -AsHashtable
     if ([string]$journal['phase'] -in @('committed', 'rolled-back', 'recovered-committed', 'recovered-preimage')) { return $journal }
     $profilesRoot = [IO.Path]::GetFullPath([string]$Config.mo2.profilesDirectory)
@@ -1730,13 +1837,22 @@ function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
 }
 
 function Resolve-PendingWorkspaceJournals($Config) {
+    Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
     $root = Get-WorkspaceControlRoot -Config $Config
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
-    $inventory = Get-BoundedTreeInventory -Path $root -Purpose 'Workspace operation journal discovery'
+    Assert-NoWorkspaceReparsePoint -Path $root -Purpose 'Workspace operation control root'
     $resolved = @()
-    foreach ($file in @($inventory.files | Where-Object { [IO.Path]::GetFileName([string]$_.path) -match '\.(creation|resume\.[^.]+|retire\.[^.]+)\.journal\.json$' })) {
-        $resolved += Resolve-PendingWorkspaceJournal -Config $Config -JournalPath ([string]$file.fullPath)
+    $journalFiles = @(Get-ChildItem -LiteralPath $root -Filter '*.journal.json' -File -Force | Where-Object { $_.Name -match '\.(creation|resume\.[^.]+|retire\.[^.]+)\.journal\.json$' })
+    Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
+    foreach ($file in $journalFiles) {
+        Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
+        Assert-NoWorkspaceReparsePoint -Path $file.FullName -Purpose 'Workspace operation recovery journal'
     }
+    foreach ($file in $journalFiles) {
+        Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
+        $resolved += Resolve-PendingWorkspaceJournal -Config $Config -JournalPath $file.FullName
+    }
+    Assert-TreeOperationBudget -Purpose 'Workspace operation journal discovery'
     return @($resolved)
 }
 
@@ -1980,15 +2096,84 @@ function Read-OwnedWorkspace($Config, [string]$Id, [string]$OwnedAccessId, [stri
     return $workspace
 }
 
+function Get-WorkspaceResumeClassification($Config, $Manifest, [string]$ManifestPath) {
+    $status = [string]$Manifest.status
+    $profilePath = [IO.Path]::GetFullPath([string]$Manifest.profilePath)
+    $profileExists = Test-Path -LiteralPath $profilePath -PathType Container
+    if ($status -notin @('ready', 'retained')) {
+        return [pscustomobject]@{ resumable = $false; reason = "status-$status"; profileExists = $profileExists; runtimeOutputCompatible = $false; resumeDisposition = 'blocked'; activeOutputRecoveryRequired = $false }
+    }
+    if (-not $profileExists) {
+        return [pscustomobject]@{ resumable = $false; reason = 'profile-directory-missing'; profileExists = $false; runtimeOutputCompatible = $false; resumeDisposition = 'blocked'; activeOutputRecoveryRequired = $false }
+    }
+    if (-not $Manifest.PSObject.Properties['runtimeOutput'] -or $null -eq $Manifest.runtimeOutput) {
+        return [pscustomobject]@{ resumable = $false; reason = 'legacy-runtime-output-contract-missing'; profileExists = $true; runtimeOutputCompatible = $false; resumeDisposition = 'blocked'; activeOutputRecoveryRequired = $false }
+    }
+    $requiredOutputProperties = @('mode', 'executable', 'overwritePath', 'ownerMarkerPath', 'ownerMarkerSha256', 'cachePath', 'backupPath', 'cachePathExistedBefore', 'backupPathExistedBefore', 'communityShadersPlugin', 'cacheEvidenceDirectory', 'cachePlanPath', 'cacheCompletionPath', 'backupEvidenceDirectory', 'backupPlanPath', 'backupCompletionPath')
+    $missingOutputProperties = @($requiredOutputProperties | Where-Object {
+        -not $Manifest.runtimeOutput.PSObject.Properties[$_] -or [string]::IsNullOrWhiteSpace([string]$Manifest.runtimeOutput.$_)
+    })
+    if ($missingOutputProperties.Count -gt 0 -or [string]$Manifest.runtimeOutput.mode -cne 'mo2-overwrite-output') {
+        $reason = if ($missingOutputProperties.Count -gt 0) { 'legacy-runtime-output-contract-incomplete: ' + ($missingOutputProperties -join ', ') } else { 'unsupported-runtime-output-mode' }
+        return [pscustomobject]@{ resumable = $false; reason = $reason; profileExists = $true; runtimeOutputCompatible = $false; resumeDisposition = 'blocked'; activeOutputRecoveryRequired = $false }
+    }
+    $output = $Manifest.runtimeOutput
+    if (Test-Path -LiteralPath ([string]$output.ownerMarkerPath) -PathType Leaf) {
+        try {
+            $observedMarker = Get-Content -LiteralPath ([string]$output.ownerMarkerPath) -Raw | ConvertFrom-Json -Depth 20
+            if ([string]$observedMarker.workspaceId -cne [string]$Manifest.workspaceId) {
+                return [pscustomobject]@{ resumable = $false; reason = 'runtime-output-owned-by-other-workspace'; profileExists = $true; runtimeOutputCompatible = $true; resumeDisposition = 'blocked'; activeOutputRecoveryRequired = $false }
+            }
+            $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Manifest.workspaceId) -OwnershipId ([string]$Manifest.ownershipId) -OverwritePath ([string]$output.overwritePath)
+        }
+        catch {
+            return [pscustomobject]@{ resumable = $false; reason = 'runtime-output-owner-marker-invalid'; profileExists = $true; runtimeOutputCompatible = $true; resumeDisposition = 'blocked'; activeOutputRecoveryRequired = $true }
+        }
+        return [pscustomobject]@{ resumable = $true; reason = $null; profileExists = $true; runtimeOutputCompatible = $true; resumeDisposition = 'rebind-active-output'; activeOutputRecoveryRequired = $true }
+    }
+    $missingCompletionProperties = @(@('cacheCompletionPath', 'backupCompletionPath') | Where-Object {
+        -not (Test-Path -LiteralPath ([string]$output.$_) -PathType Leaf)
+    })
+    if ($missingCompletionProperties.Count -gt 0) {
+        return [pscustomobject]@{ resumable = $false; reason = 'runtime-output-completion-missing: ' + ($missingCompletionProperties -join ', '); profileExists = $true; runtimeOutputCompatible = $true; resumeDisposition = 'blocked'; activeOutputRecoveryRequired = $false }
+    }
+    try {
+        $workspaceView = [pscustomobject]@{ data = $Manifest; path = $ManifestPath }
+        $null = Get-WorkspaceCompletedRuntimeOutputEvidence -Config $Config -Workspace $workspaceView
+    }
+    catch {
+        return [pscustomobject]@{ resumable = $false; reason = 'runtime-output-completion-invalid: ' + $_.Exception.Message; profileExists = $true; runtimeOutputCompatible = $true; resumeDisposition = 'blocked'; activeOutputRecoveryRequired = $false }
+    }
+    return [pscustomobject]@{ resumable = $true; reason = $null; profileExists = $true; runtimeOutputCompatible = $true; resumeDisposition = 'rearm-completed-output'; activeOutputRecoveryRequired = $false }
+}
+
 function Get-TaskWorkspaces($Config, [string]$ResolvedTaskId) {
     $root = Join-Path ([string]$Config.storage.sessionStaging) 'workspaces'
     if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
     $items = @()
-    foreach ($file in @(Get-ChildItem -LiteralPath $root -Filter '*.json' -File -Force | Sort-Object LastWriteTimeUtc -Descending)) {
+    foreach ($file in @(Get-ChildItem -LiteralPath $root -Filter '*.json' -File -Force | Where-Object Name -NotLike '*.journal.json' | Sort-Object LastWriteTimeUtc -Descending)) {
+        $raw = $null
         try {
-            $manifest = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
-            if ($manifest.PSObject.Properties['ownerTaskId'] -and [string]$manifest.ownerTaskId -ceq $ResolvedTaskId) {
+            $raw = Get-Content -LiteralPath $file.FullName -Raw
+            $manifest = $raw | ConvertFrom-Json
+        }
+        catch {
+            if ($null -ne $raw -and $raw -match ('"ownerTaskId"\s*:\s*"' + [regex]::Escape($ResolvedTaskId) + '"')) {
+                $items += [pscustomobject][ordered]@{
+                    workspaceId = [IO.Path]::GetFileNameWithoutExtension($file.Name); status = 'manifest-invalid'
+                    profileName = $null; profileDirectory = $null; profileExists = $false; resumable = $false
+                    resumeBlockReason = 'manifest-invalid: ' + $_.Exception.Message
+                    runtimeOutputCompatible = $false; resumeDisposition = 'blocked'; activeOutputRecoveryRequired = $false
+                    sourceProfile = $null; accessId = $null; workspaceContent = 'unavailable'; selectedLocalWorkModIds = @()
+                    createdUtc = $null; lastResumedUtc = $null; manifestPath = $file.FullName
+                }
+            }
+            continue
+        }
+        if ($manifest.PSObject.Properties['ownerTaskId'] -and [string]$manifest.ownerTaskId -ceq $ResolvedTaskId) {
+            try {
                 $profilePath = [IO.Path]::GetFullPath([string]$manifest.profilePath)
+                $resumeClassification = Get-WorkspaceResumeClassification -Config $Config -Manifest $manifest -ManifestPath $file.FullName
                 [string[]]$selectedLocalWorkModIds = @()
                 if ($manifest.PSObject.Properties['localWorkMods'] -and @($manifest.localWorkMods.requestedIds).Count -gt 0) {
                     $selectedLocalWorkModIds = @($manifest.localWorkMods.requestedIds | ForEach-Object { [string]$_ })
@@ -1996,8 +2181,12 @@ function Get-TaskWorkspaces($Config, [string]$ResolvedTaskId) {
                 $items += [pscustomobject][ordered]@{
                     workspaceId = [string]$manifest.workspaceId; status = [string]$manifest.status
                     profileName = [string]$manifest.profileName; profileDirectory = $profilePath
-                    profileExists = Test-Path -LiteralPath $profilePath -PathType Container
-                    resumable = ([string]$manifest.status -in @('ready', 'retained')) -and (Test-Path -LiteralPath $profilePath -PathType Container)
+                    profileExists = $resumeClassification.profileExists
+                    resumable = $resumeClassification.resumable
+                    resumeBlockReason = $resumeClassification.reason
+                    runtimeOutputCompatible = $resumeClassification.runtimeOutputCompatible
+                    resumeDisposition = $resumeClassification.resumeDisposition
+                    activeOutputRecoveryRequired = $resumeClassification.activeOutputRecoveryRequired
                     sourceProfile = [string]$manifest.sourceProfile; accessId = [string]$manifest.accessId
                     workspaceContent = if ($manifest.PSObject.Properties['localWorkMods']) { [string]$manifest.localWorkMods.workspaceContent } else { 'legacy-unspecified' }
                     selectedLocalWorkModIds = $selectedLocalWorkModIds
@@ -2005,8 +2194,22 @@ function Get-TaskWorkspaces($Config, [string]$ResolvedTaskId) {
                     manifestPath = $file.FullName
                 }
             }
+            catch {
+                $items += [pscustomobject][ordered]@{
+                    workspaceId = if ($manifest.PSObject.Properties['workspaceId']) { [string]$manifest.workspaceId } else { [IO.Path]::GetFileNameWithoutExtension($file.Name) }
+                    status = if ($manifest.PSObject.Properties['status']) { [string]$manifest.status } else { 'classification-failed' }
+                    profileName = if ($manifest.PSObject.Properties['profileName']) { [string]$manifest.profileName } else { $null }
+                    profileDirectory = if ($manifest.PSObject.Properties['profilePath']) { [string]$manifest.profilePath } else { $null }
+                    profileExists = $false; resumable = $false; resumeBlockReason = 'manifest-classification-failed: ' + $_.Exception.Message
+                    runtimeOutputCompatible = $false; resumeDisposition = 'blocked'; activeOutputRecoveryRequired = $false
+                    sourceProfile = if ($manifest.PSObject.Properties['sourceProfile']) { [string]$manifest.sourceProfile } else { $null }
+                    accessId = if ($manifest.PSObject.Properties['accessId']) { [string]$manifest.accessId } else { $null }
+                    workspaceContent = 'unavailable'; selectedLocalWorkModIds = @()
+                    createdUtc = if ($manifest.PSObject.Properties['createdUtc']) { [string]$manifest.createdUtc } else { $null }
+                    lastResumedUtc = $null; manifestPath = $file.FullName
+                }
+            }
         }
-        catch { }
     }
     return @($items)
 }
@@ -2193,12 +2396,14 @@ try {
         $resolvedTaskId = Resolve-TaskId -RequestedTaskId $TaskId -Required
         $allWorkspaces = @(Get-TaskWorkspaces -Config $config -ResolvedTaskId $resolvedTaskId)
         $workspaces = @($allWorkspaces | Where-Object resumable)
+        $unavailableWorkspaces = @($allWorkspaces | Where-Object { -not $_.resumable })
+        $listState = if ($workspaces.Count -gt 0) { 'retained-workspaces-found' } elseif ($unavailableWorkspaces.Count -gt 0) { 'retained-workspaces-unavailable' } else { 'no-retained-workspaces' }
         $result = [pscustomobject][ordered]@{
-            ok = $true; command = $Command; state = $(if ($workspaces.Count -eq 0) { 'no-retained-workspaces' } else { 'retained-workspaces-found' })
+            ok = $true; command = $Command; state = $listState
             data = [pscustomobject][ordered]@{
                 ownerTaskId = $resolvedTaskId; count = $workspaces.Count; workspaces = $workspaces
-                unavailableWorkspaces = @($allWorkspaces | Where-Object { -not $_.resumable })
-                guidance = if ($workspaces.Count -eq 0) { 'This task has no retained workspace. After acquiring MO2 access, explicitly create a fresh workspace.' } else { 'After acquiring MO2 access, explicitly resume one listed WorkspaceId or explicitly create a fresh workspace.' }
+                unavailableWorkspaces = $unavailableWorkspaces
+                guidance = if ($workspaces.Count -gt 0) { 'After acquiring MO2 access, explicitly resume one listed WorkspaceId. Preserve and resolve every unavailable retained workspace; create a fresh workspace only under separately reviewed replacement authority.' } elseif ($unavailableWorkspaces.Count -gt 0) { 'This task has retained workspace state, but none is currently resumable. Preserve it and act on each exact resumeBlockReason; do not create a replacement without separately reviewed migration or retirement authority.' } else { 'This task has no matching retained workspace. After acquiring MO2 access, explicitly create a fresh workspace.' }
             }
         }
     }
@@ -2674,19 +2879,19 @@ try {
         }
         $workspace = Read-Workspace -Config $config -Id $WorkspaceId
         Assert-WorkspaceTaskOwner -Workspace $workspace -ResolvedTaskId $resolvedTaskId
-        if ([string]$workspace.data.status -notin @('ready', 'retained')) { throw "Workspace '$WorkspaceId' is not resumable; status is '$($workspace.data.status)'." }
-        $profilePath = [IO.Path]::GetFullPath([string]$workspace.data.profilePath)
-        if (-not (Test-Path -LiteralPath $profilePath -PathType Container)) {
-            $available = @(Get-TaskWorkspaces -Config $config -ResolvedTaskId $resolvedTaskId | Where-Object profileExists)
-            throw "Retained workspace '$WorkspaceId' has no profile directory at '$profilePath'. Valid retained workspaces: $((@($available.workspaceId) -join ', ') ?? '<none>'). Request a fresh workspace if none remain."
+        $resumeClassification = Get-WorkspaceResumeClassification -Config $config -Manifest $workspace.data -ManifestPath $workspace.path
+        if (-not $resumeClassification.resumable) {
+            throw "Workspace '$WorkspaceId' is safely retained but not resumable: $($resumeClassification.reason). Its profile and task-owned mods were not changed. A separately reviewed migration is required; do not silently recreate the environment."
         }
+        $profilePath = [IO.Path]::GetFullPath([string]$workspace.data.profilePath)
         $null = Assert-AccessAndClosed -Config $config -OwnedAccessId $AccessId -Profile ([string]$workspace.data.profile) -AllowOverwriteShaderCaches -RequireRuntimeRoute
         $approved = $PSCmdlet.ShouldProcess($profilePath, "bind retained workspace to access '$AccessId' and select profile '$($workspace.data.profile)'")
         if ($approved) {
             $resume = Invoke-WithWorkspaceTransactionLock -Config $config -Action {
                 $current = Read-Workspace -Config $config -Id $WorkspaceId
                 Assert-WorkspaceTaskOwner -Workspace $current -ResolvedTaskId $resolvedTaskId
-                if ([string]$current.data.status -notin @('ready', 'retained')) { throw "Workspace '$WorkspaceId' ceased to be resumable before commit." }
+                $currentResumeClassification = Get-WorkspaceResumeClassification -Config $config -Manifest $current.data -ManifestPath $current.path
+                if (-not $currentResumeClassification.resumable) { throw "Workspace '$WorkspaceId' ceased to be resumable before commit: $($currentResumeClassification.reason)." }
                 $operationId = [guid]::NewGuid().ToString('N')
                 $journalPath = Get-WorkspaceOperationJournalPath -Config $config -Id $WorkspaceId -Operation 'resume' -OperationId $operationId
                 $resumeEvidence = Join-Path (Split-Path -Parent $current.path) ($WorkspaceId + '-resume-' + $operationId)
@@ -2702,24 +2907,34 @@ try {
                     manifestPreimagePath = $manifestPreimagePath; manifestPreimageSha256 = $manifestPreimageSha256
                     profilePath = [string]$current.data.profilePath; selectedProfileJournalPath = $selectedProfileJournalPath
                     targetAccessId = $AccessId; targetProfile = [string]$current.data.profile; preparedUtc = [DateTime]::UtcNow.ToString('o')
-                    selectedProfileTransaction = $null; runtimeOutputTransactionId = $null; runtimeOutputRearm = $null
+                    selectedProfileTransaction = $null; runtimeOutputTransactionId = $null; runtimeOutputRearm = $null; runtimeOutputRebind = $null
                     rollback = $null; committedUtc = $null
                 }
                 Write-WorkspaceJsonAtomic -Path $journalPath -Value $journal
                 $selection = $null; $rearmedOutput = $null
                 try {
                     $priorAccessId = [string]$current.data.accessId
-                    if ($priorAccessId -cne $AccessId) {
-                        $activeMarkerPath = [string]$current.data.runtimeOutput.ownerMarkerPath
-                        $activeMarker = if (Test-Path -LiteralPath $activeMarkerPath -PathType Leaf) { Get-Content -LiteralPath $activeMarkerPath -Raw | ConvertFrom-Json -Depth 20 } else { $null }
-                        if ($activeMarker -and [string]$activeMarker.workspaceId -cne [string]$current.data.workspaceId) {
-                            throw "Cannot resume while workspace '$($activeMarker.workspaceId)' owns MO2 Overwrite."
-                        }
+                    $activeMarkerPath = [string]$current.data.runtimeOutput.ownerMarkerPath
+                    if ([string]$currentResumeClassification.resumeDisposition -ceq 'rebind-active-output') {
+                            $activeMarker = Assert-WorkspaceOutputOwnerMarker -Path $activeMarkerPath -ExpectedSha256 ([string]$current.data.runtimeOutput.ownerMarkerSha256) -WorkspaceId ([string]$current.data.workspaceId) -OwnershipId ([string]$current.data.ownershipId) -OverwritePath ([string]$current.data.runtimeOutput.overwritePath)
+                            $activeTransactionIdentity = if ($activeMarker.PSObject.Properties['transactionId'] -and -not [string]::IsNullOrWhiteSpace([string]$activeMarker.transactionId)) { [string]$activeMarker.transactionId } else { [string]$current.data.runtimeOutput.ownerMarkerSha256 }
+                            $journal.runtimeOutputTransactionId = $activeTransactionIdentity
+                            $journal.runtimeOutputRebind = [pscustomobject][ordered]@{
+                                state = 'validated'; workspaceId = [string]$current.data.workspaceId; ownershipId = [string]$current.data.ownershipId
+                                transactionIdentity = $activeTransactionIdentity; ownerMarkerPath = $activeMarkerPath
+                                ownerMarkerSha256 = [string]$current.data.runtimeOutput.ownerMarkerSha256
+                                priorAccessId = $priorAccessId; targetAccessId = $AccessId; validatedUtc = [DateTime]::UtcNow.ToString('o')
+                            }
+                            $journal.phase = 'active-output-rebind-validated'
+                            Write-WorkspaceJsonAtomic -Path $journalPath -Value $journal
+                    }
+                    elseif ([string]$currentResumeClassification.resumeDisposition -cne 'rearm-completed-output') {
+                        throw "Workspace '$WorkspaceId' has no safe runtime-output resume transition."
                     }
                     $selection = Set-MO2SelectedProfile -Config $config -TargetProfile ([string]$current.data.profile) -Operation 'resume-retained-task-workspace' -EvidenceRoot $resumeEvidence
                     $journal.phase = 'selection-applied-uncommitted'; $journal.selectedProfileTransaction = $selection
                     Write-WorkspaceJsonAtomic -Path $journalPath -Value $journal
-                    if ($priorAccessId -cne $AccessId) {
+                    if ([string]$currentResumeClassification.resumeDisposition -ceq 'rearm-completed-output') {
                         $priorRuntimeOutput = $current.data.runtimeOutput | ConvertTo-Json -Depth 80 | ConvertFrom-Json -Depth 80
                         $rearmedOutput = New-RearmedWorkspaceRuntimeOutput -Config $config -Workspace $current -OperationId $operationId -Journal $journal -JournalPath $journalPath
                         $journal.phase = 'runtime-output-rearmed-uncommitted'
@@ -2737,6 +2952,7 @@ try {
                     $current.data | Add-Member -NotePropertyName acquisitionDisposition -NotePropertyValue 'retained-resume' -Force
                     $current.data | Add-Member -NotePropertyName protectedSharedModNames -NotePropertyValue @($protectedNames + $currentSharedNames | Sort-Object -Unique) -Force
                     $current.data | Add-Member -NotePropertyName lastResumedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
+                    $current.data | Add-Member -NotePropertyName lastResumeDisposition -NotePropertyValue ([string]$currentResumeClassification.resumeDisposition) -Force
                     $history = if ($current.data.PSObject.Properties['leaseHistory']) { @($current.data.leaseHistory) } else { @() }
                     $current.data | Add-Member -NotePropertyName leaseHistory -NotePropertyValue (@($history) + ,([pscustomobject][ordered]@{ accessId = $AccessId; priorAccessId = $priorAccessId; acquiredForWorkspaceUtc = [DateTime]::UtcNow.ToString('o'); disposition = 'resumed' })) -Force
                     $current.data | Add-Member -NotePropertyName selectedProfileTransaction -NotePropertyValue $selection -Force

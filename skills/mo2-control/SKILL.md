@@ -52,6 +52,10 @@ are:
    verified, and selected. On later requests, require an explicit
    `resume -TaskId -WorkspaceId` or fresh `create -TaskId`. Never silently
    replace, refresh, or requalify a retained profile after task-local edits.
+   If `list-task` returns a retained workspace under `unavailableWorkspaces`,
+   report its exact `resumeBlockReason`; do not try to resume or recreate it.
+   Legacy contract migration requires separate review while the profile and
+   task-owned mods remain retained.
    Before fresh creation, run `list-local-work-mods`; pass
    `-WorkspaceContent Modlist` for no local build, or
    `ModlistPlusLocalWorkMods` plus exact available candidate IDs. Resume
@@ -187,7 +191,10 @@ are:
 - Dump Management has standing user authority to install, update, configure,
   and enable Tullius. It still obeys closed-Skyrim and lease/known-state gates;
   when a human lease is active it targets only that lease's exact profile.
-- Register a task DLL with its exact relative path in `-WinningPaths`. Treat
+- Register a task DLL with its one exact relative path in inline
+  `-WinningPaths`. For multiple paths in a native `pwsh -File` invocation,
+  always pass a JSON or line-delimited `-WinningPathsFile`; comma-separated
+  quoted arguments can bind as one path. Treat
   the returned loose-file provider proof as scoped: overwrite, unmanaged game
   files, and archives still require separate VFS evidence.
 - Never treat `coc APStartCell` as a genuine New Game. Copied ordinary saves
