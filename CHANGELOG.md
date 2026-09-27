@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Atomically replace a bounded-process receipt when its final persistence
+  crosses the absolute deadline, so reopened durable evidence cannot retain a
+  success projection after the returned result has failed.
 - Launch bounded child processes suspended, assign their complete process tree
   to the kill-on-close job before first execution, and require verified root
   exit, job quiescence, stream drain, receipt persistence, and absolute-deadline

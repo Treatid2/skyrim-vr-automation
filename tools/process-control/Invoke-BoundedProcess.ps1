@@ -11,6 +11,7 @@ param(
     [ValidateRange(100, 30000)][int]$TerminationGraceMilliseconds = 3000,
     [ValidateRange(100, 30000)][int]$StreamDrainGraceMilliseconds = 3000,
     [ValidateRange(0, 10000)][int]$RetryDelayMilliseconds = 250,
+    [Parameter(DontShow)][ValidateRange(0, 30000)][int]$FinalReceiptTestDelayMilliseconds = 0,
     [string[]]$RetryPatterns = @('(?is)\.d\.json.*permission denied', '(?is)permission denied.*\.d\.json'),
     [switch]$NoExit,
     [switch]$Compact
@@ -234,13 +235,13 @@ function Wait-JobQuiescent([IntPtr]$Job, [DateTime]$DeadlineUtc) {
     return (Get-JobActiveProcessCount -Job $Job) -eq 0
 }
 
-function Write-TextAtomic([string]$Path, [string]$Value) {
+function Write-TextAtomic([string]$Path, [string]$Value, [switch]$ReplaceExisting) {
     $parent = Split-Path -Parent $Path
     if (-not (Test-Path -LiteralPath $parent -PathType Container)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
     $temporary = Join-Path $parent ('.' + [IO.Path]::GetFileName($Path) + '.' + [guid]::NewGuid().ToString('N') + '.tmp')
     try {
         [IO.File]::WriteAllText($temporary, $Value, [Text.UTF8Encoding]::new($false))
-        [IO.File]::Move($temporary, $Path, $false)
+        [IO.File]::Move($temporary, $Path, [bool]$ReplaceExisting)
     }
     finally { if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force } }
 }
@@ -486,25 +487,32 @@ try {
     }
     if ($null -ne $resolvedEvidenceDirectory) {
         $receiptPath = Join-Path $resolvedEvidenceDirectory "bounded-process.$transactionId.receipt.json"
+        $result | Add-Member -NotePropertyName receiptPath -NotePropertyValue $receiptPath
+        $result.elapsedMs = [long]([DateTime]::UtcNow - $startedUtc).TotalMilliseconds
         try {
             Write-TextAtomic -Path $receiptPath -Value (($result | ConvertTo-Json -Depth 20) + "`n")
-            $result | Add-Member -NotePropertyName receiptPath -NotePropertyValue $receiptPath
         }
         catch {
             $result.ok = $false
             $result.errors = @($result.errors) + @("Final receipt persistence failed: $($_.Exception.Message)")
+        }
+        if ($FinalReceiptTestDelayMilliseconds -gt 0) {
+            Start-Sleep -Milliseconds $FinalReceiptTestDelayMilliseconds
         }
     }
     if ([DateTime]::UtcNow -gt $deadlineUtc) {
         $result.ok = $false
         $result.deadlineSatisfied = $false
         $result.errors = @($result.errors) + @('The bounded result or final receipt crossed the absolute process deadline.')
+        $result.elapsedMs = [long]([DateTime]::UtcNow - $startedUtc).TotalMilliseconds
         if ($result.PSObject.Properties['receiptPath'] -and (Test-Path -LiteralPath $result.receiptPath -PathType Leaf)) {
-            try { Write-TextAtomic -Path $result.receiptPath -Value (($result | ConvertTo-Json -Depth 20) + "`n") }
+            try { Write-TextAtomic -Path $result.receiptPath -Value (($result | ConvertTo-Json -Depth 20) + "`n") -ReplaceExisting }
             catch { $result.errors = @($result.errors) + @("Failed to replace a late receipt with its terminal failure projection: $($_.Exception.Message)") }
         }
     }
-    $result.elapsedMs = [long]([DateTime]::UtcNow - $startedUtc).TotalMilliseconds
+    elseif ($null -eq $resolvedEvidenceDirectory) {
+        $result.elapsedMs = [long]([DateTime]::UtcNow - $startedUtc).TotalMilliseconds
+    }
 }
 catch {
     $retainedAttempts = @(if (Get-Variable attempts -ErrorAction SilentlyContinue) { @($attempts) } else { @() })
