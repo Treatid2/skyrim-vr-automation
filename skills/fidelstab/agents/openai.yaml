@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fidelstab"
+  short_description: "Run the fixed Skyrim VR fidelity test"
+  default_prompt: "Use $fidelstab to run the preserved Breezehome fidelity, stability, CPU, and GPU protocol exactly."
