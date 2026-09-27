@@ -9,6 +9,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Atomically replace a bounded-process receipt when its final persistence
+  crosses the absolute deadline, so reopened durable evidence cannot retain a
+  success projection after the returned result has failed.
 - Rebind an exact retained active MO2 Overwrite transaction to the task's new
   closed-state access lease instead of dead-ending between obsolete-lease
   completion and fresh-transaction rearm. Workspace discovery now distinguishes

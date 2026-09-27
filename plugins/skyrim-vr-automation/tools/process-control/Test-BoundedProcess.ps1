@@ -87,6 +87,24 @@ Start-Sleep -Seconds 30
     $firstEvidence = & $tool -FilePath $pwsh -ArgumentList @('-NoProfile', '-Command', 'exit 0') -WorkingDirectory $root -EvidenceDirectory $evidenceRoot -NoExit | ConvertFrom-Json
     $secondEvidence = & $tool -FilePath $pwsh -ArgumentList @('-NoProfile', '-Command', 'exit 0') -WorkingDirectory $root -EvidenceDirectory $evidenceRoot -NoExit | ConvertFrom-Json
     if ($firstEvidence.receiptPath -eq $secondEvidence.receiptPath -or -not (Test-Path -LiteralPath $firstEvidence.receiptPath) -or -not (Test-Path -LiteralPath $secondEvidence.receiptPath)) { throw 'Repeated runs did not preserve unique append-only receipts.' }
+
+    $lateEvidenceRoot = Join-Path $root 'late-receipt-evidence'
+    $lateResult = & $tool -FilePath $pwsh -ArgumentList @('-NoProfile', '-Command', 'exit 0') -WorkingDirectory $root `
+        -EvidenceDirectory $lateEvidenceRoot -TimeoutSeconds 1 -MaxAttempts 1 -FinalReceiptTestDelayMilliseconds 1200 -NoExit | ConvertFrom-Json
+    if ($lateResult.ok -or $lateResult.deadlineSatisfied -or @($lateResult.errors) -notcontains 'The bounded result or final receipt crossed the absolute process deadline.') {
+        throw 'A deadline crossing after the initial receipt commit did not return terminal failure.'
+    }
+    $lateReceipt = Get-Content -LiteralPath $lateResult.receiptPath -Raw | ConvertFrom-Json
+    if ($lateReceipt.ok -or $lateReceipt.deadlineSatisfied -or [long]$lateReceipt.elapsedMs -ne [long]$lateResult.elapsedMs -or
+        (@($lateReceipt.errors) -join "`n") -cne (@($lateResult.errors) -join "`n")) {
+        throw 'The reopened late receipt does not match the returned terminal deadline projection.'
+    }
+    if (@(Get-ChildItem -LiteralPath $lateEvidenceRoot -Filter 'bounded-process.*.receipt.json' -File).Count -ne 1) {
+        throw 'Late receipt correction left more than one authoritative-looking final receipt.'
+    }
+    if ((@($lateResult.errors) -join ' ') -match 'Failed to replace a late receipt') {
+        throw 'Late terminal projection did not atomically replace the earlier receipt.'
+    }
     $aggregatePath = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'tests\Test-Toolset.ps1'
     $aggregateText = Get-Content -LiteralPath $aggregatePath -Raw
     if ($aggregateText -notmatch 'Invoke-BoundedProcess\.ps1' -or
@@ -95,7 +113,7 @@ Start-Sleep -Seconds 30
         $aggregateText -notmatch 'terminationConfirmed') {
         throw 'Aggregate toolset runner does not preserve bounded per-suite custody and timeout reporting.'
     }
-    [pscustomobject][ordered]@{ ok = $true; assertions = 14; receipt = $result.attemptsRun } | ConvertTo-Json
+    [pscustomobject][ordered]@{ ok = $true; assertions = 18; receipt = $result.attemptsRun } | ConvertTo-Json
 }
 finally {
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
