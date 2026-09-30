@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 [CmdletBinding()]
-param([switch]$DiscoveryOnly)
+param([switch]$DiscoveryOnly, [switch]$RequalificationOnly, [string]$FixtureRoot)
 
 $ErrorActionPreference = 'Stop'
 $entry = Join-Path (Split-Path -Parent $PSScriptRoot) 'Invoke-MO2WorkspaceControl.ps1'
 $powerShell = (Get-Process -Id $PID).Path
-$fixture = Join-Path ([IO.Path]::GetTempPath()) ('mo2-workspace-control-' + [guid]::NewGuid().ToString('N'))
+$fixture = Join-Path $(if ($FixtureRoot) { [IO.Path]::GetFullPath($FixtureRoot) } else { [IO.Path]::GetTempPath() }) ('mo2-workspace-control-' + [guid]::NewGuid().ToString('N'))
 $taskId = 'codex-test-task-001'
 $priorProfileControlRoot = $env:CSX_MO2_PROFILE_CONTROL_ROOT
 $priorShaderCacheControlRoot = $env:CSX_SHADER_CACHE_CONTROL_ROOT
+$priorFixtureTemp = $env:TEMP
+$priorFixtureTmp = $env:TMP
+# Only this isolated test process and its children use the caller's managed
+# fixture directory as temporary scope; no machine/user setting is changed.
+if ($FixtureRoot) { $env:TEMP = [IO.Path]::GetFullPath($FixtureRoot); $env:TMP = $env:TEMP }
 $env:CSX_MO2_PROFILE_CONTROL_ROOT = Join-Path $fixture 'profile-transactions'
 $env:CSX_SHADER_CACHE_CONTROL_ROOT = Join-Path $fixture 'shader-cache-transactions'
 function Get-TestProfileFingerprint([string]$Path) {
@@ -326,6 +331,10 @@ try {
     $preparedCache = & $catalogEntry prepare -CatalogRoot $catalogRoot -CachePath $created.data.runtimeOutput.cachePath -ProfilePath $created.data.modListPath -ModsPath $mods -BindToOverwrite -EvidenceDirectory $created.data.runtimeOutput.cacheEvidenceDirectory -BuildId $created.data.runtimeOutput.cachePrepareArguments.BuildId -ShaderCacheAbi $created.data.runtimeOutput.cachePrepareArguments.ShaderCacheAbi -WorkspaceId $created.data.workspaceId -OwnershipId $created.data.ownershipId -OwnerMarkerPath $created.data.runtimeOutput.ownerMarkerPath -OwnerMarkerSha256 $created.data.runtimeOutput.ownerMarkerSha256 -ShaderSourceSha256 $shaderSourceSha256 -RequireMaterializedOutput -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json
     $preparedIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
     if (-not $preparedCache.ok -or -not $preparedIsolation.ok -or -not $preparedIsolation.cachePlan.verification.ok -or [int]$preparedIsolation.cachePlan.verification.requiredProviderFiles -ne 2) { throw "Prepared Overwrite provider-shadow verification failed. Prepare: $($preparedCache | ConvertTo-Json -Depth 20 -Compress) Isolation: $($preparedIsolation | ConvertTo-Json -Depth 20 -Compress)" }
+    if ($RequalificationOnly) {
+        . (Join-Path $PSScriptRoot 'Test-OutputRequalification.inc.ps1')
+        return
+    }
     $cachePlanPath = [string]$created.data.runtimeOutput.cachePlanPath
     $cachePlanBytes = [IO.File]::ReadAllBytes($cachePlanPath)
     $malformedCachePlan = Get-Content -LiteralPath $cachePlanPath -Raw | ConvertFrom-Json -Depth 40
@@ -811,6 +820,8 @@ try {
     [pscustomobject]@{ok=$true; assertions=100; workspaceId=$created.data.workspaceId} | ConvertTo-Json
 }
 finally {
+    $env:TEMP = $priorFixtureTemp
+    $env:TMP = $priorFixtureTmp
     $env:CSX_MO2_PROFILE_CONTROL_ROOT = $priorProfileControlRoot
     $env:CSX_SHADER_CACHE_CONTROL_ROOT = $priorShaderCacheControlRoot
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }
