@@ -118,6 +118,23 @@ class Unit(unittest.TestCase):
         self.assertEqual(fake.calls,[])
     def test_trace_refuses_existing_directory(self):
         with self.assertRaises(FileExistsError): m.Trace(self.trace.directory)
+    def test_guard_log_ignores_history_then_matches_split_new_marker(self):
+        log=Path(self.temp.name)/'guard.log'
+        log.write_bytes(b'[VR pose binding guard] historical\n')
+        guard=m.GuardLog(log,self.trace)
+        guard.check()  # Existing content is not a current event.
+        with log.open('ab') as stream: stream.write(b'new line [VR pose ')
+        guard.check()
+        with log.open('ab') as stream: stream.write(b'binding guard] rejection\n')
+        with self.assertRaises(m.StopSweep): guard.check()
+    def test_guard_log_truncation_and_read_budget_fail_closed(self):
+        log=Path(self.temp.name)/'guard.log';log.write_bytes(b'old')
+        guard=m.GuardLog(log,self.trace)
+        log.write_bytes(b'')
+        with self.assertRaises(m.StopSweep): guard.check()
+        guard=m.GuardLog(log,self.trace)
+        log.write_bytes(b'x'*(m.GuardLog.LIMIT+1))
+        with self.assertRaises(m.StopSweep): guard.check()
 
 
 class Entrypoint(unittest.TestCase):
@@ -152,7 +169,8 @@ class Entrypoint(unittest.TestCase):
                   '--qualification',str(qualification),'--output',str(root/'run'),
                   '--phase','qualification','--maximum-changes','1','--pace-seconds','0']
             result=subprocess.run(argv,capture_output=True,text=True,timeout=50)
-            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            failure_trace=(root/'run'/'trace.ndjson').read_text() if (root/'run'/'trace.ndjson').exists() else ''
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr+failure_trace)
             receipt=json.loads(result.stdout)
             self.assertEqual(receipt['completedChanges'],1)
             model=json.loads(model_path.read_text(encoding='utf-8-sig'))
@@ -163,10 +181,24 @@ class Entrypoint(unittest.TestCase):
             entries=[json.loads(line) for line in (root/'run'/'trace.ndjson').read_text().splitlines()]
             self.assertEqual(sum(e['kind']=='mutation-intent' for e in entries),1)
             self.assertEqual(sum(e['kind']=='mutation-menu-verified' for e in entries),1)
+            forwarded=json.loads(next(e['stdout'] for e in entries if e['kind']=='capture-call-result'))
+            original=forwarded['data']['action']['receipt']['result']['originalControllerEnvelope']
+            self.assertFalse(original['ok'])
+            self.assertFalse(original['semantic']['known'])
             # A repeated production entry point refuses reuse before any actor mutation.
             again=subprocess.run(argv,capture_output=True,text=True,timeout=10)
             self.assertEqual(again.returncode,2)
             self.assertEqual(json.loads(model_path.read_text(encoding='utf-8-sig'))['mutations'],1)
+            # Scoped qualification must not override known semantic rejection or
+            # called=false, even when the transport and shape look plausible.
+            for flag in ('denyKnown','denyCalled'):
+                denied_model=dict(model,**{flag:True})
+                model_path.write_text(json.dumps(denied_model))
+                denied=argv.copy()
+                denied[denied.index(str(root/'run'))]=str(root/flag)
+                rejected=subprocess.run(denied,capture_output=True,text=True,timeout=5)
+                self.assertEqual(rejected.returncode,2,rejected.stdout+rejected.stderr)
+                self.assertEqual(json.loads(model_path.read_text(encoding='utf-8-sig'))['mutations'],1)
             # Exercise bounded cancellation through the real entry point, not
             # merely a mocked watchdog. The owned worker sleeps without progress.
             model['hang']=True
