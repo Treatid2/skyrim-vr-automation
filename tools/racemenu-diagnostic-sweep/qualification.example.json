@@ -1,0 +1,24 @@
+{
+  "schema": "racemenu-sweep-qualification-v1",
+  "sessionId": "COPY_EXACT_EXISTING_CAPTURE_SESSION_ID",
+  "runtimeIdentity": {
+    "listenerPid": 0,
+    "processPath": "COPY_EXACT_CAPTURE_RUNTIME_PROCESS_PATH",
+    "processStartTimeUtc": "COPY_EXACT_CAPTURE_RUNTIME_START_TIME",
+    "buildId": "COPY_EXACT_CAPTURE_BUILD_ID",
+    "artifactPath": "COPY_EXACT_CAPTURE_ARTIFACT_PATH",
+    "artifactSha256": "COPY_EXACT_CAPTURE_ARTIFACT_SHA256"
+  },
+  "protocolSha256": "SHA256_OF_RETAINED_PROTOCOL_JSON",
+  "checks": {
+    "moduleHashesVerified": false,
+    "csxPoseGuardQualified": false,
+    "nullHmdQualified": false,
+    "dumpWindowActive": false,
+    "freshGameQualified": false,
+    "devbenchLiveIdentityVerified": false
+  },
+  "evidence": [
+    {"path": "EXACT_RETAINED_QUALIFICATION_RECEIPT", "sha256": "ITS_SHA256"}
+  ]
+}
