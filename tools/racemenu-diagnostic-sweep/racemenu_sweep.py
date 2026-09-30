@@ -115,8 +115,57 @@ class Trace:
         self.stream.close()
 
 
+class GuardLog:
+    """Short read-only inspections of one exact file, starting at admission EOF."""
+    MARKER = b'[VR pose binding guard]'
+    LIMIT = 65536
+
+    def __init__(self, path, trace):
+        self.path, self.trace = Path(path).resolve(), trace
+        stat = self.path.stat()
+        if not self.path.is_file() or not stat.st_ino:
+            raise StopSweep('Guard log requires an exact regular file with stable identity')
+        self.identity = (stat.st_dev,stat.st_ino)
+        self.offset = stat.st_size
+        self.tail = b''
+        trace.write('guard-log-admission',path=str(self.path),identity=self.identity,
+                    offsetBytes=self.offset,historyMatched=False,boundary='start-at-current-EOF')
+
+    def check(self):
+        stat = self.path.stat()
+        if (stat.st_dev,stat.st_ino) != self.identity or stat.st_size < self.offset:
+            raise StopSweep('Guard log replaced or truncated; stop inputs')
+        available = stat.st_size-self.offset
+        if not available:
+            return
+        start = self.offset
+        with self.path.open('rb') as stream:
+            opened = os.fstat(stream.fileno())
+            if (opened.st_dev,opened.st_ino) != self.identity:
+                raise StopSweep('Guard log changed during open')
+            stream.seek(start)
+            data = stream.read(min(available,self.LIMIT))
+        self.offset += len(data)
+        joined = self.tail+data
+        found = joined.find(self.MARKER)
+        self.trace.write('guard-log-read',path=str(self.path),identity=self.identity,
+                         startByteInclusive=start,endByteExclusive=self.offset,
+                         sourceSizeAtReadStart=stat.st_size,bytesRead=len(data),
+                         markerFound=found >= 0,utf8ReplacementCharacters=data.decode('utf-8','replace').count('\ufffd'))
+        if found >= 0:
+            self.trace.write('guard-log-match',path=str(self.path),
+                             markerByteOffset=start-len(self.tail)+found,
+                             excerptStartByteInclusive=start-len(self.tail),
+                             excerptEndByteExclusive=self.offset,
+                             excerpt=joined.decode('utf-8','replace'),historicalMatch=False)
+            raise StopSweep('New native pose guard event; stop inputs and retain capture/game')
+        if available > self.LIMIT or len(data) != available:
+            raise StopSweep('Guard log exceeded bounded read or changed during read; stop inputs')
+        self.tail = joined[-(len(self.MARKER)-1):]
+
+
 class CaptureAdapter:
-    def __init__(self, session_path, capture_controller, pwsh, trace, stop_file=None, call_timeout=10):
+    def __init__(self, session_path, capture_controller, pwsh, trace, stop_file=None, call_timeout=10, guard_log=None):
         self.session_path = Path(session_path).resolve()
         self.controller = Path(capture_controller).resolve()
         self.pwsh = Path(pwsh).resolve()
@@ -133,8 +182,11 @@ class CaptureAdapter:
         self.devbench = self.controller.parent.parent / 'devbench-control' / 'Invoke-DevBenchControl.ps1'
         if not all(p.is_file() for p in (self.controller, self.pwsh, self.devbench)):
             raise StopSweep('Exact capture owner, PowerShell or bundled DevBench controller missing')
+        self.guard = GuardLog(guard_log,trace) if guard_log else None
 
     def check(self):
+        if self.guard:
+            self.guard.check()
         if self.stop_file and self.stop_file.exists():
             raise StopSweep('Owner stop signal present; preserving capture')
         state = load(self.session_path)
@@ -378,6 +430,7 @@ def main(argv=None):
     parser.add_argument('--race-ids',type=int,nargs=2)
     parser.add_argument('--include-sex',action='store_true')
     parser.add_argument('--stop-file')
+    parser.add_argument('--guard-log',help='Exact current CSX log; bounded new-byte inspection starting at admission EOF')
     args = parser.parse_args(argv)
     count = args.maximum_changes if args.maximum_changes is not None else CAPS[args.phase]
     pace = args.pace_seconds if args.pace_seconds is not None else (2 if args.phase=='qualification' else 0)
@@ -398,7 +451,7 @@ def main(argv=None):
         if limits['maximumInputRequestsInFlight'] != 1 or limits['mutationRetries'] != 0 or count > phase['maximumChanges'] or args.phase_seconds > limits['phaseDeadlineSeconds'] or args.settle_seconds > limits['menuSettleDeadlineSeconds']:
             raise StopSweep('Requested run exceeds retained protocol')
         trace = Trace(args.output)
-        adapter = CaptureAdapter(args.capture_session,args.capture_controller,args.pwsh,trace,args.stop_file,args.call_seconds)
+        adapter = CaptureAdapter(args.capture_session,args.capture_controller,args.pwsh,trace,args.stop_file,args.call_seconds,args.guard_log)
         qualification = attest(args.qualification,adapter,args.protocol)
         lock_path = Path(adapter.state['sessionDirectory']) / '.racemenu-sweep.lock'
         lock = lock_path.open('x',encoding='utf-8')

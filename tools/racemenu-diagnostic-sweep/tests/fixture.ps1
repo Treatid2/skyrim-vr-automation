@@ -22,7 +22,9 @@ if ($Command -eq 'call') {
   foreach ($race in $state.races) { $race.active=$race.id -eq $argsValue.args[2][1] }
  }
  $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $RuntimePath -Encoding utf8
- @{ok=$true;data=@{content=@(@{called=$true;returned=$returned})}} | ConvertTo-Json -Depth 12 -Compress
+ $known=$state.PSObject.Properties['denyKnown'] -and $state.denyKnown -eq $true
+ $called=-not ($state.PSObject.Properties['denyCalled'] -and $state.denyCalled -eq $true)
+ @{ok=$false;transportOk=$true;indeterminate=$false;semantic=@{known=[bool]$known};errors=@('Unrecognized or rejected Papyrus return');data=@{content=@(@{called=[bool]$called;returned=$returned;returnedType='String'})}} | ConvertTo-Json -Depth 12 -Compress
 } else {
  $session=Get-Content -LiteralPath $SessionPath -Raw | ConvertFrom-Json
  if ($Command -eq 'observe') {

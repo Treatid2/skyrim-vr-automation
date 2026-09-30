@@ -25,7 +25,13 @@ active `capture-interaction.session.json` and its unchanged capture controller.
 observation goes through `Invoke-CaptureInteraction.ps1`; its existing runtime
 identity guard remains enabled. `Invoke-SweepDevBench.ps1` only passes the call
 to that controller's existing sibling DevBench wrapper with retries disabled
-and a remaining deadline. It contains no HTTP/MCP implementation.
+and a remaining deadline. It contains no HTTP/MCP implementation. The installed
+generic semantic gate does not recognize Papyrus' `called`/`returned` receipt;
+the adapter supplies a narrow qualifier for this sweep's exact UI methods only
+when transport succeeded, the receipt is determinate and no known semantic
+rejection exists. It retains the entire original controller envelope and labels
+this as Papyrus-return-only, never actor-change completion. The engine still
+requires the separate movie result and fresh resulting menu state.
 
 If the run has already selected a healthy direct-MCP-only lane, **do not run
 this controller or switch lanes for convenience**. This version does not provide
@@ -89,6 +95,19 @@ dump writers. Stop signals are checked between bounded worker calls, not via a
 background collector. A synchronous call can take up to its declared worker
 budget to return/cancel. The owner still preserves the ongoing capture and dump
 window and diagnoses the cause.
+
+For deterministic first-new-guard-event stopping, pass `--guard-log` with the
+owner-resolved exact current `CommunityShaders.log`. The sweep retains file
+identity and current EOF at admission and inspects only appended bytes before
+and after its existing worker calls. It conservatively stops on **any new**
+`[VR pose binding guard]` marker (including rejection/scene/allocation messages),
+journals the exact byte offset and bounded excerpt, and preserves capture/game.
+It does not match historical startup messages, start a collector/agent, mutate
+the log, or read more than 64 KiB of new data in one check. Split markers are
+recognized across bounded reads; replacement, truncation and excess growth
+fail closed. Without this flag, only owner stop-file signalling is provided;
+do not claim automatic first-native-event stopping. Detection is between
+bounded worker calls, not an instantaneous native interrupt.
 
 ## Trace and failure contract
 
