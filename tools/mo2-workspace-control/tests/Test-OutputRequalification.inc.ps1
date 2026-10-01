@@ -2,6 +2,7 @@
 # Isolated fixture, loaded by Test-MO2WorkspaceControl.ps1 after normal prepare.
 $oldOutput = $created.data.runtimeOutput
 . (Join-Path $PSScriptRoot 'Test-ActiveOutputResume.inc.ps1')
+. (Join-Path $PSScriptRoot 'Test-RequalificationCompletion.inc.ps1')
 $candidateName = 'Codex Exact Candidate ON'
 $candidate = & $entry create-mod -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -ModName $candidateName -Confirm:$false -NoExit -Compact | ConvertFrom-Json
 if (-not $candidate.ok) { throw 'Requalification fixture candidate creation failed.' }
@@ -176,4 +177,4 @@ if (-not $ownerResumed.ok -or $ownerResumed.data.lastResumeDisposition -cne 'reb
     ($ownerResumed.data.runtimeOutput | ConvertTo-Json -Depth 80 -Compress) -cne ($oo | ConvertTo-Json -Depth 80 -Compress) -or
     [Convert]::ToBase64String([IO.File]::ReadAllBytes($oo.ownerMarkerPath)) -cne $ownerMarkerBytes) { throw 'Replacement-lease resume failed after exact requalification rollback.' }
 $null = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
-'PASS: consent, preview, corruption refusal, real interruptions, rollback recovery, winner/history preservation, absent baselines, foreign-task/inexact-workspace refusal, exact-owner recovery and active-generation resume under a real replacement lease. PR61 F3 remains outstanding.'
+'PASS: consent, preview, corruption refusal, real interruptions, rollback recovery, winner/history preservation, absent baselines, foreign-task/inexact-workspace refusal, exact-owner recovery, active-generation resume and normal completion after rollback with retained attempt audit.'

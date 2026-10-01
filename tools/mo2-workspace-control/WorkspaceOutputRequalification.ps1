@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Private helpers, loaded by Invoke-MO2WorkspaceControl.ps1. No standalone entry point.
 
-function Invoke-RequalificationTreeCommand($Config, [string]$Command, [string]$Path, [string]$Evidence) {
+function Invoke-RequalificationTreeCommand($Config, [string]$Command, [string]$Path, [string]$Evidence, [string]$RestoreEvidence) {
     Assert-TreeOperationBudget -Purpose "Output requalification $Command"
     $remaining = [Math]::Max(1, [int][Math]::Floor(($script:TreeOperationDeadlineUtc - [DateTime]::UtcNow).TotalSeconds))
     $tool = Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'
-    $result = & $tool $Command -CachePath $Path -RelativeCachePath ([IO.Path]::GetFileName($Path)) -EvidenceDirectory $Evidence -BlockingProcessNames (Get-WorkspaceBlockingProcessNames $Config) -InventoryTimeoutSeconds $remaining -NoExit -Confirm:$false | ConvertFrom-Json -Depth 40
+    $auditArguments = @{}
+    if (-not [string]::IsNullOrWhiteSpace($RestoreEvidence)) { $auditArguments.RestoreEvidenceDirectory = $RestoreEvidence }
+    $result = & $tool $Command -CachePath $Path -RelativeCachePath ([IO.Path]::GetFileName($Path)) -EvidenceDirectory $Evidence @auditArguments -BlockingProcessNames (Get-WorkspaceBlockingProcessNames $Config) -InventoryTimeoutSeconds $remaining -NoExit -Confirm:$false | ConvertFrom-Json -Depth 40
     if (-not $result.ok) { throw "Output requalification $Command failed: $($result.errors -join '; ')" }
     Assert-TreeOperationBudget -Purpose "Output requalification $Command completion"
     return $result
@@ -65,7 +67,7 @@ function Get-WorkspaceRequalificationAdmission($Config, $Workspace) {
         $snapshot = Get-RequalificationSnapshot -Config $Config -Evidence $evidence -Path $path -ExpectedHash ([string]$plan.beforeTreeSha256)
         if (-not (Test-WorkspaceSamePath ([string]$plan.transactionReceiptPath) (Join-Path $evidence 'shader-cache-transaction.receipt.json'))) { throw 'Requalification plan changed its original snapshot receipt pointer.' }
         $working = Get-WorkspaceOutputInventory -Path $path -Purpose 'Requalification retained working output'
-        $items += [pscustomobject]@{ kind = $kind; path = $path; evidence = $evidence; planPath = $planPath; planSha256 = (Get-FileHash $planPath -Algorithm SHA256).Hash; baselineHash = [string]$snapshot.beforeTreeSha256; snapshotId = [string]$snapshot.transactionId; workingHash = [string]$working.treeSha256; workingFiles = [int]$working.files; restoreReceiptPath = $null; rollbackEvidence = $null; rollbackReady = $false }
+        $items += [pscustomobject]@{ kind = $kind; path = $path; evidence = $evidence; planPath = $planPath; planSha256 = (Get-FileHash $planPath -Algorithm SHA256).Hash; baselineHash = [string]$snapshot.beforeTreeSha256; snapshotId = [string]$snapshot.transactionId; workingHash = [string]$working.treeSha256; workingFiles = [int]$working.files; restoreReceiptPath = $null; restoreEvidence = $null; rollbackEvidence = $null; rollbackReady = $false }
     }
     $build = Resolve-WorkspaceCommunityShadersBuildBinding -ProfilePath (Join-Path $Workspace.data.profilePath 'modlist.txt') -ModsPath $Config.mo2.modsDirectory -TransactionTool (Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1')
     return [pscustomobject]@{ workspaceId = $Workspace.data.workspaceId; disposition = 'supersede-unverified-active-output'; items = $items; currentBuild = $build; requiresCachePrepare = $true; runtimeQualified = $false }
@@ -74,7 +76,9 @@ function Get-WorkspaceRequalificationAdmission($Config, $Workspace) {
 function Assert-WorkspaceRequalificationBoundary($Config, $Workspace, $Proof) {
     foreach ($item in @($Proof.items)) {
         $snapshot = Get-RequalificationSnapshot -Config $Config -Evidence $item.evidence -Path $item.path -ExpectedHash $item.baselineHash
-        $null = Get-WorkspaceCommittedRestoreProof -ReceiptPath $item.restoreReceiptPath -EvidenceRoot $item.evidence -CachePath $item.path -BaselineTreeSha256 $item.baselineHash -WorkingTreeSha256 $item.workingHash -SnapshotTransactionId $snapshot.transactionId -TransactionTool (Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1')
+        $auditRoot = if ($item.PSObject.Properties['restoreEvidence'] -and $item.restoreEvidence) { [string]$item.restoreEvidence } else { [string]$item.evidence }
+        $null = Assert-WorkspaceRecoveryPath -Path $auditRoot -Root (Get-WorkspaceControlRoot $Config) -Purpose 'Requalification restore audit evidence'
+        $null = Get-WorkspaceCommittedRestoreProof -ReceiptPath $item.restoreReceiptPath -EvidenceRoot $auditRoot -CachePath $item.path -BaselineTreeSha256 $item.baselineHash -WorkingTreeSha256 $item.workingHash -SnapshotTransactionId $snapshot.transactionId -TransactionTool (Join-Path $toolRoot 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1')
     }
     if ([string]$Proof.workspaceId -cne [string]$Workspace.data.workspaceId -or @($Proof.items).Count -ne 2) { throw 'Requalification boundary lacks both exact restored output trees.' }
 }
@@ -165,7 +169,12 @@ function Invoke-WorkspaceOutputRequalification($Config, $Workspace) {
         }
         foreach ($item in @($admission.items)) {
             if ((Get-FileHash $item.planPath -Algorithm SHA256).Hash -cne $item.planSha256) { throw 'Original plan changed during requalification.' }
-            $restored = Invoke-RequalificationTreeCommand -Config $Config -Command restore -Path $item.path -Evidence $item.evidence
+            # Forward restore audit belongs to this attempt, never to the
+            # original plan's ordinary completion authority namespace.
+            $item.restoreEvidence = Join-Path $evidence ($item.kind + '-baseline-restore')
+            New-Item -ItemType Directory -Path $item.restoreEvidence -ErrorAction Stop | Out-Null
+            Write-WorkspaceJsonAtomic -Path $journalPath -Value $journal
+            $restored = Invoke-RequalificationTreeCommand -Config $Config -Command restore -Path $item.path -Evidence $item.evidence -RestoreEvidence $item.restoreEvidence
             $item.restoreReceiptPath = [string]$restored.data.restoreReceiptPath
             Write-WorkspaceJsonAtomic -Path $journalPath -Value $journal
         }

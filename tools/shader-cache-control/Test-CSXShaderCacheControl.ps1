@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([string]$FixtureRoot)
 
 Set-StrictMode -Version Latest
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -12,13 +12,21 @@ function Assert-Test([bool]$Condition, [string]$Message) {
     if ($Condition) { $passes.Add($Message) } else { $failures.Add($Message) }
 }
 
-$testRoot = Join-Path ([IO.Path]::GetTempPath()) ('csx-shader-cache-test-' + [guid]::NewGuid().ToString('N'))
-$resolvedTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+$resolvedTemp = if ($FixtureRoot) { [IO.Path]::GetFullPath($FixtureRoot) } else { [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) }
+$testRoot = Join-Path $resolvedTemp ('csx-shader-cache-test-' + [guid]::NewGuid().ToString('N'))
 $resolvedTestRoot = [IO.Path]::GetFullPath($testRoot)
 if (-not $resolvedTestRoot.StartsWith($resolvedTemp, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Test root escaped the temporary directory: $resolvedTestRoot"
 }
 $priorControlRoot = $env:CSX_SHADER_CACHE_CONTROL_ROOT
+$priorFixtureTemp = $env:TEMP
+$priorFixtureTmp = $env:TMP
+if ($FixtureRoot) {
+    New-Item -ItemType Directory -Path $resolvedTemp -Force | Out-Null
+    # Private test process only: satisfy the fixture-only control-root boundary.
+    $env:TEMP = $resolvedTemp
+    $env:TMP = $resolvedTemp
+}
 $env:CSX_SHADER_CACHE_CONTROL_ROOT = Join-Path $resolvedTestRoot 'target-controls'
 
 try {
@@ -54,6 +62,7 @@ try {
     Set-Content -LiteralPath (Join-Path $liveCache 'Info.ini') -Value @('[Cache]', 'ShaderCacheABI = snapshot-abi') -Encoding utf8
     $snap = & $transaction snapshot -CachePath $liveCache -EvidenceDirectory $evidence -BlockingProcessNames @('fixture-process-that-does-not-exist') -Confirm:$false -NoExit | ConvertFrom-Json
     Assert-Test ($snap.ok -and (Test-Path -LiteralPath $snap.data.receiptPath -PathType Leaf)) 'transaction snapshots an exact cache with a receipt'
+    if (-not $snap.ok) { throw "Snapshot fixture failed: $($snap.errors -join '; ')" }
     $controlDirectory = @(Get-ChildItem -LiteralPath $env:CSX_SHADER_CACHE_CONTROL_ROOT -Directory)[0].FullName
     $targetLockPath = Join-Path $controlDirectory 'target.lock'
     $heldTargetLock = [IO.File]::Open($targetLockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
@@ -146,6 +155,43 @@ try {
     $missingLiveAfter = & $transaction inspect -CachePath $liveCache -NoExit | ConvertFrom-Json
     Assert-Test (-not $missingLiveRecovery.ok -and $missingLiveAfter.ok -and $missingLiveAfter.data.treeSha256 -eq $originalBeforeInterrupted.treeSha256) 'restart reconciliation restores an original displaced before the replacement path was activated'
 
+    $auditCache = Join-Path $resolvedTestRoot 'audit-live\ShaderCache'
+    $auditSnapshot = Join-Path $resolvedTestRoot 'audit-snapshot'
+    $auditRestore = Join-Path $resolvedTestRoot 'restore-audit'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $auditCache),$auditRestore -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $evidence 'cache.before') -Destination $auditCache -Recurse
+    $auditSnap = & $transaction snapshot -CachePath $auditCache -EvidenceDirectory $auditSnapshot -BlockingProcessNames fixture-process-that-does-not-exist -Confirm:$false -NoExit | ConvertFrom-Json
+    [IO.File]::WriteAllText((Join-Path $auditCache 'audit-result.bin'), 'real fixture working output')
+    $auditWorking = & $transaction inspect -CachePath $auditCache -NoExit | ConvertFrom-Json
+    function Get-AuditSnapshotFingerprint {
+        return (@(Get-ChildItem -LiteralPath $auditSnapshot -Recurse -File | Sort-Object FullName | ForEach-Object { [IO.Path]::GetRelativePath($auditSnapshot,$_.FullName) + ':' + (Get-FileHash -LiteralPath $_.FullName).Hash }) -join ',')
+    }
+    $auditSnapshotHash = Get-AuditSnapshotFingerprint
+    foreach ($badAudit in @($auditSnapshot,(Join-Path $auditSnapshot 'nested'),$resolvedTestRoot,$auditCache,(Join-Path $auditCache 'nested'),(Join-Path $resolvedTestRoot 'missing-audit'))) {
+        $refusedAudit = & $transaction restore -CachePath $auditCache -EvidenceDirectory $auditSnapshot -RestoreEvidenceDirectory $badAudit -BlockingProcessNames fixture-process-that-does-not-exist -Confirm:$false -NoExit | ConvertFrom-Json
+        $observedAuditTree = & $transaction inspect -CachePath $auditCache -NoExit | ConvertFrom-Json
+        Assert-Test (-not $refusedAudit.ok -and $observedAuditTree.data.treeSha256 -ceq $auditWorking.data.treeSha256 -and (Get-AuditSnapshotFingerprint) -ceq $auditSnapshotHash) "separate restore refuses unsafe audit destination without tree/snapshot mutation: $badAudit"
+    }
+    $invalidAuditCommand = & $transaction verify -CachePath $auditCache -EvidenceDirectory $auditSnapshot -RestoreEvidenceDirectory $auditRestore -NoExit | ConvertFrom-Json
+    Assert-Test (-not $invalidAuditCommand.ok -and $invalidAuditCommand.errors[0] -match 'only by restore') 'separate restore audit parameter cannot alter another command contract'
+    $auditLink = Join-Path $resolvedTestRoot 'restore-audit-link'
+    try {
+        New-Item -ItemType Junction -Path $auditLink -Target $auditRestore -ErrorAction Stop | Out-Null
+        $linkedRestore = & $transaction restore -CachePath $auditCache -EvidenceDirectory $auditSnapshot -RestoreEvidenceDirectory $auditLink -BlockingProcessNames fixture-process-that-does-not-exist -Confirm:$false -NoExit | ConvertFrom-Json
+        Assert-Test (-not $linkedRestore.ok -and $linkedRestore.errors[0] -match 'reparse point') 'separate restore audit refuses reparse destination'
+    }
+    finally { if (Test-Path -LiteralPath $auditLink) { Remove-Item -LiteralPath $auditLink -Force } }
+    $auditRollback = & $transaction restore -CachePath $auditCache -EvidenceDirectory $auditSnapshot -RestoreEvidenceDirectory $auditRestore -InternalTestFailurePoint restore-after-activate -BlockingProcessNames fixture-process-that-does-not-exist -Confirm:$false -NoExit | ConvertFrom-Json
+    $auditAfterRollback = & $transaction inspect -CachePath $auditCache -NoExit | ConvertFrom-Json
+    Assert-Test (-not $auditRollback.ok -and $auditAfterRollback.data.treeSha256 -ceq $auditWorking.data.treeSha256 -and (Get-AuditSnapshotFingerprint) -ceq $auditSnapshotHash) 'separate restore rollback preserves exact working tree and original snapshot namespace'
+    $auditRestored = & $transaction restore -CachePath $auditCache -EvidenceDirectory $auditSnapshot -RestoreEvidenceDirectory $auditRestore -BlockingProcessNames fixture-process-that-does-not-exist -Confirm:$false -NoExit | ConvertFrom-Json
+    if (-not $auditRestored.ok) { throw "Separate audit restore fixture failed: $($auditRestored.errors -join '; ')" }
+    $auditReceipt = Get-Content -LiteralPath $auditRestored.data.restoreReceiptPath -Raw | ConvertFrom-Json
+    $auditJournal = Get-Content -LiteralPath (Join-Path $auditRestore ('shader-cache-restore.' + $auditReceipt.transactionId + '.journal.json')) -Raw | ConvertFrom-Json
+    $auditSnapshotReceipt = Get-Content -LiteralPath $auditSnap.data.receiptPath -Raw | ConvertFrom-Json
+    $auditDisplaced = & $transaction inspect -CachePath $auditReceipt.displacedPath -NoExit | ConvertFrom-Json
+    Assert-Test ($auditJournal.phase -ceq 'committed' -and $auditReceipt.snapshotTransactionId -ceq $auditSnapshotReceipt.transactionId -and $auditReceipt.snapshotReceiptPath -ceq $auditSnap.data.receiptPath -and $auditDisplaced.data.treeSha256 -ceq $auditWorking.data.treeSha256 -and (Get-AuditSnapshotFingerprint) -ceq $auditSnapshotHash) 'separate restore retains committed exact lineage and physical displaced output without modifying snapshot evidence'
+
     $mods = Join-Path $resolvedTestRoot 'mods'
     $profile = Join-Path $resolvedTestRoot 'modlist.txt'
     New-Item -ItemType Directory -Path (Join-Path $mods 'Enabled Cache\ShaderCache'), (Join-Path $mods 'Disabled Cache\ShaderCache') -Force | Out-Null
@@ -175,6 +221,8 @@ try {
 }
 finally {
     $env:CSX_SHADER_CACHE_CONTROL_ROOT = $priorControlRoot
+    $env:TEMP = $priorFixtureTemp
+    $env:TMP = $priorFixtureTmp
     if (Test-Path -LiteralPath $resolvedTestRoot -PathType Container) {
         Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force
     }
