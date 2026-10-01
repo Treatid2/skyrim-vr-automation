@@ -1065,7 +1065,7 @@ $identitySemanticCases = & {
             $payload | Add-Member retryable ($mode -like '*retryable')
             $payload | Add-Member error 'identity unavailable'
             if ($mode -like '*malformed') { $payload.ok = 'false' }
-            if ($mode -like '*unknown') { $payload.PSObject.Properties.Remove('ok'); $payload.PSObject.Properties.Remove('error') }
+            if ($mode -like '*unknown') { $payload.PSObject.Properties.Remove('ok'); $payload.PSObject.Properties.Remove('error'); $payload.PSObject.Properties.Remove('frame') }
         }
         # Real MCP and REST content is JSON-decoded; PID integers become Int64.
         [pscustomobject]@{ content = @(($payload | ConvertTo-Json -Depth 8) | ConvertFrom-Json) }
