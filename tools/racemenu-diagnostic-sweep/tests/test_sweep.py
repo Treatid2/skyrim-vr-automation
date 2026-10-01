@@ -2,6 +2,7 @@
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -139,6 +141,12 @@ class Unit(unittest.TestCase):
 
 class Entrypoint(unittest.TestCase):
     def test_production_entrypoint_and_adapter_policy(self):
+        self.run_entrypoint(False)
+
+    def test_real_capture_composite_observer_and_sweep_entrypoint(self):
+        self.run_entrypoint(True)
+
+    def run_entrypoint(self, real_capture):
         pwsh=shutil.which('pwsh')
         if not pwsh: self.skipTest('PowerShell unavailable')
         with tempfile.TemporaryDirectory() as directory:
@@ -147,13 +155,21 @@ class Entrypoint(unittest.TestCase):
             devbench=root/'devbench-control';devbench.mkdir()
             for dest in (capture/'Invoke-CaptureInteraction.ps1',devbench/'Invoke-DevBenchControl.ps1'):
                 shutil.copyfile(ROOT/'tests'/'fixture.ps1',dest)
+            if real_capture:
+                # Only DevBench responses are substituted. The actual capture
+                # entry point/module build and journal the composite observation.
+                for name in ('Invoke-CaptureInteraction.ps1','CaptureInteractionControl.psm1'):
+                    shutil.copyfile(ROOT.parent/'capture-interaction-control'/name,capture/name)
             model=state();model['frame']=0;model['mutations']=0
+            if real_capture: model['calls']=[]
             model_path=root/'model.json';model_path.write_text(json.dumps(model))
             identity=dict(listenerPid=1,processPath='fixture.exe',processStartTimeUtc='fixture',
                           buildId='fixture',artifactPath='fixture.dll',artifactSha256='a'*64)
             session=root/'session.json'
             session.write_text(json.dumps(dict(contractVersion='1.0.0',status='active',sessionId='fixture',
-                               sessionDirectory=str(root),runtimeIdentity=identity,modelPath=str(model_path))))
+                               sessionDirectory=str(root),runtimeIdentity=identity,modelPath=str(model_path),
+                               runtimePath=str(model_path),visualMode='sequence',preferredView='left_eye',
+                               screenshot=dict(requestId='fixture-shot'))))
             protocol=root/'protocol.json'
             protocol.write_text(json.dumps(dict(limits=dict(maximumInputRequestsInFlight=1,mutationRetries=0,
                                      phaseDeadlineSeconds=900,menuSettleDeadlineSeconds=30),
@@ -177,6 +193,22 @@ class Entrypoint(unittest.TestCase):
             self.assertEqual(model['mutations'],1)
             self.assertEqual(model['retries'],0)
             self.assertLessEqual(model['timeout'],30)
+            if real_capture:
+                observation=json.loads((root/'latest-observation.json').read_text(encoding='utf-8-sig'))
+                self.assertTrue(observation['game']['ok'])
+                self.assertTrue(observation['recording']['ok'])
+                self.assertIsNone(observation['screenshot']['error'])
+                observed={(c['tool'],c['arguments'].get('action',c['arguments'].get('kind')))
+                          for c in model['calls'] if c['tool']!='papyrus'}
+                self.assertEqual(observed,{('record','status'),('inspect','state'),('menu','list'),
+                                           ('input','status'),('input','observe'),
+                                           ('communityshaders.screenshot','request_get')})
+                for call in model['calls']:
+                    self.assertEqual(json.loads(call['identity']),identity)
+                    self.assertEqual(call['retries'],0)
+                    self.assertGreaterEqual(call['timeout'],1)
+                    self.assertLessEqual(call['timeout'],30)
+                    if call['tool']!='papyrus': self.assertNotIn('function',call['arguments'])
             self.assertFalse((root/'.racemenu-sweep.lock').exists())
             entries=[json.loads(line) for line in (root/'run'/'trace.ndjson').read_text().splitlines()]
             self.assertEqual(sum(e['kind']=='mutation-intent' for e in entries),1)
@@ -199,6 +231,21 @@ class Entrypoint(unittest.TestCase):
                 rejected=subprocess.run(denied,capture_output=True,text=True,timeout=5)
                 self.assertEqual(rejected.returncode,2,rejected.stdout+rejected.stderr)
                 self.assertEqual(json.loads(model_path.read_text(encoding='utf-8-sig'))['mutations'],1)
+            if real_capture:
+                # A real composite observer retains failed probes rather than
+                # fabricating qualified progress. Either mandatory probe stops
+                # the production sweep before another actor mutation.
+                for tool in ('inspect','record'):
+                    model_path.write_text(json.dumps(dict(model,denyObservation=tool)))
+                    denied=argv.copy()
+                    denied[denied.index(str(root/'run'))]=str(root/('deny-'+tool))
+                    rejected=subprocess.run(denied,capture_output=True,text=True,timeout=15)
+                    self.assertEqual(rejected.returncode,2,rejected.stdout+rejected.stderr)
+                    self.assertEqual(json.loads(model_path.read_text(encoding='utf-8-sig'))['mutations'],1)
+                    observation=json.loads((root/'latest-observation.json').read_text(encoding='utf-8-sig'))
+                    key='game' if tool=='inspect' else 'recording'
+                    self.assertFalse(observation[key]['ok'])
+                    self.assertIsNone(observation[key]['value'])
             # Exercise bounded cancellation through the real entry point, not
             # merely a mocked watchdog. The owned worker sleeps without progress.
             model['hang']=True
@@ -216,6 +263,61 @@ class Entrypoint(unittest.TestCase):
             stopped=json.loads(cancelled.stdout)
             self.assertFalse(stopped['ok'])
             self.assertIn('timed out',stopped['error'])
+
+
+class AdapterShape(unittest.TestCase):
+    def test_typed_papyrus_guard_and_unchanged_observation_responses(self):
+        pwsh=shutil.which('pwsh')
+        if not pwsh: self.skipTest('PowerShell unavailable')
+        request=dict(action='call',script='UI',function='GetString',
+                     args=[m.MENU,m.OWNER+'.vrDiagnosticSnapshotJson'])
+        response=dict(ok=False,transportOk=True,indeterminate=False,semantic=dict(known=False),
+                      errors=['unrecognized return'],data=dict(content=[dict(called=True,returned='{}',returnedType='String')]))
+        with tempfile.TemporaryDirectory() as directory:
+            model_path=Path(directory)/'model.json'
+            env=os.environ.copy()
+            env['RACEMENU_SWEEP_DEVBENCH_SCRIPT']=str(ROOT/'tests'/'fixture.ps1')
+            def call(tool,args,envelope):
+                model_path.write_text(json.dumps(dict(adapterResponse=envelope)))
+                env['RACEMENU_SWEEP_DEADLINE_UTC']=(datetime.now(timezone.utc)+timedelta(seconds=15)).isoformat()
+                result=subprocess.run([pwsh,'-NoProfile','-NonInteractive','-File',
+                         str(ROOT/'Invoke-SweepDevBench.ps1'),'call','-Tool',tool,
+                         '-ArgumentsJson',json.dumps(args),'-RuntimePath',str(model_path),
+                         '-ExpectedRuntimeIdentityJson','{}','-Compact','-NoExit'],
+                         env=env,capture_output=True,text=True,timeout=20)
+                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                return json.loads(result.stdout)
+            qualified=call('papyrus',request,response)
+            self.assertTrue(qualified['ok'])
+            self.assertEqual(qualified['originalControllerEnvelope'],response)
+            malformed=[{},None,[],dict(request,function=None),dict(request,function=['GetString']),
+                       dict(request,action=False),dict(request,script=7),dict(request,args=None),
+                       dict(request,args='not an array'),dict(request,args=[m.MENU]),
+                       dict(request,args=[m.MENU,False]),dict(request,args=['Other Menu',request['args'][1]]),
+                       dict(request,args=[m.MENU,m.OWNER+'.unrelated'])]
+            for args in malformed:
+                with self.subTest(request=args): self.assertEqual(call('papyrus',args,response),response)
+            negatives=[]
+            for key,value in [('transportOk',False),('transportOk','true'),('indeterminate',True),
+                              ('indeterminate','false'),('semantic',{}),('semantic',dict(known=True)),
+                              ('semantic',dict(known='false')),('data',{}),('data',dict(content=[None]))]:
+                negatives.append(dict(response,**{key:value}))
+            for key,value in [('called',False),('called','true'),('returned',7),('returnedType',None)]:
+                item=dict(response['data']['content'][0],**{key:value})
+                negatives.append(dict(response,data=dict(content=[item])))
+            for envelope in negatives:
+                with self.subTest(response=envelope): self.assertEqual(call('papyrus',request,envelope),envelope)
+            # Unknown/non-Papyrus envelopes are not candidates for Papyrus
+            # qualification, even if they contain a plausible called receipt.
+            for tool,args in [('record',dict(action='status')),('inspect',dict(kind='state')),
+                              ('menu',dict(action='list')),('input',dict(action='observe')),
+                              ('communityshaders.screenshot',dict(action='request_get'))]:
+                with self.subTest(tool=tool):
+                    actual=call(tool,args,response)
+                    self.assertEqual(actual,response)
+                    self.assertNotIn('originalControllerEnvelope',actual)
+                    positive=dict(response,ok=True)
+                    self.assertEqual(call(tool,args,positive),positive)
 
 
 if __name__=='__main__': unittest.main(verbosity=2)

@@ -23,7 +23,22 @@ $raw = & $env:RACEMENU_SWEEP_DEVBENCH_SCRIPT call -Tool $Tool -ArgumentsJson $Ar
 $response = $raw | ConvertFrom-Json -Depth 100
 # The installed generic semantic gate does not know Papyrus' called/returned
 # contract. Qualify ONLY this sweep's exact UI methods, never generic failures.
-$request = $ArgumentsJson | ConvertFrom-Json
+# Observation tools have no Papyrus function/args contract. Preserve their
+# upstream response without inspecting or qualifying it, including failures.
+if ($Tool -cne 'papyrus') { $raw; return }
+$request = $ArgumentsJson | ConvertFrom-Json -Depth 100
+if ($null -eq $request -or $request -isnot [pscustomobject] -or
+    -not $request.PSObject.Properties['action'] -or $request.action -isnot [string] -or
+    $request.action -cne 'call' -or
+    -not $request.PSObject.Properties['script'] -or $request.script -isnot [string] -or
+    $request.script -cne 'UI' -or
+    -not $request.PSObject.Properties['function'] -or $request.function -isnot [string] -or
+    $request.function -cnotin @('InvokeIntA','InvokeFloatA','GetString') -or
+    -not $request.PSObject.Properties['args'] -or $request.args -isnot [array] -or
+    $request.args.Count -lt 2 -or $request.args[0] -isnot [string] -or
+    $request.args[0] -cne 'RaceSex Menu' -or $request.args[1] -isnot [string]) {
+    $raw; return
+}
 $owner = '_root.RaceSexMenuBaseInstance.RaceSexPanelsInstance.'
 $allowedPaths = switch -CaseSensitive ($request.function) {
     'InvokeIntA' { ($owner + 'RefreshVRDiagnosticControls'); ($owner + 'SelectVRDiagnosticRace') }
@@ -31,17 +46,16 @@ $allowedPaths = switch -CaseSensitive ($request.function) {
     'GetString' { ($owner + 'vrDiagnosticSnapshotJson'); ($owner + 'vrDiagnosticResultJson') }
     default { @() }
 }
-if (-not $response.ok -and $Tool -ceq 'papyrus' -and
-    $request.action -ceq 'call' -and $request.script -ceq 'UI' -and
-    $request.function -cin @('InvokeIntA','InvokeFloatA','GetString') -and
-    @($request.args).Count -ge 2 -and $request.args[0] -ceq 'RaceSex Menu' -and
-    $request.args[1] -cin $allowedPaths -and
-    $response.PSObject.Properties['transportOk'] -and $response.transportOk -eq $true -and
-    $response.PSObject.Properties['indeterminate'] -and $response.indeterminate -eq $false -and
-    $response.PSObject.Properties['semantic'] -and $response.semantic.known -eq $false -and
+if ($null -ne $response -and $response.PSObject.Properties['ok'] -and
+    $response.ok -is [bool] -and -not $response.ok -and $request.args[1] -cin $allowedPaths -and
+    $response.PSObject.Properties['transportOk'] -and $response.transportOk -is [bool] -and $response.transportOk -and
+    $response.PSObject.Properties['indeterminate'] -and $response.indeterminate -is [bool] -and -not $response.indeterminate -and
+    $response.PSObject.Properties['semantic'] -and $null -ne $response.semantic -and
+    $response.semantic.PSObject.Properties['known'] -and $response.semantic.known -is [bool] -and -not $response.semantic.known -and
+    $response.PSObject.Properties['data'] -and $null -ne $response.data -and $response.data.PSObject.Properties['content'] -and
     -not [string]::IsNullOrWhiteSpace($ExpectedRuntimeIdentityJson)) {
     $content = @($response.data.content)
-    if ($content.Count -eq 1 -and $content[0].PSObject.Properties['called'] -and
+    if ($content.Count -eq 1 -and $null -ne $content[0] -and $content[0].PSObject.Properties['called'] -and
         $content[0].called -is [bool] -and $content[0].called -and
         $content[0].PSObject.Properties['returned'] -and
         $content[0].PSObject.Properties['returnedType'] -and

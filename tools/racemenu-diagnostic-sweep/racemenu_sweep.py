@@ -269,13 +269,19 @@ class CaptureAdapter:
         envelope = self.call('observe', None, deadline)
         try:
             observation = envelope['data']['observation']
-            game = observation['game']['value']
+            game_probe = observation['game']
+            record_probe = observation['recording']
+            if game_probe.get('ok') is not True or record_probe.get('ok') is not True:
+                raise KeyError('failed game/recording probe')
+            game = game_probe['value']
+            record = record_probe['value']
+            if not isinstance(game, dict) or not isinstance(record, dict):
+                raise KeyError('malformed game/recording value')
             if game['playerLoaded'] is not True or not integer(game['frame']):
                 raise KeyError('loaded/frame')
-            record = observation['recording']['value']
             if record.get('recording') is not True:
                 raise KeyError('recording')
-        except (KeyError, TypeError) as error:
+        except (KeyError, TypeError, AttributeError) as error:
             raise StopSweep('Game/capture progress observation is not qualified') from error
         return observation
 
