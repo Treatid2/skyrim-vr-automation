@@ -5331,12 +5331,39 @@ function Get-MO2RunButtonProof {
     if ($windows.Count -ne 1 -or -not $windows[0].Current.IsEnabled) { throw 'Exact MO2 main window is not uniquely accessible and enabled.' }
     $window = $windows[0]
     $controls = @{}
+    $controlIds = [ordered]@{}
+    # Qt 6.7.1 automationIdForAccessible prepends named QObject parents.
+    # These full paths come from MO2 v2.5.2 mainwindow.ui, not suffix/name
+    # matching. Retain bare IDs for providers which expose that exact form.
+    $qualifiedIds = @{
+        profileBox = 'MainWindow.centralWidget.categoriesSplitter.splitter.layoutWidget.profileBox'
+        executablesListBox = 'MainWindow.centralWidget.categoriesSplitter.splitter.layoutWidget_2.startGroup.executablesListBox'
+        startButton = 'MainWindow.centralWidget.categoriesSplitter.splitter.layoutWidget_2.startGroup.startButton'
+    }
+    $discovery = [ordered]@{ processId=[int]$Owner.id; windowHandle=[int64]$main[0].handle; queries=@(); maxQueries=6; attemptsPerQuery=1; selectorsComplete=$false; nativeRpcDeadlineEnforced=$false }
     foreach ($id in @('profileBox','executablesListBox','startButton')) {
-        $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, $id)
-        $matches = @(Invoke-MO2UiAutomationFindAll -Window $window -Scope ([System.Windows.Automation.TreeScope]::Descendants) -Condition $condition)
+        $matches = @()
+        foreach ($candidateId in @($id,$qualifiedIds[$id])) {
+            $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, $candidateId)
+            try {
+                $found = @(Invoke-MO2UiAutomationFindAll -Window $window -Scope ([System.Windows.Automation.TreeScope]::Descendants) -Condition $condition -MaxAttempts 1)
+                $discovery.queries += [pscustomobject]@{ automationId=$candidateId; matches=$found.Count }
+                $matches += $found
+            }
+            catch {
+                $discovery.queries += [pscustomobject]@{ automationId=$candidateId; matches=$null; error='native-query-failed' }
+                $_.Exception.Data['MO2RunControlDiscovery'] = [pscustomobject]$discovery
+                throw
+            }
+        }
         if ($matches.Count -ne 1 -or [int]$matches[0].Current.ProcessId -ne [int]$Owner.id -or
-            -not $matches[0].Current.IsEnabled -or $matches[0].Current.IsOffscreen) { throw "Exact enabled MO2 control '$id' is unavailable or ambiguous." }
+            -not $matches[0].Current.IsEnabled -or $matches[0].Current.IsOffscreen) {
+            $failure = [InvalidOperationException]::new("Exact enabled MO2 control '$id' is unavailable or ambiguous. See data.runControlDiscovery for exact selector counts; no selection or Run action occurred.")
+            $failure.Data['MO2RunControlDiscovery'] = [pscustomobject]$discovery
+            throw $failure
+        }
         $controls[$id] = $matches[0]
+        $controlIds[$id] = [string]$matches[0].Current.AutomationId
     }
     if ($controls.profileBox.Current.ControlType -ne [System.Windows.Automation.ControlType]::ComboBox -or
         $controls.executablesListBox.Current.ControlType -ne [System.Windows.Automation.ControlType]::ComboBox -or
@@ -5347,6 +5374,7 @@ function Get-MO2RunButtonProof {
         profile = Get-MO2RunSelectionValue $controls.profileBox
         executable = Get-MO2RunSelectionValue $controls.executablesListBox
         button = $controls.startButton
+        controlIds = [pscustomobject]$controlIds
     }
 }
 
@@ -5391,7 +5419,7 @@ function Invoke-MO2RunButtonDispatch {
         $binding.Refresh()
         if ($binding.HasExited -or $handle.IsClosed -or $handle.IsInvalid -or
             @(Get-MO2ProcessRecords -Names @($Config.mo2.gameProcessNames)).Count -ne 0) { throw 'Run owner exited or a game/loader appeared before invocation.' }
-        $LaunchStarted | Add-Member -NotePropertyName runButtonProof -NotePropertyValue ([pscustomobject]@{ owner=$owner; windowHandle=$again.windowHandle; profile=$again.profile; executable=$again.executable; registeredExecutable=$actual[0]; automationId='startButton'; invocationState=$(if ($PrepareOnly) { 'armed' } else { 'attempted' }) }) -Force
+        $LaunchStarted | Add-Member -NotePropertyName runButtonProof -NotePropertyValue ([pscustomobject]@{ owner=$owner; windowHandle=$again.windowHandle; profile=$again.profile; executable=$again.executable; registeredExecutable=$actual[0]; automationId=$again.controlIds.startButton; controlIds=$again.controlIds; invocationState=$(if ($PrepareOnly) { 'armed' } else { 'attempted' }) }) -Force
         $LaunchStarted.requestedPid = $owner.id
         $LaunchStarted.requestedProcessStartTime = $owner.startTime
         Write-MO2JsonAtomic -Path $ReceiptPath -Value $LaunchStarted
@@ -6462,13 +6490,19 @@ function Invoke-MO2CurrentGameCloseRequest {
     # Session state, not a pre-lock inventory, defines the owned game set. An
     # additional configured game/loader process is an ambiguity and vetoes all
     # close requests, even when it appeared in the caller's earlier inspection.
-    $resolution = Resolve-MO2RecordedGameProcessTargets -Recorded @($CurrentData.gameProcesses) -Current @($CurrentInspection.processes.game)
+    # A freshly opened session legitimately has no gameProcesses field until
+    # launch. Empty recorded ownership must still veto any unrecorded game.
+    $recorded = @(if ($CurrentData.PSObject.Properties['gameProcesses']) { $CurrentData.gameProcesses })
+    $resolution = Resolve-MO2RecordedGameProcessTargets -Recorded $recorded -Current @($CurrentInspection.processes.game)
     if (-not $resolution.ok) {
         return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = [string]$resolution.reason; gameResolution = $resolution }
     }
     $ownerResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $Owned -Processes @($CurrentInspection.processes.mo2)
     if (-not $ownerResolution.ok -or @($ownerResolution.targets).Count -ne 1) {
         return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = 'mo2-owner-changed-before-game-close'; ownershipResolution = $ownerResolution }
+    }
+    if (@($resolution.targets).Count -eq 0) {
+        return [pscustomobject][ordered]@{ ok = $true; state = 'close-requested'; reason = 'game-already-stopped'; targets = @() }
     }
     return Invoke-MO2VerifiedGameCloseRequestSet -Config $Config -Owned $Owned -Targets @($resolution.targets) -BindingFactory $BindingFactory -CloseAction $CloseAction
 }

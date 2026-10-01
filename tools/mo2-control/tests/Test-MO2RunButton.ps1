@@ -14,7 +14,7 @@ $result = & $module {
     $script:RunWindow = [pscustomobject]@{Current=[pscustomobject]@{NativeWindowHandle=123;IsEnabled=$true}}
     $script:RunControls = @{}
     foreach ($id in @('profileBox','executablesListBox','startButton')) {
-        $script:RunControls[$id] = [pscustomobject]@{Current=[pscustomobject]@{ProcessId=111;IsEnabled=$true;IsOffscreen=$false;Name=$(if ($id -eq 'startButton') {'Run'} else {'unused'});ControlType=$(if ($id -eq 'startButton') {[System.Windows.Automation.ControlType]::Button} else {[System.Windows.Automation.ControlType]::ComboBox})};FixtureId=$id}
+        $script:RunControls[$id] = [pscustomobject]@{Current=[pscustomobject]@{AutomationId=$id;ProcessId=111;IsEnabled=$true;IsOffscreen=$false;Name=$(if ($id -eq 'startButton') {'Run'} else {'unused'});ControlType=$(if ($id -eq 'startButton') {[System.Windows.Automation.ControlType]::Button} else {[System.Windows.Automation.ControlType]::ComboBox})};FixtureId=$id}
     }
     $script:RunProfile='Fixture Profile'; $script:RunExecutable='Fixture SKSE'
     $script:RunVisible = @([pscustomobject]@{visible=$true;automationAvailable=$true;automationId='MainWindow';handle=123})
@@ -36,7 +36,7 @@ $result = & $module {
     Set-Item Function:script:Get-Process { $script:RunBinding }
     Set-Item Function:script:Get-MO2WindowSnapshot { @($script:RunVisible) }
     Set-Item Function:script:Get-MO2AutomationWindows { @($script:RunWindow) }
-    Set-Item Function:script:Invoke-MO2UiAutomationFindAll { param($Window,$Scope,$Condition) @($script:RunControls[[string]$Condition.Value]) }
+    Set-Item Function:script:Invoke-MO2UiAutomationFindAll { param($Window,$Scope,$Condition) if ($script:RunControls.ContainsKey([string]$Condition.Value)) {@($script:RunControls[[string]$Condition.Value])} else {@()} }
     Set-Item Function:script:Get-MO2RunSelectionValue { param($Element) if ($Element.FixtureId -eq 'profileBox') {$script:RunProfile} else {$script:RunExecutable} }
     Set-Item Function:script:Start-Process { throw 'Unexpected CLI process dispatch in RunButton test.' }
     Set-Item Function:script:Invoke-MO2OwnedSessionMutation { param($Owned,$Action) $changed=& $Action $Owned.data; $Owned.data=$changed.sessionData; $Owned.data.generation++; $changed.result }
@@ -75,6 +75,36 @@ $result = & $module {
     $script:RunControls.profileBox=@($savedControl,$savedControl)
     Refused {Get-MO2RunButtonProof $script:RunOwner} 'duplicate exact selector refused'
     $script:RunControls.profileBox=$savedControl
+    $qualified=@{
+        profileBox='MainWindow.centralWidget.categoriesSplitter.splitter.layoutWidget.profileBox'
+        executablesListBox='MainWindow.centralWidget.categoriesSplitter.splitter.layoutWidget_2.startGroup.executablesListBox'
+        startButton='MainWindow.centralWidget.categoriesSplitter.splitter.layoutWidget_2.startGroup.startButton'
+    }
+    foreach($id in @('profileBox','executablesListBox','startButton')) {
+        $control=$script:RunControls[$id];$script:RunControls.Remove($id)
+        $control.Current.AutomationId=$qualified[$id];$script:RunControls[$qualified[$id]]=$control
+    }
+    $native=Invoke-MO2Launch -Config $cfg -SessionId fixture -LaunchMethod RunButton -WhatIf
+    Check ($native.ok -and $script:RunInvokes -eq 0 -and $script:RunOwned.data.status -eq 'mo2-open') 'exact Qt parent-qualified IDs verify preview without selection or dispatch'
+    $nativeProof=Get-MO2RunButtonProof $script:RunOwner
+    Check ($nativeProof.controlIds.startButton -ceq $qualified.startButton -and $nativeProof.controlIds.profileBox -ceq $qualified.profileBox) 'proof retains actual full Qt control identities'
+    $script:RunControls['profileBox']=$script:RunControls[$qualified.profileBox]
+    Refused {Get-MO2RunButtonProof $script:RunOwner} 'bare and qualified selector ambiguity refuses rather than preferring one'
+    $script:RunControls.Remove('profileBox')
+    $qProfile=$script:RunControls[$qualified.profileBox];$script:RunControls.Remove($qualified.profileBox)
+    $script:RunControls['ForeignWindow.profileBox']=$qProfile
+    $diagnostic=$null
+    try {Get-MO2RunButtonProof $script:RunOwner|Out-Null} catch {$diagnostic=$_.Exception.Data['MO2RunControlDiscovery']}
+    Check ($null -ne $diagnostic -and @($diagnostic.queries).Count -eq 2 -and @($diagnostic.queries|Where-Object matches -ne 0).Count -eq 0 -and $diagnostic.maxQueries -eq 6 -and -not $diagnostic.nativeRpcDeadlineEnforced -and $script:RunInvokes -eq 0) 'foreign prefix rejected with finite selector counts and honest native RPC deadline limitation'
+    $script:RunControls.Remove('ForeignWindow.profileBox');$script:RunControls[$qualified.profileBox]=$qProfile
+    Reset-Fixture
+    $qualifiedLaunch=Invoke-MO2Launch -Config $cfg -SessionId fixture -LaunchMethod RunButton -StartOnly
+    $qualifiedReceipt=Get-Content -LiteralPath (Join-Path $root 'mo2-launch-started.json') -Raw|ConvertFrom-Json
+    Check ($qualifiedLaunch.ok -and $script:RunInvokes -eq 1 -and $qualifiedReceipt.runButtonProof.automationId -ceq $qualified.startButton) 'one protected qualified Run invocation receipts actual identity'
+    foreach($id in @('profileBox','executablesListBox','startButton')) {
+        $control=$script:RunControls[$qualified[$id]];$script:RunControls.Remove($qualified[$id])
+        $control.Current.AutomationId=$id;$script:RunControls[$id]=$control
+    }
     Reset-Fixture;$script:RunDesktop=$false
     $desktop=Invoke-MO2Launch -Config $cfg -SessionId fixture -LaunchMethod RunButton -StartOnly
     Check ($desktop.state -eq 'interactive-desktop-required' -and $script:RunInvokes -eq 0) 'noninteractive route refuses before dispatch'
