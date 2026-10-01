@@ -51,6 +51,7 @@ $workspaceContentSupplied = $PSBoundParameters.ContainsKey('WorkspaceContent')
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $toolRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'WorkspaceCacheCompletionProof.ps1')
 Import-Module (Join-Path $toolRoot 'mo2-control\ConfigResolution.psm1') -Force
 Import-Module (Join-Path $toolRoot 'mo2-control\MO2Control.psm1') -Force
 
@@ -598,7 +599,10 @@ function Get-WorkspaceCacheCompletionEvidence($Config, $Workspace, [switch]$Requ
     foreach ($property in @('inventory', 'materializedFiles', 'preservedPath')) {
         if ($null -eq $completion.workingTree -or -not $completion.workingTree.PSObject.Properties[$property]) { throw "Shader-cache working-tree evidence lacks '$property'." }
     }
-    if ([int]$completion.workingTree.materializedFiles -lt 1 -or -not (Test-Path -LiteralPath ([string]$completion.workingTree.preservedPath) -PathType Container)) {
+    if ([int]$completion.workingTree.materializedFiles -lt 1) {
+        Assert-WorkspaceUnchangedFailedCacheCompletion -Workspace $Workspace -Plan $plan -Completion $completion
+    }
+    if (-not (Test-Path -LiteralPath ([string]$completion.workingTree.preservedPath) -PathType Container)) {
         throw 'Shader-cache completion does not retain generated task output.'
     }
     $preserved = Get-WorkspaceOutputInventory -Path ([string]$completion.workingTree.preservedPath) -Purpose 'Preserved shader-cache task output'
@@ -1020,6 +1024,11 @@ function New-RearmedWorkspaceRuntimeOutput($Config, $Workspace, [string]$Operati
         [string]$backupCompletion.ownershipId -cne [string]$Workspace.data.ownershipId) {
         throw 'Retained workspace output completions belong to a different workspace owner.'
     }
+    # Preserve the existing generated-output resume contract. The newly
+    # admitted zero-output cleanup must prove its full exact binding again.
+    if ([int]$cacheCompletion.workingTree.materializedFiles -lt 1) {
+        $null = Get-WorkspaceCacheCompletionEvidence -Config $Config -Workspace $Workspace
+    }
 
     $workspaceId = [string]$Workspace.data.workspaceId
     $ownershipId = [string]$Workspace.data.ownershipId
@@ -1195,8 +1204,11 @@ function Assert-WorkspaceRuntimeOutputReadyForRetirement($Config, $Workspace, [s
             ([string]$output.mode -cne 'mo2-overwrite-output' -and [string]$completionBinding.modName -cne [string]$output.modName) -or
             ([string]$output.mode -ceq 'mo2-overwrite-output' -and [string]$completionBinding.mode -cne 'mo2-overwrite-output') -or
             -not (Test-WorkspaceSamePath ([string]$completionBinding.cachePath) ([string]$output.cachePath)) -or
-            $materializedFiles -lt 1) {
+            ($materializedFiles -lt 1 -and [string]$output.mode -cne 'mo2-overwrite-output')) {
             throw "Shader-cache completion does not close the exact task plan: $completionPath"
+        }
+        if ([string]$output.mode -ceq 'mo2-overwrite-output') {
+            $null = Get-WorkspaceCacheCompletionEvidence -Config $Config -Workspace $Workspace
         }
     }
     else {

@@ -631,7 +631,7 @@ try {
         Command = 'complete'
         CatalogRoot = $boundCatalogRoot
         EvidenceDirectory = $boundEvidence
-        WorkingSetStatus = 'unverified'
+        WorkingSetStatus = 'known-working'
         BlockingProcessNames = $blockers
         Confirm = $false
         Compact = $true
@@ -656,6 +656,60 @@ try {
     Assert-Test ($boundComplete.ok -and [int]$boundComplete.data.task.workingTree.materializedFiles -eq 1) 'task completion preserves materialized output from the exact bound provider'
     Assert-Test (Test-Path -LiteralPath (Join-Path $boundComplete.data.task.workingTree.preservedPath 'compiled-during-bound-task.bin') -PathType Leaf) 'provider-backed compiled output survives restoration in the evidence tree'
     Assert-Test (-not (Test-Path -LiteralPath (Join-Path $taskCache 'compiled-during-bound-task.bin'))) 'task completion restores the exact pre-task provider tree'
+
+    foreach ($failedStatus in @('failed', 'unverified')) {
+        $cleanupEvidence = Join-Path $resolvedTestRoot ('unchanged-bound-' + $failedStatus)
+        $cleanupPrepareArgs = @{} + $boundPrepareArgs
+        $cleanupPrepareArgs.EvidenceDirectory = $cleanupEvidence
+        $cleanupPrepareArgs.RequireMaterializedOutput = $true
+        $cleanupPrepare = Invoke-Catalog $cleanupPrepareArgs
+        $cleanupPlan = Get-Content -LiteralPath (Join-Path $cleanupEvidence 'shader-cache-task.plan.json') -Raw | ConvertFrom-Json -Depth 40
+        if ($failedStatus -eq 'failed') {
+            $preparedHash = $cleanupPlan.preparedTreeSha256
+            $cleanupPlan.preparedTreeSha256 = 'F' * 64
+            $cleanupPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath (Join-Path $cleanupEvidence 'shader-cache-task.plan.json') -Encoding utf8
+            $driftRefusal = Invoke-Catalog @{
+                Command='complete'; CatalogRoot=$boundCatalogRoot; EvidenceDirectory=$cleanupEvidence
+                WorkingSetStatus='failed'; BlockingProcessNames=$blockers; Confirm=$false; Compact=$true; NoExit=$true
+            }
+            Assert-Test (-not $driftRefusal.ok -and -not (Test-Path -LiteralPath (Join-Path $cleanupEvidence 'shader-cache-task.completion.json'))) 'failed status cannot bypass a mismatched prepared-tree proof'
+            $cleanupPlan.preparedTreeSha256 = $preparedHash
+            $cleanupPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath (Join-Path $cleanupEvidence 'shader-cache-task.plan.json') -Encoding utf8
+        }
+        $cleanupComplete = Invoke-Catalog @{
+            Command='complete'; CatalogRoot=$boundCatalogRoot; EvidenceDirectory=$cleanupEvidence
+            WorkingSetStatus=$failedStatus; BlockingProcessNames=$blockers
+            Confirm=$false; Compact=$true; NoExit=$true
+        }
+        Assert-Test ($cleanupPrepare.ok -and $cleanupComplete.ok -and
+            [int]$cleanupComplete.data.task.workingTree.materializedFiles -eq 0 -and
+            [bool]$cleanupComplete.data.task.workingTree.unchangedPreparedFailure -and
+            $null -eq $cleanupComplete.data.task.promoted) "unchanged materialized $failedStatus output completes without promotion or invented cache writes"
+        $cleanupInventory = & $transactionTool inspect -CachePath $taskCache -NoExit | ConvertFrom-Json -Depth 30
+        Assert-Test ([string]$cleanupInventory.data.treeSha256 -ieq [string]$cleanupPlan.beforeTreeSha256 -and
+            (Test-Path -LiteralPath $cleanupComplete.data.task.workingTree.preservedPath -PathType Container)) "$failedStatus cleanup restores exact pre-task baseline and retains working-tree evidence"
+        $cleanupRepeat = Invoke-Catalog @{
+            Command='complete'; CatalogRoot=$boundCatalogRoot; EvidenceDirectory=$cleanupEvidence
+            WorkingSetStatus=$failedStatus; BlockingProcessNames=$blockers
+            Confirm=$false; Compact=$true; NoExit=$true
+        }
+        Assert-Test ($cleanupRepeat.ok -and $cleanupRepeat.state -eq 'already-complete') "$failedStatus unchanged completion is idempotent"
+    }
+
+    # Provider coverage already present before preparation: true no-op cleanup.
+    Copy-Item -LiteralPath (Join-Path $otherCache 'other-provider.bin') -Destination (Join-Path $taskCache 'other-provider.bin')
+    $noopFailedArgs = @{} + $boundPrepareArgs
+    $noopFailedArgs.EvidenceDirectory = Join-Path $resolvedTestRoot 'failed-bound-noop'
+    $noopFailedPrepare = Invoke-Catalog $noopFailedArgs
+    $noopFailedComplete = Invoke-Catalog @{
+        Command='complete'; CatalogRoot=$boundCatalogRoot; EvidenceDirectory=$noopFailedArgs.EvidenceDirectory
+        WorkingSetStatus='failed'; BlockingProcessNames=$blockers; Confirm=$false; Compact=$true; NoExit=$true
+    }
+    $noopFailedPlan = Get-Content -LiteralPath (Join-Path $noopFailedArgs.EvidenceDirectory 'shader-cache-task.plan.json') -Raw | ConvertFrom-Json -Depth 40
+    $noopFailedReceipt = Get-Content -LiteralPath $noopFailedPlan.restoreReceiptPath -Raw | ConvertFrom-Json -Depth 30
+    Assert-Test ($noopFailedPrepare.ok -and $noopFailedComplete.ok -and [string]$noopFailedReceipt.operation -ceq 'restore-noop' -and
+        [int]$noopFailedComplete.data.task.workingTree.materializedFiles -eq 0 -and $null -eq $noopFailedComplete.data.task.promoted) 'failed required-materialization cleanup commits no-op only when prepared and original trees match exactly'
+    Remove-Item -LiteralPath (Join-Path $taskCache 'other-provider.bin') -Force
 
     $largeModsRoot = Join-Path $resolvedTestRoot 'large-mo2\mods'
     $largeProfilePath = Join-Path $resolvedTestRoot 'large-mo2\profiles\Task\modlist.txt'

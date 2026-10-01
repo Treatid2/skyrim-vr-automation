@@ -181,8 +181,14 @@ and records a completion receipt. Promotion is opt-in and is refused unless the
 caller explicitly classifies the task result as `known-working`. An unverified
 or failed task result is still preserved as evidence but is not added to the
 catalog. If the failed or unverified run left the live cache byte-for-byte equal
-to its prepared baseline, `complete` verifies both trees and commits a
-`restore-noop` receipt instead of moving or rebuilding identical data. A
+to its prepared baseline, zero newly generated files does not block cleanup,
+even when preparation required materialized output. Exact bindings and restore
+proof remain mandatory; no cache writes are manufactured and no promotion is
+allowed. If that tree also equals the pre-task snapshot, `complete` verifies
+both trees and commits a `restore-noop` receipt instead of moving identical data.
+When seeding/provider shadowing changed the prepared baseline, it preserves that
+working tree and performs the normal exact pre-task restoration. Known-working
+completion with required materialization still refuses zero generated output. A
 shader-source mismatch remains excluded unless
 `-AllowSourceMismatch` is accompanied by a concrete `-CompatibilityReason`;
 this exception does not bypass ABI, runtime, bytecode-class, feature-set, status,
