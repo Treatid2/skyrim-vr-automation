@@ -21,7 +21,7 @@ function Get-DevBenchHealthSemanticStatus {
         foreach ($name in @('port','frame','lastTaskFrame','pendingTasks','vr')) {
             $property = $payload.PSObject.Properties[$name]
             if (-not $property) {
-                if (-not $generic.known) { $reasons.Add("Plain health requires $name.") }
+                if (-not ($generic.known -and ($generic.affirmative -or -not $generic.ok))) { $reasons.Add("Plain health requires $name.") }
                 continue
             }
             if ($name -eq 'vr') {

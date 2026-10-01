@@ -9,6 +9,7 @@ function Assert-Health([bool]$Condition,[string]$Name) { if (-not $Condition) { 
 $health = [pscustomobject]@{ exe = 'SkyrimVR.exe'; frame = 47572L; lastTaskFrame = -1L; pendingTasks = 0L; pid = 43980L; port = 8921L; vr = $true }
 Assert-Health (Get-DevBenchHealthSemanticStatus -Content @($health)).ok 'plain supported health does not require an invented ok marker'
 Assert-Health (Get-DevBenchHealthSemanticStatus -Content @([pscustomobject]@{ ok = $true; pid = 101L; exe = 'fixture.exe' })).ok 'legacy positive health identity remains valid'
+Assert-Health (-not (Get-DevBenchHealthSemanticStatus -Content @([pscustomobject]@{ retryable = $false; pid = 101L; exe = 'fixture.exe' })).ok) 'a retryable false marker does not qualify incomplete health'
 foreach ($case in @('negative','retryable','pid-string','pid-zero','pid-too-large','exe-empty','port-string','port-too-large','vr-string','frame-negative','task-invalid','pending-negative','missing-frame','unknown','multiple','scalar')) {
     $h = $health | ConvertTo-Json | ConvertFrom-Json
     $content = @($h)
