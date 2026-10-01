@@ -117,4 +117,58 @@ if (-not $ap.ok) { throw 'Absent baseline fresh cache prepare failed.' }
 $ac = & $catalogEntry complete -CatalogRoot $catalogRoot -CachePath $an.cachePath -EvidenceDirectory $an.cacheEvidenceDirectory -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json
 $ab = & $entry complete-output -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $absent.data.workspaceId -Confirm:$false -NoExit -Compact | ConvertFrom-Json
 if (-not $ac.ok -or -not $ab.ok -or (Test-Path $an.cachePath) -or (Test-Path $an.backupPath) -or (Test-Path $an.ownerMarkerPath)) { throw "Absent baseline completion failed: $($ab | ConvertTo-Json -Depth 12 -Compress)" }
-'PASS: consent, preview, corruption refusal, 3 real process interruptions, pre/post-rearm rollback failures and recovery, exact current winners, old history/output preservation, fresh isolation, final original baseline restoration including both originally absent trees.'
+# A real replacement access capability must not admit another task or an
+# unrelated requested workspace through global pending-journal recovery.
+$ownerFixture = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceContent Modlist -Label requalify-recovery-owner -SavePolicy FreshGame -Confirm:$false -NoExit -Compact | ConvertFrom-Json
+if (-not $ownerFixture.ok) { throw 'Recovery-owner workspace creation failed.' }
+$oo = $ownerFixture.data.runtimeOutput
+$argsPrepare.CachePath = $oo.cachePath
+$argsPrepare.ProfilePath = $ownerFixture.data.modListPath
+$argsPrepare.EvidenceDirectory = $oo.cacheEvidenceDirectory
+$argsPrepare.WorkspaceId = $ownerFixture.data.workspaceId
+$argsPrepare.OwnershipId = $ownerFixture.data.ownershipId
+$argsPrepare.OwnerMarkerPath = $oo.ownerMarkerPath
+$argsPrepare.OwnerMarkerSha256 = $oo.ownerMarkerSha256
+$argsPrepare.BuildId = $oo.cachePrepareArguments.BuildId
+$argsPrepare.ShaderCacheAbi = $oo.cachePrepareArguments.ShaderCacheAbi
+$ownerPrepared = & $catalogEntry prepare @argsPrepare | ConvertFrom-Json
+if (-not $ownerPrepared.ok) { throw 'Recovery-owner cache prepare failed.' }
+[IO.File]::WriteAllText((Join-Path $oo.cachePath 'owner-result.pso'), 'real fixture materialized output')
+[IO.File]::WriteAllText((Join-Path $oo.backupPath 'owner-result.bin'), 'real fixture backup output')
+$ownerManifest = Join-Path $sessions ('workspaces\' + $ownerFixture.data.workspaceId + '.json')
+$ownerManifestBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($ownerManifest))
+$ownerMarkerBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($oo.ownerMarkerPath))
+$raw = & $powerShell -NoProfile -NonInteractive -File $entry requalify-output -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $ownerFixture.data.workspaceId -ConfirmCandidateChanges -InternalTestFailurePoint requalify-after-baseline -Compact
+if ($LASTEXITCODE -ne 93) { throw "Recovery-owner interruption failed: $raw" }
+$ownerPending = @(Get-ChildItem -LiteralPath (Split-Path $ownerManifest) -Filter ($ownerFixture.data.workspaceId + '.requalify-output.*.journal.json'))
+if ($ownerPending.Count -ne 1) { throw 'Recovery-owner pending journal missing.' }
+$replacementRelease = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
+$replacement = Invoke-MO2RequestAccess -Config $config -TaskId different-task -Label foreign-task-recovery-fixture -RuntimeRoute SteamVRNull
+if (-not $replacementRelease.ok -or -not $replacement.ok) { throw 'Real replacement access acquisition failed.' }
+$accessId = [string]$replacement.data.access.accessId
+function Get-RecoveryOwnerState {
+    $hashes = @(@($ownerManifest,$oo.ownerMarkerPath,$ownerPending[0].FullName) | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash })
+    foreach ($kind in @('cache','backup')) {
+        $state = & $transaction inspect -CachePath $oo.($kind+'Path') -NoExit | ConvertFrom-Json
+        $hashes += $state.data.treeSha256
+    }
+    return $hashes -join ','
+}
+$beforeForeign = Get-RecoveryOwnerState
+foreach ($request in @(@('different-task', $ownerFixture.data.workspaceId), @($taskId, 'different-workspace'), @($taskId, ''))) {
+    $foreign = & $entry inspect -ConfigPath $configPath -AccessId $accessId -TaskId $request[0] -WorkspaceId $request[1] -NoExit -Compact | ConvertFrom-Json
+    if ($foreign.ok -or ($foreign.errors -join ' ') -notmatch 'different task identity|exact original workspace identity' -or (Get-RecoveryOwnerState) -cne $beforeForeign) { throw 'Foreign or inexact recovery mutated owner state with a valid replacement lease.' }
+}
+$null = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
+$ownerAccess = Invoke-MO2RequestAccess -Config $config -TaskId $taskId -Label original-owner-recovery-fixture -RuntimeRoute SteamVRNull
+if (-not $ownerAccess.ok) { throw 'Original owner replacement access acquisition failed.' }
+$accessId = [string]$ownerAccess.data.access.accessId
+$sameOwner = & $entry inspect -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $ownerFixture.data.workspaceId -NoExit -Compact | ConvertFrom-Json
+# Recovery restores the genuine old access binding. The following inspect can
+# correctly refuse that binding until F2's distinct resume transition is fixed.
+if ((-not $sameOwner.ok -and ($sameOwner.errors -join ' ') -notmatch 'different MO2 access lease') -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($ownerManifest)) -cne $ownerManifestBytes -or
+    [Convert]::ToBase64String([IO.File]::ReadAllBytes($oo.ownerMarkerPath)) -cne $ownerMarkerBytes) { throw 'Exact original owner replacement-lease recovery failed.' }
+$ownerRecoveredJournal = Get-Content -LiteralPath $ownerPending[0].FullName -Raw | ConvertFrom-Json
+if ($ownerRecoveredJournal.phase -ne 'rolled-back' -or -not $ownerRecoveredJournal.rollback.verified) { throw 'Exact owner recovery did not verify rollback.' }
+$null = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
+'PASS: consent, preview, corruption refusal, real interruptions, rollback recovery, winner/history preservation, absent baselines, plus foreign-task/inexact-workspace no-mutation refusal and exact-owner recovery under a real replacement lease. PR61 F2/F3 remain separate outstanding review findings.'
