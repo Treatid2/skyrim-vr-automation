@@ -1,5 +1,37 @@
 # DevBench Control
 
+## Phase-aware genuine New Game
+
+The existing `call -Tool game` interface supports the native DevBench
+4407a937 New Game contract without a second wrapper. Use exact JSON:
+`{"action":"newGame","phase":"inspect"}`, then one request with
+`phase:request` and a fresh UUID `requestId`, and one confirmation with the
+same ID, `phase:confirm` and Boolean `confirmNewGame:true`. Request/confirm
+require a ready/retained `FreshGame` workspace manifest and full runtime
+identity; `MainMenuOnly`, `VerifiedFixture`, absent or unknown policies refuse.
+Known-ID inspection uses `phase:inspect,requestId:<same-id>` and requires a
+matching receipt rather than accepting a general menu snapshot.
+
+Inspection qualifies typed menu state, including valid not-ready or closed
+menus; callers must inspect `semantic.readyToRequest/readyToConfirm` before
+dispatch. A staged request returns `completionBasis:staged-request`; a
+confirmed dispatch returns `completionBasis:dispatch-only`. Neither proves
+game initialization. Observe expected character creation and player/cell state
+separately. Failures/expiry, malformed fields, foreign IDs and explicit errors
+remain failures, even beside positive generic flags. Sticky unresolved
+dispatch is retained with its exact ID and blocks fresh requests; do not replay
+or infer non-execution from menu changes or elapsed time. Transport failures
+after mutation dispatch remain indeterminate and are never retried.
+
+Select one transport before this workflow's first call. If a complete direct
+catalog's `game` action enum omits `newGame`, a separately selected supported
+controller-only workflow may bind the explicit runtime/build/artifact and
+discover the fresh typed schema through `list`. This pre-call unavailable-action
+selection is not permission to switch after an uncertain call or tunnel through
+`scenario`. Direct-only protocols remain direct-only. Missing current schema
+means `toolSchemaUnresolved` with no dispatch, not a game/VR restart. Source
+support does not imply the installed cache or host catalog has been refreshed.
+
 Runtime `inspect health` has its own typed read contract. A non-error plain
 health object requires positive bounded integral PID/port, non-empty executable,
 integral frame/task counters and Boolean VR state; it need not invent a generic
