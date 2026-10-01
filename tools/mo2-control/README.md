@@ -390,9 +390,19 @@ It accepts only a fresh originally closed dispatch with no game/loader, exactly
 one live MO2, and the receipt's exact PID, executable path, and start instant.
 It checks profile/executable arguments, chronology, lock/manifest generation,
 the original controller file hashes, and identical captured configuration.
+Prepare binds the controller receipt's exact size, digest, version and physical
+identity plus the complete producer inventory into the authoritative lease;
+the session manifest projects that same binding. Recovery refuses a rewritten
+receipt, missing/duplicate/aliased member, physical replacement, reparse path,
+or lock/manifest controller path drift before ownership transfer. An old prepared
+session without that independent binding fails closed; recovery must not invent
+an external proof from the self-declared historical receipt.
 Existing owner transitions/tuples, helper-only handoffs, foreign credentials,
-extra processes, and stale generations fail closed. Legacy receipts without
-generation metadata are accepted only under all these prepared-session proofs.
+extra processes, and stale generations fail closed. Legacy launch receipts have
+both generation and leaseId absent; modern receipts have both present, typed and
+exact. One-sided metadata is invalid. Legacy launch-receipt compatibility still
+requires the independently bound controller inventory and all prepared-session
+proofs; it is not permission to upgrade an unbound historical controller.
 
 Recovery retains the original controller and receipt, snapshots pre-recovery
 lock/manifest/receipt into a new session-local evidence directory, creates a

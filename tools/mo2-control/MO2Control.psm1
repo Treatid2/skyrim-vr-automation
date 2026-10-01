@@ -2413,6 +2413,88 @@ function Invoke-MO2OwnedSessionMutation {
     return $transaction.result
 }
 
+function Assert-MO2ControllerPhysicalPath {
+    param([Parameter(Mandatory)][string]$Path)
+    $current = [IO.Path]::GetFullPath($Path)
+    while (-not [string]::IsNullOrWhiteSpace($current)) {
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Controller provenance does not permit reparse substitution.' }
+        $current = [IO.Path]::GetDirectoryName($current)
+    }
+}
+
+function New-MO2ControllerBundleBinding {
+    param([Parameter(Mandatory)]$Controller)
+    # Producer-side inventory, not an inventory recovered from the receipt.
+    Assert-MO2ControllerPhysicalPath -Path $Controller.receiptPath
+    $files = @()
+    foreach ($file in @($Controller.files)) {
+        Assert-MO2ControllerPhysicalPath -Path $file.path
+        $files += [pscustomobject][ordered]@{
+            name = [string]$file.name; path = [string]$file.path; sha256 = [string]$file.sha256
+            bytes = (Get-Item -LiteralPath $file.path -Force).Length
+            physicalIdentity = [SkyrimVRAutomation.Native.DirectoryIdentity]::Get([string]$file.path)
+        }
+    }
+    return [pscustomobject][ordered]@{
+        contractVersion = '1.0.0'; inventoryVersion = '1.0.0'; bundleContractVersion = '1.0.0'
+        controllerPath = [string]$Controller.controllerPath; configPath = [string]$Controller.configPath
+        receiptPath = [string]$Controller.receiptPath
+        receiptBytes = (Get-Item -LiteralPath $Controller.receiptPath -Force).Length
+        receiptSha256 = (Get-FileHash -LiteralPath $Controller.receiptPath -Algorithm SHA256).Hash
+        receiptPhysicalIdentity = [SkyrimVRAutomation.Native.DirectoryIdentity]::Get([string]$Controller.receiptPath)
+        files = $files
+    }
+}
+
+function Assert-MO2ControllerBundleBinding {
+    param([Parameter(Mandatory)]$Data, [Parameter(Mandatory)]$Manifest)
+    if (-not $Data.PSObject.Properties['controllerBundleBinding'] -or
+        -not $Manifest.PSObject.Properties['controllerBundleBinding']) { throw 'Prepared generation has no independent controller bundle binding; historical evidence is not upgraded in place.' }
+    $binding = $Data.controllerBundleBinding
+    if (($binding | ConvertTo-Json -Depth 30 -Compress) -cne ($Manifest.controllerBundleBinding | ConvertTo-Json -Depth 30 -Compress) -or
+        $binding.contractVersion -cne '1.0.0' -or $binding.inventoryVersion -cne '1.0.0' -or $binding.bundleContractVersion -cne '1.0.0') { throw 'Controller binding version or lock/manifest inventory differs.' }
+    $directory = Join-Path ([IO.Path]::GetFullPath([string]$Data.sessionPath)) 'controller'
+    foreach ($pair in @(@('controllerPath','Invoke-MO2Control.ps1'),@('configPath','config\machine.local.json'),@('receiptPath','controller-bundle.json'))) {
+        $property = $pair[0]
+        $expected = Join-Path $directory $pair[1]
+        if ([string]$binding.$property -cne $expected) { throw 'Controller binding path is not the exact retained path.' }
+    }
+    if ([string]$Data.controllerPath -cne [string]$binding.controllerPath -or
+        [string]$Data.controllerConfigPath -cne [string]$binding.configPath -or
+        [string]$Data.controllerReceiptPath -cne [string]$binding.receiptPath) { throw 'Controller paths differ from the authoritative prepared binding.' }
+    Assert-MO2ControllerPhysicalPath -Path $binding.receiptPath
+    $receiptItem = Get-Item -LiteralPath $binding.receiptPath -Force
+    if ($receiptItem.Length -ne $binding.receiptBytes -or
+        (Get-FileHash -LiteralPath $binding.receiptPath -Algorithm SHA256).Hash -cne $binding.receiptSha256 -or
+        [SkyrimVRAutomation.Native.DirectoryIdentity]::Get([string]$binding.receiptPath) -cne $binding.receiptPhysicalIdentity) { throw 'Controller receipt changed after prepare.' }
+    $bundle = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $binding.receiptPath -Raw)
+    if ($bundle.contractVersion -cne $binding.bundleContractVersion -or $bundle.durable -isnot [bool] -or -not $bundle.durable -or
+        [string]$bundle.controllerPath -cne [string]$binding.controllerPath -or [string]$bundle.configPath -cne [string]$binding.configPath -or
+        $bundle.files -isnot [array] -or @($bundle.files).Count -ne @($binding.files).Count -or @($binding.files).Count -lt 4 -or @($binding.files).Count -gt 32) { throw 'Controller receipt contract/inventory differs.' }
+    $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $identities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    for ($index = 0; $index -lt @($binding.files).Count; $index++) {
+        $expected = $binding.files[$index]
+        $actual = $bundle.files[$index]
+        if ([string]::IsNullOrWhiteSpace([string]$expected.name) -or -not $names.Add([string]$expected.name) -or
+            -not $identities.Add([string]$expected.physicalIdentity) -or
+            [string]$actual.name -cne [string]$expected.name -or [string]$actual.path -cne [string]$expected.path -or
+            [string]$actual.sha256 -cne [string]$expected.sha256 -or [string]$expected.sha256 -cnotmatch '^[A-F0-9]{64}$') { throw 'Controller inventory contains missing, duplicate, aliased or rewritten members.' }
+        $path = [IO.Path]::GetFullPath((Join-Path $directory ([string]$expected.name)))
+        if ([string]$expected.path -cne $path -or -not $path.StartsWith($directory.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Controller member path escapes or aliases its exact name.' }
+        Assert-MO2ControllerPhysicalPath -Path $path
+        $item = Get-Item -LiteralPath $path -Force
+        if ($item.PSIsContainer -or $item.Length -ne $expected.bytes -or
+            (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -cne $expected.sha256 -or
+            [SkyrimVRAutomation.Native.DirectoryIdentity]::Get($path) -cne $expected.physicalIdentity) { throw 'Controller member bytes or physical identity changed after prepare.' }
+    }
+    foreach ($required in @('Invoke-MO2Control.ps1','ConfigResolution.psm1','MO2Control.psm1','config/machine.local.json')) {
+        if (-not $names.Contains($required)) { throw 'Required controller member is missing.' }
+    }
+    return $binding
+}
+
 function New-MO2DurableSessionController {
     param(
         [Parameter(Mandatory)]$Config,
@@ -2452,7 +2534,9 @@ function New-MO2DurableSessionController {
         purpose = 'Session-scoped lifecycle controller retained independently of the versioned Codex plugin cache.'
         controllerPath = $entryPath; configPath = $configPath; files = $files
     }) -CreateNew
-    return [pscustomobject][ordered]@{ controllerPath = $entryPath; configPath = $configPath; receiptPath = $receiptPath; durable = $true; files = $files }
+    $controller = [pscustomobject][ordered]@{ controllerPath = $entryPath; configPath = $configPath; receiptPath = $receiptPath; durable = $true; files = $files }
+    $controller | Add-Member -NotePropertyName binding -NotePropertyValue (New-MO2ControllerBundleBinding -Controller $controller)
+    return $controller
 }
 
 function Get-MO2OwnedSession {
@@ -4207,6 +4291,9 @@ function Bind-MO2PreparedAccessLease {
         foreach ($propertyName in @('sessionId', 'sessionPath', 'status', 'createdUtc', 'profile', 'profileName', 'profileDirectory', 'modListPath', 'executable', 'requirements', 'controllerPath', 'ownerPid')) {
             $bound | Add-Member -NotePropertyName $propertyName -NotePropertyValue $PreparedLock.$propertyName -Force
         }
+        foreach ($propertyName in @('controllerConfigPath','controllerReceiptPath','controllerBundleBinding')) {
+            if ($PreparedLock.PSObject.Properties[$propertyName]) { $bound | Add-Member -NotePropertyName $propertyName -NotePropertyValue $PreparedLock.$propertyName -Force }
+        }
         $bound | Add-Member -NotePropertyName runtimeRoute -NotePropertyValue $validatedRuntimeRoute -Force
         $bound | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $currentAccess.data) -Force
         Write-MO2JsonAtomic -Path $LockPath -Value $bound
@@ -4353,6 +4440,11 @@ function Invoke-MO2Prepare {
     New-Item -ItemType Directory -Path $sessionPath -ErrorAction Stop | Out-Null
     try {
         $controller = New-MO2DurableSessionController -Config $Config -SessionPath $sessionPath
+        foreach ($target in @($manifest,$lock)) {
+            $target | Add-Member -NotePropertyName controllerConfigPath -NotePropertyValue $controller.configPath -Force
+            $target | Add-Member -NotePropertyName controllerReceiptPath -NotePropertyValue $controller.receiptPath -Force
+            $target | Add-Member -NotePropertyName controllerBundleBinding -NotePropertyValue $controller.binding -Force
+        }
         Write-MO2JsonAtomic -Path (Join-Path $sessionPath 'session.json') -Value $manifest -CreateNew
         Bind-MO2PreparedAccessLease -Config $Config -AccessId $AccessId -LockPath $lockPath -PreparedLock $lock -ExpectedRuntimeRoute $runtimeRoute -ExpectedRuntimeRouteFingerprint $runtimeRouteFingerprint
     }
@@ -5731,15 +5823,18 @@ function Get-MO2UncommittedDispatchProof {
         $manifestPath = Join-Path $sessionPath 'session.json'
         $receipt = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $receiptPath -Raw -ErrorAction Stop)
         $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop)
-        foreach ($name in @('sessionId', 'accessId', 'leaseId', 'generation', 'ownerTaskId', 'status', 'profile', 'executable', 'ownerPid')) {
+        foreach ($name in @('sessionId', 'accessId', 'leaseId', 'generation', 'ownerTaskId', 'status', 'profile', 'executable', 'ownerPid', 'controllerPath', 'controllerConfigPath', 'controllerReceiptPath')) {
             if (-not $manifest.PSObject.Properties[$name] -or [string]$manifest.$name -cne [string]$data.$name) { throw "Lock/manifest binding differs at $name." }
         }
         [guid]$parsedAttempt = [guid]::Empty
         if (-not [guid]::TryParse($AttemptId, [ref]$parsedAttempt) -or $parsedAttempt -eq [guid]::Empty -or
             [string]$receipt.attemptId -cne $AttemptId -or [string]$receipt.launchAttemptId -cne $AttemptId -or
             [string]$receipt.sessionId -cne [string]$Owned.sessionId) { throw 'The launch attempt/session receipt does not match.' }
-        if ($receipt.PSObject.Properties['generation'] -and [long]$receipt.generation -ne $ExpectedGeneration) { throw 'Receipt generation differs.' }
-        if ($receipt.PSObject.Properties['leaseId'] -and [string]$receipt.leaseId -cne [string]$data.leaseId) { throw 'Receipt lease differs.' }
+        $hasGeneration = $null -ne $receipt.PSObject.Properties['generation']
+        $hasLease = $null -ne $receipt.PSObject.Properties['leaseId']
+        if ($hasGeneration -ne $hasLease) { throw 'Receipt lease/generation metadata is incomplete.' }
+        if ($hasGeneration -and (($receipt.generation -isnot [int] -and $receipt.generation -isnot [long]) -or $receipt.generation -ne $ExpectedGeneration)) { throw 'Receipt generation is not an exact integer.' }
+        if ($hasLease -and ($receipt.leaseId -isnot [string] -or [string]::IsNullOrWhiteSpace($receipt.leaseId) -or $receipt.leaseId -cne [string]$data.leaseId)) { throw 'Receipt lease differs.' }
         if ([bool]$receipt.rootBuilderRecovery -or @($receipt.preDispatchProcesses).Count -ne 0 -or @($receipt.preLaunchGameProcesses).Count -ne 0) { throw 'Recovery accepts only a fresh, originally closed dispatch.' }
         $arguments = @('--profile', [string]$data.profile, 'run', '--executable', [string]$data.executable)
         if (@($receipt.arguments).Count -ne $arguments.Count) { throw 'Receipt argument count differs.' }
@@ -5763,14 +5858,8 @@ function Get-MO2UncommittedDispatchProof {
         $oldController = [IO.Path]::GetFullPath([string]$manifest.controllerPath)
         $oldDirectory = Join-Path $sessionPath 'controller'
         if (-not [string]::Equals($oldController, (Join-Path $oldDirectory 'Invoke-MO2Control.ps1'), [StringComparison]::OrdinalIgnoreCase)) { throw 'Original controller path is not the exact retained session bundle.' }
-        $bundle = ConvertFrom-MO2JsonText (Get-Content -LiteralPath (Join-Path $oldDirectory 'controller-bundle.json') -Raw)
-        foreach ($file in @($bundle.files)) {
-            $filePath = [IO.Path]::GetFullPath([string]$file.path)
-            if (-not $filePath.StartsWith($oldDirectory.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -or
-                -not [string]::Equals((Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash, [string]$file.sha256, [StringComparison]::OrdinalIgnoreCase)) { throw 'Original controller bundle file/hash proof failed.' }
-        }
+        $binding = Assert-MO2ControllerBundleBinding -Data $data -Manifest $manifest
         $oldConfigPath = Join-Path $oldDirectory 'config\machine.local.json'
-        if (@($bundle.files | Where-Object { [string]::Equals([string]$_.path, $oldConfigPath, [StringComparison]::OrdinalIgnoreCase) }).Count -ne 1) { throw 'Captured configuration is not covered by the original bundle.' }
         $oldConfig = Read-MO2ControlConfig -ConfigPath $oldConfigPath
         if (($oldConfig | ConvertTo-Json -Depth 30 -Compress) -cne ($Config | ConvertTo-Json -Depth 30 -Compress)) { throw 'Recovery configuration must equal the exact captured session configuration.' }
         return [pscustomobject]@{
@@ -5778,7 +5867,8 @@ function Get-MO2UncommittedDispatchProof {
             receiptPath = $receiptPath; receiptSha256 = (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash
             manifestPath = $manifestPath; originalControllerPath = $oldController
             dispatchStartedUtc = $dispatch.ToString('o'); attemptId = $AttemptId
-            legacyReceipt = -not $receipt.PSObject.Properties['generation']
+            legacyReceipt = -not $hasGeneration -and -not $hasLease
+            controllerReceiptSha256 = $binding.receiptSha256
         }
     }
     catch { return [pscustomobject]@{ ok = $false; reason = 'dispatch-recovery-proof-refused'; detail = $_.Exception.Message } }
