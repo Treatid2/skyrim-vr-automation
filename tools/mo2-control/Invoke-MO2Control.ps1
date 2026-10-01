@@ -44,6 +44,9 @@ param(
 
     [switch]$StartOnly,
 
+    [ValidateSet('CLI','RunButton')]
+    [string]$LaunchMethod = 'CLI',
+
     [switch]$NoExit,
 
     [switch]$ConfirmAbandoned,
@@ -182,7 +185,7 @@ try {
             Invoke-MO2Open -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -StartOnly:$StartOnly -WhatIf:$WhatIf
         }
         'launch' {
-            Invoke-MO2Launch -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -StartOnly:$StartOnly -WhatIf:$WhatIf
+            Invoke-MO2Launch -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -StartOnly:$StartOnly -LaunchMethod $LaunchMethod -WhatIf:$WhatIf
         }
         'status' {
             Invoke-MO2Status -Config $config -SessionId $SessionId
