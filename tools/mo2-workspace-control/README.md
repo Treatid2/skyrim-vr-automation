@@ -115,6 +115,15 @@ when an otherwise valid workspace outlives its transient access lease.
 
 ### Explicit candidate output requalification
 
+Every forward baseline restore publishes its receipt, committed journal,
+unique inventory and physically displaced working tree under this attempt's
+audit directory. The original prepared plan and snapshot namespace remain
+unchanged. Failed-attempt rollback therefore leaves ordinary catalog and
+workspace completion free to prove and finish the original generation,
+including recovery from a genuine `completing` state. Attempt evidence is
+retained, never deleted or relabelled as normal completion authority. Existing
+legacy receipt conflicts still fail closed; this does not erase older audit.
+
 `requalify-output -ConfirmCandidateChanges` is the separate closed-state
 transition after intentional candidate registration changes the task profile
 or winning CSX DLL/manifest/ABI. Ordinary `resume` never performs this refresh.
