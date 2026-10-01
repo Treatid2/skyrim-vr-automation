@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 [CmdletBinding()]
-param([switch]$DiscoveryOnly, [switch]$RequalificationOnly, [string]$FixtureRoot)
+param([switch]$DiscoveryOnly, [switch]$RequalificationOnly, [switch]$UnchangedCompletionOnly, [string]$FixtureRoot)
 
 $ErrorActionPreference = 'Stop'
 $entry = Join-Path (Split-Path -Parent $PSScriptRoot) 'Invoke-MO2WorkspaceControl.ps1'
@@ -397,6 +397,10 @@ try {
         return
     }
     $cachePlanPath = [string]$created.data.runtimeOutput.cachePlanPath
+    if ($UnchangedCompletionOnly) {
+        . (Join-Path $PSScriptRoot 'Test-UnchangedCacheCompletion.inc.ps1')
+        return
+    }
     $cachePlanBytes = [IO.File]::ReadAllBytes($cachePlanPath)
     $malformedCachePlan = Get-Content -LiteralPath $cachePlanPath -Raw | ConvertFrom-Json -Depth 40
     $malformedCachePlan.PSObject.Properties.Remove('preparedTreeSha256')
