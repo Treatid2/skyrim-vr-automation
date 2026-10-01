@@ -1057,7 +1057,7 @@ $identitySemanticCases = & {
     function Invoke-ToolRpc {
         param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers)
         $payload = if ($Name -eq 'inspect') {
-            [pscustomobject]@{ ok = $true; pid = $PID; exe = 'pwsh.exe' }
+            [pscustomobject]@{ ok = $true; pid = $PID; exe = 'pwsh.exe'; port = 1; vr = $true; frame = 1L; lastTaskFrame = -1L; pendingTasks = 0L }
         } else { [pscustomobject]@{ ok = $true; producer = [pscustomobject]@{ buildId = 'fixture-build' } } }
         if (($mode -like 'health-*' -and $Name -eq 'inspect') -or
             ($mode -like 'producer-*' -and $Name -eq 'communityshaders.first_api')) {
