@@ -2,6 +2,112 @@
 
 Set-StrictMode -Version Latest
 
+function Get-DevBenchHealthSemanticStatus {
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][object[]]$Content)
+    $reasons = [Collections.Generic.List[string]]::new()
+    $rejected = [Collections.Generic.List[string]]::new()
+    $signals = [Collections.Generic.List[string]]::new()
+    $transients = [Collections.Generic.List[string]]::new()
+    $guards = [Collections.Generic.List[string]]::new()
+    $retryHints = [Collections.Generic.List[bool]]::new()
+    $successNames = @('success','ok','ready','completed','accepted','idle','available')
+    $transientNames = @('main_thread_busy','service_unavailable','initializing','starting','waiting_for_safe_point','loading_transition','relatch_pending','compiling','pending','queued','running')
+    $guardNames = @('producer_mismatch','contract_mismatch','unsupported_contract_major','idempotency_conflict')
+    # Health must stand alone on the scoped baseline. Do not depend on optional
+    # properties or truthiness rules of the generic action classifier.
+    function Visit-HealthOutcome($Value, [string]$Path, [int]$Depth = 0) {
+        if ($Depth -gt 32) { $reasons.Add('Health outcome nesting is out of range.'); $rejected.Add($Path); return }
+        if ($null -eq $Value -or $Value -is [string] -or $Value -is [ValueType]) { return }
+        if ($Value -is [Collections.IDictionary]) {
+            $properties = @($Value.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Key; Value = $_.Value } })
+        }
+        elseif ($Value -is [Collections.IEnumerable] -and $Value -isnot [pscustomobject]) {
+            $index = 0
+            foreach ($entry in $Value) { Visit-HealthOutcome $entry "$Path[$index]" ($Depth + 1); $index++ }
+            return
+        }
+        else { $properties = @($Value.PSObject.Properties) }
+        foreach ($property in $properties) {
+            $name = [string]$property.Name; $child = $property.Value; $childPath = "$Path.$name"
+            if ($name -in @('ok','success','passed','failed','aborted','retryable')) {
+                if ($child -isnot [bool]) { $reasons.Add("Health $childPath must be Boolean."); $rejected.Add($childPath) }
+                elseif ($name -eq 'retryable') { $retryHints.Add($child) }
+                elseif (($name -in @('ok','success','passed') -and -not $child) -or ($name -in @('failed','aborted') -and $child)) { $reasons.Add("Health $childPath is negative.") }
+                elseif ($name -in @('ok','success','passed') -and $child -and $Path -ceq 'health') { $signals.Add($childPath) }
+            }
+            elseif ($name -in @('code','state','status','resultStatus')) {
+                $values = @()
+                if ($child -is [string] -and -not [string]::IsNullOrWhiteSpace($child)) { $values = @($child) }
+                elseif ($name -in @('status','resultStatus') -and $child -is [pscustomobject]) {
+                    $statusName = $child.PSObject.Properties['name']; $statusValue = $child.PSObject.Properties['value']
+                    if (-not $statusName -and -not $statusValue) { $reasons.Add("Health $childPath requires name or value."); $rejected.Add($childPath) }
+                    if ($statusName) {
+                        if ($statusName.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($statusName.Value)) { $reasons.Add("Health $childPath.name must be a non-empty string."); $rejected.Add($childPath) }
+                        else { $values = @($statusName.Value) }
+                    }
+                    if ($statusValue) {
+                        if ($null -eq $statusValue.Value -or $statusValue.Value.GetType() -notin $integers) { $reasons.Add("Health $childPath.value must be integral."); $rejected.Add($childPath) }
+                        elseif ($statusValue.Value -ne 0) { $reasons.Add("Health $childPath.value is negative.") }
+                        elseif ($Path -ceq 'health') { $signals.Add($childPath) }
+                    }
+                }
+                else { $reasons.Add("Health $childPath must be a supported outcome."); $rejected.Add($childPath) }
+                foreach ($outcomeValue in $values) {
+                    if ($outcomeValue -notin $successNames) { $reasons.Add("Health $childPath is '$outcomeValue'.") }
+                    elseif ($Path -ceq 'health') { $signals.Add($childPath) }
+                    if ($outcomeValue -in $transientNames) { $transients.Add($childPath) }
+                    if ($outcomeValue -in $guardNames) { $guards.Add($childPath) }
+                }
+            }
+            elseif ($name -in @('error','errors')) {
+                $hasError = $null -ne $child -and -not ($child -is [string] -and [string]::IsNullOrWhiteSpace($child)) -and
+                    -not ($child -is [Collections.IEnumerable] -and $child -isnot [string] -and @($child).Count -eq 0)
+                if ($hasError) {
+                    $reasons.Add("Health $childPath contains failure evidence.")
+                    if ($child -is [string] -and $child -in $transientNames) { $transients.Add($childPath) }
+                    if ($child -is [string] -and $child -in $guardNames) { $guards.Add($childPath) }
+                }
+            }
+            Visit-HealthOutcome $child $childPath ($Depth + 1)
+        }
+    }
+    $payload = if (@($Content).Count -eq 1 -and $Content[0] -is [pscustomobject]) { $Content[0] } else { $null }
+    $integers = @([byte],[sbyte],[int16],[uint16],[int32],[uint32],[int64],[uint64])
+    foreach ($item in @($Content)) { Visit-HealthOutcome $item 'health' }
+    if ($null -eq $payload) { $reasons.Add('Health requires exactly one structured payload.') }
+    else {
+        $pidValue = $payload.PSObject.Properties['pid']
+        $exeValue = $payload.PSObject.Properties['exe']
+        if (-not $pidValue -or $null -eq $pidValue.Value -or $pidValue.Value.GetType() -notin $integers -or $pidValue.Value -le 0 -or $pidValue.Value -gt [int]::MaxValue) { $reasons.Add('Health PID must be a positive bounded integer.') }
+        if (-not $exeValue -or $exeValue.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($exeValue.Value)) { $reasons.Add('Health executable must be a non-empty string.') }
+        # DevBench health is a typed read result, not a generic action verdict.
+        # Unknown plain objects require the complete supported health shape.
+        foreach ($name in @('port','frame','lastTaskFrame','pendingTasks','vr')) {
+            $property = $payload.PSObject.Properties[$name]
+            if (-not $property) {
+                if ($signals.Count -eq 0) { $reasons.Add("Plain health requires $name.") }
+                continue
+            }
+            if ($name -eq 'vr') {
+                if ($property.Value -isnot [bool]) { $reasons.Add('Health vr must be Boolean.') }
+                continue
+            }
+            if ($null -eq $property.Value -or $property.Value.GetType() -notin $integers) { $reasons.Add("Health $name must be integral."); continue }
+            $minimum = if ($name -eq 'lastTaskFrame') { -1 } elseif ($name -eq 'port') { 1 } else { 0 }
+            if ($property.Value -lt $minimum -or ($name -eq 'port' -and $property.Value -gt 65535)) { $reasons.Add("Health $name is out of range.") }
+        }
+    }
+    if ($retryHints.Contains($true)) { $reasons.Add('Health declares a retryable negative outcome.') }
+    return [pscustomobject]@{
+        known = $true; ok = $reasons.Count -eq 0; affirmative = $reasons.Count -eq 0
+        outcome = if ($reasons.Count -eq 0) { 'health-read-contract-satisfied' } else { 'health-read-contract-failed' }
+        reasons = @($reasons | Select-Object -Unique); guarded = $guards.Count -gt 0
+        transient = ($retryHints.Contains($true) -or $transients.Count -gt 0) -and -not $retryHints.Contains($false)
+        rejectedOutcomeEvidence = @($rejected | Select-Object -Unique)
+    }
+}
+
 function Get-DevBenchSemanticStatus {
     [CmdletBinding()]
     param([AllowEmptyCollection()][object[]]$Content)
@@ -1195,4 +1301,4 @@ function Test-DevBenchPerformanceWindow {
     }
 }
 
-Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow
+Export-ModuleMember -Function Get-DevBenchHealthSemanticStatus, Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow
