@@ -1,5 +1,50 @@
 # MO2 Control
 
+## Explicit exact-owner Run-button launch
+
+`launch -LaunchMethod RunButton` is an opt-in alternative to the unchanged CLI
+default. First `open` the freshly prepared session through its durable controller
+and require `mo2-open` (or verify that state using `status` after `open -StartOnly`).
+RunButton requires the logged-on interactive desktop and that already-owned
+MO2 lifetime. It never opens/adopts another process, changes a combo selection,
+replays a failed attempt, dispatches a CLI helper or launches SKSE directly.
+
+  One visible, enabled `MainWindow` must expose unique exact accessibility IDs
+  for `profileBox`, `executablesListBox`, and `startButton`. Qt 6.7.1 builds IDs
+  from named parents, so the controller accepts the exact MO2 v2.5.2 paths
+  rooted at `MainWindow.centralWidget.categoriesSplitter.splitter` as well as
+  the bare-ID form; it never uses arbitrary prefixes, suffixes or names to
+  select a control. Both forms appearing is ambiguity, not a fallback choice.
+  A discovery refusal includes `data.runControlDiscovery`: exact owner/window,
+  at most six selector queries, one attempt per query, and match counts. No
+  extra whole-tree diagnostic inventory or selection/Run action is performed.
+  These bound query count/output, not synchronous native RPC duration; use a
+  bounded interactive execution host for native qualification. Selected values must equal
+the exact session profile and registered executable; the unique button must be
+enabled, onscreen and named `Run`. Unknown/extra windows, inaccessible values,
+selection mismatch, changed registered entry, game/loader presence or active
+RootBuilder deployment fail closed. No coordinate/keyboard fallback exists.
+All ordinary route, SKSE and task-output admission remains in place.
+
+The controller records the original owner PID/path/start, exact registered
+entry, window/control identity and launch method. It commits `launching` before
+the protected UI action, rechecks selections and exact owner under the lease
+transition lock while holding a process handle, and uses the normal bounded
+game ownership/status path afterward. `-StartOnly` returns after dispatch, not
+before invoking Run. A UI exception yields `launch-dispatch-uncertain` with the
+pending attempt retained; inspect `status` and use normal cleanup, never replay.
+Accessibility-provider calls themselves depend on the Windows provider; the
+outer host must retain its bounded execution/cancellation policy. This route is
+fixture-tested but not a live-qualified fix for a Windows spawn denial.
+
+MO2 2.5.2 source shows both routes use ProcessRunner with a registered executable;
+Run uses selected-entry/TriggerRefresh whereas CLI uses name lookup and
+ForCommandLine/PreventExit. Neither source comparison nor Error5 proves the
+denying mechanism. User-reported Run success was in a programmatically opened
+MO2; do not assume a manual-process-origin difference or attach it to an unproven
+PID. Reference: upstream v2.5.2 `src/mainwindow.cpp` on_startButton_clicked and
+`src/commandline.cpp` RunCommand::runPostOrganizer.
+
 ## Bounded launch-error evidence
 
 Launch retains an optional exact registered-binary log baseline before dispatch.
