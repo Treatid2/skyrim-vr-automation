@@ -87,7 +87,9 @@ in the receipt, so plugin-cache replacement cannot strand a later restore. A
 legacy receipt may use a caller-supplied profile only when its SHA-256 matches
 the receipt. Restore accepts byte-only
 formatting changes and runtime-managed changes confined to the top-level
-`GpuSpeed` and `LastKnown` sections only when every controller-owned null-HMD
+`GpuSpeed` and `LastKnown` sections, plus the exact string-valued
+`dashboard.lastAccessedExternalOverlayKey` history leaf (addition/removal included),
+only when every controller-owned null-HMD
 setting still matches. Changes to a controller-owned key or any other section
 remain unclassified drift and fail closed. The validation route and exact
 difference paths are returned as `settingsRestoreValidation`; rollback retains
@@ -182,7 +184,13 @@ before applying or starting null-HMD. Pass that exact lease's bearer
 `-MO2AccessId` and selected `-MO2Profile` to both `apply` and `start`. The
 controller independently repeats the `runtime-route-provider` check, requires
 the `SteamVRNull` route, and binds the public admission proof into the apply
-receipt. `start` rejects lease, profile, or provider-inventory drift. The
+receipt. `start` rejects lease, profile, or semantic provider-inventory drift.
+New receipts retain the complete inventory and a versioned canonical fingerprint.
+Only provider `lineNumber` is excluded; object property order is canonicalized.
+Array order, profile/modlist path, names, paths, enable/marker state, classification,
+marker inventory and all other fields remain significant. Legacy hash-only receipts
+keep exact-hash matching and are not migrated: restore, then apply a new transaction
+under the admitted current lease. The
 explicit `-Standalone` escape is for non-MO2 SteamVR diagnostics only and must
 not be used for Skyrim through MO2. A running null SteamVR instance does not
 prove an application bypassing SteamVR is attached to it.

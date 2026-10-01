@@ -729,6 +729,24 @@ try {
     $runtimeRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
     Assert-Test ($runtimeRestore.ok -and $runtimeRestore.data.settingsRestoreValidation.runtimeManagedOnlyDriftAccepted -and $runtimeRestore.data.settingsRestoreValidation.authorizationRoute -eq 'controlled-contract-plus-runtime-managed-fields') 'restore accepts SteamVR-managed GpuSpeed and LastKnown drift while controlled settings still match'
 
+    $runtimeDrift['dashboard']['lastAccessedExternalOverlayKey'] = 'runtime.overlay.history'
+    $runtimeDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+    $historyRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($historyRestore.ok -and $historyRestore.data.settingsRestoreValidation.dashboardHistoryDriftAccepted -and $historyRestore.data.settingsRestoreValidation.runtimeManagedDifferencePaths -contains 'dashboard.lastAccessedExternalOverlayKey') 'public restore accepts only the typed dashboard history leaf and retains its exact difference path'
+    foreach ($badHistory in @($true, 12, [ordered]@{ child = 'overlay' }, $null)) {
+        $runtimeDrift['dashboard']['lastAccessedExternalOverlayKey'] = $badHistory
+        $runtimeDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+        $badHistoryRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+        Assert-Test (-not $badHistoryRestore.ok -and $badHistoryRestore.errors[0] -match 'dashboard.lastAccessedExternalOverlayKey') 'public restore rejects malformed dashboard history instead of whitelisting its subtree'
+    }
+    $runtimeDrift['dashboard']['lastAccessedExternalOverlayKey'] = 'runtime.overlay.history'
+    $runtimeDrift['dashboard']['otherHistorySetting'] = 'unclassified'
+    $runtimeDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+    $otherDashboardRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $otherDashboardRestore.ok -and $otherDashboardRestore.errors[0] -match 'dashboard.otherHistorySetting') 'public restore protects every other dashboard leaf'
+    $runtimeDrift['dashboard'].Remove('otherHistorySetting')
+    $runtimeDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+
     $controlledDrift = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
     $controlledDrift['dashboard']['enableDashboard'] = $true
     $controlledDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
@@ -836,10 +854,14 @@ try {
     Assert-Test (-not $driftRestore.ok -and $driftRestore.state -eq 'blocked' -and $driftRestore.errors[0] -match 'registration file changed') 'restore refuses to overwrite unclassified OpenVR registration drift'
 
     [IO.File]::WriteAllText($openVrPathsPath, $isolatedText, [Text.UTF8Encoding]::new($false))
+    $commitHistory = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
+    $commitHistory['dashboard']['lastAccessedExternalOverlayKey'] = 'runtime.history.before-restore'
+    $commitHistory | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
     $isolatedRestoreDry = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -WhatIf -Compact | ConvertFrom-Json
     Assert-Test ($isolatedRestoreDry.ok -and $isolatedRestoreDry.data.externalDriverIsolation.enabled -and $isolatedRestoreDry.data.wouldRestoreOpenVRPaths) 'restore dry-run reports exact external-driver restoration'
     $isolatedRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -Compact | ConvertFrom-Json
     Assert-Test ($isolatedRestore.ok -and $isolatedRestore.state -eq 'restored' -and $isolatedRestore.data.openVRPathsRestoredSha256 -and $isolatedRestore.data.externalDriverIsolationValidation.formattingOnlyDriftAccepted) 'restore reinstates the exact external-driver registration transaction after formatting-only drift'
+    Assert-Test ($isolatedRestore.data.settingsRestoreValidation.dashboardHistoryDriftAccepted -and $isolatedRestore.data.settingsRestoreValidation.controlledDifferences.Count -eq 0) 'public committed restore accepts typed dashboard history while retaining all controlled-key proofs'
     Assert-Test ([IO.File]::ReadAllText($settingsPath) -ceq $originalText) 'isolation restore keeps SteamVR settings exact-byte identical'
     Assert-Test ([IO.File]::ReadAllText($openVrPathsPath) -ceq $openVrTextBeforeIsolation) 'isolation restore keeps OpenVR registrations exact-byte identical'
 
