@@ -1298,6 +1298,15 @@ function Assert-MO2ControllerPhysicalPath {
     }
 }
 
+function Get-MO2ControllerPhysicalIdentity {
+    param([Parameter(Mandatory)][string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    # CreateFileW needs the extended path spelling for deep retained bundles;
+    # PowerShell's file cmdlets already support these ordinary absolute paths.
+    $native = if ($full.StartsWith('\\')) { '\\?\UNC\' + $full.Substring(2) } else { '\\?\' + $full }
+    return [SkyrimVRAutomation.Native.DirectoryIdentity]::Get($native)
+}
+
 function New-MO2ControllerBundleBinding {
     param([Parameter(Mandatory)]$Controller)
     # Producer-side inventory, not an inventory recovered from the receipt.
@@ -1308,7 +1317,7 @@ function New-MO2ControllerBundleBinding {
         $files += [pscustomobject][ordered]@{
             name = [string]$file.name; path = [string]$file.path; sha256 = [string]$file.sha256
             bytes = (Get-Item -LiteralPath $file.path -Force).Length
-            physicalIdentity = [SkyrimVRAutomation.Native.DirectoryIdentity]::Get([string]$file.path)
+            physicalIdentity = Get-MO2ControllerPhysicalIdentity -Path $file.path
         }
     }
     return [pscustomobject][ordered]@{
@@ -1317,7 +1326,7 @@ function New-MO2ControllerBundleBinding {
         receiptPath = [string]$Controller.receiptPath
         receiptBytes = (Get-Item -LiteralPath $Controller.receiptPath -Force).Length
         receiptSha256 = (Get-FileHash -LiteralPath $Controller.receiptPath -Algorithm SHA256).Hash
-        receiptPhysicalIdentity = [SkyrimVRAutomation.Native.DirectoryIdentity]::Get([string]$Controller.receiptPath)
+        receiptPhysicalIdentity = Get-MO2ControllerPhysicalIdentity -Path $Controller.receiptPath
         files = $files
     }
 }
@@ -1342,7 +1351,7 @@ function Assert-MO2ControllerBundleBinding {
     $receiptItem = Get-Item -LiteralPath $binding.receiptPath -Force
     if ($receiptItem.Length -ne $binding.receiptBytes -or
         (Get-FileHash -LiteralPath $binding.receiptPath -Algorithm SHA256).Hash -cne $binding.receiptSha256 -or
-        [SkyrimVRAutomation.Native.DirectoryIdentity]::Get([string]$binding.receiptPath) -cne $binding.receiptPhysicalIdentity) { throw 'Controller receipt changed after prepare.' }
+        (Get-MO2ControllerPhysicalIdentity -Path $binding.receiptPath) -cne $binding.receiptPhysicalIdentity) { throw 'Controller receipt changed after prepare.' }
     $bundle = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $binding.receiptPath -Raw)
     if ($bundle.contractVersion -cne $binding.bundleContractVersion -or $bundle.durable -isnot [bool] -or -not $bundle.durable -or
         [string]$bundle.controllerPath -cne [string]$binding.controllerPath -or [string]$bundle.configPath -cne [string]$binding.configPath -or
@@ -1362,7 +1371,7 @@ function Assert-MO2ControllerBundleBinding {
         $item = Get-Item -LiteralPath $path -Force
         if ($item.PSIsContainer -or $item.Length -ne $expected.bytes -or
             (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -cne $expected.sha256 -or
-            [SkyrimVRAutomation.Native.DirectoryIdentity]::Get($path) -cne $expected.physicalIdentity) { throw 'Controller member bytes or physical identity changed after prepare.' }
+            (Get-MO2ControllerPhysicalIdentity -Path $path) -cne $expected.physicalIdentity) { throw 'Controller member bytes or physical identity changed after prepare.' }
     }
     foreach ($required in @('Invoke-MO2Control.ps1','ConfigResolution.psm1','MO2Control.psm1','config/machine.local.json')) {
         if (-not $names.Contains($required)) { throw 'Required controller member is missing.' }
