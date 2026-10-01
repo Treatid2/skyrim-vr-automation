@@ -58,7 +58,10 @@ retained workspace to a newly owned lease and selects it without refreshing it
 from the primary profile. If the exact retained owner marker still exists,
 resume validates its bytes, task, workspace, immutable ownership ID, and
 Overwrite path, then rebinds that unchanged active transaction to the new
-closed-state lease. If the prior lease completed its output transaction, every
+closed-state lease. All output paths must match the configured exact Overwrite
+mapping. Interrupted active rebind recovery requires the original task and
+workspace plus a current closed-state lease, and restores the exact manifest
+before another resume. If the prior lease completed its output transaction, every
 resume—including one under the same access ID—first verifies the exact cache
 and backup plans, completions, snapshot and restore lineage, preserved working
 trees, and restored live Overwrite state. It then publishes a fresh owner

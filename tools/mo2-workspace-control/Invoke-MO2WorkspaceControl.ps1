@@ -42,7 +42,7 @@ param(
     [long]$MaxProfileBytes = 34359738368,
     [ValidateRange(5, 600)]
     [int]$TreeOperationTimeoutSeconds = 120,
-    [ValidateSet('', 'selected-profile-before-cas', 'tree-operation-deadline', 'owner-marker-before-claim', 'creation-fail-after-backup-snapshot', 'resume-interrupt-after-output-rearm', 'resume-rearm-fail-with-rollback-failure', 'resume-recovery-interrupt-after-owner-release', 'creation-recovery-interrupt-after-owner-release', 'requalify-after-baseline', 'requalify-after-owner-release', 'requalify-after-rearm', 'requalify-rollback-failure', 'requalify-rearm-rollback-failure')]
+    [ValidateSet('', 'selected-profile-before-cas', 'tree-operation-deadline', 'owner-marker-before-claim', 'creation-fail-after-backup-snapshot', 'resume-interrupt-after-output-rearm', 'resume-interrupt-after-active-output-rebind', 'resume-interrupt-after-manifest-write', 'resume-rearm-fail-with-rollback-failure', 'resume-recovery-interrupt-after-owner-release', 'creation-recovery-interrupt-after-owner-release', 'requalify-after-baseline', 'requalify-after-owner-release', 'requalify-after-rearm', 'requalify-rollback-failure', 'requalify-rearm-rollback-failure')]
     [string]$InternalTestFailurePoint = '',
     [switch]$Compact,
     [switch]$NoExit
@@ -1810,6 +1810,14 @@ function Resolve-PendingWorkspaceJournal($Config, [string]$JournalPath) {
         throw "Workspace $operation recovery cannot verify its exact manifest preimage: $JournalPath"
     }
 
+    if ($operation -eq 'resume' -and $journal.ContainsKey('runtimeOutputRebind') -and $null -ne $journal['runtimeOutputRebind']) {
+        $original = Get-Content -LiteralPath $preimagePath -Raw | ConvertFrom-Json -Depth 80
+        $requestTask = Resolve-TaskId -RequestedTaskId $TaskId -Required
+        if ($requestTask -cne [string]$original.ownerTaskId -or $WorkspaceId -cne [string]$original.workspaceId) { throw 'Active-output resume recovery requires the exact original task and workspace.' }
+        $classification = Get-WorkspaceResumeClassification -Config $Config -Manifest $original -ManifestPath $manifestPath
+        if (-not $classification.resumable -or $classification.resumeDisposition -cne 'rebind-active-output') { throw "Active-output resume recovery refuses changed output ownership: $($classification.reason)" }
+        $null = Assert-AccessAndClosed -Config $Config -OwnedAccessId $AccessId -Profile ([string]$original.profile) -AllowOverwriteShaderCaches -RequireRuntimeRoute
+    }
     if ($operation -eq 'resume' -and $journal.ContainsKey('runtimeOutputRearm') -and $null -ne $journal['runtimeOutputRearm']) {
         Undo-JournaledRuntimeOutputRearm -Config $Config -WorkspaceId ([string]$journal['workspaceId']) -OwnershipId ([string]$journal['ownershipId']) -Rearm $journal['runtimeOutputRearm'] -Journal $journal -JournalPath $JournalPath
     }
@@ -2128,13 +2136,27 @@ function Get-WorkspaceResumeClassification($Config, $Manifest, [string]$Manifest
         return [pscustomobject]@{ resumable = $false; reason = $reason; profileExists = $true; runtimeOutputCompatible = $false; resumeDisposition = 'blocked'; activeOutputRecoveryRequired = $false }
     }
     $output = $Manifest.runtimeOutput
+    try {
+        $overwrite = [IO.Path]::GetFullPath([string]$Config.mo2.overwriteDirectory)
+        foreach ($mapping in @(
+            @('overwritePath', $overwrite), @('ownerMarkerPath', (Join-Path $overwrite '.codex-workspace-output-owner.json')),
+            @('cachePath', (Join-Path $overwrite 'ShaderCache')), @('backupPath', (Join-Path $overwrite 'backup'))
+        )) {
+            if (-not (Test-WorkspaceSamePath ([string]$output.($mapping[0])) ([string]$mapping[1]))) { throw "Runtime output mapping '$($mapping[0])' differs from configured Overwrite." }
+            if (Test-Path -LiteralPath ([string]$mapping[1])) { Assert-NoWorkspaceReparsePoint -Path ([string]$mapping[1]) -Purpose 'Retained runtime output resume' }
+        }
+    }
+    catch {
+        return [pscustomobject]@{ resumable = $false; reason = 'runtime-output-path-invalid: ' + $_.Exception.Message; profileExists = $true; runtimeOutputCompatible = $true; resumeDisposition = 'blocked'; activeOutputRecoveryRequired = $true }
+    }
     if (Test-Path -LiteralPath ([string]$output.ownerMarkerPath) -PathType Leaf) {
         try {
             $observedMarker = Get-Content -LiteralPath ([string]$output.ownerMarkerPath) -Raw | ConvertFrom-Json -Depth 20
             if ([string]$observedMarker.workspaceId -cne [string]$Manifest.workspaceId) {
                 return [pscustomobject]@{ resumable = $false; reason = 'runtime-output-owned-by-other-workspace'; profileExists = $true; runtimeOutputCompatible = $true; resumeDisposition = 'blocked'; activeOutputRecoveryRequired = $false }
             }
-            $null = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Manifest.workspaceId) -OwnershipId ([string]$Manifest.ownershipId) -OverwritePath ([string]$output.overwritePath)
+            $validatedMarker = Assert-WorkspaceOutputOwnerMarker -Path ([string]$output.ownerMarkerPath) -ExpectedSha256 ([string]$output.ownerMarkerSha256) -WorkspaceId ([string]$Manifest.workspaceId) -OwnershipId ([string]$Manifest.ownershipId) -OverwritePath ([string]$output.overwritePath)
+            if (-not $validatedMarker.PSObject.Properties['ownerTaskId'] -or [string]$validatedMarker.ownerTaskId -cne [string]$Manifest.ownerTaskId) { throw 'Active output marker belongs to a different task.' }
         }
         catch {
             return [pscustomobject]@{ resumable = $false; reason = 'runtime-output-owner-marker-invalid'; profileExists = $true; runtimeOutputCompatible = $true; resumeDisposition = 'blocked'; activeOutputRecoveryRequired = $true }
@@ -2940,6 +2962,7 @@ try {
                     $activeMarkerPath = [string]$current.data.runtimeOutput.ownerMarkerPath
                     if ([string]$currentResumeClassification.resumeDisposition -ceq 'rebind-active-output') {
                             $activeMarker = Assert-WorkspaceOutputOwnerMarker -Path $activeMarkerPath -ExpectedSha256 ([string]$current.data.runtimeOutput.ownerMarkerSha256) -WorkspaceId ([string]$current.data.workspaceId) -OwnershipId ([string]$current.data.ownershipId) -OverwritePath ([string]$current.data.runtimeOutput.overwritePath)
+                            if (-not $activeMarker.PSObject.Properties['ownerTaskId'] -or [string]$activeMarker.ownerTaskId -cne $resolvedTaskId) { throw 'Active output marker belongs to a different task.' }
                             $activeTransactionIdentity = if ($activeMarker.PSObject.Properties['transactionId'] -and -not [string]::IsNullOrWhiteSpace([string]$activeMarker.transactionId)) { [string]$activeMarker.transactionId } else { [string]$current.data.runtimeOutput.ownerMarkerSha256 }
                             $journal.runtimeOutputTransactionId = $activeTransactionIdentity
                             $journal.runtimeOutputRebind = [pscustomobject][ordered]@{
@@ -2950,6 +2973,7 @@ try {
                             }
                             $journal.phase = 'active-output-rebind-validated'
                             Write-WorkspaceJsonAtomic -Path $journalPath -Value $journal
+                            if ($InternalTestFailurePoint -eq 'resume-interrupt-after-active-output-rebind') { exit 96 }
                     }
                     elseif ([string]$currentResumeClassification.resumeDisposition -cne 'rearm-completed-output') {
                         throw "Workspace '$WorkspaceId' has no safe runtime-output resume transition."
@@ -2982,6 +3006,7 @@ try {
                     $journal.phase = 'manifest-write-uncommitted'
                     Write-WorkspaceJsonAtomic -Path $journalPath -Value $journal
                     Write-WorkspaceJsonAtomic -Path $current.path -Value $current.data
+                    if ($InternalTestFailurePoint -eq 'resume-interrupt-after-manifest-write') { exit 97 }
                     $journal.phase = 'committed'; $journal.committedUtc = [DateTime]::UtcNow.ToString('o'); $journal.selectedProfileTransaction = $selection
                     Write-WorkspaceJsonAtomic -Path $journalPath -Value $journal
                     return [pscustomobject]@{ workspace = $current; selection = $selection; journalPath = $journalPath }
