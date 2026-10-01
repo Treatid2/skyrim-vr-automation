@@ -80,6 +80,9 @@ $freshDispatch = & $module {
 Assert-Fixture ($freshDispatch.result.ok -and $freshDispatch.result.state -eq 'launching' -and @($freshDispatch.data.gameProcesses).Count -eq 0 -and $freshDispatch.data.ownerPid -eq 123) 'fresh public StartOnly launch commits owner without prior gameProcesses'
 Assert-Fixture ($freshDispatch.writes[-2].requestedPid -eq 123 -and $freshDispatch.writes[-1].childProbeError -eq 'injected child inventory failure' -and $freshDispatch.data.ownerTransition.requestedPid -eq 123) 'record dispatched lifetime before child probe and commit owner despite probe failure'
 $controller = & $module { param($c,$p) New-MO2DurableSessionController -Config $c -SessionPath $p } $cfg $sessionPath
+$deepSession = Join-Path $fixture ('deep-' + ('x' * 120))
+$deepController = & $module { param($c,$p) New-MO2DurableSessionController -Config $c -SessionPath $p } $cfg $deepSession
+Assert-Fixture ($deepController.controllerPath.Length -gt 260 -and $deepController.binding.receiptPhysicalIdentity -and @($deepController.binding.files).Count -eq @($deepController.files).Count) 'producer binds deep retained controller members beyond native MAX_PATH'
 $attempt = [guid]::NewGuid().ToString('D')
 $access = [guid]::NewGuid().ToString('D')
 $data = [pscustomobject]@{
