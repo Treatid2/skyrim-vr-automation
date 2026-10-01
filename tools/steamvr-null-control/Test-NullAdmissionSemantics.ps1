@@ -14,6 +14,13 @@ foreach ($name in @('ConvertTo-CanonicalJsonValue','Get-JsonSemanticSha256','Tes
     Invoke-Expression $node.Extent.Text
 }
 function Clone-Value($Value) { return $Value | ConvertTo-Json -Depth 64 -Compress | ConvertFrom-Json -AsHashtable -Depth 64 }
+foreach ($pair in @(@($false,0),@($true,1),@(0,$false),@(1,$true),@('0',0),@(0,'0'),@($null,0),@(0,$null),@($false,'False'),@('False',$false))) {
+    Assert-Semantic (-not (Test-JsonValueEquivalent $pair[0] $pair[1])) 'different JSON scalar kinds never compare equal'
+}
+Assert-Semantic (Test-JsonValueEquivalent $false $false) 'identical Boolean values compare equal'
+Assert-Semantic (Test-JsonValueEquivalent ([int32]1) ([int64]1)) 'integer width alone is not JSON drift'
+Assert-Semantic (-not (Test-JsonValueEquivalent 1 1.0)) 'integer versus floating representation is conservatively refused'
+Assert-Semantic (-not (Test-JsonValueEquivalent ([long]9007199254740993) ([double]9007199254740992))) 'numeric comparison cannot round a large integer into equality'
 $inventory = [ordered]@{profile='task';modListPath='C:\fixture\profiles\task\modlist.txt';providers=@([ordered]@{classification='OCU';modName='OCU';modPath='C:\fixture\mods\OCU';lineNumber=85;marker='-';enabled=$false;markers=[ordered]@{rootOpenVrApi=$true;rootOpenCompositeIni=$true;openCompositeInput=$false}});errors=@()}
 function New-Admission($Inventory) {
     $proof = Get-MO2ProviderInventoryEvidence $Inventory
@@ -80,6 +87,20 @@ function Get-NullSettingsExpectation($Receipt,$BackupPath) { [pscustomobject]@{v
 function Assess-History($Document) {
     $Document | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $currentPath -Encoding utf8NoBOM
     Get-SettingsRestoreValidation -Receipt @{settingsSha256Null='different'} -BackupPath 'fixture-only' -CurrentPath $currentPath
+}
+foreach ($pair in @(@($false,0),@($true,1),@(0,$false),@(1,$true))) {
+    foreach ($controlled in @($true,$false)) {
+        $savedExpected = Clone-Value $expected
+        $section = if ($controlled) { 'dashboard' } else { 'protected' }
+        $key = if ($controlled) { 'enableDashboard' } else { 'value' }
+        if (-not $expected.Contains($section)) { $expected[$section] = [ordered]@{} }
+        $expected[$section][$key] = $pair[0]
+        $candidate = Clone-Value $expected; $candidate[$section][$key] = $pair[1]
+        $assessment = Assess-History $candidate
+        Assert-Semantic (-not $assessment.authorized -and -not $assessment.formattingOnlyDriftAccepted -and -not $assessment.runtimeManagedStructuralMatch -and
+            ($controlled -eq $false -or -not $assessment.controlledContractMatch)) "restore rejects Boolean/numeric type drift (controlled=$controlled, expected=$($pair[0]), actual=$($pair[1]))"
+        $expected = $savedExpected
+    }
 }
 $added=Clone-Value $expected;$added.dashboard['lastAccessedExternalOverlayKey']='overlay.one'
 Assert-Semantic (Assess-History $added).dashboardHistoryDriftAccepted 'string history addition qualifies'

@@ -94,7 +94,7 @@ try {
     New-Item -ItemType Directory -Path $failureEvidence | Out-Null
     New-Item -ItemType Directory -Path (Split-Path -Parent $startupPath) -Force | Out-Null
     [IO.File]::WriteAllBytes($startupPath, [byte[]]@(0))
-    $originalText = "{`r`n  `"steamvr`": { `"enableHomeApp`": true },`r`n  `"unrelated`": { `"value`": 7 }`r`n}`r`n"
+    $originalText = "{`r`n  `"steamvr`": { `"enableHomeApp`": true },`r`n  `"unrelated`": { `"value`": 7, `"boolFalse`": false, `"boolTrue`": true, `"numberZero`": 0, `"numberOne`": 1 }`r`n}`r`n"
     [IO.File]::WriteAllText($settingsPath, $originalText, [Text.UTF8Encoding]::new($false))
     $headPoseMapName = "Local\CSXVRHeadPose-fixture-$([guid]::NewGuid().ToString('N'))"
     [ordered]@{
@@ -730,6 +730,23 @@ try {
     Assert-Test ($runtimeRestore.ok -and $runtimeRestore.data.settingsRestoreValidation.runtimeManagedOnlyDriftAccepted -and $runtimeRestore.data.settingsRestoreValidation.authorizationRoute -eq 'controlled-contract-plus-runtime-managed-fields') 'restore accepts SteamVR-managed GpuSpeed and LastKnown drift while controlled settings still match'
 
     $runtimeDrift['dashboard']['lastAccessedExternalOverlayKey'] = 'runtime.overlay.history'
+    foreach ($case in @(
+        @('dashboard','enableDashboard',0), @('steamvr','requireHmd',0),
+        @('steamvr','activateMultipleDrivers',1), @('steamvr','enableHomeApp',0), @('driver_null','enable',1),
+        @('unrelated','boolFalse',0), @('unrelated','boolTrue',1),
+        @('unrelated','numberZero',$false), @('unrelated','numberOne',$true)
+    )) {
+        $typeDrift = $runtimeDrift | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable
+        $typeDrift[$case[0]][$case[1]] = $case[2]
+        $typeDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+        $authorityPaths = @($settingsPath,$openVrPathsPath,(Join-Path $evidence 'steamvr-null-receipt.json'),[string]$inspectBefore.data.targetControl.journalPath,(Join-Path $evidence 'steamvr-null-apply.journal.json'))
+        $beforeHashes = @($authorityPaths | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash })
+        $typeDriftRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -Compact -NoExit | ConvertFrom-Json
+        $afterHashes = @($authorityPaths | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash })
+        Assert-Test (-not $typeDriftRestore.ok -and $typeDriftRestore.state -eq 'blocked' -and
+            ($typeDriftRestore.errors -join ' ') -match ([regex]::Escape("$($case[0]).$($case[1])")) -and
+            ($beforeHashes -join ',') -ceq ($afterHashes -join ',')) "public committed restore refuses scalar type drift at $($case[0]).$($case[1]) with settings, registration, receipt and ownership journals byte-identical"
+    }
     $runtimeDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
     $historyRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
     Assert-Test ($historyRestore.ok -and $historyRestore.data.settingsRestoreValidation.dashboardHistoryDriftAccepted -and $historyRestore.data.settingsRestoreValidation.runtimeManagedDifferencePaths -contains 'dashboard.lastAccessedExternalOverlayKey') 'public restore accepts only the typed dashboard history leaf and retains its exact difference path'

@@ -92,6 +92,11 @@ formatting changes and runtime-managed changes confined to the top-level
 only when every controller-owned null-HMD setting still matches. Authorization
 uses actual JSON structure, not dotted diagnostic spelling: literal root keys
 containing dots cannot borrow history or runtime-managed authority.
+Scalar comparison preserves JSON kinds: Booleans never equal numbers or
+strings, and null equals only null. Numbers compare their invariant serialized
+JSON representation, avoiding precision loss from cross-type coercion. Integer
+width alone is ignored, but integer `1` versus floating `1.0` is conservatively
+treated as drift rather than formatting-only change.
 Changes to a controller-owned key or any other section
 remain unclassified drift and fail closed. The validation route and exact
 difference paths are returned as `settingsRestoreValidation`; rollback retains

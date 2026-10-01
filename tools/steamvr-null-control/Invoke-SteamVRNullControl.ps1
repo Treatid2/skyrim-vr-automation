@@ -495,7 +495,14 @@ function Test-JsonValueEquivalent([AllowNull()]$Expected, [AllowNull()]$Actual) 
         return $true
     }
     if ($Expected -is [string] -or $Actual -is [string]) { return $Expected -is [string] -and $Actual -is [string] -and [string]$Expected -ceq [string]$Actual }
-    return $Expected -eq $Actual
+    if ($Expected -is [bool] -or $Actual -is [bool]) { return $Expected -is [bool] -and $Actual -is [bool] -and $Expected.Equals($Actual) }
+    # Never let PowerShell's scalar coercion turn false/0 or true/1 into
+    # formatting-only drift. Numeric comparison is deliberately conservative:
+    # compare invariant JSON representations, not a lossy common numeric type.
+    # Integer widths normalize; integer 1 versus floating 1.0 is refused.
+    $numericTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64], [single], [double], [decimal], [bigint])
+    if ($Expected.GetType() -notin $numericTypes -or $Actual.GetType() -notin $numericTypes) { return $false }
+    return ($Expected | ConvertTo-Json -Compress) -ceq ($Actual | ConvertTo-Json -Compress)
 }
 
 function Get-JsonDifferencePaths([AllowNull()]$Expected, [AllowNull()]$Actual, [string]$Path = '') {
