@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 [CmdletBinding()]
-param([switch]$DiscoveryOnly)
+param([switch]$DiscoveryOnly, [switch]$UnchangedCompletionOnly, [string]$FixtureRoot)
 
 $ErrorActionPreference = 'Stop'
 $entry = Join-Path (Split-Path -Parent $PSScriptRoot) 'Invoke-MO2WorkspaceControl.ps1'
 $powerShell = (Get-Process -Id $PID).Path
-$fixture = Join-Path ([IO.Path]::GetTempPath()) ('mo2-workspace-control-' + [guid]::NewGuid().ToString('N'))
+$fixture = Join-Path $(if ($FixtureRoot) { [IO.Path]::GetFullPath($FixtureRoot) } else { [IO.Path]::GetTempPath() }) ('mo2-workspace-control-' + [guid]::NewGuid().ToString('N'))
 $taskId = 'codex-test-task-001'
 $priorProfileControlRoot = $env:CSX_MO2_PROFILE_CONTROL_ROOT
 $priorShaderCacheControlRoot = $env:CSX_SHADER_CACHE_CONTROL_ROOT
+$priorFixtureTemp = $env:TEMP
+$priorFixtureTmp = $env:TMP
+# Isolated fixture process/children only; no user or machine TEMP setting.
+if ($FixtureRoot) { $env:TEMP = [IO.Path]::GetFullPath($FixtureRoot); $env:TMP = $env:TEMP }
 $env:CSX_MO2_PROFILE_CONTROL_ROOT = Join-Path $fixture 'profile-transactions'
 $env:CSX_SHADER_CACHE_CONTROL_ROOT = Join-Path $fixture 'shader-cache-transactions'
 function Get-TestProfileFingerprint([string]$Path) {
@@ -327,6 +331,10 @@ try {
     $preparedIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
     if (-not $preparedCache.ok -or -not $preparedIsolation.ok -or -not $preparedIsolation.cachePlan.verification.ok -or [int]$preparedIsolation.cachePlan.verification.requiredProviderFiles -ne 2) { throw "Prepared Overwrite provider-shadow verification failed. Prepare: $($preparedCache | ConvertTo-Json -Depth 20 -Compress) Isolation: $($preparedIsolation | ConvertTo-Json -Depth 20 -Compress)" }
     $cachePlanPath = [string]$created.data.runtimeOutput.cachePlanPath
+    if ($UnchangedCompletionOnly) {
+        . (Join-Path $PSScriptRoot 'Test-UnchangedCacheCompletion.inc.ps1')
+        return
+    }
     $cachePlanBytes = [IO.File]::ReadAllBytes($cachePlanPath)
     $malformedCachePlan = Get-Content -LiteralPath $cachePlanPath -Raw | ConvertFrom-Json -Depth 40
     $malformedCachePlan.PSObject.Properties.Remove('preparedTreeSha256')
@@ -811,6 +819,8 @@ try {
     [pscustomobject]@{ok=$true; assertions=100; workspaceId=$created.data.workspaceId} | ConvertTo-Json
 }
 finally {
+    $env:TEMP = $priorFixtureTemp
+    $env:TMP = $priorFixtureTmp
     $env:CSX_MO2_PROFILE_CONTROL_ROOT = $priorProfileControlRoot
     $env:CSX_SHADER_CACHE_CONTROL_ROOT = $priorShaderCacheControlRoot
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }
