@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Isolated fixture, loaded by Test-MO2WorkspaceControl.ps1 after normal prepare.
 $oldOutput = $created.data.runtimeOutput
+. (Join-Path $PSScriptRoot 'Test-ActiveOutputResume.inc.ps1')
 $candidateName = 'Codex Exact Candidate ON'
 $candidate = & $entry create-mod -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -ModName $candidateName -Confirm:$false -NoExit -Compact | ConvertFrom-Json
 if (-not $candidate.ok) { throw 'Requalification fixture candidate creation failed.' }
@@ -170,5 +171,9 @@ if ((-not $sameOwner.ok -and ($sameOwner.errors -join ' ') -notmatch 'different 
     [Convert]::ToBase64String([IO.File]::ReadAllBytes($oo.ownerMarkerPath)) -cne $ownerMarkerBytes) { throw 'Exact original owner replacement-lease recovery failed.' }
 $ownerRecoveredJournal = Get-Content -LiteralPath $ownerPending[0].FullName -Raw | ConvertFrom-Json
 if ($ownerRecoveredJournal.phase -ne 'rolled-back' -or -not $ownerRecoveredJournal.rollback.verified) { throw 'Exact owner recovery did not verify rollback.' }
+$ownerResumed = & $entry resume -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $ownerFixture.data.workspaceId -Confirm:$false -NoExit -Compact | ConvertFrom-Json
+if (-not $ownerResumed.ok -or $ownerResumed.data.lastResumeDisposition -cne 'rebind-active-output' -or
+    ($ownerResumed.data.runtimeOutput | ConvertTo-Json -Depth 80 -Compress) -cne ($oo | ConvertTo-Json -Depth 80 -Compress) -or
+    [Convert]::ToBase64String([IO.File]::ReadAllBytes($oo.ownerMarkerPath)) -cne $ownerMarkerBytes) { throw 'Replacement-lease resume failed after exact requalification rollback.' }
 $null = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
-'PASS: consent, preview, corruption refusal, real interruptions, rollback recovery, winner/history preservation, absent baselines, plus foreign-task/inexact-workspace no-mutation refusal and exact-owner recovery under a real replacement lease. PR61 F2/F3 remain separate outstanding review findings.'
+'PASS: consent, preview, corruption refusal, real interruptions, rollback recovery, winner/history preservation, absent baselines, foreign-task/inexact-workspace refusal, exact-owner recovery and active-generation resume under a real replacement lease. PR61 F3 remains outstanding.'

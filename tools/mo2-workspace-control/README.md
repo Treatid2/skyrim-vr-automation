@@ -53,9 +53,16 @@ Workspaces are durably owned by `-TaskId` (or `CODEX_THREAD_ID` /
 `CODEX_TASK_ID`), not by one access lease. `create` makes and selects a fresh
 profile. `list-task` reports retained profiles. `resume` rebinds one exact
 retained workspace to a newly owned lease and selects it without refreshing it
-from the primary profile. If the prior lease completed its output transaction,
-resume also publishes a fresh owner marker, snapshots, evidence paths, and
-completion paths before returning ready. See
+from the primary profile. An active output generation is rebound unchanged only
+after proving the exact marker bytes, task, workspace, ownership ID, and all
+configured Overwrite paths. This does not qualify stale output or supersede its
+generation. Interrupted active rebind recovery requires the original task and
+workspace plus a current closed-state lease, and restores the exact manifest
+before another resume. If the prior lease completed its output transaction,
+resume verifies both plans, completion and snapshot/restore lineage, preserved
+output and live baselines before publishing a fresh generation. This applies
+even under the same access ID. No unavailable environment is silently replaced.
+See
 `../../docs/MO2-TASK-WORKSPACES.md`.
 
 Creation binds the task to MO2 Overwrite with an exact owner marker. It removes

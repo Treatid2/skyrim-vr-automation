@@ -715,9 +715,23 @@ try {
     $nextAccess = Invoke-MO2RequestAccess -Config $config -Label fixture-resume -RuntimeRoute SteamVRNull; $nextAccessId = [string]$nextAccess.data.access.accessId
     $wrongOwner = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId 'different-task' -WorkspaceId $created.data.workspaceId -NoExit -Confirm:$false | ConvertFrom-Json
     if ($wrongOwner.ok -or $wrongOwner.errors[0] -notmatch 'different task') { throw 'A different task identity was allowed to resume the retained workspace.' }
+    # Earlier mixed-state fixtures deliberately use different shared baselines.
+    # Reconstruct only test-owned live trees from the exact completed snapshots;
+    # production resume must refuse this drift rather than silently adopt it.
+    function Set-TestCompletedBaseline($Workspace) {
+        foreach ($kind in @('cache','backup')) {
+            $outputPath = [IO.Path]::GetFullPath([string]$Workspace.data.runtimeOutput.($kind+'Path'))
+            if (-not $outputPath.StartsWith([IO.Path]::GetFullPath($fixture) + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'Fixture baseline reset escaped the isolated test root.' }
+            if (Test-Path -LiteralPath $outputPath) { Remove-Item -LiteralPath $outputPath -Recurse -Force }
+            if ($Workspace.data.runtimeOutput.($kind+'PathExistedBefore')) {
+                Copy-Item -LiteralPath (Join-Path $Workspace.data.runtimeOutput.($kind+'EvidenceDirectory') 'cache.before') -Destination $outputPath -Recurse
+            }
+        }
+    }
+    Set-TestCompletedBaseline $created
     $overwriteBeforeInterruptedResume = Get-TestProfileFingerprint (Join-Path $mo2 'overwrite')
-    & $powerShell -NoProfile -NonInteractive -File $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -InternalTestFailurePoint resume-interrupt-after-output-rearm -Confirm:$false -NoExit | Out-Null
-    if ($LASTEXITCODE -ne 91) { throw 'Interrupted resume fixture did not terminate after publishing recoverable output-rearm evidence.' }
+    $interruptedResumeResult = & $powerShell -NoProfile -NonInteractive -File $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -InternalTestFailurePoint resume-interrupt-after-output-rearm -Confirm:$false -NoExit
+    if ($LASTEXITCODE -ne 91) { throw "Interrupted resume fixture did not terminate after publishing recoverable output-rearm evidence: $interruptedResumeResult" }
     & $powerShell -NoProfile -NonInteractive -File $entry list-task -ConfigPath $configPath -TaskId $taskId -InternalTestFailurePoint resume-recovery-interrupt-after-owner-release -Compact -NoExit | Out-Null
     if ($LASTEXITCODE -ne 92) { throw 'Recovery interruption fixture did not terminate immediately after attributable owner release.' }
     $global:LASTEXITCODE = 0
@@ -764,6 +778,8 @@ try {
     $alreadySelectedResume = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -Confirm:$false | ConvertFrom-Json
     $alreadySelectedAfter = [IO.File]::ReadAllBytes($ini)
     if (-not $alreadySelectedResume.ok -or [Convert]::ToBase64String($alreadySelectedAfter) -cne [Convert]::ToBase64String($alreadySelectedBefore)) { throw 'Resuming an already-selected profile did not preserve exact MO2 INI bytes.' }
+    if ($alreadySelectedResume.data.lastResumeDisposition -cne 'rearm-completed-output' -or $alreadySelectedResume.data.runtimeOutput.cacheEvidenceDirectory -ceq $resumed.data.runtimeOutput.cacheEvidenceDirectory) { throw 'Same-access completed resume did not open a new verified output generation.' }
+    Complete-RearmedTestOutput -Workspace $alreadySelectedResume -OwnedAccessId $nextAccessId
     $resumeJournal = Get-ChildItem -LiteralPath $workspaceControlRoot -Filter ($created.data.workspaceId + '.resume.*.journal.json') -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     $resumeJournalData = Get-Content -LiteralPath $resumeJournal.FullName -Raw | ConvertFrom-Json
     if ($resumeJournalData.phase -ne 'committed' -or -not (Test-Path -LiteralPath $resumeJournalData.manifestPreimagePath -PathType Leaf) -or [string]::IsNullOrWhiteSpace([string]$resumeJournalData.selectedProfileJournalPath)) { throw 'Committed resume did not retain a durable manifest preimage and selected-profile journal link.' }
@@ -783,13 +799,16 @@ try {
     if ((Get-FileHash -LiteralPath $resumeManifestPath -Algorithm SHA256).Hash -cne $resumePreimageHash -or $resumeRecoveredJournal.phase -ne 'rolled-back') { throw 'Startup recovery did not restore the exact persisted resume manifest preimage.' }
     $lateClaim = & $entry register-mod -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -ModName 'Later Shared Mod' -ModDirectory $laterSharedMod -NoExit -Confirm:$false | ConvertFrom-Json
     if ($lateClaim.ok -or $lateClaim.errors[0] -notmatch 'protected shared mod') { throw 'Resume did not protect a shared mod added after workspace creation.' }
+    Set-TestCompletedBaseline $verified
     $resumedVerified = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $verified.data.workspaceId -Confirm:$false | ConvertFrom-Json
     if (-not $resumedVerified.ok) { throw "Second retained workspace could not be explicitly resumed: $($resumedVerified | ConvertTo-Json -Depth 12 -Compress)" }
     Complete-RearmedTestOutput -Workspace $resumedVerified -OwnedAccessId $nextAccessId
     $releasedVerified = & $entry retire -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $verified.data.workspaceId -Confirm:$false | ConvertFrom-Json
     if (-not $releasedVerified.ok -or (Test-Path -LiteralPath $verified.data.profilePath)) { throw "Verified fixture workspace retirement failed: $($releasedVerified | ConvertTo-Json -Depth 12 -Compress)" }
+    Set-TestCompletedBaseline $alreadySelectedResume
     $resumedAgain = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -Confirm:$false | ConvertFrom-Json
     if (-not $resumedAgain.ok) { throw 'Original retained workspace could not be reselected after another workspace.' }
+    Complete-RearmedTestOutput -Workspace $resumedAgain -OwnedAccessId $nextAccessId
     $retireManifestPath = Join-Path $workspaceControlRoot ($created.data.workspaceId + '.json')
     $retirePreimageBytes = [IO.File]::ReadAllBytes($retireManifestPath)
     $retirePreimageHash = (Get-FileHash -LiteralPath $retireManifestPath -Algorithm SHA256).Hash
