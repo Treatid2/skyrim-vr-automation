@@ -1,5 +1,29 @@
 # MO2 Control
 
+## Bounded launch-error evidence
+
+Launch retains an optional exact registered-binary log baseline before dispatch.
+Both synchronous `launch` and `status` after `launch -StartOnly` can classify a
+new MO2 loader spawn error before the game-observation timeout. This requires
+one exact owned MO2 lifetime, no loader/game, matching attempt/profile/binary,
+and stable bounded evidence from `logs/mo_interface.log`. A retained owner uses
+only appended bytes after a prefix-and-tail verified baseline. A fresh log also
+requires the exact requested command header near the proven process start.
+The adapter supports the observed MO2 2.5.2 UTC timestamp/error-block format;
+unknown formats, rotation under a retained owner, incomplete/mismatched errors,
+inaccessible files and over-budget windows keep the existing timeout fallback.
+Each probe reads at most 256KiB of candidate bytes plus bounded anchors; a
+matched window is reread within that same bound to verify stability.
+
+An attributable error returns `launch-failed`, retains `launchFailure` and an
+attempt-specific `launchFailureReceiptPath`, and preserves the numeric Win32
+error/message with `cause=unassigned`. Error5 is not proof of antivirus,
+permissions, a lock, or another denying mechanism. Neither classification nor
+status retries launch, dismisses a dialog, closes MO2 or changes the lease.
+Use the ordinary exact-session stop/Unlock cleanup after classifying the
+attempt. A later status retains the failure; active stranded RootBuilder state
+still takes precedence as `rootbuilder-recovery-required`.
+
 MO2 Control is the shared, machine-readable entry point for Codex tasks that
 inspect or validate the Skyrim VR Mod Organizer 2 installation.
 

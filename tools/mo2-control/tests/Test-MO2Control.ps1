@@ -512,7 +512,7 @@ executable_blacklist="Steam.exe;notepad++.exe"
     $openSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Open \{.*?\n\}').Value
     Assert-MO2Test ($launchSource -notmatch 'if \([$]ownerResolution[.]adopted\) \{\s*[$]owned = Get-MO2OwnedSession' -and
         $openSource -notmatch 'if \([$]observedResolution[.]adopted\) \{\s*[$]owned = Get-MO2OwnedSession' -and
-        @([regex]::Matches($launchSource, 'Get-MO2SynchronousCompletionSupersession')).Count -eq 2 -and
+        @([regex]::Matches($launchSource, 'Get-MO2SynchronousCompletionSupersession')).Count -eq 3 -and
         @([regex]::Matches($openSource, 'Get-MO2SynchronousCompletionSupersession')).Count -eq 2) 'synchronous launch/open keep their initiating post-handoff generation and classify stale terminal writes without adopting newer authority'
     Assert-MO2Test ($moduleSource -match 'Write-MO2SessionManifestProjection -SessionData [$]updated' -and $moduleSource -notmatch '(?s)Write-MO2OwnedSessionAtomic[^}]+Write-MO2JsonAtomic -Path [$]manifestPath') 'ownership-lock and session-manifest lifecycle projection share one serialized generation boundary'
     $gamePersistenceSource = [regex]::Match($moduleSource, '(?s)function Set-MO2OwnedSessionGameProcesses \{.*?\n\}').Value
