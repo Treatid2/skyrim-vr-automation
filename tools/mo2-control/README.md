@@ -243,6 +243,40 @@ session or call `release-access`.
 
 ## Session lifecycle
 
+### Recovering an interrupted fresh dispatch
+
+If launch created MO2 and wrote `mo2-launch-started.json` but the session is
+still `prepared`, do not relaunch, force-edit the lock, use `recover-close`, or
+release another task's lease. `recover-dispatch` is a narrow source-upgrade
+exception to the usual durable-controller rule: invoke the repaired entry point
+with **that session's captured `config/machine.local.json`**, the owner's private
+`AccessId`, exact `SessionId`, recorded `TaskId`, receipt `AttemptId`, and current
+`ExpectedGeneration`. Preview first with `-WhatIf`.
+
+It accepts only a fresh originally closed dispatch with no game/loader, exactly
+one live MO2, and the receipt's exact PID, executable path, and start instant.
+It checks profile/executable arguments, chronology, lock/manifest generation,
+the original controller file hashes, and identical captured configuration.
+Existing owner transitions/tuples, helper-only handoffs, foreign credentials,
+extra processes, and stale generations fail closed. Legacy receipts without
+generation metadata are accepted only under all these prepared-session proofs.
+
+Recovery retains the original controller and receipt, snapshots pre-recovery
+lock/manifest/receipt into a new session-local evidence directory, creates a
+new durable controller, and commits one `launch-failed` generation with the
+exact owner tuple. It does not launch, dismiss a dialog, close MO2, restore
+RootBuilder, change the profile, or release access. Use its returned literal
+`controllerPath` for `status`, `close`/`stop`, and subsequent lifecycle commands.
+Cooperative close recognizes `Cannot launch program` only with a matching
+`Cannot start ...exe` message; unknown dialogs remain unattended. Inspect and
+retain modal details/logs before closing: generic antivirus advice does not
+establish an antivirus cause.
+
+Fresh launch now normalizes prior game history before process creation and
+records the dispatched lifetime before optional child inventory. Empty and
+singleton histories remain arrays, and a child-probe failure cannot strand an
+otherwise recorded owner. Recovery never enables a repeat launch implicitly.
+
 `prepare` requires a closed game/MO2 state, validates one exact profile and
 registered executable, and creates a durable evidence manifest on staging
 storage. It binds the caller's exact route-qualified access lease. It also

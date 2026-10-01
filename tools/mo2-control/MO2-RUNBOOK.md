@@ -289,6 +289,25 @@ the actual route independently.
 
 ## Failure and recovery matrix
 
+### Launch receipt exists but the owner commit failed
+
+When `mo2-launch-started.json` records a dispatched MO2 lifetime but the exact
+session remains `prepared`, stop retries and retain its receipt and exception.
+The owner may preview `recover-dispatch` from a repaired source entry point,
+using the old session controller's captured configuration plus private
+`AccessId`, exact `SessionId`, `TaskId`, `AttemptId`, and `ExpectedGeneration`.
+This explicitly supported source-upgrade command verifies the unchanged old
+controller bundle, coherent prepared lock/manifest, originally empty process
+sets, exact launch arguments and live PID/path/start. It refuses existing
+owner identity, stale/foreign authority, helper handoffs, or any game/loader.
+
+Successful recovery returns `dispatch-owner-recovered` and a new durable
+`controllerPath`; it preserves the original bundle and receipt and keeps the
+lease. Nothing is launched or closed. Inspect the modal/log evidence using the
+new controller, then use normal exact-owner `close`/`stop` and RootBuilder
+Unlock cleanup. Do not infer that a generic antivirus suggestion explains the
+loader failure. Never hand-edit the ownership lock or deployment metadata.
+
 ### Missing profile or fallback warning
 
 Symptom: MO2 says the selected profile does not exist and chooses a different

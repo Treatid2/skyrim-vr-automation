@@ -2,7 +2,8 @@
 
 [CmdletBinding()]
 param(
-    [switch]$IncludeLive
+    [switch]$IncludeLive,
+    [string]$FixtureRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,7 +54,8 @@ $acceptedExitRace = & $mo2Module {
 }
 Assert-MO2Test ($acceptedExitRace.terminal -and -not $acceptedExitRace.wrongProcess -and -not $acceptedExitRace.staleAuthority) 'an accepted exact Exit distinguishes terminal process departure from an authority failure'
 
-$fixture = Join-Path ([IO.Path]::GetTempPath()) ('mo2-control-test-' + [guid]::NewGuid().ToString('N'))
+$fixtureBase = if ([string]::IsNullOrWhiteSpace($FixtureRoot)) { [IO.Path]::GetTempPath() } else { [IO.Path]::GetFullPath($FixtureRoot) }
+$fixture = Join-Path $fixtureBase ('mo2-control-test-' + [guid]::NewGuid().ToString('N'))
 try {
     $mo2Root = Join-Path $fixture 'MO2'
     $profileRoot = Join-Path $mo2Root 'profiles'
@@ -453,7 +455,7 @@ selected_profile=@ByteArray(Codex)
     $allGameCommitCalls = @([regex]::Matches($moduleSource, '[$]null = Set-MO2OwnedSessionGameProcesses[^`r`n]+'))
     Assert-MO2Test ($qualifiedGameCommitCalls.Count -eq 2 -and $allGameCommitCalls.Count -eq 2) 'both status and synchronous launch durably co-write verified game identity with the running transition'
     Assert-MO2Test ($moduleSource -match 'ownerProcessPath' -and $moduleSource -match 'ownerProcessStartTime') 'launch and detached-owner adoption persist exact MO2 path and start-time identity'
-    Assert-MO2Test (@([regex]::Matches($moduleSource, 'Invoke-MO2OwnedSessionMutation -Owned [$]owned -Action')).Count -eq 4) 'launch, open, terminate-game, and terminate all serialize current lifecycle authority before process mutation'
+    Assert-MO2Test (@([regex]::Matches($moduleSource, 'Invoke-MO2OwnedSessionMutation -Owned [$]owned -Action')).Count -eq 5) 'launch, open, terminate-game, terminate and dispatch recovery all serialize current lifecycle authority before process mutation'
     Assert-MO2Test ($moduleSource -match 'param\([$]CurrentOwned, [$]MutationAction\)' -and $moduleSource -match 'Invoke-WithMO2LeaseTransitionLock[^\r\n]+-Action [$]lockedMutation -ArgumentList @\([$]Owned, [$]Action\)') 'serialized lifecycle mutation passes its caller action explicitly without colliding with the lock wrapper Action parameter'
     Assert-MO2Test ($moduleSource -notmatch "Set-MO2OwnedSessionOwner -Owned[^`r`n]+exact MO2 process observed after open" -and $moduleSource -match 'Resolve-MO2OwnedProcessTarget[^\r\n]+-AdoptDetachedOwner') 'synchronous open preserves its dispatch-bound owner tuple unless the explicit detached-owner proof succeeds'
     $launchSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Launch \{.*?\n\}').Value
