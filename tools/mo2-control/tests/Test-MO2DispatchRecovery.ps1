@@ -86,6 +86,8 @@ $data = [pscustomobject]@{
     contractVersion = '1.0.0'; sessionId = 'fixture-dispatch'; accessId = $access; leaseId = 'fixture-lease'
     generation = 2L; status = 'prepared'; ownerTaskId = 'fixture-task'; ownerPid = $PID
     sessionPath = $sessionPath; controllerPath = $controller.controllerPath
+    controllerConfigPath = $controller.configPath; controllerReceiptPath = $controller.receiptPath
+    controllerBundleBinding = $controller.binding
     profile = 'Fixture Profile'; executable = 'Fixture SKSE'; createdUtc = [DateTime]::UtcNow.AddSeconds(-5).ToString('o')
 }
 $data | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $lockPath
@@ -136,6 +138,95 @@ try {
     Assert-Fixture (-not (& $proofCall).ok) 'reject newer receipt generation'
     $receipt.PSObject.Properties.Remove('generation')
     $receipt | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $receiptPath
+    $receipt | Add-Member -NotePropertyName leaseId -NotePropertyValue $data.leaseId
+    $receipt | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $receiptPath
+    Assert-Fixture (-not (& $proofCall).ok) 'reject lease-only receipt metadata'
+    $receipt.PSObject.Properties.Remove('leaseId')
+    $receipt | Add-Member -NotePropertyName generation -NotePropertyValue 2L
+    $receipt | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $receiptPath
+    Assert-Fixture (-not (& $proofCall).ok) 'reject generation-only receipt metadata'
+    $receipt | Add-Member -NotePropertyName leaseId -NotePropertyValue $data.leaseId
+    $receipt | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $receiptPath
+    $modern = & $proofCall
+    Assert-Fixture ($modern.ok -and -not $modern.legacyReceipt) 'both exact modern receipt fields accepted without legacy classification'
+    foreach ($wrong in @('2',$true,2.5)) {
+        $receipt.generation = $wrong
+        $receipt | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $receiptPath
+        Assert-Fixture (-not (& $proofCall).ok) "reject wrong-typed generation $wrong"
+    }
+    $receipt.PSObject.Properties.Remove('generation')
+    $receipt.PSObject.Properties.Remove('leaseId')
+    $receipt | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $receiptPath
+    $bundleBytes = [IO.File]::ReadAllBytes($controller.receiptPath)
+    $bundleOriginal = Get-Content -LiteralPath $controller.receiptPath -Raw
+    $authorityHash = (Get-FileHash -LiteralPath $lockPath).Hash
+    foreach ($member in @($controller.files)) {
+        $bad = $bundleOriginal | ConvertFrom-Json
+        $bad.files = @($bad.files | Where-Object name -cne $member.name)
+        $bad | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $controller.receiptPath
+        Assert-Fixture (-not (& $proofCall).ok) "reject omission of prepared member $($member.name)"
+        [IO.File]::WriteAllBytes($controller.receiptPath,$bundleBytes)
+    }
+    foreach ($attack in @('duplicate','aliased-path','entry-path','config-path','version','receipt-rewrite')) {
+        $bad = $bundleOriginal | ConvertFrom-Json
+        switch ($attack) {
+            'duplicate' { $bad.files = @($bad.files)+@($bad.files[0]) }
+            'aliased-path' { $bad.files[0].path = Join-Path (Split-Path $controller.controllerPath) '.\Invoke-MO2Control.ps1' }
+            'entry-path' { $bad.controllerPath = $controller.configPath }
+            'config-path' { $bad.configPath = $controller.controllerPath }
+            'version' { $bad.contractVersion = '999.0.0' }
+            'receipt-rewrite' { $bad.purpose = 'rewritten receipt with same inventory' }
+        }
+        $bad | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $controller.receiptPath
+        Assert-Fixture (-not (& $proofCall).ok) "reject bundle $attack without external binding update"
+        [IO.File]::WriteAllBytes($controller.receiptPath,$bundleBytes)
+    }
+    $memberPath = $controller.controllerPath
+    $memberBytes = [IO.File]::ReadAllBytes($memberPath)
+    try {
+        [IO.File]::AppendAllText($memberPath,"`n# fixture corruption")
+        $bad = $bundleOriginal | ConvertFrom-Json
+        $bad.files[0].sha256 = (Get-FileHash -LiteralPath $memberPath).Hash
+        $bad | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $controller.receiptPath
+        Assert-Fixture (-not (& $proofCall).ok) 'reject altered member with rewritten self-declared hash'
+        [IO.File]::WriteAllBytes($controller.receiptPath,$bundleBytes)
+        Assert-Fixture (-not (& $proofCall).ok) 'reject altered member under original receipt'
+    } finally { [IO.File]::WriteAllBytes($memberPath,$memberBytes); [IO.File]::WriteAllBytes($controller.receiptPath,$bundleBytes) }
+    foreach ($replacedPath in @($memberPath,$controller.receiptPath)) {
+        $backupPath = $replacedPath + '.fixture-original'
+        if (-not [IO.Path]::GetFullPath($replacedPath).StartsWith($fixture+'\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Replacement fixture escaped its owned root.' }
+        $originalBytes = [IO.File]::ReadAllBytes($replacedPath)
+        Move-Item -LiteralPath $replacedPath -Destination $backupPath
+        try {
+            [IO.File]::WriteAllBytes($replacedPath,$originalBytes)
+            Assert-Fixture (-not (& $proofCall).ok) "reject same-byte physical substitution $([IO.Path]::GetFileName($replacedPath))"
+        } finally {
+            Remove-Item -LiteralPath $replacedPath -Force
+            Move-Item -LiteralPath $backupPath -Destination $replacedPath
+        }
+    }
+    $configDirectory = Split-Path -Parent $controller.configPath
+    $configBackup = $configDirectory + '.fixture-original'
+    if (-not [IO.Path]::GetFullPath($configDirectory).StartsWith($fixture+'\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Junction fixture escaped its owned root.' }
+    Move-Item -LiteralPath $configDirectory -Destination $configBackup
+    try {
+        New-Item -ItemType Junction -Path $configDirectory -Target $configBackup | Out-Null
+        Assert-Fixture (-not (& $proofCall).ok) 'reject junction substitution despite identical member bytes and physical file identity'
+    } finally {
+        if (Test-Path -LiteralPath $configDirectory) { [IO.Directory]::Delete($configDirectory) }
+        Move-Item -LiteralPath $configBackup -Destination $configDirectory
+    }
+    foreach ($property in @('controllerPath','controllerConfigPath','controllerReceiptPath')) {
+        $originalValue = $data.$property
+        $data.$property = Join-Path $sessionPath 'foreign'
+        Assert-Fixture (-not (& $proofCall).ok) "reject lock/manifest $property mismatch"
+        $data.$property = $originalValue
+    }
+    $binding = $data.controllerBundleBinding
+    $data.PSObject.Properties.Remove('controllerBundleBinding')
+    Assert-Fixture (-not (& $proofCall).ok) 'reject historical prepared session without independent controller binding'
+    $data | Add-Member -NotePropertyName controllerBundleBinding -NotePropertyValue $binding
+    Assert-Fixture ((Get-FileHash -LiteralPath $lockPath).Hash -ceq $authorityHash) 'adverse provenance matrix never commits a recovery generation'
     $data | Add-Member -NotePropertyName ownerProcessPath -NotePropertyValue $exe
     Assert-Fixture (-not (& $proofCall).ok) 'reject existing owner tuple even when receipt PID matches'
     $data.PSObject.Properties.Remove('ownerProcessPath')

@@ -300,6 +300,14 @@ This explicitly supported source-upgrade command verifies the unchanged old
 controller bundle, coherent prepared lock/manifest, originally empty process
 sets, exact launch arguments and live PID/path/start. It refuses existing
 owner identity, stale/foreign authority, helper handoffs, or any game/loader.
+  The prepared authoritative lease must independently bind the old bundle
+  receipt and its complete versioned inventory; the manifest must project that
+  exact binding. Rewritten receipts/members, omitted dependencies, path aliases,
+  physical replacements and reparse paths are refused before a recovery commit.
+  Do not retrofit an unbound historical session from its own mutable receipt.
+  A legacy launch receipt lacks both generation and leaseId; a modern receipt
+  has both typed and exact. Either one-sided shape is invalid, and legacy launch
+  metadata does not waive the independent controller proof.
 
 Successful recovery returns `dispatch-owner-recovered` and a new durable
 `controllerPath`; it preserves the original bundle and receipt and keeps the

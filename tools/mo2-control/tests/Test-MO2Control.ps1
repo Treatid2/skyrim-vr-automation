@@ -834,6 +834,11 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test (Test-Path -LiteralPath (Join-Path $prepared.data.sessionPath 'session.json') -PathType Leaf) 'prepare creates a durable session manifest'
     Assert-MO2Test ([bool]$prepared.data.session.requirements.skseLoader) 'prepare persists the SKSE requirement for launch revalidation'
     Assert-MO2Test (Test-Path -LiteralPath $prepared.data.controllerPath -PathType Leaf) 'prepare snapshots a durable session controller outside the plugin cache'
+    $preparedLock = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+    $preparedManifest = Get-Content -LiteralPath (Join-Path $prepared.data.sessionPath 'session.json') -Raw | ConvertFrom-Json
+    Assert-MO2Test (($preparedLock.controllerBundleBinding | ConvertTo-Json -Depth 30 -Compress) -ceq ($preparedManifest.controllerBundleBinding | ConvertTo-Json -Depth 30 -Compress) -and
+        $preparedLock.controllerBundleBinding.receiptSha256 -ceq (Get-FileHash -LiteralPath $prepared.data.controller.receiptPath).Hash -and
+        @($preparedLock.controllerBundleBinding.files).Count -eq @($prepared.data.controller.files).Count) 'prepare commits exact complete producer inventory and receipt binding to authoritative lock and manifest'
     $atomicManifestPath = Join-Path $prepared.data.sessionPath 'session.json'
     $atomicLockBefore = Get-Content -LiteralPath $config.session.lockFile -Raw
     $atomicManifestBefore = Get-Content -LiteralPath $atomicManifestPath -Raw
