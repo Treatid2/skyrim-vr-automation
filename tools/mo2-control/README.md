@@ -243,6 +243,50 @@ session or call `release-access`.
 
 ## Session lifecycle
 
+### Recovering an interrupted fresh dispatch
+
+If launch created MO2 and wrote `mo2-launch-started.json` but the session is
+still `prepared`, do not relaunch, force-edit the lock, use `recover-close`, or
+release another task's lease. `recover-dispatch` is a narrow source-upgrade
+exception to the usual durable-controller rule: invoke the repaired entry point
+with **that session's captured `config/machine.local.json`**, the owner's private
+`AccessId`, exact `SessionId`, recorded `TaskId`, receipt `AttemptId`, and current
+`ExpectedGeneration`. Preview first with `-WhatIf`.
+
+It accepts only a fresh originally closed dispatch with no game/loader, exactly
+one live MO2, and the receipt's exact PID, executable path, and start instant.
+It checks profile/executable arguments, chronology, lock/manifest generation,
+the original controller file hashes, and identical captured configuration.
+Prepare binds the controller receipt's exact size, digest, version and physical
+identity plus the complete producer inventory into the authoritative lease;
+the session manifest projects that same binding. Recovery refuses a rewritten
+receipt, missing/duplicate/aliased member, physical replacement, reparse path,
+or lock/manifest controller path drift before ownership transfer. An old prepared
+session without that independent binding fails closed; recovery must not invent
+an external proof from the self-declared historical receipt.
+Existing owner transitions/tuples, helper-only handoffs, foreign credentials,
+extra processes, and stale generations fail closed. Legacy launch receipts have
+both generation and leaseId absent; modern receipts have both present, typed and
+exact. One-sided metadata is invalid. Legacy launch-receipt compatibility still
+requires the independently bound controller inventory and all prepared-session
+proofs; it is not permission to upgrade an unbound historical controller.
+
+Recovery retains the original controller and receipt, snapshots pre-recovery
+lock/manifest/receipt into a new session-local evidence directory, creates a
+new durable controller, and commits one `launch-failed` generation with the
+exact owner tuple. It does not launch, dismiss a dialog, close MO2, restore
+RootBuilder, change the profile, or release access. Use its returned literal
+`controllerPath` for `status`, `close`/`stop`, and subsequent lifecycle commands.
+Cooperative close recognizes `Cannot launch program` only with a matching
+`Cannot start ...exe` message; unknown dialogs remain unattended. Inspect and
+retain modal details/logs before closing: generic antivirus advice does not
+establish an antivirus cause.
+
+Fresh launch now normalizes prior game history before process creation and
+records the dispatched lifetime before optional child inventory. Empty and
+singleton histories remain arrays, and a child-probe failure cannot strand an
+otherwise recorded owner. Recovery never enables a repeat launch implicitly.
+
 `prepare` requires a closed game/MO2 state, validates one exact profile and
 registered executable, and creates a durable evidence manifest on staging
 storage. It binds the caller's exact route-qualified access lease. It also

@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('inspect', 'validate', 'validate-closed', 'request-access', 'access-status', 'renew-access', 'release-access', 'recover-access', 'prepare', 'open', 'launch', 'status', 'stop-game', 'terminate-game', 'close', 'recover-close', 'recover-rootbuilder', 'stop', 'terminate', 'release', 'help')]
+    [ValidateSet('inspect', 'validate', 'validate-closed', 'request-access', 'access-status', 'renew-access', 'release-access', 'recover-access', 'prepare', 'open', 'launch', 'status', 'stop-game', 'terminate-game', 'close', 'recover-close', 'recover-dispatch', 'recover-rootbuilder', 'stop', 'terminate', 'release', 'help')]
     [string]$Command = 'help',
 
     [string]$ConfigPath,
@@ -15,6 +15,10 @@ param(
     [string]$SessionId,
 
     [string]$AccessId,
+
+    [string]$AttemptId,
+
+    [Nullable[long]]$ExpectedGeneration,
 
     [Alias('ReporterTaskId')]
     [string]$TaskId,
@@ -58,7 +62,7 @@ function New-MO2ApprovalMetadata {
         $hostExecutable = [string](Get-Process -Id $PID -ErrorAction Stop).Path
     }
     $entryPoint = [IO.Path]::GetFullPath($PSCommandPath)
-    $oneShotCommands = @('recover-access', 'terminate-game', 'terminate')
+    $oneShotCommands = @('recover-access', 'recover-dispatch', 'terminate-game', 'terminate')
     $readOnlyCommands = @('inspect', 'validate', 'validate-closed', 'access-status', 'status', 'help')
     return [pscustomobject][ordered]@{
         hostExecutable = $hostExecutable
@@ -104,7 +108,7 @@ try {
     }
     $config = Read-MO2ControlConfig -ConfigPath $configuration.path
 
-    $sessionCommands = @('open', 'launch', 'stop-game', 'terminate-game', 'close', 'recover-rootbuilder', 'stop', 'terminate', 'release')
+    $sessionCommands = @('open', 'launch', 'stop-game', 'terminate-game', 'close', 'recover-dispatch', 'recover-rootbuilder', 'stop', 'terminate', 'release')
     if ($Command -in $sessionCommands -and [string]::IsNullOrWhiteSpace($SessionId)) {
         $result = [pscustomobject][ordered]@{
             contractVersion = '1.0.0'
@@ -194,6 +198,10 @@ try {
         }
         'recover-close' {
             Invoke-MO2RecoverClose -Config $config -AccessId $AccessId -Label $Label -TimeoutSeconds $TimeoutSeconds -WhatIf:$WhatIf
+        }
+        'recover-dispatch' {
+            if ([string]::IsNullOrWhiteSpace($AccessId) -or [string]::IsNullOrWhiteSpace($TaskId) -or [string]::IsNullOrWhiteSpace($AttemptId) -or $null -eq $ExpectedGeneration) { throw 'recover-dispatch requires AccessId, TaskId, AttemptId and ExpectedGeneration.' }
+            Invoke-MO2RecoverDispatch -Config $config -SessionId $SessionId -AccessId $AccessId -TaskId $TaskId -AttemptId $AttemptId -ExpectedGeneration $ExpectedGeneration -WhatIf:$WhatIf
         }
         'recover-rootbuilder' {
             Invoke-MO2RecoverRootBuilder -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -StartOnly:$StartOnly -WhatIf:$WhatIf
