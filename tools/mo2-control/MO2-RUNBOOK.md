@@ -397,6 +397,15 @@ attended or unsupported step rather than substituting COC.
 
 ### MO2 command helper exits before the game appears
 
+For a proven current-attempt MO2 spawn error, `launch` or the exact session's
+`status` instead returns `launch-failed` with `launchFailure` and a retained
+attempt-specific receipt. The classifier binds exact MO2 lifetime and registered
+binary to a bounded stable log window; unknown or stale evidence is ignored.
+Preserve the numeric Win32 code/message. Do not infer antivirus from error5 or
+generic dialog advice, and do not replay launch or change ACL/elevation/security
+policy speculatively. Finish the existing attempt through normal exact-session
+stop/Unlock and preserve its RootBuilder cleanup proof before further work.
+
 Symptom: the process started for `ModOrganizer.exe --profile ... run ...` exits
 successfully while the retained MO2 UI remains open, and Skyrim appears a few
 seconds later.
