@@ -1,5 +1,21 @@
 # Bounded RaceMenu diagnostic sweep
 
+Terminal evidence failures are structured nonzero results, not uncaught cleanup
+exceptions. `sweepOutcome` preserves the original run outcome and completed
+count. `evidenceFinalizationErrors` identifies trace/receipt/owned-lock failures;
+`ownedLockReleased` says whether this invocation's acquired lock was removed.
+Trace and receipt errors cannot suppress independent owned-lock cleanup. If
+unlink itself fails, reconcile that exact retained lock rather than assuming
+release. No capture/game stop or mutation replay is introduced.
+
+The terminal trace precedes finalization. `receipt.json` is published exclusively
+only after its staging file is written, flushed, fsynced and closed, using an
+atomic hard-link creation (no overwrite or non-atomic fallback). Staging files
+are retained as audit, including partial failed files; they are not completed
+receipts. `terminalEvidenceFinalized:true` in the terminal stdout result requires
+successful trace/receipt persistence and cleanup. A partial/pending file or an
+earlier successful sweep outcome cannot override a finalization failure.
+
 `racemenu_sweep.py` implements the three bounded menu phases from the retained
 race-change/shadow protocol: paced playable-race qualification, rapid legal
 two-race alternation, and enabled race/slider coverage. It does not launch,
