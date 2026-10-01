@@ -101,6 +101,11 @@ or construct HTTP or MCP requests ad hoc.
     the exact managed `-WorkspaceManifestPath`. Do not use
     `-AllowUnprovenGameMutation` unless the user explicitly authorized bypassing
     workspace save policy.
+17. Treat a successful `game load` response with `queued: true` as the only
+    mutation dispatch. Do not wait for a lifecycle event or for an observed
+    unloaded-to-loaded edge; either can be missed between polls. On the bundled
+    lane, follow it with `wait -Condition playerLoaded -ExpectedCell <exact>`.
+    That barrier polls current player and scene state and never replays the load.
 
 The bundled fallback entry point is:
 

@@ -1,7 +1,12 @@
 # DevBench Control
 
-`Invoke-DevBenchControl.ps1` lists and calls the MCP tools exposed by a running
-CSX DevBench server. Supply runtime metadata with `-RuntimePath` or set
+`Invoke-DevBenchControl.ps1` lists and calls the tools exposed by a running
+CSX DevBench server. It prefers streamable-HTTP MCP and negotiates the REST
+`/api/tools` and `/api/tool/<name>` facade when an older host returns 404 for
+the invocation's first sessionless `/mcp` initialization. Once MCP succeeds,
+that capability remains proven for the invocation: a later replacement
+initialization cannot downgrade to REST and returns
+`mcp-capability-regression` instead. Supply runtime metadata with `-RuntimePath` or set
 `CSX_DEVBENCH_RUNTIME_PATH`; no machine-specific path is compiled into the
 client.
 
@@ -18,6 +23,8 @@ client.
 .\Invoke-DevBenchControl.ps1 wait -Condition upscalingStable `
   -ExpectedCell WindhelmExterior01 -TimeoutSeconds 120 `
   -StableSamples 2 -MinimumStableFrameAdvance 5
+.\Invoke-DevBenchControl.ps1 wait -Condition playerLoaded `
+  -ExpectedCell WhiterunBreezehome -TimeoutSeconds 120
 .\Invoke-DevBenchControl.ps1 wait -Condition mainMenuReady -TimeoutSeconds 30
 .\Invoke-DevBenchControl.ps1 wait -Condition toolAvailable `
   -Tool communityshaders.profiler_api -TimeoutSeconds 600 `
@@ -30,10 +37,15 @@ The client communicates only with the loopback endpoint and reports structured
 JSON. By default it binds the endpoint to the owning listener PID and DevBench's
 off-thread `inspect health` identity before returning. Runtime metadata may add
 `pid`/`processId` and `exe`/`executable`; supplied values become strict
-expectations. Pass `-EvidenceDirectory` to preserve this binding with the run.
+expectations. An executable supplied as a canonical path is compared exactly
+with the listener process path and by filename with DevBench health, whose
+public contract reports a basename. Two supplied canonical paths must still
+match exactly. Pass `-EvidenceDirectory` to preserve this binding with the run.
 Each invocation writes a uniquely named binding receipt, so parallel calls do
 not overwrite one another. Use `-EvidenceLabel` to give that receipt a stable
-human-readable label within the unique filename.
+human-readable label within the unique filename. The receipt records whether
+the exact call used `mcp` or `rest`; a fallback mutation keeps the same
+indeterminate/no-replay safety rule as MCP.
 The controller also persists an invocation journal before dispatch. It records
 the requested tool and arguments, dispatch boundary, last verified runtime
 identity, transport retries, and terminal result. If the target exits during a
@@ -168,7 +180,10 @@ The same `-TimeoutSeconds` value is the total transport budget for `list`,
 `call`, and `wait`. Blocking calls such as a scenario with declared server-side
 waits may therefore use the caller's full bounded budget instead of failing at
 an unrelated fixed 15-second HTTP timeout. Mutation transport failures remain
-indeterminate and are never replayed automatically.
+indeterminate and are never replayed automatically. This includes a dispatched
+MCP mutation whose HTTP response arrives but cannot be decoded; it returns the
+same `indeterminate-mutation` reconciliation boundary as other unknown
+post-dispatch outcomes.
 
 All bounded waits keep explicitly transient 404/429/502/503/504, timeout, and
 main-thread-busy probe failures as unsatisfied observations after the short
@@ -178,12 +193,18 @@ terminate immediately and the last transient error remains in the result.
 The initial MCP initialize/initialized/tools-list exchange is part of that same
 outer wait state machine, so a temporarily unavailable listener cannot exhaust
 the short transport budget before the requested timeout begins.
+An invalidated MCP session is fully rebound, but repeated invalidations are not
+allowed to consume the entire wait invisibly. `-MaxSessionRebinds` defaults to
+three; reaching it returns `persistent-session-invalidated` with the count and
+last successfully decoded observation so callers can distinguish server churn
+from an ordinary unsatisfied predicate.
 
-`playerLoaded` is transition-fresh by default: the wait must observe an
-unloaded state before accepting loaded. This prevents the prior world's cached
-`true` from satisfying an asynchronous load. Use `-AcceptAlreadyLoaded` only
-when the caller intentionally wants a current-state check rather than proof of
-a new load transition.
+`playerLoaded` is a current-state post-load barrier. After one separately
+verified `game load` dispatch reports `queued: true`, call it with the exact
+`-ExpectedCell`. It polls both `inspect state` and `inspect scene` until the
+player is loaded in that cell. It does not wait for, or require observation of,
+the transient unloaded-to-loaded edge because that edge can occur between
+polls. A transport failure never causes the load mutation to be replayed.
 
 `upscalingStable` is the fail-closed barrier for paced cell-transition tests.
 It requires the exact `-ExpectedCell`, a loaded player, no blocking menu, and a

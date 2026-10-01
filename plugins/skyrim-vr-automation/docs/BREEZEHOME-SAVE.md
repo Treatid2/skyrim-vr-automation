@@ -23,11 +23,12 @@ Every newly created task profile receives a verified copy of the complete
 `MainMenuOnly` still forbids loading any save, and `FreshGame` still requires a
 genuine New Game path; copying saves does not broaden either authorization.
 
-Before creating any fresh task workspace, run `fixture-status`. A result of
+Before creating a `VerifiedFixture` task workspace, run `fixture-status`. A result of
 `fixture-valid` confirms that the declared Breezehome `.ess` and matching
 co-save exist and match their recorded hashes. If it is stale, repair the
 maintained base profile or use the guarded `refresh-fixture` workflow before
-creating the task profile. Fresh creation is blocked otherwise.
+creating the task profile. Only `VerifiedFixture` creation is blocked otherwise;
+`MainMenuOnly` and `FreshGame` do not depend on this declaration.
 
 This integrity verification belongs to the maintained source at clone time. It
 does not by itself prove a successful load under a particular game, plugin, or

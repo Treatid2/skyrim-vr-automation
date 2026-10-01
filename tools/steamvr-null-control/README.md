@@ -158,6 +158,9 @@ possible.
 Operator diagnostics never describe unverified cleanup as successfully stopped.
 
 ```powershell
+# Create one exact task-scoped directory first; -WhatIf deliberately does not
+# create it. Reuse the same path for apply, start, and restore.
+New-Item -ItemType Directory -Path <session-evidence>
 .\Invoke-SteamVRNullControl.ps1 apply -MO2AccessId <access-id> -MO2Profile <task-profile> -EvidenceDirectory <session-evidence> -Compact
 .\Invoke-SteamVRNullControl.ps1 apply -MO2AccessId <access-id> -MO2Profile <task-profile> -EvidenceDirectory <session-evidence> -IsolateExternalDisplayRedirectors -Compact
 .\Invoke-SteamVRNullControl.ps1 start -MO2AccessId <access-id> -MO2Profile <task-profile> -EvidenceDirectory <session-evidence> -Compact

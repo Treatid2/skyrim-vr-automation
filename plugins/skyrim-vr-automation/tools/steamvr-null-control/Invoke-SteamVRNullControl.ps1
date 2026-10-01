@@ -1969,7 +1969,7 @@ try {
             throw 'EvidenceDirectory is required for apply and restore.'
         }
         if (-not (Test-Path -LiteralPath $EvidenceDirectory -PathType Container)) {
-            throw "Evidence directory does not exist: $EvidenceDirectory"
+            throw "Evidence directory does not exist: $EvidenceDirectory. Create this exact task-scoped directory before preview/apply and reuse it for start and restore; -WhatIf never creates it."
         }
         if ($ownedProcesses.Count -gt 0) {
             throw "SteamVR must be stopped before $Command. Running from configured root: $($ownedProcesses.name -join ', ')"
