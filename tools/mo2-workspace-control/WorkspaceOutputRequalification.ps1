@@ -86,6 +86,12 @@ function Restore-WorkspaceRequalification($Config, $Journal, [string]$JournalPat
     $preimage = Assert-WorkspaceRecoveryPath -Path $Journal.manifestPreimagePath -Root $root -Purpose 'Requalification manifest preimage'
     if ((Get-FileHash $preimage -Algorithm SHA256).Hash -cne [string]$Journal.manifestPreimageSha256) { throw 'Requalification manifest preimage changed; recovery required.' }
     $prior = Get-Content -LiteralPath $preimage -Raw | ConvertFrom-Json -Depth 80
+    # Global pending-journal discovery is not authority to recover another
+    # task's retained workspace, even with a legitimate current MO2 lease.
+    $recoveryTaskId = Resolve-TaskId -RequestedTaskId $TaskId -Required
+    Assert-WorkspaceTaskOwner -Workspace ([pscustomobject]@{ data = $prior }) -ResolvedTaskId $recoveryTaskId
+    if ([string]::IsNullOrWhiteSpace($WorkspaceId) -or $WorkspaceId -cne [string]$prior.workspaceId -or
+        -not (Test-WorkspaceSamePath $manifestPath (Join-Path $root ($WorkspaceId + '.json')))) { throw 'Requalification recovery requires the exact original workspace identity.' }
     $null = Assert-AccessAndClosed -Config $Config -OwnedAccessId $AccessId -Profile $prior.profile -AllowOverwriteShaderCaches
     if ([string]$prior.workspaceId -cne [string]$Journal.workspaceId -or [string]$prior.ownershipId -cne [string]$Journal.ownershipId) { throw 'Requalification journal/preimage ownership mismatch.' }
     $markerPath = [string]$prior.runtimeOutput.ownerMarkerPath
