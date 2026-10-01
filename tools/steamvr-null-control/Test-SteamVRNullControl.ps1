@@ -738,13 +738,13 @@ try {
         $runtimeDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
         $settingsBeforeCollision = (Get-FileHash -LiteralPath $settingsPath).Hash
         $registrationBeforeCollision = (Get-FileHash -LiteralPath $openVrPathsPath).Hash
-        $receiptBeforeCollision = (Get-FileHash -LiteralPath (Join-Path $evidence 'apply.receipt.json')).Hash
+        $receiptBeforeCollision = (Get-FileHash -LiteralPath (Join-Path $evidence 'steamvr-null-receipt.json')).Hash
         # Commit requested, not WhatIf: admission must reject before mutation.
         $collisionRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -Compact -NoExit | ConvertFrom-Json
         Assert-Test (-not $collisionRestore.ok -and $collisionRestore.state -eq 'blocked' -and $collisionRestore.errors[0] -match 'dashboard.lastAccessedExternalOverlayKey' -and
             (Get-FileHash -LiteralPath $settingsPath).Hash -ceq $settingsBeforeCollision -and
             (Get-FileHash -LiteralPath $openVrPathsPath).Hash -ceq $registrationBeforeCollision -and
-            (Get-FileHash -LiteralPath (Join-Path $evidence 'apply.receipt.json')).Hash -ceq $receiptBeforeCollision) 'public committed restore refuses literal dotted root-key drift without changing settings, registrations or apply receipt'
+            (Get-FileHash -LiteralPath (Join-Path $evidence 'steamvr-null-receipt.json')).Hash -ceq $receiptBeforeCollision) 'public committed restore refuses literal dotted root-key drift without changing settings, registrations or apply receipt'
     }
     $runtimeDrift.Remove('dashboard.lastAccessedExternalOverlayKey')
     foreach ($badHistory in @($true, 12, [ordered]@{ child = 'overlay' }, $null)) {
