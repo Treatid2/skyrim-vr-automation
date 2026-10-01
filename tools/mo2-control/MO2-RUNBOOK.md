@@ -253,6 +253,15 @@ When `-RequireSKSE` is supplied, that requirement is durable session state and
 
 ## Exact launch and monitoring
 
+For an explicitly authorized Run-button attempt, prepare a new durable controller
+containing this feature, then use its literal path for `open -SessionId ...` and
+require `mo2-open`. Preview `launch -SessionId ... -LaunchMethod RunButton -WhatIf`
+before `launch -SessionId ... -LaunchMethod RunButton -StartOnly`. Inspect the
+same session with `status`; dispatch is not game-readiness proof. The visible
+profile and executable must already match; do not change selections blindly.
+Do not run a visible interactive operation through the non-interactive completion
+service merely because that service was suitable for fixture tests.
+
 Open only the exact MO2/profile UI when no game launch is wanted:
 
 ```text

@@ -5304,6 +5304,110 @@ function Get-MO2LaunchResumeDisposition {
     return [pscustomobject][ordered]@{ ok = $false; mode = 'blocked'; ownerPid = $OwnerPid; reason = 'ambiguous-mo2-owner' }
 }
 
+function Get-MO2RunSelectionValue {
+    param($Element)
+    $pattern = $null
+    if ($Element.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern, [ref]$pattern)) {
+        $selected = @(([System.Windows.Automation.SelectionPattern]$pattern).GetCurrentSelection())
+        if ($selected.Count -eq 1) { return [string]$selected[0].Current.Name }
+    }
+    $pattern = $null
+    if ($Element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
+        return [string]([System.Windows.Automation.ValuePattern]$pattern).Current.Value
+    }
+    $pattern = $null
+    if ($Element.TryGetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern, [ref]$pattern)) {
+        return [string]([System.Windows.Automation.LegacyIAccessiblePattern]$pattern).Current.Value
+    }
+    throw 'MO2 selected value is not observable through a supported accessibility pattern.'
+}
+
+function Get-MO2RunButtonProof {
+    param($Owner)
+    $visible = @(Get-MO2WindowSnapshot -Processes @($Owner) | Where-Object visible)
+    $main = @($visible | Where-Object { $_.automationAvailable -and [string]$_.automationId -ceq 'MainWindow' })
+    if ($visible.Count -ne 1 -or $main.Count -ne 1) { throw 'Run requires one visible MainWindow and no other visible modal or window.' }
+    $windows = @(Get-MO2AutomationWindows -ProcessId ([int]$Owner.id) | Where-Object { [int64]$_.Current.NativeWindowHandle -eq [int64]$main[0].handle })
+    if ($windows.Count -ne 1 -or -not $windows[0].Current.IsEnabled) { throw 'Exact MO2 main window is not uniquely accessible and enabled.' }
+    $window = $windows[0]
+    $controls = @{}
+    foreach ($id in @('profileBox','executablesListBox','startButton')) {
+        $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, $id)
+        $matches = @(Invoke-MO2UiAutomationFindAll -Window $window -Scope ([System.Windows.Automation.TreeScope]::Descendants) -Condition $condition)
+        if ($matches.Count -ne 1 -or [int]$matches[0].Current.ProcessId -ne [int]$Owner.id -or
+            -not $matches[0].Current.IsEnabled -or $matches[0].Current.IsOffscreen) { throw "Exact enabled MO2 control '$id' is unavailable or ambiguous." }
+        $controls[$id] = $matches[0]
+    }
+    if ($controls.profileBox.Current.ControlType -ne [System.Windows.Automation.ControlType]::ComboBox -or
+        $controls.executablesListBox.Current.ControlType -ne [System.Windows.Automation.ControlType]::ComboBox -or
+        $controls.startButton.Current.ControlType -ne [System.Windows.Automation.ControlType]::Button -or
+        (ConvertTo-MO2ControlName ([string]$controls.startButton.Current.Name)) -cne 'Run') { throw 'MO2 Run control structure is not supported.' }
+    return [pscustomobject]@{
+        processId = [int]$Owner.id; windowHandle = [int64]$main[0].handle
+        profile = Get-MO2RunSelectionValue $controls.profileBox
+        executable = Get-MO2RunSelectionValue $controls.executablesListBox
+        button = $controls.startButton
+    }
+}
+
+function Assert-MO2RunButtonProof {
+    param($Proof, $Owned, $Owner)
+    if ([int]$Proof.processId -ne [int]$Owner.id -or [int64]$Proof.windowHandle -eq 0 -or
+        [string]$Proof.profile -cne [string]$Owned.data.profile -or
+        [string]$Proof.executable -cne [string]$Owned.data.executable) {
+        throw 'Visible profile/executable does not match the exact owned launch request; no selection was changed.'
+    }
+}
+
+function Invoke-MO2RunButtonDispatch {
+    # Caller holds the serialized session transition. No nested lock and no
+    # helper process, selection change, coordinates, keys, or loader fallback.
+    param($Config, $Owned, $Validation, $LaunchStarted, [string]$ReceiptPath, [switch]$PrepareOnly)
+    $allOwners = @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
+    $resolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $Owned -Processes $allOwners
+    if ($allOwners.Count -ne 1 -or -not $resolution.ok -or @($resolution.targets).Count -ne 1) { throw 'Run requires the exact sole session-owned MO2 lifetime.' }
+    $owner = $resolution.targets[0]
+    $binding = Get-Process -Id ([int]$owner.id) -ErrorAction Stop
+    try {
+        $handle = $binding.SafeHandle
+        $bound = [pscustomobject]@{ id=$binding.Id; name=$binding.ProcessName; path=$binding.Path; startTime=$binding.StartTime.ToUniversalTime().ToString('o') }
+        if ($handle.IsInvalid -or $handle.IsClosed -or $binding.HasExited -or -not (Test-MO2ProcessRecordIdentity -Expected $owner -Actual $bound).ok) { throw 'Run owner lifetime changed while binding its handle.' }
+        $proof = Get-MO2RunButtonProof -Owner $owner
+        Assert-MO2RunButtonProof -Proof $proof -Owned $Owned -Owner $owner
+        $skseRequired = $Owned.data.PSObject.Properties['requirements'] -and $Owned.data.requirements.PSObject.Properties['skseLoader'] -and [bool]$Owned.data.requirements.skseLoader
+        $fresh = Invoke-MO2Validate -Config $Config -Profile ([string]$Owned.data.profile) -Executable ([string]$Owned.data.executable) -RequireSKSE:$skseRequired -RequireRuntimeRoute -OwnedSessionId $Owned.sessionId
+        $expected = @($Validation.data.executables | Where-Object { [string]$_.title -ceq [string]$Owned.data.executable })
+        $actual = @($fresh.data.executables | Where-Object { [string]$_.title -ceq [string]$Owned.data.executable })
+        if (-not $fresh.ok -or @($fresh.data.processes.mo2).Count -ne 1 -or @($fresh.data.processes.game).Count -ne 0 -or
+            $expected.Count -ne 1 -or $actual.Count -ne 1 -or
+            ($expected[0] | ConvertTo-Json -Depth 20 -Compress) -cne ($actual[0] | ConvertTo-Json -Depth 20 -Compress) -or
+            @($fresh.data.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' }).Count -gt 0) { throw 'Run launch admission, executable entry, or closed-game/deployment state changed.' }
+        $freshResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $Owned -Processes @($fresh.data.processes.mo2)
+        if (-not $freshResolution.ok -or @($freshResolution.targets).Count -ne 1 -or
+            -not (Test-MO2ProcessRecordIdentity -Expected $owner -Actual $freshResolution.targets[0]).ok) { throw 'Run exact owner changed during validation.' }
+        $again = Get-MO2RunButtonProof -Owner $owner
+        Assert-MO2RunButtonProof -Proof $again -Owned $Owned -Owner $owner
+        if ([int64]$again.windowHandle -ne [int64]$proof.windowHandle) { throw 'Run window identity changed before invocation.' }
+        $binding.Refresh()
+        if ($binding.HasExited -or $handle.IsClosed -or $handle.IsInvalid -or
+            @(Get-MO2ProcessRecords -Names @($Config.mo2.gameProcessNames)).Count -ne 0) { throw 'Run owner exited or a game/loader appeared before invocation.' }
+        $LaunchStarted | Add-Member -NotePropertyName runButtonProof -NotePropertyValue ([pscustomobject]@{ owner=$owner; windowHandle=$again.windowHandle; profile=$again.profile; executable=$again.executable; registeredExecutable=$actual[0]; automationId='startButton'; invocationState=$(if ($PrepareOnly) { 'armed' } else { 'attempted' }) }) -Force
+        $LaunchStarted.requestedPid = $owner.id
+        $LaunchStarted.requestedProcessStartTime = $owner.startTime
+        Write-MO2JsonAtomic -Path $ReceiptPath -Value $LaunchStarted
+        if ($PrepareOnly) { return [pscustomobject]@{ process=$binding; invocationError=$null } }
+        $invocationError = $null
+        try { if (-not (Invoke-MO2AutomationButton -Button $again.button -ExpectedName 'Run')) { throw 'Exact Run accessible action was not accepted.' } }
+        catch { $invocationError = $_.Exception.Message }
+        $LaunchStarted.runButtonProof.invocationState = if ($invocationError) { 'uncertain' } else { 'invoked' }
+        $LaunchStarted | Add-Member -NotePropertyName invocationError -NotePropertyValue $invocationError -Force
+        # An exception after invoking may already have launched. Retain pending
+        # ownership and prohibit replay; do not revert to mo2-open.
+        return [pscustomobject]@{ process=$binding; invocationError=$invocationError }
+    }
+    catch { $binding.Dispose(); throw }
+}
+
 function Invoke-MO2Launch {
     [CmdletBinding()]
     param(
@@ -5311,12 +5415,22 @@ function Invoke-MO2Launch {
         [Parameter(Mandatory)][string]$SessionId,
         [ValidateRange(1, 600)][int]$TimeoutSeconds = 90,
         [switch]$StartOnly,
+        [ValidateSet('CLI','RunButton')][string]$LaunchMethod = 'CLI',
         [switch]$RootBuilderRecovery,
         [switch]$WhatIf
     )
 
+    # ValidateSet accepts case-insensitive spelling; never let a valid alias
+    # silently select CLI instead of the explicitly requested Run route.
+    $LaunchMethod = if ($LaunchMethod -ieq 'RunButton') { 'RunButton' } else { 'CLI' }
     $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
     $lockData = $owned.data
+    if ($LaunchMethod -ceq 'RunButton' -and ([string]$lockData.status -cne 'mo2-open' -or $RootBuilderRecovery)) {
+        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'blocked' -Data @{ sessionId=$SessionId; launchMethod=$LaunchMethod } -Errors @('RunButton requires a ready mo2-open owned session. It never opens, adopts, or retries MO2 implicitly.')
+    }
+    if ($LaunchMethod -ceq 'RunButton' -and -not (Test-MO2InteractiveDesktop)) {
+        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'interactive-desktop-required' -Data @{sessionId=$SessionId} -Errors @('RunButton requires the logged-on interactive desktop.')
+    }
     $acceptedStatuses = @('prepared', 'launch-failed', 'game-stopped', 'mo2-exited-after-game-stop', 'stop-incomplete', 'mo2-open')
     if ($RootBuilderRecovery) { $acceptedStatuses += @('mo2-closed', 'rootbuilder-recovery-required', 'launching', 'opening', 'open-incomplete') }
     if ([string]$lockData.status -notin $acceptedStatuses) {
@@ -5344,6 +5458,7 @@ function Invoke-MO2Launch {
     $mo2Path = [string]$validation.data.config.mo2Executable
     $arguments = @('--profile', [string]$lockData.profile, 'run', '--executable', [string]$lockData.executable)
     $argumentLine = ($arguments | ForEach-Object { ConvertTo-MO2CommandLineArgument ([string]$_) }) -join ' '
+    if ($LaunchMethod -ceq 'RunButton') { $arguments = @(); $argumentLine = '' }
     if ($reuseRetainedMO2) {
         $resumeOwnerResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
         if (-not $resumeOwnerResolution.ok -or @($resumeOwnerResolution.targets).Count -ne 1) {
@@ -5351,7 +5466,11 @@ function Invoke-MO2Launch {
         }
     }
     if ($WhatIf) {
-        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'dry-run' -Data @{ path = $mo2Path; arguments = $arguments; argumentLine = $argumentLine; workingDirectory = (Split-Path -Parent $mo2Path); sessionId = $SessionId; startOnly = [bool]$StartOnly; rootBuilderRecovery = [bool]$RootBuilderRecovery; resumeDisposition = $resumeDisposition; ownershipResolution = $resumeOwnerResolution }
+        if ($LaunchMethod -ceq 'RunButton') {
+            $proof = Get-MO2RunButtonProof -Owner $resumeOwnerResolution.targets[0]
+            Assert-MO2RunButtonProof -Proof $proof -Owned $owned -Owner $resumeOwnerResolution.targets[0]
+        }
+        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'dry-run' -Data @{ path = $mo2Path; launchMethod=$LaunchMethod; arguments = $(if ($LaunchMethod -ceq 'CLI') { $arguments } else { @() }); argumentLine = $(if ($LaunchMethod -ceq 'CLI') { $argumentLine } else { $null }); workingDirectory = (Split-Path -Parent $mo2Path); sessionId = $SessionId; startOnly = [bool]$StartOnly; rootBuilderRecovery = [bool]$RootBuilderRecovery; resumeDisposition=$resumeDisposition; ownershipResolution = $resumeOwnerResolution }
     }
 
     $launchAttemptId = [guid]::NewGuid().ToString('D')
@@ -5361,6 +5480,7 @@ function Invoke-MO2Launch {
     $launchStarted = [pscustomobject][ordered]@{
         contractVersion = $script:MO2ControlContractVersion
         sessionId = $SessionId
+        launchMethod = $LaunchMethod
         mo2Path = $mo2Path
         arguments = $arguments
         argumentLine = $argumentLine
@@ -5402,7 +5522,12 @@ function Invoke-MO2Launch {
         if ($currentData.PSObject.Properties['leaseId']) { $launchStarted | Add-Member -NotePropertyName leaseId -NotePropertyValue ([string]$currentData.leaseId) -Force }
         $launchStarted | Add-Member -NotePropertyName generation -NotePropertyValue ([long]$currentData.generation) -Force
         Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted
-        $process = Start-Process -FilePath $mo2Path -ArgumentList $argumentLine -WorkingDirectory (Split-Path -Parent $mo2Path) -WindowStyle Hidden -PassThru
+        if ($LaunchMethod -ceq 'RunButton') {
+            if ([string]$currentData.status -cne 'mo2-open') { throw 'RunButton session status changed before dispatch.' }
+            $uiDispatch = Invoke-MO2RunButtonDispatch -Config $Config -Owned $currentOwned -Validation $validation -LaunchStarted $launchStarted -ReceiptPath $launchStartedPath -PrepareOnly
+            $process = $uiDispatch.process
+        }
+        else { $process = Start-Process -FilePath $mo2Path -ArgumentList $argumentLine -WorkingDirectory (Split-Path -Parent $mo2Path) -WindowStyle Hidden -PassThru }
         $launchOwnerProcessPath = [IO.Path]::GetFullPath($mo2Path)
         $launchOwnerProcessStartTime = $(try { $process.StartTime.ToUniversalTime().ToString('o') } catch { $null })
         $launchStarted.requestedPid = $process.Id
@@ -5412,7 +5537,7 @@ function Invoke-MO2Launch {
         try { Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted } catch { $receiptWriteError = $_.Exception.Message }
         [object[]]$dispatchBoundChildren = @()
         try {
-            if (-not [string]::IsNullOrWhiteSpace($launchOwnerProcessStartTime)) {
+            if ($LaunchMethod -ceq 'CLI' -and -not [string]::IsNullOrWhiteSpace($launchOwnerProcessStartTime)) {
                 $dispatchBoundChildren = @(Get-MO2DispatchBoundChildEvidence -Config $Config -ParentProcess $process -ParentStartTime $launchOwnerProcessStartTime -DispatchStartedUtc $launchDispatchedUtc)
             }
         }
@@ -5451,6 +5576,25 @@ function Invoke-MO2Launch {
         throw "Launch process $($process.Id) was recorded in the ownership lock, but its dispatch receipt could not be updated: $($dispatch.receiptWriteError)"
     }
     $lockData = $owned.data
+    if ($LaunchMethod -ceq 'RunButton') {
+        # Commit launching before the UI action. If the host is interrupted or
+        # Invoke throws, another launch is blocked; status retains this attempt.
+        $uiError = $null
+        try {
+            $actualDispatch = Invoke-MO2OwnedProcessAction -Config $Config -Owned $owned -Process $process -Action {
+                param($uiConfig,$uiOwned,$uiValidation,$uiStarted,$uiReceipt)
+                Invoke-MO2RunButtonDispatch -Config $uiConfig -Owned $uiOwned -Validation $uiValidation -LaunchStarted $uiStarted -ReceiptPath $uiReceipt
+            } -ArgumentList @($Config,$owned,$validation,$launchStarted,$launchStartedPath)
+            $uiError = $actualDispatch.invocationError
+            $actualDispatch.process.Dispose()
+        }
+        catch { $uiError = $_.Exception.Message }
+        $launchStarted | Add-Member -NotePropertyName invocationError -NotePropertyValue $uiError -Force
+        Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted
+    }
+    if ($LaunchMethod -ceq 'RunButton' -and $launchStarted.invocationError) {
+        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'launch-dispatch-uncertain' -Data @{sessionId=$SessionId;launchStartedReceiptPath=$launchStartedPath;pollWith="status -SessionId $SessionId"} -Errors @('Run invocation returned an error after the dispatch boundary. Do not replay; inspect the retained pending attempt with status/normal cleanup.')
+    }
     if ($StartOnly) {
         return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'launching' -Data @{ sessionId = $SessionId; launcherPid = $process.Id; launchStartedReceiptPath = $launchStartedPath; sessionPath = $lockData.sessionPath; pollWith = "status -SessionId $SessionId"; rootBuilderRecovery = [bool]$RootBuilderRecovery; resumeDisposition = $resumeDisposition }
     }
@@ -5458,7 +5602,7 @@ function Invoke-MO2Launch {
     $primaryGameProcessName = [string]@($Config.mo2.gameProcessNames)[0]
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $status = $null
-    $blockingDialog = $null
+    $blockingDialog = @()
     $launchFailure = $null
     do {
         Start-Sleep -Milliseconds 500
