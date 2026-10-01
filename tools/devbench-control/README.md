@@ -9,6 +9,19 @@ The invocation journal retains the raw MCP result/text, parsed health and typed
 qualification under `identityHealthProbe` before identity admission, including
 failed health. This is diagnosis evidence, never permission to bypass identity
 checks or attribute a manually launched process to an old MO2 session.
+The health classifier is independent of generic action-classifier extensions:
+outcome flags must be actual Booleans, status/code fields must be supported
+typed outcomes, and non-empty `error`/`errors` take precedence over affirmative
+markers. Incomplete legacy identity requires an explicit typed affirmative
+marker; retryability alone is never success. A decoded MCP `isError` result is
+retained and rejected even if its content otherwise looks like valid health.
+`identityHealthFailedProbe` retains the last failed decoded probe when a later
+successful health check replaces `identityHealthProbe`. Transport failure before
+a decoded result exists remains a transport diagnostic, not a fabricated probe.
+Bounded waits preserve typed health failure classification through session open
+and identity refresh. Only classified transient failures may rebind, after
+successful cleanup of the prior MCP session; malformed, guarded, terminal and
+unknown failures cannot be made retryable by message text.
 
 `Invoke-DevBenchControl.ps1` lists and calls the tools exposed by a running
 CSX DevBench server. It prefers streamable-HTTP MCP and negotiates the REST

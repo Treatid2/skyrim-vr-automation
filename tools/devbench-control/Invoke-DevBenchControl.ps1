@@ -540,7 +540,8 @@ function Invoke-RestRequest {
 }
 
 function Invoke-ToolRpc {
-    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation)
+    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation, [switch]$RetainHealthToolError)
+    if ($RetainHealthToolError -and ($Name -cne 'inspect' -or [string]$Arguments['kind'] -cne 'health' -or $Mutation)) { throw 'Decoded tool-error retention is restricted to the read-only identity health probe.' }
     Set-ServerWaitBudgetAtDispatch -Arguments $Arguments
     if ($script:transport -eq 'rest') {
         $escapedName = [Uri]::EscapeDataString($Name)
@@ -549,7 +550,7 @@ function Invoke-ToolRpc {
     }
     $rpc = Invoke-McpRequest -Endpoint $endpoint -Headers $Headers -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/call'; params = @{ name = $Name; arguments = $Arguments } } -Mutation:$Mutation
     if ($rpc.json.PSObject.Properties['error']) { throw "DevBench tools/call failed: $($rpc.json.error | ConvertTo-Json -Compress)" }
-    if ($rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
+    if (-not $RetainHealthToolError -and $rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
         $message = ($rpc.json.result.content | ForEach-Object { $_.text }) -join "`n"
         throw "DevBench tool '$Name' failed: $message"
     }
@@ -898,14 +899,21 @@ function Assert-RuntimeIdentityContent {
     }
     return $Content[0]
 }
-
 function Assert-RuntimeHealthReply {
     param([Parameter(Mandatory)]$Reply)
     $content = @($Reply.content)
     $semantic = Get-DevBenchHealthSemanticStatus -Content $content
+    $rawResult = if ($Reply.PSObject.Properties['rawResult']) { $Reply.rawResult } else { $null }
+    $toolError = $null -ne $rawResult -and $rawResult.PSObject.Properties['isError'] -and ($rawResult.isError -isnot [bool] -or $rawResult.isError)
+    if ($toolError) {
+        $semantic.ok = $false; $semantic.affirmative = $false; $semantic.outcome = 'health-read-contract-failed'
+        $semantic.reasons = @($semantic.reasons) + 'Decoded MCP health tool error.'
+        if ($rawResult.isError -isnot [bool]) { $semantic.rejectedOutcomeEvidence = @($semantic.rejectedOutcomeEvidence) + 'rawResult.isError' }
+    }
     $probe = [pscustomobject]@{ capturedUtc = [DateTime]::UtcNow.ToString('o'); tool = 'inspect'; arguments = @{ kind = 'health' }; rawResult = if ($Reply.PSObject.Properties['rawResult']) { $Reply.rawResult } else { $null }; parsedContent = $content; semantic = $semantic; qualified = [bool]$semantic.ok }
     if ($null -ne $script:invocationRecord -and -not [string]::IsNullOrWhiteSpace($script:invocationEvidencePath)) {
         $script:invocationRecord['identityHealthProbe'] = $probe
+        if (-not $semantic.ok) { $script:invocationRecord['identityHealthFailedProbe'] = $probe }
         Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord
     }
     if (-not $semantic.ok) {
@@ -928,7 +936,7 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
     $errors = [Collections.Generic.List[string]]::new()
     if ($inspectAvailable) {
         try {
-            $qualifiedHealth = Assert-RuntimeHealthReply -Reply (Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'health' } -Headers $Headers)
+            $qualifiedHealth = Assert-RuntimeHealthReply -Reply (Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'health' } -Headers $Headers -RetainHealthToolError)
             if (-not $qualifiedHealth.PSObject.Properties['pid'] -or
                 ($qualifiedHealth.pid -isnot [int] -and $qualifiedHealth.pid -isnot [long]) -or
                 $qualifiedHealth.pid -le 0 -or $qualifiedHealth.pid -gt [int]::MaxValue -or
@@ -939,7 +947,7 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
             $health = $qualifiedHealth
         }
         catch {
-            if ($PropagateRetryable -and (Test-WaitRetryableException -Exception $_.Exception)) { throw }
+            if ($PropagateRetryable -and ([bool]$_.Exception.Data['DevBenchIdentitySemanticFailure'] -or (Test-WaitRetryableException -Exception $_.Exception))) { throw }
             $errors.Add($_.Exception.Message)
         }
     }

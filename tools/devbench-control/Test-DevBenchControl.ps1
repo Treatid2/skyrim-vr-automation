@@ -1154,7 +1154,7 @@ Assert-Test ($entryPointText -match "invocationRecord\['sessionCleanup'\]") 'fin
 Assert-Test ($entryPointText -match "Session cleanup evidence could not be journaled" -and $entryPointText -match 'evidenceJournalFinalized') 'a final journal failure is reported without suppressing the completed controller result'
 Assert-Test ($entryPointText -match "outcome = 'tool-unavailable'" -and $entryPointText -match "codes = @\('tool_unavailable'\)") 'missing optional tools retain a structured unavailable outcome without dispatch'
 Assert-Test ($entryPointText -match 'method = ''tools/list''[\s\S]{0,400}currentTools') 'performance boundaries refresh the live tool registry'
-Assert-Test ($entryPointText -match 'function Invoke-ToolRpc[\s\S]{0,1200}Invoke-McpRequest' -and $entryPointText -match 'function Invoke-ToolRpc[\s\S]{0,500}Invoke-RestRequest') 'tool calls use the shared deadline-bounded request path for both negotiated transports'
+Assert-Test ($entryPointText -match 'function Invoke-ToolRpc[\s\S]{0,1600}Invoke-McpRequest' -and $entryPointText -match 'function Invoke-ToolRpc[\s\S]{0,900}Invoke-RestRequest') 'tool calls use the shared deadline-bounded request path for both negotiated transports'
 Assert-Test ($entryPointText -match 'requestTimeoutSeconds = \$script:requestTimeoutSecondsForRpc') 'receipts expose the effective request timeout'
 Assert-Test ($entryPointText -match '\[string\]\$EvidenceLabel') 'runtime binding evidence accepts an explicit invocation label'
 Assert-Test ($entryPointText -match 'devbench-runtime-binding\.\$safeLabel\.\$stamp\.\$PID\.json') 'parallel runtime bindings use invocation-unique filenames'

@@ -10,12 +10,20 @@ $health = [pscustomobject]@{ exe = 'SkyrimVR.exe'; frame = 47572L; lastTaskFrame
 Assert-Health (Get-DevBenchHealthSemanticStatus -Content @($health)).ok 'plain supported health does not require an invented ok marker'
 Assert-Health (Get-DevBenchHealthSemanticStatus -Content @([pscustomobject]@{ ok = $true; pid = 101L; exe = 'fixture.exe' })).ok 'legacy positive health identity remains valid'
 Assert-Health (-not (Get-DevBenchHealthSemanticStatus -Content @([pscustomobject]@{ retryable = $false; pid = 101L; exe = 'fixture.exe' })).ok) 'a retryable false marker does not qualify incomplete health'
-foreach ($case in @('negative','retryable','pid-string','pid-zero','pid-too-large','exe-empty','port-string','port-too-large','vr-string','frame-negative','task-invalid','pending-negative','missing-frame','unknown','multiple','scalar')) {
+foreach ($case in @('negative','retryable','error-string','errors-array','nested-error','status-string-negative','status-empty','status-scalar','status-name-type','status-value-type','pid-string','pid-zero','pid-too-large','exe-empty','port-string','port-too-large','vr-string','frame-negative','task-invalid','pending-negative','missing-frame','unknown','multiple','scalar')) {
     $h = $health | ConvertTo-Json | ConvertFrom-Json
     $content = @($h)
     switch ($case) {
         negative { $h | Add-Member ok $false }
         retryable { $h | Add-Member ok $false; $h | Add-Member retryable $true; $h | Add-Member error 'main_thread_busy' }
+        error-string { $h | Add-Member error 'main_thread_busy' }
+        errors-array { $h | Add-Member errors @('failure') }
+        nested-error { $h | Add-Member detail ([pscustomobject]@{ error = 'failure' }) }
+        status-string-negative { $h | Add-Member status 'failed' }
+        status-empty { $h | Add-Member status ([pscustomobject]@{}) }
+        status-scalar { $h | Add-Member status 0 }
+        status-name-type { $h | Add-Member status ([pscustomobject]@{ name = 42; value = 0 }) }
+        status-value-type { $h | Add-Member status ([pscustomobject]@{ name = 'ready'; value = '0' }) }
         pid-string { $h.pid = '43980' }
         pid-zero { $h.pid = 0 }
         pid-too-large { $h.pid = 2147483648L }
@@ -33,6 +41,23 @@ foreach ($case in @('negative','retryable','pid-string','pid-zero','pid-too-larg
     }
     $semantic = Get-DevBenchHealthSemanticStatus -Content $content
     Assert-Health (-not $semantic.ok -and $semantic.reasons.Count -gt 0) "reject $case with explicit reasons"
+}
+foreach ($flag in @('ok','success','passed','failed','aborted','retryable')) {
+    foreach ($value in @('false',1,$null,[pscustomobject]@{ unexpected = $true })) {
+        $h = $health | ConvertTo-Json | ConvertFrom-Json
+        $h | Add-Member -NotePropertyName $flag -NotePropertyValue $value
+        $semantic = Get-DevBenchHealthSemanticStatus -Content @($h)
+        Assert-Health (-not $semantic.ok -and @($semantic.rejectedOutcomeEvidence).Count -gt 0) "reject malformed $flag ($($value -as [string]))"
+    }
+}
+Assert-Health (Get-DevBenchHealthSemanticStatus -Content @([pscustomobject]@{ status = [pscustomobject]@{ name = 'ready'; value = 0 }; pid = 101; exe = 'fixture.exe' })).ok 'typed legacy affirmative status remains valid'
+foreach ($classifierShape in @([pscustomobject]@{ known = $true; ok = $true; reasons = @() },[pscustomobject]@{ known = $true; ok = $true; affirmative = $true; rejectedOutcomeEvidence = @(); reasons = @() })) {
+    $independent = & (Get-Module DevBenchControl) {
+        param($Shape,$Health)
+        function Get-DevBenchSemanticStatus { throw 'Health must not depend on this classifier shape.' }
+        Get-DevBenchHealthSemanticStatus -Content @($Health)
+    } $classifierShape $health
+    Assert-Health $independent.ok 'health gate is independent of older/richer generic classifier extensions'
 }
 if ($HealthEvidencePath) {
     $envelope = Get-Content -LiteralPath $HealthEvidencePath -Raw | ConvertFrom-Json
@@ -56,4 +81,13 @@ $journal = Get-Content -LiteralPath $script:invocationEvidencePath -Raw | Conver
 Assert-Health ($refused -and -not $journal.identityHealthProbe.qualified -and $journal.identityHealthProbe.rawResult.content[0].text -eq $reply.rawResult.content[0].text -and -not $journal.dispatchReached) 'failed probe journal preserves raw MCP text and negative semantic outcome before dispatch'
 $good = Assert-RuntimeHealthReply -Reply ([pscustomobject]@{ content = @($health); rawResult = [pscustomobject]@{ isError = $false; content = @() } })
 Assert-Health ($good.pid -eq 43980 -and $script:invocationRecord.identityHealthProbe.qualified) 'supported typed health passes the private controller gate'
+Assert-Health (-not $script:invocationRecord.identityHealthFailedProbe.qualified) 'subsequent good health does not erase the last failed raw probe'
+$toolErrorReply = [pscustomobject]@{ content = @($health); rawResult = [pscustomobject]@{ isError = $true; content = @([pscustomobject]@{ type = 'text'; text = 'exact decoded tool failure' }) } }
+$refused = $false
+try { Assert-RuntimeHealthReply -Reply $toolErrorReply | Out-Null } catch { $refused = $_.Exception.Message -match 'Decoded MCP health tool error' }
+Assert-Health ($refused -and -not $script:invocationRecord.identityHealthProbe.qualified -and $script:invocationRecord.identityHealthProbe.rawResult.content[0].text -ceq 'exact decoded tool failure') 'decoded MCP error overrides otherwise valid health and retains exact raw result'
+function Write-JsonAtomic($Path,$Value) { throw 'fixture journal write failure' }
+$refused = $false
+try { Assert-RuntimeHealthReply -Reply ([pscustomobject]@{ content = @($health); rawResult = [pscustomobject]@{ isError = $false } }) | Out-Null } catch { $refused = $_.Exception.Message -eq 'fixture journal write failure' }
+Assert-Health $refused 'health journal write failure blocks identity admission'
 [pscustomobject]@{ ok = $true; tests = $passes.Count; passes = @($passes); fixture = $fixture } | ConvertTo-Json -Depth 5
