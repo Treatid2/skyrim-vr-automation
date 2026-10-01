@@ -420,11 +420,12 @@ function Invoke-McpRequest {
 }
 
 function Invoke-ToolRpc {
-    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation)
+    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation, [switch]$RetainHealthToolError)
+    if ($RetainHealthToolError -and ($Name -cne 'inspect' -or [string]$Arguments['kind'] -cne 'health' -or $Mutation)) { throw 'Decoded tool-error retention is restricted to the read-only identity health probe.' }
     Set-ServerWaitBudgetAtDispatch -Arguments $Arguments
     $rpc = Invoke-McpRequest -Endpoint $endpoint -Headers $Headers -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/call'; params = @{ name = $Name; arguments = $Arguments } } -Mutation:$Mutation
     if ($rpc.json.PSObject.Properties['error']) { throw "DevBench tools/call failed: $($rpc.json.error | ConvertTo-Json -Compress)" }
-    if ($rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
+    if (-not $RetainHealthToolError -and $rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
         $message = ($rpc.json.result.content | ForEach-Object { $_.text }) -join "`n"
         throw "DevBench tool '$Name' failed: $message"
     }
@@ -487,6 +488,7 @@ function Test-WaitRetryableException {
         return $false
     }
     $message = [string]$Exception.Message
+    if ([bool]$Exception.Data['DevBenchIdentitySemanticFailure']) { return [bool]$Exception.Data['DevBenchIdentityRetryable'] }
     $statusCode = $null
     try { $statusCode = [int]$Exception.Response.StatusCode } catch { $statusCode = $null }
     return $statusCode -in @(404, 429, 502, 503, 504) -or
@@ -565,7 +567,7 @@ function Close-McpSessionForRebind {
     return $cleanup
 }
 
-function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
+function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity, [switch]$PropagateRetryable) {
     $baseHeaders = @{ Accept = 'application/json, text/event-stream'; 'Content-Type' = 'application/json' }
     $sessionHeaders = $null
     try {
@@ -589,7 +591,7 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity) {
         $sessionTools = @($listRpc.json.result.tools)
         $identity = $null
         if (-not $SkipRuntimeIdentityVerification) {
-            $identity = Get-RuntimeIdentity -Runtime $Runtime -Headers $sessionHeaders -Tools $sessionTools -AllowDeferredBuildIdentity:$AllowDeferredBuildIdentity
+            $identity = Get-RuntimeIdentity -Runtime $Runtime -Headers $sessionHeaders -Tools $sessionTools -AllowDeferredBuildIdentity:$AllowDeferredBuildIdentity -PropagateRetryable:$PropagateRetryable
             if ($identity.errors.Count -gt 0) { throw "DevBench runtime identity verification failed: $($identity.errors -join ' ')" }
         }
         return [pscustomobject][ordered]@{ headers = $sessionHeaders; tools = $sessionTools; runtimeIdentity = $identity; sessionId = $sessionId }
@@ -645,9 +647,17 @@ function Assert-RuntimeHealthReply {
     param([Parameter(Mandatory)]$Reply)
     $content = @($Reply.content)
     $semantic = Get-DevBenchHealthSemanticStatus -Content $content
+    $rawResult = if ($Reply.PSObject.Properties['rawResult']) { $Reply.rawResult } else { $null }
+    $toolError = $null -ne $rawResult -and $rawResult.PSObject.Properties['isError'] -and ($rawResult.isError -isnot [bool] -or $rawResult.isError)
+    if ($toolError) {
+        $semantic.ok = $false; $semantic.affirmative = $false; $semantic.outcome = 'health-read-contract-failed'
+        $semantic.reasons = @($semantic.reasons) + 'Decoded MCP health tool error.'
+        if ($rawResult.isError -isnot [bool]) { $semantic.rejectedOutcomeEvidence = @($semantic.rejectedOutcomeEvidence) + 'rawResult.isError' }
+    }
     $probe = [pscustomobject]@{ capturedUtc = [DateTime]::UtcNow.ToString('o'); tool = 'inspect'; arguments = @{ kind = 'health' }; rawResult = if ($Reply.PSObject.Properties['rawResult']) { $Reply.rawResult } else { $null }; parsedContent = $content; semantic = $semantic; qualified = [bool]$semantic.ok }
     if ($null -ne $script:invocationRecord -and -not [string]::IsNullOrWhiteSpace($script:invocationEvidencePath)) {
         $script:invocationRecord['identityHealthProbe'] = $probe
+        if (-not $semantic.ok) { $script:invocationRecord['identityHealthFailedProbe'] = $probe }
         Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord
     }
     if (-not $semantic.ok) {
@@ -659,7 +669,7 @@ function Assert-RuntimeHealthReply {
     return $content[0]
 }
 
-function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [switch]$AllowDeferredBuildIdentity) {
+function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [switch]$AllowDeferredBuildIdentity, [switch]$PropagateRetryable) {
     $expectations = Get-DevBenchRuntimeExpectations -Runtime $Runtime
     if (-not [string]::IsNullOrWhiteSpace($ArtifactPath)) { $expectations.artifactPath = [IO.Path]::GetFullPath($ArtifactPath) }
     if (-not [string]::IsNullOrWhiteSpace($ExpectedBuildId)) { $expectations.buildId = $ExpectedBuildId }
@@ -669,8 +679,13 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
     $health = $null
     $errors = [Collections.Generic.List[string]]::new()
     if ($inspectAvailable) {
-        try { $health = Assert-RuntimeHealthReply -Reply (Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'health' } -Headers $Headers) }
-        catch { $errors.Add($_.Exception.Message) }
+        try { $health = Assert-RuntimeHealthReply -Reply (Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'health' } -Headers $Headers -RetainHealthToolError) }
+        catch {
+            # Preserve terminal classification too: message text must never turn
+            # a malformed/guarded health failure into a transient wait retry.
+            if ($PropagateRetryable -and [bool]$_.Exception.Data['DevBenchIdentitySemanticFailure']) { throw }
+            $errors.Add($_.Exception.Message)
+        }
     }
     else { $errors.Add("The authoritative tool list does not expose 'inspect' for process identity verification.") }
     if ($null -eq $listenerPid) { $errors.Add("Could not prove one loopback listener owner for port $($expectations.port).") }
@@ -1006,7 +1021,7 @@ try {
             $attempts++
             if ($null -eq $headers) {
                 try {
-                    $session = Open-McpSession -Runtime $runtime -AllowDeferredBuildIdentity:($Condition -in @('toolAvailable', 'serviceReady'))
+                    $session = Open-McpSession -Runtime $runtime -AllowDeferredBuildIdentity:($Condition -in @('toolAvailable', 'serviceReady')) -PropagateRetryable
                     $headers = $session.headers
                     $tools = @($session.tools)
                     $runtimeIdentity = $session.runtimeIdentity
@@ -1207,9 +1222,20 @@ try {
                 $currentTools = @($currentList.json.result.tools)
                 $toolPresent = @($currentTools | Where-Object name -eq $Tool).Count -eq 1
                 if ($toolPresent -and -not $SkipRuntimeIdentityVerification) {
-                    $refreshedIdentity = Get-RuntimeIdentity -Runtime $runtime -Headers $headers -Tools $currentTools
-                    if ($refreshedIdentity.errors.Count -gt 0) { throw "DevBench runtime identity verification failed after target registration: $($refreshedIdentity.errors -join ' ')" }
-                    $runtimeIdentity = $refreshedIdentity
+                    try {
+                        $refreshedIdentity = Get-RuntimeIdentity -Runtime $runtime -Headers $headers -Tools $currentTools -PropagateRetryable
+                        if ($refreshedIdentity.errors.Count -gt 0) { throw "DevBench runtime identity verification failed after target registration: $($refreshedIdentity.errors -join ' ')" }
+                        $runtimeIdentity = $refreshedIdentity
+                    }
+                    catch {
+                        if (-not (Test-WaitRetryableException -Exception $_.Exception)) { throw }
+                        Close-McpSessionForRebind -Headers $headers | Out-Null
+                        $headers = $null
+                        $observation = [pscustomobject]@{ satisfied = $false; retryable = $true; phase = 'identity-refresh'; probeError = $_.Exception.Message }
+                        Start-OperationDelay -RequestedMilliseconds $currentDelay
+                        $currentDelay = [Math]::Min($MaxPollMilliseconds, $currentDelay * 2)
+                        continue
+                    }
                 }
                 $service = $null
                 if ($Condition -eq 'serviceReady' -and $toolPresent) {
