@@ -475,21 +475,56 @@ def main(argv=None):
         result = dict(ok=False,state='stopped-inputs-capture-retained',error=str(error),
                       completedChanges=sweep.completed if sweep else 0,mutationReplayPerformed=False)
     finally:
+        original_outcome = dict(result)
+        finalization_errors = []
+        lock_released = lock is None
         result.update(startedUtc=started,endedUtc=utc(),phase=args.phase,
                       captureFinalized=False,gameLaunched=False,tracePath=str(trace.path) if trace else None)
+        def finalization_error(operation, error):
+            finalization_errors.append(dict(operation=operation,error=str(error)))
+        try:
+            if trace:
+                try:
+                    trace.write('terminal',result=dict(result))
+                except Exception as error:
+                    finalization_error('terminal-trace-write',error)
+                try:
+                    trace.close()
+                except Exception as error:
+                    finalization_error('terminal-trace-close',error)
+        finally:
+            if lock is not None:
+                try:
+                    lock.close()
+                except Exception as error:
+                    finalization_error('owned-lock-close',error)
+                # Close failure must not suppress the independent unlink attempt.
+                try:
+                    lock_path.unlink()  # Only THIS invocation acquired this lock.
+                    lock_released = True
+                except Exception as error:
+                    finalization_error('owned-lock-unlink',error)
+        result.update(sweepOutcome=original_outcome,ownedLockReleased=lock_released,
+                      terminalEvidenceFinalized=False,evidenceFinalizationErrors=finalization_errors)
+        if finalization_errors:
+            result.update(ok=False,state='terminal-finalization-failed')
         if trace:
-            try:
-                trace.write('terminal',result=result)
-            finally:
-                trace.close()
             receipt = Path(args.output)/'receipt.json'
-            with receipt.open('x',encoding='utf-8') as stream:
-                json.dump(result,stream,indent=2,allow_nan=False)
-                stream.flush()
-                os.fsync(stream.fileno())
-        if lock:
-            lock.close()
-            lock_path.unlink()  # Only the exclusive lock created by THIS run.
+            pending_receipt = Path(args.output)/('receipt.pending-'+str(uuid.uuid4())+'.json')
+            result['receiptStagingPath'] = str(pending_receipt)
+            # Publish only the fully written/closed file, with exclusive creation
+            # of the canonical name. Retain staging as audit even on failure.
+            # A pending path is never a completed receipt. No overwrite fallback.
+            result['terminalEvidenceFinalized'] = not finalization_errors
+            try:
+                with pending_receipt.open('x',encoding='utf-8') as stream:
+                    json.dump(result,stream,indent=2,allow_nan=False)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.link(pending_receipt,receipt)
+            except Exception as error:
+                finalization_error('terminal-receipt-persist',error)
+                result.update(ok=False,state='terminal-finalization-failed',terminalEvidenceFinalized=False)
     print(json.dumps(result,allow_nan=False))
     return 0 if result['ok'] else 2
 

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import copy
+import contextlib
+import io
 import importlib.util
 import json
 import os
@@ -62,6 +64,114 @@ class Unit(unittest.TestCase):
     def tearDown(self):
         self.trace.close()
         self.temp.cleanup()
+    def test_cli_terminal_faults_always_attempt_own_cleanup_and_report(self):
+        original_open, original_unlink = Path.open, Path.unlink
+        original_write, original_close, original_fsync, original_link = m.Trace.write, m.Trace.close, m.os.fsync, m.os.link
+        for fault in ('none','trace-write','trace-close','receipt-open','receipt-write','receipt-flush','receipt-fsync','receipt-close','receipt-publish','lock-close','lock-unlink'):
+            for earlier_error in (False, True):
+                with self.subTest(fault=fault,earlier_error=earlier_error):
+                    folder=Path(self.temp.name)/f'final-{fault}-{earlier_error}'
+                    folder.mkdir()
+                    session=folder/'session';session.mkdir()
+                    output=folder/'output'
+                    protocol=folder/'protocol.json'
+                    protocol.write_text(json.dumps(dict(limits=dict(maximumInputRequestsInFlight=1,mutationRetries=0,phaseDeadlineSeconds=900,menuSettleDeadlineSeconds=30),phases=[dict(id='qualification',maximumChanges=20)])))
+                    events=[]
+                    receipt_fd=[None]
+                    class FileProxy:
+                        def __init__(self,stream,kind):self.stream,self.kind=stream,kind
+                        def __getattr__(self,name):return getattr(self.stream,name)
+                        def __enter__(self):return self
+                        def __exit__(self,*unused):self.close()
+                        def write(self,value):
+                            if self.kind=='receipt' and fault=='receipt-write':raise OSError('injected receipt write')
+                            return self.stream.write(value)
+                        def flush(self):
+                            if self.kind=='receipt' and fault=='receipt-flush':raise OSError('injected receipt flush')
+                            return self.stream.flush()
+                        def close(self):
+                            events.append(self.kind+'-close')
+                            self.stream.close()
+                            if fault==self.kind+'-close':raise OSError('injected '+self.kind+' close')
+                    def faulty_open(path,*args,**kwargs):
+                        if path.name.startswith('receipt.pending-'):
+                            if fault=='receipt-open':raise OSError('injected receipt open')
+                            stream=original_open(path,*args,**kwargs);receipt_fd[0]=stream.fileno()
+                            return FileProxy(stream,'receipt')
+                        if path.name=='.racemenu-sweep.lock':return FileProxy(original_open(path,*args,**kwargs),'lock')
+                        return original_open(path,*args,**kwargs)
+                    def faulty_unlink(path,*args,**kwargs):
+                        if path.name=='.racemenu-sweep.lock':
+                            events.append('lock-unlink')
+                            if fault=='lock-unlink':raise OSError('injected lock unlink')
+                        return original_unlink(path,*args,**kwargs)
+                    def faulty_trace_write(trace,kind,**values):
+                        if kind=='terminal' and fault=='trace-write':raise OSError('injected terminal trace')
+                        return original_write(trace,kind,**values)
+                    def faulty_trace_close(trace):
+                        events.append('trace-close');original_close(trace)
+                        if fault=='trace-close':raise OSError('injected trace close')
+                    def faulty_fsync(fd):
+                        if receipt_fd[0] is not None and fd==receipt_fd[0] and fault=='receipt-fsync':raise OSError('injected receipt fsync')
+                        return original_fsync(fd)
+                    def faulty_link(source,destination):
+                        if fault=='receipt-publish':raise OSError('injected receipt publication')
+                        return original_link(source,destination)
+                    class Adapter:
+                        state=dict(sessionDirectory=str(session))
+                    class CompletedSweep:
+                        completed=3
+                        def __init__(self,*args,**kwargs):pass
+                        def run(self):
+                            events.append('single-sweep-run')
+                            if earlier_error:raise m.StopSweep('original sweep failure')
+                            return dict(ok=True,state='bounded-count-completed',completedChanges=3)
+                    argv=['--capture-session','retained-session','--capture-controller',str(ROOT/'Invoke-SweepDevBench.ps1'),'--confirm-existing-capture-lane','--pwsh','fixture-only','--protocol',str(protocol),'--qualification','owner-fixture','--output',str(output),'--phase','qualification','--maximum-changes','3']
+                    stdout=io.StringIO()
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(patch.object(m,'CaptureAdapter',return_value=Adapter()))
+                        stack.enter_context(patch.object(m,'Sweep',CompletedSweep))
+                        stack.enter_context(patch.object(m,'attest',return_value={}))
+                        stack.enter_context(patch.object(Path,'open',faulty_open))
+                        stack.enter_context(patch.object(Path,'unlink',faulty_unlink))
+                        stack.enter_context(patch.object(m.Trace,'write',faulty_trace_write))
+                        stack.enter_context(patch.object(m.Trace,'close',faulty_trace_close))
+                        stack.enter_context(patch.object(m.os,'fsync',faulty_fsync))
+                        stack.enter_context(patch.object(m.os,'link',faulty_link))
+                        stack.enter_context(contextlib.redirect_stdout(stdout))
+                        code=m.main(argv)
+                    result=json.loads(stdout.getvalue())
+                    self.assertEqual(events.count('single-sweep-run'),1)
+                    self.assertIn('lock-close',events);self.assertIn('lock-unlink',events)
+                    self.assertEqual(result['completedChanges'],3)
+                    self.assertEqual(result['sweepOutcome']['ok'],not earlier_error)
+                    if earlier_error:self.assertEqual(result['sweepOutcome']['error'],'original sweep failure')
+                    self.assertFalse(result['captureFinalized']);self.assertFalse(result['gameLaunched'])
+                    self.assertEqual(result['ownedLockReleased'],fault!='lock-unlink')
+                    self.assertEqual((session/'.racemenu-sweep.lock').exists(),fault=='lock-unlink')
+                    if fault!='none':
+                        self.assertEqual(code,2);self.assertFalse(result['ok'])
+                        self.assertFalse(result['terminalEvidenceFinalized'])
+                        self.assertTrue(result['evidenceFinalizationErrors'])
+                    else:
+                        self.assertEqual(code,2 if earlier_error else 0)
+                        self.assertTrue(result['terminalEvidenceFinalized'])
+                        self.assertEqual(result['evidenceFinalizationErrors'],[])
+                    if fault.startswith('receipt-'):
+                        self.assertFalse((output/'receipt.json').exists())
+                    elif (output/'receipt.json').exists():
+                        self.assertEqual(json.loads((output/'receipt.json').read_text()),result)
+    def test_cli_never_removes_a_foreign_unacquired_lock(self):
+        foreign=Path(self.temp.name)/'.racemenu-sweep.lock'
+        foreign.write_text('foreign-owner-evidence')
+        with patch.object(m,'load',side_effect=OSError('preflight rejected before lock acquisition')), patch.object(Path,'unlink') as unlink:
+            stdout=io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code=m.main(['--capture-session','retained','--capture-controller','fixture','--confirm-existing-capture-lane','--pwsh','fixture','--protocol','bad','--qualification','fixture','--output','unused','--phase','qualification'])
+            self.assertEqual(code,2)
+            self.assertFalse(json.loads(stdout.getvalue())['ok'])
+            unlink.assert_not_called()
+            self.assertEqual(foreign.read_text(),'foreign-owner-evidence')
     def run_fake(self, fake, phase='human-beast-alternation', count=2, **kw):
         return m.Sweep(fake,self.trace,phase,count,phase_seconds=1,settle_seconds=.05,
                        pace=0,poll=.001,race_ids=[1,2],**kw).run()
