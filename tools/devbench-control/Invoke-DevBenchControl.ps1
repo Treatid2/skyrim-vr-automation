@@ -641,6 +641,24 @@ function Get-ListenerPid([int]$Port) {
     return [int]$records[0]
 }
 
+function Assert-RuntimeHealthReply {
+    param([Parameter(Mandatory)]$Reply)
+    $content = @($Reply.content)
+    $semantic = Get-DevBenchHealthSemanticStatus -Content $content
+    $probe = [pscustomobject]@{ capturedUtc = [DateTime]::UtcNow.ToString('o'); tool = 'inspect'; arguments = @{ kind = 'health' }; rawResult = if ($Reply.PSObject.Properties['rawResult']) { $Reply.rawResult } else { $null }; parsedContent = $content; semantic = $semantic; qualified = [bool]$semantic.ok }
+    if ($null -ne $script:invocationRecord -and -not [string]::IsNullOrWhiteSpace($script:invocationEvidencePath)) {
+        $script:invocationRecord['identityHealthProbe'] = $probe
+        Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord
+    }
+    if (-not $semantic.ok) {
+        $exception = [InvalidOperationException]::new("Unqualified runtime identity from inspect health: $(@($semantic.reasons) -join '; ')")
+        $exception.Data['DevBenchIdentitySemanticFailure'] = $true
+        $exception.Data['DevBenchIdentityRetryable'] = $semantic.transient -and -not $semantic.guarded -and @($semantic.rejectedOutcomeEvidence).Count -eq 0 -and @($semantic.reasons | Where-Object { $_ -match 'must be|requires|out of range' }).Count -eq 0
+        throw $exception
+    }
+    return $content[0]
+}
+
 function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [switch]$AllowDeferredBuildIdentity) {
     $expectations = Get-DevBenchRuntimeExpectations -Runtime $Runtime
     if (-not [string]::IsNullOrWhiteSpace($ArtifactPath)) { $expectations.artifactPath = [IO.Path]::GetFullPath($ArtifactPath) }
@@ -651,7 +669,7 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
     $health = $null
     $errors = [Collections.Generic.List[string]]::new()
     if ($inspectAvailable) {
-        try { $health = @(Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'health' } -Headers $Headers).content | Select-Object -First 1 }
+        try { $health = Assert-RuntimeHealthReply -Reply (Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'health' } -Headers $Headers) }
         catch { $errors.Add($_.Exception.Message) }
     }
     else { $errors.Add("The authoritative tool list does not expose 'inspect' for process identity verification.") }
