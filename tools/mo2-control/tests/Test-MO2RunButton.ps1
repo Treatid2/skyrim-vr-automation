@@ -25,7 +25,7 @@ $result = & $module {
     $entry=[pscustomobject]@{title='Fixture SKSE';binary=(Join-Path $root 'sksevr_loader.exe');arguments='';workingDirectory=$root}
     $script:RunValidation=[pscustomobject]@{ok=$true;warnings=@();errors=@();data=[pscustomobject]@{config=[pscustomobject]@{mo2Executable=$cfg.mo2.executable};executables=@($entry);processes=[pscustomobject]@{mo2=@($script:RunOwner);game=@()};rootBuilder=[pscustomobject]@{active=@()};sessionLock=[pscustomobject]@{ownerIdentityMatched=$true}}}
     function Reset-Fixture {
-        $script:RunOwned=[pscustomobject]@{path='fixture-lock';sessionId='fixture';accessId='private-fixture';data=[pscustomobject]@{generation=1;status='mo2-open';profile='Fixture Profile';executable='Fixture SKSE';sessionPath=$root;requirements=[pscustomobject]@{skseLoader=$true};ownerPid=111}}
+        $script:RunOwned=[pscustomobject]@{path='fixture-lock';sessionId='fixture';accessId='private-fixture';data=[pscustomobject]@{generation=1;accessId='private-fixture';status='mo2-open';profile='Fixture Profile';executable='Fixture SKSE';sessionPath=$root;requirements=[pscustomobject]@{skseLoader=$true};ownerPid=111}}
         $script:RunInvokes=0; $script:RunDesktop=$true; $script:RunThrow=$false; $script:RunStale=$false; $script:RunGame=$false; $script:RunObserveAfterUI=$false
     }
     Set-Item Function:script:Get-MO2OwnedSession { $script:RunOwned }
