@@ -722,6 +722,28 @@ try {
     $formattingRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
     Assert-Test ($formattingRestore.ok -and $formattingRestore.data.settingsRestoreValidation.formattingOnlyDriftAccepted -and $formattingRestore.data.settingsRestoreValidation.authorizationRoute -eq 'semantic-formatting-only') 'restore accepts formatting-only SteamVR settings drift'
 
+    $numericDrift = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
+    $numericDrift.driver_null.displayFrequency = 90
+    foreach ($key in @('positionX','positionZ','yawDegrees','pitchDegrees','rollDegrees')) { $numericDrift.driver_codex_head_pose[$key] = 0 }
+    $numericDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+    $numericAuthority = @($settingsPath,$openVrPathsPath,(Join-Path $evidence 'steamvr-null-receipt.json'),[string]$inspectBefore.data.targetControl.journalPath,(Join-Path $evidence 'steamvr-null-apply.journal.json'))
+    $numericBefore = @($numericAuthority | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash })
+    $numericRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+    $numericAfter = @($numericAuthority | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash })
+    Assert-Test ($numericRestore.ok -and $numericRestore.data.settingsRestoreValidation.authorized -and $numericRestore.data.settingsRestoreValidation.controlledDifferences.Count -eq 0 -and $numericRestore.data.settingsRestoreValidation.formattingOnlyDriftAccepted -and ($numericBefore -join ',') -ceq ($numericAfter -join ',')) 'public preview accepts all six equal Double-to-integer protected values without mutation'
+    foreach ($case in @(@('driver_null','displayFrequency'),@('driver_codex_head_pose','positionX'),@('driver_codex_head_pose','positionZ'),@('driver_codex_head_pose','yawDegrees'),@('driver_codex_head_pose','pitchDegrees'),@('driver_codex_head_pose','rollDegrees'))) {
+        foreach ($change in @('actual-value','string','boolean')) {
+            $candidate = $numericDrift | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable
+            $candidate[$case[0]][$case[1]] = switch ($change) { 'actual-value' { 17 }; 'string' { [string]$candidate[$case[0]][$case[1]] }; 'boolean' { $false } }
+            $candidate | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+            $before = @($numericAuthority | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash })
+            $refused = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -Compact -NoExit | ConvertFrom-Json
+            $after = @($numericAuthority | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash })
+            Assert-Test (-not $refused.ok -and $refused.state -eq 'blocked' -and ($refused.errors -join ' ') -match [regex]::Escape($case[0]+'.'+$case[1]) -and ($before -join ',') -ceq ($after -join ',')) "public committed restore rejects $change at $($case[0]).$($case[1]) without altering any target/authority"
+        }
+    }
+    $numericDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+
     $runtimeDrift = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
     $runtimeDrift['GpuSpeed'] = [ordered]@{ gpuSpeed0 = 1234; gpuSpeedCount = 1 }
     $runtimeDrift['LastKnown'] = [ordered]@{ HMDManufacturer = 'Null'; HMDModel = 'Null Model' }
@@ -887,6 +909,8 @@ try {
     [IO.File]::WriteAllText($openVrPathsPath, $isolatedText, [Text.UTF8Encoding]::new($false))
     $commitHistory = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
     $commitHistory['dashboard']['lastAccessedExternalOverlayKey'] = 'runtime.history.before-restore'
+    $commitHistory.driver_null.displayFrequency = 90
+    foreach ($key in @('positionX','positionZ','yawDegrees','pitchDegrees','rollDegrees')) { $commitHistory.driver_codex_head_pose[$key] = 0 }
     $commitHistory | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
     $isolatedRestoreDry = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -WhatIf -Compact | ConvertFrom-Json
     Assert-Test ($isolatedRestoreDry.ok -and $isolatedRestoreDry.data.externalDriverIsolation.enabled -and $isolatedRestoreDry.data.wouldRestoreOpenVRPaths) 'restore dry-run reports exact external-driver restoration'

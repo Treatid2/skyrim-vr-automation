@@ -475,6 +475,22 @@ function Test-JsonDictionaryContains($Dictionary, [string]$Key) {
     return $Dictionary -is [Collections.IDictionary] -and $Dictionary.Contains($Key)
 }
 
+function Get-JsonNumberIdentity($Value) {
+    # Compare JSON numeric values exactly as decimal coefficient/exponent,
+    # without coercing an integer/decimal through a rounded Double. This also
+    # accepts SteamVR's harmless 90.0 -> 90 and 0.0 -> 0 reserialization.
+    $json = $Value | ConvertTo-Json -Compress
+    $match = [regex]::Match($json, '\A(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?\z')
+    if (-not $match.Success) { return $null } # NaN/Infinity serialize as strings.
+    $digits = ($match.Groups[2].Value + $match.Groups[3].Value).TrimStart('0')
+    if ($digits.Length -eq 0) { return '0@0' }
+    $exponent = if ($match.Groups[4].Success) { [long]::Parse($match.Groups[4].Value, [Globalization.CultureInfo]::InvariantCulture) } else { [long]0 }
+    $exponent -= $match.Groups[3].Value.Length
+    $coefficient = $digits.TrimEnd('0')
+    $exponent += $digits.Length - $coefficient.Length
+    return $match.Groups[1].Value + $coefficient + '@' + $exponent.ToString([Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Test-JsonValueEquivalent([AllowNull()]$Expected, [AllowNull()]$Actual) {
     if ($null -eq $Expected -or $null -eq $Actual) { return $null -eq $Expected -and $null -eq $Actual }
     if ($Expected -is [Collections.IDictionary] -or $Actual -is [Collections.IDictionary]) {
@@ -496,13 +512,13 @@ function Test-JsonValueEquivalent([AllowNull()]$Expected, [AllowNull()]$Actual) 
     }
     if ($Expected -is [string] -or $Actual -is [string]) { return $Expected -is [string] -and $Actual -is [string] -and [string]$Expected -ceq [string]$Actual }
     if ($Expected -is [bool] -or $Actual -is [bool]) { return $Expected -is [bool] -and $Actual -is [bool] -and $Expected.Equals($Actual) }
-    # Never let PowerShell's scalar coercion turn false/0 or true/1 into
-    # formatting-only drift. Numeric comparison is deliberately conservative:
-    # compare invariant JSON representations, not a lossy common numeric type.
-    # Integer widths normalize; integer 1 versus floating 1.0 is refused.
+    # Only numeric JSON kinds reach normalization. Booleans/strings never
+    # borrow numeric equality; exact decimal normalization avoids precision loss.
     $numericTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64], [single], [double], [decimal], [bigint])
     if ($Expected.GetType() -notin $numericTypes -or $Actual.GetType() -notin $numericTypes) { return $false }
-    return ($Expected | ConvertTo-Json -Compress) -ceq ($Actual | ConvertTo-Json -Compress)
+    $expectedIdentity = Get-JsonNumberIdentity $Expected
+    $actualIdentity = Get-JsonNumberIdentity $Actual
+    return $null -ne $expectedIdentity -and $null -ne $actualIdentity -and $expectedIdentity -ceq $actualIdentity
 }
 
 function Get-JsonDifferencePaths([AllowNull()]$Expected, [AllowNull()]$Actual, [string]$Path = '') {

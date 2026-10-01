@@ -9,7 +9,7 @@ $entry = Join-Path $PSScriptRoot 'Invoke-SteamVRNullControl.ps1'
 $parseErrors = $null; $tokens = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($entry,[ref]$tokens,[ref]$parseErrors)
 Assert-Semantic (@($parseErrors).Count -eq 0) 'entry point parses without errors'
-foreach ($name in @('ConvertTo-CanonicalJsonValue','Get-JsonSemanticSha256','Test-JsonDictionaryContains','Test-JsonValueEquivalent','Get-JsonDifferencePaths','Get-SettingsRestoreValidation','Get-MO2ProviderInventoryEvidence','Assert-MO2NullAdmissionMatchesReceipt')) {
+foreach ($name in @('ConvertTo-CanonicalJsonValue','Get-JsonSemanticSha256','Test-JsonDictionaryContains','Get-JsonNumberIdentity','Test-JsonValueEquivalent','Get-JsonDifferencePaths','Get-SettingsRestoreValidation','Get-MO2ProviderInventoryEvidence','Assert-MO2NullAdmissionMatchesReceipt')) {
     $node = @($ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true))[0]
     Invoke-Expression $node.Extent.Text
 }
@@ -19,7 +19,13 @@ foreach ($pair in @(@($false,0),@($true,1),@(0,$false),@(1,$true),@('0',0),@(0,'
 }
 Assert-Semantic (Test-JsonValueEquivalent $false $false) 'identical Boolean values compare equal'
 Assert-Semantic (Test-JsonValueEquivalent ([int32]1) ([int64]1)) 'integer width alone is not JSON drift'
-Assert-Semantic (-not (Test-JsonValueEquivalent 1 1.0)) 'integer versus floating representation is conservatively refused'
+foreach ($pair in @(@(1,1.0),@(90.0,90),@(0.0,0),@([decimal]0.100,[double]0.1),@([double]1e3,1000),@([double]1e-10,[decimal]0.0000000001),@(-90,-90.0),@([double]::NegativeZero,0))) {
+    Assert-Semantic (Test-JsonValueEquivalent $pair[0] $pair[1]) 'equal JSON numeric values qualify across exact representations'
+    Assert-Semantic (Test-JsonValueEquivalent $pair[1] $pair[0]) 'numeric equivalence is symmetric'
+}
+foreach ($pair in @(@(90.0,91),@(0.0,0.0001),@([double]1e-10,[double]1e-11),@(-90,90),@([decimal]9007199254740993,[double]9007199254740992),@([double]::NaN,[double]::NaN),@([double]::PositiveInfinity,[double]::PositiveInfinity),@(90.0,'90'),@(0.0,$false))) {
+    Assert-Semantic (-not (Test-JsonValueEquivalent $pair[0] $pair[1])) 'different values or nonnumeric/nonfinite kinds never qualify'
+}
 Assert-Semantic (-not (Test-JsonValueEquivalent ([long]9007199254740993) ([double]9007199254740992))) 'numeric comparison cannot round a large integer into equality'
 $inventory = [ordered]@{profile='task';modListPath='C:\fixture\profiles\task\modlist.txt';providers=@([ordered]@{classification='OCU';modName='OCU';modPath='C:\fixture\mods\OCU';lineNumber=85;marker='-';enabled=$false;markers=[ordered]@{rootOpenVrApi=$true;rootOpenCompositeIni=$true;openCompositeInput=$false}});errors=@()}
 function New-Admission($Inventory) {
@@ -88,6 +94,29 @@ function Assess-History($Document) {
     $Document | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $currentPath -Encoding utf8NoBOM
     Get-SettingsRestoreValidation -Receipt @{settingsSha256Null='different'} -BackupPath 'fixture-only' -CurrentPath $currentPath
 }
+# Reproduce all six protected values reported by the stopped live transaction.
+$savedNumericExpected = Clone-Value $expected
+$expected['driver_null'] = [ordered]@{displayFrequency=90.0}
+$expected['driver_codex_head_pose'] = [ordered]@{positionX=0.0;positionZ=0.0;yawDegrees=0.0;pitchDegrees=0.0;rollDegrees=0.0}
+function Get-NullSettingsExpectation($Receipt,$BackupPath) {
+    $controlled=@('dashboard.enableDashboard','steamvr.forcedDriver')
+    if ($expected.Contains('driver_null')) { $controlled+=@('driver_null.displayFrequency','driver_codex_head_pose.positionX','driver_codex_head_pose.positionZ','driver_codex_head_pose.yawDegrees','driver_codex_head_pose.pitchDegrees','driver_codex_head_pose.rollDegrees') }
+    [pscustomobject]@{value=$expected;profile=$expected;controlledPaths=$controlled;semanticSha256=Get-JsonSemanticSha256 -Value $expected}
+}
+$numericCandidate = Clone-Value $expected
+$numericCandidate.driver_null.displayFrequency = 90
+foreach ($key in @('positionX','positionZ','yawDegrees','pitchDegrees','rollDegrees')) { $numericCandidate.driver_codex_head_pose[$key] = 0 }
+$numericAssessment = Assess-History $numericCandidate
+Assert-Semantic ($numericAssessment.authorized -and $numericAssessment.controlledContractMatch -and $numericAssessment.controlledDifferences.Count -eq 0 -and $numericAssessment.formattingOnlyDriftAccepted) 'all six protected Double-to-integer rewrites are formatting-only, not value drift'
+foreach ($case in @(@('driver_null','displayFrequency'),@('driver_codex_head_pose','positionX'),@('driver_codex_head_pose','positionZ'),@('driver_codex_head_pose','yawDegrees'),@('driver_codex_head_pose','pitchDegrees'),@('driver_codex_head_pose','rollDegrees'))) {
+    foreach ($change in @('actual-value','string','boolean')) {
+        $candidate = Clone-Value $numericCandidate
+        $candidate[$case[0]][$case[1]] = switch ($change) { 'actual-value' { 17 }; 'string' { [string]$candidate[$case[0]][$case[1]] }; 'boolean' { $false } }
+        $assessment = Assess-History $candidate
+        Assert-Semantic (-not $assessment.authorized -and -not $assessment.controlledContractMatch -and $assessment.controlledDifferences -contains ($case[0]+'.'+$case[1])) "protected numeric key rejects $change at $($case[0]).$($case[1])"
+    }
+}
+$expected = $savedNumericExpected
 foreach ($pair in @(@($false,0),@($true,1),@(0,$false),@(1,$true))) {
     foreach ($controlled in @($true,$false)) {
         $savedExpected = Clone-Value $expected
