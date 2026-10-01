@@ -9,8 +9,17 @@ RunButton requires the logged-on interactive desktop and that already-owned
 MO2 lifetime. It never opens/adopts another process, changes a combo selection,
 replays a failed attempt, dispatches a CLI helper or launches SKSE directly.
 
-One visible, enabled `MainWindow` must expose the unique Qt accessibility IDs
-`profileBox`, `executablesListBox`, and `startButton`. Selected values must equal
+  One visible, enabled `MainWindow` must expose unique exact accessibility IDs
+  for `profileBox`, `executablesListBox`, and `startButton`. Qt 6.7.1 builds IDs
+  from named parents, so the controller accepts the exact MO2 v2.5.2 paths
+  rooted at `MainWindow.centralWidget.categoriesSplitter.splitter` as well as
+  the bare-ID form; it never uses arbitrary prefixes, suffixes or names to
+  select a control. Both forms appearing is ambiguity, not a fallback choice.
+  A discovery refusal includes `data.runControlDiscovery`: exact owner/window,
+  at most six selector queries, one attempt per query, and match counts. No
+  extra whole-tree diagnostic inventory or selection/Run action is performed.
+  These bound query count/output, not synchronous native RPC duration; use a
+  bounded interactive execution host for native qualification. Selected values must equal
 the exact session profile and registered executable; the unique button must be
 enabled, onscreen and named `Run`. Unknown/extra windows, inaccessible values,
 selection mismatch, changed registered entry, game/loader presence or active

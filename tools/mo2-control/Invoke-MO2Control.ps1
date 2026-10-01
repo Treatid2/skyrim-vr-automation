@@ -227,6 +227,7 @@ try {
     Set-MO2ResultDataValue -Result $result -Name approval -Value (New-MO2ApprovalMetadata -Subcommand $Command)
 }
 catch {
+    $runControlDiscovery = if ($_.Exception.Data.Contains('MO2RunControlDiscovery')) { $_.Exception.Data['MO2RunControlDiscovery'] } else { $null }
     $result = [pscustomobject][ordered]@{
         contractVersion = '1.0.0'
         command = $Command
@@ -238,6 +239,7 @@ catch {
         errors = @($_.Exception.Message)
         data = [pscustomobject]@{
             exceptionType = $_.Exception.GetType().FullName
+            runControlDiscovery = $runControlDiscovery
             configuration = $configuration
             requestedConfigPath = $ConfigPath
             approval = New-MO2ApprovalMetadata -Subcommand $Command
