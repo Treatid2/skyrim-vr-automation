@@ -1,5 +1,15 @@
 # DevBench Control
 
+Runtime `inspect health` has its own typed read contract. A non-error plain
+health object requires positive bounded integral PID/port, non-empty executable,
+integral frame/task counters and Boolean VR state; it need not invent a generic
+`ok` marker. Explicit negative/malformed health still fails. Existing listener,
+runtime metadata, executable, producer/build and artifact guards remain required.
+The invocation journal retains the raw MCP result/text, parsed health and typed
+qualification under `identityHealthProbe` before identity admission, including
+failed health. This is diagnosis evidence, never permission to bypass identity
+checks or attribute a manually launched process to an old MO2 session.
+
 `Invoke-DevBenchControl.ps1` lists and calls the tools exposed by a running
 CSX DevBench server. It prefers streamable-HTTP MCP and negotiates the REST
 `/api/tools` and `/api/tool/<name>` facade when an older host returns 404 for

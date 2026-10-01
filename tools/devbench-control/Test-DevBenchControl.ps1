@@ -1003,6 +1003,10 @@ $runtimeIdentityAst = @($entryPointAst.FindAll({ param($node) $node -is [Managem
 $retryableExceptionAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-WaitRetryableException' }, $true))[0]
 $identityProbeResult = & {
     param([string]$RuntimeIdentityFunction, [string]$RetryableFunction)
+    $script:invocationRecord = $null
+    $script:invocationEvidencePath = $null
+    $healthReplyAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-RuntimeHealthReply' }, $true))[0]
+    Invoke-Expression $healthReplyAst.Extent.Text
     Invoke-Expression $RetryableFunction
     $identityContentAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-RuntimeIdentityContent' }, $true))[0]
     Invoke-Expression $identityContentAst.Extent.Text
@@ -1033,6 +1037,10 @@ $identityProbeResult = & {
 Assert-Test ($identityProbeResult.nonWait.errors.Count -eq 0 -and $identityProbeResult.nonWait.build.buildId -eq 'fixture-build' -and $identityProbeResult.nonWait.build.sources[0].error -match 'main thread busy') 'non-wait identity discovery retains one transient candidate failure and continues to a valid sibling producer'
 Assert-Test $identityProbeResult.waitPropagated 'wait identity discovery propagates a retryable producer failure into the bounded rebind loop'
 $identitySemanticCases = & {
+    $script:invocationRecord = $null
+    $script:invocationEvidencePath = $null
+    $healthReplyAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-RuntimeHealthReply' }, $true))[0]
+    Invoke-Expression $healthReplyAst.Extent.Text
     $ExpectedRuntimeIdentityJson = ''
     Invoke-Expression $retryableExceptionAst.Extent.Text
     $contentAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-RuntimeIdentityContent' }, $true))[0]
