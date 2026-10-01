@@ -57,7 +57,7 @@ $freshDispatch = & $module {
     if (Get-Command Get-MO2TaskWorkspaceIsolation -ErrorAction SilentlyContinue) { $names += 'Get-MO2TaskWorkspaceIsolation' }
     $originals = @{}
     foreach ($name in $names) { $originals[$name] = (Get-Command $name).ScriptBlock }
-    $script:FreshOwned = [pscustomobject]@{ path = 'fixture-lock'; sessionId = 'fresh-fixture'; accessId = 'fixture'; data = [pscustomobject]@{ status = 'prepared'; profile = 'Fixture'; executable = 'Fixture'; sessionPath = $fixturePath; generation = 2L; leaseId = 'fixture' } }
+    $script:FreshOwned = [pscustomobject]@{ path = 'fixture-lock'; sessionId = 'fresh-fixture'; accessId = 'fixture'; data = [pscustomobject]@{ status = 'prepared'; profile = 'Fixture'; executable = 'Fixture'; sessionPath = $fixturePath; generation = 2L; leaseId = 'fixture'; accessId = 'fixture' } }
     $script:FreshWrites = [Collections.Generic.List[object]]::new()
     try {
         Set-Item Function:script:Get-MO2OwnedSession { $script:FreshOwned }
