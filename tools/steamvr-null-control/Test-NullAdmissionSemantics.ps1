@@ -93,4 +93,32 @@ $added.dashboard.enableDashboard=$false;$added.dashboard['other']='unclassified'
 Assert-Semantic (-not (Assess-History $added).authorized) 'history allowance cannot override other dashboard changes'
 $added.dashboard.Remove('other');$added.steamvr.forcedDriver='other'
 Assert-Semantic (-not (Assess-History $added).authorized) 'history allowance cannot override other controlled settings'
+# Preserve real nested history while attacking the ambiguous display spelling.
+$historyKey = 'lastAccessedExternalOverlayKey'
+foreach ($case in @('add','remove','change','object','null','boolean','number')) {
+    $originalExpected = Clone-Value $expected
+    $candidate = Clone-Value $expected
+    $literalKey = 'dashboard.lastAccessedExternalOverlayKey'
+    switch ($case) {
+        add { $candidate[$literalKey] = 'unrelated' }
+        remove { $expected[$literalKey] = 'unrelated' }
+        change { $expected[$literalKey] = 'old'; $candidate[$literalKey] = 'new' }
+        object { $candidate[$literalKey] = [ordered]@{ value = 'unrelated' } }
+        null { $candidate[$literalKey] = $null }
+        boolean { $candidate[$literalKey] = $true }
+        number { $candidate[$literalKey] = 42 }
+    }
+    $candidate.dashboard[$historyKey] = 'overlay.new'
+    $assessment = Assess-History $candidate
+    Assert-Semantic (-not $assessment.authorized -and -not $assessment.dashboardHistoryDriftAccepted -and -not $assessment.runtimeManagedStructuralMatch) "literal dotted root-key drift is never history authority: $case"
+    $expected = $originalExpected
+}
+foreach ($value in @($null,$false,42,[ordered]@{ value = 'not-string' })) {
+    $candidate = Clone-Value $expected; $candidate.dashboard[$historyKey] = $value
+    Assert-Semantic (-not (Assess-History $candidate).authorized) 'non-string actual history leaf remains refused'
+}
+$candidate = Clone-Value $expected; $candidate['GpuSpeed'] = [ordered]@{ nested = 42 }; $candidate.dashboard[$historyKey] = 'overlay.new'
+Assert-Semantic (Assess-History $candidate).authorized 'actual runtime-managed root subtree and actual string history qualify together'
+$candidate = Clone-Value $expected; $candidate['GpuSpeed.nested'] = 42
+Assert-Semantic (-not (Assess-History $candidate).authorized) 'literal runtime-managed dotted root key does not borrow subtree authority'
 [pscustomobject]@{ok=$true;passed=$passes.Count;passes=@($passes);fixture=$fixture;liveMutation=$false} | ConvertTo-Json -Depth 6

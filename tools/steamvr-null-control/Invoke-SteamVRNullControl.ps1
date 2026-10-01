@@ -572,20 +572,43 @@ function Get-SettingsRestoreValidation([Collections.IDictionary]$Receipt, [strin
                 ((Test-JsonDictionaryContains $dashboard $historyKey) -and $dashboard[$historyKey] -isnot [string])) { $historyTyped = $false }
         }
     }
+    # Display paths are diagnostics, not structural authority: a literal root
+    # key can contain dots and collide with dashboard history's display path.
+    # Compare copies with only the actual allowed JSON subtrees removed.
+    $qualifiedDocuments = @(
+        foreach ($document in @($expectation.value, $current)) {
+            $qualified = [ordered]@{}
+            foreach ($key in $document.Keys) {
+                if ([string]$key -cin $runtimeManagedPrefixes) { continue }
+                if ([string]$key -ceq 'dashboard' -and $historyTyped -and $document[$key] -is [Collections.IDictionary]) {
+                    $dashboardCopy = [ordered]@{}
+                    foreach ($dashboardKey in $document[$key].Keys) {
+                        if ([string]$dashboardKey -cne $historyKey) { $dashboardCopy[$dashboardKey] = $document[$key][$dashboardKey] }
+                    }
+                    $qualified[$key] = $dashboardCopy
+                }
+                else { $qualified[$key] = $document[$key] }
+            }
+            $qualified
+        }
+    )
+    $structuralDriftAllowed = Test-JsonValueEquivalent $qualifiedDocuments[0] $qualifiedDocuments[1]
     $unclassified = @($allDifferences | Where-Object {
         $candidate = [string]$_
         -not ($candidate -ceq $historyPath -and $historyTyped) -and
             @($runtimeManagedPrefixes | Where-Object { $candidate -eq $_ -or $candidate.StartsWith("$_`.", [StringComparison]::Ordinal) }).Count -eq 0
     })
     $controlledMatch = $controlledDifferences.Count -eq 0
+    if (-not $structuralDriftAllowed -and $unclassified.Count -eq 0) { $unclassified = @($allDifferences) }
     $formattingOnly = -not $exactMatch -and $allDifferences.Count -eq 0
-    $runtimeManagedOnly = -not $exactMatch -and $controlledMatch -and $allDifferences.Count -gt 0 -and $unclassified.Count -eq 0
+    $runtimeManagedOnly = -not $exactMatch -and $controlledMatch -and $allDifferences.Count -gt 0 -and $unclassified.Count -eq 0 -and $structuralDriftAllowed
     return [pscustomobject][ordered]@{
         exactMatch = $exactMatch; controlledContractMatch = $controlledMatch; formattingOnlyDriftAccepted = $formattingOnly; runtimeManagedOnlyDriftAccepted = $runtimeManagedOnly
         authorized = $exactMatch -or $formattingOnly -or $runtimeManagedOnly; authorizationRoute = if ($exactMatch) { 'exact-applied-bytes' } elseif ($formattingOnly) { 'semantic-formatting-only' } elseif ($runtimeManagedOnly) { 'controlled-contract-plus-runtime-managed-fields' } else { 'none' }
         currentSha256 = $currentHash; expectedSha256 = [string]$Receipt['settingsSha256Null']; expectedSemanticSha256 = $expectation.semanticSha256
         currentSemanticSha256 = Get-JsonSemanticSha256 -Value $current; controlledDifferences = @($controlledDifferences)
         dashboardHistoryDriftAccepted = $runtimeManagedOnly -and $historyPath -cin $allDifferences
+        runtimeManagedStructuralMatch = $structuralDriftAllowed
         runtimeManagedDifferencePaths = @($allDifferences | Where-Object { $_ -notin $unclassified }); unclassifiedDifferencePaths = @($unclassified)
     }
 }

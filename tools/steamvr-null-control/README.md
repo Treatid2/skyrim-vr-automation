@@ -89,6 +89,8 @@ the receipt. Restore accepts byte-only
 formatting changes and runtime-managed changes confined to the top-level
 `GpuSpeed` and `LastKnown` sections, plus the exact string-valued
 `dashboard.lastAccessedExternalOverlayKey` history leaf (addition/removal included),
+qualified by its actual JSON structure, not dotted diagnostic spelling. Literal
+root keys containing dots cannot borrow history or runtime-managed authority.
 only when every controller-owned null-HMD
 setting still matches. Changes to a controller-owned key or any other section
 remain unclassified drift and fail closed. The validation route and exact
