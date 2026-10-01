@@ -1282,7 +1282,14 @@ function Complete-TaskCache($Storage) {
         (Test-Property $plan.providerShadow 'receipt') -and $null -ne $plan.providerShadow.receipt -and
         (Test-Property $plan.providerShadow.receipt 'preparedInventory')) { $plan.providerShadow.receipt.preparedInventory } else { $null }
     $materializedEntries = @(Get-TaskOutputEntries $currentBeforeRestore.data $preparedInventory)
-    if ($requireMaterialized -and $materializedEntries.Count -eq 0) {
+    # A failed/unverified run may never reach the compiler. Its unchanged
+    # prepared tree still needs preservation/restoration; absence of new output
+    # is not permission to promote it, nor to skip exact restore proof below.
+    $unchangedPreparedFailure = $WorkingSetStatus -in @('failed', 'unverified') -and
+        -not $Promote -and (Test-Property $plan 'preparedTreeSha256') -and
+        [string]$plan.preparedTreeSha256 -match '^[0-9a-fA-F]{64}$' -and
+        [string]$currentBeforeRestore.data.treeSha256 -ieq [string]$plan.preparedTreeSha256
+    if ($requireMaterialized -and $materializedEntries.Count -eq 0 -and -not $unchangedPreparedFailure) {
         $failurePath = Join-Path $evidence 'shader-cache-task.materialization-failure.json'
         $failure = [pscustomobject][ordered]@{
             contractVersion = $contractVersion; state = 'materialization-missing'
@@ -1355,7 +1362,7 @@ function Complete-TaskCache($Storage) {
         completedUtc = [DateTime]::UtcNow.ToString('o')
         planPath = $planPath
         cacheBinding = $cacheBinding
-        workingTree = [pscustomobject][ordered]@{ status = $WorkingSetStatus; inventory = $currentBeforeRestore.data; materializedFiles = $materializedEntries.Count; preservedPath = [string]$restore.data.displacedPath }
+        workingTree = [pscustomobject][ordered]@{ status = $WorkingSetStatus; inventory = $currentBeforeRestore.data; materializedFiles = $materializedEntries.Count; unchangedPreparedFailure = [bool]$unchangedPreparedFailure; preservedPath = [string]$restore.data.displacedPath }
         restoredTreeSha256 = [string]$restore.data.baseline.treeSha256
         promoted = $promoted
     }
