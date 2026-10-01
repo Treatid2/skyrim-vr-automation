@@ -13,6 +13,28 @@ if ($Command -eq 'call') {
  $state | Add-Member -NotePropertyName retries -NotePropertyValue $MaxTransientRetries -Force
  $state | Add-Member -NotePropertyName timeout -NotePropertyValue $TimeoutSeconds -Force
  $argsValue=$ArgumentsJson | ConvertFrom-Json
+ if ($state.PSObject.Properties['calls']) {
+  $state.calls=@($state.calls)+@(@{tool=$Tool;arguments=$argsValue;identity=$ExpectedRuntimeIdentityJson;retries=$MaxTransientRetries;timeout=$TimeoutSeconds})
+ }
+ if ($state.PSObject.Properties['adapterResponse']) {
+  $state | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $RuntimePath -Encoding utf8
+  $state.adapterResponse | ConvertTo-Json -Depth 30 -Compress
+  return
+ }
+ if ($Tool -cne 'papyrus') {
+  $value=switch ($Tool) {
+   'record' { @{recording=$true} }
+   'inspect' { $state.frame++; @{playerLoaded=$true;frame=$state.frame} }
+   'menu' { @{menus=@('RaceSex Menu')} }
+   'input' { @{active=$false;frame=@{}} }
+   'communityshaders.screenshot' { @{requestId='fixture-shot';state='completed';terminal=$true} }
+   default { throw "Unexpected fixture observation tool: $Tool" }
+  }
+  $denied=$state.PSObject.Properties['denyObservation'] -and $state.denyObservation -ceq $Tool
+  $state | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $RuntimePath -Encoding utf8
+  @{ok=(-not $denied);transportOk=$true;indeterminate=$false;semantic=@{known=$true;ok=(-not $denied)};errors=$(if ($denied) {@('fixture observation rejection')} else {@()});data=@{content=@($value)}} | ConvertTo-Json -Depth 30 -Compress
+  return
+ }
  $returned=$null
  if ($argsValue.function -eq 'GetString') {
   if ($argsValue.args[1] -like '*.vrDiagnosticSnapshotJson') { $returned=$state | ConvertTo-Json -Depth 10 -Compress }
@@ -31,7 +53,7 @@ if ($Command -eq 'call') {
   $state=Get-Content -LiteralPath $session.modelPath -Raw | ConvertFrom-Json
   $state.frame++
   $state | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $session.modelPath -Encoding utf8
-  @{ok=$true;data=@{observation=@{game=@{value=@{playerLoaded=$true;frame=$state.frame}};recording=@{value=@{recording=$true}}}}} | ConvertTo-Json -Depth 12 -Compress
+  @{ok=$true;data=@{observation=@{game=@{ok=$true;value=@{playerLoaded=$true;frame=$state.frame}};recording=@{ok=$true;value=@{recording=$true}}}}} | ConvertTo-Json -Depth 12 -Compress
  } else {
   $response=& $DevBenchScriptPath call -Tool $DirectTool -ArgumentsJson $DirectArgumentsJson -RuntimePath $session.modelPath -ExpectedRuntimeIdentityJson '{}' -Compact -NoExit -RequireSuccess | ConvertFrom-Json
   @{ok=$response.ok;data=@{action=@{receipt=@{result=$response.data.content[0]}}}} | ConvertTo-Json -Depth 15 -Compress

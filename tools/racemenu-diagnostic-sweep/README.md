@@ -32,6 +32,10 @@ when transport succeeded, the receipt is determinate and no known semantic
 rejection exists. It retains the entire original controller envelope and labels
 this as Papyrus-return-only, never actor-change completion. The engine still
 requires the separate movie result and fresh resulting menu state.
+Non-Papyrus observation responses pass through unchanged, including negative
+results. Papyrus qualification checks the typed request shape before reading
+function/path fields; a missing or malformed property is not permission to
+convert an upstream failure into success.
 
 If the run has already selected a healthy direct-MCP-only lane, **do not run
 this controller or switch lanes for convenience**. This version does not provide
@@ -145,7 +149,13 @@ allocates scratch nor releases the owner's allocation.
 Fixtures use temporary isolated state, never Skyrim or network calls. Tests
 cover dynamic generations, legal slider intervals, refusal/no-replay, pending
 deadlines, inactive/disabled controls, frame failure, exclusive output, and
-the real production entry point plus PowerShell policy adapter. Its sleeping
+the real production entry point plus PowerShell policy adapter. An additional
+end-to-end fixture uses the actual capture controller and module, substituting
+only bounded offline DevBench responses: record, inspect, menu, input and
+screenshot requests without Papyrus fields produce real composite observations
+and reach the first input. Failed game/recording probes stop before input;
+typed Papyrus request/envelope rejection tests retain negative responses.
+These are offline controller-path tests, not native/runtime qualification. Its sleeping
 worker cancellation test verifies bounded return, lock release, no added
 mutation and preservation of the previous valid receipt. Live qualification
 must still be performed by the runtime owner against the exact deployed movie.
