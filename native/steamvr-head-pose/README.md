@@ -16,7 +16,8 @@ but cause no output. There is no controller command or replay interface.
 
 Run `csx_openvr_pose_probe.exe --require-controllers` before admitting Skyrim.
 It requires distinct non-HMD left/right indices within OpenVR's tracked-device
-array, matching runtime class/roles, finite connected valid standing and
+array, matching runtime class/roles and the pair's serial/provider identity,
+finite connected valid standing and
 compositor render/game poses, and successful neutral legacy
 `GetControllerState` samples. It observes 100 samples over approximately two
 seconds and rejects any controller button/touch event during that interval.
