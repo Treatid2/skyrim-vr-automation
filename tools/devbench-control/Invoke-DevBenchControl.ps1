@@ -255,8 +255,9 @@ function Get-GameMutationRequests {
             if ($Value.Contains('tool') -and [string]$Value['tool'] -eq 'game' -and $Value.Contains('args') -and $Value['args'] -is [Collections.IDictionary]) {
                 $args = $Value['args']
                 $action = if ($args.Contains('action')) { [string]$args['action'] } else { '' }
-                if ($action -in @('load', 'loadLast', 'save') -or ($action -ceq 'newGame' -and
-                    $args.Contains('phase') -and $args['phase'] -cne 'inspect')) {
+                # Nested lane admission is independent of direct mutation
+                # classification: even default/explicit inspect must not tunnel.
+                if ($action -in @('load', 'loadLast', 'save') -or $action -ceq 'newGame') {
                     $requests.Add([pscustomobject][ordered]@{ path = "$CurrentPath.args"; action = $action; arguments = $args })
                 }
             }
