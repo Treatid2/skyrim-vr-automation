@@ -95,11 +95,13 @@ try {
     $contractNode=@($nullAst.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-RuntimeInputContract'}, $true))[0]
     Invoke-Expression $contractNode.Extent.Text
     $runtime=[pscustomobject]@{active=$true;headPoseReady=$true;controllersReady=$false}
-    $contract=Get-RuntimeInputContract -BaseContract @{replayReady=$true} -Effective @{active=$true} -Runtime $runtime -ExternalDrivers @{errors=@();conflicts=@()}
+    $contract=Get-RuntimeInputContract -BaseContract @{replayReady=$true} -Effective @{active=$true;controllerInactivitySuppressed=$true} -Runtime $runtime -ExternalDrivers @{errors=@();conflicts=@()}
     Assert-Controller (-not $contract.measurementReady -and -not $contract.controllerPresenceReady -and -not $contract.replayReady -and $contract.measurementBlockers -contains 'passive-controller-pair-not-qualified') 'head-only runtime cannot admit measurement or replay'
     $runtime.controllersReady=$true
-    $contract=Get-RuntimeInputContract -BaseContract @{replayReady=$true} -Effective @{active=$true} -Runtime $runtime -ExternalDrivers @{errors=@();conflicts=@()}
+    $contract=Get-RuntimeInputContract -BaseContract @{replayReady=$true} -Effective @{active=$true;controllerInactivitySuppressed=$true} -Runtime $runtime -ExternalDrivers @{errors=@();conflicts=@()}
     Assert-Controller ($contract.measurementReady -and $contract.controllerPresenceReady -and $contract.controllerInput -eq 'passive-neutral' -and -not $contract.replayReady) 'qualified passive pair does not imply interactive replay'
+    $contract=Get-RuntimeInputContract -BaseContract @{} -Effective @{active=$true;controllerInactivitySuppressed=$false} -Runtime $runtime -ExternalDrivers @{errors=@();conflicts=@()}
+    Assert-Controller (-not $contract.measurementReady -and $contract.controllerPresenceReady -and $contract.measurementBlockers -contains 'controller-inactivity-timeout-not-suppressed') 'positive or historical undeclared timeout cannot admit measurement despite a qualified pair'
     [pscustomobject]@{ok=$true;passed=$passed;scope='fixture-only; no SteamVR or Skyrim launched'} | ConvertTo-Json -Compress
 }
 finally {

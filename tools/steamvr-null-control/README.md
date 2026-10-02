@@ -35,6 +35,30 @@ distinguishes `controllerPresenceReady` from `controllerInput=passive-neutral`;
 replay readiness remains false, and the broader measurement policy
 remains fail-closed until its other runtime conflicts are separately qualified.
 
+Passive devices must not rely on synthetic activity to avoid standby. The
+controller-required production profile declares
+`power.turnOffControllersTimeout=0` (Never in the installed SteamVR schema).
+Apply stages and hash-binds that exact profile, changes only this power leaf,
+and preserves other existing power settings. Effective-state inspection checks
+the typed integer value; measurement readiness additionally requires
+`controllerInactivitySuppressed=true`. This is not proof that controller roles
+remain valid: the independent required-controller probe is still mandatory.
+
+An explicitly selected `-Standalone` diagnostic profile may declare a positive
+integer timeout for a bounded idle-standby comparison. Pass the same explicit
+profile and `-Standalone` to apply/start; this never authorizes Skyrim through
+MO2. Its effective timeout can match and startup can qualify initial presence,
+but `controller-inactivity-timeout-not-suppressed` blocks measurement readiness.
+Non-standalone apply/start require Never when power is declared. Profile power
+must contain only this one nonnegative Int32-range JSON integer; malformed
+values or an existing non-object power section fail before mutation.
+
+Restore reconstructs this controlled leaf from the receipt-bound profile and
+rejects timeout drift as well as unclassified changes to other power leaves.
+The exact original bytes are restored, including absence of a power section.
+Historical receipt-bound profiles without power remain restorable and acquire
+no new power ownership; they cannot establish inactivity-suppressed readiness.
+
 Before `start`, the controller reads the OpenVR registration file (normally
 `%LOCALAPPDATA%\openvr\openvrpaths.vrpath`) and inventories every external
 driver manifest with exact paths and hashes. A non-Virtual-Desktop external

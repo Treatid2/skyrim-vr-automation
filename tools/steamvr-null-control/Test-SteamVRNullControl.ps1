@@ -94,14 +94,15 @@ try {
     New-Item -ItemType Directory -Path $failureEvidence | Out-Null
     New-Item -ItemType Directory -Path (Split-Path -Parent $startupPath) -Force | Out-Null
     [IO.File]::WriteAllBytes($startupPath, [byte[]]@(0))
-    $originalText = "{`r`n  `"steamvr`": { `"enableHomeApp`": true },`r`n  `"unrelated`": { `"value`": 7 }`r`n}`r`n"
+    $originalText = "{`r`n  `"steamvr`": { `"enableHomeApp`": true },`r`n  `"power`": { `"turnOffControllersTimeout`": 600, `"turnOffScreensTimeout`": 30, `"powerOffOnExit`": false },`r`n  `"unrelated`": { `"value`": 7 }`r`n}`r`n"
     [IO.File]::WriteAllText($settingsPath, $originalText, [Text.UTF8Encoding]::new($false))
     $headPoseMapName = "Local\CSXVRHeadPose-fixture-$([guid]::NewGuid().ToString('N'))"
     [ordered]@{
         steamvr = [ordered]@{ forcedDriver = 'null'; requireHmd = $false; activateMultipleDrivers = $true; enableHomeApp = $false }
         dashboard = [ordered]@{ enableDashboard = $false }
+        power = [ordered]@{ turnOffControllersTimeout = 0 }
         driver_null = [ordered]@{ enable = $true; serialNumber = 'Fixture'; modelNumber = 'Fixture'; windowWidth = 2160; windowHeight = 1200; renderWidth = 1512; renderHeight = 1680; displayFrequency = 90.0 }
-        driver_codex_head_pose = [ordered]@{ enable = $true; serialNumber = 'CSX-NULL-HMD-POSE-1'; modelNumber = 'Fixture Pose'; positionX = 0.0; eyeHeightMeters = 1.68; positionZ = 0.0; yawDegrees = 0.0; pitchDegrees = 0.0; rollDegrees = 0.0 }
+        driver_codex_head_pose = [ordered]@{ enable = $true; enableControllers = $true; serialNumber = 'CSX-NULL-HMD-POSE-1'; modelNumber = 'Fixture Pose'; positionX = 0.0; eyeHeightMeters = 1.68; positionZ = 0.0; yawDegrees = 0.0; pitchDegrees = 0.0; rollDegrees = 0.0 }
         TrackingOverrides = [ordered]@{ '/devices/codex_head_pose/CSX-NULL-HMD-POSE-1' = '/user/head' }
         headPoseProviderContract = [ordered]@{ driverName = 'codex_head_pose'; registeredDevicePath = '/devices/codex_head_pose/CSX-NULL-HMD-POSE-1'; semanticTarget = '/user/head'; sharedMemoryName = $headPoseMapName; sharedMemoryVersion = 2; sharedMemorySize = 128; minimumQualifiedEyeHeightMeters = 1.0; maximumQualifiedEyeHeightMeters = 2.5 }
         automationInputContract = [ordered]@{ hmdPoseProvider = 'codex-head-pose-v2'; hmdPoseControl = 'shared-memory-v2'; controllerInput = 'unavailable'; dashboardInput = 'disabled'; replayReady = $false; measurementReady = $false; qualificationRequired = 'fixture qualification' }
@@ -524,6 +525,28 @@ try {
     Assert-Test ($dry.ok -and $dry.state -eq 'dry-run') 'apply dry-run succeeds'
     Assert-Test (-not (Test-Path -LiteralPath (Join-Path $evidence 'steamvr.vrsettings.before'))) 'apply dry-run creates no backup'
 
+    $powerProfilePath = Join-Path $fixture 'power-profile.json'
+    foreach ($case in @('missing', 'boolean', 'string', 'float-zero', 'float', 'negative', 'overflow', 'extra-key', 'non-object', 'positive')) {
+        $powerProfile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json -AsHashtable
+        switch ($case) {
+            missing { $powerProfile.Remove('power') }
+            boolean { $powerProfile['power']['turnOffControllersTimeout'] = $false }
+            string { $powerProfile['power']['turnOffControllersTimeout'] = '0' }
+            float-zero { $powerProfile['power']['turnOffControllersTimeout'] = [double]0.0 }
+            float { $powerProfile['power']['turnOffControllersTimeout'] = 0.5 }
+            negative { $powerProfile['power']['turnOffControllersTimeout'] = -1 }
+            overflow { $powerProfile['power']['turnOffControllersTimeout'] = [long]2147483648 }
+            extra-key { $powerProfile['power']['powerOffOnExit'] = $true }
+            non-object { $powerProfile['power'] = @() }
+            positive { $powerProfile['power']['turnOffControllersTimeout'] = 30 }
+        }
+        $powerProfile | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $powerProfilePath -Encoding utf8
+        $rejectedPower = & $entry apply -SettingsPath $settingsPath -NullProfilePath $powerProfilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+        Assert-Test (-not $rejectedPower.ok -and [IO.File]::ReadAllText($settingsPath) -ceq $originalText -and -not (Test-Path -LiteralPath (Join-Path $evidence 'steamvr.vrsettings.before'))) "invalid or non-standalone power profile fails before mutation: $case"
+    }
+    $diagnosticPower = & $entry apply -Standalone -SettingsPath $settingsPath -NullProfilePath $powerProfilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($diagnosticPower.ok -and $diagnosticPower.state -eq 'dry-run') 'explicit standalone diagnostic admits a controlled positive integer timeout'
+
     $profileTextBeforeApply = [IO.File]::ReadAllText($profilePath)
     $applied = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint apply-source-drift-after-stage -Compact | ConvertFrom-Json
     Assert-Test ($applied.ok -and $applied.state -eq 'null-applied') 'apply writes effective null profile'
@@ -532,6 +555,8 @@ try {
     $driftedSourceProfile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json -AsHashtable
     Assert-Test ($appliedJson['unrelated']['value'] -eq 7) 'apply preserves unrelated settings'
     Assert-Test ($appliedJson['dashboard']['enableDashboard'] -eq $false) 'apply disables the dashboard generic-HMD input route'
+    Assert-Test ($appliedJson['power']['turnOffControllersTimeout'] -eq 0 -and $appliedJson['power']['turnOffScreensTimeout'] -eq 30 -and $appliedJson['power']['powerOffOnExit'] -eq $false -and $applied.data.effective.controllerInactivitySuppressed) 'apply suppresses controller inactivity without altering unrelated power leaves'
+    Assert-Test ($driftedSourceProfile['power']['turnOffControllersTimeout'] -eq 30 -and $appliedJson['power']['turnOffControllersTimeout'] -eq 0) 'staged profile hash binds the power timeout despite caller-source drift'
     Assert-Test ($appliedJson['driver_codex_head_pose']['eyeHeightMeters'] -eq 1.68 -and $appliedJson['TrackingOverrides']['/devices/codex_head_pose/CSX-NULL-HMD-POSE-1'] -eq '/user/head') 'apply configures the synthetic head pose and semantic override'
     Assert-Test ($driftedSourceProfile['driver_codex_head_pose']['eyeHeightMeters'] -eq 9.25 -and $appliedJson['driver_codex_head_pose']['eyeHeightMeters'] -eq 1.68) 'apply uses the staged profile when the caller source changes before settings mutation'
     Assert-Test (Test-Path -LiteralPath (Join-Path $evidence 'steamvr-null-receipt.json')) 'apply writes hash receipt'
@@ -731,6 +756,27 @@ try {
     $controlledDriftRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $controlledDriftRestore.ok -and $controlledDriftRestore.state -eq 'blocked' -and $controlledDriftRestore.errors[0] -match 'dashboard.enableDashboard') 'restore refuses drift in a controller-owned SteamVR setting'
 
+    $powerDrift = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
+    $powerDrift['dashboard']['enableDashboard'] = $false
+    $powerDrift['power']['turnOffControllersTimeout'] = 30
+    $powerDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+    $powerDriftRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $powerDriftRestore.ok -and $powerDriftRestore.errors[0] -match 'power.turnOffControllersTimeout') 'restore refuses controlled timeout drift'
+    foreach ($badActual in @($false, '0', [double]0.0, 0.5, 30)) {
+        $powerDrift['power']['turnOffControllersTimeout'] = $badActual
+        $powerDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+        $powerInspect = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact -NoExit | ConvertFrom-Json
+        Assert-Test (-not $powerInspect.data.effective.active -and -not $powerInspect.data.effective.controllerInactivitySuppressed -and $powerInspect.data.inputContract.measurementBlockers -contains 'controller-inactivity-timeout-not-suppressed') "effective-state refuses malformed or changed controller timeout: $badActual"
+        $badPowerRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+        Assert-Test (-not $badPowerRestore.ok -and $badPowerRestore.errors[0] -match 'power.turnOffControllersTimeout') "restore refuses typed timeout drift, not just numerical equivalence: $badActual"
+    }
+    $powerDrift['power']['turnOffControllersTimeout'] = 0
+    $powerDrift['power']['powerOffOnExit'] = $true
+    $powerDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+    $unownedPowerDrift = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $unownedPowerDrift.ok -and $unownedPowerDrift.errors[0] -match 'power.powerOffOnExit') 'unowned power drift remains unclassified and cannot be overwritten'
+    [IO.File]::WriteAllText($settingsPath, $appliedText, [Text.UTF8Encoding]::new($false))
+
     $unclassifiedDrift = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
     $unclassifiedDrift['dashboard']['enableDashboard'] = $false
     $unclassifiedDrift['unrelated']['newValue'] = 8
@@ -765,6 +811,42 @@ try {
     $restored = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -Compact | ConvertFrom-Json
     Assert-Test ($restored.ok -and $restored.state -eq 'restored' -and $restored.data.backupRetained) 'restore succeeds and retains backup'
     Assert-Test ([IO.File]::ReadAllText($settingsPath) -ceq $originalText) 'restore is exact-byte identical'
+
+    # A historical profile owns no power leaf; the new reader must still restore it.
+    $legacyPowerProfile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json -AsHashtable
+    $legacyPowerProfile.Remove('power')
+    $legacyPowerProfile['driver_codex_head_pose'].Remove('enableControllers')
+    $legacyPowerPath = Join-Path $fixture 'historical-profile.json'
+    $legacyPowerProfile | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $legacyPowerPath -Encoding utf8
+    $legacyEvidence = Join-Path $fixture 'historical-evidence'
+    New-Item -ItemType Directory -Path $legacyEvidence | Out-Null
+    $legacyApply = & $entry apply -SettingsPath $settingsPath -NullProfilePath $legacyPowerPath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $legacyEvidence -Compact -NoExit | ConvertFrom-Json
+    $legacySettings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
+    Assert-Test ($legacyApply.ok -and $legacySettings['power']['turnOffControllersTimeout'] -eq 600) 'historical profile apply does not manufacture power ownership'
+    $legacyRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $legacyPowerPath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $legacyEvidence -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($legacyRestore.ok -and [IO.File]::ReadAllText($settingsPath) -ceq $originalText) 'historical receipt-bound profile remains exactly restorable without a power section'
+
+    $absentPowerText = '{"steamvr":{"enableHomeApp":true}}'
+    [IO.File]::WriteAllText($otherSettingsPath, $absentPowerText, [Text.UTF8Encoding]::new($false))
+    $absentPowerEvidence = Join-Path $fixture 'absent-power-evidence'
+    New-Item -ItemType Directory -Path $absentPowerEvidence | Out-Null
+    $absentPowerApply = & $entry apply -SettingsPath $otherSettingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $absentPowerEvidence -Compact -NoExit | ConvertFrom-Json
+    $absentPowerRestore = & $entry restore -SettingsPath $otherSettingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $absentPowerEvidence -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($absentPowerApply.ok -and $absentPowerRestore.ok -and [IO.File]::ReadAllText($otherSettingsPath) -ceq $absentPowerText) 'restore removes the newly introduced power section when it was originally absent'
+
+    $positivePowerEvidence = Join-Path $fixture 'positive-power-evidence'
+    New-Item -ItemType Directory -Path $positivePowerEvidence | Out-Null
+    $positivePowerApply = & $entry apply -Standalone -SettingsPath $otherSettingsPath -NullProfilePath $powerProfilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $positivePowerEvidence -Compact -NoExit | ConvertFrom-Json
+    # The existing fixture registration deliberately contains a conflicting
+    # display driver. Keep it intact and use only the diagnostic dry-run route.
+    $positivePowerStart = & $entry start -Standalone -SettingsPath $otherSettingsPath -NullProfilePath $powerProfilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $positivePowerEvidence -AllowExternalDisplayRedirector -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($positivePowerApply.ok -and $positivePowerStart.ok -and $positivePowerStart.data.effective.active -and -not $positivePowerStart.data.inputContract.measurementReady -and $positivePowerStart.data.inputContract.measurementBlockers -contains 'controller-inactivity-timeout-not-suppressed') 'standalone positive timeout is applied and start-admitted only as a measurement-blocked diagnostic'
+    $positivePowerRestore = & $entry restore -SettingsPath $otherSettingsPath -NullProfilePath $powerProfilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $positivePowerEvidence -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($positivePowerRestore.ok -and [IO.File]::ReadAllText($otherSettingsPath) -ceq $absentPowerText) 'standalone positive timeout restores its exact original bytes'
+    $malformedPowerText = '{"steamvr":{"enableHomeApp":true},"power":"unclassified"}'
+    [IO.File]::WriteAllText($otherSettingsPath, $malformedPowerText, [Text.UTF8Encoding]::new($false))
+    $malformedPowerApply = & $entry apply -SettingsPath $otherSettingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $positivePowerEvidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $malformedPowerApply.ok -and $malformedPowerApply.errors[0] -match 'not an object' -and [IO.File]::ReadAllText($otherSettingsPath) -ceq $malformedPowerText) 'apply preserves and refuses an existing malformed power section'
 
     $openVrTextBeforeIsolation = [IO.File]::ReadAllText($openVrPathsPath)
     $isolationDry = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -IsolateExternalDisplayRedirectors -WhatIf -Compact | ConvertFrom-Json
