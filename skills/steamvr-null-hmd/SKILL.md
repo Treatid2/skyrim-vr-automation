@@ -61,11 +61,14 @@ particular drive letter for the plugin itself.
    the exact registration and manifest hashes. After `restore`, require both
    the settings and OpenVR registration hashes to match their exact backups.
 7. Require `headPoseProvider.state` to be `ready` and independently run the
-   head-pose controller's `qualify` command. Qualification requires both the
+   head-pose controller's `qualify -RequireControllers` command. Qualification requires both the
    driver's shared-memory acknowledgement and a valid standing HMD pose seen
    by a separate OpenVR application. Treat any unqualified runtime as rendering
    availability only; do not replay input or collect measurements. Controllers
-   remain explicitly unavailable. Treat a resident `vrdashboard.exe` as
+   must be independently qualified as the exact passive left/right pair, with
+   valid poses and neutral legacy input; registration alone and a head-only
+   probe are insufficient. Passive presence does not provide interactive input
+   or replay readiness. Treat a resident `vrdashboard.exe` as
    telemetry; `dashboard.enableDashboard=false` is the dashboard contract.
 8. For an MO2 test, return to the already admitted `$mo2-control` lifecycle and
    use the same access lease, task workspace, and `SteamVRNull` route for

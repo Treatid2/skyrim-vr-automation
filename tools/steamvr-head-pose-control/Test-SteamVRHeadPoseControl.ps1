@@ -50,6 +50,8 @@ try {
 
     $qualify = & $entry qualify -MapName $mapName -SkipOpenVRProbe -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $qualify.ok -and $qualify.state -eq 'head-pose-not-qualified' -and $qualify.data.pose.qualified -and $qualify.data.applicationPose.skipped) 'skipping the independent stereo probe remains explicitly unqualified'
+    $skippedControllers = & $entry qualify -MapName $mapName -RequireControllers -SkipOpenVRProbe -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $skippedControllers.ok -and $skippedControllers.data.controllersRequired -and $skippedControllers.data.applicationPose.skipped) 'required passive controller qualification cannot be bypassed by skipping the probe'
 
     $set = & $entry set -MapName $mapName -EyeHeightMeters 1.72 -YawDegrees 15 -NoWait -Compact -NoExit | ConvertFrom-Json
     Assert-Test ($set.ok -and $set.state -eq 'pose-submitted' -and $set.data.writerNonce -ne 0 -and ($view.ReadUInt64(8) % 2) -eq 0) 'set publishes an atomic even pose sequence with a unique writer nonce'
@@ -162,6 +164,26 @@ try {
     Assert-Test ($successfulUpgrade.ok -and $successfulUpgrade.state -eq 'driver-upgraded' -and $committedInstall.phase -eq 'committed') 'recovered target admits one subsequent serialized upgrade and commits its authoritative journal'
     Assert-Test ($successfulUpgrade.data.dllSha256 -eq [string]$provenance.artifacts.'bin/win64/driver_codex_head_pose.dll' -and $successfulUpgrade.data.poseProbeSha256 -eq [string]$provenance.artifacts.'tools/csx_openvr_pose_probe.exe') 'committed upgrade binds installed driver and probe hashes to bundled provenance'
 
+    $controllerBundle = Join-Path $fixture 'controller-package'
+    Copy-Item -LiteralPath $bundleRoot -Destination $controllerBundle -Recurse
+    $controllerSettingsPath = Join-Path $controllerBundle 'resources\settings\default.vrsettings'
+    $controllerSettings = Get-Content -LiteralPath $controllerSettingsPath -Raw | ConvertFrom-Json -AsHashtable
+    $controllerSettings['driver_codex_head_pose']['enableControllers'] = $false
+    $controllerSettings | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $controllerSettingsPath -Encoding utf8
+    $beforeMissingHash = (Get-FileHash -LiteralPath $oldDll -Algorithm SHA256).Hash
+    $missingControllerProfile = & $entry install -DriverPackagePath $controllerBundle -InstallRoot $installRoot -VRPathRegPath $entry -OpenVRPathsPath $openVrPaths -EvidenceDirectory $differentEvidence -Upgrade -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $missingControllerProfile.ok -and $missingControllerProfile.errors[0] -match 'missing resources.*passive_controller_profile') 'controller-capable packages require an input profile even when controllers default off'
+    Assert-Test ((Get-FileHash -LiteralPath $oldDll -Algorithm SHA256).Hash -eq $beforeMissingHash) 'missing input profile fails before replacing the owned driver'
+    $inputProfilePath = Join-Path $controllerBundle 'resources\input\passive_controller_profile.json'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $inputProfilePath) -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'native\steamvr-head-pose\resources\input\passive_controller_profile.json') -Destination $inputProfilePath
+    $controllerInstalled = & $entry install -DriverPackagePath $controllerBundle -InstallRoot $installRoot -VRPathRegPath $entry -OpenVRPathsPath $openVrPaths -EvidenceDirectory $differentEvidence -Upgrade -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($controllerInstalled.ok) 'controller input profile package completes the guarded upgrade'
+    $expectedProfileHash = (Get-FileHash -LiteralPath $inputProfilePath -Algorithm SHA256).Hash
+    $controllerJournal = Get-Content -LiteralPath $authoritativeJournalPath -Raw | ConvertFrom-Json
+    Assert-Test ($controllerJournal.sourceProvenance.passiveControllerInputProfileSha256 -eq $expectedProfileHash -and $controllerInstalled.data.passiveControllerInputProfileSha256 -eq $expectedProfileHash -and $controllerInstalled.data.defaultSettingsSha256 -eq (Get-FileHash -LiteralPath $controllerSettingsPath -Algorithm SHA256).Hash) 'controller input profile and settings are hash-bound in journal and installation receipt'
+    $installedMarker = Get-Content -LiteralPath (Join-Path $installRoot '.csx-vr-automation-driver.json') -Raw | ConvertFrom-Json
+    Assert-Test ($installedMarker.passiveControllerInputProfileSha256 -eq $expectedProfileHash -and (Get-FileHash -LiteralPath (Join-Path $installRoot 'resources\input\passive_controller_profile.json')).Hash -eq $expectedProfileHash) 'installed input profile matches the ownership marker and source bytes'
     [pscustomobject]@{ ok = $true; passed = $passed } | ConvertTo-Json -Compress
 }
 finally {

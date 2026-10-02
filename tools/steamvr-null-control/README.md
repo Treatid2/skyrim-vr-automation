@@ -16,8 +16,8 @@ independent OpenVR probe.
 The profile sets `dashboard.enableDashboard=false` so the generic-HMD
 laser-mouse/dashboard route cannot be summoned. A resident `vrdashboard.exe`
 is retained as process telemetry; its presence alone is not an input-conflict
-signal. The controller never edits Valve's bindings and does not invent
-controller devices.
+signal. The controller never edits Valve's bindings. The separately packaged
+native provider supplies the opt-in passive controller devices.
 
 Valve's null display driver does not provide the controlled standing pose this
 automation requires. The separately installed `codex_head_pose` server driver
@@ -25,8 +25,14 @@ supplies one HMD pose and is mapped to `/user/head` with SteamVR
 `TrackingOverrides`. Its default eye height is 1.68 metres; the controller can
 update the pose through `Local\CSXVRHeadPose-v2`. The returned `inputContract`
 marks the HMD pose provider ready only after both driver acknowledgement and an
-application-observed OpenVR qualification. Controller input remains
-unavailable, replay readiness remains false, and the broader measurement policy
+application-observed OpenVR qualification. The default null profile enables
+the native passive left/right pair. Every null-route application probe passes
+`--require-controllers`: exact passive serial/provider identity, distinct hand
+roles, valid connected finite standing and compositor poses, 100 neutral legacy
+input samples and zero button/touch events must pass before runtime admission.
+Head-only or legacy probe output fails this gate. The returned input contract
+distinguishes `controllerPresenceReady` from `controllerInput=passive-neutral`;
+replay readiness remains false, and the broader measurement policy
 remains fail-closed until its other runtime conflicts are separately qualified.
 
 Before `start`, the controller reads the OpenVR registration file (normally

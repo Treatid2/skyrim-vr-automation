@@ -1156,6 +1156,23 @@ function Get-HeadPoseSharedState {
     }
 }
 
+function Test-PassiveControllerProbeObservation($Payload) {
+    try {
+        $pair = $Payload.controllers
+        if ($pair.required -isnot [bool] -or -not $pair.required -or
+            $pair.valid -isnot [bool] -or -not $pair.valid) { return $false }
+        foreach ($value in @($pair.leftIndex, $pair.rightIndex, $pair.neutralSamples, $pair.inputEvents)) {
+            if ($value -isnot [int] -and $value -isnot [long] -and $value -isnot [uint32]) { return $false }
+        }
+        # Matches the pinned OpenVR tracked-device array; index zero is the HMD.
+        return $pair.leftIndex -gt 0 -and $pair.leftIndex -lt 64 -and
+            $pair.rightIndex -gt 0 -and $pair.rightIndex -lt 64 -and
+            $pair.leftIndex -ne $pair.rightIndex -and
+            $pair.neutralSamples -eq 100 -and $pair.inputEvents -eq 0
+    }
+    catch { return $false }
+}
+
 function Get-ApplicationHeadPose {
     param(
         [Parameter(Mandatory)]$Contract,
@@ -1179,19 +1196,22 @@ function Get-ApplicationHeadPose {
             }
             $probeTimeoutSeconds = [Math]::Max(1, [Math]::Min(10, [Math]::Floor(($remainingMilliseconds - 450) / 1000)))
         }
-        $bounded = & $boundedTool -FilePath $probePath -WorkingDirectory (Split-Path -Parent $probePath) -MaxAttempts 1 -TimeoutSeconds $probeTimeoutSeconds -TerminationGraceMilliseconds 100 -StreamDrainGraceMilliseconds 100 -NoExit -Compact | ConvertFrom-Json -Depth 30
+        $bounded = & $boundedTool -FilePath $probePath -ArgumentList @('--require-controllers') -WorkingDirectory (Split-Path -Parent $probePath) -MaxAttempts 1 -TimeoutSeconds $probeTimeoutSeconds -TerminationGraceMilliseconds 100 -StreamDrainGraceMilliseconds 100 -NoExit -Compact | ConvertFrom-Json -Depth 30
         $attempt = if (@($bounded.attempts).Count -gt 0) { $bounded.attempts[-1] } else { $null }
         if ($attempt -and [bool]$attempt.timedOut) {
             throw [TimeoutException]::new("Independent OpenVR pose probe exceeded its $probeTimeoutSeconds-second share of the SteamVR readiness deadline.")
         }
         if ($null -eq $attempt -or [string]::IsNullOrWhiteSpace([string]$attempt.stdout)) { throw "Independent OpenVR pose probe produced no bounded output. $($bounded.errors -join '; ')" }
         $payload = [string]$attempt.stdout | ConvertFrom-Json -ErrorAction Stop
+        $controllersQualified = Test-PassiveControllerProbeObservation $payload
         $qualified = $bounded.ok -and $payload.ok -and $payload.standing.connected -and $payload.standing.valid -and
             [double]$payload.standing.position[1] -ge [double]$Contract['minimumQualifiedEyeHeightMeters'] -and
-            [double]$payload.standing.position[1] -le [double]$Contract['maximumQualifiedEyeHeightMeters']
+            [double]$payload.standing.position[1] -le [double]$Contract['maximumQualifiedEyeHeightMeters'] -and $controllersQualified
         return [pscustomobject][ordered]@{
             available = $true
             qualified = $qualified
+            controllersRequired = $true
+            controllersQualified = $controllersQualified
             probePath = $probePath
             exitCode = $attempt.exitCode
             boundedProcess = $bounded
@@ -1310,6 +1330,7 @@ function Get-NullRuntimeEvidence {
         headPoseState = $headPoseState
         headPoseAuthorizationError = $headPoseAuthorizationError
         applicationHeadPose = $applicationHeadPose
+        controllersReady = $applicationHeadPose.PSObject.Properties['controllersQualified'] -and [bool]$applicationHeadPose.controllersQualified
         headPoseReady = $providerLogReady -and [bool]$headPoseState.qualified -and [bool]$applicationHeadPose.qualified
         dashboardProcesses = @($owned | Where-Object name -eq 'vrdashboard')
         dashboardSuppressed = $Profile['dashboard'].ContainsKey('enableDashboard') -and -not [bool]$Profile['dashboard']['enableDashboard']
@@ -1339,6 +1360,7 @@ function Get-NullRuntimeEvidence {
     if ($fixtureMode -and $InternalTestFailurePoint -in $fixtureReadyPoints) {
         $runtimeEvidence.active = $true
         $runtimeEvidence.headPoseReady = $true
+        $runtimeEvidence.controllersReady = $true
         $runtimeEvidence.headPoseAuthorizationError = $null
     }
     return $runtimeEvidence
@@ -1550,10 +1572,15 @@ function Get-RuntimeInputContract {
     if (-not [bool]$Effective.active) { $blockers.Add('null-profile-not-effective') }
     if (-not [bool]$Runtime.active) { $blockers.Add('null-runtime-not-active') }
     if (-not [bool]$Runtime.headPoseReady) { $blockers.Add('head-pose-not-qualified') }
+    $controllersReady = $Runtime.PSObject.Properties['controllersReady'] -and [bool]$Runtime.controllersReady
+    if (-not $controllersReady) { $blockers.Add('passive-controller-pair-not-qualified') }
     if ($ExternalDrivers.errors.Count -gt 0) { $blockers.Add('external-driver-inventory-incomplete') }
     if ($ExternalDrivers.conflicts.Count -gt 0) { $blockers.Add('external-display-redirector-present') }
     if ($DiagnosticDisplayOverride) { $blockers.Add('diagnostic-display-override') }
     $contract['measurementReady'] = $blockers.Count -eq 0
+    $contract['controllerPresenceReady'] = [bool]$controllersReady
+    $contract['controllerInput'] = 'passive-neutral'
+    $contract['replayReady'] = $false
     $contract['measurementBlockers'] = @($blockers)
     $contract['dashboardProcessTelemetryOnly'] = $true
     return $contract
