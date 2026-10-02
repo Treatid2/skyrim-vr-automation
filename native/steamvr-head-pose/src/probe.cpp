@@ -96,6 +96,20 @@ ControllerCheck CheckControllers(vr::IVRSystem* system)
             return result;
         }
     }
+    for (std::size_t hand = 0; hand < indices.size(); ++hand) {
+        std::array<char, 128> serial{}, trackingSystem{};
+        vr::ETrackedPropertyError propertyError = vr::TrackedProp_Success;
+        const auto serialSize = system->GetStringTrackedDeviceProperty(indices[hand],
+            vr::Prop_SerialNumber_String, serial.data(), static_cast<std::uint32_t>(serial.size()), &propertyError);
+        const auto expected = hand == 0 ? "CSX-NULL-CONTROLLER-LEFT-1" : "CSX-NULL-CONTROLLER-RIGHT-1";
+        if (propertyError != vr::TrackedProp_Success || serialSize > serial.size() ||
+            std::string(serial.data()) != expected) { return result; }
+        const auto trackingSize = system->GetStringTrackedDeviceProperty(indices[hand],
+            vr::Prop_TrackingSystemName_String, trackingSystem.data(),
+            static_cast<std::uint32_t>(trackingSystem.size()), &propertyError);
+        if (propertyError != vr::TrackedProp_Success || trackingSize > trackingSystem.size() ||
+            std::string(trackingSystem.data()) != "codex_head_pose") { return result; }
+    }
     std::array<vr::TrackedDevicePose_t, vr::k_unMaxTrackedDeviceCount> game{}, render{}, standing{};
     // Observe a stable neutral pair for two seconds, including the compositor
     // arrays consumed by VR Tools. One good registration snapshot is insufficient.
@@ -179,7 +193,8 @@ int main(int argc, char** argv)
         eyeSeparation >= 0.01 && eyeSeparation <= 0.20 && renderWidth > 0 && renderHeight > 0 &&
         runtimePathAvailable && requiredRuntimePath > 1 && requiredRuntimePath <= runtimePath.size();
     const auto controllers = requireControllers ? CheckControllers(system) : ControllerCheck{};
-    const auto qualified = stereoValid && (!requireControllers || controllers.valid);
+    const auto qualified = stereoValid && (!requireControllers ||
+        (ValidPose(standing[vr::k_unTrackedDeviceIndex_Hmd]) && controllers.valid));
 
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "{\"ok\":" << (qualified ? "true" : "false")
