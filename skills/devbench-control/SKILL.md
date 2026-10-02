@@ -5,6 +5,31 @@ description: "Inspect and call the MCP tools exposed by a running CSX DevBench s
 
 # DevBench Control
 
+For a newly added typed action such as `game/newGame`, determine availability
+for that exact workflow before its first live call. If the complete direct
+catalog exposes `game` but its action/phase schema cannot express `newGame`,
+retain that mismatch and treat direct MCP as unavailable for this workflow,
+not as permission to tunnel through `scenario`. A new, explicitly selected
+controller-only workflow may use the supported source controller: bind the
+explicit expected runtime/build/artifact, obtain its fresh `list`, and require
+the exact typed action/phase schema before dispatch. Do not mix lanes in the
+workflow, retry an earlier mutation, or use this pre-call selection to resolve
+an uncertain prior operation. Existing protocols that require direct-only
+transport still take precedence. If neither lane has a current typed schema,
+report `toolSchemaUnresolved` and dispatch nothing. This is not a host refresh
+or an installed-cache reload claim.
+
+New Game uses `game` with `action:newGame`, `phase:inspect|request|confirm`.
+Inspect is read-only. Require `readyToRequest` before one UUID-correlated
+request, then bounded current-state inspection for that same pending ID and
+`readyToConfirm`, then exactly one explicit `confirmNewGame:true` confirmation.
+The staged request (`accepted:false, completed:false`) is valid; acknowledged
+dispatch (`accepted:true, completed:false`) is not world-entry completion.
+Inspect known IDs for lost responses. `dispatchUncertain`, `unresolvedDispatch`,
+`unresolvedRequestId`, `newRequestsBlocked` and `invalidationReason` remain
+authoritative across menu changes and expiry: no replay or fresh-ID escape.
+Verify character creation/player/cell state separately, not a transient event.
+
 Choose exactly one live transport before the first live call. When the
 plugin-provided direct MCP tools are callable, they are the mandatory and
 exclusive lane for live discovery, calls, waits, screenshots, and performance

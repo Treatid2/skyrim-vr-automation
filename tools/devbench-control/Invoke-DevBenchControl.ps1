@@ -237,7 +237,8 @@ function Get-GameMutationRequests {
     $requests = [Collections.Generic.List[object]]::new()
     if ($ToolName -eq 'game' -and $Arguments -is [Collections.IDictionary]) {
         $action = if ($Arguments.Contains('action')) { [string]$Arguments['action'] } else { '' }
-        if ($action -in @('load', 'loadLast', 'save')) {
+        if ($action -in @('load', 'loadLast', 'save') -or ($action -ceq 'newGame' -and
+            $Arguments.Contains('phase') -and $Arguments['phase'] -cne 'inspect')) {
             $requests.Add([pscustomobject][ordered]@{ path = $Path; action = $action; arguments = $Arguments })
         }
         return @($requests)
@@ -254,7 +255,9 @@ function Get-GameMutationRequests {
             if ($Value.Contains('tool') -and [string]$Value['tool'] -eq 'game' -and $Value.Contains('args') -and $Value['args'] -is [Collections.IDictionary]) {
                 $args = $Value['args']
                 $action = if ($args.Contains('action')) { [string]$args['action'] } else { '' }
-                if ($action -in @('load', 'loadLast', 'save')) {
+                # Nested lane admission is independent of direct mutation
+                # classification: even default/explicit inspect must not tunnel.
+                if ($action -in @('load', 'loadLast', 'save') -or $action -ceq 'newGame') {
                     $requests.Add([pscustomobject][ordered]@{ path = "$CurrentPath.args"; action = $action; arguments = $args })
                 }
             }
@@ -280,6 +283,16 @@ function Get-GameMutationRequests {
 
 function Test-GameMutationPolicy {
     param([Parameter(Mandatory)]$Request)
+    if ($Request.action -ceq 'newGame') {
+        if ($Request.path -cne '$') { return [pscustomobject]@{ allowed=$false; override=$false; error='New Game requires the typed game tool, not a nested/scenario dispatcher.' } }
+        $args = $Request.arguments
+        if ($args['phase'] -isnot [string] -or $args['phase'] -cnotin @('request','confirm') -or
+            -not $args.Contains('requestId') -or $args['requestId'] -isnot [string] -or [string]::IsNullOrWhiteSpace($args['requestId']) -or
+            [Text.Encoding]::UTF8.GetByteCount($args['requestId']) -gt 128 -or
+            ($args['phase'] -ceq 'confirm' -and (-not $args.Contains('confirmNewGame') -or $args['confirmNewGame'] -isnot [bool] -or -not $args['confirmNewGame']))) {
+            return [pscustomobject]@{ allowed=$false; override=$false; error='New Game requires typed phase, exact 1..128-byte requestId and explicit Boolean confirmNewGame for confirmation.' }
+        }
+    }
     if ($AllowUnprovenGameMutation) { return [pscustomobject]@{ allowed = $true; override = $true; error = $null } }
     if ([string]::IsNullOrWhiteSpace($WorkspaceManifestPath)) {
         return [pscustomobject]@{ allowed = $false; override = $false; error = "DevBench game action '$($Request.action)' at $($Request.path) requires -WorkspaceManifestPath. Pass -AllowUnprovenGameMutation only when the caller explicitly accepts bypassing workspace save policy." }
@@ -293,6 +306,9 @@ function Test-GameMutationPolicy {
     $workspaceStatus = if ($workspace.PSObject.Properties['status']) { [string]$workspace.status } else { '' }
     if ($workspaceStatus -notin @('ready', 'retained')) {
         return [pscustomobject]@{ allowed = $false; override = $false; error = "Workspace status '$workspaceStatus' is not authorized for a DevBench game mutation." }
+    }
+    if ($Request.action -ceq 'newGame' -and $policy -ceq 'FreshGame') {
+        return [pscustomobject]@{ allowed=$true; override=$false; error=$null; policy=$policy; manifestPath=$resolvedManifest }
     }
     if ($policy -in @('MainMenuOnly', 'FreshGame')) {
         return [pscustomobject]@{ allowed = $false; override = $false; error = "Workspace save policy '$policy' forbids DevBench game action '$($Request.action)' at $($Request.path)." }
@@ -321,6 +337,25 @@ function Test-GameMutationPolicy {
         return [pscustomobject]@{ allowed = $false; override = $false; error = "VerifiedFixture saves directory mismatch at $($Request.path): requested '$actualDirectory', expected '$expectedDirectory'." }
     }
     return [pscustomobject]@{ allowed = $true; override = $false; error = $null; policy = $policy; manifestPath = $resolvedManifest; loadName = $expectedName }
+}
+
+function Test-NewGameCatalog {
+    param([object[]]$Tools, [Collections.IDictionary]$Arguments)
+    $game = @($Tools | Where-Object { $_.name -ceq 'game' })
+    if ($game.Count -ne 1 -or -not $game[0].PSObject.Properties['inputSchema']) { return $false }
+    $schema = $game[0].inputSchema
+    if (-not $schema.PSObject.Properties['properties']) { return $false }
+    $properties = $schema.properties
+    foreach ($name in @('action','phase','requestId','confirmNewGame')) {
+        if (-not $properties.PSObject.Properties[$name] -or $properties.PSObject.Properties[$name].Value -isnot [pscustomobject]) { return $false }
+    }
+    $phase = if ($Arguments.Contains('phase')) { $Arguments['phase'] } else { 'inspect' }
+    return ($properties.action.PSObject.Properties['type'] -and $properties.action.type -ceq 'string' -and
+        $properties.action.PSObject.Properties['enum'] -and @($properties.action.enum) -ccontains 'newGame' -and
+        $properties.phase.PSObject.Properties['type'] -and $properties.phase.type -ceq 'string' -and
+        $properties.phase.PSObject.Properties['enum'] -and @($properties.phase.enum) -ccontains $phase -and
+        $properties.requestId.PSObject.Properties['type'] -and $properties.requestId.type -ceq 'string' -and
+        $properties.confirmNewGame.PSObject.Properties['type'] -and $properties.confirmNewGame.type -ceq 'boolean')
 }
 
 function Get-McpSessionHeaderValue {
@@ -841,6 +876,11 @@ try {
         $headers = $session.headers
         $tools = @($session.tools)
         $runtimeIdentity = $session.runtimeIdentity
+        if ($Command -eq 'call' -and $Tool -ceq 'game' -and $arguments.Contains('action') -and
+            $arguments['action'] -ceq 'newGame' -and -not (Test-NewGameCatalog -Tools $tools -Arguments $arguments)) {
+            Update-InvocationEvidence -State 'guard-rejected' -Errors @('toolSchemaUnresolved: current catalog cannot express typed game/newGame phase and correlation fields.')
+            throw 'toolSchemaUnresolved: current catalog cannot express typed game/newGame phase and correlation fields; no dispatch or scenario fallback.'
+        }
         if (-not $SkipRuntimeIdentityVerification) {
             if ($Command -eq 'call' -and -not $readOnlyCall -and -not $runtimeIdentity.complete) {
                 throw "Mutation-capable DevBench calls require complete runtime identity. Missing: $($runtimeIdentity.missing -join ', ')."
@@ -935,7 +975,8 @@ try {
                     }
                 }
             }
-            if (-not [string]::IsNullOrWhiteSpace($ExpectedErrorCode)) {
+            if (-not [string]::IsNullOrWhiteSpace($ExpectedErrorCode) -and
+                -not ($Tool -ceq 'game' -and $arguments.Contains('action') -and $arguments['action'] -ceq 'newGame')) {
                 $matched = @($semantic.codes | Where-Object { $_ -eq $ExpectedErrorCode }).Count -gt 0
                 $semantic | Add-Member -NotePropertyName expectedErrorCode -NotePropertyValue $ExpectedErrorCode -Force
                 $semantic | Add-Member -NotePropertyName expectedErrorMatched -NotePropertyValue $matched -Force
