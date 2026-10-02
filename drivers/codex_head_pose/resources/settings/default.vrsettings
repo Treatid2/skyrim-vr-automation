@@ -1,6 +1,7 @@
 {
   "driver_codex_head_pose": {
     "enable": false,
+    "enableControllers": false,
     "serialNumber": "CSX-NULL-HMD-POSE-1",
     "modelNumber": "CSX Synthetic Head Pose",
     "positionX": 0.0,

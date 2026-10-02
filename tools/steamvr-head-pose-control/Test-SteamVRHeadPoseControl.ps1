@@ -166,6 +166,20 @@ try {
 
     $controllerBundle = Join-Path $fixture 'controller-package'
     Copy-Item -LiteralPath $bundleRoot -Destination $controllerBundle -Recurse
+    # Exercise bare legacy package compatibility separately from the current
+    # controller-capable bundled publication.
+    $legacyBundle = Join-Path $fixture 'legacy-head-only-package'
+    Copy-Item -LiteralPath $bundleRoot -Destination $legacyBundle -Recurse
+    $legacySettingsPath = Join-Path $legacyBundle 'resources\settings\default.vrsettings'
+    $legacySettings = Get-Content -LiteralPath $legacySettingsPath -Raw | ConvertFrom-Json -AsHashtable
+    $legacySettings['driver_codex_head_pose'].Remove('enableControllers')
+    $legacySettings | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $legacySettingsPath -Encoding utf8
+    Remove-Item -LiteralPath (Join-Path $legacyBundle 'resources\input\passive_controller_profile.json') -Force
+    Remove-Item -LiteralPath (Join-Path $legacyBundle 'build-provenance.json') -Force
+    $legacyInstalled = & $entry install -DriverPackagePath $legacyBundle -InstallRoot $installRoot -VRPathRegPath $entry -OpenVRPathsPath $openVrPaths -EvidenceDirectory $differentEvidence -Upgrade -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($legacyInstalled.ok -and $null -eq $legacyInstalled.data.passiveControllerInputProfileSha256) 'bare historical head-only package remains installable for diagnostics'
+    Remove-Item -LiteralPath (Join-Path $controllerBundle 'resources\input\passive_controller_profile.json') -Force
+    Remove-Item -LiteralPath (Join-Path $controllerBundle 'build-provenance.json') -Force
     $controllerSettingsPath = Join-Path $controllerBundle 'resources\settings\default.vrsettings'
     $controllerSettings = Get-Content -LiteralPath $controllerSettingsPath -Raw | ConvertFrom-Json -AsHashtable
     $controllerSettings['driver_codex_head_pose']['enableControllers'] = $false
