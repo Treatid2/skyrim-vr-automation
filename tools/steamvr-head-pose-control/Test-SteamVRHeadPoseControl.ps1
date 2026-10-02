@@ -50,8 +50,19 @@ try {
 
     $qualify = & $entry qualify -MapName $mapName -SkipOpenVRProbe -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $qualify.ok -and $qualify.state -eq 'head-pose-not-qualified' -and $qualify.data.pose.qualified -and $qualify.data.applicationPose.skipped) 'skipping the independent stereo probe remains explicitly unqualified'
+    $aggregateProbeError = 'The independent OpenVR application pose qualification did not succeed; inspect the retained probe result for the failed component or execution error.'
+    Assert-Test ($qualify.errors -contains $aggregateProbeError -and -not ($qualify.errors -match 'did not observe a valid standing HMD')) 'skipped application qualification does not invent an invalid HMD observation'
     $skippedControllers = & $entry qualify -MapName $mapName -RequireControllers -SkipOpenVRProbe -Compact -NoExit | ConvertFrom-Json
     Assert-Test (-not $skippedControllers.ok -and $skippedControllers.data.controllersRequired -and $skippedControllers.data.applicationPose.skipped) 'required passive controller qualification cannot be bypassed by skipping the probe'
+
+    # Non-executable fixture exercises the actual bounded-run/public-qualify
+    # failure path without executing an OpenVR client or starting a runtime.
+    New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+    $invalidProbe = Join-Path $fixture 'invalid-probe.exe'
+    [IO.File]::WriteAllText($invalidProbe, 'not an executable; fixture only')
+    $failedApplication = & $entry qualify -MapName $mapName -RequireControllers -PoseProbePath $invalidProbe -InstallRoot $fixture -OpenVRPathsPath (Join-Path $fixture 'unused-openvrpaths.json') -EvidenceDirectory (Join-Path $fixture 'invalid-probe-evidence') -ProbeTimeoutSeconds 1 -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $failedApplication.ok -and $failedApplication.data.pose.qualified -and -not $failedApplication.data.applicationPose.boundedRun.ok) 'failed application probe remains negative despite an acknowledged fixture head pose'
+    Assert-Test ($failedApplication.errors -contains $aggregateProbeError -and -not ($failedApplication.errors -match 'did not observe a valid standing HMD') -and ($failedApplication.errors -match 'required passive left/right controller pair')) 'aggregate probe error preserves controller refusal without falsely blaming the HMD'
 
     $set = & $entry set -MapName $mapName -EyeHeightMeters 1.72 -YawDegrees 15 -NoWait -Compact -NoExit | ConvertFrom-Json
     Assert-Test ($set.ok -and $set.state -eq 'pose-submitted' -and $set.data.writerNonce -ne 0 -and ($view.ReadUInt64(8) % 2) -eq 0) 'set publishes an atomic even pose sequence with a unique writer nonce'
