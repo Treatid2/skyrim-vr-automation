@@ -799,7 +799,9 @@ try {
             $qualified = [bool]$pose.qualified -and [bool]$applicationPose.qualified
             $qualificationErrors = @()
             if (-not $pose.qualified) { $qualificationErrors += 'The running provider does not expose an acknowledged standing head pose within the configured height range.' }
-            if (-not $applicationPose.qualified) { $qualificationErrors += 'The independent OpenVR client did not observe a valid standing HMD pose within the configured height range.' }
+            # Aggregate probe failure can be controller-only, stereo-only,
+            # skipped, or an execution failure; it is not proof of a bad HMD.
+            if (-not $applicationPose.qualified) { $qualificationErrors += 'The independent OpenVR application pose qualification did not succeed; inspect the retained probe result for the failed component or execution error.' }
             if ($RequireControllers -and -not $applicationPose.qualified) { $qualificationErrors += 'The required passive left/right controller pair was not independently qualified; skipping the probe cannot satisfy this gate.' }
             $result = New-Result -Ok $qualified -State $(if ($qualified) { 'head-pose-qualified' } else { 'head-pose-not-qualified' }) -Data @{ mapName = $MapName; pose = $pose; applicationPose = $applicationPose; controllersRequired = [bool]$RequireControllers; minimumEyeHeightMeters = $MinimumEyeHeightMeters; maximumEyeHeightMeters = $MaximumEyeHeightMeters } -Errors $qualificationErrors
         }
