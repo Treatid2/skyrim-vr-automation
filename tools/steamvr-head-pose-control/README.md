@@ -13,6 +13,7 @@ separately reviewed build.
 
 .\Invoke-SteamVRHeadPoseControl.ps1 inspect -Compact
 .\Invoke-SteamVRHeadPoseControl.ps1 qualify -Compact
+.\Invoke-SteamVRHeadPoseControl.ps1 qualify -RequireControllers -Compact
 .\Invoke-SteamVRHeadPoseControl.ps1 set -EyeHeightMeters 1.68 -YawDegrees 0
 ```
 
@@ -27,6 +28,14 @@ but is deliberately not required to bootstrap the pose.
 observe the standing pose, finite and distinct left/right eye transforms, a
 plausible eye separation, and a valid recommended render target. Using
 `-SkipOpenVRProbe` is diagnostic and explicitly unqualified.
+
+`-RequireControllers` passes `--require-controllers` to the same bounded
+independent probe. It additionally requires the exact passive provider's
+distinct left/right roles, valid connected standing and compositor poses,
+100 neutral legacy input samples and zero button/touch events. Missing or
+head-only probe output cannot satisfy it. Skipping the probe remains
+unqualified even with an acknowledged head pose. This is passive controller
+presence, not interactive input or replay support.
 
 `install` requires SteamVR to be stopped. It copies a validated package to a
 stable user-local directory, records an ownership marker, registers the driver
@@ -44,6 +53,14 @@ bytes, and verifies original marker/DLL provenance. A registration command
 whose result was not journalled is accepted for rollback only when its semantic
 driver inventory differs from the preimage solely by the one canonical target.
 Unclassified target or registration drift fails for manual recovery.
+
+Controller-capable packages (including an explicit `enableControllers=false`
+default) must include `resources/input/passive_controller_profile.json`.
+The installer validates its driver/class identity, copies it, and binds its
+SHA-256 plus the default-settings hash into the source journal, ownership marker
+and installation receipt. Those installed hashes must match the exact source
+package. Historical head-only packages without the controller setting remain
+installable, but cannot pass required-controller qualification.
 
 The install lock is bounded by `-InstallLockTimeoutMilliseconds`. Its control
 root is fixed under Windows LocalApplicationData; the fixture-only environment

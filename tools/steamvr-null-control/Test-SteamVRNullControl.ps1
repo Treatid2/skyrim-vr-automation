@@ -741,7 +741,7 @@ try {
 
     $inspectConfigured = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json
     Assert-Test ($inspectConfigured.ok -and $inspectConfigured.state -eq 'null-configured-runtime-stopped' -and -not $inspectConfigured.data.runtime.active) 'inspect distinguishes configured settings from a proven runtime'
-    Assert-Test (-not $inspectConfigured.data.inputContract.replayReady -and $inspectConfigured.data.inputContract.controllerInput -eq 'unavailable' -and $inspectConfigured.data.inputContract.hmdPoseControl -eq 'shared-memory-v2') 'inspect exposes controlled HMD pose while keeping controller replay unavailable'
+    Assert-Test (-not $inspectConfigured.data.inputContract.replayReady -and -not $inspectConfigured.data.inputContract.controllerPresenceReady -and $inspectConfigured.data.inputContract.controllerInput -eq 'passive-neutral' -and $inspectConfigured.data.inputContract.hmdPoseControl -eq 'shared-memory-v2') 'inspect distinguishes unqualified passive controller presence from unavailable replay'
 
     $startDry = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact | ConvertFrom-Json
     Assert-Test ($startDry.ok -and $startDry.state -eq 'dry-run' -and $startDry.data.startupPath -eq $startupPath) 'start dry-run validates the configured transaction and exact startup path'
