@@ -110,7 +110,8 @@ function Get-DevBenchHealthSemanticStatus {
 
 function Get-DevBenchSemanticStatus {
     [CmdletBinding()]
-    param([AllowEmptyCollection()][object[]]$Content)
+    param([AllowEmptyCollection()][object[]]$Content,
+        [ValidateSet('content.status.vendorWorkGate.state')][string[]]$UnsignedTelemetryStatePaths = @())
 
     $known = $false
     $reasons = [Collections.Generic.List[string]]::new()
@@ -317,7 +318,14 @@ function Get-DevBenchSemanticStatus {
                 }
             }
             elseif ($name -eq 'state') {
-                if ($child -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$child)) {
+                if ($childPath -cin $UnsignedTelemetryStatePaths) {
+                    # Exact producer-owned telemetry, never a generic outcome.
+                    if ($null -eq $child -or $child.GetType() -notin @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64]) -or [decimal]$child -lt 0) {
+                        $script:semanticKnown = $true
+                        $reasons.Add("$childPath is not unsigned integral telemetry")
+                    }
+                }
+                elseif ($child -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$child)) {
                     if (-not $states.Contains([string]$child)) { $states.Add([string]$child) }
                 }
                 elseif ($null -eq $child -or $child -is [string] -or $child -is [ValueType]) {
@@ -542,6 +550,7 @@ function Test-DevBenchReadOnlyRequest {
         return $kind -in @('state', 'health', 'vm', 'scene', 'mods', 'player', 'inventory', 'quests', 'effects', 'refs', 'registrants', 'screenshots', 'extensions')
     }
     if ($ToolName -eq 'menu') { return $action -eq 'list' }
+    if ($ToolName -ceq 'camera') { return $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'get' }
     if ($ToolName -eq 'record') { return $action -eq 'status' }
     if ($ToolName -eq 'input') { return $action -in @('observe', 'status') }
     if ($ToolName -eq 'communityshaders.renderscale') { return $action -eq 'status' }
@@ -616,8 +625,102 @@ function Get-DevBenchCallSemanticStatus {
     if ($ToolName -ceq 'game' -and $Arguments.Contains('action') -and $Arguments['action'] -ceq 'newGame') {
         return Get-DevBenchNewGameSemanticStatus -Arguments $Arguments -Content $Content
     }
-    $semantic = Get-DevBenchSemanticStatus -Content $Content
+    $semantic = if ($ToolName -ceq 'communityshaders.renderscale' -and $Arguments.Contains('action') -and $Arguments['action'] -ceq 'status') {
+        Get-DevBenchSemanticStatus -Content $Content -UnsignedTelemetryStatePaths 'content.status.vendorWorkGate.state'
+    } else { Get-DevBenchSemanticStatus -Content $Content }
     $payloads = @($Content)
+    if ($ToolName -ceq 'communityshaders.renderscale' -and $Arguments.Contains('action') -and $Arguments['action'] -ceq 'status') {
+        $reasons = [Collections.Generic.List[string]]::new()
+        if ($semantic.known -and -not $semantic.ok) { foreach ($reason in $semantic.reasons) { $reasons.Add([string]$reason) } }
+        $payload = if ($payloads.Count -eq 1 -and $payloads[0] -is [pscustomobject]) { $payloads[0] } else { $null }
+        if ($null -eq $payload -or -not $payload.PSObject.Properties['action'] -or $payload.action -isnot [string] -or $payload.action -cne 'status' -or
+            -not $payload.PSObject.Properties['status'] -or $payload.status -isnot [pscustomobject]) { $reasons.Add('Render-scale status requires one exact action/status structured receipt.') }
+        elseif ($payload.status.PSObject.Properties['vendorWorkGate']) {
+            $gate = $payload.status.vendorWorkGate
+            if ($gate -isnot [pscustomobject]) { $reasons.Add('Render-scale vendorWorkGate must be structured.') }
+            else {
+                $state = $gate.PSObject.Properties['state']
+                if (-not $state -or $null -eq $state.Value -or $state.Value.GetType() -notin @([byte],[sbyte],[int16],[uint16],[int32],[uint32],[int64],[uint64]) -or [decimal]$state.Value -lt 0) { $reasons.Add('Render-scale vendorWorkGate.state must be uint64 telemetry.') }
+                $active = $gate.PSObject.Properties['active']; $epoch = $gate.PSObject.Properties['epoch']
+                if (-not $active -or $active.Value -isnot [bool]) { $reasons.Add('Render-scale vendorWorkGate.active must be Boolean.') }
+                if (-not $epoch -or $null -eq $epoch.Value -or $epoch.Value.GetType() -notin @([byte],[sbyte],[int16],[uint16],[int32],[uint32],[int64],[uint64]) -or [decimal]$epoch.Value -lt 0 -or [decimal]$epoch.Value -gt [uint32]::MaxValue) { $reasons.Add('Render-scale vendorWorkGate.epoch must be uint32 telemetry.') }
+            }
+        }
+        $semantic.known = $true; $semantic.ok = $reasons.Count -eq 0
+        $semantic.outcome = if ($semantic.ok) { 'read-contract-satisfied' } else { 'read-contract-failed' }
+        $semantic.reasons = @($reasons | Select-Object -Unique)
+        $semantic.explicitOutcomeEvidence = @('native-render-scale-status-observation')
+        return $semantic
+    }
+    $worldScaleQuery = $ToolName -ceq 'console' -and $Arguments.Contains('action') -and $Arguments['action'] -ceq 'exec' -and
+        $Arguments.Contains('command') -and $Arguments['command'] -is [string] -and $Arguments['command'] -ceq 'getini "fVrScale:VR"' -and
+        $Arguments.Contains('capture') -and $Arguments['capture'] -is [bool] -and $Arguments['capture']
+    if ($worldScaleQuery -or ($ToolName -ceq 'console' -and $Arguments.Contains('action') -and $Arguments['action'] -ceq 'read')) {
+        $reasons = [Collections.Generic.List[string]]::new()
+        if ($semantic.known -and -not $semantic.ok) { foreach ($reason in $semantic.reasons) { $reasons.Add([string]$reason) } }
+        $payload = if ($payloads.Count -eq 1 -and $payloads[0] -is [pscustomobject]) { $payloads[0] } else { $null }
+        if ($null -eq $payload) { $reasons.Add('Console capture requires exactly one structured receipt.') }
+        elseif ($worldScaleQuery) {
+            if (-not $payload.PSObject.Properties['command'] -or $payload.command -isnot [string] -or $payload.command -cne $Arguments['command']) { $reasons.Add('Console receipt command does not match the exact world-scale query.') }
+            foreach ($entry in @(@('completed', $true), @('queued', $false), @('capturing', $true))) {
+                $property = $payload.PSObject.Properties[$entry[0]]
+                if (-not $property -or $property.Value -isnot [bool] -or $property.Value -ne $entry[1]) { $reasons.Add("Console $($entry[0]) is not the required Boolean value.") }
+            }
+        }
+        else {
+            foreach ($entry in @(@('markersFound', $true), @('sawBegin', $true), @('sawEnd', $true), @('lossPossible', $false))) {
+                $property = $payload.PSObject.Properties[$entry[0]]
+                if (-not $property -or $property.Value -isnot [bool] -or $property.Value -ne $entry[1]) { $reasons.Add("Console $($entry[0]) does not prove lossless fenced output.") }
+            }
+            $lines = $payload.PSObject.Properties['lines']; $count = $payload.PSObject.Properties['count']
+            if (-not $lines -or $lines.Value -isnot [array] -or @($lines.Value | Where-Object { $_ -isnot [string] }).Count -gt 0) { $reasons.Add('Console lines must be an array of strings.') }
+            if (-not $count -or $null -eq $count.Value -or $count.Value.GetType() -notin @([byte],[sbyte],[int16],[uint16],[int32],[uint32],[int64],[uint64]) -or $count.Value -lt 0 -or $count.Value -gt 200 -or -not $lines -or $count.Value -ne @($lines.Value).Count) { $reasons.Add('Console count must match the bounded output array.') }
+            $source = $payload.PSObject.Properties['source']
+            if (-not $source -or $source.Value -isnot [string] -or $source.Value -cnotin @('print','buffer')) { $reasons.Add('Console output source is not a supported lossless route.') }
+            $diag = $payload.PSObject.Properties['diag']
+            if (-not $diag -or $diag.Value -isnot [pscustomobject] -or -not $diag.Value.PSObject.Properties['timedOut'] -or $diag.Value.timedOut -isnot [bool] -or $diag.Value.timedOut) { $reasons.Add('Console capture timeout state is not proven false.') }
+            if ($source -and $source.Value -ceq 'print') {
+                if (-not $diag -or $diag.Value -isnot [pscustomobject] -or -not $diag.Value.PSObject.Properties['printHooked'] -or $diag.Value.printHooked -isnot [bool] -or -not $diag.Value.printHooked) { $reasons.Add('Console print hook is not proven active.') }
+                $dropped = if ($diag -and $diag.Value -is [pscustomobject]) { $diag.Value.PSObject.Properties['printDropped'] } else { $null }
+                if (-not $dropped -or $null -eq $dropped.Value -or $dropped.Value.GetType() -notin @([byte],[sbyte],[int16],[uint16],[int32],[uint32],[int64],[uint64]) -or $dropped.Value -ne 0) { $reasons.Add('Console print loss is not proven zero.') }
+            }
+        }
+        $semantic.known = $true; $semantic.ok = $reasons.Count -eq 0
+        $semantic.outcome = if (-not $semantic.ok) { 'console-capture-contract-failed' } elseif ($worldScaleQuery) { 'worldscale-query-execution-completed' } else { 'console-fenced-output-qualified' }
+        $semantic.reasons = @($reasons | Select-Object -Unique)
+        $semantic.explicitOutcomeEvidence = @('native-console-capture-typed-receipt')
+        $semantic | Add-Member -NotePropertyName completionBasis -NotePropertyValue $(if ($worldScaleQuery) { 'execution-only' } else { 'output-capture-only' })
+        return $semantic
+    }
+    if ($ToolName -ceq 'camera' -and $Arguments.Contains('action') -and $Arguments['action'] -ceq 'get') {
+        $reasons = [Collections.Generic.List[string]]::new()
+        if ($semantic.known -and -not $semantic.ok) { foreach ($reason in $semantic.reasons) { $reasons.Add([string]$reason) } }
+        $payload = if ($payloads.Count -eq 1 -and $payloads[0] -is [pscustomobject]) { $payloads[0] } else { $null }
+        if ($null -eq $payload) { $reasons.Add('Camera get requires exactly one structured payload.') }
+        else {
+            foreach ($name in @('camX', 'camY', 'camZ', 'camPitch', 'camYaw')) {
+                $property = $payload.PSObject.Properties[$name]
+                if (-not $property -or $null -eq $property.Value -or $property.Value.GetType() -notin @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64], [single], [double], [decimal]) -or
+                    [double]::IsNaN([double]$property.Value) -or [double]::IsInfinity([double]$property.Value)) { $reasons.Add("Camera $name must be a finite JSON number.") }
+            }
+            foreach ($name in @('freeCam', 'freeCamOwned')) {
+                $property = $payload.PSObject.Properties[$name]
+                if (-not $property -or $property.Value -isnot [bool]) { $reasons.Add("Camera $name must be Boolean.") }
+            }
+            $state = $payload.PSObject.Properties['stateId']
+            if (-not $state -or $null -eq $state.Value -or $state.Value.GetType() -notin @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64]) -or [decimal]$state.Value -lt 0 -or [decimal]$state.Value -gt [uint32]::MaxValue) { $reasons.Add('Camera stateId must be a uint32 JSON integer.') }
+            foreach ($entry in @(@('pov', @('first','third','vanity','other')), @('freeCamBackend', @('vr-state','engine')))) {
+                $property = $payload.PSObject.Properties[$entry[0]]
+                if (-not $property -or $property.Value -isnot [string] -or $property.Value -cnotin $entry[1]) { $reasons.Add("Camera $($entry[0]) is not a supported exact value.") }
+            }
+            if ($payload.PSObject.Properties['freeCam'] -and $payload.freeCam -is [bool] -and -not $payload.freeCam -and $payload.PSObject.Properties['freeCamOwned'] -and $payload.freeCamOwned -is [bool] -and $payload.freeCamOwned) { $reasons.Add('Camera ownership contradicts inactive freeCam.') }
+        }
+        $semantic.known = $true; $semantic.ok = $reasons.Count -eq 0
+        $semantic.outcome = if ($semantic.ok) { 'camera-read-contract-satisfied' } else { 'camera-read-contract-failed' }
+        $semantic.reasons = @($reasons | Select-Object -Unique)
+        $semantic.explicitOutcomeEvidence = @('native-camera-get-typed-observation')
+        return $semantic
+    }
     if ($ToolName -eq 'game' -and $Arguments.Contains('action') -and [string]$Arguments['action'] -eq 'load') {
         $reasons = [Collections.Generic.List[string]]::new()
         if ($semantic.known -and -not $semantic.ok) {
@@ -896,6 +999,18 @@ function Get-DevBenchCallSemanticStatus {
             $null
         }
         if ($null -ne $payload) {
+            if ($payload.PSObject.Properties['result']) {
+                $contract = $payload.PSObject.Properties['contract']
+                $major = if ($contract -and $contract.Value -is [pscustomobject]) { $contract.Value.PSObject.Properties['major'] } else { $null }
+                if (-not $payload.PSObject.Properties['ok'] -or $payload.ok -isnot [bool] -or -not $payload.ok -or
+                    -not $contract -or $contract.Value -isnot [pscustomobject] -or
+                    -not $contract.Value.PSObject.Properties['name'] -or $contract.Value.name -isnot [string] -or $contract.Value.name -cne 'csx.screenshot' -or
+                    -not $major -or $null -eq $major.Value -or $major.Value.GetType() -notin @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64]) -or $major.Value -ne 1) {
+                    $reasons.Add('Nested screenshot capabilities require Boolean ok and exact csx.screenshot contract major 1.')
+                }
+                if ($payload.result -is [pscustomobject]) { $payload = $payload.result }
+                else { $reasons.Add('Screenshot capabilities result must be structured.'); $payload = [pscustomobject]@{} }
+            }
             if (-not $payload.PSObject.Properties['schema'] -or [string]$payload.schema -cne 'urn:csx:devbench:screenshot:1') {
                 $reasons.Add('content.schema is not the screenshot contract schema')
             }
@@ -919,6 +1034,7 @@ function Get-DevBenchCallSemanticStatus {
             codes = @($semantic.codes); states = @($semantic.states)
             reasons = @($reasons | Select-Object -Unique); schedulerOnly = $false
             schedulerReceiptPaths = @(); explicitOutcomeEvidence = @('content.schema', 'content.limits.maximumSequenceFrames', 'content.limits.maximumSequenceDurationMs')
+            qualifiedCapabilities = if ($reasons.Count -eq 0) { $payload } else { $null }
         }
     }
 

@@ -10,6 +10,65 @@ $passes = [Collections.Generic.List[string]]::new()
 $failures = [Collections.Generic.List[string]]::new()
 function Assert-Test([bool]$Condition, [string]$Message) { if ($Condition) { $passes.Add($Message) } else { $failures.Add($Message) } }
 
+$cameraRead = [pscustomobject]@{pov='other';freeCam=$false;freeCamOwned=$false;stateId=9;freeCamBackend='vr-state';camX=-536.154;camY=0.254;camZ=228.059;camPitch=-0.0;camYaw=-0.0423}
+Assert-Test ((Get-DevBenchCallSemanticStatus -ToolName camera -Arguments @{action='get'} -Content @($cameraRead)).ok) 'camera get qualifies the observed VR transform without a fabricated ok marker'
+Assert-Test (Test-DevBenchReadOnlyRequest -ToolName camera -Arguments @{action='get'}) 'only exact explicit camera get enters read-only admission'
+foreach ($action in @('drive','freecam','setPov','GET','')) { Assert-Test (-not (Test-DevBenchReadOnlyRequest -ToolName camera -Arguments @{action=$action})) "camera $action is not admitted as the exact read" }
+foreach ($entry in @(@('camX','1'),@('camY',[double]::NaN),@('camZ',[double]::PositiveInfinity),@('freeCam','false'),@('freeCamOwned',$true),@('stateId',9.5),@('pov','unknown'),@('freeCamBackend','VR-state'))) {
+    $malformed = $cameraRead | ConvertTo-Json | ConvertFrom-Json
+    $malformed.($entry[0]) = $entry[1]
+    Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName camera -Arguments @{action='get'} -Content @($malformed)).ok) "camera rejects malformed $($entry[0])"
+}
+foreach ($payload in @([pscustomobject]@{ok=$true}, [pscustomobject]@{pov=$null}, 'scalar')) { Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName camera -Arguments @{action='get'} -Content @($payload)).ok) 'camera requires its full typed observation despite generic success'
+}
+$negativeCamera = $cameraRead | ConvertTo-Json | ConvertFrom-Json
+$negativeCamera | Add-Member error 'unavailable'
+Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName camera -Arguments @{action='get'} -Content @($negativeCamera)).ok) 'camera retains explicit error veto'
+Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName camera -Arguments @{action='get'} -Content @($cameraRead,$cameraRead)).ok) 'camera refuses multiple payloads'
+
+$numericRender = [pscustomobject]@{action='status';status=[pscustomobject]@{vendorWorkGate=[pscustomobject]@{state=[int64]38654705664;epoch=9;active=$false};frame=103395}}
+Assert-Test ((Get-DevBenchCallSemanticStatus -ToolName communityshaders.renderscale -Arguments @{action='status'} -Content @($numericRender)).ok) 'render-scale status accepts the exact packed native uint64 state as telemetry, not success'
+Assert-Test (-not (Get-DevBenchSemanticStatus -Content @($numericRender)).ok) 'numeric telemetry exception does not broaden the generic classifier'
+foreach ($state in @(-1, 0.5, $true, '38654705664', $null)) {
+    $badRender = $numericRender | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+    $badRender.status.vendorWorkGate.state = $state
+    Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName communityshaders.renderscale -Arguments @{action='status'} -Content @($badRender)).ok) 'packed native state rejects negative/fractional/Boolean/string/null drift'
+}
+$badRender = $numericRender | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+$badRender | Add-Member error 'failed'
+Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName communityshaders.renderscale -Arguments @{action='status'} -Content @($badRender)).ok) 'packed state does not hide explicit render-scale errors'
+Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName communityshaders.renderscale -Arguments @{action='apply'} -Content @($numericRender)).ok) 'numeric state exception is not applied to mutations'
+Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName communityshaders.renderscale -Arguments @{action='status'} -Content @($numericRender,$numericRender)).ok) 'render-scale read refuses multiple positive payloads'
+Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName communityshaders.renderscale -Arguments @{action='status'} -Content @([pscustomobject]@{ok=$true})).ok) 'render-scale generic affirmative cannot replace its exact status receipt'
+
+$nativeCapabilities = [pscustomobject]@{ok=$true;contract=[pscustomobject]@{name='csx.screenshot';major=1};result=[pscustomobject]@{schema='urn:csx:devbench:screenshot:1';limits=[pscustomobject]@{maximumSequenceFrames=10000;maximumSequenceDurationMs=3600000}}}
+$qualifiedCapabilities = Get-DevBenchCallSemanticStatus -ToolName communityshaders.screenshot -Arguments @{action='capabilities'} -Content @($nativeCapabilities)
+Assert-Test ($qualifiedCapabilities.ok -and $qualifiedCapabilities.qualifiedCapabilities.limits.maximumSequenceFrames -eq 10000) 'native screenshot contract/result envelope exposes only its qualified capability projection'
+foreach ($defect in @('foreign','majorString','major2','okFalse','scalarResult','nestedError','fractional','duplicate')) {
+    $bad = $nativeCapabilities | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+    switch ($defect) {
+        foreign { $bad.contract.name='foreign' }; majorString { $bad.contract.major='1' }; major2 { $bad.contract.major=2 }; okFalse { $bad.ok=$false }
+        scalarResult { $bad.result='scalar' }; nestedError { $bad.result | Add-Member error 'bad' }; fractional { $bad.result.limits.maximumSequenceFrames=1.5 }
+    }
+    $content = if ($defect -eq 'duplicate') { @($bad,$bad) } else { @($bad) }
+    $outcome = Get-DevBenchCallSemanticStatus -ToolName communityshaders.screenshot -Arguments @{action='capabilities'} -Content $content
+    Assert-Test (-not $outcome.ok -and $null -eq $outcome.qualifiedCapabilities) "native screenshot $defect refuses projection"
+}
+
+$queryArgs = @{action='exec';command='getini "fVrScale:VR"';capture=$true}
+$queryReceipt = [pscustomobject]@{command=$queryArgs.command;completed=$true;queued=$false;capturing=$true}
+$queryOutcome = Get-DevBenchCallSemanticStatus -ToolName console -Arguments $queryArgs -Content @($queryReceipt)
+Assert-Test ($queryOutcome.ok -and $queryOutcome.completionBasis -eq 'execution-only') 'world-scale query qualifies execution only, never inventing a calibration value'
+$queryReceipt.command='setini "fVrScale:VR" 1'
+Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName console -Arguments $queryArgs -Content @($queryReceipt)).ok) 'world-scale query requires exact command identity'
+$fenced = [pscustomobject]@{count=1;lines=@('INISetting fVrScale:VR >> 79.06');source='print';lossPossible=$false;markersFound=$true;sawBegin=$true;sawEnd=$true;diag=[pscustomobject]@{timedOut=$false;printHooked=$true;printDropped=0;lastMessage='Script command "DVBCAPENDx9F3" not found.'}}
+Assert-Test ((Get-DevBenchCallSemanticStatus -ToolName console -Arguments @{action='read'} -Content @($fenced)).ok) 'fenced console output preserves marker diagnostic text without treating it as an execution error'
+foreach ($defect in @('lost','missingEnd','drop','timeout','count','stringLine','error')) {
+    $bad = $fenced | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+    switch ($defect) { lost {$bad.lossPossible=$true}; missingEnd {$bad.sawEnd=$false}; drop {$bad.diag.printDropped=1}; timeout {$bad.diag.timedOut=$true}; count {$bad.count=2}; stringLine {$bad.lines='not-array'}; error {$bad | Add-Member error 'bad'} }
+    Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName console -Arguments @{action='read'} -Content @($bad)).ok) "console fenced $defect cannot qualify output"
+}
+
 $success = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ status = [pscustomobject]@{ name = 'success'; value = 0 } })
 Assert-Test ($success.known -and $success.ok) 'semantic status recognizes a successful API payload'
 $conflict = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ status = [pscustomobject]@{ name = 'idempotency_conflict'; value = 12 } })
@@ -140,7 +199,7 @@ Assert-Test ($inspectSemantic.known -and $inspectSemantic.ok -and $inspectSemant
 $renderScaleSemantic = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.renderscale' -Arguments @{ action = 'status' } -Content @([pscustomobject]@{ action = 'status'; status = [pscustomobject]@{ controller = [pscustomobject]@{ state = 'Active'; revision = 42 } } })
 Assert-Test ($renderScaleSemantic.known -and $renderScaleSemantic.ok -and $renderScaleSemantic.outcome -eq 'read-contract-satisfied') 'render-scale status recognizes its explicit structured read contract'
 $renderScaleMissingStatus = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.renderscale' -Arguments @{ action = 'status' } -Content @([pscustomobject]@{ action = 'status' })
-Assert-Test (-not $renderScaleMissingStatus.known) 'render-scale status rejects a response without structured status telemetry'
+Assert-Test ($renderScaleMissingStatus.known -and -not $renderScaleMissingStatus.ok) 'render-scale status explicitly rejects a response without structured status telemetry'
 $renderScaleArrayStatus = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.renderscale' -Arguments @{ action = 'status' } -Content @([pscustomobject]@{ action = 'status'; status = [object[]]@() })
 Assert-Test (-not $renderScaleArrayStatus.ok -and $renderScaleArrayStatus.outcome -ne 'read-contract-satisfied') 'render-scale status rejects an array replacing its required status object'
 $screenshotCapabilities = Get-DevBenchCallSemanticStatus -ToolName 'communityshaders.screenshot' -Arguments @{ action = 'capabilities' } -Content @([pscustomobject]@{ schema = 'urn:csx:devbench:screenshot:1'; limits = [pscustomobject]@{ maximumSequenceFrames = 10000; maximumSequenceDurationMs = 3600000 } })

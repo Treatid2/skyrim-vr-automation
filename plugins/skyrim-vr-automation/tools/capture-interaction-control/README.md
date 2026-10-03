@@ -1,5 +1,16 @@
 # Capture interaction control
 
+For a newly deployed runtime, `capabilities` and `start` accept `-ArtifactPath`,
+`-ExpectedArtifactSha256` and `-ExpectedBuildId` and forward those exact
+expectations to every controller call, including initial input capabilities,
+screenshot preflight and recording start. These are expectations, not identity
+bypasses. Later commands use the complete accepting runtime identity persisted
+in session state; bootstrap expectations cannot replace that identity.
+Screenshot preflight consumes only the controller's qualifiedCapabilities
+projection, while probe receipts retain the original native contract/result
+envelope. Select this supported controller lane before the workflow begins;
+source delivery does not refresh an installed plugin or direct tool catalogue.
+
 `Invoke-CaptureInteraction.ps1` is the host-side observation/action layer over
 DevBench recording, atomic OpenVR tracked-set input, and the CSX screenshot v1
 service. It does not encode video and does not invent missing game state.

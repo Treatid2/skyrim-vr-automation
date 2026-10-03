@@ -8,6 +8,9 @@ param(
     [string]$SessionPath,
     [string]$SessionDirectory,
     [string]$RuntimePath = $env:CSX_DEVBENCH_RUNTIME_PATH,
+    [string]$ArtifactPath,
+    [string]$ExpectedArtifactSha256,
+    [string]$ExpectedBuildId,
     [ValidateSet('none', 'on-demand', 'sequence')]
     [string]$VisualMode = 'on-demand',
     [ValidateSet('left_eye', 'right_eye', 'side_by_side', 'framed_combined', 'source_native')]
@@ -143,6 +146,10 @@ function Invoke-DevBench([string]$Tool, [hashtable]$Arguments, [string]$Runtime,
         NoExit = $true
     }
     if ($RequireSuccess) { $parameters['RequireSuccess'] = $true }
+    foreach ($name in @('ArtifactPath', 'ExpectedArtifactSha256', 'ExpectedBuildId')) {
+        $expectation = Get-Variable -Name $name -ValueOnly
+        if (-not [string]::IsNullOrWhiteSpace($expectation)) { $parameters[$name] = $expectation }
+    }
     if ($null -ne $ExpectedRuntimeIdentity) {
         $parameters['ExpectedRuntimeIdentityJson'] = $ExpectedRuntimeIdentity | ConvertTo-Json -Depth 20 -Compress
     }
@@ -175,8 +182,17 @@ function Invoke-DevBench([string]$Tool, [hashtable]$Arguments, [string]$Runtime,
             throw $failure
         }
         $content = @($response.data.content)
-        if ($content.Count -lt 1) { throw "DevBench tool '$Tool' returned no content." }
-        return [pscustomobject][ordered]@{ value = $content[0]; envelope = $response; attempt = $attempt }
+        if ($content.Count -ne 1) { throw "DevBench tool '$Tool' must return exactly one content payload." }
+        $value = $content[0]
+        if ($Tool -ceq $screenshotTool -and $Arguments.ContainsKey('action') -and $Arguments.action -ceq 'capabilities') {
+            if (-not $response.PSObject.Properties['semantic'] -or -not $response.semantic -or
+                -not $response.semantic.PSObject.Properties['qualifiedCapabilities'] -or
+                $response.semantic.qualifiedCapabilities -isnot [pscustomobject]) {
+                throw 'Screenshot capabilities lack the controller-qualified v1 payload; no unvalidated result projection.'
+            }
+            $value = $response.semantic.qualifiedCapabilities
+        }
+        return [pscustomobject][ordered]@{ value = $value; envelope = $response; attempt = $attempt }
     }
     catch {
         if (-not $_.Exception.Data.Contains('DevBenchAttempt')) { $_.Exception.Data['DevBenchAttempt'] = $attempt }
@@ -199,7 +215,7 @@ function Test-DefiniteDevBenchMutationRejection($FailureEnvelope) {
 function Invoke-Probe([string]$Tool, [hashtable]$Arguments, [string]$Runtime, $ExpectedRuntimeIdentity) {
     try {
         $call = Invoke-DevBench -Tool $Tool -Arguments $Arguments -Runtime $Runtime -ExpectedRuntimeIdentity $ExpectedRuntimeIdentity
-        return [pscustomobject][ordered]@{ ok = $true; value = $call.value; error = $null }
+        return [pscustomobject][ordered]@{ ok = $true; value = $call.value; envelope = $call.envelope; error = $null }
     }
     catch { return [pscustomobject][ordered]@{ ok = $false; value = $null; error = $_.Exception.Message } }
 }
