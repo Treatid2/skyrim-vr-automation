@@ -34,6 +34,9 @@ optional integration rather than the identity or boundary of the toolkit.
   OpenVR display redirectors.
 - `tools/steamvr-head-pose-control` — install, inspect, update, and independently
   qualify the bundled SteamVR head-pose provider used by null-HMD sessions.
+- `tools/steamvr-controller-control` — exact-instance, leased native controller
+  pose/input commands, bounded tap/sequence, neutral release and haptic readback.
+  Full-input provider required; passive qualification is not game acceptance.
 - `tools/devbench-control` — a small MCP client for the DevBench endpoint
   exposed by a running CSX build, with listener/process/build/artifact binding
   and normalized semantic results.
