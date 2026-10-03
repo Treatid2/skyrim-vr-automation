@@ -352,7 +352,8 @@ A transport failure never causes the load mutation to be replayed.
 Before a `communityshaders.render_map` `start`, capture the live `registry`
 response and use `New-CSXRenderMapCapturePlan.ps1` with a workload JSON file.
 The retained registry must be a successful response bound to the exact
-`communityshaders.render_map` service, explicit contract major, producer build,
+`communityshaders.render-map` service (distinct from the
+`communityshaders.render_map` callable tool), explicit contract major, producer build,
 and source snapshot hash. The workload states positive integer JSON numbers for
 expected duration, frames, event count, event bytes, scope depth, and every
 catalogue observation family. The planner multiplies each by explicit headroom,
@@ -363,6 +364,14 @@ containing the selected bounds and rationale. Pass only a successful result's
 failure result retains the committed path and withholds arguments so the exact
 receipt can be reconciled. Any limit hit makes the evidence incomplete unless
 saturation itself is the experiment.
+
+The planner accepts an untouched retained controller response with exactly one
+structured `data.content` payload, the native registry response, or an explicit
+raw registry with producer provenance. It preserves the original snapshot hash
+and service identity; it does not rewrite the registry or treat the tool name as
+a service alias. Failed envelopes, foreign services/tools and multiple payloads
+are rejected before issuing start arguments. Planning is offline and never
+starts a capture or changes the running session.
 
 `upscalingStable` is the fail-closed barrier for paced cell-transition tests.
 It requires the exact `-ExpectedCell`, a loaded player, no blocking menu, and a
