@@ -67,7 +67,7 @@ class Unit(unittest.TestCase):
     def test_cli_terminal_faults_always_attempt_own_cleanup_and_report(self):
         original_open, original_unlink = Path.open, Path.unlink
         original_write, original_close, original_fsync, original_link = m.Trace.write, m.Trace.close, m.os.fsync, m.os.link
-        for fault in ('none','trace-write','trace-close','receipt-open','receipt-write','receipt-flush','receipt-fsync','receipt-close','receipt-publish','lock-close','lock-unlink'):
+        for fault in ('none','trace-write','trace-close','receipt-open','receipt-write','receipt-flush','receipt-fsync','receipt-close','receipt-publish','audit-open','audit-close','audit-update','candidate-cleanup','lock-close','lock-unlink'):
             for earlier_error in (False, True):
                 with self.subTest(fault=fault,earlier_error=earlier_error):
                     folder=Path(self.temp.name)/f'final-{fault}-{earlier_error}'
@@ -94,13 +94,19 @@ class Unit(unittest.TestCase):
                             self.stream.close()
                             if fault==self.kind+'-close':raise OSError('injected '+self.kind+' close')
                     def faulty_open(path,*args,**kwargs):
-                        if path.name.startswith('receipt.pending-'):
+                        if path.name.startswith('receipt.candidate-'):
                             if fault=='receipt-open':raise OSError('injected receipt open')
                             stream=original_open(path,*args,**kwargs);receipt_fd[0]=stream.fileno()
                             return FileProxy(stream,'receipt')
+                        if path.name.startswith('receipt.pending-'):
+                            if fault=='audit-open':raise OSError('injected audit open')
+                            if args[0]=='w' and fault=='audit-update':raise OSError('injected audit update')
+                            return FileProxy(original_open(path,*args,**kwargs),'audit')
                         if path.name=='.racemenu-sweep.lock':return FileProxy(original_open(path,*args,**kwargs),'lock')
                         return original_open(path,*args,**kwargs)
                     def faulty_unlink(path,*args,**kwargs):
+                        if path.name.startswith('receipt.candidate-') and fault=='candidate-cleanup':
+                            raise OSError('injected candidate cleanup')
                         if path.name=='.racemenu-sweep.lock':
                             events.append('lock-unlink')
                             if fault=='lock-unlink':raise OSError('injected lock unlink')
@@ -115,7 +121,7 @@ class Unit(unittest.TestCase):
                         if receipt_fd[0] is not None and fd==receipt_fd[0] and fault=='receipt-fsync':raise OSError('injected receipt fsync')
                         return original_fsync(fd)
                     def faulty_link(source,destination):
-                        if fault=='receipt-publish':raise OSError('injected receipt publication')
+                        if fault in ('receipt-publish','audit-update','candidate-cleanup'):raise OSError('injected receipt publication')
                         return original_link(source,destination)
                     class Adapter:
                         state=dict(sessionDirectory=str(session))
@@ -157,10 +163,54 @@ class Unit(unittest.TestCase):
                         self.assertEqual(code,2 if earlier_error else 0)
                         self.assertTrue(result['terminalEvidenceFinalized'])
                         self.assertEqual(result['evidenceFinalizationErrors'],[])
-                    if fault.startswith('receipt-'):
+                    if fault.startswith(('receipt-','audit-')) or fault=='candidate-cleanup':
                         self.assertFalse((output/'receipt.json').exists())
                     elif (output/'receipt.json').exists():
                         self.assertEqual(json.loads((output/'receipt.json').read_text()),result)
+                    for pending_path in output.glob('receipt.pending-*.json'):
+                        pending=json.loads(pending_path.read_text())
+                        self.assertFalse(pending['terminalEvidenceFinalized'])
+                        self.assertFalse(pending['ok'])
+                        if fault.startswith('receipt-') or fault in ('audit-close','candidate-cleanup'):
+                            self.assertEqual(next(e for e in pending['evidenceFinalizationErrors'] if e['operation']=='terminal-receipt-persist'),
+                                             next(e for e in result['evidenceFinalizationErrors'] if e['operation']=='terminal-receipt-persist'))
+                    if fault=='audit-update':
+                        self.assertIn('terminal-receipt-audit-persist',[e['operation'] for e in result['evidenceFinalizationErrors']])
+                    if fault=='candidate-cleanup':
+                        self.assertIn('terminal-receipt-candidate-cleanup',[e['operation'] for e in result['evidenceFinalizationErrors']])
+                    elif fault.startswith('receipt-'):
+                        self.assertEqual(list(output.glob('receipt.candidate-*.tmp')),[])
+    def test_cli_extreme_slider_arithmetic_is_structured_before_mutation(self):
+        cases=[('nonfinite lattice',-1e307,1e307,1e-308,'lattice'),
+               ('nonfinite span',-1e308,1e308,1,'span'),
+               ('inexact lattice',0,1,1e-16,'lattice'),
+               ('nonadvancing step',1e15,1e15+1,.001,'advance')]
+        for name,low,high,step,message in cases:
+            with self.subTest(name=name):
+                folder=Path(self.temp.name)/name;folder.mkdir()
+                protocol=folder/'protocol.json'
+                protocol.write_text(json.dumps(dict(limits=dict(maximumInputRequestsInFlight=1,mutationRetries=0,phaseDeadlineSeconds=900,menuSettleDeadlineSeconds=30),phases=[dict(id='race-slider-cross-product',maximumChanges=200)])))
+                class Adapter(Fake):
+                    def refresh(self,deadline):return m.snapshot(super().refresh(deadline))
+                adapter=Adapter();adapter.state=dict(sessionDirectory=str(folder))
+                adapter.s['sliders'][0].update(minimum=low,maximum=high,step=step,value=low)
+                stdout=io.StringIO()
+                with patch.object(m,'CaptureAdapter',return_value=adapter), patch.object(m,'attest',return_value={}), contextlib.redirect_stdout(stdout):
+                    code=m.main(['--capture-session','fixture','--capture-controller',str(ROOT/'Invoke-SweepDevBench.ps1'),'--confirm-existing-capture-lane','--pwsh','fixture','--protocol',str(protocol),'--qualification','fixture','--output',str(folder/'output'),'--phase','race-slider-cross-product'])
+                result=json.loads(stdout.getvalue())
+                self.assertEqual(code,2);self.assertFalse(result['ok'])
+                self.assertIn(message,result['error']);self.assertEqual(result['completedChanges'],0)
+                self.assertEqual(adapter.calls,[]);self.assertTrue(result['ownedLockReleased'])
+                self.assertFalse((folder/'.racemenu-sweep.lock').exists())
+                self.assertEqual(json.loads((folder/'output'/'receipt.json').read_text()),result)
+                self.assertTrue(result['terminalEvidenceFinalized'])
+    def test_slider_arithmetic_residual_and_oversized_integers_fail_closed(self):
+        self.assertFalse(m.number(10**400))
+        s=state();s['generation']=10**400
+        with self.assertRaises(m.StopSweep):m.snapshot(s)
+        with patch.object(m.math,'floor',side_effect=OverflowError('residual arithmetic')):
+            with self.assertRaisesRegex(m.StopSweep,'Unsafe slider lattice arithmetic'):
+                m.legal_targets(state()['sliders'][0])
     def test_cli_never_removes_a_foreign_unacquired_lock(self):
         foreign=Path(self.temp.name)/'.racemenu-sweep.lock'
         foreign.write_text('foreign-owner-evidence')

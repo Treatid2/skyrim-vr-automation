@@ -9,10 +9,16 @@ unlink itself fails, reconcile that exact retained lock rather than assuming
 release. No capture/game stop or mutation replay is introduced.
 
 The terminal trace precedes finalization. `receipt.json` is published exclusively
-only after its staging file is written, flushed, fsynced and closed, using an
-atomic hard-link creation (no overwrite or non-atomic fallback). Staging files
-are retained as audit, including partial failed files; they are not completed
-receipts. `terminalEvidenceFinalized:true` in the terminal stdout result requires
+only after its candidate is written, flushed, fsynced and closed, using an
+atomic hard-link creation (no overwrite or non-atomic fallback). The separate
+`receipt.pending-*.json` audit is always explicitly non-final; on publication
+failure it is best-effort annotated with the exact persistence error. If that
+annotation also fails, stdout reports the audit failure and the original audit
+still cannot claim success. Candidates (`receipt.candidate-*.tmp`) are not
+completion authority and are removed on failed publication where possible;
+cleanup failures are explicit. Only `receipt.json` is the canonical receipt.
+Successful canonical bytes equal terminal stdout. `terminalEvidenceFinalized:true`
+in the terminal stdout result requires
 successful trace/receipt persistence and cleanup. A partial/pending file or an
 earlier successful sweep outcome cannot override a finalization failure.
 
@@ -98,6 +104,12 @@ minimum/interval-aligned upper endpoints. Every slot is read afresh. Use
 sculpt, paint/color dialogs, saved presets or hidden/disabled controls. It may
 finish earlier as `coverage-exhausted`; the receipt reports the actual count,
 not a fictitious 200-action success.
+
+Live slider metadata must also have a finite span and a representable lattice:
+at most `2**53-1` steps, a positive step that advances the minimum, and a finite
+upper endpoint. Individually finite bounds are insufficient if their subtraction
+or division overflows. Unsafe arithmetic is a structured stop before mutation,
+not an uncaught exception; integer conversion overflow is likewise refused.
 
 Phase/settle maxima are 900/30 seconds, bounded further by the retained protocol.
 Defaults: qualifier pacing 2 seconds, other pacing 0, menu poll spacing 0.1,

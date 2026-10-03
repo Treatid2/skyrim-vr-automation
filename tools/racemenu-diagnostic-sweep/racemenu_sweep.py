@@ -19,6 +19,7 @@ PENDING = {'race-change-pending', 'sliders-rebuilding', 'menu-not-ready'}
 CAPS = {'qualification': 20, 'human-beast-alternation': 100, 'race-slider-cross-product': 200}
 CHECKS = ('moduleHashesVerified', 'csxPoseGuardQualified', 'nullHmdQualified',
           'dumpWindowActive', 'freshGameQualified', 'devbenchLiveIdentityVerified')
+MAX_LATTICE_STEPS = 2**53-1  # Largest consecutively exact binary64 integer.
 
 
 def utc():
@@ -39,7 +40,10 @@ class StopSweep(RuntimeError):
 
 
 def number(value):
-    return type(value) in (int, float) and math.isfinite(value)
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except ArithmeticError:
+        return False
 
 
 def integer(value):
@@ -82,6 +86,7 @@ def snapshot(value):
                 raise StopSweep('Nonfinite or malformed slider bounds')
             if slider['maximum'] < slider['minimum'] or slider['step'] < 0:
                 raise StopSweep('Invalid slider bounds')
+            slider_top(slider)  # Reject unsafe live arithmetic before any mutation.
     return value
 
 
@@ -89,11 +94,31 @@ def active_race(s):
     return next(r['id'] for r in s['races'] if r['active'])
 
 
-def legal_targets(s):
+def slider_top(s):
     low, high, step = s['minimum'], s['maximum'], s['step']
-    # A maximum need not be interval-aligned. Stay on the minimum-based lattice.
-    top = low + math.floor((high-low)/step + 1e-8)*step if step else high
-    return [v for v in (low, min(top, high)) if not math.isclose(v, s['value'], abs_tol=1e-6, rel_tol=0)]
+    try:
+        span = high-low
+        if not number(span) or span < 0:
+            raise StopSweep('Slider span is nonfinite or invalid')
+        if not step:
+            return high
+        units = span/step
+        if not number(units) or not 0 <= units <= MAX_LATTICE_STEPS:
+            raise StopSweep('Slider lattice exceeds finite representable step range')
+        if span and low+step == low:
+            raise StopSweep('Slider step cannot advance its minimum')
+        # A maximum need not be interval-aligned. Stay on the minimum-based lattice.
+        top = low + math.floor(units + 1e-8)*step
+        if not number(top):
+            raise StopSweep('Slider lattice endpoint is nonfinite')
+        return min(top, high)
+    except ArithmeticError as error:
+        raise StopSweep('Unsafe slider lattice arithmetic: '+str(error)) from error
+
+
+def legal_targets(s):
+    low, top = s['minimum'], slider_top(s)
+    return [v for v in (low, top) if not math.isclose(v, s['value'], abs_tol=1e-6, rel_tol=0)]
 
 
 class Trace:
@@ -471,7 +496,7 @@ def main(argv=None):
         sweep = Sweep(adapter,trace,args.phase,count,args.phase_seconds,args.settle_seconds,
                       pace,args.poll_seconds,args.race_ids,args.include_sex,args.stop_file)
         result = sweep.run()
-    except (StopSweep, OSError, ValueError, KeyError, TypeError, StopIteration) as error:
+    except (StopSweep, ArithmeticError, OSError, ValueError, KeyError, TypeError, StopIteration) as error:
         result = dict(ok=False,state='stopped-inputs-capture-retained',error=str(error),
                       completedChanges=sweep.completed if sweep else 0,mutationReplayPerformed=False)
     finally:
@@ -512,19 +537,46 @@ def main(argv=None):
             receipt = Path(args.output)/'receipt.json'
             pending_receipt = Path(args.output)/('receipt.pending-'+str(uuid.uuid4())+'.json')
             result['receiptStagingPath'] = str(pending_receipt)
-            # Publish only the fully written/closed file, with exclusive creation
-            # of the canonical name. Retain staging as audit even on failure.
-            # A pending path is never a completed receipt. No overwrite fallback.
-            result['terminalEvidenceFinalized'] = not finalization_errors
+            candidate = Path(args.output)/('receipt.candidate-'+str(uuid.uuid4())+'.tmp')
+            pending_created = False
+            candidate_created = False
+            # The retained audit is always explicitly nonfinal. The separate
+            # candidate supplies fully closed bytes for exclusive publication;
+            # only receipt.json is completion authority, never either staging path.
+            pending = dict(result, state='terminal-receipt-pending', ok=False,
+                           terminalEvidenceFinalized=False)
             try:
                 with pending_receipt.open('x',encoding='utf-8') as stream:
-                    json.dump(result,stream,indent=2,allow_nan=False)
+                    pending_created = True
+                    json.dump(pending,stream,indent=2,allow_nan=False)
                     stream.flush()
                     os.fsync(stream.fileno())
-                os.link(pending_receipt,receipt)
+                finalized = dict(result, terminalEvidenceFinalized=not finalization_errors)
+                with candidate.open('x',encoding='utf-8') as stream:
+                    candidate_created = True
+                    json.dump(finalized,stream,indent=2,allow_nan=False)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.link(candidate,receipt)
+                result = finalized
             except Exception as error:
                 finalization_error('terminal-receipt-persist',error)
                 result.update(ok=False,state='terminal-finalization-failed',terminalEvidenceFinalized=False)
+                # Best-effort failure annotation cannot turn an audit into success.
+                # Only rewrite this invocation's exclusively created audit.
+                if pending_created:
+                    try:
+                        with pending_receipt.open('w',encoding='utf-8') as stream:
+                            json.dump(result,stream,indent=2,allow_nan=False)
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                    except Exception as audit_error:
+                        finalization_error('terminal-receipt-audit-persist',audit_error)
+                if candidate_created:
+                    try:
+                        candidate.unlink()
+                    except Exception as cleanup_error:
+                        finalization_error('terminal-receipt-candidate-cleanup',cleanup_error)
     print(json.dumps(result,allow_nan=False))
     return 0 if result['ok'] else 2
 
