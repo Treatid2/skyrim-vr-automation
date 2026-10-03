@@ -8,6 +8,7 @@ param(
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CommandId,
     [Parameter(Mandatory)][string]$OutputPath,
     [ValidateRange(1.0, 10.0)][double]$HeadroomFactor = 2.0,
+    [string[]]$EventKinds,
     [ValidateSet('none', 'receipt-hash')][string]$InternalTestFailurePoint = 'none',
     [switch]$NoExit,
     [switch]$Compact
@@ -190,6 +191,25 @@ try {
     $defaults = Get-Property $registry 'defaults'
     $limits = Get-Property $registry 'limits'
     if ($null -eq $defaults -or $null -eq $limits) { throw 'Registry result must publish defaults and limits.' }
+    $requestedEventKinds = $null
+    if ($PSBoundParameters.ContainsKey('EventKinds')) {
+        $selection = Get-Property $registry 'eventSelection'
+        if ((Get-Property $selection 'optional') -isnot [bool] -or -not (Get-Property $selection 'optional')) {
+            throw 'Registry does not advertise optional event selection.'
+        }
+        if (@($EventKinds).Count -eq 0) { throw 'EventKinds must be a non-empty explicit selection.' }
+        $advertisedKinds = @(Get-Property $registry 'eventKinds')
+        if ($advertisedKinds.Count -eq 0 -or @($advertisedKinds | Where-Object { $_ -isnot [string] -or [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+            throw 'Registry eventKinds is not a non-empty string catalogue.'
+        }
+        $seenKinds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($kind in $EventKinds) {
+            if ([string]::IsNullOrWhiteSpace($kind) -or $kind -cnotin $advertisedKinds -or -not $seenKinds.Add($kind)) {
+                throw 'EventKinds must contain distinct exact names from registry.eventKinds; planned or unknown kinds are not selectable.'
+            }
+        }
+        $requestedEventKinds = @($EventKinds)
+    }
 
     $expectedDurationMs = Require-PositiveLong (Get-Property $workload 'expectedDurationMs') 'workload.expectedDurationMs'
     $expectedFrames = Require-PositiveLong (Get-Property $workload 'expectedFrames') 'workload.expectedFrames'
@@ -216,6 +236,7 @@ try {
 
     $selected = [ordered]@{}
     $exceeded = [Collections.Generic.List[object]]::new()
+    $unprovenCatalogueBounds = [Collections.Generic.List[object]]::new()
     foreach ($spec in $specs) {
         $desired = Get-ScaledBound $spec.expected $HeadroomFactor "workload bound $($spec.argument)"
         $ceiling = Require-PositiveLong (Get-Property $limits $spec.limit) "registry.limits.$($spec.limit)"
@@ -223,9 +244,21 @@ try {
         if ($desired -gt $ceiling) {
             $exceeded.Add([pscustomobject]@{ bound = $spec.argument; desired = $desired; ceiling = $ceiling })
         }
+        if ($spec.argument -like 'max*Observations') {
+            $defaultCapacity = Require-PositiveLong (Get-Property $defaults $spec.argument) "registry.defaults.$($spec.argument)"
+            if ($desired -gt $defaultCapacity) {
+                $unprovenCatalogueBounds.Add([pscustomobject]@{ bound = $spec.argument; desired = $desired; defaultCapacity = $defaultCapacity })
+            }
+        }
     }
     $fixedCatalogueBytes = Require-PositiveLong (Get-Property $defaults 'fixedCatalogueBytes') 'registry.defaults.fixedCatalogueBytes'
+    $eventStorageUnitBytes = Require-PositiveLong (Get-Property $defaults 'eventStorageUnitBytes') 'registry.defaults.eventStorageUnitBytes'
     $eventBytesWithHeadroom = Get-ScaledBound $expectedEventBytes $HeadroomFactor 'workload.expectedEventBytes'
+    $requiredEventBytesDecimal = [decimal]$selected['maxEvents'] * [decimal]$eventStorageUnitBytes
+    if ($requiredEventBytesDecimal -gt [decimal][long]::MaxValue) {
+        throw 'registry eventStorageUnitBytes times the event count exceeds the supported 64-bit capture bound.'
+    }
+    $eventBytesWithHeadroom = [Math]::Max($eventBytesWithHeadroom, [long]$requiredEventBytesDecimal)
     $desiredBytesDecimal = [decimal]$fixedCatalogueBytes + [decimal]$eventBytesWithHeadroom
     if ($desiredBytesDecimal -gt [decimal][long]::MaxValue) {
         throw 'registry.defaults.fixedCatalogueBytes plus the event-byte workload exceeds the supported 64-bit capture bound.'
@@ -237,7 +270,11 @@ try {
         $exceeded.Add([pscustomobject]@{ bound = 'maxBytes'; desired = $desiredBytes; ceiling = $maximumBytes })
     }
 
-    $admissible = $exceeded.Count -eq 0
+    $admissible = $exceeded.Count -eq 0 -and $unprovenCatalogueBounds.Count -eq 0
+    $planState = if ($unprovenCatalogueBounds.Count -gt 0) { 'catalogue-storage-unproven' } elseif ($exceeded.Count -gt 0) { 'workload-exceeds-service-ceilings' } else { 'capture-plan-ready' }
+    $planErrors = @()
+    if ($unprovenCatalogueBounds.Count -gt 0) { $planErrors += 'Selected catalogue capacities exceed the registry defaults. The default fixedCatalogueBytes cannot prove their allocation cost; a native per-catalogue sizing recipe or a separately selected smaller workload is required. No start arguments were issued.' }
+    if ($exceeded.Count -gt 0) { $planErrors += 'The stated workload plus headroom exceeds one or more live service ceilings; no start arguments were issued.' }
     $arguments = if ($admissible) {
         [ordered]@{
             contractMajor = [int]$resolvedRegistry.major
@@ -246,9 +283,10 @@ try {
             action = 'start'
         } + $selected
     } else { $null }
+    if ($arguments -and $null -ne $requestedEventKinds) { $arguments['eventKinds'] = $requestedEventKinds }
     $receipt = [pscustomobject][ordered]@{
         schemaVersion = 1
-        state = if ($admissible) { 'capture-plan-ready' } else { 'workload-exceeds-service-ceilings' }
+        state = $planState
         admissible = $admissible
         service = $resolvedRegistry.service
         commandId = $CommandId
@@ -259,11 +297,17 @@ try {
         registryContractMajor = $resolvedRegistry.major
         workload = $workload
         headroomFactor = $HeadroomFactor
-        rationale = 'Every bound is the stated workload multiplied by explicit headroom; maxBytes additionally includes the registry fixedCatalogueBytes allocation.'
+        requestedEventKinds = $requestedEventKinds
+        eventSelectionBasis = if ($null -ne $requestedEventKinds) { 'Exact advertised requested kinds; native dependency expansion/resolved selection must be retained from start response. Selection does not reduce catalogue allocation.' } else { 'Omitted selection retains native all-events default.' }
+        rationale = 'Every count is the stated workload multiplied by explicit headroom. Byte budget is the registry default-catalogue upper bound plus the greater of workload event bytes with headroom and selected events times the native event storage unit. Default catalogue bytes qualify only capacities at or below the published defaults.'
         saturationPolicy = 'Any capture limit hit makes the evidence run incomplete unless saturation is the declared subject of the experiment.'
         fixedCatalogueBytes = $fixedCatalogueBytes
+        catalogueStorageBasis = 'registry-default-catalogue-upper-bound; no extrapolation to larger capacities'
+        eventStorageUnitBytes = $eventStorageUnitBytes
+        selectedEventBytes = $eventBytesWithHeadroom
         selectedBounds = [pscustomobject]$selected
         exceededCeilings = @($exceeded)
+        unprovenCatalogueBounds = @($unprovenCatalogueBounds)
         arguments = if ($arguments) { [pscustomobject]$arguments } else { $null }
         createdUtc = [DateTime]::UtcNow.ToString('o')
     }
@@ -280,7 +324,8 @@ try {
         receiptSha256 = $receiptSha256
         arguments = $receipt.arguments
         exceededCeilings = @($exceeded)
-        errors = if ($admissible) { @() } else { @('The stated workload plus headroom exceeds one or more live service ceilings; no start arguments were issued.') }
+        unprovenCatalogueBounds = @($unprovenCatalogueBounds)
+        errors = $planErrors
     }
 }
 catch {
