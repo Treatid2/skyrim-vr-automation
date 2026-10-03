@@ -7,11 +7,12 @@
   "legacy_binding": "{htc}/input/legacy_bindings_vive_controller.json",
   "input_bindingui_mode": "controller_handed",
   "input_source": {
-    "/input/system": { "type": "button", "click": true },
-    "/input/application_menu": { "type": "button", "click": true },
-    "/input/grip": { "type": "button", "click": true },
+    "/input/system": { "type": "button", "click": true, "touch": true },
+    "/input/application_menu": { "type": "button", "click": true, "touch": true },
+    "/input/grip": { "type": "trigger", "click": true, "touch": true, "value": true },
     "/input/trackpad": { "type": "trackpad", "click": true, "touch": true },
-    "/input/trigger": { "type": "trigger", "click": true, "value": true },
+    "/input/trigger": { "type": "trigger", "click": true, "touch": true, "value": true },
+    "/input/thumbstick": { "type": "joystick", "click": true, "touch": true },
     "/pose/raw": { "type": "pose" },
     "/output/haptic": { "type": "vibration" }
   }

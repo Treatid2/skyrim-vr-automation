@@ -65,3 +65,9 @@ installable, but cannot pass required-controller qualification.
 The install lock is bounded by `-InstallLockTimeoutMilliseconds`. Its control
 root is fixed under Windows LocalApplicationData; the fixture-only environment
 override is accepted only for targets within the OS temporary directory.
+
+Full-input packages additionally expose the separate controller v1 protocol.
+See `../steamvr-controller-control/README.md` for inspect/set/reset, bounded
+tap/sequence, ownership, native expiry and haptic cursors. Head v2 stays unchanged.
+The neutral required-controller probe still proves passive presence only; it
+does not certify active controller input, bindings, keyboard or game actions.
