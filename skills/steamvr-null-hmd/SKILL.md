@@ -75,6 +75,21 @@ particular drive letter for the plugin itself.
 9. Run `inspect -Compact` again and preserve the before/after results, exact
    backup, receipt, hashes, and evidence-directory identity.
 
+## Controller and Skyrim keyboard input
+
+For controller pose/button/touch/axis commands, additionally read
+`../../tools/steamvr-controller-control/README.md` and its entry-point parameter
+block. Use its inspect binding and stable task owner; never manufacture a new
+mapping, borrow another active owner, or replay an indeterminate command. The
+full-input native provider is required: the limited passive-only live DLL does
+not expose this protocol. Passive neutral qualification remains a presence test,
+not active-input/game acceptance. Keep head v2 control unchanged.
+
+Keyboard uses the existing DevBench `input` tool, capability/status negotiation
+and a stable task owner, as described in that README. It is Skyrim-only, not
+dashboard or OS injection. Preserve keyboard releaseAll and native controller
+release/reset receipts separately; neither implies atomic cross-provider reset.
+
 ## Safety and recovery
 
 - Inspection does not initiate a new runtime mutation, but every command takes

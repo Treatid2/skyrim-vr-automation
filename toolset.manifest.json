@@ -44,6 +44,11 @@
       "entryPoint": "tools/steamvr-head-pose-control/Invoke-SteamVRHeadPoseControl.ps1"
     },
     {
+      "name": "steamvr-controller-control",
+      "version": "1.0.0",
+      "entryPoint": "tools/steamvr-controller-control/Invoke-SteamVRControllerControl.ps1"
+    },
+    {
       "name": "devbench-control",
       "version": "1.5.0",
       "entryPoint": "tools/devbench-control/Invoke-DevBenchControl.ps1"
