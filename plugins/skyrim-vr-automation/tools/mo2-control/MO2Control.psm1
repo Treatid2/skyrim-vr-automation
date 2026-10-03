@@ -2,6 +2,7 @@
 
 Set-StrictMode -Version Latest
 $script:MO2ControlContractVersion = '1.1.0'
+. (Join-Path $PSScriptRoot 'CSXConfigCustodyProof.ps1')
 
 if (-not ('SkyrimVRAutomation.Native.DirectoryIdentity' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -903,6 +904,10 @@ function Get-MO2TaskWorkspaceIsolation {
         }
     }
 
+    if ($RequirePreparedCache) {
+        try { Assert-CSXConfigCustodyIsolation $Config $manifest -AllowGrowth:$AllowPreparedCacheGrowth }
+        catch { $errors.Add("CSX configuration custody admission failed: $($_.Exception.Message)") }
+    }
     $output = $manifest.runtimeOutput
     foreach ($requiredField in @('mode', 'executable')) {
         if (-not $output.PSObject.Properties[$requiredField] -or [string]::IsNullOrWhiteSpace([string]$output.$requiredField)) {
@@ -1861,7 +1866,8 @@ function Get-MO2InspectionData {
     $selectedProfile = if ($ini.Count -gt 0) { ConvertFrom-MO2ByteArrayValue (Find-MO2IniValue -Ini $ini -Key 'selected_profile') } else { $null }
     $selectedTaskWorkspace = Get-MO2SelectedTaskWorkspace -Config $Config -Profile $selectedProfile
     $profiles = if (Test-Path -LiteralPath $profilesRoot -PathType Container) {
-        @(Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction Stop | Sort-Object Name | ForEach-Object Name)
+        # Member-name ForEach-Object inherits WhatIf and suppresses this read.
+        @(Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction Stop | Sort-Object Name | ForEach-Object { $_.Name })
     }
     else {
         @()
@@ -1920,8 +1926,8 @@ function ConvertTo-MO2Result {
         [string]$PreferredState
     )
 
-    $errors = @($Checks | Where-Object status -eq 'fail' | ForEach-Object message)
-    $warnings = @($Checks | Where-Object status -eq 'warn' | ForEach-Object message)
+    $errors = @($Checks | Where-Object status -eq 'fail' | ForEach-Object { $_.message })
+    $warnings = @($Checks | Where-Object status -eq 'warn' | ForEach-Object { $_.message })
     $ok = $errors.Count -eq 0
 
     if (-not [string]::IsNullOrWhiteSpace($PreferredState)) {
@@ -2413,6 +2419,97 @@ function Invoke-MO2OwnedSessionMutation {
     return $transaction.result
 }
 
+function Assert-MO2ControllerPhysicalPath {
+    param([Parameter(Mandatory)][string]$Path)
+    $current = [IO.Path]::GetFullPath($Path)
+    while (-not [string]::IsNullOrWhiteSpace($current)) {
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Controller provenance does not permit reparse substitution.' }
+        $current = [IO.Path]::GetDirectoryName($current)
+    }
+}
+
+function Get-MO2ControllerPhysicalIdentity {
+    param([Parameter(Mandatory)][string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    # CreateFileW needs the extended path spelling for deep retained bundles;
+    # PowerShell's file cmdlets already support these ordinary absolute paths.
+    $native = if ($full.StartsWith('\\')) { '\\?\UNC\' + $full.Substring(2) } else { '\\?\' + $full }
+    return [SkyrimVRAutomation.Native.DirectoryIdentity]::Get($native)
+}
+
+function New-MO2ControllerBundleBinding {
+    param([Parameter(Mandatory)]$Controller)
+    # Producer-side inventory, not an inventory recovered from the receipt.
+    Assert-MO2ControllerPhysicalPath -Path $Controller.receiptPath
+    $files = @()
+    foreach ($file in @($Controller.files)) {
+        Assert-MO2ControllerPhysicalPath -Path $file.path
+        $files += [pscustomobject][ordered]@{
+            name = [string]$file.name; path = [string]$file.path; sha256 = [string]$file.sha256
+            bytes = (Get-Item -LiteralPath $file.path -Force).Length
+            physicalIdentity = Get-MO2ControllerPhysicalIdentity -Path $file.path
+        }
+    }
+    return [pscustomobject][ordered]@{
+        contractVersion = '1.0.0'; inventoryVersion = '1.0.0'; bundleContractVersion = '1.0.0'
+        controllerPath = [string]$Controller.controllerPath; configPath = [string]$Controller.configPath
+        receiptPath = [string]$Controller.receiptPath
+        receiptBytes = (Get-Item -LiteralPath $Controller.receiptPath -Force).Length
+        receiptSha256 = (Get-FileHash -LiteralPath $Controller.receiptPath -Algorithm SHA256).Hash
+        receiptPhysicalIdentity = Get-MO2ControllerPhysicalIdentity -Path $Controller.receiptPath
+        files = $files
+    }
+}
+
+function Assert-MO2ControllerBundleBinding {
+    param([Parameter(Mandatory)]$Data, [Parameter(Mandatory)]$Manifest)
+    if (-not $Data.PSObject.Properties['controllerBundleBinding'] -or
+        -not $Manifest.PSObject.Properties['controllerBundleBinding']) { throw 'Prepared generation has no independent controller bundle binding; historical evidence is not upgraded in place.' }
+    $binding = $Data.controllerBundleBinding
+    if (($binding | ConvertTo-Json -Depth 30 -Compress) -cne ($Manifest.controllerBundleBinding | ConvertTo-Json -Depth 30 -Compress) -or
+        $binding.contractVersion -cne '1.0.0' -or $binding.inventoryVersion -cne '1.0.0' -or $binding.bundleContractVersion -cne '1.0.0') { throw 'Controller binding version or lock/manifest inventory differs.' }
+    $directory = Join-Path ([IO.Path]::GetFullPath([string]$Data.sessionPath)) 'controller'
+    foreach ($pair in @(@('controllerPath','Invoke-MO2Control.ps1'),@('configPath','config\machine.local.json'),@('receiptPath','controller-bundle.json'))) {
+        $property = $pair[0]
+        $expected = Join-Path $directory $pair[1]
+        if ([string]$binding.$property -cne $expected) { throw 'Controller binding path is not the exact retained path.' }
+    }
+    if ([string]$Data.controllerPath -cne [string]$binding.controllerPath -or
+        [string]$Data.controllerConfigPath -cne [string]$binding.configPath -or
+        [string]$Data.controllerReceiptPath -cne [string]$binding.receiptPath) { throw 'Controller paths differ from the authoritative prepared binding.' }
+    Assert-MO2ControllerPhysicalPath -Path $binding.receiptPath
+    $receiptItem = Get-Item -LiteralPath $binding.receiptPath -Force
+    if ($receiptItem.Length -ne $binding.receiptBytes -or
+        (Get-FileHash -LiteralPath $binding.receiptPath -Algorithm SHA256).Hash -cne $binding.receiptSha256 -or
+        (Get-MO2ControllerPhysicalIdentity -Path $binding.receiptPath) -cne $binding.receiptPhysicalIdentity) { throw 'Controller receipt changed after prepare.' }
+    $bundle = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $binding.receiptPath -Raw)
+    if ($bundle.contractVersion -cne $binding.bundleContractVersion -or $bundle.durable -isnot [bool] -or -not $bundle.durable -or
+        [string]$bundle.controllerPath -cne [string]$binding.controllerPath -or [string]$bundle.configPath -cne [string]$binding.configPath -or
+        $bundle.files -isnot [array] -or @($bundle.files).Count -ne @($binding.files).Count -or @($binding.files).Count -lt 4 -or @($binding.files).Count -gt 32) { throw 'Controller receipt contract/inventory differs.' }
+    $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $identities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    for ($index = 0; $index -lt @($binding.files).Count; $index++) {
+        $expected = $binding.files[$index]
+        $actual = $bundle.files[$index]
+        if ([string]::IsNullOrWhiteSpace([string]$expected.name) -or -not $names.Add([string]$expected.name) -or
+            -not $identities.Add([string]$expected.physicalIdentity) -or
+            [string]$actual.name -cne [string]$expected.name -or [string]$actual.path -cne [string]$expected.path -or
+            [string]$actual.sha256 -cne [string]$expected.sha256 -or [string]$expected.sha256 -cnotmatch '^[A-F0-9]{64}$') { throw 'Controller inventory contains missing, duplicate, aliased or rewritten members.' }
+        $path = [IO.Path]::GetFullPath((Join-Path $directory ([string]$expected.name)))
+        if ([string]$expected.path -cne $path -or -not $path.StartsWith($directory.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Controller member path escapes or aliases its exact name.' }
+        Assert-MO2ControllerPhysicalPath -Path $path
+        $item = Get-Item -LiteralPath $path -Force
+        if ($item.PSIsContainer -or $item.Length -ne $expected.bytes -or
+            (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -cne $expected.sha256 -or
+            (Get-MO2ControllerPhysicalIdentity -Path $path) -cne $expected.physicalIdentity) { throw 'Controller member bytes or physical identity changed after prepare.' }
+    }
+    foreach ($required in @('Invoke-MO2Control.ps1','ConfigResolution.psm1','MO2Control.psm1','config/machine.local.json')) {
+        if (-not $names.Contains($required)) { throw 'Required controller member is missing.' }
+    }
+    return $binding
+}
+
 function New-MO2DurableSessionController {
     param(
         [Parameter(Mandatory)]$Config,
@@ -2428,11 +2525,12 @@ function New-MO2DurableSessionController {
         [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'Invoke-MO2Control.ps1'); relativePath = 'Invoke-MO2Control.ps1' },
         [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'ConfigResolution.psm1'); relativePath = 'ConfigResolution.psm1' },
         [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'MO2Control.psm1'); relativePath = 'MO2Control.psm1' },
+        [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'CSXConfigCustodyProof.ps1'); relativePath = 'CSXConfigCustodyProof.ps1' },
         [pscustomobject]@{ source = (Join-Path (Split-Path -Parent $PSScriptRoot) 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'); relativePath = 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1' },
         [pscustomobject]@{ source = (Join-Path (Split-Path -Parent $PSScriptRoot) 'shader-cache-control\ShaderCacheInventory.ps1'); relativePath = 'shader-cache-control\ShaderCacheInventory.ps1' }
     )
     if ($WhatIf) {
-        return [pscustomobject][ordered]@{ controllerPath = $entryPath; configPath = $configPath; receiptPath = $receiptPath; durable = $true; wouldCopy = @($sourceFiles | ForEach-Object relativePath) }
+        return [pscustomobject][ordered]@{ controllerPath = $entryPath; configPath = $configPath; receiptPath = $receiptPath; durable = $true; wouldCopy = @($sourceFiles | ForEach-Object { $_.relativePath }) }
     }
     New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
     $files = @()
@@ -2452,7 +2550,9 @@ function New-MO2DurableSessionController {
         purpose = 'Session-scoped lifecycle controller retained independently of the versioned Codex plugin cache.'
         controllerPath = $entryPath; configPath = $configPath; files = $files
     }) -CreateNew
-    return [pscustomobject][ordered]@{ controllerPath = $entryPath; configPath = $configPath; receiptPath = $receiptPath; durable = $true; files = $files }
+    $controller = [pscustomobject][ordered]@{ controllerPath = $entryPath; configPath = $configPath; receiptPath = $receiptPath; durable = $true; files = $files }
+    $controller | Add-Member -NotePropertyName binding -NotePropertyValue (New-MO2ControllerBundleBinding -Controller $controller)
+    return $controller
 }
 
 function Get-MO2OwnedSession {
@@ -2903,6 +3003,10 @@ function Invoke-MO2ReleaseAccess {
     if ($accessKind -ne 'human' -and ($inspection.processes.mo2.Count -gt 0 -or $inspection.processes.game.Count -gt 0 -or $activeBuildData.Count -gt 0)) {
         return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $false -State 'blocked' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $owned; processes = $inspection.processes; activeBuildData = $activeBuildData } -Errors @('Access cannot be released while MO2, the game, or a RootBuilder deployment transaction remains active.')
     }
+    $configOwnerPath = Join-Path ([string]$Config.mo2.overwriteDirectory) '.codex-csx-config-owner.json'
+    if ($accessKind -ne 'human' -and (Test-Path -LiteralPath $configOwnerPath)) {
+        return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $false -State 'config-completion-required' -Data @{ ownerMarkerPath = $configOwnerPath } -Errors @('Shared CSX configuration custody remains active. Run exact workspace complete-config/complete-output before yielding access; task configuration is retained.')
+    }
     if ($WhatIf) {
         return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $true -State 'dry-run' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $owned; wouldRemoveLock = $true; liveStateRetained = $accessKind -eq 'human'; processes = $inspection.processes; activeBuildData = $activeBuildData }
     }
@@ -3174,6 +3278,7 @@ function Get-MO2KnownDialogKind {
     if ($combined -match '(?i)waiting on an application to close before exiting') { return 'usvfs-participant-wait' }
     if ($combined -match '(?i)failed to write settings') { return 'failed-to-write-settings' }
     if ($combined -match '(?i)failed to (run|start|launch)') { return 'failed-to-run' }
+    if ($Title -ieq 'Cannot launch program' -and @($Texts | Where-Object { $_ -match '(?i)^Cannot start .+\.exe\b' }).Count -gt 0) { return 'failed-to-run' }
     return $null
 }
 
@@ -4206,6 +4311,9 @@ function Bind-MO2PreparedAccessLease {
         foreach ($propertyName in @('sessionId', 'sessionPath', 'status', 'createdUtc', 'profile', 'profileName', 'profileDirectory', 'modListPath', 'executable', 'requirements', 'controllerPath', 'ownerPid')) {
             $bound | Add-Member -NotePropertyName $propertyName -NotePropertyValue $PreparedLock.$propertyName -Force
         }
+        foreach ($propertyName in @('controllerConfigPath','controllerReceiptPath','controllerBundleBinding')) {
+            if ($PreparedLock.PSObject.Properties[$propertyName]) { $bound | Add-Member -NotePropertyName $propertyName -NotePropertyValue $PreparedLock.$propertyName -Force }
+        }
         $bound | Add-Member -NotePropertyName runtimeRoute -NotePropertyValue $validatedRuntimeRoute -Force
         $bound | Add-Member -NotePropertyName generation -NotePropertyValue (Get-MO2NextLeaseGeneration -Lease $currentAccess.data) -Force
         Write-MO2JsonAtomic -Path $LockPath -Value $bound
@@ -4352,6 +4460,11 @@ function Invoke-MO2Prepare {
     New-Item -ItemType Directory -Path $sessionPath -ErrorAction Stop | Out-Null
     try {
         $controller = New-MO2DurableSessionController -Config $Config -SessionPath $sessionPath
+        foreach ($target in @($manifest,$lock)) {
+            $target | Add-Member -NotePropertyName controllerConfigPath -NotePropertyValue $controller.configPath -Force
+            $target | Add-Member -NotePropertyName controllerReceiptPath -NotePropertyValue $controller.receiptPath -Force
+            $target | Add-Member -NotePropertyName controllerBundleBinding -NotePropertyValue $controller.binding -Force
+        }
         Write-MO2JsonAtomic -Path (Join-Path $sessionPath 'session.json') -Value $manifest -CreateNew
         Bind-MO2PreparedAccessLease -Config $Config -AccessId $AccessId -LockPath $lockPath -PreparedLock $lock -ExpectedRuntimeRoute $runtimeRoute -ExpectedRuntimeRouteFingerprint $runtimeRouteFingerprint
     }
@@ -4419,9 +4532,9 @@ function Reset-MO2GameProcessStateForLaunch {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$PreLaunchGameProcesses
     )
 
-    $priorProcesses = if ($Data.PSObject.Properties['gameProcesses']) { @($Data.gameProcesses) } else { @() }
+    [object[]]$priorProcesses = @(if ($Data.PSObject.Properties['gameProcesses']) { $Data.gameProcesses })
     if ($priorProcesses.Count -gt 0) {
-        $history = if ($Data.PSObject.Properties['gameProcessHistory']) { @($Data.gameProcessHistory) } else { @() }
+        [object[]]$history = @(if ($Data.PSObject.Properties['gameProcessHistory']) { $Data.gameProcessHistory })
         $history += [pscustomobject][ordered]@{
             launchAttemptId = if ($Data.PSObject.Properties['gameProcessesLaunchAttemptId']) { [string]$Data.gameProcessesLaunchAttemptId } elseif ($Data.PSObject.Properties['launchAttemptId']) { [string]$Data.launchAttemptId } else { $null }
             launchedUtc = if ($Data.PSObject.Properties['launchDispatchedUtc']) { [string]$Data.launchDispatchedUtc } elseif ($Data.PSObject.Properties['launchedUtc']) { [string]$Data.launchedUtc } else { $null }
@@ -4672,7 +4785,7 @@ function Invoke-MO2UnlockOnly {
     if (-not $ownerIdentityVerified -and [string]::IsNullOrWhiteSpace($blockedReason)) {
         $blockedReason = if ($finalOwnerResolution.reason) { [string]$finalOwnerResolution.reason } else { 'mo2-owner-not-exact' }
     }
-    return [pscustomobject][ordered]@{ restored = $remainingBuildData.Count -eq 0 -and $ownerIdentityVerified; ownerIdentityVerified=$ownerIdentityVerified; blockedReason=$blockedReason; ownerResolution=$finalOwnerResolution; actions=@($actions); remainingBuildData=@($remainingBuildData | ForEach-Object path); mo2Processes=@($final.processes.mo2); gameProcesses=@($final.processes.game) }
+    return [pscustomobject][ordered]@{ restored = $remainingBuildData.Count -eq 0 -and $ownerIdentityVerified; ownerIdentityVerified=$ownerIdentityVerified; blockedReason=$blockedReason; ownerResolution=$finalOwnerResolution; actions=@($actions); remainingBuildData=@($remainingBuildData | ForEach-Object { $_.path }); mo2Processes=@($final.processes.mo2); gameProcesses=@($final.processes.game) }
 }
 
 function Test-MO2OpeningReady {
@@ -4808,7 +4921,7 @@ function Get-MO2HumanMutationValidationUnderLock {
         return New-MO2ActionResult -Config $Config -Command 'validate-human-mutation' -Ok $false -State 'game-close-required' -Data @{ leaseId = $leaseId; profile = $expectedProfile; processes = $inspection.processes } -Errors @('Human-authorized profile mutation requires Skyrim and its loader to be closed.')
     }
     if ($activeBuildData.Count -gt 0) {
-        return New-MO2ActionResult -Config $Config -Command 'validate-human-mutation' -Ok $false -State 'known-ground-state-required' -Data @{ leaseId = $leaseId; profile = $expectedProfile; activeBuildData = @($activeBuildData | ForEach-Object path); recovery = 'Close or recover-close the exact MO2 state, then recover RootBuilder before mutation.' } -Errors @('Active RootBuilder deployment makes the live MO2 state uncertain; establish a known closed state before mutation.')
+        return New-MO2ActionResult -Config $Config -Command 'validate-human-mutation' -Ok $false -State 'known-ground-state-required' -Data @{ leaseId = $leaseId; profile = $expectedProfile; activeBuildData = @($activeBuildData | ForEach-Object { $_.path }); recovery = 'Close or recover-close the exact MO2 state, then recover RootBuilder before mutation.' } -Errors @('Active RootBuilder deployment makes the live MO2 state uncertain; establish a known closed state before mutation.')
     }
     if ([string]$inspection.selectedProfile -cne $expectedProfile) {
         return New-MO2ActionResult -Config $Config -Command 'validate-human-mutation' -Ok $false -State 'profile-drift' -Data @{ leaseId = $leaseId; authorizedProfile = $expectedProfile; selectedProfile = [string]$inspection.selectedProfile } -Errors @('MO2 selected a different profile after the human lease was established.')
@@ -4948,7 +5061,7 @@ function Invoke-MO2Refresh {
             return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'game-close-required' -Data @{ authorityKind = $authorityKind; profile = $expectedProfile; processes = $inspection.processes } -Errors @('Refresh refuses while Skyrim or its loader is running. Close Skyrim first so the next launch begins from the changed mod state.')
         }
         if ($activeBuildData.Count -gt 0) {
-            return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'known-ground-state-required' -Data @{ authorityKind = $authorityKind; profile = $expectedProfile; activeBuildData = @($activeBuildData | ForEach-Object path); recovery = 'Use the owned close/recover-close and RootBuilder recovery route before refreshing.' } -Errors @('Active RootBuilder deployment makes the live MO2 state uncertain; establish a known closed state before mutation or refresh.')
+            return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'known-ground-state-required' -Data @{ authorityKind = $authorityKind; profile = $expectedProfile; activeBuildData = @($activeBuildData | ForEach-Object { $_.path }); recovery = 'Use the owned close/recover-close and RootBuilder recovery route before refreshing.' } -Errors @('Active RootBuilder deployment makes the live MO2 state uncertain; establish a known closed state before mutation or refresh.')
         }
         if ([string]$inspection.selectedProfile -cne $expectedProfile) {
             return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'profile-drift' -Data @{ authorityKind = $authorityKind; authorizedProfile = $expectedProfile; selectedProfile = [string]$inspection.selectedProfile } -Errors @('MO2 selected a different profile after authority was established; coordinate the exact profile before refreshing.')
@@ -5024,6 +5137,138 @@ function Invoke-MO2Refresh {
     }
 }
 
+function Read-MO2LaunchLogWindow {
+    param([string]$Path, [long]$Offset = 0, [int]$MaximumBytes = 262144)
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    try {
+        $length = $stream.Length
+        if ($Offset -lt 0 -or $Offset -gt $length) { throw 'Invalid log byte boundary.' }
+        $count = [int][math]::Min($MaximumBytes, $length - $Offset)
+        $bytes = [byte[]]::new($count)
+        $null = $stream.Seek($Offset, [IO.SeekOrigin]::Begin)
+        $read = 0
+        while ($read -lt $count) {
+            $n = $stream.Read($bytes, $read, $count - $read)
+            if ($n -eq 0) { break }
+            $read += $n
+        }
+        if ($read -ne $count -or $stream.Length -lt $length) { throw 'Log truncated during read.' }
+        return [pscustomobject]@{ length = $length; offset = $Offset; bytesRead = $read; bytes = $bytes; truncated = $length - $Offset -gt $MaximumBytes; sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)) }
+    }
+    finally { $stream.Dispose() }
+}
+
+function New-MO2LaunchLogBoundary {
+    param($Config, $Validation, [string]$AttemptId, [string]$Profile, [string]$Executable, [string]$ArgumentLine, [bool]$RetainedOwner)
+    try {
+        $entries = @($Validation.data.executables | Where-Object { [string]$_.title -ceq $Executable })
+        if ($entries.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$entries[0].binary)) { throw 'Exact registered binary unavailable.' }
+        $path = Join-Path ([IO.Path]::GetFullPath([string]$Config.mo2.root)) 'logs\mo_interface.log'
+        $boundary = [pscustomobject][ordered]@{
+            available = $true; contractVersion = 1; attemptId = $AttemptId; profile = $Profile; executable = $Executable
+            mo2Path = [IO.Path]::GetFullPath([string]$Config.mo2.executable); binary = [IO.Path]::GetFullPath([string]$entries[0].binary)
+            path = $path; retainedOwner = $RetainedOwner; expectedCommandLine = ('"' + [IO.Path]::GetFullPath([string]$Config.mo2.executable) + '" ' + $ArgumentLine)
+            existed = Test-Path -LiteralPath $path -PathType Leaf; length = 0L; anchorOffset = 0L; anchorLength = 0; anchorSha256 = $null; prefixLength = 0; prefixSha256 = $null
+        }
+        if ($boundary.existed) {
+            $length = (Get-Item -LiteralPath $path).Length
+            $anchorOffset = [math]::Max(0L, $length - 128L)
+            $anchor = Read-MO2LaunchLogWindow -Path $path -Offset $anchorOffset -MaximumBytes 128
+            if ($anchor.length -ne $length) { throw 'Log boundary changed before dispatch.' }
+            $boundary.length = $length; $boundary.anchorOffset = $anchorOffset; $boundary.anchorLength = $anchor.bytesRead; $boundary.anchorSha256 = $anchor.sha256
+            $prefix = Read-MO2LaunchLogWindow -Path $path -MaximumBytes ([int][math]::Max(1,[math]::Min(256,$length)))
+            if ($prefix.length -ne $length) { throw 'Log prefix changed before dispatch.' }
+            $boundary.prefixLength = $prefix.bytesRead; $boundary.prefixSha256 = $prefix.sha256
+        }
+        return $boundary
+    }
+    catch { return [pscustomobject]@{ available = $false; reason = $_.Exception.Message; attemptId = $AttemptId } }
+}
+
+function Get-MO2LaunchFailureEvidence {
+    param($Config, $Owned, [object[]]$MO2Processes, [object[]]$GameProcesses)
+    if ([string]$Owned.data.status -cne 'launching' -or @($GameProcesses).Count -ne 0 -or
+        -not $Owned.data.PSObject.Properties['launchLogBoundary'] -or -not $Owned.data.launchLogBoundary.available) { return $null }
+    try {
+        $boundary = $Owned.data.launchLogBoundary
+        if ([int]$boundary.contractVersion -ne 1 -or [string]$boundary.attemptId -cne [string]$Owned.data.launchAttemptId -or
+            [string]$boundary.profile -cne [string]$Owned.data.profile -or [string]$boundary.executable -cne [string]$Owned.data.executable -or
+            -not [string]::Equals([string]$boundary.mo2Path, [IO.Path]::GetFullPath([string]$Config.mo2.executable), [StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([string]$boundary.path, (Join-Path ([IO.Path]::GetFullPath([string]$Config.mo2.root)) 'logs\mo_interface.log'), [StringComparison]::OrdinalIgnoreCase)) { return $null }
+        $resolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $Owned -Processes @($MO2Processes) -AdoptDetachedOwner
+        if (-not $resolution.ok -or @($resolution.targets).Count -ne 1 -or @($MO2Processes).Count -ne 1) { return $null }
+        $owner = $resolution.targets[0]
+        $dispatchUtc = [DateTimeOffset]::Parse([string]$Owned.data.launchDispatchedUtc).UtcDateTime
+        $append = $false
+        if ($boundary.existed -and (Get-Item -LiteralPath $boundary.path).Length -ge [long]$boundary.length) {
+            $anchor = Read-MO2LaunchLogWindow -Path ([string]$boundary.path) -Offset ([long]$boundary.anchorOffset) -MaximumBytes ([int][math]::Max(1,$boundary.anchorLength))
+            if ($anchor.length -ge [long]$boundary.length -and $anchor.bytesRead -ge [int]$boundary.anchorLength) {
+                $anchorBytes = [byte[]]::new([int]$boundary.anchorLength)
+                [Array]::Copy($anchor.bytes, $anchorBytes, $anchorBytes.Length)
+                $append = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($anchorBytes)) -ceq [string]$boundary.anchorSha256
+                if ($append) {
+                    $prefix = Read-MO2LaunchLogWindow -Path ([string]$boundary.path) -MaximumBytes ([int][math]::Max(1,$boundary.prefixLength))
+                    $prefixBytes = [byte[]]::new([int]$boundary.prefixLength)
+                    if ($prefix.bytesRead -lt $prefixBytes.Length) { return $null }
+                    [Array]::Copy($prefix.bytes, $prefixBytes, $prefixBytes.Length)
+                    $append = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($prefixBytes)) -ceq [string]$boundary.prefixSha256
+                }
+            }
+        }
+        $offset = if ($append) { [long]$boundary.length } else { 0L }
+        $window = Read-MO2LaunchLogWindow -Path ([string]$boundary.path) -Offset $offset
+        if ($window.truncated -or $window.bytesRead -eq 0) { return $null }
+        $text = [Text.UTF8Encoding]::new($false,$true).GetString($window.bytes)
+        $styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+        if (-not $append) {
+            if ($boundary.retainedOwner) { return $null }
+            # The captured MO2 2.5.2 log uses UTC stamps; other formats fail closed.
+            $header = [regex]::Match($text, "(?m)^\[(?<stamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) D\] command line: '(?<command>[^\r\n]*)'\r?$")
+            if (-not $header.Success -or $header.Groups['command'].Value -cne [string]$boundary.expectedCommandLine) { return $null }
+            $headerUtc = [DateTime]::ParseExact($header.Groups['stamp'].Value, 'yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture, $styles)
+            $ownerUtc = [DateTimeOffset]::Parse([string]$owner.startTime).UtcDateTime
+            if ($headerUtc -lt $dispatchUtc -or $headerUtc -lt $ownerUtc -or ($headerUtc - $ownerUtc).TotalSeconds -gt 10) { return $null }
+        }
+        $pattern = "(?m)^\[(?<stamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) E\] Error (?<code>[1-9]\d{0,9}) (?<message>[^\r\n]+)\r?\n\[\k<stamp> E\]  \. binary: '(?<binary>[^'\r\n]+)'\r?$"
+        foreach ($match in @([regex]::Matches($text, $pattern))) {
+            $errorUtc = [DateTime]::ParseExact($match.Groups['stamp'].Value, 'yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture, $styles)
+            if ($errorUtc -lt $dispatchUtc -or $errorUtc -gt [DateTime]::UtcNow -or
+                -not [string]::Equals([IO.Path]::GetFullPath($match.Groups['binary'].Value), [string]$boundary.binary, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $verification = Read-MO2LaunchLogWindow -Path ([string]$boundary.path) -Offset $offset -MaximumBytes $window.bytesRead
+            if ($verification.sha256 -cne $window.sha256) { return $null }
+            return [pscustomobject][ordered]@{
+                schemaVersion = 1; classification = 'loader-spawn-failed'; sessionId = $Owned.sessionId; attemptId = $boundary.attemptId
+                observedUtc = [DateTime]::UtcNow.ToString('o'); dispatchStartedUtc = $dispatchUtc.ToString('o'); owner = $owner
+                binary = $boundary.binary; win32ErrorCode = [uint32]$match.Groups['code'].Value; message = $match.Groups['message'].Value
+                cause = 'unassigned'; errorLogTimestampUtc = $errorUtc.ToString('o'); logPath = $boundary.path
+                byteOffset = $window.offset; byteLength = $window.bytesRead; bounds = '[offset,offset+length)'; windowSha256 = $window.sha256
+                matchedText = $match.Value; logBoundary = $boundary; windowStableAtVerification = $true
+            }
+        }
+    }
+    catch { return $null }
+    return $null
+}
+
+function Set-MO2LaunchFailureEvidence {
+    param($Config, $Owned, $Failure)
+    return Invoke-MO2OwnedSessionMutation -Owned $Owned -Action {
+        param($currentData)
+        if ([string]$currentData.status -cne 'launching' -or [string]$currentData.launchAttemptId -cne [string]$Failure.attemptId) { throw 'Launch failure superseded before commit.' }
+        $currentOwned = [pscustomobject]@{ path = $Owned.path; sessionId = $Owned.sessionId; accessId = $Owned.accessId; data = $currentData }
+        $resolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $currentOwned -Processes @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
+        if (-not $resolution.ok -or @($resolution.targets).Count -ne 1 -or
+            -not (Test-MO2ProcessRecordIdentity -Expected $Failure.owner -Actual $resolution.targets[0]).ok -or
+            @(Get-MO2ProcessRecords -Names @($Config.mo2.gameProcessNames)).Count -ne 0) { throw 'Launch failure owner or closed-game proof changed.' }
+        $receiptPath = Join-Path ([string]$currentData.sessionPath) ('mo2-launch-failure.' + [guid]::Parse([string]$Failure.attemptId).ToString('D') + '.json')
+        Write-MO2JsonAtomic -Path $receiptPath -Value $Failure -CreateNew
+        $currentData.status = 'launch-failed'
+        $currentData | Add-Member -NotePropertyName launchFailure -NotePropertyValue $Failure -Force
+        $currentData | Add-Member -NotePropertyName launchFailureReceiptPath -NotePropertyValue $receiptPath -Force
+        return [pscustomobject]@{ sessionData = $currentData; result = $receiptPath }
+    }
+}
+
 function Invoke-MO2Status {
     [CmdletBinding()]
     param(
@@ -5065,6 +5310,13 @@ function Invoke-MO2Status {
         }
         else { $gameProcessAdoption | Add-Member -NotePropertyName adopted -NotePropertyValue $false -Force }
     }
+    $launchFailure = if ($owned) { Get-MO2LaunchFailureEvidence -Config $Config -Owned $owned -MO2Processes @($data.processes.mo2) -GameProcesses @($data.processes.game) } else { $null }
+    if ($launchFailure) {
+        $null = Set-MO2LaunchFailureEvidence -Config $Config -Owned $owned -Failure $launchFailure
+        $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
+    }
+    elseif ($owned -and [string]$owned.data.status -ceq 'launch-failed' -and $owned.data.PSObject.Properties['launchFailure'] -and
+        [string]$owned.data.launchFailure.attemptId -ceq [string]$owned.data.launchAttemptId) { $launchFailure = $owned.data.launchFailure }
     $buildData = @($data.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
     $windows = if ($data.processes.mo2.Count -gt 0) { @(Get-MO2WindowSnapshot -Processes @($data.processes.mo2)) } else { @() }
     $openingCompleted = $false
@@ -5102,6 +5354,9 @@ function Invoke-MO2Status {
     elseif ($buildData.Count -gt 0 -and ($headlessMO2 -or $data.processes.mo2.Count -eq 0)) {
         'rootbuilder-recovery-required'
     }
+    elseif ($launchFailure) {
+        'launch-failed'
+    }
     elseif ($data.processes.mo2.Count -gt 0) {
         'mo2-running'
     }
@@ -5115,18 +5370,20 @@ function Invoke-MO2Status {
         lockStatus = if ($owned) { [string]$owned.data.status } else { $null }
         windows = @($windows)
         headlessMO2 = $headlessMO2
-        activeBuildData = @($buildData | ForEach-Object path)
+        activeBuildData = @($buildData | ForEach-Object { $_.path })
         ownershipResolution = $ownershipResolution
         gameProcessAdoption = $gameProcessAdoption
         recordedGameResolution = $recordedGameResolution
         openingCompleted = $openingCompleted
+        launchFailure = $launchFailure
+        launchFailureReceiptPath = if ($launchFailure) { [string]$owned.data.launchFailureReceiptPath } else { $null }
         launchPending = $launchPending
         launchElapsedSeconds = $launchElapsedSeconds
         launchGraceSeconds = $launchGraceSeconds
         launchGraceRemainingSeconds = if ($launchPending) { [math]::Max(0, [math]::Round($launchGraceSeconds - $launchElapsedSeconds, 3)) } else { 0 }
         recoveryCommand = if ($buildData.Count -gt 0 -and $owned -and -not $launchPending) { "recover-rootbuilder -SessionId $SessionId" } else { $null }
     }) -Force
-    return ConvertTo-MO2PublicResult -Result (New-MO2ActionResult -Config $Config -Command 'status' -Ok $true -State $state -Data $data)
+    return ConvertTo-MO2PublicResult -Result (New-MO2ActionResult -Config $Config -Command 'status' -Ok (-not [bool]$launchFailure) -State $state -Data $data -Errors $(if ($launchFailure) { @("MO2 failed to spawn '$($launchFailure.binary)': Win32 error $($launchFailure.win32ErrorCode) $($launchFailure.message). Cause is unassigned; no retry or cleanup was dispatched.") } else { @() }))
 }
 
 function Get-MO2LaunchResumeDisposition {
@@ -5159,6 +5416,138 @@ function Get-MO2LaunchResumeDisposition {
     return [pscustomobject][ordered]@{ ok = $false; mode = 'blocked'; ownerPid = $OwnerPid; reason = 'ambiguous-mo2-owner' }
 }
 
+function Get-MO2RunSelectionValue {
+    param($Element)
+    $pattern = $null
+    if ($Element.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern, [ref]$pattern)) {
+        $selected = @(([System.Windows.Automation.SelectionPattern]$pattern).GetCurrentSelection())
+        if ($selected.Count -eq 1) { return [string]$selected[0].Current.Name }
+    }
+    $pattern = $null
+    if ($Element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
+        return [string]([System.Windows.Automation.ValuePattern]$pattern).Current.Value
+    }
+    $pattern = $null
+    if ($Element.TryGetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern, [ref]$pattern)) {
+        return [string]([System.Windows.Automation.LegacyIAccessiblePattern]$pattern).Current.Value
+    }
+    throw 'MO2 selected value is not observable through a supported accessibility pattern.'
+}
+
+function Get-MO2RunButtonProof {
+    param($Owner)
+    $visible = @(Get-MO2WindowSnapshot -Processes @($Owner) | Where-Object visible)
+    $main = @($visible | Where-Object { $_.automationAvailable -and [string]$_.automationId -ceq 'MainWindow' })
+    if ($visible.Count -ne 1 -or $main.Count -ne 1) { throw 'Run requires one visible MainWindow and no other visible modal or window.' }
+    $windows = @(Get-MO2AutomationWindows -ProcessId ([int]$Owner.id) | Where-Object { [int64]$_.Current.NativeWindowHandle -eq [int64]$main[0].handle })
+    if ($windows.Count -ne 1 -or -not $windows[0].Current.IsEnabled) { throw 'Exact MO2 main window is not uniquely accessible and enabled.' }
+    $window = $windows[0]
+    $controls = @{}
+    $controlIds = [ordered]@{}
+    # Qt 6.7.1 automationIdForAccessible prepends named QObject parents.
+    # These full paths come from MO2 v2.5.2 mainwindow.ui, not suffix/name
+    # matching. Retain bare IDs for providers which expose that exact form.
+    $qualifiedIds = @{
+        profileBox = 'MainWindow.centralWidget.categoriesSplitter.splitter.layoutWidget.profileBox'
+        executablesListBox = 'MainWindow.centralWidget.categoriesSplitter.splitter.layoutWidget_2.startGroup.executablesListBox'
+        startButton = 'MainWindow.centralWidget.categoriesSplitter.splitter.layoutWidget_2.startGroup.startButton'
+    }
+    $discovery = [ordered]@{ processId=[int]$Owner.id; windowHandle=[int64]$main[0].handle; queries=@(); maxQueries=6; attemptsPerQuery=1; selectorsComplete=$false; nativeRpcDeadlineEnforced=$false }
+    foreach ($id in @('profileBox','executablesListBox','startButton')) {
+        $matches = @()
+        foreach ($candidateId in @($id,$qualifiedIds[$id])) {
+            $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, $candidateId)
+            try {
+                $found = @(Invoke-MO2UiAutomationFindAll -Window $window -Scope ([System.Windows.Automation.TreeScope]::Descendants) -Condition $condition -MaxAttempts 1)
+                $discovery.queries += [pscustomobject]@{ automationId=$candidateId; matches=$found.Count }
+                $matches += $found
+            }
+            catch {
+                $discovery.queries += [pscustomobject]@{ automationId=$candidateId; matches=$null; error='native-query-failed' }
+                $_.Exception.Data['MO2RunControlDiscovery'] = [pscustomobject]$discovery
+                throw
+            }
+        }
+        if ($matches.Count -ne 1 -or [int]$matches[0].Current.ProcessId -ne [int]$Owner.id -or
+            -not $matches[0].Current.IsEnabled -or $matches[0].Current.IsOffscreen) {
+            $failure = [InvalidOperationException]::new("Exact enabled MO2 control '$id' is unavailable or ambiguous. See data.runControlDiscovery for exact selector counts; no selection or Run action occurred.")
+            $failure.Data['MO2RunControlDiscovery'] = [pscustomobject]$discovery
+            throw $failure
+        }
+        $controls[$id] = $matches[0]
+        $controlIds[$id] = [string]$matches[0].Current.AutomationId
+    }
+    if ($controls.profileBox.Current.ControlType -ne [System.Windows.Automation.ControlType]::ComboBox -or
+        $controls.executablesListBox.Current.ControlType -ne [System.Windows.Automation.ControlType]::ComboBox -or
+        $controls.startButton.Current.ControlType -ne [System.Windows.Automation.ControlType]::Button -or
+        (ConvertTo-MO2ControlName ([string]$controls.startButton.Current.Name)) -cne 'Run') { throw 'MO2 Run control structure is not supported.' }
+    return [pscustomobject]@{
+        processId = [int]$Owner.id; windowHandle = [int64]$main[0].handle
+        profile = Get-MO2RunSelectionValue $controls.profileBox
+        executable = Get-MO2RunSelectionValue $controls.executablesListBox
+        button = $controls.startButton
+        controlIds = [pscustomobject]$controlIds
+    }
+}
+
+function Assert-MO2RunButtonProof {
+    param($Proof, $Owned, $Owner)
+    if ([int]$Proof.processId -ne [int]$Owner.id -or [int64]$Proof.windowHandle -eq 0 -or
+        [string]$Proof.profile -cne [string]$Owned.data.profile -or
+        [string]$Proof.executable -cne [string]$Owned.data.executable) {
+        throw 'Visible profile/executable does not match the exact owned launch request; no selection was changed.'
+    }
+}
+
+function Invoke-MO2RunButtonDispatch {
+    # Caller holds the serialized session transition. No nested lock and no
+    # helper process, selection change, coordinates, keys, or loader fallback.
+    param($Config, $Owned, $Validation, $LaunchStarted, [string]$ReceiptPath, [switch]$PrepareOnly)
+    $allOwners = @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
+    $resolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $Owned -Processes $allOwners
+    if ($allOwners.Count -ne 1 -or -not $resolution.ok -or @($resolution.targets).Count -ne 1) { throw 'Run requires the exact sole session-owned MO2 lifetime.' }
+    $owner = $resolution.targets[0]
+    $binding = Get-Process -Id ([int]$owner.id) -ErrorAction Stop
+    try {
+        $handle = $binding.SafeHandle
+        $bound = [pscustomobject]@{ id=$binding.Id; name=$binding.ProcessName; path=$binding.Path; startTime=$binding.StartTime.ToUniversalTime().ToString('o') }
+        if ($handle.IsInvalid -or $handle.IsClosed -or $binding.HasExited -or -not (Test-MO2ProcessRecordIdentity -Expected $owner -Actual $bound).ok) { throw 'Run owner lifetime changed while binding its handle.' }
+        $proof = Get-MO2RunButtonProof -Owner $owner
+        Assert-MO2RunButtonProof -Proof $proof -Owned $Owned -Owner $owner
+        $skseRequired = $Owned.data.PSObject.Properties['requirements'] -and $Owned.data.requirements.PSObject.Properties['skseLoader'] -and [bool]$Owned.data.requirements.skseLoader
+        $fresh = Invoke-MO2Validate -Config $Config -Profile ([string]$Owned.data.profile) -Executable ([string]$Owned.data.executable) -RequireSKSE:$skseRequired -RequireRuntimeRoute -OwnedSessionId $Owned.sessionId
+        $expected = @($Validation.data.executables | Where-Object { [string]$_.title -ceq [string]$Owned.data.executable })
+        $actual = @($fresh.data.executables | Where-Object { [string]$_.title -ceq [string]$Owned.data.executable })
+        if (-not $fresh.ok -or @($fresh.data.processes.mo2).Count -ne 1 -or @($fresh.data.processes.game).Count -ne 0 -or
+            $expected.Count -ne 1 -or $actual.Count -ne 1 -or
+            ($expected[0] | ConvertTo-Json -Depth 20 -Compress) -cne ($actual[0] | ConvertTo-Json -Depth 20 -Compress) -or
+            @($fresh.data.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' }).Count -gt 0) { throw 'Run launch admission, executable entry, or closed-game/deployment state changed.' }
+        $freshResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $Owned -Processes @($fresh.data.processes.mo2)
+        if (-not $freshResolution.ok -or @($freshResolution.targets).Count -ne 1 -or
+            -not (Test-MO2ProcessRecordIdentity -Expected $owner -Actual $freshResolution.targets[0]).ok) { throw 'Run exact owner changed during validation.' }
+        $again = Get-MO2RunButtonProof -Owner $owner
+        Assert-MO2RunButtonProof -Proof $again -Owned $Owned -Owner $owner
+        if ([int64]$again.windowHandle -ne [int64]$proof.windowHandle) { throw 'Run window identity changed before invocation.' }
+        $binding.Refresh()
+        if ($binding.HasExited -or $handle.IsClosed -or $handle.IsInvalid -or
+            @(Get-MO2ProcessRecords -Names @($Config.mo2.gameProcessNames)).Count -ne 0) { throw 'Run owner exited or a game/loader appeared before invocation.' }
+        $LaunchStarted | Add-Member -NotePropertyName runButtonProof -NotePropertyValue ([pscustomobject]@{ owner=$owner; windowHandle=$again.windowHandle; profile=$again.profile; executable=$again.executable; registeredExecutable=$actual[0]; automationId=$again.controlIds.startButton; controlIds=$again.controlIds; invocationState=$(if ($PrepareOnly) { 'armed' } else { 'attempted' }) }) -Force
+        $LaunchStarted.requestedPid = $owner.id
+        $LaunchStarted.requestedProcessStartTime = $owner.startTime
+        Write-MO2JsonAtomic -Path $ReceiptPath -Value $LaunchStarted
+        if ($PrepareOnly) { return [pscustomobject]@{ process=$binding; invocationError=$null } }
+        $invocationError = $null
+        try { if (-not (Invoke-MO2AutomationButton -Button $again.button -ExpectedName 'Run')) { throw 'Exact Run accessible action was not accepted.' } }
+        catch { $invocationError = $_.Exception.Message }
+        $LaunchStarted.runButtonProof.invocationState = if ($invocationError) { 'uncertain' } else { 'invoked' }
+        $LaunchStarted | Add-Member -NotePropertyName invocationError -NotePropertyValue $invocationError -Force
+        # An exception after invoking may already have launched. Retain pending
+        # ownership and prohibit replay; do not revert to mo2-open.
+        return [pscustomobject]@{ process=$binding; invocationError=$invocationError }
+    }
+    catch { $binding.Dispose(); throw }
+}
+
 function Invoke-MO2Launch {
     [CmdletBinding()]
     param(
@@ -5166,12 +5555,22 @@ function Invoke-MO2Launch {
         [Parameter(Mandatory)][string]$SessionId,
         [ValidateRange(1, 600)][int]$TimeoutSeconds = 90,
         [switch]$StartOnly,
+        [ValidateSet('CLI','RunButton')][string]$LaunchMethod = 'CLI',
         [switch]$RootBuilderRecovery,
         [switch]$WhatIf
     )
 
+    # ValidateSet accepts case-insensitive spelling; never let a valid alias
+    # silently select CLI instead of the explicitly requested Run route.
+    $LaunchMethod = if ($LaunchMethod -ieq 'RunButton') { 'RunButton' } else { 'CLI' }
     $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
     $lockData = $owned.data
+    if ($LaunchMethod -ceq 'RunButton' -and ([string]$lockData.status -cne 'mo2-open' -or $RootBuilderRecovery)) {
+        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'blocked' -Data @{ sessionId=$SessionId; launchMethod=$LaunchMethod } -Errors @('RunButton requires a ready mo2-open owned session. It never opens, adopts, or retries MO2 implicitly.')
+    }
+    if ($LaunchMethod -ceq 'RunButton' -and -not (Test-MO2InteractiveDesktop)) {
+        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'interactive-desktop-required' -Data @{sessionId=$SessionId} -Errors @('RunButton requires the logged-on interactive desktop.')
+    }
     $acceptedStatuses = @('prepared', 'launch-failed', 'game-stopped', 'mo2-exited-after-game-stop', 'stop-incomplete', 'mo2-open')
     if ($RootBuilderRecovery) { $acceptedStatuses += @('mo2-closed', 'rootbuilder-recovery-required', 'launching', 'opening', 'open-incomplete') }
     if ([string]$lockData.status -notin $acceptedStatuses) {
@@ -5199,6 +5598,7 @@ function Invoke-MO2Launch {
     $mo2Path = [string]$validation.data.config.mo2Executable
     $arguments = @('--profile', [string]$lockData.profile, 'run', '--executable', [string]$lockData.executable)
     $argumentLine = ($arguments | ForEach-Object { ConvertTo-MO2CommandLineArgument ([string]$_) }) -join ' '
+    if ($LaunchMethod -ceq 'RunButton') { $arguments = @(); $argumentLine = '' }
     if ($reuseRetainedMO2) {
         $resumeOwnerResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
         if (-not $resumeOwnerResolution.ok -or @($resumeOwnerResolution.targets).Count -ne 1) {
@@ -5206,7 +5606,11 @@ function Invoke-MO2Launch {
         }
     }
     if ($WhatIf) {
-        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'dry-run' -Data @{ path = $mo2Path; arguments = $arguments; argumentLine = $argumentLine; workingDirectory = (Split-Path -Parent $mo2Path); sessionId = $SessionId; startOnly = [bool]$StartOnly; rootBuilderRecovery = [bool]$RootBuilderRecovery; resumeDisposition = $resumeDisposition; ownershipResolution = $resumeOwnerResolution }
+        if ($LaunchMethod -ceq 'RunButton') {
+            $proof = Get-MO2RunButtonProof -Owner $resumeOwnerResolution.targets[0]
+            Assert-MO2RunButtonProof -Proof $proof -Owned $owned -Owner $resumeOwnerResolution.targets[0]
+        }
+        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'dry-run' -Data @{ path = $mo2Path; launchMethod=$LaunchMethod; arguments = $(if ($LaunchMethod -ceq 'CLI') { $arguments } else { @() }); argumentLine = $(if ($LaunchMethod -ceq 'CLI') { $argumentLine } else { $null }); workingDirectory = (Split-Path -Parent $mo2Path); sessionId = $SessionId; startOnly = [bool]$StartOnly; rootBuilderRecovery = [bool]$RootBuilderRecovery; resumeDisposition=$resumeDisposition; ownershipResolution = $resumeOwnerResolution }
     }
 
     $launchAttemptId = [guid]::NewGuid().ToString('D')
@@ -5216,6 +5620,7 @@ function Invoke-MO2Launch {
     $launchStarted = [pscustomobject][ordered]@{
         contractVersion = $script:MO2ControlContractVersion
         sessionId = $SessionId
+        launchMethod = $LaunchMethod
         mo2Path = $mo2Path
         arguments = $arguments
         argumentLine = $argumentLine
@@ -5248,15 +5653,37 @@ function Invoke-MO2Launch {
         $launchDispatchedUtc = [DateTime]::UtcNow.ToString('o')
         $launchStarted.dispatchStartedUtc = $launchDispatchedUtc
         $launchStarted.preLaunchGameProcesses = @($preLaunchGameProcesses)
-        $process = Start-Process -FilePath $mo2Path -ArgumentList $argumentLine -WorkingDirectory (Split-Path -Parent $mo2Path) -WindowStyle Hidden -PassThru
+        # Fallible history normalization belongs before the irreversible dispatch.
+        Reset-MO2GameProcessStateForLaunch -Data $currentData -LaunchAttemptId $launchAttemptId -LaunchDispatchedUtc $launchDispatchedUtc -PreLaunchGameProcesses $preLaunchGameProcesses
+        $logBoundary = New-MO2LaunchLogBoundary -Config $Config -Validation $validation -AttemptId $launchAttemptId -Profile ([string]$currentData.profile) -Executable ([string]$currentData.executable) -ArgumentLine $argumentLine -RetainedOwner (@($preLaunchMO2Processes).Count -gt 0)
+        $currentData | Add-Member -NotePropertyName launchLogBoundary -NotePropertyValue $logBoundary -Force
+        $launchStarted | Add-Member -NotePropertyName launchLogBoundary -NotePropertyValue $logBoundary -Force
+        foreach ($oldFailureField in @('launchFailure', 'launchFailureReceiptPath')) { $currentData.PSObject.Properties.Remove($oldFailureField) }
+        if ($currentData.PSObject.Properties['leaseId']) { $launchStarted | Add-Member -NotePropertyName leaseId -NotePropertyValue ([string]$currentData.leaseId) -Force }
+        $launchStarted | Add-Member -NotePropertyName generation -NotePropertyValue ([long]$currentData.generation) -Force
+        Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted
+        if ($LaunchMethod -ceq 'RunButton') {
+            if ([string]$currentData.status -cne 'mo2-open') { throw 'RunButton session status changed before dispatch.' }
+            $uiDispatch = Invoke-MO2RunButtonDispatch -Config $Config -Owned $currentOwned -Validation $validation -LaunchStarted $launchStarted -ReceiptPath $launchStartedPath -PrepareOnly
+            $process = $uiDispatch.process
+        }
+        else { $process = Start-Process -FilePath $mo2Path -ArgumentList $argumentLine -WorkingDirectory (Split-Path -Parent $mo2Path) -WindowStyle Hidden -PassThru }
         $launchOwnerProcessPath = [IO.Path]::GetFullPath($mo2Path)
         $launchOwnerProcessStartTime = $(try { $process.StartTime.ToUniversalTime().ToString('o') } catch { $null })
-        $dispatchBoundChildren = if ([string]::IsNullOrWhiteSpace($launchOwnerProcessStartTime)) { @() } else { @(Get-MO2DispatchBoundChildEvidence -Config $Config -ParentProcess $process -ParentStartTime $launchOwnerProcessStartTime -DispatchStartedUtc $launchDispatchedUtc) }
         $launchStarted.requestedPid = $process.Id
         $launchStarted.requestedProcessStartTime = $launchOwnerProcessStartTime
-        $launchStarted | Add-Member -NotePropertyName dispatchBoundChildren -NotePropertyValue @($dispatchBoundChildren) -Force
+        # Save the exact dispatched lifetime before optional child inventory.
         $receiptWriteError = $null
         try { Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted } catch { $receiptWriteError = $_.Exception.Message }
+        [object[]]$dispatchBoundChildren = @()
+        try {
+            if ($LaunchMethod -ceq 'CLI' -and -not [string]::IsNullOrWhiteSpace($launchOwnerProcessStartTime)) {
+                $dispatchBoundChildren = @(Get-MO2DispatchBoundChildEvidence -Config $Config -ParentProcess $process -ParentStartTime $launchOwnerProcessStartTime -DispatchStartedUtc $launchDispatchedUtc)
+            }
+        }
+        catch { $launchStarted | Add-Member -NotePropertyName childProbeError -NotePropertyValue $_.Exception.Message -Force }
+        $launchStarted | Add-Member -NotePropertyName dispatchBoundChildren -NotePropertyValue @($dispatchBoundChildren) -Force
+        try { Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted; $receiptWriteError = $null } catch { $receiptWriteError = $_.Exception.Message }
         $ownerTransition = [pscustomobject][ordered]@{
             kind = 'launch'
             attemptId = $launchAttemptId
@@ -5270,7 +5697,6 @@ function Invoke-MO2Launch {
             detachedAdoptionAllowed = -not $reuseRetainedMO2
         }
         $currentData.status = 'launching'
-        Reset-MO2GameProcessStateForLaunch -Data $currentData -LaunchAttemptId $launchAttemptId -LaunchDispatchedUtc $launchDispatchedUtc -PreLaunchGameProcesses $preLaunchGameProcesses
         $currentData | Add-Member -NotePropertyName ownerTransition -NotePropertyValue $ownerTransition -Force
         if (-not $reuseRetainedMO2) {
             $currentData | Add-Member -NotePropertyName ownerPid -NotePropertyValue ([int]$process.Id) -Force
@@ -5290,6 +5716,25 @@ function Invoke-MO2Launch {
         throw "Launch process $($process.Id) was recorded in the ownership lock, but its dispatch receipt could not be updated: $($dispatch.receiptWriteError)"
     }
     $lockData = $owned.data
+    if ($LaunchMethod -ceq 'RunButton') {
+        # Commit launching before the UI action. If the host is interrupted or
+        # Invoke throws, another launch is blocked; status retains this attempt.
+        $uiError = $null
+        try {
+            $actualDispatch = Invoke-MO2OwnedProcessAction -Config $Config -Owned $owned -Process $process -Action {
+                param($uiConfig,$uiOwned,$uiValidation,$uiStarted,$uiReceipt)
+                Invoke-MO2RunButtonDispatch -Config $uiConfig -Owned $uiOwned -Validation $uiValidation -LaunchStarted $uiStarted -ReceiptPath $uiReceipt
+            } -ArgumentList @($Config,$owned,$validation,$launchStarted,$launchStartedPath)
+            $uiError = $actualDispatch.invocationError
+            $actualDispatch.process.Dispose()
+        }
+        catch { $uiError = $_.Exception.Message }
+        $launchStarted | Add-Member -NotePropertyName invocationError -NotePropertyValue $uiError -Force
+        Write-MO2JsonAtomic -Path $launchStartedPath -Value $launchStarted
+    }
+    if ($LaunchMethod -ceq 'RunButton' -and $launchStarted.invocationError) {
+        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'launch-dispatch-uncertain' -Data @{sessionId=$SessionId;launchStartedReceiptPath=$launchStartedPath;pollWith="status -SessionId $SessionId"} -Errors @('Run invocation returned an error after the dispatch boundary. Do not replay; inspect the retained pending attempt with status/normal cleanup.')
+    }
     if ($StartOnly) {
         return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'launching' -Data @{ sessionId = $SessionId; launcherPid = $process.Id; launchStartedReceiptPath = $launchStartedPath; sessionPath = $lockData.sessionPath; pollWith = "status -SessionId $SessionId"; rootBuilderRecovery = [bool]$RootBuilderRecovery; resumeDisposition = $resumeDisposition }
     }
@@ -5297,13 +5742,16 @@ function Invoke-MO2Launch {
     $primaryGameProcessName = [string]@($Config.mo2.gameProcessNames)[0]
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $status = $null
-    $blockingDialog = $null
+    $blockingDialog = @()
+    $launchFailure = $null
     do {
         Start-Sleep -Milliseconds 500
         $status = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$lockData.profile) -RequestedExecutable ([string]$lockData.executable)
         if (@($status.processes.game | Where-Object { $_.name -ieq $primaryGameProcessName }).Count -gt 0) { break }
         $blockingDialog = @(Get-MO2WindowSnapshot -Processes @($status.processes.mo2) | Where-Object { $_.dialogKind -eq 'failed-to-write-settings' } | Select-Object -First 1)
         if ($blockingDialog.Count -gt 0) { break }
+        $launchFailure = Get-MO2LaunchFailureEvidence -Config $Config -Owned $owned -MO2Processes @($status.processes.mo2) -GameProcesses @($status.processes.game)
+        if ($launchFailure) { break }
     } while ([DateTime]::UtcNow -lt $deadline)
 
     $gameObserved = @($status.processes.game | Where-Object { $_.name -ieq $primaryGameProcessName }).Count -gt 0
@@ -5329,6 +5777,15 @@ function Invoke-MO2Launch {
         $gameProcessAdoption | Add-Member -NotePropertyName commitOwnershipResolution -NotePropertyValue $commitOwnerResolution -Force
     }
     if (-not $gameOwned) {
+        if ($launchFailure) {
+            try { $failureReceiptPath = Set-MO2LaunchFailureEvidence -Config $Config -Owned $owned -Failure $launchFailure }
+            catch {
+                $supersession = Get-MO2SynchronousCompletionSupersession -Config $Config -Owned $owned -SessionId $SessionId -Operation launch -AttemptId $launchAttemptId
+                if (-not $supersession.superseded) { throw }
+                return New-MO2SynchronousCompletionSupersededResult -Config $Config -Supersession $supersession -SessionId $SessionId
+            }
+            return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'launch-failed' -Data @{ sessionId = $SessionId; launchFailure = $launchFailure; launchFailureReceiptPath = $failureReceiptPath; launchStartedReceiptPath = $launchStartedPath; processes = $status.processes; sessionPath = $lockData.sessionPath } -Errors @("MO2 failed to spawn '$($launchFailure.binary)': Win32 error $($launchFailure.win32ErrorCode) $($launchFailure.message). Cause is unassigned; no retry or cleanup was dispatched.")
+        }
         $lockData.status = if ($blockingDialog.Count -gt 0) { 'launch-blocked-dialog' } else { 'launch-failed' }
         try {
             $null = Write-MO2OwnedSessionAtomic -Owned $owned -Value $lockData
@@ -5363,6 +5820,146 @@ function Invoke-MO2Launch {
     return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $true -State 'game-running' -Data @{ launcherPid = $process.Id; ownerPid = $ownerResolution.ownerPid; ownershipResolution = $ownerResolution; primaryGameProcessName = $primaryGameProcessName; processes = $status.processes; sessionPath = $lockData.sessionPath; launchStartedReceiptPath = $launchStartedPath; rootBuilderRecovery = [bool]$RootBuilderRecovery; resumeDisposition = $resumeDisposition }
 }
 
+function Get-MO2UncommittedDispatchProof {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Owned,
+        [Parameter(Mandatory)][string]$TaskId,
+        [Parameter(Mandatory)][string]$AttemptId,
+        [Parameter(Mandatory)][long]$ExpectedGeneration,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$MO2Processes,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$GameProcesses
+    )
+    try {
+        $data = $Owned.data
+        if ([string]$data.status -cne 'prepared' -or [long]$data.generation -ne $ExpectedGeneration) { throw 'Recovery requires the exact prepared generation.' }
+        if ([string]$data.ownerTaskId -cne $TaskId) { throw 'The lease task identity does not match.' }
+        foreach ($name in @('ownerTransition', 'processPath', 'processStartTime', 'ownerProcessPath', 'ownerProcessStartTime', 'dispatchRecovery')) {
+            if ($data.PSObject.Properties[$name]) { throw "Prepared session already contains $name; receipt-only recovery is forbidden." }
+        }
+        if ($GameProcesses.Count -ne 0 -or $MO2Processes.Count -ne 1) { throw 'Recovery requires no game/loader and exactly one MO2 process.' }
+        $sessionPath = [IO.Path]::GetFullPath([string]$data.sessionPath)
+        $receiptPath = Join-Path $sessionPath 'mo2-launch-started.json'
+        $manifestPath = Join-Path $sessionPath 'session.json'
+        $receipt = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $receiptPath -Raw -ErrorAction Stop)
+        $manifest = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop)
+        foreach ($name in @('sessionId', 'accessId', 'leaseId', 'generation', 'ownerTaskId', 'status', 'profile', 'executable', 'ownerPid', 'controllerPath', 'controllerConfigPath', 'controllerReceiptPath')) {
+            if (-not $manifest.PSObject.Properties[$name] -or [string]$manifest.$name -cne [string]$data.$name) { throw "Lock/manifest binding differs at $name." }
+        }
+        [guid]$parsedAttempt = [guid]::Empty
+        if (-not [guid]::TryParse($AttemptId, [ref]$parsedAttempt) -or $parsedAttempt -eq [guid]::Empty -or
+            [string]$receipt.attemptId -cne $AttemptId -or [string]$receipt.launchAttemptId -cne $AttemptId -or
+            [string]$receipt.sessionId -cne [string]$Owned.sessionId) { throw 'The launch attempt/session receipt does not match.' }
+        $hasGeneration = $null -ne $receipt.PSObject.Properties['generation']
+        $hasLease = $null -ne $receipt.PSObject.Properties['leaseId']
+        if ($hasGeneration -ne $hasLease) { throw 'Receipt lease/generation metadata is incomplete.' }
+        if ($hasGeneration -and (($receipt.generation -isnot [int] -and $receipt.generation -isnot [long]) -or $receipt.generation -ne $ExpectedGeneration)) { throw 'Receipt generation is not an exact integer.' }
+        if ($hasLease -and ($receipt.leaseId -isnot [string] -or [string]::IsNullOrWhiteSpace($receipt.leaseId) -or $receipt.leaseId -cne [string]$data.leaseId)) { throw 'Receipt lease differs.' }
+        if ([bool]$receipt.rootBuilderRecovery -or @($receipt.preDispatchProcesses).Count -ne 0 -or @($receipt.preLaunchGameProcesses).Count -ne 0) { throw 'Recovery accepts only a fresh, originally closed dispatch.' }
+        $arguments = @('--profile', [string]$data.profile, 'run', '--executable', [string]$data.executable)
+        if (@($receipt.arguments).Count -ne $arguments.Count) { throw 'Receipt argument count differs.' }
+        for ($i = 0; $i -lt $arguments.Count; $i++) {
+            if ([string]$receipt.arguments[$i] -cne $arguments[$i]) { throw 'Receipt profile/executable arguments differ.' }
+        }
+        $expectedArgumentLine = ($arguments | ForEach-Object { ConvertTo-MO2CommandLineArgument ([string]$_) }) -join ' '
+        if ([string]$receipt.argumentLine -cne $expectedArgumentLine) { throw 'Receipt argument line differs.' }
+        $configuredPath = [IO.Path]::GetFullPath([string]$Config.mo2.executable)
+        if (-not [string]::Equals($configuredPath, [IO.Path]::GetFullPath([string]$receipt.mo2Path), [StringComparison]::OrdinalIgnoreCase)) { throw 'Receipt executable differs from configuration.' }
+        $candidate = $MO2Processes[0]
+        $expected = [pscustomobject]@{ id = [int]$receipt.requestedPid; name = [IO.Path]::GetFileNameWithoutExtension($configuredPath); path = $configuredPath; startTime = [string]$receipt.requestedProcessStartTime }
+        if ($expected.id -le 0 -or -not (Test-MO2ProcessRecordIdentity -Expected $expected -Actual $candidate).ok) { throw 'The live process is not the exact dispatched PID/path/start lifetime.' }
+        $created = [DateTimeOffset]::Parse([string]$data.createdUtc).UtcDateTime
+        $started = [DateTimeOffset]::Parse([string]$receipt.startedUtc).UtcDateTime
+        $dispatch = [DateTimeOffset]::Parse([string]$receipt.dispatchStartedUtc).UtcDateTime
+        $processStart = [DateTimeOffset]::Parse([string]$candidate.startTime).UtcDateTime
+        if ($started -lt $created -or $dispatch -lt $started -or $processStart -lt $dispatch -or ($processStart - $dispatch).TotalSeconds -gt 10) { throw 'Receipt dispatch chronology is not attributable to this prepared session.' }
+        # A newer source entry point may recover an old session only using that
+        # session's unchanged captured configuration and controller identity.
+        $oldController = [IO.Path]::GetFullPath([string]$manifest.controllerPath)
+        $oldDirectory = Join-Path $sessionPath 'controller'
+        if (-not [string]::Equals($oldController, (Join-Path $oldDirectory 'Invoke-MO2Control.ps1'), [StringComparison]::OrdinalIgnoreCase)) { throw 'Original controller path is not the exact retained session bundle.' }
+        $binding = Assert-MO2ControllerBundleBinding -Data $data -Manifest $manifest
+        $oldConfigPath = Join-Path $oldDirectory 'config\machine.local.json'
+        $oldConfig = Read-MO2ControlConfig -ConfigPath $oldConfigPath
+        if (($oldConfig | ConvertTo-Json -Depth 30 -Compress) -cne ($Config | ConvertTo-Json -Depth 30 -Compress)) { throw 'Recovery configuration must equal the exact captured session configuration.' }
+        return [pscustomobject]@{
+            ok = $true; reason = 'exact-uncommitted-dispatch'; candidate = $candidate
+            receiptPath = $receiptPath; receiptSha256 = (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash
+            manifestPath = $manifestPath; originalControllerPath = $oldController
+            dispatchStartedUtc = $dispatch.ToString('o'); attemptId = $AttemptId
+            legacyReceipt = -not $hasGeneration -and -not $hasLease
+            controllerReceiptSha256 = $binding.receiptSha256
+        }
+    }
+    catch { return [pscustomobject]@{ ok = $false; reason = 'dispatch-recovery-proof-refused'; detail = $_.Exception.Message } }
+}
+
+function Invoke-MO2RecoverDispatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$AccessId,
+        [Parameter(Mandatory)][string]$TaskId,
+        [Parameter(Mandatory)][string]$AttemptId,
+        [Parameter(Mandatory)][long]$ExpectedGeneration,
+        [switch]$WhatIf
+    )
+    $ownedAccess = Get-MO2OwnedAccessLease -Config $Config -AccessId $AccessId
+    $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
+    if ([string]$ownedAccess.sessionId -cne $SessionId -or [string]$owned.accessId -cne $AccessId) { throw 'The supplied credential does not own this exact session.' }
+    $proof = Get-MO2UncommittedDispatchProof -Config $Config -Owned $owned -TaskId $TaskId -AttemptId $AttemptId -ExpectedGeneration $ExpectedGeneration -MO2Processes @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames)) -GameProcesses @(Get-MO2ProcessRecords -Names @($Config.mo2.gameProcessNames))
+    if (-not $proof.ok) { return New-MO2ActionResult -Config $Config -Command 'recover-dispatch' -Ok $false -State 'blocked' -Data @{ proof = $proof; sessionId = $SessionId } -Errors @($proof.detail) }
+    if ($WhatIf) { return New-MO2ActionResult -Config $Config -Command 'recover-dispatch' -Ok $true -State 'dry-run' -Data @{ sessionId = $SessionId; attemptId = $AttemptId; expectedGeneration = $ExpectedGeneration; ownerPid = [int]$proof.candidate.id; wouldLaunch = $false; wouldReplaceOriginalController = $false; receiptSha256 = $proof.receiptSha256 } }
+    $process = Get-Process -Id ([int]$proof.candidate.id) -ErrorAction Stop
+    try {
+        $handle = $process.SafeHandle
+        if ($handle.IsInvalid -or $handle.IsClosed) { throw 'The dispatched process handle is unavailable.' }
+        $recovery = Invoke-MO2OwnedSessionMutation -Owned $owned -Action {
+            param($currentData)
+            $currentOwned = [pscustomobject]@{ path = $owned.path; sessionId = $SessionId; accessId = $AccessId; data = $currentData }
+            $currentProof = Get-MO2UncommittedDispatchProof -Config $Config -Owned $currentOwned -TaskId $TaskId -AttemptId $AttemptId -ExpectedGeneration $ExpectedGeneration -MO2Processes @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames)) -GameProcesses @(Get-MO2ProcessRecords -Names @($Config.mo2.gameProcessNames))
+            if (-not $currentProof.ok -or [string]$currentProof.receiptSha256 -cne [string]$proof.receiptSha256) { throw "Recovery evidence changed before commit: $($currentProof.reason)" }
+            $process.Refresh()
+            $bound = [pscustomobject]@{ id = $process.Id; name = $process.ProcessName; path = $process.Path; startTime = $process.StartTime.ToUniversalTime().ToString('o') }
+            if ($process.HasExited -or -not (Test-MO2ProcessRecordIdentity -Expected $currentProof.candidate -Actual $bound).ok) { throw 'The retained dispatched process lifetime changed before recovery.' }
+            $recoveryPath = Join-Path ([string]$currentData.sessionPath) ('dispatch-recovery-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $recoveryPath -ErrorAction Stop | Out-Null
+            Copy-Item -LiteralPath ([string]$owned.path) -Destination (Join-Path $recoveryPath 'lock-before.json')
+            Copy-Item -LiteralPath $currentProof.manifestPath -Destination (Join-Path $recoveryPath 'session-before.json')
+            Copy-Item -LiteralPath $currentProof.receiptPath -Destination (Join-Path $recoveryPath 'launch-started-before.json')
+            $controller = New-MO2DurableSessionController -Config $Config -SessionPath $recoveryPath
+            $adoption = Set-MO2OwnedSessionOwnerData -Data $currentData -ProcessRecord $bound -Reason 'exact-uncommitted-dispatch-recovery'
+            Reset-MO2GameProcessStateForLaunch -Data $currentData -LaunchAttemptId $AttemptId -LaunchDispatchedUtc $currentProof.dispatchStartedUtc -PreLaunchGameProcesses @()
+            $currentData.status = 'launch-failed'
+            $receipt = [pscustomobject]@{
+                contractVersion = '1.0.0'; recoveredUtc = [DateTime]::UtcNow.ToString('o'); sessionId = $SessionId
+                attemptId = $AttemptId; previousGeneration = $ExpectedGeneration; committedGeneration = $ExpectedGeneration + 1
+                ownerPid = $bound.id; processPath = $bound.path; processStartTime = $bound.startTime
+                sourceReceiptSha256 = $currentProof.receiptSha256; sourceReceiptPath = $currentProof.receiptPath
+                legacyReceipt = $currentProof.legacyReceipt; originalControllerPath = $currentProof.originalControllerPath
+                controllerPath = $controller.controllerPath; recoveryPath = $recoveryPath; launched = $false
+            }
+            $recoveryReceiptPath = Join-Path $recoveryPath 'dispatch-recovery.json'
+            Write-MO2JsonAtomic -Path $recoveryReceiptPath -Value $receipt -CreateNew
+            $currentData | Add-Member -NotePropertyName dispatchRecovery -NotePropertyValue $receipt -Force
+            $currentData | Add-Member -NotePropertyName controllerPath -NotePropertyValue $controller.controllerPath -Force
+            $currentData | Add-Member -NotePropertyName controller -NotePropertyValue $controller -Force
+            $currentData | Add-Member -NotePropertyName launchStartedReceiptPath -NotePropertyValue $currentProof.receiptPath -Force
+            $process.Refresh()
+            $finalIdentity = [pscustomobject]@{ id = $process.Id; name = $process.ProcessName; path = $process.Path; startTime = $process.StartTime.ToUniversalTime().ToString('o') }
+            if ($process.HasExited -or -not (Test-MO2ProcessRecordIdentity -Expected $bound -Actual $finalIdentity).ok -or
+                @(Get-MO2ProcessRecords -Names @($Config.mo2.gameProcessNames)).Count -ne 0 -or
+                @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames)).Count -ne 1) { throw 'Process inventory changed while retaining recovery evidence; no ownership commit.' }
+            # The only effect on the live process is retaining its handle. Normal
+            # exact-owner close/Unlock remains a separate caller operation.
+            return [pscustomobject]@{ sessionData = $currentData; result = @{ sessionId = $SessionId; ownerPid = $bound.id; controllerPath = $controller.controllerPath; recoveryReceiptPath = $recoveryReceiptPath; generation = $ExpectedGeneration + 1; launched = $false; leaseRetained = $true } }
+        }
+        return New-MO2ActionResult -Config $Config -Command 'recover-dispatch' -Ok $true -State 'dispatch-owner-recovered' -Data $recovery
+    }
+    finally { $process.Dispose() }
+}
+
 function Invoke-MO2RecoverRootBuilder {
     [CmdletBinding()]
     param(
@@ -5383,7 +5980,7 @@ function Invoke-MO2RecoverRootBuilder {
         return New-MO2ActionResult -Config $Config -Command 'recover-rootbuilder' -Ok $true -State 'no-recovery-required' -Data @{ sessionId = $SessionId; activeBuildData = @(); sessionPath = $owned.data.sessionPath }
     }
     if ($buildData.Count -ne 1) {
-        return New-MO2ActionResult -Config $Config -Command 'recover-rootbuilder' -Ok $false -State 'blocked' -Data @{ sessionId = $SessionId; activeBuildData = @($buildData | ForEach-Object path); sessionPath = $owned.data.sessionPath } -Errors @('RootBuilder recovery requires exactly one active BuildData.json; multiple deployment records require manual classification.')
+        return New-MO2ActionResult -Config $Config -Command 'recover-rootbuilder' -Ok $false -State 'blocked' -Data @{ sessionId = $SessionId; activeBuildData = @($buildData | ForEach-Object { $_.path }); sessionPath = $owned.data.sessionPath } -Errors @('RootBuilder recovery requires exactly one active BuildData.json; multiple deployment records require manual classification.')
     }
 
     if (-not $WhatIf) {
@@ -6003,13 +6600,19 @@ function Invoke-MO2CurrentGameCloseRequest {
     # Session state, not a pre-lock inventory, defines the owned game set. An
     # additional configured game/loader process is an ambiguity and vetoes all
     # close requests, even when it appeared in the caller's earlier inspection.
-    $resolution = Resolve-MO2RecordedGameProcessTargets -Recorded @($CurrentData.gameProcesses) -Current @($CurrentInspection.processes.game)
+    # A freshly opened session legitimately has no gameProcesses field until
+    # launch. Empty recorded ownership must still veto any unrecorded game.
+    $recorded = @(if ($CurrentData.PSObject.Properties['gameProcesses']) { $CurrentData.gameProcesses })
+    $resolution = Resolve-MO2RecordedGameProcessTargets -Recorded $recorded -Current @($CurrentInspection.processes.game)
     if (-not $resolution.ok) {
         return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = [string]$resolution.reason; gameResolution = $resolution }
     }
     $ownerResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $Owned -Processes @($CurrentInspection.processes.mo2)
     if (-not $ownerResolution.ok -or @($ownerResolution.targets).Count -ne 1) {
         return [pscustomobject][ordered]@{ ok = $false; state = 'blocked'; reason = 'mo2-owner-changed-before-game-close'; ownershipResolution = $ownerResolution }
+    }
+    if (@($resolution.targets).Count -eq 0) {
+        return [pscustomobject][ordered]@{ ok = $true; state = 'close-requested'; reason = 'game-already-stopped'; targets = @() }
     }
     return Invoke-MO2VerifiedGameCloseRequestSet -Config $Config -Owned $Owned -Targets @($resolution.targets) -BindingFactory $BindingFactory -CloseAction $CloseAction
 }
@@ -6475,6 +7078,7 @@ function Get-MO2ControlHelp {
             [pscustomobject]@{ name = 'terminate-game'; mutation = $true; description = 'Terminate only launch-recorded exact game/loader PIDs after a deadlock, retain MO2, invoke exact Unlock, and require RootBuilder restoration.' },
             [pscustomobject]@{ name = 'close'; mutation = $true; description = 'Cooperatively close only exact session-owned MO2, including its exact Unlock control and MO2-owned modal windows. Never force-terminates.' },
             [pscustomobject]@{ name = 'recover-close'; mutation = $true; description = 'Use a route-qualified access lease to adopt one stranded exact-path MO2 into a recorded recovery session, then cooperatively close it. Never targets editor or crash-handler processes.' },
+            [pscustomobject]@{ name = 'recover-dispatch'; mutation = $true; description = 'Recover one fresh prepared dispatch from its exact receipt and PID/path/start lifetime. Requires owned AccessId, TaskId, AttemptId and ExpectedGeneration; never launches or closes a process.' },
             [pscustomobject]@{ name = 'recover-rootbuilder'; mutation = $true; description = 'Recover one stranded RootBuilder BuildData transaction through one exact-profile launch, followed by the normal stop/Unlock path. Never deletes deployment metadata.' },
             [pscustomobject]@{ name = 'stop'; mutation = $true; description = 'Request graceful game shutdown, then cooperatively close exact owned MO2. Never force-terminates.' },
             [pscustomobject]@{ name = 'terminate'; mutation = $true; description = 'Force-terminate only owned MO2 processes after proving game absence and RootBuilder cleanup. Requires -SessionId and supports -WhatIf.' },
@@ -6513,4 +7117,4 @@ function Get-MO2ControlHelp {
     }
 }
 
-Export-ModuleMember -Function Read-MO2ControlConfig, Get-MO2TaskWorkspaceIsolation, ConvertTo-MO2PublicResult, Invoke-MO2Inspect, Invoke-MO2Validate, Invoke-MO2ValidateHumanMutation, Invoke-MO2HumanMutationTransaction, Invoke-MO2RequestAccess, Invoke-MO2AccessStatus, Invoke-MO2RenewAccess, Invoke-MO2ReleaseAccess, Invoke-MO2RecoverAccess, Invoke-MO2Prepare, Invoke-MO2Open, Invoke-MO2Launch, Invoke-MO2Status, Invoke-MO2Refresh, Invoke-MO2StopGame, Invoke-MO2TerminateGame, Invoke-MO2Close, Invoke-MO2RecoverClose, Invoke-MO2RecoverRootBuilder, Invoke-MO2Stop, Invoke-MO2Terminate, Invoke-MO2Release, Get-MO2ControlHelp
+Export-ModuleMember -Function Read-MO2ControlConfig, Get-MO2TaskWorkspaceIsolation, ConvertTo-MO2PublicResult, Invoke-MO2Inspect, Invoke-MO2Validate, Invoke-MO2ValidateHumanMutation, Invoke-MO2HumanMutationTransaction, Invoke-MO2RequestAccess, Invoke-MO2AccessStatus, Invoke-MO2RenewAccess, Invoke-MO2ReleaseAccess, Invoke-MO2RecoverAccess, Invoke-MO2Prepare, Invoke-MO2Open, Invoke-MO2Launch, Invoke-MO2Status, Invoke-MO2Refresh, Invoke-MO2StopGame, Invoke-MO2TerminateGame, Invoke-MO2Close, Invoke-MO2RecoverClose, Invoke-MO2RecoverDispatch, Invoke-MO2RecoverRootBuilder, Invoke-MO2Stop, Invoke-MO2Terminate, Invoke-MO2Release, Get-MO2ControlHelp

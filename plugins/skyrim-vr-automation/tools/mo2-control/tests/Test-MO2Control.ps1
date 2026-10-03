@@ -2,7 +2,8 @@
 
 [CmdletBinding()]
 param(
-    [switch]$IncludeLive
+    [switch]$IncludeLive,
+    [string]$FixtureRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -74,7 +75,8 @@ $acceptedExitRace = & $mo2Module {
 }
 Assert-MO2Test ($acceptedExitRace.terminal -and -not $acceptedExitRace.wrongProcess -and -not $acceptedExitRace.staleAuthority) 'an accepted exact Exit distinguishes terminal process departure from an authority failure'
 
-$fixture = Join-Path ([IO.Path]::GetTempPath()) ('mo2-control-test-' + [guid]::NewGuid().ToString('N'))
+$fixtureBase = if ([string]::IsNullOrWhiteSpace($FixtureRoot)) { [IO.Path]::GetTempPath() } else { [IO.Path]::GetFullPath($FixtureRoot) }
+$fixture = Join-Path $fixtureBase ('mo2-control-test-' + [guid]::NewGuid().ToString('N'))
 try {
     $mo2Root = Join-Path $fixture 'MO2'
     $profileRoot = Join-Path $mo2Root 'profiles'
@@ -175,6 +177,59 @@ executable_blacklist="Steam.exe;notepad++.exe"
     Assert-MO2Test ($inspection.command -eq 'inspect' -and $inspection.ok) 'clean fixture inspection succeeds'
     Assert-MO2Test ($validation.command -eq 'validate' -and $validation.ok) 'clean fixture validation succeeds'
     Assert-MO2Test ($validation.state -eq 'ready') 'clean fixture is ready'
+    # Caller WhatIf must suppress writes, never read-only profile discovery.
+    $iniHashBeforePreview = (Get-FileHash -LiteralPath $ini).Hash
+    $modlistHashBeforePreview = (Get-FileHash -LiteralPath (Join-Path $profile 'modlist.txt')).Hash
+    $previewInspection = & $mo2Module {
+        param($fixtureConfig)
+        $WhatIfPreference = $true
+        Invoke-MO2Inspect -Config $fixtureConfig
+    } $config
+    Assert-MO2Test ($previewInspection.ok -and @($previewInspection.data.profiles).Count -eq 1 -and $previewInspection.data.profiles[0] -ceq 'Codex') 'inherited WhatIf preserves single exact profile inspection'
+    $previewValidation = & $mo2Module {
+        param($fixtureConfig)
+        $WhatIfPreference = $true
+        Invoke-MO2Validate -Config $fixtureConfig -RequireClosed
+    } $config
+    Assert-MO2Test ($previewValidation.ok -and @($previewValidation.checks | Where-Object name -eq 'requested-profile')[0].status -eq 'pass') 'inherited WhatIf validates the existing exact profile'
+    $missingPreviewProfile = & $mo2Module {
+        param($fixtureConfig)
+        $WhatIfPreference = $true
+        Invoke-MO2Validate -Config $fixtureConfig -Profile 'Not present' -RequireClosed
+    } $config
+    Assert-MO2Test (-not $missingPreviewProfile.ok -and @($missingPreviewProfile.checks | Where-Object name -eq 'requested-profile')[0].status -eq 'fail') 'inherited WhatIf still rejects a missing profile without fallback'
+    Assert-MO2Test (@($missingPreviewProfile.errors).Count -gt 0 -and ($missingPreviewProfile.errors -join '|') -match 'Exact profile does not exist') 'inherited WhatIf retains the actual profile refusal message'
+    $previewMessages = & $mo2Module {
+        param($fixtureConfig)
+        $WhatIfPreference = $true
+        ConvertTo-MO2Result -Config $fixtureConfig -Command 'validate' -Checks @(
+            (New-MO2Check -Name 'fixture-blocker' -Status fail -Message 'exact fixture error'),
+            (New-MO2Check -Name 'fixture-warning' -Status warn -Message 'exact fixture warning')
+        ) -Data @{}
+    } $config
+    Assert-MO2Test (-not $previewMessages.ok -and $previewMessages.errors[0] -ceq 'exact fixture error' -and $previewMessages.warnings[0] -ceq 'exact fixture warning') 'inherited WhatIf preserves error and warning text and fail-closed result'
+    foreach ($extraProfile in @('Zed fixture', 'Alpha fixture')) { New-Item -ItemType Directory -Path (Join-Path $profileRoot $extraProfile) | Out-Null }
+    $multiNormal = Invoke-MO2Inspect -Config $config
+    $multiPreview = & $mo2Module {
+        param($fixtureConfig)
+        $WhatIfPreference = $true
+        Invoke-MO2Inspect -Config $fixtureConfig
+    } $config
+    Assert-MO2Test (@($multiPreview.data.profiles).Count -eq 3 -and (@($multiPreview.data.profiles) -join '|') -ceq (@($multiNormal.data.profiles) -join '|')) 'inherited WhatIf preserves multiple sorted profile names exactly'
+    $emptyProfiles = Join-Path $fixture 'empty-profiles'
+    New-Item -ItemType Directory -Path $emptyProfiles | Out-Null
+    $oldProfilesDirectory = $config.mo2.profilesDirectory
+    try {
+        $config.mo2.profilesDirectory = $emptyProfiles
+        $emptyPreview = & $mo2Module {
+            param($fixtureConfig)
+            $WhatIfPreference = $true
+            Invoke-MO2Validate -Config $fixtureConfig -RequireClosed
+        } $config
+        Assert-MO2Test (@($emptyPreview.data.profiles).Count -eq 0 -and -not $emptyPreview.ok) 'inherited WhatIf handles an empty profile inventory without inventing a profile'
+    }
+    finally { $config.mo2.profilesDirectory = $oldProfilesDirectory }
+    Assert-MO2Test ((Get-FileHash -LiteralPath $ini).Hash -ceq $iniHashBeforePreview -and (Get-FileHash -LiteralPath (Join-Path $profile 'modlist.txt')).Hash -ceq $modlistHashBeforePreview) 'preview profile reads leave INI and modlist bytes unchanged'
     Assert-MO2Test ($validation.data.selectedProfile -eq 'Codex') 'ByteArray profile is decoded'
     Assert-MO2Test (@($validation.data.executables | Where-Object title -eq 'Launch MGO - Do Not Unlock').Count -eq 1) 'registered executable is parsed exactly once'
     Assert-MO2Test (@($validation.data.executables | Where-Object title -eq 'Launch MGO - Do Not Unlock').capabilities -contains 'skse-loader') 'registered SKSE executable advertises its inferred capability'
@@ -503,14 +558,14 @@ executable_blacklist="Steam.exe;notepad++.exe"
     $allGameCommitCalls = @([regex]::Matches($moduleSource, '[$]null = Set-MO2OwnedSessionGameProcesses[^`r`n]+'))
     Assert-MO2Test ($qualifiedGameCommitCalls.Count -eq 2 -and $allGameCommitCalls.Count -eq 2) 'both status and synchronous launch durably co-write verified game identity with the running transition'
     Assert-MO2Test ($moduleSource -match 'processPath' -and $moduleSource -match 'processStartTime') 'launch and detached-owner adoption persist exact MO2 path and start-time identity'
-    Assert-MO2Test (@([regex]::Matches($moduleSource, 'Invoke-MO2OwnedSessionMutation -Owned [$]owned -Action')).Count -eq 4) 'launch, open, terminate-game, and terminate all serialize current lifecycle authority before process mutation'
+    Assert-MO2Test (@([regex]::Matches($moduleSource, 'Invoke-MO2OwnedSessionMutation -Owned [$]owned -Action')).Count -eq 5) 'launch, open, terminate-game, terminate and dispatch recovery all serialize current lifecycle authority before process mutation'
     Assert-MO2Test ($moduleSource -match 'param\([$]CurrentOwned, [$]MutationAction\)' -and $moduleSource -match 'Invoke-WithMO2LeaseTransitionLock[^\r\n]+-Action [$]lockedMutation -ArgumentList @\([$]Owned, [$]Action\)') 'serialized lifecycle mutation passes its caller action explicitly without colliding with the lock wrapper Action parameter'
     Assert-MO2Test ($moduleSource -notmatch "Set-MO2OwnedSessionOwner -Owned[^`r`n]+exact MO2 process observed after open" -and $moduleSource -match 'Resolve-MO2OwnedProcessTarget[^\r\n]+-AdoptDetachedOwner') 'synchronous open preserves its dispatch-bound owner tuple unless the explicit detached-owner proof succeeds'
     $launchSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Launch \{.*?\n\}').Value
     $openSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2Open \{.*?\n\}').Value
     Assert-MO2Test ($launchSource -notmatch 'if \([$]ownerResolution[.]adopted\) \{\s*[$]owned = Get-MO2OwnedSession' -and
         $openSource -notmatch 'if \([$]observedResolution[.]adopted\) \{\s*[$]owned = Get-MO2OwnedSession' -and
-        @([regex]::Matches($launchSource, 'Get-MO2SynchronousCompletionSupersession')).Count -eq 2 -and
+        @([regex]::Matches($launchSource, 'Get-MO2SynchronousCompletionSupersession')).Count -eq 3 -and
         @([regex]::Matches($openSource, 'Get-MO2SynchronousCompletionSupersession')).Count -eq 2) 'synchronous launch/open keep their initiating post-handoff generation and classify stale terminal writes without adopting newer authority'
     Assert-MO2Test ($moduleSource -match 'Write-MO2SessionManifestProjection -SessionData [$]updated' -and $moduleSource -notmatch '(?s)Write-MO2OwnedSessionAtomic[^}]+Write-MO2JsonAtomic -Path [$]manifestPath') 'ownership-lock and session-manifest lifecycle projection share one serialized generation boundary'
     $gamePersistenceSource = [regex]::Match($moduleSource, '(?s)function Set-MO2OwnedSessionGameProcesses \{.*?\n\}').Value
@@ -546,6 +601,20 @@ executable_blacklist="Steam.exe;notepad++.exe"
     $missingOwnerInspection = [pscustomobject]@{ processes = [pscustomobject]@{ game = @($observedGame); mo2 = @() } }
     $missingOwnerClose = & $mo2Module { param($cfg, $owned, $data, $inspection, $closer) Invoke-MO2CurrentGameCloseRequest -Config $cfg -Owned $owned -CurrentData $data -CurrentInspection $inspection -CloseAction $closer } $config $recordedCloseOwned $recordedCloseOwned.data $missingOwnerInspection $unrecordedCloser
     Assert-MO2Test (-not $missingOwnerClose.ok -and $missingOwnerClose.reason -eq 'mo2-owner-changed-before-game-close' -and $unrecordedCloseCalls.Count -eq 0) 'graceful game close requires the exact current MO2 owner before invoking CloseMainWindow'
+    # Preserve exact process-start strings; date coercion loses subsecond
+    # identity when cast back to string by the ownership verifier.
+    $neverLaunchedOwned = $launchingOwned | ConvertTo-Json -Depth 20 | ConvertFrom-Json -DateKind String
+    $neverLaunchedOwned.data.PSObject.Properties.Remove('gameProcesses')
+    $neverLaunchedOwned.data.status = 'mo2-open'
+    $emptyGameInspection = [pscustomobject]@{processes=[pscustomobject]@{game=@();mo2=@($launchOwner.targets)}}
+    $emptyGameClose = & $mo2Module {param($cfg,$owned,$inspection,$closer) Invoke-MO2CurrentGameCloseRequest -Config $cfg -Owned $owned -CurrentData $owned.data -CurrentInspection $inspection -CloseAction $closer} $config $neverLaunchedOwned $emptyGameInspection $unrecordedCloser
+    if (-not $emptyGameClose.ok) { throw "Never-launched empty-game close failed: $($emptyGameClose|ConvertTo-Json -Depth 12 -Compress)" }
+    Assert-MO2Test ($emptyGameClose.ok -and @($emptyGameClose.targets).Count -eq 0 -and $unrecordedCloseCalls.Count -eq 0) 'never-launched mo2-open session without gameProcesses safely passes empty-game close without process action'
+    $unrecordedEmptyClose = & $mo2Module {param($cfg,$owned,$inspection,$closer) Invoke-MO2CurrentGameCloseRequest -Config $cfg -Owned $owned -CurrentData $owned.data -CurrentInspection $inspection -CloseAction $closer} $config $neverLaunchedOwned $unrecordedInspection $unrecordedCloser
+    Assert-MO2Test (-not $unrecordedEmptyClose.ok -and $unrecordedEmptyClose.reason -eq 'unrecorded-game-process-present' -and $unrecordedCloseCalls.Count -eq 0) 'missing gameProcesses never adopts or closes an unrecorded live game'
+    $emptyGameInspection.processes.mo2=@()
+    $ownerlessEmptyClose = & $mo2Module {param($cfg,$owned,$inspection,$closer) Invoke-MO2CurrentGameCloseRequest -Config $cfg -Owned $owned -CurrentData $owned.data -CurrentInspection $inspection -CloseAction $closer} $config $neverLaunchedOwned $emptyGameInspection $unrecordedCloser
+    Assert-MO2Test (-not $ownerlessEmptyClose.ok -and $ownerlessEmptyClose.reason -eq 'mo2-owner-changed-before-game-close') 'missing gameProcesses still requires exact MO2 owner before cooperative shutdown'
 
     $dialogAuthority = & $mo2Module {
         param($cfg, $owned, $ownerRecord)
@@ -591,7 +660,7 @@ executable_blacklist="Steam.exe;notepad++.exe"
         $stopSource -notmatch 'Invoke-MO2OwnedGameCloseRequest[^\r\n]+-Targets' -and
         $ownedCloseSource -match 'Invoke-MO2CurrentGameCloseRequest[^\r\n]+-CurrentData \$currentData' -and
         $moduleSource -match 'Resolve-MO2OwnedProcessTarget -Config \$Config -Owned \$Owned -Processes @\(\$CurrentInspection[.]processes[.]mo2\)' -and
-        $moduleSource -match 'Resolve-MO2RecordedGameProcessTargets -Recorded @\(\$CurrentData[.]gameProcesses\)' -and
+        $moduleSource -match 'Resolve-MO2RecordedGameProcessTargets -Recorded \$recorded -Current @\(\$CurrentInspection[.]processes[.]game\)' -and
         $stopGameSource -notmatch 'Get-Process -Id' -and $stopSource -notmatch 'Get-Process -Id') 'stop-game and stop close only the serialized session-recorded game set through retained live handles'
     $recoverCloseSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2RecoverClose \{.*?\n\}').Value
     Assert-MO2Test (@([regex]::Matches($recoverCloseSource, '\$owned = Get-MO2OwnedSession -Config \$Config -SessionId \$sessionId')).Count -eq 1 -and $recoverCloseSource -match 'Invoke-MO2CooperativeClose -Config \$Config -Owned \$owned' -and $recoverCloseSource -match 'Set-MO2OwnedSessionStatus -Owned \$owned') 'recovery close preserves one initiating owned-session generation through process action and completion write'
@@ -1035,6 +1104,15 @@ catch [IO.IOException] {
     $sessionAccessId = [string]$sessionAccess.data.access.accessId
     $prepareDryRun = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -AccessId $sessionAccessId -WhatIf
     Assert-MO2Test ($prepareDryRun.ok -and $prepareDryRun.state -eq 'dry-run') 'prepare dry-run succeeds'
+    $publicPreparePreview = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') prepare -ConfigPath $configPath -AccessId $sessionAccessId -Profile Codex -RequireSKSE -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-MO2Test ($publicPreparePreview.ok -and $publicPreparePreview.state -eq 'dry-run' -and @($publicPreparePreview.errors).Count -eq 0) 'public prepare WhatIf keeps exact profile admission without false missing-profile errors'
+    Assert-MO2Test (-not (Test-Path -LiteralPath $publicPreparePreview.data.sessionPath)) 'public prepare WhatIf creates no session tree'
+    $previewBundle = & $mo2Module {
+        param($fixtureConfig, $candidateSessionPath)
+        $WhatIfPreference = $true
+        New-MO2DurableSessionController -Config $fixtureConfig -SessionPath $candidateSessionPath -WhatIf
+    } $config $prepareDryRun.data.sessionPath
+    Assert-MO2Test (@($previewBundle.wouldCopy).Count -eq 6 -and $previewBundle.wouldCopy -contains 'MO2Control.psm1' -and $previewBundle.wouldCopy -contains 'CSXConfigCustodyProof.ps1') 'inherited WhatIf retains complete planned controller-file inventory including config custody proof'
     $dryRunLease = Invoke-MO2AccessStatus -Config $config -AccessId $sessionAccessId
     Assert-MO2Test ($dryRunLease.state -eq 'access-owned' -and [string]::IsNullOrWhiteSpace([string]$dryRunLease.data.access.sessionId)) 'prepare dry-run leaves the access-only lease unbound'
     Assert-MO2Test (-not (Test-Path -LiteralPath $prepareDryRun.data.sessionPath -PathType Container)) 'prepare dry-run creates no evidence directory'
@@ -1086,6 +1164,11 @@ catch [IO.IOException] {
     Assert-MO2Test (Test-Path -LiteralPath $prepared.data.controllerPath -PathType Leaf) 'prepare snapshots a durable session controller outside the plugin cache'
     Assert-MO2Test (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $prepared.data.controllerPath) 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1') -PathType Leaf) 'durable session controller retains its shader-cache provider verifier'
     Assert-MO2Test (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $prepared.data.controllerPath) 'shader-cache-control\ShaderCacheInventory.ps1') -PathType Leaf) 'durable session controller retains the shader-cache inventory dependency'
+    $preparedLock = Get-Content -LiteralPath $config.session.lockFile -Raw | ConvertFrom-Json
+    $preparedManifest = Get-Content -LiteralPath (Join-Path $prepared.data.sessionPath 'session.json') -Raw | ConvertFrom-Json
+    Assert-MO2Test (($preparedLock.controllerBundleBinding | ConvertTo-Json -Depth 30 -Compress) -ceq ($preparedManifest.controllerBundleBinding | ConvertTo-Json -Depth 30 -Compress) -and
+        $preparedLock.controllerBundleBinding.receiptSha256 -ceq (Get-FileHash -LiteralPath $prepared.data.controller.receiptPath).Hash -and
+        @($preparedLock.controllerBundleBinding.files).Count -eq @($prepared.data.controller.files).Count) 'prepare commits exact complete producer inventory and receipt binding to authoritative lock and manifest'
     $atomicManifestPath = Join-Path $prepared.data.sessionPath 'session.json'
     $atomicLockBefore = Get-Content -LiteralPath $config.session.lockFile -Raw
     $atomicManifestBefore = Get-Content -LiteralPath $atomicManifestPath -Raw

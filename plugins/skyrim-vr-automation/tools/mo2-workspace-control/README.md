@@ -90,6 +90,70 @@ ordinary Overwrite route, while paths that already existed in a mod also have
 an Overwrite winner. First launch requires exact prepared hashes; retained game
 cycles may grow both trees while preserving complete provider coverage.
 
+## Task CSX configuration custody
+
+An enabled settings mod cannot outrank existing files in shared MO2 Overwrite.
+Use `stage-config`, edit the returned task working copy, then `bind-config`.
+The controller owns shared-state restoration; the experiment owner owns the
+requested settings and runtime qualification. It does not synthesize calibration
+or alter unrelated feature values.
+
+This lane is bounded to the exact `SKSE\Plugins\CommunityShaders` subtree:
+256 files, 16 MiB, depth 8, 128 directories, 30 seconds per tree inventory,
+with the existing command-wide workspace deadline and a 90-second launch-proof
+deadline. It preserves the whole subtree, including root settings, override
+providers/user layers, tracking JSON/backups and empty directories. It never
+touches other Overwrite paths or edits lower shared mod providers. Reparse
+points, profile drift, missing shadows and changed shared providers fail closed.
+
+All three commands require exact task/workspace/access ownership, closed
+MO2/game/loader/RootBuilder state, and no bound evidence session. Stage does
+not change shared Overwrite. Pass the exact game
+`Data\SKSE\Plugins\CommunityShaders` path as `-UnmanagedConfigPath` even when
+absent; nonempty unmanaged settings are refused. `-ConfigScopeNote` is required
+and must explicitly state archive coverage and remaining VFS limitations. That
+note records the caller's scope disposition; it is not independent archive
+inspection or runtime VFS proof. Archive-only configuration is not qualified
+by this physical loose-file lane. The task must independently qualify actual
+post-load config and effective settings before accepting experimental results.
+
+Stage captures every enabled mod's exact config root, including absent roots,
+the profile hash and shared baseline hashes. It materializes the effective
+loose-provider union in a retained task working directory, with existing
+Overwrite files taking precedence. Edit only that returned copy. Bind checks
+unchanged baseline/providers/profile, snapshots the original shared tree through
+the existing transaction primitive, and seeds the exact working copy into
+Overwrite. First launch requires the bound prepared hash; retained relaunches
+may grow settings/tracking output but still require complete provider shadows
+and unchanged shared providers. A staged or interrupted binding is not launch
+authority.
+
+`complete-config` preserves task-generated settings and restores exact shared
+bytes and prior configuration-root directory-existence semantics. Ancestors
+created by binding are removed only when empty; unrelated generated content
+is retained and any resulting ancestor-existence difference is reported under
+`retainedNonemptyParents`, not erased or labelled a whole-Overwrite reset.
+It requires the underlying
+snapshot, committed restore journal/receipt and preserved/live tree proofs.
+Interrupted bind/completion keeps its owner marker; invoke the same exact
+closed-state `complete-config` to finish recovery, never delete markers or
+rewrite receipts. Completing an unbound stage retains its task working copy
+without claiming shared restoration. Configuration completion is also included
+in ordinary `complete-output`, before backup/output ownership is released.
+Automation `release-access` refuses while a CSX config owner remains.
+
+After normal workspace `resume`, run `stage-config` again: it snapshots the
+current shared baseline while picking up that task's last retained settings,
+not another task's configuration. Bind after any intentional edits. Neither
+completion nor staging resets the retained profile, saves or task mods. All
+three transitions remain one-shot approvals where escalation applies.
+
+```text
+<pwsh.exe> -NoProfile -NonInteractive -File <Invoke-MO2WorkspaceControl.ps1> stage-config -AccessId <owned-access> -TaskId <owner-task> -WorkspaceId <exact-workspace> -UnmanagedConfigPath <game-Data\SKSE\Plugins\CommunityShaders> -ConfigScopeNote <explicit-archive-and-VFS-disposition> -Confirm:$false -Compact
+<pwsh.exe> -NoProfile -NonInteractive -File <same-source-controller> bind-config -AccessId <same-access> -TaskId <same-task> -WorkspaceId <same-workspace> -Confirm:$false -Compact
+<pwsh.exe> -NoProfile -NonInteractive -File <same-source-controller> complete-config -AccessId <same-access> -TaskId <same-task> -WorkspaceId <same-workspace> -Confirm:$false -Compact
+```
+
 ## Modlist and local-work choices
 
 Fresh workspace requests distinguish the original maintained modlist from
@@ -226,6 +290,18 @@ restore's immutable transaction identity, committed journal, and snapshot lineag
 baseline, and the physical preserved task output before publishing completion
 or releasing ownership. Conflicting or malformed restore evidence remains
 nonterminal and retains the task's recovery authority.
+Zero generated shader-cache files are accepted only as non-promoted
+`failed`/`unverified` cleanup, never as known-working output. The workspace
+independently verifies the exact prepared provider-shadow hash, original
+physical snapshot, preserved physical working tree, canonical restore receipt,
+and committed journal bound to the same snapshot and output generation.
+`restore-noop` additionally requires the exact snapshot `cache.before` path and
+matching original/prepared hashes; an identical tree at another path is not
+equivalent proof. `complete-output`, completed-generation `resume`, and
+retirement use this same validation. Missing or changed evidence fails closed
+without releasing the owner or changing the retained profile. A successful
+cleanup allows later resume into a fresh output generation; it does not promote
+the failed cache or certify it as working.
 Restoring shared runtime state is independent and must not rewrite or retire
 the retained workspace. Virtual Desktop and `VirtualDesktop.Streamer` never
 block profile mutation or SteamVR null-HMD; an enabled profile-local
