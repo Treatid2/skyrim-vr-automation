@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 [CmdletBinding()]
-param([switch]$DiscoveryOnly, [switch]$UnchangedCompletionOnly, [string]$FixtureRoot)
+param([switch]$DiscoveryOnly, [switch]$UnchangedCompletionOnly, [switch]$ConfigCustodyOnly, [string]$FixtureRoot)
 
 $ErrorActionPreference = 'Stop'
 $entry = Join-Path (Split-Path -Parent $PSScriptRoot) 'Invoke-MO2WorkspaceControl.ps1'
@@ -331,6 +331,10 @@ try {
     $preparedIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
     if (-not $preparedCache.ok -or -not $preparedIsolation.ok -or -not $preparedIsolation.cachePlan.verification.ok -or [int]$preparedIsolation.cachePlan.verification.requiredProviderFiles -ne 2) { throw "Prepared Overwrite provider-shadow verification failed. Prepare: $($preparedCache | ConvertTo-Json -Depth 20 -Compress) Isolation: $($preparedIsolation | ConvertTo-Json -Depth 20 -Compress)" }
     $cachePlanPath = [string]$created.data.runtimeOutput.cachePlanPath
+    if ($ConfigCustodyOnly) {
+        . (Join-Path $PSScriptRoot 'Test-ConfigCustody.inc.ps1')
+        return
+    }
     if ($UnchangedCompletionOnly) {
         . (Join-Path $PSScriptRoot 'Test-UnchangedCacheCompletion.inc.ps1')
         return
