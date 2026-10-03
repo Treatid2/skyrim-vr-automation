@@ -24,6 +24,13 @@ The driver acknowledges that exact nonce and sequence and exposes its current
 process identity and instance nonce. DevBench may become another writer later,
 but is deliberately not required to bootstrap the pose.
 
+Command positions, including `EyeHeightMeters`, are raw tracking-space values.
+OpenVR transforms them into standing space using the current calibration; a
+raw default height of 1.68m need not read back as standing height 1.68m. Compare
+standing observations against `standing_from_raw * raw_from_device` using the
+actual runtime transform. Preserve calibration and the declared test inputs;
+do not force agreement through a hardcoded offset or global calibration reset.
+
 `qualify` always requires the bounded independent OpenVR probe. The probe must
 observe the standing pose, finite and distinct left/right eye transforms, a
 plausible eye separation, and a valid recommended render target. Using
