@@ -8,6 +8,15 @@ description: "Inspect and operate Mod Organizer 2 through the bundled exact-prof
 Use the plugin's PowerShell controls; do not reconstruct MO2 command lines or
 edit `modlist.txt` ad hoc.
 
+Auto-Tools owns shared-state cleanup, recovery, and verified handoff. Tasks own
+experiment setup and calibration and leave their configured workspace retained;
+do not require callers to invent cleanup sequences or revert their setup.
+For resume versus a requested clean baseline, follow
+`../../docs/MO2-TASK-WORKSPACES.md` (cleanup and environment handoff responsibility).
+Unresolved cleanup must not be reported as a clean handoff. Existing lifecycle
+commands remain the supported interface; this policy does not imply that a new
+automatic orchestration endpoint exists.
+
 ## Load the applicable contract
 
 - For access requests, inspection, validation, prepare, open, launch, status,
