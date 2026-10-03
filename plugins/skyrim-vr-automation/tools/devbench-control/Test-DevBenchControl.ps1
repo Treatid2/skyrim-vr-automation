@@ -306,7 +306,15 @@ try {
         result = [pscustomobject]@{
             service = 'communityshaders.render-map'
             major = 1
-            defaults = [pscustomobject]@{ fixedCatalogueBytes = 1000 }
+            eventKinds = @('draw','eye-submitted','resource-flow')
+            plannedEventKinds = @('planned-only')
+            eventSelection = [pscustomobject]@{ optional = $true; dependencyExpansion = $true; emptyAllowed = $false }
+            defaults = [pscustomobject]@{
+                fixedCatalogueBytes = 1000; eventStorageUnitBytes = 100
+                maxGeometryObservations = 20; maxMaterialStateObservations = 20; maxResourceObservations = 20
+                maxSceneObjectObservations = 20; maxShaderObservations = 20; maxStageShaderObservations = 20
+                maxTargetBindingObservations = 20; maxTargetViewObservations = 20
+            }
             limits = [pscustomobject]@{
                 maximumBytes = 100000; maximumDurationMs = 10000; maximumEvents = 10000; maximumFrames = 100
                 maximumScopeDepth = 32; maximumGeometryObservations = 1000; maximumMaterialStateObservations = 1000
@@ -356,6 +364,38 @@ try {
     $rawRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $rawRegistryPath -Encoding utf8
     $rawPlan = & $plannerPath -RegistryPath $rawRegistryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId raw-registry -OutputPath (Join-Path $planFixture 'raw-registry-plan.json') -NoExit -Compact | ConvertFrom-Json
     Assert-Test ($rawPlan.ok -and $rawPlan.arguments.contractMajor -eq 1) 'explicit raw-registry mode requires and preserves service, contract, and producer provenance'
+    $selectedPlan = & $plannerPath -RegistryPath $registryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId selected-events -OutputPath (Join-Path $planFixture 'selected-events-plan.json') -EventKinds @('draw','eye-submitted') -NoExit -Compact | ConvertFrom-Json
+    $selectedReceipt = Get-Content -LiteralPath $selectedPlan.receiptPath -Raw | ConvertFrom-Json
+    Assert-Test ($selectedPlan.ok -and ($selectedPlan.arguments.eventKinds -join ',') -ceq 'draw,eye-submitted' -and ($selectedReceipt.requestedEventKinds -join ',') -ceq 'draw,eye-submitted' -and $selectedPlan.arguments.maxBytes -eq $plan.arguments.maxBytes) 'explicit event selection preserves exact requested names and never discounts catalogue storage'
+    Assert-Test (-not $plan.arguments.PSObject.Properties['eventKinds']) 'omitted event selection preserves the native all-events default'
+    foreach ($badSelection in @(@('draw','draw'), @('DRAW'), @('planned-only'), @('unknown-kind'), @(''))) {
+        $badSelectionPlan = & $plannerPath -RegistryPath $registryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId invalid-selection -OutputPath (Join-Path $planFixture "bad-selection-$([guid]::NewGuid().ToString('N')).json") -EventKinds $badSelection -NoExit -Compact | ConvertFrom-Json
+        Assert-Test (-not $badSelectionPlan.ok -and $null -eq $badSelectionPlan.arguments -and -not $badSelectionPlan.receiptPublished) 'duplicate, nonexact, planned and unknown selected event kinds fail before issuing arguments'
+    }
+    foreach ($catalogueFamily in @('geometry', 'materialState', 'resource', 'sceneObject', 'shader', 'stageShader', 'targetBinding', 'targetView')) {
+        $enlargedWorkload = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
+        $enlargedWorkload.expectedObservations.$catalogueFamily = 11
+        $enlargedPath = Join-Path $planFixture "enlarged-$catalogueFamily.json"
+        $enlargedWorkload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $enlargedPath -Encoding utf8
+        $enlargedPlan = & $plannerPath -RegistryPath $registryPath -WorkloadPath $enlargedPath -ClientId fixture-client -CommandId enlarged-catalogue -OutputPath "$enlargedPath.plan.json" -NoExit -Compact | ConvertFrom-Json
+        Assert-Test (-not $enlargedPlan.ok -and $enlargedPlan.state -eq 'catalogue-storage-unproven' -and $null -eq $enlargedPlan.arguments -and $enlargedPlan.unprovenCatalogueBounds.Count -eq 1) "default catalogue bytes never admit an enlarged $catalogueFamily catalogue"
+    }
+    $smallEventBytes = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
+    $smallEventBytes.expectedEventBytes = 1
+    $smallBytesPath = Join-Path $planFixture 'small-event-bytes.json'
+    $smallEventBytes | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $smallBytesPath -Encoding utf8
+    $smallBytesPlan = & $plannerPath -RegistryPath $registryPath -WorkloadPath $smallBytesPath -ClientId fixture-client -CommandId event-slots -OutputPath "$smallBytesPath.plan.json" -NoExit -Compact | ConvertFrom-Json
+    Assert-Test ($smallBytesPlan.ok -and $smallBytesPlan.arguments.maxBytes -eq 21000) 'byte budget admits every selected native event slot even when caller event-byte estimate is smaller'
+    foreach ($allocationField in @('eventStorageUnitBytes','maxGeometryObservations','maxMaterialStateObservations','maxResourceObservations','maxSceneObjectObservations','maxShaderObservations','maxStageShaderObservations','maxTargetBindingObservations','maxTargetViewObservations')) {
+        foreach ($badAllocationValue in @($null, $true, 1.5)) {
+            $allocationRegistry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+            $allocationRegistry.result.defaults.$allocationField = $badAllocationValue
+            $allocationPath = Join-Path $planFixture "allocation-$allocationField-$([guid]::NewGuid().ToString('N')).json"
+            $allocationRegistry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $allocationPath -Encoding utf8
+            $allocationPlan = & $plannerPath -RegistryPath $allocationPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId invalid-allocation -OutputPath "$allocationPath.plan.json" -NoExit -Compact | ConvertFrom-Json
+            Assert-Test (-not $allocationPlan.ok -and $null -eq $allocationPlan.arguments) "native allocation field $allocationField rejects missing, Boolean or fractional data"
+        }
+    }
     $oversizedPath = Join-Path $planFixture 'oversized.json'
     $oversizedWorkload = Get-Content -LiteralPath $workloadPath -Raw | ConvertFrom-Json
     $oversizedWorkload.expectedEvents = 6000

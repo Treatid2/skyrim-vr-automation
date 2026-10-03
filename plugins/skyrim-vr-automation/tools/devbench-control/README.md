@@ -318,6 +318,25 @@ a service alias. Failed envelopes, foreign services/tools and multiple payloads
 are rejected before issuing start arguments. Planning is offline and never
 starts a capture or changes the running session.
 
+`defaults.fixedCatalogueBytes` is the allocation for the registry's default
+catalogue capacities, not a constant valid for arbitrary larger catalogues.
+Until the producer publishes a per-catalogue sizing recipe, selected capacities
+above any corresponding default return `catalogue-storage-unproven` and no
+start arguments. At or below those defaults, the default allocation is retained
+as a conservative upper bound. The event budget also admits the selected event
+count multiplied by `defaults.eventStorageUnitBytes`, even when the caller's
+event-byte estimate is smaller. A service ceiling is still an absolute limit.
+Do not reduce a workload silently: the experiment owner must explicitly select
+and justify smaller estimates, and saturation remains incomplete evidence.
+
+Use optional `-EventKinds @('draw','resource-flow','eye-submitted')` only for an
+experiment-selected subset. Every name must be distinct and match the retained
+registry's `eventKinds` exactly. Unknown/planned kinds, duplicates or an empty
+selection are refused. Omitting the option preserves the native all-events
+default. The plan retains requested names; the native start response owns any
+dependency expansion and resolved selection. Filtering does not discount
+catalogue allocation or promise that a trace cannot saturate.
+
 `upscalingStable` is the fail-closed barrier for paced cell-transition tests.
 It requires the exact `-ExpectedCell`, a loaded player, no blocking menu, and a
 CSX profile that remains unchanged across advancing frames. Its public API
