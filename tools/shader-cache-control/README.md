@@ -241,7 +241,16 @@ explicitly needs that potentially large list in the command response.
 
 Restore never silently discards the current tree: it copies the displaced
 contents into the evidence directory, verifies that copy, and only then removes
-the temporary sibling used for the atomic swap. Seed and restore mirror unique
+the temporary sibling used for the atomic swap. `restore` optionally accepts
+`-RestoreEvidenceDirectory` for an explicit existing, reparse-free audit directory
+disjoint from both snapshot evidence and the live cache. Snapshot authority,
+baseline and receipt remain in `-EvidenceDirectory`; the restore receipt,
+committed journal, unique pre-restore inventory and displaced physical tree go
+to the separate audit directory. Their original snapshot transaction ID and
+receipt path are retained. Workspace requalification uses an attempt-local
+namespace so rolled-back forward restores never become normal completion
+authority. Ordinary callers retain the original namespace by default.
+Seed and restore mirror unique
 evidence journals while updating the one target-owned authoritative journal
 before each filesystem move. Any pre-commit failure first
 quarantines the uncommitted replacement, restores and hash-verifies the exact
