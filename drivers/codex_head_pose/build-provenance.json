@@ -2,19 +2,36 @@
   "schemaVersion": 2,
   "driverName": "codex_head_pose",
   "sourceDirectory": "native/steamvr-head-pose",
-  "configuration": "Release",
+  "configuration": "RelWithDebInfo",
+  "sourceCommit": "ede2d96a834e94517f6489c1ddf54acaa8630666",
+  "sourceSha256Scope": "Native Windows checkout bytes; Git subtree equality to the exact broker commit is verified separately. These are not frozen-source manifest hashes.",
+  "brokerBuild": {
+    "profile": "head-provider.relwithdebinfo",
+    "profileRegistered": false,
+    "buildKey": "sha256:90f49c41ad10842fda32a99be9f65fecbfab1ad7273ec976bf58ed79eb5b540e",
+    "deliveryReceiptSha256": "de8d59694517dc9334da9120988ad2c28796f14d49a41127d4f69caaa23c9d55",
+    "sourceManifestSha256": "4aea96441d316dd3142a9ba92653bff261264381c38600b70c953e1ee74bd772",
+    "compileOnly": true,
+    "testsRun": false,
+    "embeddedSourceCommitAttestation": false,
+    "byteReproducibilityProved": false
+  },
   "openVrRepository": "https://github.com/ValveSoftware/openvr.git",
   "openVrCommit": "0924064316de3effbcd1acf1e309182a2deb1c05",
   "sharedMemoryProtocolVersion": 2,
   "sourceSha256": {
-    "native/steamvr-head-pose/src/driver.cpp": "C30E680AD4E2936724D81DF3EB2B1A0D1BCE5140A87E8A06B3B9DD9BCC34F16C",
-    "native/steamvr-head-pose/src/probe.cpp": "E7C185398D41BFFAA4820921DCF4F81BFA4CD12258259D941B2E7E7BC7DFDA87",
-    "native/steamvr-head-pose/CMakeLists.txt": "D905F210DDB9646A4D3EB76D7A88DFEAC8AA73E8FE2031605BA77175AFA42466"
+    "native/steamvr-head-pose/src/driver.cpp": "018E9F6B221EAE9BD2B2F6EB5A8227C37869E168BE8085CCF5D4DA896817C453",
+    "native/steamvr-head-pose/src/probe.cpp": "BCCCC59F6E63CADD114DF7270F7FF8B661F0DBDC415A461B4D6221A557FF38C4",
+    "native/steamvr-head-pose/CMakeLists.txt": "34921E35C98B42094AA2651B3BAB13A6C36213F51959AE4B4113021C62E18645"
   },
   "artifacts": {
-    "bin/win64/driver_codex_head_pose.dll": "4A361E9956169E4FAF4BFC2DC5D2282A97CF366CC1D1B3950A0F8463429A42D7",
-    "tools/csx_openvr_pose_probe.exe": "02250F18A526F479AF4C4D750FA575BFB03D3F1259C0004696712BDE1D612B88",
-    "tools/openvr_api.dll": "BAB8AC6EF64E68A9CA53315B0014D131088584B2EFDFA6DB511D67EC03CFCB4A"
+    "bin/win64/driver_codex_head_pose.dll": "401AFC31347E05825D3E16B205714830D612C306ED29F5BD78229A5C1E7E2AD3",
+    "tools/csx_openvr_pose_probe.exe": "FFBEC181D875E9A145D6CC3BB859BB7A06FE681F7C7B8891AB2ADF5FD74A810F",
+    "tools/openvr_api.dll": "BAB8AC6EF64E68A9CA53315B0014D131088584B2EFDFA6DB511D67EC03CFCB4A",
+    "driver.vrdrivermanifest": "690A5F6A3D5B764BE4E277321D5C27B235C9960A510CF072D73A6F504197CA68",
+    "licenses/OpenVR-LICENSE.txt": "F56FF606104D4EF18E617921A75C73AD73B5A1A1D70C69590C29DE16919E04AD",
+    "resources/settings/default.vrsettings": "3ED6D79EF9F1C415BF839A3C8D5CC3B9449ACA5936E74B89A921827D18300630",
+    "resources/input/passive_controller_profile.json": "17FA64F32428AB3F85ED5F5471890A3390F0071FD4C7C5B5B59BD22C7F1713BE"
   },
   "licenses": [
     "../../LICENSE",
