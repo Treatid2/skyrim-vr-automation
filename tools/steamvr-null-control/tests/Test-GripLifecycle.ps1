@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-param([Parameter(Mandatory)][string]$EvidenceDirectory,[Parameter(Mandatory)][string]$BoundedProcessPath,[Parameter(Mandatory)][string]$BoundedProcessSha256,[string[]]$Case=@())
+param([Parameter(Mandatory)][string]$EvidenceDirectory,[Parameter(Mandatory)][string]$BoundedProcessPath,[Parameter(Mandatory)][string]$BoundedProcessSha256,[string[]]$Case=@(),[ValidateRange(12,300)][int]$SessionBudgetSeconds=20,[ValidateRange(5,90)][int]$CleanupReserveSeconds=10)
 $ErrorActionPreference='Stop'
 if(Test-Path -LiteralPath $EvidenceDirectory){throw 'A new test evidence root is required'}
 [void][IO.Directory]::CreateDirectory($EvidenceDirectory)
@@ -10,7 +10,7 @@ if($Case.Count -gt 0){foreach($selected in $Case){if($selected -notin $cases){th
 $checks=[Collections.Generic.List[object]]::new()
 foreach($case in $cases){
     $root=Join-Path $EvidenceDirectory $case
-    $raw=& $pwsh -NoProfile -File $entry -OfflineCase $case -EvidenceDirectory $root -BoundedProcessPath $BoundedProcessPath -BoundedProcessSha256 $BoundedProcessSha256 -SessionBudgetSeconds 20 -CleanupReserveSeconds 10
+    $raw=& $pwsh -NoProfile -File $entry -OfflineCase $case -EvidenceDirectory $root -BoundedProcessPath $BoundedProcessPath -BoundedProcessSha256 $BoundedProcessSha256 -SessionBudgetSeconds $SessionBudgetSeconds -CleanupReserveSeconds $CleanupReserveSeconds
     $exit=$LASTEXITCODE
     $coordinator=$raw | ConvertFrom-Json -AsHashtable -DateKind String
     $reportPath=Join-Path $root 'session-result.json'
@@ -46,7 +46,11 @@ foreach($case in $cases){
         }
         'binding-mismatch' {if($report.firstFailure.phase -cne 'controllerControl-inspect' -or (Test-Path -LiteralPath (Join-Path $root 'injected-assay-A.json'))){throw 'Wrong PID binding admitted positive dispatch'}}
         'close-unknown' {if($report.firstFailure.phase -cne 'assay-A' -or (Test-Path -LiteralPath (Join-Path $root 'injected-assay-B.json')) -or [IO.File]::ReadAllText((Join-Path $root 'fixture-neutral-count.txt')) -cne '1'){throw 'Unknown A close admitted the after-close probe'}}
-        'abnormal-assay-exit' {if($null -eq $report.firstFailure -or -not $report.cleanHandoffVerified -or (Test-Path -LiteralPath (Join-Path $root 'injected-assay-B.json'))){throw 'Abnormal assay exit lost failure or recovery'}}
+        'abnormal-assay-exit' {
+            if($null -eq $report.firstFailure -or -not $report.cleanHandoffVerified -or (Test-Path -LiteralPath (Join-Path $root 'injected-assay-B.json'))){throw 'Abnormal assay exit lost failure or recovery'}
+            $aProcess=Get-Content -LiteralPath (Join-Path $root 'assay-A-process.json') -Raw | ConvertFrom-Json -AsHashtable -DateKind String
+            if($aProcess.attempts[0].exitCode -ne 17 -or -not $aProcess.attempts[0].jobQuiescent -or -not $aProcess.attempts[0].exitVerified -or $report.firstFailure.reason -notlike 'Native A diagnostic exited with code 17; owned exit/quiescence verified;*'){throw 'Native diagnostic failure was mislabeled as custody failure'}
+        }
         'restore-drift' {if($exit -ne 2 -or $report.cleanHandoffVerified -or $null -eq $report.recoveryErrors){throw 'A restoration acknowledgement hid hash drift'}}
         'restore-preview-rejected' {
             if($exit -ne 2 -or $report.cleanHandoffVerified -or $null -eq $report.recoveryErrors -or [IO.File]::ReadAllText((Join-Path $root 'fixture-settings.txt')) -cne 'applied-fixture-settings' -or (Test-Path -LiteralPath (Join-Path $root 'fixture-restore-count.txt'))){throw 'Rejected preview mutated applied fixture state or dispatched restore'}
@@ -59,7 +63,7 @@ foreach($case in $cases){
     if($null -ne $report -and -not $report.cleanHandoffVerified -and $exit -ne 2){throw 'Unknown handoff did not return a blocked exit'}
     $checks.Add(@{case=$case;ok=$true;exitCode=$exit;childPid=$child.id;childClosed=$true;deadlineSatisfied=$coordinator.deadlineSatisfied;resultPath=if($null -ne $report){$reportPath}else{$null};runtimeResponsesSimulated=$true})
 }
-$receipt=@{ok=$true;cases=$checks.ToArray();count=$checks.Count;scope='Actual task-specific entry point and owned cancellation; injected runtime responses';liveQualified=$false}
+$receipt=@{ok=$true;cases=$checks.ToArray();count=$checks.Count;sessionBudgetSeconds=$SessionBudgetSeconds;cleanupReserveSeconds=$CleanupReserveSeconds;scope='Actual task-specific entry point and owned cancellation; injected runtime responses';liveQualified=$false}
 $path=Join-Path $EvidenceDirectory 'test-receipt.json'
 [IO.File]::WriteAllText($path,($receipt | ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
 @{ok=$true;count=$checks.Count;receipt=$path;liveQualified=$false} | ConvertTo-Json -Compress

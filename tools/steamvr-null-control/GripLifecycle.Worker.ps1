@@ -85,11 +85,13 @@ function Run-Assay([string]$Mode){
     $receipt=$raw | ConvertFrom-Json -AsHashtable -DateKind String
     Save ('assay-'+$Mode+'-process') $receipt
     if($OfflineCase -eq 'exit-unknown' -and $Mode -eq 'A'){$receipt.attempts[0].jobQuiescent=$false}
-    if($receipt.ok -isnot [bool] -or -not $receipt.ok -or @($receipt.attempts).Count -ne 1){throw 'A/B process did not reach complete owned quiescence'}
+    if(@($receipt.attempts).Count -ne 1){throw 'A/B process did not return exactly one owned attempt'}
     $attempt=$receipt.attempts[0]
-    foreach($key in @('ok','launched','exitVerified','processTreeOwned','jobQuiescent','jobClosed','streamDrainComplete','deadlineSatisfied')){Assert-True $attempt[$key] ('A/B owned exit field unverified: '+$key)}
+    foreach($key in @('launched','exitVerified','processTreeOwned','jobQuiescent','jobClosed','streamDrainComplete','deadlineSatisfied')){Assert-True $attempt[$key] ('A/B owned exit field unverified: '+$key)}
     foreach($key in @('timedOut','terminationRequested','unresolvedProcess')){if($attempt[$key] -isnot [bool] -or $attempt[$key]){throw 'Cancelled or unknown A/B worker exit cannot admit a probe'}}
-    if($attempt.exitCode -ne 0){throw 'A/B worker exit was not zero'}
+    if($attempt.exitCode -ne 0){throw "Native $Mode diagnostic exited with code $($attempt.exitCode); owned exit/quiescence verified; inspect retained assay result: $output"}
+    Assert-True $attempt.ok 'A/B owned attempt reported failure despite zero exit'
+    Assert-True $receipt.ok 'A/B process envelope reported failure despite verified zero-exit attempt'
     $body=Read-GripJson $output
     Assert-GripNativeResult $body $Mode $script:binding $PositiveDeadlineTickMs ([bool]$OfflineCase)
     $closeEnd=Convert-GripUInt64 $body.closeBoundary.end.tickMs
