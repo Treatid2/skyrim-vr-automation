@@ -462,6 +462,8 @@ try {
     }
     elseif ($Command -eq 'amend') {
         Require-Value 'FeedbackId' $FeedbackId; Require-Value 'Actor' $Actor; Require-Value 'ActorRole' $ActorRole
+        # The lock callback has its own parameter scope; capture caller intent here.
+        $severityWasSpecified = $PSBoundParameters.ContainsKey('Severity')
         $updated = Invoke-WithFeedbackLock -Root $root -Action {
             $current = Get-CurrentFeedback -Root $root -Id $FeedbackId
             if ($current.status -in $script:TerminalStatuses) { throw "Closed feedback '$FeedbackId' must be reopened before amendment." }
@@ -470,7 +472,7 @@ try {
                 @{ key = 'summary'; value = $Summary }, @{ key = 'observed'; value = $Observed }, @{ key = 'expected'; value = $Expected },
                 @{ key = 'suggestion'; value = $Suggestion }, @{ key = 'operation'; value = $Operation }
             )) { if (-not [string]::IsNullOrWhiteSpace([string]$entry.value)) { $patch[$entry.key] = ([string]$entry.value).Trim() } }
-            if ($PSBoundParameters.ContainsKey('Severity')) { $patch.severity = $Severity }
+            if ($severityWasSpecified) { $patch.severity = $Severity }
             if ($BlockedState -ne 'unchanged') { $patch.blocked = $BlockedState -eq 'true' }
             if (-not [string]::IsNullOrWhiteSpace($ParametersJson)) { $patch.parameters = $ParametersJson | ConvertFrom-Json -Depth 30 }
             $evidenceValues = @($EvidencePath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })

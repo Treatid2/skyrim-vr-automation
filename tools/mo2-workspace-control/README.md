@@ -273,6 +273,18 @@ restore's immutable transaction identity, committed journal, and snapshot lineag
 baseline, and the physical preserved task output before publishing completion
 or releasing ownership. Conflicting or malformed restore evidence remains
 nonterminal and retains the task's recovery authority.
+Zero generated shader-cache files are accepted only as non-promoted
+`failed`/`unverified` cleanup, never as known-working output. The workspace
+independently verifies the exact prepared provider-shadow hash, original
+physical snapshot, preserved physical working tree, canonical restore receipt,
+and committed journal bound to the same snapshot and output generation.
+`restore-noop` additionally requires the exact snapshot `cache.before` path and
+matching original/prepared hashes; an identical tree at another path is not
+equivalent proof. `complete-output`, completed-generation `resume`, and
+retirement use this same validation. Missing or changed evidence fails closed
+without releasing the owner or changing the retained profile. A successful
+cleanup allows later resume into a fresh output generation; it does not promote
+the failed cache or certify it as working.
 Restoring shared runtime state is independent and must not rewrite or retire
 the retained workspace. Virtual Desktop and `VirtualDesktop.Streamer` never
 block profile mutation or SteamVR null-HMD; an enabled profile-local
