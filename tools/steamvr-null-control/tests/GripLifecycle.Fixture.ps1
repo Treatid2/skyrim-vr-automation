@@ -46,6 +46,10 @@ function Invoke-GripFixture([string]$Name,[string]$Command,[hashtable]$Options){
                 return @{ok=$true;data=@{remaining=@()}}
             }
             restore {
+                if($Options.ContainsKey('WhatIf') -and $Options.WhatIf){return @{ok=($OfflineCase -ne 'restore-preview-rejected');state='fixture-restore-preview';nonmutating=$true}}
+                $counter=Join-Path $Root 'fixture-restore-count.txt'
+                $count=if(Test-Path -LiteralPath $counter){[int][IO.File]::ReadAllText($counter)}else{0}
+                [IO.File]::WriteAllText($counter,($count+1).ToString())
                 $content=if($OfflineCase -eq 'restore-drift'){'corrupted-fixture-restoration'}else{'original-fixture-settings'}
                 [IO.File]::WriteAllText($settings,$content)
                 return @{ok=$true;state='restored'}

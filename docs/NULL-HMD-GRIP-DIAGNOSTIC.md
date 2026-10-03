@@ -62,6 +62,12 @@ positive cutoff. A separate bounded worker then uses receipt-bound restoration
 and verifies exact settings/registration hashes inside the same common end.
 Unknown cleanup is reported as unknown, never a clean handoff. Original failure
 and subsequent cleanup errors remain distinct. No phase implicitly retries.
+Recovery previews the exact receipt-bound restore with supported `-WhatIf`,
+requires its success, then performs restore within the same inherited budget.
+A rejected preview blocks actual restore and a verified-clean claim; it never
+authorizes a fallback. As documented by the controller, command entry may first
+reconcile a pending authoritative transaction even for inspection/preview;
+`-WhatIf` prevents a new requested restore, not mandatory prior recovery.
 The coordinator returns exit2 for unknown cleanup or incomplete publication;
 exit0 describes a completed diagnostic with verified cleanup, not product PASS.
 
@@ -80,7 +86,8 @@ children, exercise startup-parent exit and real job cancellation, and manipulate
 only new fixture files beneath the declared evidence directory. They never load
 OpenVR DLLs or production maps. The native owner separately tests actual A/B
 entry-point semantics, independent all-axis neutral gates and event/sample caps.
-The suite's original 12 cases plus 13 boundary-refusal cases exercise the real
+The suite's original 12 cases plus 13 boundary-refusal cases and one rejected
+restore-preview case exercise the real
 nested A worker's exit/job receipt. Runtime responses and clock/result failure
 injections remain simulated; these tests do not qualify live SteamVR inheritance,
 client unregistration, input consumption, or the experimental adapter itself.

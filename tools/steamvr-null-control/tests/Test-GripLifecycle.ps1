@@ -5,7 +5,7 @@ if(Test-Path -LiteralPath $EvidenceDirectory){throw 'A new test evidence root is
 [void][IO.Directory]::CreateDirectory($EvidenceDirectory)
 $entry=Join-Path (Split-Path -Parent $PSScriptRoot) 'Invoke-NullHmdGripDiagnostic.ps1'
 $pwsh=(Get-Process -Id $PID).Path
-$cases=@('normal','semantic-mismatch','baseline-failure','startup-stall','assay-stall','cleanup-unknown','baseline-cleanup-unknown','publication-stall','binding-mismatch','close-unknown','abnormal-assay-exit','restore-drift','result-injected','result-instance','result-ceiling','close-errors','close-state','exit-unknown','owner-busy','deadline-active','pair-active','health-unknown','runtime-changed','close-clock-unknown','result-partial')
+$cases=@('normal','semantic-mismatch','baseline-failure','startup-stall','assay-stall','cleanup-unknown','baseline-cleanup-unknown','publication-stall','binding-mismatch','close-unknown','abnormal-assay-exit','restore-drift','result-injected','result-instance','result-ceiling','close-errors','close-state','exit-unknown','owner-busy','deadline-active','pair-active','health-unknown','runtime-changed','close-clock-unknown','result-partial','restore-preview-rejected')
 if($Case.Count -gt 0){foreach($selected in $Case){if($selected -notin $cases){throw 'Unknown fixed case selection'}};$cases=@($cases | Where-Object {$_ -in $Case})}
 $checks=[Collections.Generic.List[object]]::new()
 foreach($case in $cases){
@@ -29,6 +29,8 @@ foreach($case in $cases){
             if($boundary.scope -cne 'after-shutdown-return-and-worker-exit' -or $boundary.externalUnregistrationVerified -or $boundary.launchAndInitInterval.exactTicksKnown -or [uint64]$boundary.workerExitObservation.upperTickMs -gt [uint64]$boundary.probeInvocation.lowerTickMs -or [uint64]$boundary.shutdownEnd.tickMs -gt [uint64]$boundary.workerExitObservation.upperTickMs){throw 'Observation boundary is missing, reordered, or stronger than recorded evidence'}
             $aProcess=Get-Content -LiteralPath (Join-Path $root 'assay-A-process.json') -Raw | ConvertFrom-Json -AsHashtable
             if(-not $aProcess.attempts[0].jobQuiescent -or -not $aProcess.attempts[0].exitVerified -or $aProcess.attempts[0].terminationRequested){throw 'Real nested A worker exit was not exercised'}
+            $restores=@(Get-ChildItem -LiteralPath $root -Filter 'nullControl-restore-*.json' -File | ForEach-Object {Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json -AsHashtable})
+            if(@($restores | Where-Object state -eq 'fixture-restore-preview').Count -ne 1 -or @($restores | Where-Object state -eq 'restored').Count -ne 1 -or [IO.File]::ReadAllText((Join-Path $root 'fixture-restore-count.txt')) -cne '1'){throw 'Normal recovery did not exercise nonmutating preview then exactly one restore'}
         }
         'semantic-mismatch' {if($null -ne $report.firstFailure -or $report.session.semanticMismatches.Count -ne 1 -or $report.productAcceptancePassed){throw 'Semantic mismatch was lost or promoted to product PASS'}}
         'baseline-failure' {if($report.firstFailure.phase -cne 'assay-A' -or -not $report.cleanHandoffVerified -or (Test-Path -LiteralPath (Join-Path $root 'injected-assay-B.json'))){throw 'Baseline failure did not stop later dispatch'}}
@@ -46,6 +48,9 @@ foreach($case in $cases){
         'close-unknown' {if($report.firstFailure.phase -cne 'assay-A' -or (Test-Path -LiteralPath (Join-Path $root 'injected-assay-B.json')) -or [IO.File]::ReadAllText((Join-Path $root 'fixture-neutral-count.txt')) -cne '1'){throw 'Unknown A close admitted the after-close probe'}}
         'abnormal-assay-exit' {if($null -eq $report.firstFailure -or -not $report.cleanHandoffVerified -or (Test-Path -LiteralPath (Join-Path $root 'injected-assay-B.json'))){throw 'Abnormal assay exit lost failure or recovery'}}
         'restore-drift' {if($exit -ne 2 -or $report.cleanHandoffVerified -or $null -eq $report.recoveryErrors){throw 'A restoration acknowledgement hid hash drift'}}
+        'restore-preview-rejected' {
+            if($exit -ne 2 -or $report.cleanHandoffVerified -or $null -eq $report.recoveryErrors -or [IO.File]::ReadAllText((Join-Path $root 'fixture-settings.txt')) -cne 'applied-fixture-settings' -or (Test-Path -LiteralPath (Join-Path $root 'fixture-restore-count.txt'))){throw 'Rejected preview mutated applied fixture state or dispatched restore'}
+        }
         {$_ -in @('result-injected','result-instance','result-ceiling','close-errors','close-state','exit-unknown','owner-busy','deadline-active','pair-active','health-unknown','runtime-changed','close-clock-unknown','result-partial')} {
             if($null -eq $report.firstFailure -or -not $report.cleanHandoffVerified -or (Test-Path -LiteralPath (Join-Path $root 'injected-assay-B.json')) -or (Test-Path -LiteralPath (Join-Path $root 'after-close-probe-boundary.json')) -or [IO.File]::ReadAllText((Join-Path $root 'fixture-neutral-count.txt')) -cne '1'){throw "Invalid boundary admitted the after-close probe: $case"}
         }

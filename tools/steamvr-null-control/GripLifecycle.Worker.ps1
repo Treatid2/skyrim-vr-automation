@@ -176,7 +176,10 @@ try{
         Stop-OwnedRuntime
         $before=Read-GripJson (Join-Path $Root 'before.json')
         $current=Call-Control 'nullControl' 'inspect'
-        if($current.state -cne 'null-inactive' -or $current.data.settingsSha256 -cne $before.data.settingsSha256){$restore=Call-Control 'nullControl' 'restore';Assert-True $restore.ok 'Receipt-bound settings restore failed'}
+        if($current.state -cne 'null-inactive' -or $current.data.settingsSha256 -cne $before.data.settingsSha256){
+            $preview=Call-Control 'nullControl' 'restore' @{WhatIf=$true};Assert-True $preview.ok 'Receipt-bound restore preview failed; no restore dispatch'
+            $restore=Call-Control 'nullControl' 'restore';Assert-True $restore.ok 'Receipt-bound settings restore failed'
+        }
         $after=Call-Control 'nullControl' 'inspect'
         if($after.state -cne 'null-inactive' -or @($after.data.runtime.steamVrProcesses).Count -ne 0 -or $after.data.settingsSha256 -cne $before.data.settingsSha256 -or $after.data.externalDrivers.sha256 -cne $before.data.externalDrivers.sha256){throw 'Closed runtime and exact settings/registration baseline not verified'}
         Save 'recovery-result' @{verified=$true;beforeSettingsSha256=$before.data.settingsSha256;afterSettingsSha256=$after.data.settingsSha256;registrationSha256=$after.data.externalDrivers.sha256;endedTickMs=(Get-GripTick).ToString()}

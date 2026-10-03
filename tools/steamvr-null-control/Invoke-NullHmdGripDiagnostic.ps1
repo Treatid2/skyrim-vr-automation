@@ -4,7 +4,7 @@ param(
     [Parameter(Mandatory,ParameterSetName='Live')][switch]$Live,
     [Parameter(Mandatory,ParameterSetName='Live')][string]$PlanPath,
     [Parameter(Mandatory,ParameterSetName='Offline')]
-    [ValidateSet('normal','semantic-mismatch','baseline-failure','startup-stall','assay-stall','cleanup-unknown','baseline-cleanup-unknown','publication-stall','binding-mismatch','close-unknown','abnormal-assay-exit','restore-drift','result-injected','result-instance','result-ceiling','close-errors','close-state','exit-unknown','owner-busy','deadline-active','pair-active','health-unknown','runtime-changed','close-clock-unknown','result-partial')][string]$OfflineCase,
+    [ValidateSet('normal','semantic-mismatch','baseline-failure','startup-stall','assay-stall','cleanup-unknown','baseline-cleanup-unknown','publication-stall','binding-mismatch','close-unknown','abnormal-assay-exit','restore-drift','result-injected','result-instance','result-ceiling','close-errors','close-state','exit-unknown','owner-busy','deadline-active','pair-active','health-unknown','runtime-changed','close-clock-unknown','result-partial','restore-preview-rejected')][string]$OfflineCase,
     [Parameter(Mandatory)][string]$EvidenceDirectory,
     [Parameter(Mandatory)][string]$BoundedProcessPath,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$BoundedProcessSha256,
