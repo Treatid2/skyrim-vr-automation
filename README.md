@@ -78,7 +78,10 @@ codex plugin add skyrim-vr-automation@skyrim-vr-tools
 
 The reproducible marketplace package lives under
 `plugins/skyrim-vr-automation`; canonical sources remain at repository root.
-See `docs/INSTALL-CODEX.md` for upgrades, removal, and release pinning. Restart
+The maintained local live plugin instead follows an exact committed
+`codex/auto-tools-all-integrated` head, including incorporated pending PRs;
+reviewed `main` remains the curated public lane. See `docs/INSTALL-CODEX.md`
+for the guarded live-publication workflow, upgrades, removal, and release pinning. Restart
 Codex after installing or updating.
 
 ## Local setup
