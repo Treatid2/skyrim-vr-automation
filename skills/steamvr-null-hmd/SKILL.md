@@ -59,11 +59,14 @@ particular drive letter for the plugin itself.
    the exact registration and manifest hashes. After `restore`, require both
    the settings and OpenVR registration hashes to match their exact backups.
 7. Require `headPoseProvider.state` to be `ready` and independently run the
-   head-pose controller's `qualify` command. Qualification requires both the
+   head-pose controller's `qualify -RequireControllers` command. Qualification requires both the
    driver's shared-memory acknowledgement and a valid standing HMD pose seen
    by a separate OpenVR application. Treat any unqualified runtime as rendering
    availability only; do not replay input or collect measurements. Controllers
-   remain explicitly unavailable. Treat a resident `vrdashboard.exe` as
+   must be independently qualified as the exact passive left/right pair, with
+   valid poses and neutral legacy input; registration alone and a head-only
+   probe are insufficient. Passive presence does not provide interactive input
+   or replay readiness. Treat a resident `vrdashboard.exe` as
    telemetry; `dashboard.enableDashboard=false` is the dashboard contract.
 8. For an MO2 test, return to the already admitted `$mo2-control` lifecycle and
    use the same access lease, task workspace, and `SteamVRNull` route for
@@ -71,6 +74,21 @@ particular drive letter for the plugin itself.
    substitute an OCU-qualified workspace after the null-HMD transition.
 9. Run `inspect -Compact` again and preserve the before/after results, exact
    backup, receipt, hashes, and evidence-directory identity.
+
+## Controller and Skyrim keyboard input
+
+For controller pose/button/touch/axis commands, additionally read
+`../../tools/steamvr-controller-control/README.md` and its entry-point parameter
+block. Use its inspect binding and stable task owner; never manufacture a new
+mapping, borrow another active owner, or replay an indeterminate command. The
+full-input native provider is required: the limited passive-only live DLL does
+not expose this protocol. Passive neutral qualification remains a presence test,
+not active-input/game acceptance. Keep head v2 control unchanged.
+
+Keyboard uses the existing DevBench `input` tool, capability/status negotiation
+and a stable task owner, as described in that README. It is Skyrim-only, not
+dashboard or OS injection. Preserve keyboard releaseAll and native controller
+release/reset receipts separately; neither implies atomic cross-provider reset.
 
 ## Safety and recovery
 

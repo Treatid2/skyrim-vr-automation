@@ -1,0 +1,19 @@
+{
+  "jsonid": "input_profile",
+  "controller_type": "vive_controller",
+  "device_class": "TrackedDeviceClass_Controller",
+  "resource_root": "codex_head_pose",
+  "driver_name": "codex_head_pose",
+  "legacy_binding": "{htc}/input/legacy_bindings_vive_controller.json",
+  "input_bindingui_mode": "controller_handed",
+  "input_source": {
+    "/input/system": { "type": "button", "click": true, "touch": true },
+    "/input/application_menu": { "type": "button", "click": true, "touch": true },
+    "/input/grip": { "type": "trigger", "click": true, "touch": true, "value": true },
+    "/input/trackpad": { "type": "trackpad", "click": true, "touch": true },
+    "/input/trigger": { "type": "trigger", "click": true, "touch": true, "value": true },
+    "/input/thumbstick": { "type": "joystick", "click": true, "touch": true },
+    "/pose/raw": { "type": "pose" },
+    "/output/haptic": { "type": "vibration" }
+  }
+}
