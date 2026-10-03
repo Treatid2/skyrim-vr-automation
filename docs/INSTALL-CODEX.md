@@ -90,6 +90,30 @@ either `-WorkspaceContent Modlist` or
 
 ## Upgrade
 
+### Maintained live development plugin
+
+The maintained local live plugin is published from an exact committed
+`codex/auto-tools-all-integrated` head, including incorporated PR work that is
+still in review. `main` remains curated and receives individual PRs only after
+review passes. Publishing the integrated plugin does not promote those PRs to
+main or certify their native/runtime behavior. Never merge the aggregate wholesale.
+
+At an authorized publication boundary, finish every active automation protocol
+in every chat first. Rotate both source/package plugin manifest version identities
+once, build with `scripts/Build-CodexMarketplacePlugin.ps1` into managed staging,
+and promote the verified package to the configured local marketplace plugin path.
+Keep the previous installed package as a verified rollback artifact. Install with
+`scripts/Install-CodexMarketplacePlugin.ps1 -MarketplaceRoot <registered-root>
+-MarketplaceName <registered-name> -ConfirmSafeCacheRotation`; do not replace cache
+files directly or change unrelated marketplace entries. Verify exact source,
+marketplace and installed file sets/hashes, registered version and integrated head.
+Retain a publication receipt with review/runtime qualification limits.
+
+Fully restart the Codex host after installation; a new chat alone is not a safe
+pickup boundary. Existing protocols keep their pinned controller/profile bytes
+until terminal. The public Git marketplace commands below track curated main,
+not this maintained local development lane.
+
 ```text
 codex plugin marketplace upgrade skyrim-vr-tools
 codex plugin add skyrim-vr-automation@skyrim-vr-tools
