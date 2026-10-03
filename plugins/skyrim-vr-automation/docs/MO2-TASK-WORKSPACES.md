@@ -97,6 +97,39 @@ command now fails closed without mutation. It points callers to MO2
 `release-access` for lease yield and to the explicit `retire` command for
 destructive cleanup.
 
+## Cleanup and environment handoff responsibility
+
+Auto-Tools owns the cleanup, recovery, and known-state handoff of shared
+resources. Calling tasks specify and configure their experiment environment,
+including any exact pose or view calibration, and leave that setup retained.
+They may invoke the documented lifecycle controls, but must not invent a
+reset sequence, undo their setup, or reconstruct shared-runtime recovery as a
+condition of releasing access. Missing lifecycle orchestration is an Auto-Tools
+implementation gap, not a reason to transfer that responsibility to callers.
+
+Use the existing ownership-guarded controllers to end the owned live session,
+preserve generated output and evidence, release transient input ownership,
+and recover shared state as required by the selected workflow. Verify the
+actual process, ownership, output, and runtime postconditions before handing
+off the next environment. A cleanup request or neutral owner marker alone is
+not proof of a clean environment. If verification fails, retain recovery
+receipts, report the unresolved state, and withhold a clean-state handoff;
+do not guess through it or dismantle another task's workspace.
+
+On a later request, resume the exact retained workspace and verify its current
+compatibility without silently refreshing it from the source profile. For an
+explicit clean-environment request, create a separate workspace from the
+selected verified baseline, leaving prior task setups intact. "Known state"
+means a verified, explicitly selected state, not necessarily factory defaults.
+Discarding or replacing a retained setup still requires the retirement
+authority described above. This policy does not authorize shared-mod edits,
+unowned process termination, or an unrequested runtime route change.
+
+The human code word `Release` remains coordination-only: it does not request
+application shutdown or a clean-environment transition. Safety input release
+and recovery of a failed owned run are distinct from reverting the task's
+persisted setup.
+
 ## Ownership and shared-state rules
 
 A task may change files only in its cloned profile and in a uniquely named mod
