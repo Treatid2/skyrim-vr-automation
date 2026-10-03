@@ -82,6 +82,7 @@ try {
     @"
 [General]
 selected_profile=@ByteArray(Codex)
+executable_blacklist="Steam.exe;notepad++.exe"
 [customExecutables]
 1\title=@ByteArray(Launch MGO - Do Not Unlock)
 1\binary=@ByteArray($loader)
@@ -167,6 +168,72 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test ($unlockDialogKind -eq 'unlock-required') 'Unlock dialog is classified structurally even when titled with a child executable'
     $failedRunDialogKind = & (Get-Module MO2Control) { Get-MO2KnownDialogKind -Title 'Mod Organizer' -Texts @('Failed to run SkyrimVR.exe') -Buttons @([pscustomobject]@{name='OK'}) }
     Assert-MO2Test ($failedRunDialogKind -eq 'failed-to-run') 'retained failed-to-run dialog is classified without matching the main window'
+    $usvfsWaitFixture = & $mo2Module {
+        param($fixtureConfig, $fixtureMO2Root)
+        $window = [pscustomobject]@{
+            dialogKind = 'usvfs-participant-wait'
+            title = 'Mod Organizer is waiting on an application to close before exiting.'
+            texts = @('notepad++.exe (36128)')
+        }
+        $resolver = {
+            param([int]$ProcessId)
+            [pscustomobject]@{
+                name = 'notepad++'; id = $ProcessId; path = 'C:\Tools\notepad++.exe'
+                startTime = [DateTime]::UtcNow.AddDays(-2).ToString('o')
+                commandLine = 'notepad++.exe crash.log'
+                modules = @([pscustomobject]@{ name='usvfs_x86.dll'; path=(Join-Path $fixtureMO2Root 'usvfs_x86.dll'); version='0.5.6.1' })
+            }
+        }.GetNewClosure()
+        Get-MO2USVFSWaitDiagnostics -Config $fixtureConfig -Windows @($window) -MO2Processes @([pscustomobject]@{ startTime=[DateTime]::UtcNow.AddHours(-1).ToString('o') }) -ProcessResolver $resolver
+    } $config $mo2Root
+    Assert-MO2Test ($usvfsWaitFixture.state -eq 'active' -and $usvfsWaitFixture.participants.Count -eq 1 -and $usvfsWaitFixture.participants[0].processId -eq 36128 -and $usvfsWaitFixture.participants[0].processLookupEvidence -eq 'verified' -and $usvfsWaitFixture.participants[0].executableNameAgreement -eq 'verified' -and $usvfsWaitFixture.participants[0].usvfsInjectionEvidence -eq 'verified' -and $usvfsWaitFixture.participants[0].injectedMO2USVFS -and $usvfsWaitFixture.participants[0].startedBeforeMO2 -and $usvfsWaitFixture.participants[0].executableBlacklisted -and $usvfsWaitFixture.verifiedParticipantCount -eq 1 -and -not $usvfsWaitFixture.automaticTerminationAllowed) 'inspection attributes a stale external editor wait only with exact process and installation-local USVFS evidence'
+    $zeroWindowObservation = & $mo2Module { Get-MO2InspectionWindowObservation -Processes @([pscustomobject]@{ id = 7 }) -SnapshotProvider { param($items) @() } }
+    Assert-MO2Test ($zeroWindowObservation.state -eq 'unavailable' -and $zeroWindowObservation.windowCount -eq 0) 'running MO2 with no observable windows remains unknown instead of proving no wait dialog'
+    $failedWindowObservation = & $mo2Module { Get-MO2InspectionWindowObservation -Processes @([pscustomobject]@{ id = 7 }) -SnapshotProvider { param($items) throw 'persistent UIA failure' } }
+    Assert-MO2Test ($failedWindowObservation.state -eq 'unavailable' -and $failedWindowObservation.errors.Count -eq 1 -and $failedWindowObservation.errors[0] -match 'persistent UIA failure') 'optional persistent UI Automation failure is retained without aborting inspection'
+    $partialWindowObservation = & $mo2Module { Get-MO2InspectionWindowObservation -Processes @([pscustomobject]@{ id = 7 }) -SnapshotProvider { param($items) @([pscustomobject]@{ visible = $true; automationAvailable = $false }) } }
+    Assert-MO2Test ($partialWindowObservation.state -eq 'partial' -and $partialWindowObservation.unobservableVisibleWindowCount -eq 1) 'native-only visible windows are classified as partial observation'
+    $unknownWait = & $mo2Module { param($fixtureConfig) Get-MO2USVFSWaitDiagnostics -Config $fixtureConfig -Windows @() -MO2Processes @([pscustomobject]@{ id = 7 }) -WindowObservationState unavailable -WindowObservationErrors @('persistent UIA failure') } $config
+    Assert-MO2Test ($unknownWait.state -eq 'unknown' -and -not $unknownWait.active -and $unknownWait.explanation -match 'not proven') 'unavailable window evidence produces a warning-grade unknown diagnosis'
+
+    $reportedWaitWindow = [pscustomobject]@{ dialogKind = 'usvfs-participant-wait'; title = 'Mod Organizer is waiting on an application to close before exiting.'; texts = @('notepad++.exe (36128)') }
+    $missingParticipant = & $mo2Module { param($fixtureConfig, $window) Get-MO2USVFSWaitDiagnostics -Config $fixtureConfig -Windows @($window) -MO2Processes @() -ProcessResolver { param([int]$ProcessId) $null } } $config $reportedWaitWindow
+    Assert-MO2Test ($missingParticipant.active -and $missingParticipant.participants[0].processLookupEvidence -eq 'not-observed' -and $missingParticipant.participants[0].usvfsInjectionEvidence -eq 'unavailable' -and $missingParticipant.verifiedParticipantCount -eq 0 -and $missingParticipant.explanation -notmatch 'matching live identity') 'a missing reported PID remains dialog evidence without a live-participant claim'
+    $unavailableParticipant = & $mo2Module {
+        param($fixtureConfig, $window)
+        Get-MO2USVFSWaitDiagnostics -Config $fixtureConfig -Windows @($window) -MO2Processes @() -ProcessResolver {
+            param([int]$ProcessId)
+            [pscustomobject]@{ name = 'notepad++'; id = $ProcessId; path = $null; startTime = $null; commandLine = $null; commandLineEvidence = 'unavailable'; modules = @(); moduleEvidence = 'unavailable' }
+        }
+    } $config $reportedWaitWindow
+    Assert-MO2Test ($unavailableParticipant.participants[0].commandLineEvidence -eq 'unavailable' -and $unavailableParticipant.participants[0].moduleEvidence -eq 'unavailable' -and $unavailableParticipant.participants[0].usvfsInjectionEvidence -eq 'unavailable' -and $null -eq $unavailableParticipant.participants[0].injectedMO2USVFS) 'inaccessible command-line and module evidence stays unavailable rather than false'
+    $mismatchedParticipant = & $mo2Module {
+        param($fixtureConfig, $window)
+        Get-MO2USVFSWaitDiagnostics -Config $fixtureConfig -Windows @($window) -MO2Processes @() -ProcessResolver {
+            param([int]$ProcessId)
+            [pscustomobject]@{ name = 'reused-pid'; id = $ProcessId; path = 'C:\Tools\reused-pid.exe'; startTime = $null; commandLine = ''; commandLineEvidence = 'verified'; modules = @(); moduleEvidence = 'verified' }
+        }
+    } $config $reportedWaitWindow
+    Assert-MO2Test ($mismatchedParticipant.participants[0].executableNameAgreement -eq 'mismatch' -and $mismatchedParticipant.verifiedParticipantCount -eq 0) 'reported executable mismatch prevents PID reuse from becoming verified participant evidence'
+    $unparsedWaitWindow = [pscustomobject]@{ dialogKind = 'usvfs-participant-wait'; title = 'Mod Organizer is waiting on an application to close before exiting.'; texts = @('odd helper.exe [36128]') }
+    $unparsedParticipant = & $mo2Module { param($fixtureConfig, $window) Get-MO2USVFSWaitDiagnostics -Config $fixtureConfig -Windows @($window) -MO2Processes @() -ProcessResolver { param([int]$ProcessId) $null } } $config $unparsedWaitWindow
+    Assert-MO2Test ($unparsedParticipant.active -and -not $unparsedParticipant.participantParseComplete -and $unparsedParticipant.participants.Count -eq 0 -and $unparsedParticipant.unparsedDialogText.Count -eq 1 -and $unparsedParticipant.explanation -notmatch '0 external') 'an active dialog with unparseable participant text is retained as incomplete evidence'
+    $spacedWaitWindow = [pscustomobject]@{ dialogKind = 'usvfs-participant-wait'; title = 'Mod Organizer is waiting on an application to close before exiting.'; texts = @('my helper.exe (36129)') }
+    $spacedParticipant = & $mo2Module {
+        param($fixtureConfig, $fixtureMO2Root, $window)
+        $resolver = {
+            param([int]$ProcessId)
+            [pscustomobject]@{ name = 'my helper'; id = $ProcessId; path = 'C:\Tools\my helper.exe'; startTime = $null; commandLine = ''; commandLineEvidence = 'verified'; modules = @([pscustomobject]@{ path = (Join-Path $fixtureMO2Root 'usvfs_x64.dll') }); moduleEvidence = 'verified' }
+        }.GetNewClosure()
+        Get-MO2USVFSWaitDiagnostics -Config $fixtureConfig -Windows @($window) -MO2Processes @() -ProcessResolver $resolver
+    } $config $mo2Root $spacedWaitWindow
+    Assert-MO2Test ($spacedParticipant.participantParseComplete -and $spacedParticipant.participants[0].reportedExecutable -eq 'my helper.exe' -and $spacedParticipant.verifiedParticipantCount -eq 1) 'participant parsing accepts executable basenames containing spaces'
+    $malformedIni = Join-Path $fixture 'malformed-ModOrganizer.ini'
+    "[General]`nexecutable_blacklist=`"notepad++.exe" | Set-Content -LiteralPath $malformedIni -Encoding utf8
+    $malformedConfig = $config | ConvertTo-Json -Depth 20 | ConvertFrom-Json -Depth 20
+    $malformedConfig.mo2.ini = $malformedIni
+    $malformedBlacklist = & $mo2Module { param($fixtureConfig, $window) Get-MO2USVFSWaitDiagnostics -Config $fixtureConfig -Windows @($window) -MO2Processes @() -ProcessResolver { param([int]$ProcessId) $null } } $malformedConfig $reportedWaitWindow
+    Assert-MO2Test ($malformedBlacklist.executableBlacklistEvidence -eq 'unavailable' -and $malformedBlacklist.executableBlacklistErrors.Count -eq 1 -and $null -eq $malformedBlacklist.participants[0].executableBlacklisted) 'malformed blacklist data remains unavailable rather than not blacklisted'
     $transientWindow = [pscustomobject]@{ callCount = 0 }
     $transientWindow | Add-Member -MemberType ScriptMethod -Name FindAll -Value {
         param($scope, $condition)
