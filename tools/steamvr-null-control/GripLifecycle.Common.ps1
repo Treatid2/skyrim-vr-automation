@@ -65,6 +65,7 @@ function Assert-GripPlan($Plan){
     if(-not [IO.Path]::IsPathFullyQualified([string]$Plan.toolkitRoot)){throw 'An exact toolkit root is required'}
     $toolPaths=@{nullControl='tools/steamvr-null-control/Invoke-SteamVRNullControl.ps1';headControl='tools/steamvr-head-pose-control/Invoke-SteamVRHeadPoseControl.ps1';controllerControl='tools/steamvr-controller-control/Invoke-SteamVRControllerControl.ps1';boundedProcess='tools/process-control/Invoke-BoundedProcess.ps1';nullProfile='profiles/steamvr-null.profile.json'}
     foreach($key in $toolPaths.Keys){if(-not [string]::Equals([IO.Path]::GetFullPath($Plan[$key].path),[IO.Path]::GetFullPath((Join-Path $Plan.toolkitRoot $toolPaths[$key])),[StringComparison]::OrdinalIgnoreCase)){throw 'Controller pins must address the supported toolkit entry points'}}
+    if([string]::IsNullOrWhiteSpace($env:CODEX_PYTHON)){throw 'CODEX_PYTHON is missing from this process environment; explicitly propagate the selected configured stable Python binding before invoking the coordinator'}
     if(-not [string]::Equals([IO.Path]::GetFullPath($Plan.python.path),[IO.Path]::GetFullPath($env:CODEX_PYTHON),[StringComparison]::OrdinalIgnoreCase)){throw 'Use the configured stable Python entry point'}
     foreach($key in @('settingsPath','openVRPathsPath','steamVRRoot','serverLogPath','driverRoot')){if(-not [IO.Path]::IsPathFullyQualified([string]$Plan[$key])){throw 'Runtime paths must be explicit and absolute'}}
     if($Plan.fixture.path -notlike '*\grip_neutral_ab.py'){throw 'The fixed A/B fixture is required'}

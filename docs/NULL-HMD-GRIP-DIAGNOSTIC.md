@@ -27,6 +27,17 @@ The live evidence root must be new and beneath that fixed fixture's `evidence`
 directory, with ordinary non-reparse ancestors. Invalid output placement is
 rejected before the coordinator creates the root or starts a worker.
 
+When the completion service does not inherit shell-only `CODEX_PYTHON`, use the
+task-shaped `Invoke-NullHmdGripSelectedRun.ps1` envelope. Supply the exact selected
+plan/hash and independently verified configured Python path/hash. It refuses a
+different plan binding or conflicting existing process configuration, sets only
+the invocation's process environment, and calls the fixed pinned coordinator
+with the unchanged240-second common/90-second recovery reserve. Descendants
+inherit the binding; no global/service environment rewrite or Python fallback
+occurs. `-ValidateOnly` verifies this same binding and all plan pins without
+creating evidence or invoking runtime controls. A new live attempt still needs
+its own explicit selection, unique completion job and new evidence root.
+
 ## Selected observational boundary
 
 Mapping selected `after-shutdown-return-and-worker-exit`, not independent
