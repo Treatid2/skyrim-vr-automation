@@ -304,7 +304,7 @@ try {
     [pscustomobject]@{
         ok = $true
         result = [pscustomobject]@{
-            service = 'communityshaders.render_map'
+            service = 'communityshaders.render-map'
             major = 1
             defaults = [pscustomobject]@{ fixedCatalogueBytes = 1000 }
             limits = [pscustomobject]@{
@@ -323,7 +323,33 @@ try {
     $plannerPath = Join-Path $PSScriptRoot 'New-CSXRenderMapCapturePlan.ps1'
     $plan = & $plannerPath -RegistryPath $registryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId fixture-command -OutputPath $planPath -HeadroomFactor 2 -NoExit -Compact | ConvertFrom-Json
     $planReceipt = Get-Content -LiteralPath $plan.receiptPath -Raw | ConvertFrom-Json
-    Assert-Test ($plan.ok -and $plan.arguments.maxEvents -eq 200 -and $plan.arguments.maxBytes -eq 21000 -and (Test-Path -LiteralPath $plan.receiptPath -PathType Leaf) -and $planReceipt.service -eq 'communityshaders.render_map' -and $planReceipt.producerBuildId -eq 'fixture-build' -and $planReceipt.registrySha256 -eq (Get-FileHash -LiteralPath $registryPath -Algorithm SHA256).Hash) 'render-map planner sizes every bound from workload plus headroom and retains an exact registry-bound receipt'
+    Assert-Test ($plan.ok -and $plan.arguments.maxEvents -eq 200 -and $plan.arguments.maxBytes -eq 21000 -and (Test-Path -LiteralPath $plan.receiptPath -PathType Leaf) -and $planReceipt.service -eq 'communityshaders.render-map' -and $planReceipt.producerBuildId -eq 'fixture-build' -and $planReceipt.registrySha256 -eq (Get-FileHash -LiteralPath $registryPath -Algorithm SHA256).Hash) 'render-map planner sizes every bound from workload plus headroom and retains an exact registry-bound receipt'
+    $nativeRegistry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+    $controllerRegistryPath = Join-Path $planFixture 'controller-registry.json'
+    [pscustomobject]@{
+        ok = $true; state = 'completed'
+        data = [pscustomobject]@{ tool = 'communityshaders.render_map'; content = @($nativeRegistry) }
+    } | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath $controllerRegistryPath -Encoding utf8
+    $controllerPlan = & $plannerPath -RegistryPath $controllerRegistryPath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId controller-envelope -OutputPath (Join-Path $planFixture 'controller-plan.json') -NoExit -Compact | ConvertFrom-Json
+    $controllerReceipt = Get-Content -LiteralPath $controllerPlan.receiptPath -Raw | ConvertFrom-Json
+    Assert-Test ($controllerPlan.ok -and $controllerPlan.arguments.maxBytes -eq 21000 -and $controllerReceipt.service -eq 'communityshaders.render-map' -and $controllerReceipt.producerBuildId -eq 'fixture-build' -and $controllerReceipt.registrySha256 -eq (Get-FileHash -LiteralPath $controllerRegistryPath -Algorithm SHA256).Hash) 'render-map planner accepts the exact single-payload controller envelope without rewriting service or registry evidence'
+    foreach ($envelopeCase in @('outer-failure', 'payload-failure', 'foreign-service', 'tool-as-service', 'foreign-tool', 'empty-content', 'multiple-content', 'scalar-content')) {
+        $controllerCase = Get-Content -LiteralPath $controllerRegistryPath -Raw | ConvertFrom-Json
+        switch ($envelopeCase) {
+            'outer-failure' { $controllerCase.ok = $false }
+            'payload-failure' { $controllerCase.data.content[0].ok = $false }
+            'foreign-service' { $controllerCase.data.content[0].result.service = 'communityshaders.other-service' }
+            'tool-as-service' { $controllerCase.data.content[0].result.service = 'communityshaders.render_map' }
+            'foreign-tool' { $controllerCase.data.tool = 'communityshaders.other_tool' }
+            'empty-content' { $controllerCase.data.content = @() }
+            'multiple-content' { $controllerCase.data.content = @($controllerCase.data.content[0], [pscustomobject]@{ ok = $false; error = 'extra payload' }) }
+            'scalar-content' { $controllerCase.data.content = @('not a registry payload') }
+        }
+        $controllerCasePath = Join-Path $planFixture "controller-$envelopeCase.json"
+        $controllerCase | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath $controllerCasePath -Encoding utf8
+        $controllerCasePlan = & $plannerPath -RegistryPath $controllerCasePath -WorkloadPath $workloadPath -ClientId fixture-client -CommandId $envelopeCase -OutputPath "$controllerCasePath.plan.json" -NoExit -Compact | ConvertFrom-Json
+        Assert-Test (-not $controllerCasePlan.ok -and $null -eq $controllerCasePlan.arguments -and -not $controllerCasePlan.receiptPublished) "render-map planner rejects controller $envelopeCase without issuing arguments or publishing a receipt"
+    }
     $rawRegistryPath = Join-Path $planFixture 'raw-registry.json'
     $rawRegistry = (Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json).result
     $rawRegistry | Add-Member -NotePropertyName producerBuildId -NotePropertyValue 'fixture-build'
