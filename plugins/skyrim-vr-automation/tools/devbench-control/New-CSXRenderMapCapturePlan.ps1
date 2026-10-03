@@ -107,8 +107,17 @@ function Resolve-Registry($Envelope) {
         Assert-RegistryEnvelopeSuccess $data 'registryEnvelope.data'
         $content = Get-Property $data 'content'
         if ($null -ne $content) {
-            Assert-RegistryEnvelopeSuccess $content 'registryEnvelope.data.content'
-            $candidate = $content
+            $toolProperty = $data.PSObject.Properties['tool']
+            if ($toolProperty -and $toolProperty.Value -cne 'communityshaders.render_map') {
+                throw 'Registry controller response is not bound to tool communityshaders.render_map.'
+            }
+            $contentItems = @($content)
+            if ($contentItems.Count -ne 1 -or $null -eq $contentItems[0] -or
+                $contentItems[0] -is [string] -or $contentItems[0] -is [ValueType]) {
+                throw 'Registry controller response must contain exactly one structured registry payload.'
+            }
+            $candidate = $contentItems[0]
+            Assert-RegistryEnvelopeSuccess $candidate 'registryEnvelope.data.content[0]'
         }
     }
     $result = Get-Property $candidate 'result'
@@ -118,12 +127,12 @@ function Resolve-Registry($Envelope) {
         $candidate
     } else { $null }
     if ($null -eq $registry) {
-        throw 'RegistryPath does not contain a communityshaders.render_map registry result.'
+        throw 'RegistryPath does not contain a communityshaders.render-map registry result.'
     }
     Assert-RegistryEnvelopeSuccess $registry 'registry'
     $service = [string](Get-Property $registry 'service')
-    if ($service -cne 'communityshaders.render_map') {
-        throw 'Registry result is not bound to service communityshaders.render_map.'
+    if ($service -cne 'communityshaders.render-map') {
+        throw 'Registry result is not bound to service communityshaders.render-map (tool communityshaders.render_map).'
     }
     $major = Require-PositiveLong (Get-Property $registry 'major') 'registry.major'
     $producerBuildId = [string](Get-Property $registry 'producerBuildId')
