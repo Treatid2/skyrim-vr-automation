@@ -34,7 +34,13 @@ shape. `set` requires both full hand snapshots and an integer lease of
 inspect a coherent pair under your ownership if you intend to preserve it.
 Both hands are validated before any command bytes are written.
 
-Standing positions are metres (+X right, +Y up, -Z forward). Quaternions are
+Command positions are in OpenVR's **raw tracking space**, in metres (+X right,
++Y up, -Z forward). They are not standing-space coordinates. The provider uses
+identity world-from-driver and driver-from-head transforms; OpenVR applies the
+current raw-to-standing calibration to application-observed standing poses.
+For standing readback, compose `standing_from_raw * raw_from_device` using the
+actual runtime transform for the HMD and both hands. Never hardcode a height
+offset or change global calibration to make the two spaces agree. Quaternions are
 WXYZ; finite squared norm must be strictly between .25 and 4, and native code
 normalizes them. Trackpad/stick axes are [-1,1], trigger/grip [0,1]. Mask IDs are
 system=0, application_menu=1, grip=2, trackpad=32, trigger=33, thumbstick=34.
@@ -64,7 +70,7 @@ one new neutral full-pair command with a 100ms lease. It returns success only
 after that command is acknowledged **and** coherent telemetry reports its exact
 accepted sequence, no active owner/deadline, healthy neutral inputs. A changed
 accepted sequence or unobserved expiry fails. Explicit reset instead restores
-default neutral poses (left [-.25,1.25,-.35], right [.25,1.25,-.35]) and releases
+default neutral raw poses (left [-.25,1.25,-.35], right [.25,1.25,-.35]) and releases
 the lease. On interruption/failure, an accepted command retains its original
 deadline: native expiry releases buttons/touches/axes on the next RunFrame,
 retaining poses and connected roles. This is not a guarantee that a halted
