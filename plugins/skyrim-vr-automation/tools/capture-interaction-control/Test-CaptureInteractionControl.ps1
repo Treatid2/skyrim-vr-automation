@@ -49,12 +49,20 @@ param(
     [string]$ArgumentsJson,
     [string]$RuntimePath,
     [string]$ExpectedRuntimeIdentityJson,
+    [string]$ArtifactPath,
+    [string]$ExpectedArtifactSha256,
+    [string]$ExpectedBuildId,
     [switch]$RequireSuccess,
     [switch]$Compact,
     [switch]$NoExit,
     [switch]$SkipRuntimeIdentityVerification
 )
 Import-Module $env:CAPTURE_INTERACTION_SEMANTIC_MODULE -Force
+if ($env:CAPTURE_INTERACTION_REQUIRE_BOOTSTRAP -eq '1' -and
+    ($ArtifactPath -cne 'C:\fixture\CommunityShaders.dll' -or $ExpectedArtifactSha256 -cne ('b' * 64) -or $ExpectedBuildId -cne ('a' * 64))) {
+    [pscustomobject]@{ok=$false;errors=@('fixture missing or mismatched bootstrap identity');data=$null} | ConvertTo-Json -Compress
+    return
+}
 $argsObject = $ArgumentsJson | ConvertFrom-Json -Depth 80
 $listenerPid = if ($env:CAPTURE_INTERACTION_RUNTIME_PID) { [int]$env:CAPTURE_INTERACTION_RUNTIME_PID } else { 101 }
 $processStartTimeUtc = if ($env:CAPTURE_INTERACTION_RUNTIME_START) { [string]$env:CAPTURE_INTERACTION_RUNTIME_START } else { "2026-09-11T00:00:$('{0:d2}' -f ($listenerPid % 60)).0000000Z" }
@@ -115,8 +123,11 @@ if ($Tool -eq 'communityshaders.screenshot') {
     $maximumFrames = if ($env:CAPTURE_INTERACTION_RAW_NEGATIVE_LIMIT -eq 'frames') { -1 } else { 60000 }
     $maximumDuration = if ($env:CAPTURE_INTERACTION_RAW_NEGATIVE_LIMIT -eq 'duration') { [int64]-1 } else { 3600000 }
     $value=[pscustomobject]@{schema='urn:csx:devbench:screenshot:1';limits=[pscustomobject]@{maximumSequenceFrames=$maximumFrames;maximumSequenceDurationMs=$maximumDuration}}
+    if ($env:CAPTURE_INTERACTION_NATIVE_CAPABILITIES -eq '1') {
+      $value=[pscustomobject]@{ok=$true;contract=[pscustomobject]@{name='csx.screenshot';major=1};result=$value}
+    }
     if ($env:CAPTURE_INTERACTION_RAW_NEGATIVE_LIMIT) {
-      [pscustomobject]@{ok=$true;transportOk=$true;indeterminate=$false;state='completed';semantic=[pscustomobject]@{known=$true;ok=$true};data=[pscustomobject]@{content=@($value)};errors=@()} | ConvertTo-Json -Depth 100 -Compress
+      [pscustomobject]@{ok=$true;transportOk=$true;indeterminate=$false;state='completed';semantic=[pscustomobject]@{known=$true;ok=$true;qualifiedCapabilities=$value};data=[pscustomobject]@{content=@($value)};errors=@()} | ConvertTo-Json -Depth 100 -Compress
       return
     }
   }
@@ -182,6 +193,24 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     $env:CAPTURE_INTERACTION_FAKE_ROOT = $root
     $env:CAPTURE_INTERACTION_SEMANTIC_MODULE = Join-Path (Split-Path -Parent $PSScriptRoot) 'devbench-control\DevBenchControl.psm1'
     $entry = Join-Path $PSScriptRoot 'Invoke-CaptureInteraction.ps1'
+    $env:CAPTURE_INTERACTION_REQUIRE_BOOTSTRAP = '1'
+    $env:CAPTURE_INTERACTION_NATIVE_CAPABILITIES = '1'
+    $bootstrap = @{ArtifactPath='C:\fixture\CommunityShaders.dll';ExpectedArtifactSha256=('b' * 64);ExpectedBuildId=('a' * 64)}
+    $capabilities = & $entry capabilities -RuntimePath $runtime -DevBenchScriptPath $fake @bootstrap -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test ($capabilities.ok -and $capabilities.data.input.ok -and $capabilities.data.screenshots.ok -and $capabilities.data.screenshots.value.limits.maximumSequenceFrames -eq 60000 -and $capabilities.data.screenshots.envelope.data.content[0].contract.name -eq 'csx.screenshot') 'bootstrap expectations reach both probes and nested capabilities are qualified while raw envelope is retained'
+    $unbound = & $entry capabilities -RuntimePath $runtime -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test (-not $unbound.data.input.ok -and -not $unbound.data.screenshots.ok) 'omitting identity expectations cannot pass the guarded bootstrap fixture'
+    $wrongBootstrap = $bootstrap.Clone(); $wrongBootstrap.ExpectedBuildId = 'foreign-build'
+    $wrongSession = Join-Path $root 'wrong-bootstrap'
+    $wrongStart = & $entry start -SessionDirectory $wrongSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -DevBenchScriptPath $fake @wrongBootstrap -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test (-not $wrongStart.ok -and -not (Test-Path -LiteralPath $wrongSession)) 'foreign explicit build fails sequence preflight before creating state or starting recording'
+    $bootstrapSession = Join-Path $root 'bootstrap-session'
+    $bootstrapStart = & $entry start -SessionDirectory $bootstrapSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -DevBenchScriptPath $fake @bootstrap -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test ($bootstrapStart.ok -and $bootstrapStart.data.runtimeIdentity.listenerPid -eq 101) 'bootstrap expectations reach sequence preflight and first record mutation without identity bypass'
+    Remove-Item Env:CAPTURE_INTERACTION_REQUIRE_BOOTSTRAP
+    $bootstrapStop = & $entry stop -SessionDirectory $bootstrapSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test ($bootstrapStop.ok) 'later stop uses persisted accepting identity without requiring bootstrap arguments again'
+    Remove-Item Env:CAPTURE_INTERACTION_NATIVE_CAPABILITIES
     $oversizedSession = Join-Path $root 'oversized-session'
     $oversized = & $entry start -SessionDirectory $oversizedSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 60000 -FrameIntervalMs 1000 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test (-not $oversized.ok -and $oversized.errors -match 'runtime limits are 60000 frames and 3600000 ms' -and $oversized.errors -match 'no greater than 3600') 'sequence preflight reports the exact runtime duration limit and compatible frame count after accepting the server maximum at parameter binding'
@@ -334,6 +363,8 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     [pscustomobject]@{ ok=$true; sessionPath=$started.data.statePath; actionCount=(Get-CaptureInteractionActionCatalog).actions.Count } | ConvertTo-Json -Compress
 }
 finally {
+    Remove-Item Env:CAPTURE_INTERACTION_REQUIRE_BOOTSTRAP -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_NATIVE_CAPABILITIES -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_FAKE_ROOT -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_SEMANTIC_MODULE -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_FAIL_VISUAL_START -ErrorAction SilentlyContinue

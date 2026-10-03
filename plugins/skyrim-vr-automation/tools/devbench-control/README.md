@@ -1,5 +1,33 @@
 # DevBench Control
 
+## Current native read contracts
+
+Explicit `camera {action:get}` is read-only and requires one complete typed
+observation: finite JSON position/pitch/yaw numbers, supported exact POV/backend,
+uint32 stateId, and Boolean freeCam/freeCamOwned without contradictory ownership.
+Unavailable/incomplete camera state fails; get qualification never applies to
+drive, setPov or freecam. Calibration remains the experiment owner's job.
+
+Render-scale `status.vendorWorkGate.state` is native uint64 packed telemetry,
+not a string outcome or proof of stability. Only that exact path on an exact
+status read receives numeric qualification; malformed types, explicit errors,
+foreign actions and multiple payloads remain failures. Raw state is unchanged.
+
+Screenshot capabilities accept the native Boolean-ok, csx.screenshot-major-1
+contract envelope with schema/limits inside result, or the existing exact flat
+v1 capability receipt. A successful classifier exposes qualifiedCapabilities
+without replacing the raw envelope. Failed/foreign/malformed/multiple receipts
+never expose a qualified projection.
+
+The exact captured console query `getini "fVrScale:VR"` has an execution-only
+receipt adapter (completed true, queued false, capturing true, exact command).
+It does not establish a scale value. `console read` qualifies one bounded,
+lossless fenced string-array receipt with count agreement, both markers and
+non-timeout evidence; the print route also requires its active hook and zero
+drops. Marker diagnostic text is retained. The caller must parse the actual
+INISetting line, validate its value and relate it to the scene; neither console
+adapter proves the command's desired game outcome or broadens other exec calls.
+
 `Invoke-DevBenchControl.ps1` lists and calls the tools exposed by a running
 CSX DevBench server. It prefers streamable-HTTP MCP and negotiates the REST
 `/api/tools` and `/api/tool/<name>` facade when an older host returns 404 for
