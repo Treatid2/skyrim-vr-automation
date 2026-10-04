@@ -29,7 +29,28 @@ function Get-DevBenchNativeReadReasons {
     }
     Require ($Payload -is [pscustomobject]) 'payload (exactly one structured object required)'
     if ($Payload -isnot [pscustomobject]) { return @($reasons) }
-    if ($Kind -ceq 'input-capabilities') {
+    if ($Kind -ceq 'menu-status') {
+        Require (@($Arguments.Keys | Where-Object { $_ -cnotin @('action','expectedBuildId') }).Count -eq 0) 'exact status arguments only'
+        Literal $Payload 'action' 'status' 'payload'
+        Require ((Member $Payload 'path') -is [string] -and (Member $Payload 'path') -ceq '') 'empty status path'
+        Require ($Payload.PSObject.Properties['delegatedRequest'] -and $null -eq (Member $Payload 'delegatedRequest')) 'explicit null delegatedRequest'
+        foreach($name in @('accepted','resultingRevision','requestId','applied')) { Require (-not $Payload.PSObject.Properties[$name]) "status cannot qualify mutation receipt $name" }
+        $producer=Member $Payload 'producer'
+        Literal $producer 'component' 'CommunityShaders' 'producer'
+        foreach($pair in @(@('buildId',64),@('shaderCacheAbiId',64),@('sourceCommit',40))) {
+            $value=Member $producer $pair[0];Require ($value -is [string] -and $value -cmatch ('^[0-9a-f]{'+$pair[1]+'}$')) "producer.$($pair[0])"
+        }
+        Boolean $producer 'sourceDirty' 'producer'
+        if($Arguments.Contains('expectedBuildId')) { Require ($Arguments['expectedBuildId'] -is [string] -and $Arguments['expectedBuildId'] -ceq (Member $producer 'buildId')) 'producer expectedBuildId binding' }
+        $status=Member $Payload 'status';Require ($status -is [pscustomobject]) 'typed menu status'
+        foreach($name in @('menuEnabled','menuSessionOpen','menuLayoutUnlocked','desktopMenuCanvasLocked','controllerGripDragEnabled','hasOverlayInterface','hmdOverlayHandle','controllerOverlayHandle','menuRenderTarget','menuTexture','drawDataValid','effectiveFixedWorldPositioning','fixedWorldPositionInitialized','fixedWorldReanchorRequested','loadingMenuOpen','mainMenuOpen','inSceneSubmitSuppressed','inSceneResourcesInitialized','openVRCompatible','submitHookInstalled','screenshotEnabled','screenshotPending','shouldUseInSceneOverlay','shouldPresentOverlayInHeadset','performanceOverlayVisible')) { Boolean $status $name 'status' }
+        foreach($name in @('runtimeType','menuPositioningMethod','attachMode','menuOverlayPath','drawCommandLists','drawTotalIndices','drawTotalVertices','inSceneSubmitSuppressionReasons')) { Require (UInt (Member $status $name) ([uint32]::MaxValue)) "status.$name unsigned telemetry (not outcome)" }
+        foreach($name in @('menuOffsetX','menuOffsetY','menuOffsetZ','menuScale')) { Require (Number (Member $status $name)) "status.$name finite number" }
+        $scale=Member $status 'menuScale';if(Number $scale){Require ($scale -gt 0) 'positive menuScale'}
+        $position=Member $status 'fixedWorldPosition'
+        foreach($name in @('x','y','z')) { Require (Number (Member $position $name)) "status.fixedWorldPosition.$name" }
+    }
+    elseif ($Kind -ceq 'input-capabilities') {
         $contract = Member $Payload 'contract'; $version = Member $contract 'version'
         Literal $contract 'name' 'devbench.input' 'contract'
         Require ((UInt (Member $version 'major') 2 2) -and (UInt (Member $version 'minor') 0)) 'contract.version (2.0)'

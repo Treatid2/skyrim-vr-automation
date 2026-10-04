@@ -97,6 +97,18 @@ unknown failures cannot be made retryable by message text.
 
 ## Current native read contracts
 
+Exact `communityshaders.menu {action:status}` qualifies one typed native
+action/status/producer receipt, empty path and explicit null delegatedRequest.
+Core menu/overlay/scene flags remain Booleans, counters unsigned telemetry and
+placement values finite numbers, with a positive scale. A disabled/closed menu
+is a valid observation; it is not interaction failure or proof of readiness.
+Producer/build/source/ABI fields are retained and optional expectedBuildId must
+match. Explicit errors, foreign/malformed/multiple receipts and mutation fields
+fail. No synthetic generic `ok` is inserted into the original payload.
+`semantic.qualifiedMenuStatus` is **read-schema-only**, not calibration,
+visibility, rendering, setting/save success or deployment qualification.
+Only exact status enters this adapter; mutation/read admission is not broadened.
+
 Exact `input {action:capabilities}` accepts only the complete native
 `devbench.input` 2.0 capability payload: ready/available Boolean keyboard v1
 and tracked-set v1.1, all 102 canonical key/scancode bindings,
