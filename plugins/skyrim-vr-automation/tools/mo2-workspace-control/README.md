@@ -58,7 +58,10 @@ retained workspace to a newly owned lease and selects it without refreshing it
 from the primary profile. If the exact retained owner marker still exists,
 resume validates its bytes, task, workspace, immutable ownership ID, and
 Overwrite path, then rebinds that unchanged active transaction to the new
-closed-state lease. If the prior lease completed its output transaction, every
+closed-state lease. All output paths must match the configured exact Overwrite
+mapping. Interrupted active rebind recovery requires the original task and
+workspace plus a current closed-state lease, and restores the exact manifest
+before another resume. If the prior lease completed its output transaction, every
 resume—including one under the same access ID—first verifies the exact cache
 and backup plans, completions, snapshot and restore lineage, preserved working
 trees, and restored live Overwrite state. It then publishes a fresh owner
@@ -190,6 +193,67 @@ legacy shader-cache trees out of shared Overwrite state.
 exact ready workspace to the caller's new active lease only after closed-state,
 stable-source, task identity, and task-profile fingerprint proofs. It is
 one-shot because it replaces the workspace's retained ownership metadata.
+
+### Explicit candidate output requalification
+
+Every forward baseline restore publishes its receipt, committed journal,
+unique inventory and physically displaced working tree under this attempt's
+audit directory. The original prepared plan and snapshot namespace remain
+unchanged. Failed-attempt rollback therefore leaves ordinary catalog and
+workspace completion free to prove and finish the original generation,
+including recovery from a genuine `completing` state. Attempt evidence is
+retained, never deleted or relabelled as normal completion authority. Existing
+legacy receipt conflicts still fail closed; this does not erase older audit.
+
+`requalify-output -ConfirmCandidateChanges` is the separate closed-state
+transition after intentional candidate registration changes the task profile
+or winning CSX DLL/manifest/ABI. Ordinary `resume` never performs this refresh.
+First reacquire access and `resume` the exact workspace; then preview and invoke
+this command with that same access ID, task ID, and workspace ID. It requires
+the exact active owner marker, both original **prepared** cache/backup plans
+and their intact physical snapshot baselines, no completion in progress, no
+MO2/game/loader, no evidence session, and a qualified runtime route. Missing,
+corrupt, foreign, legacy, or partially completed contracts fail before mutation.
+
+The controller snapshots both current working trees for exact rollback, then
+uses the existing transaction primitive to restore both original baselines
+while physically preserving the displaced output. This output is classified
+`superseded-unverified`, never promoted or called known-working. Original
+plans, snapshots, manifest bytes, and ownership-marker bytes are retained;
+`runtimeOutputHistory` links the supersession journal and restore receipts.
+Only after validating both committed restores does it release the old marker
+and derive a new generation from the actual current winning DLL and verified
+build manifest. No expected build ID or old OFF/ON variant is hardcoded. Profile
+markers, task mods, saves, settings, source profiles, and unrelated Overwrite
+content are not edited. Original pre-task directory-existence semantics remain
+binding, including when both `ShaderCache` and `backup` were absent.
+
+Success is `output-requalified-cache-prepare-required`, **not launch-ready**.
+Use the returned fresh `runtimeOutput.cachePrepareArguments` for ordinary
+catalog `prepare` with the actual shader-source/runtime compatibility metadata.
+Then require normal MO2 preparation/first-launch isolation checks and
+`-RequireSKSE`. Old cache-plan arguments are no longer valid. The new backup
+provider shadow is materialized by requalification; the cache shadow is
+materialized by subsequent catalog prepare. Completion of the new generation
+restores the original pre-task baselines through the normal strict gates.
+
+```text
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <source-Invoke-MO2WorkspaceControl.ps1> requalify-output -AccessId <owned-access-id> -TaskId <original-owner-task-id> -WorkspaceId <exact-workspace-id> -ConfirmCandidateChanges -WhatIf -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <same-source-Invoke-MO2WorkspaceControl.ps1> requalify-output -AccessId <same-owned-access-id> -TaskId <same-owner-task-id> -WorkspaceId <same-workspace-id> -ConfirmCandidateChanges -Compact
+```
+
+A failure restores the exact prior working trees, marker, and manifest, retaining
+all displaced evidence. If rollback cannot be verified, it reports
+`recovery-required` and leaves a nonterminal journal; it never declares a
+successful rollback or launches. Recovery is integrated into the next
+controller command, but this transaction requires the caller's exact active
+closed-state access lease. If access was released, reacquire it and pass the
+new `-AccessId` to exact `resume`; its recovery hook restores the preimage before
+it rebinds the retained workspace. A foreign
+owner or active process fails closed. No plugin rotation is needed when a task
+explicitly invokes this source controller; installation remains deferred while
+any live protocol is active. This is a one-shot mutation, not a reusable broad
+approval or permission to rewrite evidence manually.
 
 ```text
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> prepare-source -AccessId <literal-access-id> -Confirm:$false -Compact
