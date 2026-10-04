@@ -141,6 +141,9 @@ if ($Tool -eq 'communityshaders.screenshot') {
     $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{state='running';terminal=$false}}
   }
   elseif ($argsObject.action -in @('sequence_start','capture')) {
+    if ($argsObject.action -eq 'capture' -and $env:CAPTURE_INTERACTION_NATIVE_REQUEST -eq '1') {
+      $ArgumentsJson | Set-Content -LiteralPath (Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'native-capture-command.json') -Encoding utf8
+    }
     $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='running';terminal=$false}}
     if ($argsObject.action -eq 'sequence_start' -and $env:CAPTURE_INTERACTION_LOSE_VISUAL_ACCEPTED -eq '1') {
       [pscustomobject]@{ok=$false;transportOk=$true;state='post-dispatch-evidence-failed';indeterminate=$false;dispatchReached=$true;acceptedDataRetained=$true;invocationEvidencePath='screenshot-start-invocation.json';semantic=[pscustomobject]@{known=$true;ok=$true};data=[pscustomobject]@{content=@($value)};errors=@('fixture final evidence write failed')} | ConvertTo-Json -Depth 30 -Compress
@@ -165,6 +168,25 @@ if ($Tool -eq 'communityshaders.screenshot') {
     if (-not (Test-Path $image)) { [IO.File]::WriteAllBytes($image,[byte[]](1,2,3)) }
     $terminalState = if ($env:CAPTURE_INTERACTION_CONTRADICT_TERMINAL -eq '1') { 'running' } else { 'completed' }
     $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state=$terminalState;terminal=$true;children=@([pscustomobject]@{ordinal=4;scheduledEngineFrame=44;artifacts=@([pscustomobject]@{view='left_eye';path=$image;format='png';bytes=3;committed=$true})})}}
+    if ($env:CAPTURE_INTERACTION_NATIVE_REQUEST -eq '1') {
+      $capture=Get-Content -LiteralPath (Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'native-capture-command.json') -Raw | ConvertFrom-Json -Depth 80
+      $queryCount=@(Get-Content -LiteralPath (Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'calls.log') | Where-Object {$_ -ceq 'communityshaders.screenshot/request_get'}).Count
+      $stateFile=if($queryCount -eq [int]$env:CAPTURE_INTERACTION_NATIVE_FIRST_QUERY){'native-screenshot-encoding.json'}else{'native-screenshot-completed.json'}
+      $value=Get-Content -LiteralPath (Join-Path $env:CAPTURE_INTERACTION_SCREENSHOT_FIXTURES $stateFile) -Raw | ConvertFrom-Json -Depth 80
+      $value.command.action='request_get';$value.command.clientId=$argsObject.clientId;$value.command.commandId=$argsObject.commandId
+      $value.server.buildId=$buildId;$value.result.requestId=$argsObject.requestId
+      $value.result.clientId=$capture.clientId;$value.result.commandId=$capture.commandId
+      $value.result.requested.clientId=$capture.clientId;$value.result.requested.commandId=$capture.commandId
+      foreach($artifact in $value.result.artifacts){
+        $artifact.path=$image;$artifact.bytes=3;$artifact.sha256=(Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash.ToLowerInvariant()
+        if($artifact.actual.view -ceq 'right_eye'){$artifact.path=Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'frame-right.png';[IO.File]::WriteAllBytes($artifact.path,[byte[]](1,2,3))}
+      }
+      if($env:CAPTURE_INTERACTION_NATIVE_FAILURE -eq '1'){
+        $value.result.state='failed_partial';$value.result.artifacts=@($value.result.artifacts[0]);$value.result.artifactProgress.successful=1
+        $value.result.error=[pscustomobject]@{code='artifact_failed';message='native fixture failure';phase='encoding';path=$null};$value.result.errors=@($value.result.error)
+      }
+      if($env:CAPTURE_INTERACTION_NATIVE_FOREIGN_COMMAND -eq '1'){$value.result.commandId='foreign-capture';$value.result.requested.commandId='foreign-capture'}
+    }
   }
   else { $value=[pscustomobject]@{ok=$true;result=[pscustomobject]@{requestId='req-1';state='stop_requested'}} }
 } elseif ($Tool -eq 'record') {
@@ -197,6 +219,7 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     $env:CAPTURE_INTERACTION_FAKE_ROOT = $root
     $env:CAPTURE_INTERACTION_SEMANTIC_MODULE = Join-Path (Split-Path -Parent $PSScriptRoot) 'devbench-control\DevBenchControl.psm1'
     $env:CAPTURE_INTERACTION_INPUT_CAPABILITIES_PATH = Join-Path (Split-Path -Parent $PSScriptRoot) 'devbench-control\fixtures\native-input-capabilities.v2.json'
+    $env:CAPTURE_INTERACTION_SCREENSHOT_FIXTURES = Join-Path (Split-Path -Parent $PSScriptRoot) 'devbench-control\fixtures'
     $entry = Join-Path $PSScriptRoot 'Invoke-CaptureInteraction.ps1'
     $env:CAPTURE_INTERACTION_REQUIRE_BOOTSTRAP = '1'
     $env:CAPTURE_INTERACTION_NATIVE_CAPABILITIES = '1'
@@ -237,6 +260,27 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     Assert-Test $guardedAct.ok 'named input action forwards persisted artifact/build expectations under the same identity guard'
     $demandStop = & $entry stop -SessionDirectory $demandSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test $demandStop.ok 'on-demand stop forwards accepting expectations without bootstrap flags repeated'
+    $nativeSession=Join-Path $root 'native-demand-session'
+    $nativeStart=& $entry start -SessionDirectory $nativeSession -RuntimePath $runtime -VisualMode on-demand -DevBenchScriptPath $fake @bootstrap -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test $nativeStart.ok 'native request fixture session uses exact persisted bootstrap expectations'
+    $callsBefore=@(Get-Content -LiteralPath (Join-Path $root 'calls.log'))
+    $env:CAPTURE_INTERACTION_NATIVE_REQUEST='1'
+    $env:CAPTURE_INTERACTION_NATIVE_FIRST_QUERY=[string](@($callsBefore | Where-Object {$_ -ceq 'communityshaders.screenshot/request_get'}).Count+1)
+    $nativeObserve=& $entry observe -SessionDirectory $nativeSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test ($nativeObserve.ok -and $null -eq $nativeObserve.data.observation.screenshot.error -and $nativeObserve.data.observation.screenshot.receipt.terminal -and $nativeObserve.data.observation.screenshot.receipt.requestSucceeded -and $nativeObserve.data.observation.frameSubmission.engineFrame -eq 159016 -and $nativeObserve.data.observation.frameSubmission.view -ceq 'left_eye') 'native encoding then completed reads produce owned qualified nested-artifact frame through SessionDirectory-only orchestration'
+    $newCalls=@(Get-Content -LiteralPath (Join-Path $root 'calls.log')) | Select-Object -Skip $callsBefore.Count
+    Assert-Test (@($newCalls|Where-Object {$_ -ceq 'communityshaders.screenshot/capture'}).Count -eq 1 -and @($newCalls|Where-Object {$_ -ceq 'communityshaders.screenshot/request_get'}).Count -eq 2) 'one capture dispatch; exact owner read reconciliation never replays the mutation'
+    $env:CAPTURE_INTERACTION_NATIVE_FAILURE='1'
+    $failedObserve=& $entry observe -SessionDirectory $nativeSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test ($failedObserve.data.observation.screenshot.error -match 'failed_partial' -and $null -eq $failedObserve.data.observation.frameSubmission -and $failedObserve.data.observation.screenshot.receipt.errors[0].code -ceq 'artifact_failed') 'terminal failed capture retains receipt/errors and never submits a partial artifact as a successful image'
+    Remove-Item Env:CAPTURE_INTERACTION_NATIVE_FAILURE
+    $env:CAPTURE_INTERACTION_NATIVE_FOREIGN_COMMAND='1'
+    $foreignObserve=& $entry observe -SessionDirectory $nativeSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test ($foreignObserve.data.observation.screenshot.error -match 'accepted capture command identity' -and $null -eq $foreignObserve.data.observation.frameSubmission) 'native query must refer to the exact original capture command, not merely a internally consistent foreign receipt'
+    Remove-Item Env:CAPTURE_INTERACTION_NATIVE_FOREIGN_COMMAND
+    Remove-Item Env:CAPTURE_INTERACTION_NATIVE_REQUEST
+    $nativeStop=& $entry stop -SessionDirectory $nativeSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test $nativeStop.ok 'native still session finalizes recording and input without screenshot replay'
     $bootstrapStop = & $entry stop -SessionDirectory $bootstrapSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test ($bootstrapStop.ok) 'later stop uses persisted accepting identity without requiring bootstrap arguments again'
     Remove-Item Env:CAPTURE_INTERACTION_REQUIRE_BOOTSTRAP
@@ -393,6 +437,11 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     [pscustomobject]@{ ok=$true; sessionPath=$started.data.statePath; actionCount=(Get-CaptureInteractionActionCatalog).actions.Count } | ConvertTo-Json -Compress
 }
 finally {
+    Remove-Item Env:CAPTURE_INTERACTION_NATIVE_REQUEST -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_NATIVE_FAILURE -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_NATIVE_FOREIGN_COMMAND -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_NATIVE_FIRST_QUERY -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_SCREENSHOT_FIXTURES -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_REQUIRE_BOOTSTRAP -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_NATIVE_CAPABILITIES -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_FAKE_ROOT -ErrorAction SilentlyContinue

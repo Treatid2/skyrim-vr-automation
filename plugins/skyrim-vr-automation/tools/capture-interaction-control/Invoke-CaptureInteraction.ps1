@@ -199,6 +199,12 @@ function Invoke-DevBench([string]$Tool, [hashtable]$Arguments, [string]$Runtime,
         $content = @($response.data.content)
         if ($content.Count -ne 1) { throw "DevBench tool '$Tool' must return exactly one content payload." }
         $value = $content[0]
+        if ($Tool -ceq $screenshotTool -and $Arguments.ContainsKey('action') -and $Arguments.action -ceq 'request_get' -and $value.PSObject.Properties['contract']) {
+            if (-not $response.semantic.PSObject.Properties['qualifiedScreenshotRequest'] -or $response.semantic.qualifiedScreenshotRequest -isnot [pscustomobject]) {
+                throw 'Native screenshot request_get lacks a controller-qualified owned receipt; no raw terminal inference.'
+            }
+            $value=$response.semantic.qualifiedScreenshotRequest
+        }
         if ($Tool -ceq 'input' -and $Arguments.ContainsKey('action') -and $Arguments.action -ceq 'capabilities') {
             if (-not $response.PSObject.Properties['semantic'] -or -not $response.semantic -or
                 -not $response.semantic.PSObject.Properties['qualifiedInputCapabilities'] -or
@@ -319,22 +325,26 @@ function New-CaptureDescriptor([string]$Directory, [string]$BaseName, [string]$S
     }
 }
 
-function Get-ScreenshotReceipt([string]$RequestId, $State) {
+function Get-ScreenshotReceipt([string]$RequestId, $State, [string]$ExpectedCaptureCommandId) {
     $arguments = New-ScreenshotCommand ([string]$State.sessionId) 'request_get'
     $arguments['requestId'] = $RequestId
     $call = Invoke-DevBench -Tool $screenshotTool -Arguments $arguments -Runtime ([string]$State.runtimePath) -ExpectedRuntimeIdentity $State.runtimeIdentity
     $receipt = @(Find-CaptureInteractionScreenshotReceipt -Value $call.value | Select-Object -First 1)
     if ($receipt.Count -ne 1) { throw "Screenshot request_get did not expose receipt '$RequestId'." }
+    if ($receipt[0].PSObject.Properties['terminalBasis'] -and $ExpectedCaptureCommandId -and
+        [string]$receipt[0].commandId -cne $ExpectedCaptureCommandId) {
+        throw "Native screenshot request '$RequestId' does not match its accepted capture command identity."
+    }
     return $receipt[0]
 }
 
-function Wait-ScreenshotTerminal([string]$RequestId, $State) {
+function Wait-ScreenshotTerminal([string]$RequestId, $State, [string]$ExpectedCaptureCommandId) {
     $deadline = [DateTime]::UtcNow.AddSeconds($CaptureTimeoutSeconds)
     $terminalStates = @('completed', 'completed_with_warnings', 'stopped',
-        'cancelled', 'cancelled_partial', 'failed', 'failed_partial', 'rejected')
-    $nonterminalStates = @('accepted', 'queued', 'pending', 'running')
+        'cancelled', 'cancelled_partial', 'failed', 'failed_partial', 'rejected', 'dropped')
+    $nonterminalStates = @('accepted', 'queued', 'pending', 'running', 'waiting_source', 'encoding', 'stop_requested', 'cancel_requested', 'finalizing')
     do {
-        $receipt = Get-ScreenshotReceipt -RequestId $RequestId -State $State
+        $receipt = Get-ScreenshotReceipt -RequestId $RequestId -State $State -ExpectedCaptureCommandId $ExpectedCaptureCommandId
         $stateName = [string]$receipt.state
         $terminalProperty = $receipt.PSObject.Properties['terminal']
         if (-not $terminalProperty -or $terminalProperty.Value -isnot [bool] -or
@@ -356,7 +366,13 @@ function Start-OnDemandCapture($State) {
     $call = Invoke-DevBench -Tool $screenshotTool -Arguments $arguments -Runtime ([string]$State.runtimePath) -ExpectedRuntimeIdentity $State.runtimeIdentity -RequireSuccess
     $receipt = @(Find-CaptureInteractionScreenshotReceipt -Value $call.value | Select-Object -First 1)
     if ($receipt.Count -ne 1) { throw 'Screenshot capture did not expose an accepted request receipt.' }
-    return Wait-ScreenshotTerminal -RequestId ([string]$receipt[0].requestId) -State $State
+    $terminalReceipt = Wait-ScreenshotTerminal -RequestId ([string]$receipt[0].requestId) -State $State -ExpectedCaptureCommandId ([string]$arguments.commandId)
+    if ($terminalReceipt.PSObject.Properties['requestSucceeded'] -and -not $terminalReceipt.requestSucceeded) {
+        $failure=[InvalidOperationException]::new("Owned screenshot request '$($terminalReceipt.requestId)' terminated as '$($terminalReceipt.state)', not successful capture.")
+        $failure.Data['ScreenshotTerminalReceipt']=$terminalReceipt
+        throw $failure
+    }
+    return $terminalReceipt
 }
 
 function Get-CompositeObservation($State, [switch]$CaptureOnDemand) {
@@ -375,8 +391,11 @@ function Get-CompositeObservation($State, [switch]$CaptureOnDemand) {
             $screenshotReceipt = Start-OnDemandCapture -State $State
         }
     }
-    catch { $screenshotError = $_.Exception.Message }
-    $latest = if ($screenshotReceipt) { Get-CaptureInteractionLatestFrame -Receipt $screenshotReceipt -PreferredView ([string]$State.preferredView) } else { $null }
+    catch {
+        $screenshotError = $_.Exception.Message
+        if ($_.Exception.Data.Contains('ScreenshotTerminalReceipt')) { $screenshotReceipt=$_.Exception.Data['ScreenshotTerminalReceipt'] }
+    }
+    $latest = if ($screenshotReceipt -and -not $screenshotError) { Get-CaptureInteractionLatestFrame -Receipt $screenshotReceipt -PreferredView ([string]$State.preferredView) } else { $null }
     $observationId = [guid]::NewGuid().ToString('N')
     $observation = [pscustomobject][ordered]@{
         contractVersion = '1.0.0'

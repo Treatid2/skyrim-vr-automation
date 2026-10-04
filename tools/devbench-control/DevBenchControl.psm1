@@ -2,6 +2,7 @@
 
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'NativeReadContracts.ps1')
+. (Join-Path $PSScriptRoot 'ScreenshotRequestRead.ps1')
 
 function Get-DevBenchSemanticStatus {
     [CmdletBinding()]
@@ -830,6 +831,16 @@ function Get-DevBenchCallSemanticStatus {
         }
     }
 
+    if ($ToolName -ceq 'communityshaders.screenshot' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'request_get' -and
+        $payloads.Count -eq 1 -and $payloads[0] -is [pscustomobject] -and $payloads[0].PSObject.Properties['contract']) {
+        $nativeRead = Get-DevBenchNativeScreenshotRequest -Payload $payloads[0] -Arguments $Arguments
+        $semantic.known=$true; $semantic.ok=$nativeRead.ok; $semantic.reasons=@($nativeRead.reasons)
+        $semantic.outcome=if($nativeRead.ok){'screenshot-native-request-read-qualified'}else{'screenshot-native-request-read-failed'}
+        $semantic.explicitOutcomeEvidence=if($nativeRead.ok){@('native-v1-owned-screenshot-receipt')}else{@()}
+        $semantic|Add-Member qualifiedScreenshotRequest $nativeRead.projection
+        $semantic|Add-Member completionBasis 'owned-request-observation-only'
+        return $semantic
+    }
     if ($ToolName -eq 'communityshaders.screenshot' -and $Arguments.Contains('action') -and
         [string]$Arguments['action'] -in @('status', 'settings_get', 'request_get', 'request_list', 'events_poll')) {
         $action = [string]$Arguments['action']

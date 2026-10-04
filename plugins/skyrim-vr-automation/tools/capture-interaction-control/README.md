@@ -46,6 +46,15 @@ Incomplete identity is not filled from bootstrap flags or an adjacent runtime.
 Outer `observe.ok` means an observation report was produced; a screenshot error
 or null `frameSubmission` is not a successful image capture.
 
+Native v1 still `request_get` uses only the controller-qualified owned receipt,
+not a guessed terminal flag or file-existence test. On-demand observation binds
+it to the original accepted capture command, reads that request through native
+encoding/finalization, and submits only a successful committed artifact. A
+qualified failed terminal request retains its receipt and errors but produces
+no `frameSubmission`; successful query and successful capture remain separate.
+This adapter does not claim support for native sequence receipts or qualify an
+experiment's stereo/frame correlation. Reconciliation never repeats capture.
+
 Every recording and screenshot start records its attempted command identity
 before dispatch. Failed controller envelopes, indeterminate flags, and journal
 paths survive the wrapper boundary. A definite qualified rejection may release
