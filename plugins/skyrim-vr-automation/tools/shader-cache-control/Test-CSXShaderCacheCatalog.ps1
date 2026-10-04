@@ -631,7 +631,7 @@ try {
         Command = 'complete'
         CatalogRoot = $boundCatalogRoot
         EvidenceDirectory = $boundEvidence
-        WorkingSetStatus = 'unverified'
+        WorkingSetStatus = 'known-working'
         BlockingProcessNames = $blockers
         Confirm = $false
         Compact = $true
@@ -656,6 +656,60 @@ try {
     Assert-Test ($boundComplete.ok -and [int]$boundComplete.data.task.workingTree.materializedFiles -eq 1) 'task completion preserves materialized output from the exact bound provider'
     Assert-Test (Test-Path -LiteralPath (Join-Path $boundComplete.data.task.workingTree.preservedPath 'compiled-during-bound-task.bin') -PathType Leaf) 'provider-backed compiled output survives restoration in the evidence tree'
     Assert-Test (-not (Test-Path -LiteralPath (Join-Path $taskCache 'compiled-during-bound-task.bin'))) 'task completion restores the exact pre-task provider tree'
+
+    foreach ($failedStatus in @('failed', 'unverified')) {
+        $cleanupEvidence = Join-Path $resolvedTestRoot ('unchanged-bound-' + $failedStatus)
+        $cleanupPrepareArgs = @{} + $boundPrepareArgs
+        $cleanupPrepareArgs.EvidenceDirectory = $cleanupEvidence
+        $cleanupPrepareArgs.RequireMaterializedOutput = $true
+        $cleanupPrepare = Invoke-Catalog $cleanupPrepareArgs
+        $cleanupPlan = Get-Content -LiteralPath (Join-Path $cleanupEvidence 'shader-cache-task.plan.json') -Raw | ConvertFrom-Json -Depth 40
+        if ($failedStatus -eq 'failed') {
+            $preparedHash = $cleanupPlan.preparedTreeSha256
+            $cleanupPlan.preparedTreeSha256 = 'F' * 64
+            $cleanupPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath (Join-Path $cleanupEvidence 'shader-cache-task.plan.json') -Encoding utf8
+            $driftRefusal = Invoke-Catalog @{
+                Command='complete'; CatalogRoot=$boundCatalogRoot; EvidenceDirectory=$cleanupEvidence
+                WorkingSetStatus='failed'; BlockingProcessNames=$blockers; Confirm=$false; Compact=$true; NoExit=$true
+            }
+            Assert-Test (-not $driftRefusal.ok -and -not (Test-Path -LiteralPath (Join-Path $cleanupEvidence 'shader-cache-task.completion.json'))) 'failed status cannot bypass a mismatched prepared-tree proof'
+            $cleanupPlan.preparedTreeSha256 = $preparedHash
+            $cleanupPlan | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath (Join-Path $cleanupEvidence 'shader-cache-task.plan.json') -Encoding utf8
+        }
+        $cleanupComplete = Invoke-Catalog @{
+            Command='complete'; CatalogRoot=$boundCatalogRoot; EvidenceDirectory=$cleanupEvidence
+            WorkingSetStatus=$failedStatus; BlockingProcessNames=$blockers
+            Confirm=$false; Compact=$true; NoExit=$true
+        }
+        Assert-Test ($cleanupPrepare.ok -and $cleanupComplete.ok -and
+            [int]$cleanupComplete.data.task.workingTree.materializedFiles -eq 0 -and
+            [bool]$cleanupComplete.data.task.workingTree.unchangedPreparedFailure -and
+            $null -eq $cleanupComplete.data.task.promoted) "unchanged materialized $failedStatus output completes without promotion or invented cache writes"
+        $cleanupInventory = & $transactionTool inspect -CachePath $taskCache -NoExit | ConvertFrom-Json -Depth 30
+        Assert-Test ([string]$cleanupInventory.data.treeSha256 -ieq [string]$cleanupPlan.beforeTreeSha256 -and
+            (Test-Path -LiteralPath $cleanupComplete.data.task.workingTree.preservedPath -PathType Container)) "$failedStatus cleanup restores exact pre-task baseline and retains working-tree evidence"
+        $cleanupRepeat = Invoke-Catalog @{
+            Command='complete'; CatalogRoot=$boundCatalogRoot; EvidenceDirectory=$cleanupEvidence
+            WorkingSetStatus=$failedStatus; BlockingProcessNames=$blockers
+            Confirm=$false; Compact=$true; NoExit=$true
+        }
+        Assert-Test ($cleanupRepeat.ok -and $cleanupRepeat.state -eq 'already-complete') "$failedStatus unchanged completion is idempotent"
+    }
+
+    # Provider coverage already present before preparation: true no-op cleanup.
+    Copy-Item -LiteralPath (Join-Path $otherCache 'other-provider.bin') -Destination (Join-Path $taskCache 'other-provider.bin')
+    $noopFailedArgs = @{} + $boundPrepareArgs
+    $noopFailedArgs.EvidenceDirectory = Join-Path $resolvedTestRoot 'failed-bound-noop'
+    $noopFailedPrepare = Invoke-Catalog $noopFailedArgs
+    $noopFailedComplete = Invoke-Catalog @{
+        Command='complete'; CatalogRoot=$boundCatalogRoot; EvidenceDirectory=$noopFailedArgs.EvidenceDirectory
+        WorkingSetStatus='failed'; BlockingProcessNames=$blockers; Confirm=$false; Compact=$true; NoExit=$true
+    }
+    $noopFailedPlan = Get-Content -LiteralPath (Join-Path $noopFailedArgs.EvidenceDirectory 'shader-cache-task.plan.json') -Raw | ConvertFrom-Json -Depth 40
+    $noopFailedReceipt = Get-Content -LiteralPath $noopFailedPlan.restoreReceiptPath -Raw | ConvertFrom-Json -Depth 30
+    Assert-Test ($noopFailedPrepare.ok -and $noopFailedComplete.ok -and [string]$noopFailedReceipt.operation -ceq 'restore-noop' -and
+        [int]$noopFailedComplete.data.task.workingTree.materializedFiles -eq 0 -and $null -eq $noopFailedComplete.data.task.promoted) 'failed required-materialization cleanup commits no-op only when prepared and original trees match exactly'
+    Remove-Item -LiteralPath (Join-Path $taskCache 'other-provider.bin') -Force
 
     $largeModsRoot = Join-Path $resolvedTestRoot 'large-mo2\mods'
     $largeProfilePath = Join-Path $resolvedTestRoot 'large-mo2\profiles\Task\modlist.txt'
@@ -741,6 +795,158 @@ try {
     }
     Assert-Test ($overwriteComplete.ok -and (Test-Path -LiteralPath (Join-Path $overwriteComplete.data.task.workingTree.preservedPath 'later-area.bin') -PathType Leaf)) 'Overwrite completion preserves later-area generated cache output'
     Assert-Test ((Test-Path -LiteralPath (Join-Path $overwriteCache 'pre-task.bin') -PathType Leaf) -and -not (Test-Path -LiteralPath (Join-Path $overwriteCache 'later-area.bin'))) 'Overwrite completion restores the exact pre-task cache tree'
+
+    $resumeArgs = @{
+        Command = 'prepare'; CatalogRoot = (Join-Path $resolvedTestRoot 'overwrite-catalog')
+        CachePath = $overwriteCache; ProfilePath = $profilePath; ModsPath = $modsRoot
+        BindToOverwrite = $true; EvidenceDirectory = (Join-Path $resolvedTestRoot 'resume-evidence')
+        ShaderCacheAbi = 'abi-bound'; ShaderSourceSha256 = $shaderSource; BuildId = 'build-bound-fixture'
+        WorkspaceId = $overwriteWorkspaceId; OwnershipId = $overwriteOwnershipId
+        OwnerMarkerPath = $overwriteOwnerMarkerPath; OwnerMarkerSha256 = $overwriteOwnerMarkerSha256
+        ResumeCompletionPath = [string]$overwriteComplete.data.task.completionPath
+        ExpectedResumeCompletionSha256 = (Get-FileHash -LiteralPath $overwriteComplete.data.task.completionPath -Algorithm SHA256).Hash
+        RequireMaterializedOutput = $true; BlockingProcessNames = $blockers
+        Confirm = $false; Compact = $true; NoExit = $true; WhatIf = $true
+    }
+    $noResumeArgs = @{} + $resumeArgs
+    $noResumeArgs.Remove('ResumeCompletionPath'); $noResumeArgs.Remove('ExpectedResumeCompletionSha256')
+    $noResume = Invoke-Catalog $noResumeArgs
+    Assert-Test ($noResume.ok -and $noResume.data.task.action -eq 'use-current-no-match' -and $null -eq $noResume.data.task.resume) 'default preparation still excludes preserved unverified task caches'
+    foreach ($field in @('ResumeCompletionPath', 'ExpectedResumeCompletionSha256')) {
+        $bad = @{} + $resumeArgs; $bad.Remove($field)
+        $r = Invoke-Catalog $bad
+        Assert-Test (-not $r.ok -and $r.errors[0] -match 'supplied together') "resume requires both explicit path and hash: $field"
+    }
+    foreach ($field in @('ShaderSourceSha256', 'BuildId', 'GameRuntime', 'BytecodeCompatibilityClass', 'RenderPath', 'PresetSha256', 'FeatureSetSha256', 'Tags', 'RequiredTags')) {
+        $bad = @{} + $resumeArgs
+        $bad[$field] = switch ($field) { ShaderSourceSha256 { 'F' * 64 }; PresetSha256 { 'F' * 64 }; FeatureSetSha256 { 'F' * 64 }; Tags { @('foreign') }; RequiredTags { @('foreign') }; default { 'foreign' } }
+        $r = Invoke-Catalog $bad
+        Assert-Test (-not $r.ok) "same-task resume rejects changed compatibility: $field"
+    }
+    foreach ($field in @('AllowSourceMismatch', 'RequireMatch')) {
+        $bad = @{} + $resumeArgs; $bad[$field] = $true; $bad.CompatibilityReason = 'fixture cannot bypass'
+        $r = Invoke-Catalog $bad
+        Assert-Test (-not $r.ok -and $r.errors[0] -match 'cannot use') "resume cannot bypass strict gates: $field"
+    }
+    $bad = @{} + $resumeArgs; $bad.ExpectedResumeCompletionSha256 = '0' * 64
+    $r = Invoke-Catalog $bad
+    Assert-Test (-not $r.ok -and $r.errors[0] -match 'SHA-256 mismatch') 'resume rejects an unpinned completion'
+    $bad = @{} + $resumeArgs; $bad.Command = 'select'
+    $r = Invoke-Catalog $bad
+    Assert-Test (-not $r.ok -and $r.errors[0] -match 'only to prepare') 'resume cannot relax general catalog selection'
+    $oldCompletionText = Get-Content -LiteralPath $resumeArgs.ResumeCompletionPath -Raw
+    $historicalPlanPath = Join-Path $overwriteEvidence 'shader-cache-task.plan.json'
+    $historicalPlanBytes = [IO.File]::ReadAllBytes($historicalPlanPath)
+    $historicalPlanSha = (Get-FileHash -LiteralPath $historicalPlanPath -Algorithm SHA256).Hash
+    $historicalCompletion = $oldCompletionText | ConvertFrom-Json -Depth 40
+    Assert-Test ($historicalCompletion.planSha256 -ceq $historicalPlanSha) 'immutable completion pins finalized restored plan bytes including exact compatibility request'
+    foreach ($edit in @(
+        @{request='shaderSourceSha256';argument='ShaderSourceSha256';value=('F'*64)},
+        @{request='buildId';argument='BuildId';value='changed-build'},
+        @{request='featureSetSha256';argument='FeatureSetSha256';value=('F'*64)},
+        @{request='presetSha256';argument='PresetSha256';value=('F'*64)},
+        @{request='tags';argument='Tags';value=@('changed-tag')}
+    )) {
+        try {
+            $editedPlan = [Text.Encoding]::UTF8.GetString($historicalPlanBytes) | ConvertFrom-Json -Depth 40
+            $editedPlan.request | Add-Member -NotePropertyName $edit.request -NotePropertyValue $edit.value -Force
+            [IO.File]::WriteAllText($historicalPlanPath, ($editedPlan | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+            $bad = @{} + $resumeArgs
+            $bad[$edit.argument] = $edit.value
+            $bad.WhatIf = $false
+            $bad.EvidenceDirectory = Join-Path $resolvedTestRoot ('edited-history-'+$edit.request)
+            $r = Invoke-Catalog $bad
+            # Build ID has an earlier exact currently-enabled plugin guard.
+            # Preserve that stronger refusal; don't change plugin provenance
+            # merely to force execution through the later historical-plan gate.
+            $pinRefusal = $r.errors[0] -match 'finalized plan SHA-256 mismatch'
+            $earlierBuildRefusal = $edit.request -eq 'buildId' -and $r.errors[0] -match 'winning Community Shaders provider .* has build'
+            Assert-Test (-not $r.ok -and ($pinRefusal -or $earlierBuildRefusal)) "pinned original completion refuses edited historical request: $($edit.request)"
+            Assert-Test (-not (Test-Path -LiteralPath $bad.EvidenceDirectory)) "edited request refused before new evidence/snapshot/seed: $($edit.request)"
+            Assert-Test ((Get-FileHash -LiteralPath $resumeArgs.ResumeCompletionPath -Algorithm SHA256).Hash -ceq $resumeArgs.ExpectedResumeCompletionSha256) "edited plan leaves original completion bytes pinned: $($edit.request)"
+        } finally { [IO.File]::WriteAllBytes($historicalPlanPath, $historicalPlanBytes) }
+    }
+    try {
+        $legacy = $oldCompletionText | ConvertFrom-Json -Depth 40
+        $legacy.PSObject.Properties.Remove('planSha256')
+        [IO.File]::WriteAllText($resumeArgs.ResumeCompletionPath, ($legacy | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+        $bad = @{} + $resumeArgs
+        $bad.ExpectedResumeCompletionSha256 = (Get-FileHash -LiteralPath $resumeArgs.ResumeCompletionPath -Algorithm SHA256).Hash
+        $bad.WhatIf = $false; $bad.EvidenceDirectory = Join-Path $resolvedTestRoot 'legacy-history'
+        $r = Invoke-Catalog $bad
+        Assert-Test (-not $r.ok -and $r.errors[0] -match 'legacy completions are ineligible') 'externally pinned legacy completion cannot authenticate current plan bytes'
+        Assert-Test (-not (Test-Path -LiteralPath $bad.EvidenceDirectory)) 'legacy refusal precedes snapshot/seed/evidence creation'
+    } finally { [IO.File]::WriteAllText($resumeArgs.ResumeCompletionPath, $oldCompletionText, [Text.UTF8Encoding]::new($false)) }
+    foreach ($mutation in @('status', 'state', 'workspaceId', 'ownershipId', 'profileSha256', 'artifactSha256', 'preservedPath', 'files', 'bytes')) {
+        $changed = $oldCompletionText | ConvertFrom-Json -Depth 40
+        switch ($mutation) {
+            status { $changed.workingTree.status = 'failed' }
+            state { $changed.state = 'completing' }
+            workspaceId { $changed.cacheBinding.workspaceId = 'foreign' }
+            ownershipId { $changed.cacheBinding.ownershipId = 'foreign' }
+            profileSha256 { $changed.cacheBinding.profileSha256 = '0' * 64 }
+            artifactSha256 { $changed.cacheBinding.communityShadersPlugin.artifactSha256 = '0' * 64 }
+            preservedPath { $changed.workingTree.preservedPath = $resolvedTestRoot }
+            files { $changed.workingTree.inventory.files++ }
+            bytes { $changed.workingTree.inventory.bytes++ }
+        }
+        try {
+            $changed | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $resumeArgs.ResumeCompletionPath -Encoding utf8
+            $bad = @{} + $resumeArgs; $bad.ExpectedResumeCompletionSha256 = (Get-FileHash -LiteralPath $resumeArgs.ResumeCompletionPath -Algorithm SHA256).Hash
+            $r = Invoke-Catalog $bad
+            Assert-Test (-not $r.ok) "resume rejects malformed/foreign completion: $mutation"
+        } finally { [IO.File]::WriteAllText($resumeArgs.ResumeCompletionPath, $oldCompletionText, [Text.UTF8Encoding]::new($false)) }
+    }
+    # Restore original serialization hash after deliberate fixture rewrites.
+    $resumeArgs.ExpectedResumeCompletionSha256 = (Get-FileHash -LiteralPath $resumeArgs.ResumeCompletionPath -Algorithm SHA256).Hash
+    $priorPlanPath = Join-Path $overwriteEvidence 'shader-cache-task.plan.json'
+    $priorPlanText = Get-Content -LiteralPath $priorPlanPath -Raw
+    $priorPlan = $priorPlanText | ConvertFrom-Json -Depth 40
+    $priorJournalPath = Join-Path $overwriteEvidence ((Split-Path -Leaf $priorPlan.restoreReceiptPath) -replace '\.receipt\.json$', '.journal.json')
+    $priorJournalText = Get-Content -LiteralPath $priorJournalPath -Raw
+    try {
+        $journal = $priorJournalText | ConvertFrom-Json -Depth 30; $journal.phase = 'prepared'
+        $journal | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $priorJournalPath -Encoding utf8
+        $r = Invoke-Catalog $resumeArgs
+        Assert-Test (-not $r.ok -and $r.errors[0] -match 'does not prove') 'resume requires a committed restore journal'
+    } finally { [IO.File]::WriteAllText($priorJournalPath, $priorJournalText, [Text.UTF8Encoding]::new($false)) }
+    $warmFile = Join-Path $overwriteComplete.data.task.workingTree.preservedPath 'later-area.bin'
+    $warmBytes = [IO.File]::ReadAllBytes($warmFile)
+    try {
+        [IO.File]::WriteAllBytes($warmFile, [byte[]](0))
+        $r = Invoke-Catalog $resumeArgs
+        Assert-Test (-not $r.ok -and $r.errors[0] -match 'differs from') 'resume hash-verifies preserved cache bytes'
+    } finally { [IO.File]::WriteAllBytes($warmFile, $warmBytes) }
+    # New ownership marker incarnation and a different shared pre-task tree are
+    # allowed; retained workspace identity, profile and plugin must stay exact.
+    $marker = Get-Content -LiteralPath $overwriteOwnerMarkerPath -Raw | ConvertFrom-Json
+    $marker | Add-Member -NotePropertyName incarnation -NotePropertyValue 'new-session'
+    $marker | ConvertTo-Json | Set-Content -LiteralPath $overwriteOwnerMarkerPath -Encoding utf8
+    $resumeArgs.OwnerMarkerSha256 = (Get-FileHash -LiteralPath $overwriteOwnerMarkerPath -Algorithm SHA256).Hash
+    [IO.File]::WriteAllBytes((Join-Path $overwriteCache 'pre-task.bin'), [byte[]](9, 9))
+    $dryResume = Invoke-Catalog $resumeArgs
+    Assert-Test ($dryResume.ok -and $dryResume.data.task.action -eq 'seed-same-task-unverified' -and $null -eq $dryResume.data.task.selection.selected) 'dry-run admits only exact same-workspace history without selecting or promoting a global catalog entry'
+    Assert-Test (-not (Test-Path -LiteralPath $resumeArgs.EvidenceDirectory)) 'resume dry-run writes no plan or transaction evidence'
+    $resumeArgs.Remove('WhatIf')
+    $warmResume = Invoke-Catalog $resumeArgs
+    Assert-Test ($warmResume.ok -and $warmResume.data.task.resume.status -eq 'unverified' -and -not $warmResume.data.task.resume.globalPromotion) 'explicit same-task resume preserves unverified classification'
+    Assert-Test ((Test-Path -LiteralPath (Join-Path $overwriteCache 'later-area.bin')) -and $warmResume.data.task.seed.ok) 'resume seeds the preserved working cache through the existing attributable transaction'
+    $repeatWarm = Invoke-Catalog $resumeArgs
+    Assert-Test ($repeatWarm.ok -and $repeatWarm.state -eq 'already-prepared') 'same exact resume proof is idempotent'
+    Assert-Test ($warmResume.data.task.resume.planSha256 -ceq $historicalPlanSha -and $repeatWarm.data.task.resume.planSha256 -ceq $historicalPlanSha -and
+        (Get-FileHash -LiteralPath $historicalPlanPath -Algorithm SHA256).Hash -ceq $historicalPlanSha) 'first resume and prepared retry preserve immutable historical finalized-plan digest'
+    $omitProof = @{} + $resumeArgs; $omitProof.Remove('ResumeCompletionPath'); $omitProof.Remove('ExpectedResumeCompletionSha256')
+    $r = Invoke-Catalog $omitProof
+    Assert-Test (-not $r.ok -and $r.errors[0] -match 'immutable resume proof') 'prepared resume cannot be silently reinterpreted as default selection'
+    $warmComplete = Invoke-Catalog @{
+        Command = 'complete'; CatalogRoot = $resumeArgs.CatalogRoot; CachePath = $overwriteCache
+        EvidenceDirectory = $resumeArgs.EvidenceDirectory; WorkingSetStatus = 'unverified'
+        BlockingProcessNames = $blockers; Confirm = $false; Compact = $true; NoExit = $true
+    }
+    Assert-Test ($warmComplete.ok -and $null -eq $warmComplete.data.task.promoted) 'unverified resumed cache completes without promotion or manufactured compiler output'
+    Assert-Test (([IO.File]::ReadAllBytes((Join-Path $overwriteCache 'pre-task.bin')) -join ',') -eq '9,9') 'resume completion restores the new exact pre-task baseline, not the prior session baseline'
+    $warmList = Invoke-Catalog @{ Command = 'list'; CatalogRoot = $resumeArgs.CatalogRoot; Compact = $true; NoExit = $true }
+    Assert-Test (@($warmList.data.snapshots).Count -eq 0) 'same-task warm resume never adds an unverified global catalog snapshot'
 
     $finalList = Invoke-Catalog @{ Command = 'list'; CatalogRoot = $catalogRoot; Compact = $true; NoExit = $true }
     Assert-Test (@($finalList.data.snapshots).Count -eq 5 -and @($finalList.data.issues).Count -eq 0) 'catalog retains all known-working compatibility records and validates every manifest'
