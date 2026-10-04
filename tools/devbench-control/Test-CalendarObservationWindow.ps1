@@ -7,7 +7,7 @@ Import-Module (Join-Path $PSScriptRoot 'CalendarObservationWindow.psm1') -Force
 $checks=0
 function Require([bool]$Condition,[string]$Message) { if(-not $Condition){throw $Message}; $script:checks++ }
 function Clone($Object){return $Object | ConvertTo-Json -Depth 30 | ConvertFrom-Json -Depth 30}
-foreach($mode in @('healthy','failed-observation','expired','generation','globals','cell','foreign-owner','wrong-session','lost-hold','late-hold','late-response','release-failed','restore-proof','no-prior-rate','uncertain-no-lease','stale-initial','deadline')) {
+foreach($mode in @('healthy','failed-observation','expired','generation','globals','cell','foreign-owner','wrong-session','lost-hold','late-hold','late-response','release-failed','restore-proof','no-prior-rate','boolean-prior-rate','schema-string','wrong-pid','uncertain-no-lease','stale-initial','deadline')) {
     $script:mode=$mode; $script:calls=[Collections.Generic.List[object]]::new(); $script:held=$false; $script:released=$false; $script:statusCount=0; $script:holdId=$null; $script:owner=$null
     $script:binding=[pscustomobject]@{processSession='123:456';pid=123;loadGeneration=1;cellFormId=7;globalFormIds=@(1,2,3,4,5,6)}
     $script:values=[pscustomobject]@{year=201;month=1;day=1;gameHour=12;daysPassed=1;calendarRate=20;engineMultiplier=1}
@@ -38,6 +38,9 @@ foreach($mode in @('healthy','failed-observation','expired','generation','global
         }
         if($outstanding){$payload.values.calendarRate=0}
         if($script:mode -eq 'no-prior-rate' -and $script:held){$payload.lease.captured.calendarRate='20'}
+        if($script:mode -eq 'boolean-prior-rate' -and $script:held){$payload.lease.captured.calendarRate=$true}
+        if($script:mode -eq 'schema-string'){$payload.schemaVersion='1'}
+        if($script:mode -eq 'wrong-pid'){$payload.binding.pid=456}
         if($script:mode -eq 'stale-initial' -and -not $script:held){$payload.readbackFresh=$false}
         if($script:mode -eq 'late-hold' -and $arguments.action -eq 'hold'){$payload.ok=$false;$payload | Add-Member mayCompleteLater $true}
         if($script:held -and -not $script:released -and $script:statusCount -gt 1) {
@@ -54,15 +57,15 @@ foreach($mode in @('healthy','failed-observation','expired','generation','global
     }
     $assertSession={if($script:mode -eq 'wrong-session' -and $script:held){throw 'fixture session mismatch'}}
     $deadline=$(if($mode -eq 'deadline'){[datetime]::UtcNow.AddSeconds(1)}elseif($mode -eq 'late-response'){[datetime]::UtcNow.AddSeconds(5.2)}else{[datetime]::UtcNow.AddSeconds(60)})
-    $result=Invoke-DevBenchCalendarWindow -Call $call -AssertSession $assertSession -Owner 'fixture-owner' -Observations @(@{tool='inspect';arguments=@{kind='state'}}) -DeadlineUtc $deadline -CleanupSeconds 5
+    $result=Invoke-DevBenchCalendarWindow -Call $call -AssertSession $assertSession -Owner 'fixture-owner' -Observations @(@{tool='inspect';arguments=@{kind='state'}}) -DeadlineUtc $deadline -CleanupSeconds 5 -ExpectedProcessId 123
     Require ($result.ok -eq ($mode -eq 'healthy')) "$mode had incorrect success"
     Require (@($script:calls | Where-Object {$_.arguments.Contains('action') -and $_.arguments.action -eq 'hold'}).Count -le 1) "$mode replayed hold"
     Require (@($script:calls | Where-Object {$_.arguments.Contains('action') -and $_.arguments.action -eq 'release'}).Count -le 1) "$mode replayed release"
     Require (-not $result.disconnectRestorationClaimed) "$mode invented disconnect restoration"
     if($mode -eq 'healthy'){Require $result.restorationVerified 'Healthy restoration missing';Require $result.continuityVerified 'Healthy continuity missing'}
     if($mode -in @('failed-observation','expired','generation','globals','cell','foreign-owner','lost-hold','late-hold','late-response')){Require $script:released "$mode skipped same-session original exact cleanup"}
-    if($mode -in @('wrong-session','uncertain-no-lease','no-prior-rate')){Require (-not $script:released) "$mode adopted unknown cleanup authority"}
-    if($mode -in @('stale-initial','deadline')){Require (-not $script:held) "$mode dispatched despite rejected admission"}
+    if($mode -in @('wrong-session','uncertain-no-lease','no-prior-rate','boolean-prior-rate')){Require (-not $script:released) "$mode adopted unknown cleanup authority"}
+    if($mode -in @('stale-initial','deadline','schema-string','wrong-pid')){Require (-not $script:held) "$mode dispatched despite rejected admission"}
 }
 # Exercise refusal through the actual public production entry point before it
 # opens any network session. Native operation tests above substitute only RPC.
@@ -76,4 +79,4 @@ try {
         Require (-not $actual.ok -and -not $actual.dispatchReached -and $actual.sessionCleanup.state -eq 'not_opened') 'Production entry accepted an intrusive observation'
     }
 }finally{Remove-Item -LiteralPath $temp -Recurse -Force}
-[pscustomobject]@{ok=$true;checks=$checks;cases=17;liveQualification=$false} | ConvertTo-Json -Compress
+[pscustomobject]@{ok=$true;checks=$checks;cases=20;liveQualification=$false} | ConvertTo-Json -Compress
