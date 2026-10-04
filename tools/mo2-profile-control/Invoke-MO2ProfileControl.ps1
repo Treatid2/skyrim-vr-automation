@@ -28,6 +28,8 @@ param(
     [ValidatePattern('^[A-Fa-f0-9]{64}$')]
     [string]$PinnedProfileSha256,
 
+    [string]$DisabledModNamesFile,
+
     [string[]]$WinningPaths,
 
     [string]$WinningPathsFile,
@@ -762,8 +764,21 @@ $mutationApplied = $false
 if ($Command -in @('recover-disabled-append', 'normalize-installed')) {
     if ($humanMutationAuthority) { throw 'Disabled inventory reconciliation requires closed MO2, not a human live-mutation capability.' }
     if ([string]::IsNullOrWhiteSpace($ExpectedCurrentSha256) -or $beforeHash -cne $ExpectedCurrentSha256.ToUpperInvariant()) { throw 'Disabled inventory current-hash CAS mismatch or missing ExpectedCurrentSha256.' }
-    $plan = Get-DisabledModlistReconciliation -Bytes $beforeBytes -ModRoot $ModsDirectory -Operation $Command -PinnedHash $PinnedProfileSha256
-    $operationResult = [pscustomobject]@{ changed = $plan.changed; names = $plan.names; beforeSha256 = $beforeHash; intendedSha256 = $plan.sha256; originalBytesPreserved = $true; enabledOrderPreserved = $true }
+    $requestedNames = @()
+    $nameProofSha256 = $null
+    if ($DisabledModNamesFile) {
+        if ($Command -ne 'recover-disabled-append') { throw 'DisabledModNamesFile applies only to exact recovery.' }
+        Assert-NoReparsePointPath -Path $DisabledModNamesFile -Purpose 'Explicit disabled mod names file'
+        if ((Get-Item -LiteralPath $DisabledModNamesFile).Length -gt 32768) { throw 'Disabled mod names file exceeds 32 KiB.' }
+        $nameBytes = [IO.File]::ReadAllBytes($DisabledModNamesFile)
+        $nameText = [Text.UTF8Encoding]::new($false,$true).GetString($nameBytes).TrimStart([char]0xFEFF)
+        if (-not $nameText.TrimStart().StartsWith('[')) { throw 'Disabled mod names file must be a JSON string array.' }
+        $requestedNames = @($nameText | ConvertFrom-Json -Depth 3 -ErrorAction Stop)
+        if ($requestedNames.Count -lt 1 -or $requestedNames.Count -gt 64) { throw 'Explicit disabled recovery requires 1..64 names.' }
+        $nameProofSha256 = Get-BytesSha256 $nameBytes
+    }
+    $plan = Get-DisabledModlistReconciliation -Bytes $beforeBytes -ModRoot $ModsDirectory -Operation $Command -PinnedHash $PinnedProfileSha256 -RequestedNames $requestedNames
+    $operationResult = [pscustomobject]@{ changed = $plan.changed; names = $plan.names; explicitNamesSha256 = $nameProofSha256; beforeSha256 = $beforeHash; intendedSha256 = $plan.sha256; originalBytesPreserved = $true; enabledOrderPreserved = $true }
     if ($plan.changed -and (Test-ProfileShouldProcess -Caller $PSCmdlet -Target $resolvedProfile -Action $Command)) {
         $receipt = [pscustomobject]@{ operation = $Command; profilePath = $resolvedProfile; modName = $ModName; modsDirectory = [IO.Path]::GetFullPath($ModsDirectory); reconciliation = $operationResult }
         $postcondition = {

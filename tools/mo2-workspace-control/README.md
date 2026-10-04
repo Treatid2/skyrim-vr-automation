@@ -219,7 +219,12 @@ with `-WhatIf`). The controller requires both original **prepared** cache and
 backup plans, exact owner marker, intact snapshot baselines, unchanged CSX build,
 and agreeing original profile hashes. Recovery accepts only at most 64 known
 installed, new disabled trailing lines whose removal restores the exact pinned
-bytes. It does not adopt semantic equivalence, change enabled order, rewrite
+bytes. If MO2 inserted the additions before existing lines rather than at EOF,
+pass `-DisabledModNamesFile` with the explicit known added names as a bounded
+JSON string array. This removes only one exact disabled record per named
+installed mod and requires the same exact original byte hash; no search or
+semantic-equivalence bypass is used. Enabled/order/comment/newline drift still
+fails. It does not adopt semantic equivalence, change enabled order, rewrite
 plans or receipts, or reclassify output. Unknown/non-suffix drift fails closed.
 The ordinary profile transaction retains the entire current file as its exact
 backup and commits a durable CAS receipt, with rollback on failed postconditions.

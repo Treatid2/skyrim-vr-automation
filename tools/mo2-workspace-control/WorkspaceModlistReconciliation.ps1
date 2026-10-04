@@ -4,6 +4,7 @@ function Invoke-WorkspaceProfileReconciliation($Config, [string]$ProfilePath, [s
     $arguments = @{ ProfilePath = $ProfilePath; ModName = 'disabled-inventory-reconciliation'; ModsDirectory = [string]$Config.mo2.modsDirectory
         ExpectedCurrentSha256 = $ExpectedHash; EvidenceDirectory = $Evidence; BlockingProcessNames = @(Get-WorkspaceBlockingProcessNames $Config); NoExit = $true; Compact = $true }
     if ($PinnedHash) { $arguments.PinnedProfileSha256 = $PinnedHash }
+    if ($Operation -eq 'recover-disabled-append' -and $DisabledModNamesFile) { $arguments.DisabledModNamesFile = $DisabledModNamesFile }
     if ($Preview) { $arguments.WhatIf = $true } else { $arguments.Confirm = $false }
     $answer = & (Join-Path $toolRoot 'mo2-profile-control\Invoke-MO2ProfileControl.ps1') $Operation @arguments | ConvertFrom-Json -Depth 20
     if (-not $answer.ok) { throw 'Profile disabled inventory reconciliation failed.' }

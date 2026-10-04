@@ -93,7 +93,15 @@ does not pretend the committed bytes were rolled back.
 `normalize-installed` appends only installed direct-child mods absent from the
 profile, as disabled markers. It preserves all original bytes and enabled order.
 `recover-disabled-append` removes at most 64 new disabled trailing markers only
-when the exact remaining bytes match `-PinnedProfileSha256`. It refuses enabled,
+when the exact remaining bytes match `-PinnedProfileSha256`. MO2 may instead
+insert new disabled entries near the start. For this case only, supply
+`-DisabledModNamesFile`: an explicit JSON array of 1..64 unique installed names,
+at most 32 KiB, not a reparse path. Recovery removes exactly one disabled record
+per named mod, wherever inserted, preserving every other byte; the result must
+still equal the trusted pinned SHA exactly. It performs no candidate search and
+does not accept enabled/order/comment/newline drift. The names-file SHA is
+recorded in the transaction proof. Without this parameter only suffix recovery
+is attempted. It refuses enabled,
 reordered, duplicate, unknown, unsafe, reparse, or non-suffix drift. Strict UTF-8,
 16 MiB profile and 30-second planning budgets apply; inventory is bounded to
 20,000 direct directories, with no recursive shared-mod scan.

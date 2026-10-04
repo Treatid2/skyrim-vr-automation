@@ -20,7 +20,7 @@ function Get-DisabledInventoryNames([string]$Text) {
     return ,$names
 }
 
-function Get-DisabledModlistReconciliation([byte[]]$Bytes, [string]$ModRoot, [string]$Operation, [string]$PinnedHash) {
+function Get-DisabledModlistReconciliation([byte[]]$Bytes, [string]$ModRoot, [string]$Operation, [string]$PinnedHash, [object[]]$RequestedNames = @()) {
     if ($Bytes.Length -gt 16777216) { throw 'Disabled inventory modlist exceeds 16 MiB.' }
     $utf8 = [Text.UTF8Encoding]::new($false, $true)
     $text = $utf8.GetString($Bytes)
@@ -32,7 +32,29 @@ function Get-DisabledModlistReconciliation([byte[]]$Bytes, [string]$ModRoot, [st
         if ($PinnedHash -notmatch '^[A-Fa-f0-9]{64}$') { throw 'Disabled suffix recovery requires an exact pinned profile hash.' }
         $pinned = $PinnedHash.ToUpperInvariant()
         $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        while ((Get-BytesSha256 $after) -cne $pinned) {
+        if ($RequestedNames.Count -gt 0) {
+            if ($RequestedNames.Count -gt 64) { throw 'Explicit disabled recovery exceeds 64 names.' }
+            foreach ($requested in $RequestedNames) {
+                if ($requested -isnot [string] -or -not $seen.Add($requested)) { throw 'Explicit disabled recovery requires unique string names.' }
+                Assert-InstalledModName $requested $ModRoot
+            }
+            if ((Get-BytesSha256 $after) -cne $pinned) {
+                $bom = if ($text.StartsWith([string][char]0xFEFF)) { [string][char]0xFEFF } else { '' }
+                $content = $text.Substring($bom.Length)
+                foreach ($requested in $RequestedNames) {
+                    if ([DateTime]::UtcNow -ge $deadline) { throw 'Explicit disabled recovery exceeds its 30-second budget.' }
+                    $pattern = '(?m)^(?<marker>[+-])' + [regex]::Escape($requested) + '(?:\r\n|\n|\z)'
+                    $records = [regex]::Matches($content,$pattern)
+                    if ($records.Count -ne 1 -or $records[0].Groups['marker'].Value -cne '-') { throw 'Explicit recovery requires exactly one disabled record for each named installed mod.' }
+                    $content = $content.Remove($records[0].Index,$records[0].Length)
+                    $names.Add($requested)
+                }
+                $text = $bom + $content
+                $after = $utf8.GetBytes($text)
+                if ((Get-BytesSha256 $after) -cne $pinned) { throw 'Explicit disabled-only removal does not restore the exact pinned bytes.' }
+            }
+        }
+        else { while ((Get-BytesSha256 $after) -cne $pinned) {
             if ($names.Count -ge 64 -or [DateTime]::UtcNow -ge $deadline) { throw 'Disabled suffix recovery exceeds its 64-line/30-second budget.' }
             $end = $text.Length
             if ($end -gt 0 -and $text[$end - 1] -eq "`n") { $end--; if ($end -gt 0 -and $text[$end - 1] -eq "`r") { $end-- } }
@@ -45,7 +67,7 @@ function Get-DisabledModlistReconciliation([byte[]]$Bytes, [string]$ModRoot, [st
             $names.Insert(0, $name)
             $text = $text.Substring(0, $start)
             $after = $utf8.GetBytes($text)
-        }
+        } }
         $prefixNames = Get-DisabledInventoryNames $text
         foreach ($name in $names) { if ($prefixNames.Contains($name)) { throw 'Disabled suffix duplicates a marker from the original profile.' } }
     }

@@ -43,9 +43,27 @@ try {
             Check ($normalized.ok -and $normalized.operationResult.changed -and $utf8.GetString($normalizedBytes).StartsWith($utf8.GetString($original),[StringComparison]::Ordinal)) 'Normalization changed original byte prefix.'
             $normNoop=Invoke-Case normalize-installed
             Check ($normNoop.ok -and -not $normNoop.operationResult.changed) 'Normalization was not idempotent.'
+            $namesFile=Join-Path $root 'explicit-names.json'
+            [IO.File]::WriteAllText($namesFile,'["New α","New two"]',$utf8)
+            $originalText=$utf8.GetString($original)
+            $inserted=$utf8.GetBytes($originalText.Insert($originalText.IndexOf("`n")+1,"-New α${newline}-New two${newline}"))
+            Refuse $inserted 'Implicit suffix recovery accepted a non-suffix insertion.'
+            $named=Invoke-Case recover-disabled-append @{DisabledModNamesFile=$namesFile}
+            Check ($named.ok -and $named.sha256 -ceq $pinned -and $named.operationResult.explicitNamesSha256 -ceq (Get-FileHash -LiteralPath $namesFile).Hash) 'Explicit inserted disabled records did not restore exact original bytes/proof.'
+            Check ((Get-FileHash -LiteralPath $named.backupPath).Hash -ceq (Hash $inserted)) 'Named insertion drift backup was not retained.'
         }
     }
     $original=$utf8.GetBytes("+Existing`r`n-Old disabled`r`n"); $pinned=Hash $original
+    $namesFile=Join-Path $root 'explicit-names.json'
+    [IO.File]::WriteAllText($namesFile,'["New two"]',$utf8)
+    Refuse ($utf8.GetBytes("+Existing`r`n+New two`r`n-Old disabled`r`n")) 'Explicit named enabled record was accepted.' @{DisabledModNamesFile=$namesFile}
+    Refuse ($utf8.GetBytes("-Existing`r`n-New two`r`n-Old disabled`r`n")) 'Explicit removal hid enabled-state drift.' @{DisabledModNamesFile=$namesFile}
+    Refuse ($utf8.GetBytes("-Old disabled`r`n-New two`r`n+Existing`r`n")) 'Explicit removal hid original order drift.' @{DisabledModNamesFile=$namesFile}
+    Refuse ($original+$utf8.GetBytes("-Nonexistent`r`n")) 'Explicit names accepted unknown/mismatched record.' @{DisabledModNamesFile=$namesFile}
+    [IO.File]::WriteAllText($namesFile,'["New two","New two"]',$utf8)
+    Refuse ($original+$utf8.GetBytes("-New two`r`n")) 'Duplicate explicit requested names accepted.' @{DisabledModNamesFile=$namesFile}
+    [IO.File]::WriteAllText($namesFile,'{"name":"New two"}',$utf8)
+    Refuse ($original+$utf8.GetBytes("-New two`r`n")) 'Non-array explicit name JSON accepted.' @{DisabledModNamesFile=$namesFile}
     Refuse ($original+$utf8.GetBytes("+New two`r`n")) 'Enabled suffix was accepted.'
     Refuse ($utf8.GetBytes("-Existing`r`n-Old disabled`r`n-New two`r`n")) 'Existing enable-state drift was accepted.'
     Refuse ($utf8.GetBytes("-Old disabled`r`n+Existing`r`n-New two`r`n")) 'Existing order drift was accepted.'
