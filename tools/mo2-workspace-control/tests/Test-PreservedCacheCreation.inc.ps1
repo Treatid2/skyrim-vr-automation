@@ -81,7 +81,7 @@ if ($DisabledInventoryOnly) {
     Assert-Preserved (([IO.File]::ReadAllText($createdBaseline.data.modListPath)).Contains('-Late installed two')) 'Normalization omitted an installed disabled mod.'
     $newHash = (Get-FileHash -LiteralPath $createdBaseline.data.modListPath).Hash
     $resumed = & $entry resume -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $createdBaseline.data.workspaceId -NoExit -Confirm:$false | ConvertFrom-Json
-    Assert-Preserved ($resumed.ok -and $resumed.data.runtimeOutput.communityShadersPlugin.profileSha256 -ceq $newHash) "Resume did not freshly pin normalized bytes: $($resumed.errors -join ';')"
+    Assert-Preserved ($resumed.ok -and $resumed.data.runtimeOutput.communityShadersPlugin.profileSha256 -ceq $newHash) "Resume did not freshly pin normalized bytes: $($resumed | ConvertTo-Json -Depth 12 -Compress)"
     $output = $resumed.data.runtimeOutput
     $prepared = & $catalogEntry prepare -CatalogRoot $catalogRoot -CachePath $output.cachePath -ProfilePath $createdBaseline.data.modListPath -ModsPath $mods -BindToOverwrite -EvidenceDirectory $output.cacheEvidenceDirectory -BuildId $output.cachePrepareArguments.BuildId -ShaderCacheAbi $output.cachePrepareArguments.ShaderCacheAbi -WorkspaceId $createdBaseline.data.workspaceId -OwnershipId $createdBaseline.data.ownershipId -OwnerMarkerPath $output.ownerMarkerPath -OwnerMarkerSha256 $output.ownerMarkerSha256 -ShaderSourceSha256 ([string]::new([char]'A',64)) -RequireMaterializedOutput -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json
     Assert-Preserved ($prepared.ok) 'Normalized generation did not prepare.'
