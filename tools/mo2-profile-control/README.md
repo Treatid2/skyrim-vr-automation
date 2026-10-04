@@ -88,4 +88,24 @@ refresh cannot be proven, it returns `ok=false`, state
 `committed-refresh-required`, and retains the exact transaction receipt; it
 does not pretend the committed bytes were rolled back.
 
-Run `tests/Test-MO2ProfileControl.ps1` after changing the contract.
+## Disabled installed inventory (workspace-owned orchestration)
+
+`normalize-installed` appends only installed direct-child mods absent from the
+profile, as disabled markers. It preserves all original bytes and enabled order.
+`recover-disabled-append` removes at most 64 new disabled trailing markers only
+when the exact remaining bytes match `-PinnedProfileSha256`. It refuses enabled,
+reordered, duplicate, unknown, unsafe, reparse, or non-suffix drift. Strict UTF-8,
+16 MiB profile and 30-second planning budgets apply; inventory is bounded to
+20,000 direct directories, with no recursive shared-mod scan.
+
+Both commands require `-ExpectedCurrentSha256`, `-ModsDirectory`, closed MO2/game,
+and normal evidence/backup/journal/CAS/rollback. `ModName` remains required as an
+audit label, not a selected marker. They do not accept a human live-mutation
+capability. Operational callers use the workspace entry point, which derives
+the trusted pinned hash from existing ownership and plans; never manufacture
+a pinned hash or mutate active bindings through this lower-level primitive.
+An already exact/normalized profile is a mutation-free no-op, not a new receipt.
+
+Run `tests/Test-MO2ProfileControl.ps1` after changing the contract, and run
+`tests/Test-DisabledModlistReconciliation.ps1 -FixtureRoot <managed-fixture-root>`
+for the disabled inventory matrix.

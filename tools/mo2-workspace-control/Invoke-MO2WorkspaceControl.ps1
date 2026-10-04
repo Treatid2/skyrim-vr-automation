@@ -3,13 +3,15 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [ValidateSet('create', 'resume', 'requalify-output', 'stage-config', 'bind-config', 'complete-config', 'list-task', 'list-local-work-mods', 'inspect', 'fixture-status', 'refresh-fixture', 'prepare-source', 'complete-output', 'create-mod', 'register-mod', 'ensure-mod-wins', 'retire', 'release')]
+    [ValidateSet('create', 'resume', 'requalify-output', 'recover-disabled-append', 'normalize-installed', 'stage-config', 'bind-config', 'complete-config', 'list-task', 'list-local-work-mods', 'inspect', 'fixture-status', 'refresh-fixture', 'prepare-source', 'complete-output', 'create-mod', 'register-mod', 'ensure-mod-wins', 'retire', 'release')]
     [string]$Command,
 
     [string]$ConfigPath,
     [string]$AccessId,
     [string]$WorkspaceId,
     [string]$TaskId,
+    [ValidatePattern('^[A-Fa-f0-9]{64}$')]
+    [string]$ExpectedCurrentSha256,
     [string]$UnmanagedConfigPath,
     [string]$ConfigScopeNote,
     [string]$Label = 'task',
@@ -106,7 +108,7 @@ function New-WorkspaceApprovalMetadata([string]$Subcommand) {
     $hostExecutable = [string][Environment]::ProcessPath
     if ([string]::IsNullOrWhiteSpace($hostExecutable)) { $hostExecutable = [string](Get-Process -Id $PID -ErrorAction Stop).Path }
     $entryPoint = [IO.Path]::GetFullPath($PSCommandPath)
-    $oneShotCommands = @('requalify-output', 'stage-config', 'bind-config', 'complete-config', 'refresh-fixture', 'prepare-source', 'complete-output', 'retire', 'release')
+    $oneShotCommands = @('recover-disabled-append', 'normalize-installed', 'requalify-output', 'stage-config', 'bind-config', 'complete-config', 'refresh-fixture', 'prepare-source', 'complete-output', 'retire', 'release')
     return [pscustomobject][ordered]@{
         hostExecutable = $hostExecutable; entryPoint = $entryPoint; subcommand = $Subcommand
         reusablePrefix = @($hostExecutable, '-NoProfile', '-NonInteractive', '-File', $entryPoint, $Subcommand)
@@ -2424,6 +2426,7 @@ function Move-OverwriteShaderCachesToStableMod($Config, [string]$SourceName, [st
 }
 
 . (Join-Path $PSScriptRoot 'WorkspaceOutputRequalification.ps1')
+. (Join-Path $PSScriptRoot 'WorkspaceModlistReconciliation.ps1')
 $resolvedConfig = $null
 try {
     $script:TreeOperationDeadlineUtc = if ($InternalTestFailurePoint -eq 'tree-operation-deadline') { [DateTime]::UtcNow.AddMilliseconds(-1) } else { [DateTime]::UtcNow.AddSeconds($TreeOperationTimeoutSeconds) }
@@ -2700,6 +2703,9 @@ try {
                     $manifest.localWorkMods.application = $localWorkApplication
                     $runtimeRouteApplication = Set-WorkspaceRuntimeRouteSelection -ModListPath (Join-Path $profilePath 'modlist.txt') -Config $config -RuntimeRoute $runtimeRoute
                     $manifest.runtimeRouteApplication = $runtimeRouteApplication
+                    # MO2 inserts installed-but-unlisted mods on open. Pin the
+                    # complete disabled inventory in the clone, never the source.
+                    $manifest | Add-Member -NotePropertyName disabledInventory -NotePropertyValue (Invoke-WorkspaceProfileReconciliation -Config $config -ProfilePath $profilePath -Operation normalize-installed -ExpectedHash (Get-FileHash -LiteralPath (Join-Path $profilePath 'modlist.txt')).Hash -Evidence (Join-Path (Get-WorkspaceControlRoot $config) ($workspaceId + '-disabled-inventory-create'))) -Force
                     if ([string]$runtimeRoute.id -in @('SteamVR', 'SteamVRNull')) {
                         $routeValidation = Invoke-MO2Validate -Config $config -Profile $profileName -RequireClosed -RequireRuntimeRoute -OwnedAccessId $AccessId
                         $routeCheck = @($routeValidation.checks | Where-Object name -eq 'runtime-route-provider')
@@ -2909,6 +2915,17 @@ try {
             $result = [pscustomobject]@{ ok = $true; command = $Command; state = $data.state; data = $data }
         }
         else { $result = [pscustomobject]@{ ok = $true; command = $Command; state = 'dry-run'; data = @{ workspaceId = $WorkspaceId; sharedConfigChanged = $false } } }
+    }
+    elseif ($Command -in @('recover-disabled-append', 'normalize-installed')) {
+        $resolvedTaskId = Resolve-TaskId -RequestedTaskId $TaskId -Required
+        if ([string]::IsNullOrWhiteSpace($ExpectedCurrentSha256)) { throw 'Disabled inventory reconciliation requires explicit ExpectedCurrentSha256.' }
+        $owned = Read-OwnedWorkspace -Config $config -Id $WorkspaceId -OwnedAccessId $AccessId -ResolvedTaskId $resolvedTaskId
+        $approved = $PSCmdlet.ShouldProcess([string]$owned.data.profilePath, $Command)
+        $result = Invoke-WithWorkspaceTransactionLock -Config $config -Action {
+            $current = Read-OwnedWorkspace -Config $config -Id $WorkspaceId -OwnedAccessId $AccessId -ResolvedTaskId $resolvedTaskId
+            $null = Assert-AccessAndClosed -Config $config -OwnedAccessId $AccessId -Profile ([string]$current.data.profile) -AllowOverwriteShaderCaches
+            Invoke-WorkspaceModlistReconciliation -Config $config -Workspace $current -Operation $Command -ExpectedHash $ExpectedCurrentSha256 -Preview:(-not $approved)
+        }
     }
     elseif ($Command -eq 'complete-output') {
         $resolvedTaskId = Resolve-TaskId -RequestedTaskId $TaskId -Required

@@ -3,7 +3,7 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [ValidateSet('inspect', 'register', 'register-winning', 'add-enable', 'ensure-winner', 'enable', 'disable', 'restore')]
+    [ValidateSet('inspect', 'register', 'register-winning', 'add-enable', 'ensure-winner', 'enable', 'disable', 'restore', 'recover-disabled-append', 'normalize-installed')]
     [string]$Command,
 
     [Parameter(Mandatory)]
@@ -21,6 +21,12 @@ param(
     [string]$RelativeToMod,
 
     [string]$ModsDirectory,
+
+    [ValidatePattern('^[A-Fa-f0-9]{64}$')]
+    [string]$ExpectedCurrentSha256,
+
+    [ValidatePattern('^[A-Fa-f0-9]{64}$')]
+    [string]$PinnedProfileSha256,
 
     [string[]]$WinningPaths,
 
@@ -70,6 +76,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'DisabledModlistReconciliation.ps1')
 
 function Resolve-WinningPathInput([string[]]$Inline, [string]$File) {
     $values = [Collections.Generic.List[string]]::new()
@@ -704,6 +711,7 @@ if ($Command -ne 'inspect') {
     }
 }
 
+if ($Command -in @('recover-disabled-append', 'normalize-installed') -and (Get-Item -LiteralPath $resolvedProfile).Length -gt 16777216) { throw 'Disabled inventory modlist exceeds 16 MiB.' }
 $beforeBytes = [IO.File]::ReadAllBytes($resolvedProfile)
 $beforeMatches = @(Get-ModLineMatches -Bytes $beforeBytes -Name $ModName)
 $beforeLine = if ($beforeMatches.Count -eq 1) { Get-ModLineRecord -Bytes $beforeBytes -Name $ModName } else { $null }
@@ -751,7 +759,24 @@ $backupPath = Join-Path $resolvedEvidence 'modlist.before.bin'
 $receiptPath = Join-Path $resolvedEvidence 'modlist-control.receipt.json'
 $mutationApplied = $false
 
-if ($Command -eq 'add-enable') {
+if ($Command -in @('recover-disabled-append', 'normalize-installed')) {
+    if ($humanMutationAuthority) { throw 'Disabled inventory reconciliation requires closed MO2, not a human live-mutation capability.' }
+    if ([string]::IsNullOrWhiteSpace($ExpectedCurrentSha256) -or $beforeHash -cne $ExpectedCurrentSha256.ToUpperInvariant()) { throw 'Disabled inventory current-hash CAS mismatch or missing ExpectedCurrentSha256.' }
+    $plan = Get-DisabledModlistReconciliation -Bytes $beforeBytes -ModRoot $ModsDirectory -Operation $Command -PinnedHash $PinnedProfileSha256
+    $operationResult = [pscustomobject]@{ changed = $plan.changed; names = $plan.names; beforeSha256 = $beforeHash; intendedSha256 = $plan.sha256; originalBytesPreserved = $true; enabledOrderPreserved = $true }
+    if ($plan.changed -and (Test-ProfileShouldProcess -Caller $PSCmdlet -Target $resolvedProfile -Action $Command)) {
+        $receipt = [pscustomobject]@{ operation = $Command; profilePath = $resolvedProfile; modName = $ModName; modsDirectory = [IO.Path]::GetFullPath($ModsDirectory); reconciliation = $operationResult }
+        $postcondition = {
+            param([byte[]]$liveBytes)
+            if ((Get-BytesSha256 $liveBytes) -cne $plan.sha256) { throw 'Disabled reconciliation exact-byte postcondition failed.' }
+            foreach ($name in @($plan.names)) { Assert-InstalledModName -Name $name -ModRoot $ModsDirectory }
+            return [pscustomobject]@{ verified = $true; exactHash = $plan.sha256; enabledOrderPreserved = $true }
+        }
+        $null = Invoke-AuthorizedProfileMutation -Action { Invoke-ProfileMutationTransaction -Path $resolvedProfile -ExpectedBeforeBytes $beforeBytes -AfterBytes $plan.bytes -EvidenceRoot $resolvedEvidence -BackupPath $backupPath -ReceiptPath $receiptPath -Receipt $receipt -Postcondition $postcondition }
+        $mutationApplied = $true
+    }
+}
+elseif ($Command -eq 'add-enable') {
     if ($beforeMatches.Count -gt 1) { throw "Expected at most one modlist line for '$ModName'; found $($beforeMatches.Count)." }
     if ([string]::IsNullOrWhiteSpace($ModDirectory)) { throw '-ModDirectory is required for add-enable.' }
     if ([string]::IsNullOrWhiteSpace($ModsDirectory)) { throw '-ModsDirectory is required for add-enable.' }

@@ -203,6 +203,40 @@ exact ready workspace to the caller's new active lease only after closed-state,
 stable-source, task identity, and task-profile fingerprint proofs. It is
 one-shot because it replaces the workspace's retained ownership metadata.
 
+### MO2 installed-disabled append recovery
+
+MO2 can append installed mods missing from a profile when opening it. Fresh
+creation now normalizes that inventory in the task clone **before** output,
+build, cache, and configuration hashes are pinned. All added entries are
+disabled; the maintained source profile, fixture and shared mod bytes stay
+unchanged. New installs after pinning still require an explicit transition.
+
+If a retained prepared generation has already drifted, close MO2/game/loader,
+release its evidence session, and finish `complete-config` first. Invoke
+`recover-disabled-append` with the exact owning `AccessId`, `TaskId`,
+`WorkspaceId`, and an independently observed `ExpectedCurrentSha256` (preview
+with `-WhatIf`). The controller requires both original **prepared** cache and
+backup plans, exact owner marker, intact snapshot baselines, unchanged CSX build,
+and agreeing original profile hashes. Recovery accepts only at most 64 known
+installed, new disabled trailing lines whose removal restores the exact pinned
+bytes. It does not adopt semantic equivalence, change enabled order, rewrite
+plans or receipts, or reclassify output. Unknown/non-suffix drift fails closed.
+The ordinary profile transaction retains the entire current file as its exact
+backup and commits a durable CAS receipt, with rollback on failed postconditions.
+
+Success `pinned-profile-restored-completion-required` is cleanup authority, not
+launch readiness. Run ordinary catalog `complete -WorkingSetStatus unverified`
+(or the run's actual appropriate classification), then workspace `complete-output`.
+After fully proven output/config completion and owner release, run explicit
+`normalize-installed` with the current SHA and same ownership identities.
+Success `disabled-inventory-normalized-resume-required` requires ordinary
+`resume`, cache prepare, and fresh configuration stage/bind before launch. Old
+immutable generation plans remain untouched; resume derives new hashes from
+the actual normalized profile. Never normalize an active pinned generation.
+Both transitions are one-shot mutations. They neither launch applications nor
+retire/reset the task environment. Isolated acceptance is available via
+`tests/Test-MO2WorkspaceControl.ps1 -DisabledInventoryOnly -FixtureRoot <managed-root>`.
+
 ### Explicit candidate output requalification
 
 Every forward baseline restore publishes its receipt, committed journal,
