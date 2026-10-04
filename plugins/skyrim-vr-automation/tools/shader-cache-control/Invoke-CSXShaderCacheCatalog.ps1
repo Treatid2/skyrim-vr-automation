@@ -48,6 +48,9 @@ param(
     [string]$CompatibilityReason,
     [switch]$RequireMatch,
 
+    [string]$ResumeCompletionPath,
+    [string]$ExpectedResumeCompletionSha256,
+
     [switch]$RequireMaterializedOutput,
     [switch]$Promote,
     [ValidateSet('known-working', 'unverified', 'failed')]
@@ -580,7 +583,8 @@ function Get-CommittedRestoreProof(
     [string]$WorkingTreeSha256,
     [string]$SnapshotTransactionId,
     [Parameter(Mandatory)][string]$ExpectedNoOpPreservedPath,
-    [switch]$RecoverMissingNoOpJournal) {
+    [switch]$RecoverMissingNoOpJournal,
+    [switch]$HistoricalPreservedOnly) {
     if ([string]::IsNullOrWhiteSpace($ReceiptPath) -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) {
         throw 'Committed restore receipt is missing; recovery remains required.'
     }
@@ -622,15 +626,18 @@ function Get-CommittedRestoreProof(
     if ([string]$preserved.treeSha256 -ine $WorkingTreeSha256) {
         throw 'Preserved task output differs from the recorded working tree; recovery remains required.'
     }
-    $live = Invoke-Transaction 'inspect' @{ CachePath = $CachePath }
-    if ([string]$live.data.treeSha256 -ine $BaselineTreeSha256) {
-        throw 'Live cache no longer matches the exact restored baseline; recovery remains required.'
+    $live = $null
+    if (-not $HistoricalPreservedOnly) {
+        $live = Invoke-Transaction 'inspect' @{ CachePath = $CachePath }
+        if ([string]$live.data.treeSha256 -ine $BaselineTreeSha256) {
+            throw 'Live cache no longer matches the exact restored baseline; recovery remains required.'
+        }
     }
 
     $journalPath = Join-Path $resolvedEvidence "shader-cache-restore.$transactionId.journal.json"
     $journalRecovered = $false
     if (-not (Test-Path -LiteralPath $journalPath -PathType Leaf)) {
-        if (-not $RecoverMissingNoOpJournal -or $receiptOperation -cne 'restore-noop') {
+        if ($HistoricalPreservedOnly -or -not $RecoverMissingNoOpJournal -or $receiptOperation -cne 'restore-noop') {
             throw 'Committed restore journal is missing; recovery remains required.'
         }
         $recoveredUtc = [DateTime]::UtcNow.ToString('o')
@@ -670,7 +677,7 @@ function Get-CommittedRestoreProof(
         receipt = $receipt
         journal = $journal
         preserved = $preserved
-        live = $live.data
+        live = $(if ($null -ne $live) { $live.data } else { $null })
         data = [pscustomobject]@{
             displacedPath = $preservedPath
             baseline = [pscustomobject]@{ treeSha256 = [string]$receipt.restoredTreeSha256 }
@@ -1132,17 +1139,123 @@ function Complete-TaskProviderShadow($Binding, [string]$EvidenceRoot) {
     return [pscustomobject][ordered]@{ receiptPath = $receiptPath; receipt = $receipt }
 }
 
+function Get-SameTaskResume($Binding, [string]$CurrentEvidence) {
+    if ([string]::IsNullOrWhiteSpace($ResumeCompletionPath)) { return $null }
+    if ($null -eq $Binding -or [string]$Binding.mode -cne 'mo2-overwrite-output') {
+        throw 'Same-task resume requires the exact current -BindToOverwrite workspace owner.'
+    }
+    if ($AllowSourceMismatch -or $RequireMatch) {
+        throw 'Same-task resume cannot use -AllowSourceMismatch or -RequireMatch (known-working catalog admission).'
+    }
+    $expected = Assert-Hash $ExpectedResumeCompletionSha256 'ExpectedResumeCompletionSha256'
+    $completionPath = [IO.Path]::GetFullPath($ResumeCompletionPath)
+    Assert-CSXNoCacheReparsePoint -Path $completionPath -Purpose 'Same-task completion'
+    if ([IO.Path]::GetFileName($completionPath) -cne 'shader-cache-task.completion.json' -or
+        -not (Test-Path -LiteralPath $completionPath -PathType Leaf)) { throw 'Same-task resume requires an exact canonical completion file.' }
+    $priorEvidence = Split-Path -Parent $completionPath
+    if (Test-SamePath $priorEvidence $CurrentEvidence) { throw 'Same-task resume requires a new evidence directory, not its completed source.' }
+    if ((Get-FileHash -LiteralPath $completionPath -Algorithm SHA256).Hash -cne $expected) { throw 'Same-task completion SHA-256 mismatch.' }
+    $completion = Get-Content -LiteralPath $completionPath -Raw | ConvertFrom-Json -Depth 40
+    $priorPlanPath = Join-Path $priorEvidence 'shader-cache-task.plan.json'
+    Assert-CSXNoCacheReparsePoint -Path $priorPlanPath -Purpose 'Same-task plan'
+    $planHash = (Get-FileHash -LiteralPath $priorPlanPath -Algorithm SHA256).Hash
+    $priorPlan = Get-Content -LiteralPath $priorPlanPath -Raw | ConvertFrom-Json -Depth 40
+    if ([string]$completion.state -cne 'complete' -or [string]$priorPlan.state -cne 'restored' -or
+        -not (Test-SamePath ([string]$completion.planPath) $priorPlanPath) -or
+        -not (Test-SamePath ([string]$priorPlan.evidenceDirectory) $priorEvidence) -or
+        [string]$completion.workingTree.status -cne 'unverified' -or $null -ne $completion.promoted) {
+        throw 'Same-task resume requires a completed, restored, unverified, unpromoted task result.'
+    }
+    $oldBinding = $priorPlan.cacheBinding
+    foreach ($candidate in @($oldBinding, $completion.cacheBinding)) {
+        foreach ($field in @('mode', 'workspaceId', 'ownershipId', 'relativeCachePath', 'profileSha256')) {
+            if ([string]::IsNullOrWhiteSpace([string]$candidate.$field) -or [string]$candidate.$field -cne [string]$Binding.$field) {
+                throw "Same-task resume binding mismatch: $field"
+            }
+        }
+        foreach ($field in @('profilePath', 'modsPath', 'overwriteRoot', 'cachePath')) {
+            if (-not (Test-SamePath ([string]$candidate.$field) ([string]$Binding.$field))) { throw "Same-task resume binding mismatch: $field" }
+        }
+        foreach ($field in @('buildId', 'shaderCacheAbi', 'artifactSha256', 'artifactBytes', 'manifestSha256')) {
+            if ([string]$candidate.communityShadersPlugin.$field -cne [string]$Binding.communityShadersPlugin.$field) {
+                throw "Same-task resume plugin mismatch: $field"
+            }
+        }
+        foreach ($field in @('pluginPath', 'manifestPath')) {
+            if (-not (Test-SamePath ([string]$candidate.communityShadersPlugin.$field) ([string]$Binding.communityShadersPlugin.$field))) {
+                throw "Same-task resume plugin mismatch: $field"
+            }
+        }
+    }
+    $request = New-CompatibilityRecord
+    foreach ($field in @('shaderCacheAbi', 'gameRuntime', 'bytecodeCompatibilityClass', 'renderPath', 'shaderSourceSha256', 'buildId', 'presetSha256', 'featureSetSha256')) {
+        if ([string](Get-PropertyValue $priorPlan.request $field '') -cne [string]$request.$field) { throw "Same-task resume compatibility mismatch: $field" }
+    }
+    $priorTags = @(Get-NormalizedStrings @($priorPlan.request.tags))
+    foreach ($tag in @(Get-NormalizedStrings $RequiredTags)) { if ($priorTags -cnotcontains $tag) { throw "Same-task resume missing-tag:$tag" } }
+    if ((@(Get-NormalizedStrings $Tags) -join ',') -cne ($priorTags -join ',')) { throw 'Same-task resume compatibility mismatch: tags' }
+    $snapshotPath = Join-Path $priorEvidence 'shader-cache-transaction.receipt.json'
+    if (-not (Test-SamePath ([string]$priorPlan.transactionReceiptPath) $snapshotPath)) { throw 'Same-task snapshot receipt path mismatch.' }
+    Assert-CSXNoCacheReparsePoint -Path $snapshotPath -Purpose 'Same-task snapshot receipt'
+    $snapshotHash = (Get-FileHash -LiteralPath $snapshotPath -Algorithm SHA256).Hash
+    $snapshot = Get-Content -LiteralPath $snapshotPath -Raw | ConvertFrom-Json -Depth 30
+    $baseline = Assert-Hash ([string]$priorPlan.beforeTreeSha256) 'Same-task baseline'
+    $workingHash = Assert-Hash ([string]$completion.workingTree.inventory.treeSha256) 'Same-task working tree'
+    if ([string]$snapshot.operation -cne 'snapshot' -or [string]::IsNullOrWhiteSpace([string]$snapshot.transactionId) -or
+        -not (Test-SamePath ([string]$snapshot.cachePath) ([string]$Binding.cachePath)) -or
+        -not (Test-SamePath ([string]$priorPlan.cachePath) ([string]$Binding.cachePath)) -or
+        [string]$snapshot.beforeTreeSha256 -ine $baseline -or [string]$completion.restoredTreeSha256 -ine $baseline -or
+        [string]$priorPlan.workingTreeInventory.treeSha256 -ine $workingHash) { throw 'Same-task snapshot/completion lineage mismatch.' }
+    $receiptPath = [string]$priorPlan.restoreReceiptPath
+    Assert-CSXNoCacheReparsePoint -Path $receiptPath -Purpose 'Same-task restore receipt'
+    $receiptHash = (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash
+    $receipts = @(Get-ChildItem -LiteralPath $priorEvidence -Filter 'shader-cache-restore.*.receipt.json' -File -Force)
+    if ($receipts.Count -ne 1 -or -not (Test-SamePath $receipts[0].FullName $receiptPath)) { throw 'Same-task restore proof is missing or ambiguous.' }
+    # Validate the original committed lineage and preserved bytes, not today's
+    # shared live tree. Historical proof never repairs a missing journal.
+    $restoreRecord = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json -Depth 30
+    $journalPath = Join-Path $priorEvidence "shader-cache-restore.$($restoreRecord.transactionId).journal.json"
+    Assert-CSXNoCacheReparsePoint -Path $journalPath -Purpose 'Same-task restore journal'
+    $journalHash = (Get-FileHash -LiteralPath $journalPath -Algorithm SHA256).Hash
+    $proof = Get-CommittedRestoreProof -ReceiptPath $receiptPath -EvidenceRoot $priorEvidence -CachePath ([string]$Binding.cachePath) -BaselineTreeSha256 $baseline -WorkingTreeSha256 $workingHash -SnapshotTransactionId ([string]$snapshot.transactionId) -ExpectedNoOpPreservedPath ([string]$snapshot.backupPath) -HistoricalPreservedOnly
+    if (-not (Test-SamePath ([string]$completion.workingTree.preservedPath) ([string]$proof.data.displacedPath)) -or
+        [long]$proof.preserved.files -le 0 -or [long]$proof.preserved.files -ne [long]$completion.workingTree.inventory.files -or
+        [long]$proof.preserved.bytes -ne [long]$completion.workingTree.inventory.bytes) { throw 'Same-task preserved identity/counts mismatch or empty cache.' }
+    if ((Get-FileHash -LiteralPath $completionPath -Algorithm SHA256).Hash -cne $expected) { throw 'Same-task completion changed during validation.' }
+    foreach ($pin in @(@($priorPlanPath, $planHash), @($snapshotPath, $snapshotHash), @($receiptPath, $receiptHash), @($journalPath, $journalHash))) {
+        if ((Get-FileHash -LiteralPath $pin[0] -Algorithm SHA256).Hash -cne $pin[1]) { throw 'Same-task source proof changed during validation.' }
+    }
+    return [pscustomobject][ordered]@{
+        source = 'same-task-preserved-unverified'; status = 'unverified'; globalPromotion = $false
+        featureSetFingerprintKnown = -not [string]::IsNullOrWhiteSpace($FeatureSetSha256)
+        presetFingerprintKnown = -not [string]::IsNullOrWhiteSpace($PresetSha256)
+        completionPath = $completionPath; completionSha256 = $expected; planPath = $priorPlanPath
+        planSha256 = $planHash; snapshotReceiptPath = $snapshotPath; snapshotReceiptSha256 = $snapshotHash
+        restoreReceiptPath = $receiptPath; restoreReceiptSha256 = $receiptHash
+        restoreJournalPath = $journalPath; restoreJournalSha256 = $journalHash
+        workspaceId = [string]$Binding.workspaceId; ownershipId = [string]$Binding.ownershipId
+        cachePath = [string]$proof.data.displacedPath; treeSha256 = $workingHash
+        files = [long]$proof.preserved.files; bytes = [long]$proof.preserved.bytes
+    }
+}
+
 function Prepare-TaskCache($Storage) {
     Assert-CompatibilityInput
     $cacheResolution = Resolve-TaskCacheBinding
     $resolvedCache = [string]$cacheResolution.cachePath
     $evidence = Assert-SafeDirectory $EvidenceDirectory 'shader-cache task evidence'
     $planPath = Join-Path $evidence 'shader-cache-task.plan.json'
+    $resume = Get-SameTaskResume $cacheResolution.binding $evidence
     $existingPlan = $null
     if (Test-Path -LiteralPath $planPath -PathType Leaf) {
         $existingPlan = Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json -Depth 40
         if ([IO.Path]::GetFullPath([string]$existingPlan.cachePath) -ne $resolvedCache -or [IO.Path]::GetFullPath([string]$existingPlan.catalog.path) -ne [IO.Path]::GetFullPath([string]$Storage.path) -or [IO.Path]::GetFullPath([string]$existingPlan.evidenceDirectory) -ne $evidence) { throw 'Existing task cache plan owns different immutable source or target identities.' }
         if ([string]$existingPlan.state -notin @('snapshot-preserved', 'prepared')) { throw "Existing task cache plan is not resumable from state '$($existingPlan.state)'." }
+        $existingResume = Get-PropertyValue $existingPlan 'resume' $null
+        if (($null -eq $existingResume) -ne ($null -eq $resume) -or
+            ($null -ne $resume -and (($existingResume | ConvertTo-Json -Depth 10 -Compress) -cne ($resume | ConvertTo-Json -Depth 10 -Compress)))) {
+            throw 'Existing task cache plan owns different immutable resume proof.'
+        }
         $existingBinding = if ((Test-Property $existingPlan 'cacheBinding') -and $null -ne $existingPlan.cacheBinding) { $existingPlan.cacheBinding } else { $null }
         Assert-TaskCacheBindingCurrent $existingBinding
         if ($null -ne $cacheResolution.binding -and $null -ne $existingBinding -and
@@ -1156,17 +1269,18 @@ function Prepare-TaskCache($Storage) {
     }
     $selection = if ($null -ne $existingPlan) { $existingPlan.selection } else { Select-CatalogSnapshot $Storage }
     if ($RequireMatch -and $null -eq $selection.selected) { throw 'No compatible known-working shader-cache snapshot matched the task request.' }
+    $seedSource = if ($null -ne $resume) { $resume } else { $selection.selected }
 
     if ($WhatIfPreference) {
         $current = Invoke-Transaction 'inspect' @{ CachePath = $resolvedCache }
-        return [pscustomobject][ordered]@{ state = 'dry-run'; planPath = $planPath; current = $current.data; selection = $selection; cacheBinding = $cacheResolution.binding; requireMaterializedOutput = [bool]$RequireMaterializedOutput; action = $(if ($null -eq $selection.selected) { 'use-current-no-match' } elseif ([string]$selection.selected.treeSha256 -ieq [string]$current.data.treeSha256) { 'use-current-exact' } else { 'seed-selected' }) }
+        return [pscustomobject][ordered]@{ state = 'dry-run'; planPath = $planPath; current = $current.data; selection = $selection; resume = $resume; cacheBinding = $cacheResolution.binding; requireMaterializedOutput = [bool]$RequireMaterializedOutput; action = $(if ($null -eq $seedSource) { 'use-current-no-match' } elseif ([string]$seedSource.treeSha256 -ieq [string]$current.data.treeSha256) { if ($resume) { 'use-current-resume-exact' } else { 'use-current-exact' } } else { if ($resume) { 'seed-same-task-unverified' } else { 'seed-selected' } }) }
     }
 
     if ($null -ne $existingPlan -and [string]$existingPlan.state -eq 'prepared') {
         $current = Invoke-Transaction 'inspect' @{ CachePath = $resolvedCache }
         $expectedLiveHash = if (Test-Property $existingPlan 'preparedTreeSha256') { [string]$existingPlan.preparedTreeSha256 } elseif ([string]$existingPlan.action -eq 'seed-selected') { [string]$existingPlan.selection.selected.treeSha256 } else { [string]$existingPlan.beforeTreeSha256 }
         if ([string]$current.data.treeSha256 -ine $expectedLiveHash) { throw 'Prepared task cache plan no longer matches the exact live cache state.' }
-        return [pscustomobject][ordered]@{ state = 'already-prepared'; planPath = $planPath; action = [string]$existingPlan.action; selection = $existingPlan.selection; providerShadow = $(if (Test-Property $existingPlan 'providerShadow') { $existingPlan.providerShadow } else { $null }); before = @{ treeSha256 = [string]$existingPlan.beforeTreeSha256 }; seed = $null }
+        return [pscustomobject][ordered]@{ state = 'already-prepared'; planPath = $planPath; action = [string]$existingPlan.action; selection = $existingPlan.selection; resume = $resume; providerShadow = $(if (Test-Property $existingPlan 'providerShadow') { $existingPlan.providerShadow } else { $null }); before = @{ treeSha256 = [string]$existingPlan.beforeTreeSha256 }; seed = $null }
     }
     $snapshot = if ($null -ne $existingPlan) {
         [pscustomobject]@{ data = [pscustomobject]@{ receiptPath = [string]$existingPlan.transactionReceiptPath; inventory = [pscustomobject]@{ treeSha256 = [string]$existingPlan.beforeTreeSha256 } } }
@@ -1189,6 +1303,7 @@ function Prepare-TaskCache($Storage) {
         evidenceDirectory = $evidence
         request = New-CompatibilityRecord
         selection = $selection
+        resume = $resume
         action = $action
         transactionReceiptPath = [string]$snapshot.data.receiptPath
         beforeTreeSha256 = [string]$snapshot.data.inventory.treeSha256
@@ -1198,23 +1313,23 @@ function Prepare-TaskCache($Storage) {
         Assert-OverwriteOwnerBinding $cacheResolution.binding
         Write-JsonAtomic $planPath $plan -RefuseExisting
     }
-    if ($null -ne $selection.selected) {
-        if ([string]$selection.selected.treeSha256 -ieq [string]$snapshot.data.inventory.treeSha256) {
-            $action = 'use-current-exact'
+    if ($null -ne $seedSource) {
+        if ([string]$seedSource.treeSha256 -ieq [string]$snapshot.data.inventory.treeSha256) {
+            $action = if ($resume) { 'use-current-resume-exact' } else { 'use-current-exact' }
         }
         else {
             $seedArgs = @{
                 CachePath = $resolvedCache
                 EvidenceDirectory = $evidence
-                SourceCachePath = [string]$selection.selected.cachePath
-                ExpectedSourceTreeSha256 = [string]$selection.selected.treeSha256
+                SourceCachePath = [string]$seedSource.cachePath
+                ExpectedSourceTreeSha256 = [string]$seedSource.treeSha256
                 BlockingProcessNames = $BlockingProcessNames
                 Confirm = $false
             }
             if ($AllowSourceMismatch) { $seedArgs['CompatibilityReason'] = $CompatibilityReason }
             Assert-OverwriteOwnerBinding $cacheResolution.binding
             $seed = Invoke-Transaction 'seed' $seedArgs
-            $action = 'seed-selected'
+            $action = if ($resume) { 'seed-same-task-unverified' } else { 'seed-selected' }
         }
     }
     Assert-OverwriteOwnerBinding $cacheResolution.binding
@@ -1227,7 +1342,7 @@ function Prepare-TaskCache($Storage) {
     $plan | Add-Member -NotePropertyName preparedTreeSha256 -NotePropertyValue ([string]$preparedInventory.treeSha256) -Force
     Assert-OverwriteOwnerBinding $cacheResolution.binding
     Write-JsonAtomic $planPath $plan
-    return [pscustomobject][ordered]@{ state = 'prepared'; planPath = $planPath; action = $action; selection = $selection; providerShadow = $providerShadow; cacheBinding = $cacheResolution.binding; requireMaterializedOutput = [bool]$RequireMaterializedOutput; before = $snapshot.data.inventory; seed = $seed }
+    return [pscustomobject][ordered]@{ state = 'prepared'; planPath = $planPath; action = $action; selection = $selection; resume = $resume; providerShadow = $providerShadow; cacheBinding = $cacheResolution.binding; requireMaterializedOutput = [bool]$RequireMaterializedOutput; before = $snapshot.data.inventory; seed = $seed }
 }
 
 function Complete-TaskCache($Storage) {
@@ -1282,7 +1397,14 @@ function Complete-TaskCache($Storage) {
         (Test-Property $plan.providerShadow 'receipt') -and $null -ne $plan.providerShadow.receipt -and
         (Test-Property $plan.providerShadow.receipt 'preparedInventory')) { $plan.providerShadow.receipt.preparedInventory } else { $null }
     $materializedEntries = @(Get-TaskOutputEntries $currentBeforeRestore.data $preparedInventory)
-    if ($requireMaterialized -and $materializedEntries.Count -eq 0) {
+    # A failed/unverified run may never reach the compiler. Its unchanged
+    # prepared tree still needs preservation/restoration; absence of new output
+    # is not permission to promote it, nor to skip exact restore proof below.
+    $unchangedPreparedFailure = $WorkingSetStatus -in @('failed', 'unverified') -and
+        -not $Promote -and (Test-Property $plan 'preparedTreeSha256') -and
+        [string]$plan.preparedTreeSha256 -match '^[0-9a-fA-F]{64}$' -and
+        [string]$currentBeforeRestore.data.treeSha256 -ieq [string]$plan.preparedTreeSha256
+    if ($requireMaterialized -and $materializedEntries.Count -eq 0 -and -not $unchangedPreparedFailure) {
         $failurePath = Join-Path $evidence 'shader-cache-task.materialization-failure.json'
         $failure = [pscustomobject][ordered]@{
             contractVersion = $contractVersion; state = 'materialization-missing'
@@ -1355,7 +1477,7 @@ function Complete-TaskCache($Storage) {
         completedUtc = [DateTime]::UtcNow.ToString('o')
         planPath = $planPath
         cacheBinding = $cacheBinding
-        workingTree = [pscustomobject][ordered]@{ status = $WorkingSetStatus; inventory = $currentBeforeRestore.data; materializedFiles = $materializedEntries.Count; preservedPath = [string]$restore.data.displacedPath }
+        workingTree = [pscustomobject][ordered]@{ status = $WorkingSetStatus; inventory = $currentBeforeRestore.data; materializedFiles = $materializedEntries.Count; unchangedPreparedFailure = [bool]$unchangedPreparedFailure; preservedPath = [string]$restore.data.displacedPath }
         restoredTreeSha256 = [string]$restore.data.baseline.treeSha256
         promoted = $promoted
     }
@@ -1366,6 +1488,10 @@ function Complete-TaskCache($Storage) {
 
 $result = $null
 try {
+    if ((-not [string]::IsNullOrWhiteSpace($ResumeCompletionPath) -or -not [string]::IsNullOrWhiteSpace($ExpectedResumeCompletionSha256)) -and
+        ($Command -cne 'prepare' -or [string]::IsNullOrWhiteSpace($ResumeCompletionPath) -or [string]::IsNullOrWhiteSpace($ExpectedResumeCompletionSha256))) {
+        throw 'Resume completion path and SHA-256 must be supplied together, only to prepare.'
+    }
     $storage = Resolve-CatalogRoot
     if ($Command -eq 'list') {
         $layout = Get-CatalogLayout $storage
