@@ -104,4 +104,3 @@ try {
 } finally {
     foreach($name in @('AutoContinuityDispatches','AutoContinuityPoseBefore','AutoContinuityPoseAfter','AutoContinuityPackageBefore','AutoContinuityPackageAfter','AutoContinuityPackageReads','AutoContinuityPoseReads')){Remove-Variable -Scope Global -Name $name -ErrorAction SilentlyContinue}
 }
-
