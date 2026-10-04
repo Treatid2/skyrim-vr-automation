@@ -79,6 +79,27 @@ function Assert-GripFile($Record){
     if($item.PSIsContainer -or $item.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Artifact must be an ordinary file'}
     if((Get-FileHash -Algorithm SHA256 -LiteralPath $Record.path).Hash.ToLowerInvariant() -cne $Record.sha256){throw 'Pinned artifact hash changed'}
 }
+function Open-GripPinnedInput($Record,$Handles){
+    # Hash the held handle, never a second mutable pathname read. Concurrent
+    # writers/deleters are refused by the OS before this pin can be admitted.
+    if($Record.path -isnot [string] -or -not [IO.Path]::IsPathFullyQualified($Record.path) -or $Record.sha256 -cnotmatch '^[0-9a-f]{64}$'){throw 'Exact selected input required'}
+    $item=Get-Item -LiteralPath $Record.path
+    if($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Selected input must be an ordinary file'}
+    $handle=[IO.File]::Open($Record.path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    $Handles.Add($handle)
+    $hash=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($handle)).ToLowerInvariant();$handle.Position=0
+    if($hash -cne $Record.sha256){throw 'Pinned artifact hash changed'}
+    return $handle
+}
+function Protect-GripPlanInputs($Plan,[string]$LifecycleRoot,$Handles){
+    foreach($name in @('Invoke-NullHmdGripDiagnostic.ps1','GripLifecycle.Worker.ps1','GripLifecycle.Common.ps1')){
+        $path=[IO.Path]::GetFullPath((Join-Path $LifecycleRoot $name))
+        $pins=@($Plan.fixtureDependencies | Where-Object {[string]::Equals([IO.Path]::GetFullPath($_.path),$path,[StringComparison]::OrdinalIgnoreCase)})
+        if($pins.Count -ne 1){throw 'Every lifecycle script must have exactly one selected pin'}
+    }
+    foreach($key in @('nullControl','headControl','controllerControl','fixture','atomics','python','provider','openvr','poseProbe','nullProfile','boundedProcess')){[void](Open-GripPinnedInput $Plan[$key] $Handles)}
+    foreach($pin in $Plan.fixtureDependencies){[void](Open-GripPinnedInput $pin $Handles)}
+}
 function Assert-GripPlan($Plan){
     if($Plan.schemaVersion -cne 'null-grip-session.1' -or $Plan.diagnostic -cne 'fixed-grip-neutral-A-B' -or $Plan.standalone -isnot [bool] -or -not $Plan.standalone){throw 'Only the explicitly selected standalone grip diagnostic is supported'}
     foreach($key in @('nullControl','headControl','controllerControl','fixture','atomics','python','provider','openvr','poseProbe','nullProfile')){Assert-GripFile $Plan[$key]}

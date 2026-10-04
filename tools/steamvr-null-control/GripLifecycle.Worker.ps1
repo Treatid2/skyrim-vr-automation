@@ -9,10 +9,25 @@ param(
     [Parameter(Mandatory)][uint64]$PositiveDeadlineTickMs,
     [Parameter(Mandatory)][uint64]$CommonDeadlineTickMs,
     [string]$PlanPath,
+    [string]$ExpectedPlanSha256,
+    [string]$ExpectedWorkerSha256,
+    [string]$ExpectedCommonSha256,
     [string]$OfflineCase,
     [string]$CoordinatorFailureBase64
 )
 $ErrorActionPreference='Stop'
+$workerSelectedHandles=[Collections.Generic.List[IO.FileStream]]::new()
+try {
+if(-not $OfflineCase){
+    # Refuse outside cleanup before loading Common or reading any target value.
+    foreach($pin in @(@{path=$PlanPath;sha256=$ExpectedPlanSha256},@{path=$PSCommandPath;sha256=$ExpectedWorkerSha256},@{path=(Join-Path $PSScriptRoot 'GripLifecycle.Common.ps1');sha256=$ExpectedCommonSha256})){
+        if(-not [IO.Path]::IsPathFullyQualified($pin.path) -or $pin.sha256 -cnotmatch '^[0-9a-f]{64}$'){throw 'Exact selected worker/plan/Common identity required'}
+        $item=Get-Item -LiteralPath $pin.path
+        if($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Selected worker/plan/Common must be ordinary files'}
+        $handle=[IO.File]::Open($pin.path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read);$workerSelectedHandles.Add($handle)
+        if([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($handle)).ToLowerInvariant() -cne $pin.sha256){throw 'Selected worker/plan/Common hash changed before admission'}
+    }
+}
 . (Join-Path $PSScriptRoot 'GripLifecycle.Common.ps1')
 # Admission is outside the lifecycle try/finally. A foreign worker must not
 # inspect fixed ownership files, publish errors, stop or recover this session.
@@ -85,7 +100,7 @@ function Run-Assay([string]$Mode){
     $output=Join-Path $Root ($(if($OfflineCase){'injected-assay-'}else{'assay-'})+$Mode+'.json')
     $pwsh=(Get-Process -Id $PID).Path
     $phaseArgs=@('-NoProfile','-File',$PSCommandPath,'-Stage',('native-'+$Mode),'-Root',$Root,'-OuterNonce',$OuterNonce,'-OuterCreatorPid',$OuterCreatorPid.ToString(),'-OuterCreatorFileTime',$OuterCreatorFileTime,'-DeadlineTickMs',$PositiveDeadlineTickMs.ToString(),'-PositiveDeadlineTickMs',$PositiveDeadlineTickMs.ToString(),'-CommonDeadlineTickMs',$CommonDeadlineTickMs.ToString())
-    if($OfflineCase){$phaseArgs+=@('-OfflineCase',$OfflineCase,'-PlanPath',$PlanPath);$runner=$PlanPath;$working=$PSScriptRoot}else{$phaseArgs+=@('-PlanPath',$PlanPath);$runner=$plan.boundedProcess.path;$working=Split-Path -Parent $plan.fixture.path}
+    if($OfflineCase){$phaseArgs+=@('-OfflineCase',$OfflineCase,'-PlanPath',$PlanPath);$runner=$PlanPath;$working=$PSScriptRoot}else{$phaseArgs+=@('-PlanPath',$PlanPath,'-ExpectedPlanSha256',$ExpectedPlanSha256,'-ExpectedWorkerSha256',$ExpectedWorkerSha256,'-ExpectedCommonSha256',$ExpectedCommonSha256);$runner=$plan.boundedProcess.path;$working=Split-Path -Parent $plan.fixture.path}
     $cap=if($Mode -eq 'A'){60}else{7}
     $seconds=[int][Math]::Floor(([Math]::Min([long]$PositiveDeadlineTickMs-[long](Get-GripTick),$cap*1000)-750)/1000)
     if($seconds -lt 1){throw 'No assay budget remains inside common positive ceiling'}
@@ -113,7 +128,7 @@ function Run-Assay([string]$Mode){
 }
 try{
     if($OfflineCase){. (Join-Path $PSScriptRoot 'tests/GripLifecycle.Fixture.ps1')}
-    else{$script:plan=Read-GripJson $PlanPath;Assert-GripPlan $script:plan}
+    else{$script:plan=Read-GripJson $PlanPath;Protect-GripPlanInputs $script:plan $PSScriptRoot $workerSelectedHandles;Assert-GripPlan $script:plan}
     if($Stage -in @('native-A','native-B')){
         Assert-GripDeadline $PositiveDeadlineTickMs
         $mode=if($Stage -eq 'native-A'){'A'}else{'B'}
@@ -220,4 +235,5 @@ try{
     elseif($Stage -eq 'recovery' -and $script:postErrors.Count -gt 0){Save 'recovery-errors' @{verified=$false;errors=$script:postErrors.ToArray()}}
 }
 @{completed=$true;stage=$Stage;firstFailure=$script:firstFailure;postErrors=$script:postErrors.ToArray();outerSession=$script:outerSession} | ConvertTo-Json -Depth 5 -Compress
+}finally{foreach($handle in $workerSelectedHandles){$handle.Dispose()}}
 if($Stage -in @('native-A','native-B') -and $script:postErrors.Count -gt 0){exit 2}
