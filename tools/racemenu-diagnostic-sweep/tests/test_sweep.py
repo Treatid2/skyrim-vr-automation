@@ -362,7 +362,7 @@ class Entrypoint(unittest.TestCase):
             if real_capture: model['calls']=[]
             model_path=root/'model.json';model_path.write_text(json.dumps(model))
             identity=dict(listenerPid=1,processPath='fixture.exe',processStartTimeUtc='fixture',
-                          buildId='fixture',artifactPath='fixture.dll',artifactSha256='a'*64)
+                          buildId='fixture',artifactPath=str(root/'fixture.dll'),artifactSha256='a'*64)
             session=root/'session.json'
             session.write_text(json.dumps(dict(contractVersion='1.0.0',status='active',sessionId='fixture',
                                sessionDirectory=str(root),runtimeIdentity=identity,modelPath=str(model_path),
@@ -396,6 +396,8 @@ class Entrypoint(unittest.TestCase):
             self.assertEqual(model['retries'],0)
             self.assertLessEqual(model['timeout'],30)
             if real_capture:
+                if model['artifactExpectations']['artifactPath']:
+                    self.assertEqual(model['artifactExpectations'],{key:identity[key] for key in ('artifactPath','buildId','artifactSha256')})
                 observation=json.loads((root/'latest-observation.json').read_text(encoding='utf-8-sig'))
                 self.assertTrue(observation['game']['ok'])
                 self.assertTrue(observation['recording']['ok'])
