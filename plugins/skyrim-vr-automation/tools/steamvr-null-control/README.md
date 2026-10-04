@@ -129,6 +129,10 @@ coercing integers or decimals through a rounded floating-point type. Numerically
 identical spellings (`90.0`/`90`, `0.0`/`0`, and equivalent exponent forms) are
 formatting-only changes; actual value differences and non-finite values fail
 closed, including large integers that would become equal after lossy rounding.
+The same typed comparator governs `inspect` and startup admission for every
+controlled section. Boolean/number/string coercion and string-case drift do
+not count as a configured runtime; `start` refuses them before publishing a
+runtime attempt or launching. Equal numeric spellings remain admissible.
 Changes to a controller-owned key or any other section
 remain unclassified drift and fail closed. The validation route and exact
 difference paths are returned as `settingsRestoreValidation`; rollback retains
