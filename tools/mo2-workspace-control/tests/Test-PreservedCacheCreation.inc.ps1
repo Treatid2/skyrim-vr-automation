@@ -77,7 +77,7 @@ Assert-Preserved ((Get-FileHash -LiteralPath (Join-Path $cache 'fixture.bin')).H
 Assert-Preserved ((Get-TestProfileFingerprint $source) -ceq $originalSourceHash -and (Get-FileHash -LiteralPath $fixtureManifestPath).Hash -ceq $originalFixtureHash) 'Completion changed maintained fixture state.'
 if ($DisabledInventoryOnly) {
     $normalized = Invoke-DisabledCase normalize-installed
-    Assert-Preserved ($normalized.ok -and $normalized.state -eq 'disabled-inventory-normalized-resume-required') "Completed profile normalization failed: $($normalized.errors -join ';')"
+    Assert-Preserved ($normalized.ok -and $normalized.state -eq 'disabled-inventory-normalized-resume-required') "Completed profile normalization failed: $($normalized | ConvertTo-Json -Depth 12 -Compress)"
     Assert-Preserved (([IO.File]::ReadAllText($createdBaseline.data.modListPath)).Contains('-Late installed two')) 'Normalization omitted an installed disabled mod.'
     $newHash = (Get-FileHash -LiteralPath $createdBaseline.data.modListPath).Hash
     $resumed = & $entry resume -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $createdBaseline.data.workspaceId -NoExit -Confirm:$false | ConvertFrom-Json
