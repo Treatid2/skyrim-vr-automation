@@ -821,6 +821,59 @@ try {
     $startDry = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact | ConvertFrom-Json
     Assert-Test ($startDry.ok -and $startDry.state -eq 'dry-run' -and $startDry.data.startupPath -eq $startupPath) 'start dry-run validates the configured transaction and exact startup path'
 
+    # Exercise the public startup boundary with an actual fixture apply receipt.
+    # Every path/binary/provider is fixture-owned; an invalid value must refuse
+    # before any startup attempt, stage, launch or authoritative state change.
+    function Get-StartupFixtureEvidenceIdentity {
+        $members = @(Get-ChildItem -LiteralPath $evidence -File -Recurse |
+            Sort-Object FullName | ForEach-Object {
+                [ordered]@{ path = $_.FullName; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
+            })
+        return ConvertTo-Json -InputObject $members -Depth 6 -Compress
+    }
+    $trackingKey = @((Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json -AsHashtable).TrackingOverrides.Keys)[0]
+    $startupDriftCases = @(
+        @{ section = 'dashboard'; key = 'enableDashboard'; value = 0; label = 'false Boolean to zero' },
+        @{ section = 'steamvr'; key = 'requireHmd'; value = 'False'; label = 'false Boolean to string' },
+        @{ section = 'driver_null'; key = 'enable'; value = 1; label = 'true Boolean to one' },
+        @{ section = 'driver_codex_head_pose'; key = 'enable'; value = 1; label = 'head provider Boolean to one' },
+        @{ section = 'driver_null'; key = 'displayFrequency'; value = '90'; label = 'numeric frequency to string' },
+        @{ section = 'driver_codex_head_pose'; key = 'positionX'; value = $false; label = 'numeric zero to Boolean' },
+        @{ section = 'steamvr'; key = 'forcedDriver'; value = 'NULL'; label = 'forced driver string case drift' },
+        @{ section = 'driver_null'; key = 'serialNumber'; value = 'fixture'; label = 'driver identity string case drift' },
+        @{ section = 'TrackingOverrides'; key = $trackingKey; value = '/USER/HEAD'; label = 'tracking override string case drift' },
+        @{ section = 'dashboard'; key = 'enableDashboard'; value = $null; label = 'Boolean to null' },
+        @{ section = 'dashboard'; key = 'enableDashboard'; remove = $true; label = 'missing controlled leaf' }
+    )
+    foreach ($case in $startupDriftCases) {
+        $drift = $appliedText | ConvertFrom-Json -AsHashtable
+        if ($case.ContainsKey('remove')) { $drift[$case.section].Remove($case.key) }
+        else { $drift[$case.section][$case.key] = $case.value }
+        [IO.File]::WriteAllText($settingsPath, ($drift | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+        $settingsIdentity = (Get-FileHash -LiteralPath $settingsPath).Hash
+        $registrationIdentity = (Get-FileHash -LiteralPath $openVrPathsPath).Hash
+        $journalIdentity = (Get-FileHash -LiteralPath $inspectConfigured.data.targetControl.journalPath).Hash
+        $evidenceIdentity = Get-StartupFixtureEvidenceIdentity
+        $typedInspect = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact -NoExit | ConvertFrom-Json
+        Assert-Test ($typedInspect.ok -and $typedInspect.state -eq 'null-inactive' -and -not $typedInspect.data.effective.active -and -not $typedInspect.data.runtime.active) "public inspect refuses active configuration for $($case.label)"
+        foreach ($preview in @($true, $false)) {
+            $typedStart = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf:$preview -Compact -NoExit | ConvertFrom-Json
+            Assert-Test (-not $typedStart.ok -and $typedStart.state -eq 'null-not-configured' -and -not $typedStart.data.effective.active -and -not $typedStart.data.runtime.active -and 'runtimeAttemptId' -notin @($typedStart.data.PSObject.Properties.Name)) "public start preview=$preview refuses $($case.label) before an attempt or launch"
+        }
+        Assert-Test ((Get-FileHash -LiteralPath $settingsPath).Hash -ceq $settingsIdentity -and
+            (Get-FileHash -LiteralPath $openVrPathsPath).Hash -ceq $registrationIdentity -and
+            (Get-FileHash -LiteralPath $inspectConfigured.data.targetControl.journalPath).Hash -ceq $journalIdentity -and
+            (Get-StartupFixtureEvidenceIdentity) -ceq $evidenceIdentity) "startup refusal preserves settings, registrations, journal, receipt and all attempt/stage evidence for $($case.label)"
+    }
+    $numericEquivalent = $appliedText | ConvertFrom-Json -AsHashtable
+    $numericEquivalent.driver_null.displayFrequency = 90
+    foreach ($key in @('positionX', 'positionZ', 'yawDegrees', 'pitchDegrees', 'rollDegrees')) { $numericEquivalent.driver_codex_head_pose[$key] = 0 }
+    [IO.File]::WriteAllText($settingsPath, ($numericEquivalent | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+    $numericInspect = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact -NoExit | ConvertFrom-Json
+    $numericStart = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($numericInspect.ok -and $numericInspect.data.effective.active -and $numericStart.ok -and $numericStart.state -eq 'dry-run') 'public inspect/start accept equal JSON numeric spellings without a runtime launch'
+    [IO.File]::WriteAllText($settingsPath, $appliedText, [Text.UTF8Encoding]::new($false))
+
     [ordered]@{ name = 'VirtualDesktop'; alwaysActivate = $true; redirectsDisplay = $true } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $externalDriverRoot 'driver.vrdrivermanifest') -Encoding utf8
     [ordered]@{ version = 1; external_drivers = @($headPoseDriverRoot, $externalDriverRoot) } | ConvertTo-Json | Set-Content -LiteralPath $openVrPathsPath -Encoding utf8
     $virtualDesktopInspect = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json

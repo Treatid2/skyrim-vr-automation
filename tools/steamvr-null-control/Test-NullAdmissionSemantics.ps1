@@ -9,7 +9,7 @@ $entry = Join-Path $PSScriptRoot 'Invoke-SteamVRNullControl.ps1'
 $parseErrors = $null; $tokens = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($entry,[ref]$tokens,[ref]$parseErrors)
 Assert-Semantic (@($parseErrors).Count -eq 0) 'entry point parses without errors'
-foreach ($name in @('ConvertTo-CanonicalJsonValue','Get-JsonSemanticSha256','Test-JsonDictionaryContains','Get-JsonNumberIdentity','Test-JsonValueEquivalent','Get-JsonDifferencePaths','Get-SettingsRestoreValidation','Get-MO2ProviderInventoryEvidence','Assert-MO2NullAdmissionMatchesReceipt')) {
+foreach ($name in @('ConvertTo-CanonicalJsonValue','Get-JsonSemanticSha256','Test-JsonDictionaryContains','Get-JsonNumberIdentity','Test-JsonValueEquivalent','Get-JsonDifferencePaths','Get-SettingsRestoreValidation','Get-MO2ProviderInventoryEvidence','Assert-MO2NullAdmissionMatchesReceipt','Get-EffectiveState')) {
     $node = @($ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true))[0]
     Invoke-Expression $node.Extent.Text
 }
@@ -27,6 +27,30 @@ foreach ($pair in @(@(90.0,91),@(0.0,0.0001),@([double]1e-10,[double]1e-11),@(-9
     Assert-Semantic (-not (Test-JsonValueEquivalent $pair[0] $pair[1])) 'different values or nonnumeric/nonfinite kinds never qualify'
 }
 Assert-Semantic (-not (Test-JsonValueEquivalent ([long]9007199254740993) ([double]9007199254740992))) 'numeric comparison cannot round a large integer into equality'
+$effectiveProfile = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../../profiles/steamvr-null.profile.json') -Raw | ConvertFrom-Json -AsHashtable
+Assert-Semantic (Get-EffectiveState (Clone-Value $effectiveProfile) $effectiveProfile).active 'production effective-state function admits its exact typed profile'
+$trackingKey = @($effectiveProfile.TrackingOverrides.Keys)[0]
+foreach ($case in @(
+    @{section='dashboard';key='enableDashboard';value=0},
+    @{section='steamvr';key='requireHmd';value='False'},
+    @{section='driver_null';key='enable';value=1},
+    @{section='driver_codex_head_pose';key='enable';value=1},
+    @{section='driver_null';key='displayFrequency';value='90'},
+    @{section='driver_codex_head_pose';key='positionX';value=$false},
+    @{section='steamvr';key='forcedDriver';value='NULL'},
+    @{section='TrackingOverrides';key=$trackingKey;value='/USER/HEAD'},
+    @{section='dashboard';key='enableDashboard';value=$null}
+)) {
+    $changed = Clone-Value $effectiveProfile
+    $changed[$case.section][$case.key] = $case.value
+    $effective = Get-EffectiveState $changed $effectiveProfile
+    Assert-Semantic (-not $effective.active -and -not $effective.checks["$($case.section).$($case.key)"].matches) "production effective-state rejects typed/ordinal drift: $($case.section).$($case.key)"
+}
+$missing = Clone-Value $effectiveProfile; $missing.dashboard.Remove('enableDashboard')
+Assert-Semantic (-not (Get-EffectiveState $missing $effectiveProfile).active) 'production effective-state rejects missing Boolean leaf'
+$numeric = Clone-Value $effectiveProfile; $numeric.driver_null.displayFrequency = 90
+foreach ($key in @('positionX','positionZ','yawDegrees','pitchDegrees','rollDegrees')) { $numeric.driver_codex_head_pose[$key] = 0 }
+Assert-Semantic (Get-EffectiveState $numeric $effectiveProfile).active 'production effective-state admits equivalent JSON numeric spellings'
 $inventory = [ordered]@{profile='task';modListPath='C:\fixture\profiles\task\modlist.txt';providers=@([ordered]@{classification='OCU';modName='OCU';modPath='C:\fixture\mods\OCU';lineNumber=85;marker='-';enabled=$false;markers=[ordered]@{rootOpenVrApi=$true;rootOpenCompositeIni=$true;openCompositeInput=$false}});errors=@()}
 function New-Admission($Inventory) {
     $proof = Get-MO2ProviderInventoryEvidence $Inventory

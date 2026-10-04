@@ -1019,35 +1019,35 @@ function Get-EffectiveState {
         $checks["steamvr.$key"] = [ordered]@{
             actual = if ($steamvr.ContainsKey($key)) { $steamvr[$key] } else { $null }
             expected = $expectedSteamVR[$key]
-            matches = $steamvr.ContainsKey($key) -and $steamvr[$key] -eq $expectedSteamVR[$key]
+            matches = $steamvr.ContainsKey($key) -and (Test-JsonValueEquivalent $expectedSteamVR[$key] $steamvr[$key])
         }
     }
     foreach ($key in $expectedDashboard.Keys) {
         $checks["dashboard.$key"] = [ordered]@{
             actual = if ($dashboard.ContainsKey($key)) { $dashboard[$key] } else { $null }
             expected = $expectedDashboard[$key]
-            matches = $dashboard.ContainsKey($key) -and $dashboard[$key] -eq $expectedDashboard[$key]
+            matches = $dashboard.ContainsKey($key) -and (Test-JsonValueEquivalent $expectedDashboard[$key] $dashboard[$key])
         }
     }
     foreach ($key in @('enable', 'serialNumber', 'modelNumber', 'windowWidth', 'windowHeight', 'renderWidth', 'renderHeight', 'displayFrequency')) {
         $checks["driver_null.$key"] = [ordered]@{
             actual = if ($driver.ContainsKey($key)) { $driver[$key] } else { $null }
             expected = $expectedDriver[$key]
-            matches = $driver.ContainsKey($key) -and $driver[$key] -eq $expectedDriver[$key]
+            matches = $driver.ContainsKey($key) -and (Test-JsonValueEquivalent $expectedDriver[$key] $driver[$key])
         }
     }
     foreach ($key in $expectedHeadPoseDriver.Keys) {
         $checks["driver_codex_head_pose.$key"] = [ordered]@{
             actual = if ($headPoseDriver.ContainsKey($key)) { $headPoseDriver[$key] } else { $null }
             expected = $expectedHeadPoseDriver[$key]
-            matches = $headPoseDriver.ContainsKey($key) -and $headPoseDriver[$key] -eq $expectedHeadPoseDriver[$key]
+            matches = $headPoseDriver.ContainsKey($key) -and (Test-JsonValueEquivalent $expectedHeadPoseDriver[$key] $headPoseDriver[$key])
         }
     }
     foreach ($key in $expectedTrackingOverrides.Keys) {
         $checks["TrackingOverrides.$key"] = [ordered]@{
             actual = if ($trackingOverrides.ContainsKey($key)) { $trackingOverrides[$key] } else { $null }
             expected = $expectedTrackingOverrides[$key]
-            matches = $trackingOverrides.ContainsKey($key) -and $trackingOverrides[$key] -eq $expectedTrackingOverrides[$key]
+            matches = $trackingOverrides.ContainsKey($key) -and (Test-JsonValueEquivalent $expectedTrackingOverrides[$key] $trackingOverrides[$key])
         }
     }
     return [pscustomobject][ordered]@{
