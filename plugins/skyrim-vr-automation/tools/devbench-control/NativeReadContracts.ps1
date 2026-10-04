@@ -6,7 +6,7 @@ function Get-DevBenchNativeReadReasons {
     function Member($Node, [string]$Name) {
         if ($Node -isnot [pscustomobject]) { return $null }
         $p = $Node.PSObject.Properties[$Name]
-        if ($p -and $p.Name -ceq $Name) { return $p.Value }
+        if ($p -and $p.Name -ceq $Name) { return ,$p.Value }
         return $null
     }
     function Require([bool]$Good, [string]$Path) { if (-not $Good) { $reasons.Add("Native $Kind read: $Path is missing, malformed or unsupported.") } }
@@ -112,6 +112,63 @@ function Get-DevBenchNativeReadReasons {
         }
         # Acceptance proves schema only. Stale, unmatched or inactive eyes remain raw
         # observations, not same-frame vendor/HDR/RS experiment qualification.
+    }
+    elseif ($Kind -ceq 'colour-probe-status') {
+        # f362 BuildStatus schema3 is deliberately not an arm/read/reset receipt.
+        foreach ($key in $Arguments.Keys) { Require ($key -cin @('action','expectedBuildId')) "unknown status parameter $key" }
+        foreach ($name in @('action','accepted','stage','eye','frame','pages','samples','metadata')) { Require (-not $Payload.PSObject.Properties[$name]) "status cannot qualify mutation/page receipt $name" }
+        $producer=Member $Payload 'producer'
+        Literal $producer 'component' 'CommunityShaders' 'producer'
+        foreach ($pair in @(@('buildId',64),@('shaderCacheAbiId',64),@('sourceCommit',40))) {
+            $value=Member $producer $pair[0]; Require ($value -is [string] -and $value -cmatch ('^[0-9a-f]{'+$pair[1]+'}$')) "producer.$($pair[0])"
+        }
+        Boolean $producer 'sourceDirty' 'producer'
+        if ($Arguments.Contains('expectedBuildId')) { Require ($Arguments['expectedBuildId'] -is [string] -and $Arguments['expectedBuildId'] -ceq (Member $producer 'buildId')) 'producer expectedBuildId binding' }
+        Require (UInt (Member $Payload 'schemaVersion') 3 3) 'schemaVersion3'
+        $state=Member $Payload 'state'
+        Require ($state -is [string] -and $state -cin @('idle','armed','capturing','readback_pending','complete','failed')) 'source-bound probe state'
+        foreach ($name in @('generation','expectedColourContractRevision','armedQpc','queryQueuedQpc','completedQpc','stagingPayloadBytes')) { Require (UInt (Member $Payload $name)) $name }
+        Require (UInt (Member $Payload 'expectedStageEyeSlots') 10 10) 'expectedStageEyeSlots10'
+        Require (UInt (Member $Payload 'maximumStagingPayloadBytes') 1073741824 1073741824) 'maximumStagingPayloadBytes1GiB'
+        Require (UInt (Member $Payload 'timeoutSeconds') 15 15) 'timeoutSeconds15'
+        foreach ($name in @('queuedStageEyeSlots','mappedStageEyeSlots')) { Require (UInt (Member $Payload $name) 10) $name }
+        $queued=Member $Payload 'queuedStageEyeSlots';$mapped=Member $Payload 'mappedStageEyeSlots';$bytes=Member $Payload 'stagingPayloadBytes'
+        if ((UInt $queued 10) -and (UInt $mapped 10)) { Require ($mapped -le $queued) 'mapped/queued slot ordering' }
+        if (UInt $bytes) { Require ($bytes -le 1073741824) 'bounded staging payload' }
+        foreach ($name in @('sceneEpoch','submissionEpoch')) { Require ($Payload.PSObject.Properties[$name] -and $null -eq (Member $Payload $name)) "$name explicit null (schema3 attribution unavailable)" }
+        $cpu=Member $Payload 'cpuFrame'
+        Require ($Payload.PSObject.Properties['cpuFrame'] -and ($null -eq $cpu -or (UInt $cpu ([uint32]::MaxValue) 1))) 'cpuFrame explicit null or positive uint32'
+        $capture=Member $Payload 'captureId'
+        Require ($capture -is [string] -and [Text.Encoding]::UTF8.GetByteCount($capture) -le 128) 'captureId string/128 UTF8 bytes'
+        $error=Member $Payload 'error'
+        Require ($Payload.PSObject.Properties['error'] -and ($null -eq $error -or ($error -is [string] -and -not [string]::IsNullOrWhiteSpace($error)))) 'error explicit null or nonempty text'
+        if ($state -ceq 'failed') { Require ($error -is [string] -and -not [string]::IsNullOrWhiteSpace($error)) 'failed state retains failure evidence' }
+        else { Require ($null -eq $error) 'nonfailed state has explicit null error' }
+        if ($state -ceq 'idle') {
+            Require ($capture -is [string] -and $capture -ceq '' -and $null -eq $cpu) 'idle cleared capture/frame'
+            foreach ($name in @('expectedColourContractRevision','armedQpc','queryQueuedQpc','completedQpc','stagingPayloadBytes','queuedStageEyeSlots','mappedStageEyeSlots')) { Require (UInt (Member $Payload $name) 0) "idle cleared $name" }
+            # Reset increments generation and then clears state; idle generation need not be zero.
+        } elseif ($state -is [string] -and $state -cin @('armed','capturing','readback_pending','complete','failed')) {
+            Require ($capture -is [string] -and $capture.Length -gt 0) 'owned capture identity'
+            foreach ($name in @('generation','expectedColourContractRevision')) { Require (UInt (Member $Payload $name) ([uint64]::MaxValue) 1) "owned $name" }
+            if ($state -ceq 'armed') {
+                Require ($null -eq $cpu) 'armed frame not yet selected'
+                foreach ($name in @('queryQueuedQpc','completedQpc','stagingPayloadBytes','queuedStageEyeSlots','mappedStageEyeSlots')) { Require (UInt (Member $Payload $name) 0) "armed pre-acquisition $name" }
+            }
+            if ($state -cin @('armed','capturing','readback_pending')) { Require (UInt (Member $Payload 'completedQpc') 0) 'active state has no completion QPC' }
+            if ($state -ceq 'capturing') { foreach ($name in @('mappedStageEyeSlots','queryQueuedQpc')) { Require (UInt (Member $Payload $name) 0) "capturing before readback $name" } }
+            if ($state -cin @('readback_pending','complete')) { Require (UInt $queued 10 10) 'all stage-eye slots queued' }
+            if ($state -ceq 'complete') { Require (UInt $mapped 10 10) 'complete mapped stage-eye inventory' }
+            if ($state -cne 'failed' -and (UInt $queued 10) -and $queued -gt 0) { Require (UInt $bytes 1073741824 1) 'queued slots retain positive bounded staging payload' }
+        }
+        $armed=Member $Payload 'armedQpc';$query=Member $Payload 'queryQueuedQpc';$ended=Member $Payload 'completedQpc'
+        if ((UInt $armed) -and (UInt $query) -and $armed -gt 0 -and $query -gt 0) { Require ($query -ge $armed) 'query/armed QPC order' }
+        if ((UInt $ended) -and $ended -gt 0) {
+            if ((UInt $armed) -and $armed -gt 0) { Require ($ended -ge $armed) 'completion/armed QPC order' }
+            if ((UInt $query) -and $query -gt 0) { Require ($ended -ge $query) 'completion/query QPC order' }
+        }
+        # QPC zero is source-supported when QueryPerformanceCounter fails. Neither
+        # a complete state nor schema acceptance proves sample/epoch/science quality.
     }
     else { Require $false 'unregistered read contract' }
     return @($reasons)
