@@ -553,6 +553,7 @@ function Test-DevBenchReadOnlyRequest {
     }
     if ($ToolName -eq 'menu') { return $action -eq 'list' }
     if ($ToolName -ceq 'camera') { return $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'get' }
+    if ($ToolName -ceq 'communityshaders.menu') { return $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status' -and @($Arguments.Keys | Where-Object { $_ -cnotin @('action','expectedBuildId') }).Count -eq 0 }
     if ($ToolName -eq 'record') { return $action -eq 'status' }
     if ($ToolName -ceq 'input') { return $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -cin @('observe', 'status', 'capabilities') }
     if ($ToolName -ceq 'communityshaders.fsr_color_contract') { return $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status' -and -not $Arguments.Contains('expectedRevision') -and -not $Arguments.Contains('highDynamicRangeInput') -and -not $Arguments.Contains('autoExposure') }
@@ -633,7 +634,8 @@ function Get-DevBenchCallSemanticStatus {
         Get-DevBenchSemanticStatus -Content $Content -UnsignedTelemetryStatePaths 'content.status.vendorWorkGate.state'
     } else { Get-DevBenchSemanticStatus -Content $Content }
     $payloads = @($Content)
-    $nativeReadKind = if ($ToolName -ceq 'input' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'capabilities') { 'input-capabilities' }
+    $nativeReadKind = if ($ToolName -ceq 'communityshaders.menu' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status') { 'menu-status' }
+        elseif ($ToolName -ceq 'input' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'capabilities') { 'input-capabilities' }
         elseif ($ToolName -ceq 'communityshaders.fsr_color_contract' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status') { 'fsr-colour-status' }
         elseif ($ToolName -ceq 'communityshaders.colour_pipeline_probe' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status') { 'colour-probe-status' } else { $null }
     if ($nativeReadKind) {
@@ -647,6 +649,7 @@ function Get-DevBenchCallSemanticStatus {
         $semantic.explicitOutcomeEvidence = if ($semantic.ok) { @("native-$nativeReadKind-typed-observation") } else { @() }
         if ($nativeReadKind -ceq 'input-capabilities') { $semantic | Add-Member -NotePropertyName qualifiedInputCapabilities -NotePropertyValue $(if ($semantic.ok) { $payload } else { $null }) }
         if ($nativeReadKind -ceq 'colour-probe-status') { $semantic | Add-Member -NotePropertyName qualifiedColourProbeStatus -NotePropertyValue $(if ($semantic.ok) { $payload } else { $null }) }
+        if ($nativeReadKind -ceq 'menu-status') { $semantic | Add-Member -NotePropertyName qualifiedMenuStatus -NotePropertyValue $(if ($semantic.ok) { $payload } else { $null }) }
         $semantic | Add-Member -NotePropertyName completionBasis -NotePropertyValue 'read-schema-only'
         return $semantic
     }
