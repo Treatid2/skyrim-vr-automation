@@ -7,7 +7,7 @@ $checks=0
 function Require([bool]$Condition,[string]$Message){if(-not $Condition){throw $Message};$script:checks++}
 $root=Join-Path ([IO.Path]::GetFullPath($FixtureRoot)) ('calendar-entry-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
-$cases=@('healthy','failed-observation','generation','release-failed','cell-recovered','cell-foreign-rate','cell-new-globals','cell-unavailable','cell-no-transition','cell-lease-id')
+$cases=@('healthy','failed-observation','generation','release-failed','cell-recovered','cell-foreign-rate','cell-new-globals','cell-unavailable','cell-no-transition','cell-lease-id','scene-status','scene-release','scene-release-restored-false','scene-release-ok-false','scene-release-lease-id','scene-release-binding','scene-generation','scene-globals','scene-session','scene-unavailable','scene-rate','scene-transition-missing','scene-transition-reason','scene-transition-ok-false','scene-transition-restored-false','scene-unknown-reason')
 foreach($case in $cases) {
     $fixture=Join-Path $root $case;New-Item -ItemType Directory -Path $fixture | Out-Null
     $start=[Diagnostics.ProcessStartInfo]::new()
@@ -33,11 +33,23 @@ foreach($case in $cases) {
         $release=@($events|Where-Object {$_.method -eq 'tools/call' -and $_.arguments.name -eq 'calendar' -and $_.arguments.arguments.action -eq 'release'})[0].arguments.arguments
         Require (($release.binding|ConvertTo-Json -Depth 10 -Compress) -ceq ($hold.binding|ConvertTo-Json -Depth 10 -Compress) -and $release.leaseId -ceq 'fixture-lease' -and $release.owner -ceq $hold.owner -and $release.commandId -cne $hold.commandId) "$case lost original release custody"
         Require ($events[-1].method -eq 'DELETE' -and $response.sessionCleanup.ok) "$case closed session before terminal calendar work"
-        Require ($response.data.restorationVerified -eq ($case -in @('healthy','failed-observation','cell-recovered'))) "$case incorrect restoration claim"
+        Require ($response.data.restorationVerified -eq ($case -in @('healthy','failed-observation','cell-recovered','scene-status','scene-release'))) "$case incorrect restoration claim"
         if($case.StartsWith('cell-')) {
             Require (-not $response.data.continuityVerified -and -not $response.ok) "$case turned cell drift into a successful observation"
             Require ($response.data.indeterminate -eq ($case -ne 'cell-recovered')) "$case confused positively verified cleanup and uncertainty"
             Require (@($events|Where-Object {$_.method -eq 'tools/call' -and $_.arguments.name -eq 'inspect' -and $_.arguments.arguments.kind -eq 'state'}).Count -eq 0) "$case dispatched observation after cell drift"
+        }
+        if($case.StartsWith('scene-')) {
+            $positive=$case -cin @('scene-status','scene-release')
+            Require (-not $response.data.continuityVerified -and -not $response.ok) "$case promoted scene loss into scientific success"
+            Require ($response.data.indeterminate -ne $positive) "$case confused positive native cleanup and uncertainty"
+            $automatic=@($events|Where-Object method -eq 'native-auto-restore')
+            Require ($automatic.Count -eq 1 -and $automatic[0].arguments.reason -ceq 'scene_lost' -and $automatic[0].arguments.writes -eq 1) "$case omitted or replayed native automatic restoration"
+            $observationIndexes=@(for($i=0;$i -lt $events.Count;$i++){if($events[$i].method -eq 'tools/call' -and $events[$i].arguments.name -eq 'inspect' -and $events[$i].arguments.arguments.kind -eq 'state'){$i}})
+            if($case -ceq 'scene-release') {
+                $changeIndex=@(for($i=0;$i -lt $events.Count;$i++){if($events[$i].method -eq 'native-scene-change'){$i}})
+                Require ($observationIndexes.Count -eq 1 -and $changeIndex.Count -eq 1 -and $observationIndexes[0] -lt $changeIndex[0]) "$case dispatched observation after drift"
+            } else {Require ($observationIndexes.Count -eq 0) "$case dispatched observation after automatic scene cleanup"}
         }
         $journal=Get-Content -LiteralPath $response.invocationEvidencePath -Raw | ConvertFrom-Json -Depth 50
         Require ($journal.calendarDispatchArguments.action -eq 'release' -and $journal.sessionCleanup.ok) "$case lost dispatch/cleanup custody"
