@@ -1,0 +1,158 @@
+{
+  "description": "Versioned, explicitly bounded CSX render-map diagnostic capture. Capture is off by default; start retains runtime provenance and its response before hook activation. Registry/status expose independent persistent shader limits and diagnostic failureCount; post-success shader observations cannot change native results. Stop requires the original capture-start provenance; events are read only after stop. The VR-only main_post_processing selector arms with a bounded wait, bootstraps queried native state at the original main-target boundary and retains dependent late events through a same-frame accepted-eye pair with matching cycle/publication. Earlier history is explicitly unobserved. Main_PostProcessing observations retain native bindings, raster state, candidate command epochs and accepted eye publication; these do not prove pixel transfers.",
+  "inputSchema": {
+    "type": "object",
+    "required": [
+      "contractMajor",
+      "clientId",
+      "commandId",
+      "action"
+    ],
+    "properties": {
+      "contractMajor": {
+        "type": "integer",
+        "const": 1
+      },
+      "clientId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "commandId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "expectedBuildId": {
+        "type": "string"
+      },
+      "action": {
+        "type": "string",
+        "enum": [
+          "registry",
+          "status",
+          "start",
+          "stop",
+          "capture_events"
+        ],
+        "description": "registry/status include shaderMetadata identity/alias/dump limits, failureCount and includedInCaptureMaxBytes=false. start rejects inconsistent runtime provenance before activation; stop reports capture_provenance_unavailable when start-time context is missing."
+      },
+      "captureId": {
+        "type": "string",
+        "minLength": 1
+      },
+      "eventKinds": {
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": {
+          "type": "string"
+        }
+      },
+      "geometryShaderTypes": {
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 63
+        }
+      },
+      "executionWithinSelectedGeometry": {
+        "type": "boolean"
+      },
+      "activation": {
+        "type": "string",
+        "enum": [
+          "immediate",
+          "main_post_processing"
+        ],
+        "default": "immediate",
+        "description": "VR-only late window at the original main-target Main_PostProcessing call through a matching accepted-eye pair. Requires eye-submitted and excludes earlier pipeline work."
+      },
+      "maxActivationWaitMs": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 10000,
+        "default": 2000,
+        "description": "Bounded armed wait for main_post_processing activation, separate from the active maxDurationMs."
+      },
+      "maxFrames": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 600
+      },
+      "maxDurationMs": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 10000
+      },
+      "maxEvents": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 65536
+      },
+      "maxBytes": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 67108864
+      },
+      "maxScopeDepth": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 32
+      },
+      "maxShaderObservations": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 8192
+      },
+      "maxStageShaderObservations": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 32768
+      },
+      "maxResourceObservations": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 32768
+      },
+      "maxTargetViewObservations": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 32768
+      },
+      "maxTargetBindingObservations": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 32768
+      },
+      "maxSceneObjectObservations": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 32768
+      },
+      "maxGeometryObservations": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 65536
+      },
+      "maxMaterialStateObservations": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 65536
+      },
+      "offset": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 500
+      }
+    }
+  },
+  "name": "communityshaders.render_map"
+}
