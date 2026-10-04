@@ -473,6 +473,7 @@ def main(argv=None):
     lock = None
     result = {'ok':False,'state':'preflight-refused','completedChanges':0}
     sweep = None
+    terminal_bytes = None
     started = utc()
     try:
         # Validate protocol limits rather than silently widening its contract.
@@ -552,13 +553,18 @@ def main(argv=None):
                     stream.flush()
                     os.fsync(stream.fileno())
                 finalized = dict(result, terminalEvidenceFinalized=not finalization_errors)
-                with candidate.open('x',encoding='utf-8') as stream:
+                # One canonical UTF-8 buffer: no BOM, compact JSON, exactly one
+                # LF. Filesystem and terminal authority use these same bytes.
+                finalized_bytes = (json.dumps(finalized,ensure_ascii=False,allow_nan=False,
+                                              separators=(',',':'))+'\n').encode('utf-8')
+                with candidate.open('xb') as stream:
                     candidate_created = True
-                    json.dump(finalized,stream,indent=2,allow_nan=False)
+                    stream.write(finalized_bytes)
                     stream.flush()
                     os.fsync(stream.fileno())
                 os.link(candidate,receipt)
                 result = finalized
+                terminal_bytes = finalized_bytes
             except Exception as error:
                 finalization_error('terminal-receipt-persist',error)
                 result.update(ok=False,state='terminal-finalization-failed',terminalEvidenceFinalized=False)
@@ -577,7 +583,11 @@ def main(argv=None):
                         candidate.unlink()
                     except Exception as cleanup_error:
                         finalization_error('terminal-receipt-candidate-cleanup',cleanup_error)
-    print(json.dumps(result,allow_nan=False))
+    if terminal_bytes is None:
+        terminal_bytes = (json.dumps(result,ensure_ascii=False,allow_nan=False,
+                                     separators=(',',':'))+'\n').encode('utf-8')
+    sys.stdout.buffer.write(terminal_bytes)
+    sys.stdout.buffer.flush()
     return 0 if result['ok'] else 2
 
 

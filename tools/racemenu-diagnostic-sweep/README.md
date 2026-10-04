@@ -17,7 +17,11 @@ annotation also fails, stdout reports the audit failure and the original audit
 still cannot claim success. Candidates (`receipt.candidate-*.tmp`) are not
 completion authority and are removed on failed publication where possible;
 cleanup failures are explicit. Only `receipt.json` is the canonical receipt.
-Successful canonical bytes equal terminal stdout. `terminalEvidenceFinalized:true`
+Canonical receipt and terminal stdout use the same once-serialized binary
+buffer: compact UTF-8 JSON without a BOM, followed by exactly one LF. This is
+raw-byte equality, including non-ASCII text and escaped embedded line breaks,
+not merely JSON-object equality or platform-dependent text-mode output.
+`terminalEvidenceFinalized:true`
 in the terminal stdout result requires
 successful trace/receipt persistence and cleanup. A partial/pending file or an
 earlier successful sweep outcome cannot override a finalization failure.

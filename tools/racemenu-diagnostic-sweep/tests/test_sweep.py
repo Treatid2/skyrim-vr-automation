@@ -22,6 +22,12 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
 
+class BinaryStdout:
+    """Actual-main tests capture the public binary UTF-8 terminal contract."""
+    def __init__(self):self.buffer=io.BytesIO()
+    def getvalue(self):return self.buffer.getvalue().decode('utf-8')
+
+
 def state():
     return dict(schema=1,status='ready',generation=1,mode=0,
                 races=[dict(id=1,name='Nord',enabled=True,active=True),dict(id=2,name='Argonian',enabled=True,active=False)],
@@ -133,7 +139,7 @@ class Unit(unittest.TestCase):
                             if earlier_error:raise m.StopSweep('original sweep failure')
                             return dict(ok=True,state='bounded-count-completed',completedChanges=3)
                     argv=['--capture-session','retained-session','--capture-controller',str(ROOT/'Invoke-SweepDevBench.ps1'),'--confirm-existing-capture-lane','--pwsh','fixture-only','--protocol',str(protocol),'--qualification','owner-fixture','--output',str(output),'--phase','qualification','--maximum-changes','3']
-                    stdout=io.StringIO()
+                    stdout=BinaryStdout()
                     with contextlib.ExitStack() as stack:
                         stack.enter_context(patch.object(m,'CaptureAdapter',return_value=Adapter()))
                         stack.enter_context(patch.object(m,'Sweep',CompletedSweep))
@@ -167,6 +173,7 @@ class Unit(unittest.TestCase):
                         self.assertFalse((output/'receipt.json').exists())
                     elif (output/'receipt.json').exists():
                         self.assertEqual(json.loads((output/'receipt.json').read_text()),result)
+                        self.assertEqual((output/'receipt.json').read_bytes(),stdout.buffer.getvalue())
                     for pending_path in output.glob('receipt.pending-*.json'):
                         pending=json.loads(pending_path.read_text())
                         self.assertFalse(pending['terminalEvidenceFinalized'])
@@ -180,6 +187,36 @@ class Unit(unittest.TestCase):
                         self.assertIn('terminal-receipt-candidate-cleanup',[e['operation'] for e in result['evidenceFinalizationErrors']])
                     elif fault.startswith('receipt-'):
                         self.assertEqual(list(output.glob('receipt.candidate-*.tmp')),[])
+    def test_cli_unicode_and_escaped_lines_share_one_exact_terminal_buffer(self):
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                folder=Path(self.temp.name)/('unicode-failed' if failed else 'unicode-success')
+                folder.mkdir()
+                protocol=folder/'protocol.json'
+                protocol.write_text(json.dumps(dict(limits=dict(maximumInputRequestsInFlight=1,mutationRetries=0,phaseDeadlineSeconds=900,menuSettleDeadlineSeconds=30),phases=[dict(id='qualification',maximumChanges=20)])))
+                message='Épreuve — 雪 🐈\nsecond line\r\n"quoted" \\ path'
+                class Adapter:
+                    state=dict(sessionDirectory=str(folder))
+                class CompletedSweep:
+                    completed=1
+                    def __init__(self,*args,**kwargs):pass
+                    def run(self):
+                        if failed:raise m.StopSweep(message)
+                        return dict(ok=True,state='bounded-count-completed',completedChanges=1,detail=message)
+                stdout=BinaryStdout()
+                with patch.object(m,'CaptureAdapter',return_value=Adapter()), patch.object(m,'Sweep',CompletedSweep), patch.object(m,'attest',return_value={}), contextlib.redirect_stdout(stdout):
+                    code=m.main(['--capture-session','fixture','--capture-controller',str(ROOT/'Invoke-SweepDevBench.ps1'),'--confirm-existing-capture-lane','--pwsh','fixture','--protocol',str(protocol),'--qualification','fixture','--output',str(folder/'output'),'--phase','qualification','--maximum-changes','1'])
+                raw=stdout.buffer.getvalue()
+                self.assertEqual(code,2 if failed else 0)
+                self.assertEqual((folder/'output'/'receipt.json').read_bytes(),raw)
+                self.assertIn('雪 🐈'.encode('utf-8'),raw)
+                self.assertFalse(raw.startswith(b'\xef\xbb\xbf'))
+                self.assertEqual(raw.count(b'\n'),1)
+                self.assertNotIn(b'\r',raw)
+                result=json.loads(raw)
+                self.assertEqual(result['sweepOutcome']['error' if failed else 'detail'],message)
+                self.assertTrue(result['ownedLockReleased'])
+                self.assertFalse((folder/'.racemenu-sweep.lock').exists())
     def test_cli_extreme_slider_arithmetic_is_structured_before_mutation(self):
         cases=[('nonfinite lattice',-1e307,1e307,1e-308,'lattice'),
                ('nonfinite span',-1e308,1e308,1,'span'),
@@ -194,7 +231,7 @@ class Unit(unittest.TestCase):
                     def refresh(self,deadline):return m.snapshot(super().refresh(deadline))
                 adapter=Adapter();adapter.state=dict(sessionDirectory=str(folder))
                 adapter.s['sliders'][0].update(minimum=low,maximum=high,step=step,value=low)
-                stdout=io.StringIO()
+                stdout=BinaryStdout()
                 with patch.object(m,'CaptureAdapter',return_value=adapter), patch.object(m,'attest',return_value={}), contextlib.redirect_stdout(stdout):
                     code=m.main(['--capture-session','fixture','--capture-controller',str(ROOT/'Invoke-SweepDevBench.ps1'),'--confirm-existing-capture-lane','--pwsh','fixture','--protocol',str(protocol),'--qualification','fixture','--output',str(folder/'output'),'--phase','race-slider-cross-product'])
                 result=json.loads(stdout.getvalue())
@@ -203,6 +240,7 @@ class Unit(unittest.TestCase):
                 self.assertEqual(adapter.calls,[]);self.assertTrue(result['ownedLockReleased'])
                 self.assertFalse((folder/'.racemenu-sweep.lock').exists())
                 self.assertEqual(json.loads((folder/'output'/'receipt.json').read_text()),result)
+                self.assertEqual((folder/'output'/'receipt.json').read_bytes(),stdout.buffer.getvalue())
                 self.assertTrue(result['terminalEvidenceFinalized'])
     def test_slider_arithmetic_residual_and_oversized_integers_fail_closed(self):
         self.assertFalse(m.number(10**400))
@@ -215,7 +253,7 @@ class Unit(unittest.TestCase):
         foreign=Path(self.temp.name)/'.racemenu-sweep.lock'
         foreign.write_text('foreign-owner-evidence')
         with patch.object(m,'load',side_effect=OSError('preflight rejected before lock acquisition')), patch.object(Path,'unlink') as unlink:
-            stdout=io.StringIO()
+            stdout=BinaryStdout()
             with contextlib.redirect_stdout(stdout):
                 code=m.main(['--capture-session','retained','--capture-controller','fixture','--confirm-existing-capture-lane','--pwsh','fixture','--protocol','bad','--qualification','fixture','--output','unused','--phase','qualification'])
             self.assertEqual(code,2)
@@ -344,10 +382,14 @@ class Entrypoint(unittest.TestCase):
                   '--pwsh',pwsh,'--confirm-existing-capture-lane','--protocol',str(protocol),
                   '--qualification',str(qualification),'--output',str(root/'run'),
                   '--phase','qualification','--maximum-changes','1','--pace-seconds','0']
-            result=subprocess.run(argv,capture_output=True,text=True,timeout=50)
+            result=subprocess.run(argv,capture_output=True,timeout=50)
             failure_trace=(root/'run'/'trace.ndjson').read_text() if (root/'run'/'trace.ndjson').exists() else ''
-            self.assertEqual(result.returncode,0,result.stdout+result.stderr+failure_trace)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr+failure_trace.encode('utf-8'))
             receipt=json.loads(result.stdout)
+            self.assertEqual((root/'run'/'receipt.json').read_bytes(),result.stdout)
+            self.assertTrue(result.stdout.endswith(b'\n'))
+            self.assertNotIn(b'\r\n',result.stdout)
+            self.assertFalse(result.stdout.startswith(b'\xef\xbb\xbf'))
             self.assertEqual(receipt['completedChanges'],1)
             model=json.loads(model_path.read_text(encoding='utf-8-sig'))
             self.assertEqual(model['mutations'],1)
