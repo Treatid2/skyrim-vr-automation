@@ -3,10 +3,13 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('list', 'call', 'wait')]
+    [ValidateSet('list', 'call', 'wait', 'calendar-window')]
     [string]$Command = 'list',
     [string]$Tool,
     [string]$ArgumentsJson = '{}',
+    [string]$CalendarOwner,
+    [ValidateRange(1,300000)][int]$CalendarHoldMilliseconds = 60000,
+    [string]$CalendarObservationsJson,
     [string]$RuntimePath = $env:CSX_DEVBENCH_RUNTIME_PATH,
     [string]$ToolFilter,
     [switch]$NamesOnly,
@@ -83,6 +86,7 @@ $effectiveOperationTimeoutSeconds = $TimeoutSeconds
 $serverTimeoutMilliseconds = $null
 $serverTimeoutDispatchRemainingSeconds = $null
 Import-Module (Join-Path $PSScriptRoot 'DevBenchControl.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'CalendarObservationWindow.psm1') -Force
 $script:requestTimeoutSecondsForRpc = $RequestTimeoutSeconds
 
 function Get-RequestTimeoutSeconds {
@@ -1142,6 +1146,19 @@ try {
     $baseEndpoint = "http://127.0.0.1:$([int]$runtime.port)"
     $endpoint = "$baseEndpoint/mcp"
     $arguments = $null
+    $calendarObservations = @()
+    if ($Command -eq 'calendar-window') {
+        if ($SkipRuntimeIdentityVerification -or $MaxTransientRetries -ne 0 -or $TimeoutSeconds -lt 20 -or $RequirePerformanceNeutral) { throw 'calendar-window requires identity verification, -MaxTransientRetries 0, at least 20 seconds and no performance-neutrality claim.' }
+        if ([string]::IsNullOrWhiteSpace($CalendarOwner) -or $CalendarOwner.Length -gt 128) { throw 'calendar-window requires a bounded explicit CalendarOwner.' }
+        $calendarObservations = @($CalendarObservationsJson | ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop)
+        if ($calendarObservations.Count -lt 1 -or $calendarObservations.Count -gt 16) { throw 'calendar-window requires 1..16 observations.' }
+        foreach ($item in $calendarObservations) {
+            if ($item -isnot [Collections.IDictionary] -or $item.Count -ne 2 -or -not $item.Contains('tool') -or -not $item.Contains('arguments') -or $item.tool -isnot [string] -or $item.arguments -isnot [Collections.IDictionary] -or $item.tool -ceq 'calendar' -or -not (Test-DevBenchReadOnlyRequest -ToolName $item.tool -Arguments $item.arguments) -or $item.arguments.Contains('timeoutMs')) { throw 'calendar-window accepts only exact supported non-mutating observation requests; no calendar/save/time/quality/weather mutations.' }
+        }
+        $script:invocationRecord.requestMode = 'finite-calendar-hold-with-read-only-observations'
+        $script:invocationRecord.requestedArguments = $CalendarObservationsJson
+        Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord
+    }
     if ($Command -eq 'call') {
         if ([string]::IsNullOrWhiteSpace($Tool)) { throw 'Tool is required for call.' }
         try { $arguments = $ArgumentsJson | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { throw "ArgumentsJson is invalid: $($_.Exception.Message)" }
@@ -1170,10 +1187,23 @@ try {
     $tools = @()
     $evidencePath = $null
     if ($Command -ne 'wait') {
-        $session = Open-DevBenchSession -Runtime $runtime
+        # Ownership-bearing composition deliberately selects MCP before its
+        # first request; no REST downgrade or replacement session is allowed.
+        $session = if ($Command -eq 'calendar-window') {
+            $script:transport = 'mcp'
+            Open-McpSession -Runtime $runtime
+        } else { Open-DevBenchSession -Runtime $runtime }
         $headers = $session.headers
         $tools = @($session.tools)
         $runtimeIdentity = $session.runtimeIdentity
+        if ($Command -eq 'calendar-window') {
+            if (-not $runtimeIdentity.complete -or -not $runtimeIdentity.verified) { throw 'calendar-window requires complete verified runtime identity.' }
+            $calendarTools=@($tools | Where-Object name -CEQ 'calendar')
+            if ($calendarTools.Count -ne 1) { throw 'toolSchemaUnresolved: exact calendar is absent.' }
+            $schema=$calendarTools[0].inputSchema
+            if (@($schema.properties.action.enum).Count -ne 3 -or @($schema.properties.action.enum | Where-Object { $_ -cnotin @('status','hold','release') }).Count -gt 0 -or $schema.properties.holdMs.maximum -ne 300000 -or @($schema.properties.binding.required).Count -ne 5 -or @($schema.oneOf).Count -ne 3) { throw 'toolSchemaUnresolved: current calendar schema cannot establish the native finite ownership contract.' }
+            foreach ($item in $calendarObservations) { if (@($tools | Where-Object name -CEQ $item.tool).Count -ne 1) { throw "toolSchemaUnresolved: observation $($item.tool) is absent." } }
+        }
         if ($Command -eq 'call' -and $Tool -ceq 'game' -and $arguments.Contains('action') -and
             $arguments['action'] -ceq 'newGame' -and -not (Test-NewGameCatalog -Tools $tools -Arguments $arguments)) {
             Update-InvocationEvidence -State 'guard-rejected' -Errors @('toolSchemaUnresolved: current catalog cannot express typed game/newGame phase and correlation fields.')
@@ -1191,6 +1221,24 @@ try {
     if ($Command -eq 'list') {
         if (-not [string]::IsNullOrWhiteSpace($ToolFilter)) { $tools = @($tools | Where-Object { $_.name -like "*$ToolFilter*" }) }
         $data = if ($NamesOnly) { [pscustomobject][ordered]@{ names = @($tools | ForEach-Object name); count = $tools.Count } } else { [pscustomobject][ordered]@{ tools = $tools } }
+    }
+    elseif ($Command -eq 'calendar-window') {
+        $calendarSessionId=[string]$headers['Mcp-Session-Id']
+        $calendarDeadline=$operationDeadlineUtc
+        $data=Invoke-DevBenchCalendarWindow -Owner $CalendarOwner -Observations $calendarObservations -HoldMilliseconds $CalendarHoldMilliseconds -DeadlineUtc $calendarDeadline -ExpectedProcessId $runtimeIdentity.listenerPid -AssertSession {
+            if ($script:transport -cne 'mcp' -or [string]::IsNullOrWhiteSpace($calendarSessionId) -or [string]$headers['Mcp-Session-Id'] -cne $calendarSessionId) { throw 'Calendar MCP session changed; no rebind/release on a replacement.' }
+        } -Call {
+            param($name,$argsMap,$mutation,$bound)
+            $script:operationDeadlineUtc=$bound
+            try {
+                if ($mutation) {
+                    $script:invocationRecord.commandId=[string]$argsMap.commandId
+                    $script:invocationRecord['calendarDispatchArguments']=$argsMap
+                    Invoke-DevBenchTargetDispatch -InvocationRecord $invocationRecord -PersistIntent { Update-InvocationEvidence -State 'dispatching' } -TargetAction { Invoke-ToolRpc -Name $name -Arguments $argsMap -Headers $headers -Mutation }
+                } else { Invoke-ToolRpc -Name $name -Arguments $argsMap -Headers $headers }
+            } finally { $script:operationDeadlineUtc=$calendarDeadline }
+        }
+        $semantic=[pscustomobject]@{known=$true;ok=$data.ok;outcome='calendar-window';guarded=$false;transient=$false;codes=@();states=@();reasons=@($data.errors);completionBasis=$data.completionBasis}
     }
     elseif ($Command -eq 'call') {
         $toolAvailable = @($tools | Where-Object name -eq $Tool).Count -eq 1
@@ -1779,7 +1827,7 @@ try {
         $semantic.outcome = 'unverified'
         $semantic.reasons = @($semantic.reasons) + 'A verified semantic outcome was required, but the response did not provide one.'
     }
-    $semanticFailure = if ($Command -eq 'call') {
+    $semanticFailure = if ($Command -in @('call','calendar-window')) {
         -not $semantic.known -or -not $semantic.ok
     }
     elseif ($RequireSuccess -or $Command -eq 'wait') {
@@ -1791,7 +1839,7 @@ try {
         ok = -not $semanticFailure
         transportOk = $true
         state = $(if ($Command -eq 'wait') { [string]$waitCompletion.state } elseif ($semanticFailure) { 'semantic-failed' } else { 'completed' })
-        indeterminate = $false
+        indeterminate = [bool]($Command -eq 'calendar-window' -and $data.indeterminate)
         dispatchReached = [bool]$dispatch.dispatchReached
         responseDataRetained = [bool]$dispatch.responseDataRetained
         acceptedDataRetained = [bool]$dispatch.acceptedDataRetained
