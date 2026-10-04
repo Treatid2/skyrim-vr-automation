@@ -184,6 +184,14 @@ function Invoke-DevBench([string]$Tool, [hashtable]$Arguments, [string]$Runtime,
         $content = @($response.data.content)
         if ($content.Count -ne 1) { throw "DevBench tool '$Tool' must return exactly one content payload." }
         $value = $content[0]
+        if ($Tool -ceq 'input' -and $Arguments.ContainsKey('action') -and $Arguments.action -ceq 'capabilities') {
+            if (-not $response.PSObject.Properties['semantic'] -or -not $response.semantic -or
+                -not $response.semantic.PSObject.Properties['qualifiedInputCapabilities'] -or
+                $response.semantic.qualifiedInputCapabilities -isnot [pscustomobject]) {
+                throw 'Input capabilities lack the controller-qualified native v2 payload; no unvalidated projection.'
+            }
+            $value = $response.semantic.qualifiedInputCapabilities
+        }
         if ($Tool -ceq $screenshotTool -and $Arguments.ContainsKey('action') -and $Arguments.action -ceq 'capabilities') {
             if (-not $response.PSObject.Properties['semantic'] -or -not $response.semantic -or
                 -not $response.semantic.PSObject.Properties['qualifiedCapabilities'] -or

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'NativeReadContracts.ps1')
 
 function Get-DevBenchHealthSemanticStatus {
     [CmdletBinding()]
@@ -552,7 +553,8 @@ function Test-DevBenchReadOnlyRequest {
     if ($ToolName -eq 'menu') { return $action -eq 'list' }
     if ($ToolName -ceq 'camera') { return $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'get' }
     if ($ToolName -eq 'record') { return $action -eq 'status' }
-    if ($ToolName -eq 'input') { return $action -in @('observe', 'status') }
+    if ($ToolName -ceq 'input') { return $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -cin @('observe', 'status', 'capabilities') }
+    if ($ToolName -ceq 'communityshaders.fsr_color_contract') { return $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status' -and -not $Arguments.Contains('expectedRevision') -and -not $Arguments.Contains('highDynamicRangeInput') -and -not $Arguments.Contains('autoExposure') }
     if ($ToolName -eq 'communityshaders.renderscale') { return $action -eq 'status' }
     if ($ToolName -eq 'communityshaders.upscaling_api') { return $action -eq 'snapshot' }
     if ($ToolName -eq 'communityshaders.screenshot') {
@@ -629,6 +631,21 @@ function Get-DevBenchCallSemanticStatus {
         Get-DevBenchSemanticStatus -Content $Content -UnsignedTelemetryStatePaths 'content.status.vendorWorkGate.state'
     } else { Get-DevBenchSemanticStatus -Content $Content }
     $payloads = @($Content)
+    $nativeReadKind = if ($ToolName -ceq 'input' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'capabilities') { 'input-capabilities' }
+        elseif ($ToolName -ceq 'communityshaders.fsr_color_contract' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status') { 'fsr-colour-status' } else { $null }
+    if ($nativeReadKind) {
+        $reasons = [Collections.Generic.List[string]]::new()
+        if ($semantic.known -and -not $semantic.ok) { foreach ($reason in $semantic.reasons) { $reasons.Add([string]$reason) } }
+        $payload = if ($payloads.Count -eq 1 -and $payloads[0] -is [pscustomobject]) { $payloads[0] } else { $null }
+        foreach ($reason in @(Get-DevBenchNativeReadReasons -Kind $nativeReadKind -Payload $payload -Arguments $Arguments)) { $reasons.Add([string]$reason) }
+        $semantic.known = $true; $semantic.ok = $reasons.Count -eq 0
+        $semantic.outcome = if ($semantic.ok) { "$nativeReadKind-read-contract-satisfied" } else { "$nativeReadKind-read-contract-failed" }
+        $semantic.reasons = @($reasons | Select-Object -Unique)
+        $semantic.explicitOutcomeEvidence = if ($semantic.ok) { @("native-$nativeReadKind-typed-observation") } else { @() }
+        if ($nativeReadKind -ceq 'input-capabilities') { $semantic | Add-Member -NotePropertyName qualifiedInputCapabilities -NotePropertyValue $(if ($semantic.ok) { $payload } else { $null }) }
+        $semantic | Add-Member -NotePropertyName completionBasis -NotePropertyValue 'read-schema-only'
+        return $semantic
+    }
     if ($ToolName -ceq 'communityshaders.renderscale' -and $Arguments.Contains('action') -and $Arguments['action'] -ceq 'status') {
         $reasons = [Collections.Generic.List[string]]::new()
         if ($semantic.known -and -not $semantic.ok) { foreach ($reason in $semantic.reasons) { $reasons.Add([string]$reason) } }

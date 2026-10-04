@@ -35,6 +35,16 @@ retains its command or correlation identity plus the complete failed controller
 envelope and journal path. An ambiguous recording start never triggers an
 unscoped stop against potentially unrelated recording work.
 
+The `capabilities` command reports independent input and screenshot probe
+outcomes; its outer `ok` means the report was produced, not that every service
+passed. Require `data.input.ok` and its controller-qualified native
+`devbench.input` v2.0 projection. It includes ready keyboard v1 with the complete
+canonical binding inventory, plus ready atomic tracked-set v1.1 and its exact
+limits/ownership/encoding fields. Raw controller evidence remains in
+`data.input.envelope`. A generic success marker cannot replace those fields.
+These reads start no recording, input sequence or screenshot capture. Runtime
+identity bootstrap expectations remain mandatory where selected.
+
 `-MaximumFrames` accepts up to 60,000 frames, matching the current DevBench
 recording ceiling. Sequence admission still uses the live screenshot capability
 receipt, so a lower server frame or duration limit fails before mutation. Stop
