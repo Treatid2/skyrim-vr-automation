@@ -475,6 +475,22 @@ function Test-JsonDictionaryContains($Dictionary, [string]$Key) {
     return $Dictionary -is [Collections.IDictionary] -and $Dictionary.Contains($Key)
 }
 
+function Get-JsonNumberIdentity($Value) {
+    # Compare JSON numeric values exactly as decimal coefficient/exponent,
+    # without coercing an integer/decimal through a rounded Double. This also
+    # accepts SteamVR's harmless 90.0 -> 90 and 0.0 -> 0 reserialization.
+    $json = $Value | ConvertTo-Json -Compress
+    $match = [regex]::Match($json, '\A(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?\z')
+    if (-not $match.Success) { return $null } # NaN/Infinity serialize as strings.
+    $digits = ($match.Groups[2].Value + $match.Groups[3].Value).TrimStart('0')
+    if ($digits.Length -eq 0) { return '0@0' }
+    $exponent = if ($match.Groups[4].Success) { [long]::Parse($match.Groups[4].Value, [Globalization.CultureInfo]::InvariantCulture) } else { [long]0 }
+    $exponent -= $match.Groups[3].Value.Length
+    $coefficient = $digits.TrimEnd('0')
+    $exponent += $digits.Length - $coefficient.Length
+    return $match.Groups[1].Value + $coefficient + '@' + $exponent.ToString([Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Test-JsonValueEquivalent([AllowNull()]$Expected, [AllowNull()]$Actual) {
     if ($null -eq $Expected -or $null -eq $Actual) { return $null -eq $Expected -and $null -eq $Actual }
     if ($Expected -is [Collections.IDictionary] -or $Actual -is [Collections.IDictionary]) {
@@ -495,7 +511,14 @@ function Test-JsonValueEquivalent([AllowNull()]$Expected, [AllowNull()]$Actual) 
         return $true
     }
     if ($Expected -is [string] -or $Actual -is [string]) { return $Expected -is [string] -and $Actual -is [string] -and [string]$Expected -ceq [string]$Actual }
-    return $Expected -eq $Actual
+    if ($Expected -is [bool] -or $Actual -is [bool]) { return $Expected -is [bool] -and $Actual -is [bool] -and $Expected.Equals($Actual) }
+    # Only numeric JSON kinds reach normalization. Booleans/strings never
+    # borrow numeric equality; exact decimal normalization avoids precision loss.
+    $numericTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64], [single], [double], [decimal], [bigint])
+    if ($Expected.GetType() -notin $numericTypes -or $Actual.GetType() -notin $numericTypes) { return $false }
+    $expectedIdentity = Get-JsonNumberIdentity $Expected
+    $actualIdentity = Get-JsonNumberIdentity $Actual
+    return $null -ne $expectedIdentity -and $null -ne $actualIdentity -and $expectedIdentity -ceq $actualIdentity
 }
 
 function Get-JsonDifferencePaths([AllowNull()]$Expected, [AllowNull()]$Actual, [string]$Path = '') {
@@ -562,18 +585,53 @@ function Get-SettingsRestoreValidation([Collections.IDictionary]$Receipt, [strin
     }
     $allDifferences = @(Get-JsonDifferencePaths $expectation.value $current)
     $runtimeManagedPrefixes = @('GpuSpeed', 'LastKnown')
+    $historyKey = 'lastAccessedExternalOverlayKey'
+    $historyPath = "dashboard.$historyKey"
+    $historyTyped = $true
+    foreach ($document in @($expectation.value, $current)) {
+        if (Test-JsonDictionaryContains $document 'dashboard') {
+            $dashboard = $document['dashboard']
+            if ($dashboard -isnot [Collections.IDictionary] -or
+                ((Test-JsonDictionaryContains $dashboard $historyKey) -and $dashboard[$historyKey] -isnot [string])) { $historyTyped = $false }
+        }
+    }
+    # Display paths are diagnostics, not structural authority: a literal root
+    # key can contain dots and collide with dashboard history's display path.
+    # Compare copies with only the actual allowed JSON subtrees removed.
+    $qualifiedDocuments = @(
+        foreach ($document in @($expectation.value, $current)) {
+            $qualified = [ordered]@{}
+            foreach ($key in $document.Keys) {
+                if ([string]$key -cin $runtimeManagedPrefixes) { continue }
+                if ([string]$key -ceq 'dashboard' -and $historyTyped -and $document[$key] -is [Collections.IDictionary]) {
+                    $dashboardCopy = [ordered]@{}
+                    foreach ($dashboardKey in $document[$key].Keys) {
+                        if ([string]$dashboardKey -cne $historyKey) { $dashboardCopy[$dashboardKey] = $document[$key][$dashboardKey] }
+                    }
+                    $qualified[$key] = $dashboardCopy
+                }
+                else { $qualified[$key] = $document[$key] }
+            }
+            $qualified
+        }
+    )
+    $structuralDriftAllowed = Test-JsonValueEquivalent $qualifiedDocuments[0] $qualifiedDocuments[1]
     $unclassified = @($allDifferences | Where-Object {
         $candidate = [string]$_
-        @($runtimeManagedPrefixes | Where-Object { $candidate -eq $_ -or $candidate.StartsWith("$_`.", [StringComparison]::Ordinal) }).Count -eq 0
+        -not ($candidate -ceq $historyPath -and $historyTyped) -and
+            @($runtimeManagedPrefixes | Where-Object { $candidate -eq $_ -or $candidate.StartsWith("$_`.", [StringComparison]::Ordinal) }).Count -eq 0
     })
     $controlledMatch = $controlledDifferences.Count -eq 0
+    if (-not $structuralDriftAllowed -and $unclassified.Count -eq 0) { $unclassified = @($allDifferences) }
     $formattingOnly = -not $exactMatch -and $allDifferences.Count -eq 0
-    $runtimeManagedOnly = -not $exactMatch -and $controlledMatch -and $allDifferences.Count -gt 0 -and $unclassified.Count -eq 0
+    $runtimeManagedOnly = -not $exactMatch -and $controlledMatch -and $allDifferences.Count -gt 0 -and $unclassified.Count -eq 0 -and $structuralDriftAllowed
     return [pscustomobject][ordered]@{
         exactMatch = $exactMatch; controlledContractMatch = $controlledMatch; formattingOnlyDriftAccepted = $formattingOnly; runtimeManagedOnlyDriftAccepted = $runtimeManagedOnly
         authorized = $exactMatch -or $formattingOnly -or $runtimeManagedOnly; authorizationRoute = if ($exactMatch) { 'exact-applied-bytes' } elseif ($formattingOnly) { 'semantic-formatting-only' } elseif ($runtimeManagedOnly) { 'controlled-contract-plus-runtime-managed-fields' } else { 'none' }
         currentSha256 = $currentHash; expectedSha256 = [string]$Receipt['settingsSha256Null']; expectedSemanticSha256 = $expectation.semanticSha256
         currentSemanticSha256 = Get-JsonSemanticSha256 -Value $current; controlledDifferences = @($controlledDifferences)
+        dashboardHistoryDriftAccepted = $runtimeManagedOnly -and $historyPath -cin $allDifferences
+        runtimeManagedStructuralMatch = $structuralDriftAllowed
         runtimeManagedDifferencePaths = @($allDifferences | Where-Object { $_ -notin $unclassified }); unclassifiedDifferencePaths = @($unclassified)
     }
 }
@@ -961,35 +1019,35 @@ function Get-EffectiveState {
         $checks["steamvr.$key"] = [ordered]@{
             actual = if ($steamvr.ContainsKey($key)) { $steamvr[$key] } else { $null }
             expected = $expectedSteamVR[$key]
-            matches = $steamvr.ContainsKey($key) -and $steamvr[$key] -eq $expectedSteamVR[$key]
+            matches = $steamvr.ContainsKey($key) -and (Test-JsonValueEquivalent $expectedSteamVR[$key] $steamvr[$key])
         }
     }
     foreach ($key in $expectedDashboard.Keys) {
         $checks["dashboard.$key"] = [ordered]@{
             actual = if ($dashboard.ContainsKey($key)) { $dashboard[$key] } else { $null }
             expected = $expectedDashboard[$key]
-            matches = $dashboard.ContainsKey($key) -and $dashboard[$key] -eq $expectedDashboard[$key]
+            matches = $dashboard.ContainsKey($key) -and (Test-JsonValueEquivalent $expectedDashboard[$key] $dashboard[$key])
         }
     }
     foreach ($key in @('enable', 'serialNumber', 'modelNumber', 'windowWidth', 'windowHeight', 'renderWidth', 'renderHeight', 'displayFrequency')) {
         $checks["driver_null.$key"] = [ordered]@{
             actual = if ($driver.ContainsKey($key)) { $driver[$key] } else { $null }
             expected = $expectedDriver[$key]
-            matches = $driver.ContainsKey($key) -and $driver[$key] -eq $expectedDriver[$key]
+            matches = $driver.ContainsKey($key) -and (Test-JsonValueEquivalent $expectedDriver[$key] $driver[$key])
         }
     }
     foreach ($key in $expectedHeadPoseDriver.Keys) {
         $checks["driver_codex_head_pose.$key"] = [ordered]@{
             actual = if ($headPoseDriver.ContainsKey($key)) { $headPoseDriver[$key] } else { $null }
             expected = $expectedHeadPoseDriver[$key]
-            matches = $headPoseDriver.ContainsKey($key) -and $headPoseDriver[$key] -eq $expectedHeadPoseDriver[$key]
+            matches = $headPoseDriver.ContainsKey($key) -and (Test-JsonValueEquivalent $expectedHeadPoseDriver[$key] $headPoseDriver[$key])
         }
     }
     foreach ($key in $expectedTrackingOverrides.Keys) {
         $checks["TrackingOverrides.$key"] = [ordered]@{
             actual = if ($trackingOverrides.ContainsKey($key)) { $trackingOverrides[$key] } else { $null }
             expected = $expectedTrackingOverrides[$key]
-            matches = $trackingOverrides.ContainsKey($key) -and $trackingOverrides[$key] -eq $expectedTrackingOverrides[$key]
+            matches = $trackingOverrides.ContainsKey($key) -and (Test-JsonValueEquivalent $expectedTrackingOverrides[$key] $trackingOverrides[$key])
         }
     }
     return [pscustomobject][ordered]@{
@@ -1299,6 +1357,32 @@ function New-Result {
     }
 }
 
+function Get-MO2ProviderInventoryEvidence($Inventory) {
+    # Preserve full provenance. Only absolute provider line numbers are excluded
+    # from canonical semantic admission; array order remains significant.
+    $retained = $Inventory | ConvertTo-Json -Depth 64 -Compress | ConvertFrom-Json -AsHashtable -Depth 64
+    if ($retained -isnot [Collections.IDictionary] -or
+        -not (Test-JsonDictionaryContains $retained 'profile') -or $retained['profile'] -isnot [string] -or [string]::IsNullOrWhiteSpace($retained['profile']) -or
+        -not (Test-JsonDictionaryContains $retained 'modListPath') -or $retained['modListPath'] -isnot [string] -or [string]::IsNullOrWhiteSpace($retained['modListPath']) -or
+        -not (Test-JsonDictionaryContains $retained 'providers') -or $retained['providers'] -isnot [array] -or
+        -not (Test-JsonDictionaryContains $retained 'errors') -or $retained['errors'] -isnot [array] -or @($retained['errors']).Count -ne 0) { throw 'Malformed runtime-provider inventory.' }
+    $semantic = $retained | ConvertTo-Json -Depth 64 -Compress | ConvertFrom-Json -AsHashtable -Depth 64
+    foreach ($provider in @($semantic['providers'])) {
+        if ($provider -isnot [Collections.IDictionary]) { throw 'Malformed runtime-provider record.' }
+        foreach ($field in @('classification','modName','modPath','marker')) {
+            if (-not (Test-JsonDictionaryContains $provider $field) -or $provider[$field] -isnot [string] -or [string]::IsNullOrWhiteSpace($provider[$field])) { throw "Malformed runtime-provider $field." }
+        }
+        if ($provider['marker'] -cnotin @('+','-') -or -not (Test-JsonDictionaryContains $provider 'enabled') -or $provider['enabled'] -isnot [bool] -or $provider['enabled'] -ne ($provider['marker'] -ceq '+')) { throw 'Contradictory runtime-provider marker/enabled state.' }
+        if (-not (Test-JsonDictionaryContains $provider 'markers') -or $provider['markers'] -isnot [Collections.IDictionary]) { throw 'Malformed runtime-provider markers.' }
+        foreach ($field in @('rootOpenVrApi','rootOpenCompositeIni','openCompositeInput')) {
+            if (-not (Test-JsonDictionaryContains $provider['markers'] $field) -or $provider['markers'][$field] -isnot [bool]) { throw "Malformed runtime-provider marker $field." }
+        }
+        if ($provider['enabled'] -and $provider['markers']['rootOpenVrApi']) { throw 'Enabled root OpenVR replacement cannot enter null-HMD admission.' }
+        if (Test-JsonDictionaryContains $provider 'lineNumber') { $provider.Remove('lineNumber') }
+    }
+    return [pscustomobject][ordered]@{ contractVersion = 1; inventory = $retained; semanticSha256 = Get-JsonSemanticSha256 -Value $semantic }
+}
+
 function Get-MO2NullAdmission {
     $fixtureMode = -not $InternalTestRequireMO2Admission -and -not [string]::IsNullOrWhiteSpace($env:CSX_STEAMVR_TRANSACTION_ROOT) -and
         [IO.Path]::GetFullPath($SettingsPath).StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()), [StringComparison]::OrdinalIgnoreCase)
@@ -1349,10 +1433,14 @@ function Get-MO2NullAdmission {
     if ($enabledReplacements.Count -ne 0) { throw 'MO2 null-HMD admission returned pass while an enabled profile-local OpenVR replacement remained.' }
     $inventoryJson = $validation.data.runtimeProviders | ConvertTo-Json -Depth 8 -Compress
     $inventoryHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($inventoryJson)))
+    $inventoryEvidence = Get-MO2ProviderInventoryEvidence -Inventory $validation.data.runtimeProviders
     return [pscustomobject][ordered]@{
         mode = 'mo2'; runtimeRoute = $routeId; profile = [string]$validation.data.requested.profile
         leaseId = [string]$validation.data.sessionLock.leaseId; validatedUtc = [DateTime]::UtcNow.ToString('o')
         providerInventorySha256 = $inventoryHash; enabledOpenVrReplacementCount = 0
+        providerInventoryContractVersion = $inventoryEvidence.contractVersion
+        providerInventorySemanticSha256 = $inventoryEvidence.semanticSha256
+        providerInventory = $inventoryEvidence.inventory
         validationContractVersion = [string]$validation.contractVersion
     }
 }
@@ -1365,8 +1453,19 @@ function Assert-MO2NullAdmissionMatchesReceipt($Admission, $Receipt) {
             throw "Current MO2/null-HMD admission differs from the apply receipt at '$field'."
         }
     }
-    if ([string]$Admission.mode -eq 'mo2' -and [string]$recorded['providerInventorySha256'] -cne [string]$Admission.providerInventorySha256) {
-        throw 'The exact MO2 runtime-provider inventory changed after null-HMD apply; revalidate and create a new transaction.'
+    if ([string]$Admission.mode -eq 'mo2') {
+        if (Test-JsonDictionaryContains $recorded 'providerInventoryContractVersion') {
+            if (($recorded['providerInventoryContractVersion'] -isnot [int] -and $recorded['providerInventoryContractVersion'] -isnot [long]) -or $recorded['providerInventoryContractVersion'] -ne 1 -or $Admission.providerInventoryContractVersion -ne 1 -or
+                -not (Test-JsonDictionaryContains $recorded 'providerInventory') -or -not (Test-JsonDictionaryContains $recorded 'providerInventorySemanticSha256')) { throw 'Unsupported or incomplete runtime-provider inventory receipt contract.' }
+            $expected = Get-MO2ProviderInventoryEvidence -Inventory $recorded['providerInventory']
+            $actual = Get-MO2ProviderInventoryEvidence -Inventory $Admission.providerInventory
+            if ([string]$expected.inventory['profile'] -cne [string]$recorded['profile'] -or [string]$actual.inventory['profile'] -cne [string]$Admission.profile -or
+                $expected.semanticSha256 -cne [string]$recorded['providerInventorySemanticSha256'] -or $actual.semanticSha256 -cne [string]$Admission.providerInventorySemanticSha256) { throw 'Runtime-provider retained inventory disagrees with its receipt-bound semantic fingerprint.' }
+            if ($expected.semanticSha256 -cne $actual.semanticSha256) { throw 'The semantic MO2 runtime-provider inventory changed after null-HMD apply; restore and create a new admitted transaction.' }
+        }
+        elseif ([string]$recorded['providerInventorySha256'] -cne [string]$Admission.providerInventorySha256) {
+            throw 'The legacy exact MO2 runtime-provider inventory changed after null-HMD apply; restore and create a new admitted transaction. Legacy receipts are not migrated.'
+        }
     }
 }
 
