@@ -34,9 +34,17 @@ function Get-HashOrNull([string]$Path) {
 }
 # This extracted-function harness tests probe payload parsing only. Package and
 # process authority are covered by the real entry-point identity regression.
-function Get-HeadPosePackageAuthority { return [pscustomobject]@{verified=$true;markerSha256=('1' * 64)} }
+function Get-HeadPosePackageAuthority {
+    $artifacts=@{};foreach($relative in (Get-HeadPoseArtifactPaths).Values){$artifacts[$relative]='2'*64}
+    return [pscustomobject]@{verified=$true;root=$fixture;markerSha256=('1'*64);provenanceSha256=('3'*64);transactionId='fixture-install';sourceCommit=('4'*40);artifacts=$artifacts}
+}
 function Get-NullProviderAuthority { return Get-HeadPosePackageAuthority }
 function Get-HeadPoseCanonicalPath([string]$Path) { return $probe }
+function New-FixturePose {
+    [pscustomobject]@{qualified=$true;driverCreatorPid=123;driverStartedFileTimeUtc=[uint64]100;driverInstanceNonce=[uint64]200;writerNonce=[uint64]300;acknowledgedWriterNonce=[uint64]300;requestedSequence=[uint64]2;appliedSequence=[uint64]2;creatorAuthority=[pscustomobject]@{verified=$true;pid=123;processStartFileTimeUtc=[uint64]50;executablePath=$probe;loadedModulePath=$probe}}
+}
+function Read-PoseState { New-FixturePose }
+function Get-HeadPoseSharedState { param($Contract);New-FixturePose }
 $ExpectedPackageProvenanceSha256 = $null
 function New-Payload {
     [pscustomobject]@{
@@ -48,6 +56,12 @@ function New-Payload {
 }
 try {
     $repositoryRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $authorityTokens=$authorityErrors=$null
+    $authorityAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'DriverPackageAuthority.ps1'),[ref]$authorityTokens,[ref]$authorityErrors)
+    foreach($name in @('Get-HeadPoseArtifactPaths','New-HeadPoseContinuityIdentity','Assert-HeadPoseContinuity')){
+        $node=@($authorityAst.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true))[0]
+        Invoke-Expression $node.Extent.Text
+    }
     foreach ($lane in @('head', 'null')) {
         $entry = if ($lane -eq 'head') { Join-Path $PSScriptRoot 'Invoke-SteamVRHeadPoseControl.ps1' } else { Join-Path $repositoryRoot 'tools\steamvr-null-control\Invoke-SteamVRNullControl.ps1' }
         $parseErrors = $tokens = $null
@@ -84,8 +98,8 @@ try {
             $PoseProbePath=$probe; $InstallRoot=$fixture; $HeadPoseDriverRoot=$fixture
             $OpenVRPathsPath=$null; $EvidenceDirectory=$null; $ProbeTimeoutSeconds=10
             $MinimumEyeHeightMeters=1.0; $MaximumEyeHeightMeters=2.5; $RequireControllers=$true
-            if ($lane -eq 'head') { $observation = Invoke-PoseProbe }
-            else { $observation=Get-ApplicationHeadPose -Contract @{poseProbeRelativePath='probe-fixture.exe';minimumQualifiedEyeHeightMeters=1.0;maximumQualifiedEyeHeightMeters=2.5} }
+            if ($lane -eq 'head') { $observation = Invoke-PoseProbe -PreProbePose (New-FixturePose) }
+            else { $observation=Get-ApplicationHeadPose -Contract @{poseProbeRelativePath='probe-fixture.exe';minimumQualifiedEyeHeightMeters=1.0;maximumQualifiedEyeHeightMeters=2.5} -PreProbePose (New-FixturePose) -PreProbePackageAuthority (Get-HeadPosePackageAuthority) }
             if (-not $observation.available) { throw "Fixture probe failed: $($observation | ConvertTo-Json -Depth 10 -Compress)" }
             $run = if ($lane -eq 'head') { $observation.boundedRun } else { $observation.boundedProcess }
             Assert-Controller ($observation.qualified -eq $expected) "$lane production probe function enforces controller gate: $case"
@@ -95,7 +109,7 @@ try {
     $RequireControllers=$false
     $legacy=New-Payload; $legacy.PSObject.Properties.Remove('controllers')
     [IO.File]::WriteAllText($payloadPath, ($legacy | ConvertTo-Json -Depth 10))
-    $headOnly=Invoke-PoseProbe
+    $headOnly=Invoke-PoseProbe -PreProbePose (New-FixturePose)
     Assert-Controller ($headOnly.qualified -and @($headOnly.boundedRun.argumentsReceived).Count -eq 0) 'explicit standalone head-only probe preserves legacy diagnostics'
     $nullAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repositoryRoot 'tools\steamvr-null-control\Invoke-SteamVRNullControl.ps1'), [ref]$tokens, [ref]$parseErrors)
     $contractNode=@($nullAst.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-RuntimeInputContract'}, $true))[0]

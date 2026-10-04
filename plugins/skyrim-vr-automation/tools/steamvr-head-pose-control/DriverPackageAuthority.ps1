@@ -123,6 +123,60 @@ function Get-HeadPosePackageAuthority {
     return [pscustomobject]$proof
 }
 
+function New-HeadPoseContinuityIdentity {
+    param([Parameter(Mandatory)]$Pose, [Parameter(Mandatory)]$PackageAuthority)
+    # Copy only validated scalar values into a deterministic immutable string.
+    # Shared-memory v2 has writer/acknowledgement nonces, not writer PID/start
+    # fields; never invent an OS writer identity that this protocol lacks.
+    if (-not $Pose.qualified -or -not $PackageAuthority.verified -or -not $Pose.creatorAuthority.verified) {
+        throw 'Provider continuity requires qualified pose, package and creator authority.'
+    }
+    $identity = [ordered]@{
+        schemaVersion = 1
+        packageRoot = (Get-HeadPoseCanonicalPath $PackageAuthority.root).ToLowerInvariant()
+        provenanceSha256 = ([string]$PackageAuthority.provenanceSha256).ToLowerInvariant()
+        markerSha256 = ([string]$PackageAuthority.markerSha256).ToLowerInvariant()
+        transactionId = [string]$PackageAuthority.transactionId
+        sourceCommit = [string]$PackageAuthority.sourceCommit
+        artifactDigests = [ordered]@{}
+        creatorExecutablePath = (Get-HeadPoseCanonicalPath $Pose.creatorAuthority.executablePath).ToLowerInvariant()
+        creatorPid = [uint32]$Pose.driverCreatorPid
+        creatorProcessStartFileTimeUtc = [uint64]$Pose.creatorAuthority.processStartFileTimeUtc
+        driverStartedFileTimeUtc = [uint64]$Pose.driverStartedFileTimeUtc
+        loadedModulePath = (Get-HeadPoseCanonicalPath $Pose.creatorAuthority.loadedModulePath).ToLowerInvariant()
+        driverInstanceNonce = [uint64]$Pose.driverInstanceNonce
+        writerNonce = [uint64]$Pose.writerNonce
+        acknowledgedWriterNonce = [uint64]$Pose.acknowledgedWriterNonce
+        requestedSequence = [uint64]$Pose.requestedSequence
+        appliedSequence = [uint64]$Pose.appliedSequence
+    }
+    if ($identity.provenanceSha256 -notmatch '^[a-f0-9]{64}$' -or $identity.markerSha256 -notmatch '^[a-f0-9]{64}$' -or
+        [string]::IsNullOrWhiteSpace($identity.transactionId) -or [string]::IsNullOrWhiteSpace($identity.sourceCommit) -or
+        $identity.creatorPid -eq 0 -or $identity.creatorPid -ne $Pose.creatorAuthority.pid -or
+        $identity.creatorProcessStartFileTimeUtc -eq 0 -or $identity.driverStartedFileTimeUtc -eq 0 -or
+        $identity.driverInstanceNonce -eq 0 -or $identity.writerNonce -eq 0 -or
+        $identity.writerNonce -ne $identity.acknowledgedWriterNonce -or
+        $identity.requestedSequence -eq 0 -or $identity.requestedSequence -ne $identity.appliedSequence) {
+        throw 'Incomplete or inconsistent provider continuity identity.'
+    }
+    foreach ($relative in @((Get-HeadPoseArtifactPaths).Values | Sort-Object)) {
+        $digest = ([string]$PackageAuthority.artifacts[$relative]).ToLowerInvariant()
+        if ($digest -notmatch '^[a-f0-9]{64}$') { throw "Missing governed continuity artifact digest: $relative" }
+        $identity.artifactDigests[$relative] = $digest
+    }
+    $canonicalJson = $identity | ConvertTo-Json -Depth 5 -Compress
+    $sha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($canonicalJson))).ToLowerInvariant()
+    return [pscustomobject]@{verified=$true;canonicalJson=$canonicalJson;sha256=$sha}
+}
+
+function Assert-HeadPoseContinuity {
+    param([Parameter(Mandatory)]$Before,[Parameter(Mandatory)]$After)
+    if (-not $Before.verified -or -not $After.verified -or
+        $Before.canonicalJson -cne $After.canonicalJson -or $Before.sha256 -cne $After.sha256) {
+        throw 'Provider continuity changed during the independent probe; no mixed-instance admission or replay is permitted.'
+    }
+}
+
 function Get-HeadPoseCreatorAuthority {
     param([uint32]$CreatorPid, [uint64]$DriverStartedFileTimeUtc, [string]$SteamVRRoot, [string]$DriverRoot)
     $proof = [ordered]@{ verified = $false; pid = $CreatorPid; processStartFileTimeUtc = $null; executablePath = $null; loadedModulePath = $null; error = $null }
