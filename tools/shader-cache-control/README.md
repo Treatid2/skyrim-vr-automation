@@ -301,6 +301,15 @@ quarantines the uncommitted replacement, restores and hash-verifies the exact
 displaced original, and reports `recovery-required` if that rollback cannot be
 fully verified.
 
+Same-task resume additionally requires the externally pinned completion to carry
+the exact SHA256 of its finalized restored plan. Resume matches that digest
+before parsing or using any compatibility request. Editing shader/build/feature/
+preset/tag fields in a sibling plan cannot redefine the historical cache inputs.
+Legacy completions lacking `planSha256` are ineligible for this opt-in mode;
+do not rewrite them or infer historical trust from their current sibling plan.
+Ordinary no-resume selection/completion and explicit known-working promotion
+retain their existing contracts.
+
 Run `Test-CSXShaderCacheControl.ps1` after changing comparison or transaction
 logic, and `Test-CSXShaderCacheCatalog.ps1` after changing catalog selection or
 task lifecycle logic.
