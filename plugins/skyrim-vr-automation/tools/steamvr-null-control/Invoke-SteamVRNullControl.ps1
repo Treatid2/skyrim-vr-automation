@@ -18,6 +18,8 @@ param(
 
     [string]$HeadPoseDriverRoot = $(if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { Join-Path $env:LOCALAPPDATA 'CSX-VR-Automation\SteamVR\drivers\codex_head_pose' } else { $null }),
 
+    [string]$HeadPoseExpectedProvenanceSha256,
+
     [string]$EvidenceDirectory,
 
     [string]$MO2AccessId,
@@ -77,6 +79,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '..\steamvr-head-pose-control\DriverPackageAuthority.ps1')
 
 if (-not ('SkyrimVRAutomation.Native.SharedPoseAtomics' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -540,7 +543,9 @@ function Get-NullSettingsExpectation([Collections.IDictionary]$Receipt, [string]
     $expected = Read-JsonHashtable -Path $BackupPath
     $profile = Read-JsonHashtable -Path $profilePath
     $controlled = [Collections.Generic.List[string]]::new()
-    foreach ($section in @('steamvr', 'dashboard', 'driver_null', 'driver_codex_head_pose', 'TrackingOverrides')) {
+    foreach ($section in @('steamvr', 'dashboard', 'driver_null', 'driver_codex_head_pose', 'TrackingOverrides', 'power')) {
+        # Historical receipt-bound profiles did not own a power setting.
+        if (-not $profile.Contains($section)) { continue }
         if (-not $expected.Contains($section)) { $expected[$section] = [ordered]@{} }
         foreach ($key in $profile[$section].Keys) {
             $expected[$section][$key] = $profile[$section][$key]
@@ -559,6 +564,12 @@ function Get-SettingsRestoreValidation([Collections.IDictionary]$Receipt, [strin
     foreach ($path in @($expectation.controlledPaths)) {
         $section, $key = $path -split '[.]', 2
         if (-not $current.Contains($section) -or $current[$section] -isnot [Collections.IDictionary] -or -not $current[$section].Contains($key) -or -not (Test-JsonValueEquivalent $expectation.profile[$section][$key] $current[$section][$key])) { $controlledDifferences += $path }
+        elseif ($path -ceq 'power.turnOffControllersTimeout') {
+            # Generic JSON equivalence can coerce false/0 or integer/float.
+            # SteamVR's timeout schema requires an integer, including Never.
+            $timeout = $current[$section][$key]
+            if (($timeout -isnot [int] -and $timeout -isnot [long]) -or $timeout -lt 0 -or $timeout -gt [int]::MaxValue) { $controlledDifferences += $path }
+        }
     }
     $allDifferences = @(Get-JsonDifferencePaths $expectation.value $current)
     $runtimeManagedPrefixes = @('GpuSpeed', 'LastKnown')
@@ -567,7 +578,7 @@ function Get-SettingsRestoreValidation([Collections.IDictionary]$Receipt, [strin
         @($runtimeManagedPrefixes | Where-Object { $candidate -eq $_ -or $candidate.StartsWith("$_`.", [StringComparison]::Ordinal) }).Count -eq 0
     })
     $controlledMatch = $controlledDifferences.Count -eq 0
-    $formattingOnly = -not $exactMatch -and $allDifferences.Count -eq 0
+    $formattingOnly = -not $exactMatch -and $controlledMatch -and $allDifferences.Count -eq 0
     $runtimeManagedOnly = -not $exactMatch -and $controlledMatch -and $allDifferences.Count -gt 0 -and $unclassified.Count -eq 0
     return [pscustomobject][ordered]@{
         exactMatch = $exactMatch; controlledContractMatch = $controlledMatch; formattingOnlyDriftAccepted = $formattingOnly; runtimeManagedOnlyDriftAccepted = $runtimeManagedOnly
@@ -940,6 +951,30 @@ function Stop-ExactStartedSteamVRProcesses([DateTime]$StartedUtc) {
     return [pscustomobject][ordered]@{ requested = $targets; remaining = $remaining; errors = $errors; verified = $verified }
 }
 
+function Assert-ControllerPowerProfile {
+    param([Parameter(Mandatory)]$Profile, [Parameter(Mandatory)]$Settings)
+    $requiresControllers = $Profile['driver_codex_head_pose'].Contains('enableControllers') -and
+        $Profile['driver_codex_head_pose']['enableControllers'] -eq $true
+    if (-not $Profile.Contains('power')) {
+        if ($requiresControllers) { throw 'Controller-required null profiles must declare power.turnOffControllersTimeout.' }
+        return
+    }
+    $power = $Profile['power']
+    if ($power -isnot [Collections.IDictionary] -or $power.Count -ne 1 -or -not $power.Contains('turnOffControllersTimeout')) {
+        throw 'Null profile power must declare only turnOffControllersTimeout.'
+    }
+    $timeout = $power['turnOffControllersTimeout']
+    if (($timeout -isnot [int] -and $timeout -isnot [long]) -or $timeout -lt 0 -or $timeout -gt [int]::MaxValue) {
+        throw 'power.turnOffControllersTimeout must be a nonnegative JSON integer within Int32 range.'
+    }
+    if ($timeout -ne 0 -and -not $Standalone) {
+        throw 'A positive controller timeout is permitted only for an explicit -Standalone diagnostic; MO2 admission requires Never (0).'
+    }
+    if ($Settings.Contains('power') -and $Settings['power'] -isnot [Collections.IDictionary]) {
+        throw 'Existing SteamVR power settings are not an object; refusing to replace an unclassified section.'
+    }
+}
+
 function Get-EffectiveState {
     param(
         [Parameter(Mandatory)]$Settings,
@@ -992,8 +1027,21 @@ function Get-EffectiveState {
             matches = $trackingOverrides.ContainsKey($key) -and $trackingOverrides[$key] -eq $expectedTrackingOverrides[$key]
         }
     }
+    $controllerInactivitySuppressed = $false
+    if ($Profile.Contains('power')) {
+        $expectedPower = $Profile['power']
+        $actualPower = if ($Settings.Contains('power')) { $Settings['power'] } else { $null }
+        $actualTimeout = if ($actualPower -is [Collections.IDictionary] -and $actualPower.Contains('turnOffControllersTimeout')) { $actualPower['turnOffControllersTimeout'] } else { $null }
+        $expectedTimeout = if ($expectedPower -is [Collections.IDictionary] -and $expectedPower.Contains('turnOffControllersTimeout')) { $expectedPower['turnOffControllersTimeout'] } else { $null }
+        $expectedValid = $expectedPower -is [Collections.IDictionary] -and $expectedPower.Count -eq 1 -and ($expectedTimeout -is [int] -or $expectedTimeout -is [long]) -and $expectedTimeout -ge 0 -and $expectedTimeout -le [int]::MaxValue
+        $actualValid = ($actualTimeout -is [int] -or $actualTimeout -is [long]) -and $actualTimeout -ge 0 -and $actualTimeout -le [int]::MaxValue
+        $matches = $expectedValid -and $actualValid -and $actualTimeout -eq $expectedTimeout
+        $checks['power.turnOffControllersTimeout'] = [ordered]@{ actual = $actualTimeout; expected = $expectedTimeout; matches = $matches }
+        $controllerInactivitySuppressed = $matches -and $expectedTimeout -eq 0
+    }
     return [pscustomobject][ordered]@{
         active = @($checks.Values | Where-Object { -not $_.matches }).Count -eq 0
+        controllerInactivitySuppressed = [bool]$controllerInactivitySuppressed
         checks = $checks
     }
 }
@@ -1006,14 +1054,12 @@ function Read-HeadPoseAtomicUInt64([IO.MemoryMappedFiles.MemoryMappedViewAccesso
 }
 
 function Test-HeadPoseDriverIdentity([uint32]$CreatorPid, [uint64]$DriverStartedFileTimeUtc) {
-    if ($CreatorPid -eq 0 -or $DriverStartedFileTimeUtc -eq 0) { return $false }
-    try {
-        $process = Get-Process -Id $CreatorPid -ErrorAction Stop
-        $processStart = [uint64]$process.StartTime.ToUniversalTime().ToFileTimeUtc()
-        $now = [uint64][DateTime]::UtcNow.AddSeconds(5).ToFileTimeUtc()
-        return $processStart -le $DriverStartedFileTimeUtc -and $DriverStartedFileTimeUtc -le $now
-    }
-    catch { return $false }
+    $script:LastCreatorAuthority = Get-HeadPoseCreatorAuthority -CreatorPid $CreatorPid -DriverStartedFileTimeUtc $DriverStartedFileTimeUtc -SteamVRRoot $SteamVRRoot -DriverRoot $HeadPoseDriverRoot
+    return [bool]$script:LastCreatorAuthority.verified
+}
+
+function Get-NullProviderAuthority([DateTime]$DeadlineUtc = [DateTime]::MaxValue) {
+    return Get-HeadPosePackageAuthority -Root $HeadPoseDriverRoot -RegistrationPath $OpenVRPathsPath -BundledProvenancePath (Join-Path $PSScriptRoot '..\..\drivers\codex_head_pose\build-provenance.json') -ExpectedProvenanceSha256 $HeadPoseExpectedProvenanceSha256 -DeadlineUtc $DeadlineUtc
 }
 
 function Get-HeadPoseSharedState {
@@ -1072,12 +1118,13 @@ function Get-HeadPoseSharedState {
             $state['eyeHeightQualified'] = $state.position[1] -ge [double]$Contract['minimumQualifiedEyeHeightMeters'] -and $state.position[1] -le [double]$Contract['maximumQualifiedEyeHeightMeters']
             if ($expectedVersion -eq 2) {
                 $state['driverIdentityVerified'] = Test-HeadPoseDriverIdentity -CreatorPid $state.driverCreatorPid -DriverStartedFileTimeUtc $state.driverStartedFileTimeUtc
+                $state['creatorAuthority'] = $script:LastCreatorAuthority
                 $state['acknowledged'] = $state.requestedSequence -gt 0 -and $state.appliedSequence -eq $state.requestedSequence -and $state.writerNonce -ne 0 -and $state.acknowledgedWriterNonce -eq $state.writerNonce -and $state.status -eq 1
                 $state['qualified'] = $state.protocolValid -and $state.driverIdentityVerified -and $state.driverInstanceNonce -ne 0 -and $state.acknowledged -and $state.eyeHeightQualified -and (($state.flags -band 1) -eq 1)
             }
             else {
                 $state['acknowledged'] = $state.requestedSequence -gt 0 -and $state.appliedSequence -eq $state.requestedSequence -and $state.status -eq 1
-                $state['qualified'] = $state.protocolValid -and $state.acknowledged -and $state.eyeHeightQualified -and (($state.flags -band 1) -eq 1)
+                $state['qualified'] = $false # Legacy v1 has no creator/module identity authority.
             }
             return [pscustomobject]$state
         }
@@ -1098,6 +1145,23 @@ function Get-HeadPoseSharedState {
     }
 }
 
+function Test-PassiveControllerProbeObservation($Payload) {
+    try {
+        $pair = $Payload.controllers
+        if ($pair.required -isnot [bool] -or -not $pair.required -or
+            $pair.valid -isnot [bool] -or -not $pair.valid) { return $false }
+        foreach ($value in @($pair.leftIndex, $pair.rightIndex, $pair.neutralSamples, $pair.inputEvents)) {
+            if ($value -isnot [int] -and $value -isnot [long] -and $value -isnot [uint32]) { return $false }
+        }
+        # Matches the pinned OpenVR tracked-device array; index zero is the HMD.
+        return $pair.leftIndex -gt 0 -and $pair.leftIndex -lt 64 -and
+            $pair.rightIndex -gt 0 -and $pair.rightIndex -lt 64 -and
+            $pair.leftIndex -ne $pair.rightIndex -and
+            $pair.neutralSamples -eq 100 -and $pair.inputEvents -eq 0
+    }
+    catch { return $false }
+}
+
 function Get-ApplicationHeadPose {
     param(
         [Parameter(Mandatory)]$Contract,
@@ -1111,6 +1175,9 @@ function Get-ApplicationHeadPose {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; probePath = $probePath; error = 'The independent OpenVR pose probe is not installed.' }
     }
     try {
+        $packageAuthority = Get-NullProviderAuthority -DeadlineUtc $DeadlineUtc
+        if (-not $packageAuthority.verified) { throw "Provider package refused before probe execution: $($packageAuthority.errors -join '; ')" }
+        if ((Get-HeadPoseCanonicalPath $probePath) -ne (Get-HeadPoseCanonicalPath (Join-Path $HeadPoseDriverRoot 'tools\csx_openvr_pose_probe.exe'))) { throw 'The profile cannot substitute a probe outside the exact owned package member.' }
         $boundedTool = Join-Path (Split-Path -Parent $PSScriptRoot) 'process-control\Invoke-BoundedProcess.ps1'
         if (-not (Test-Path -LiteralPath $boundedTool -PathType Leaf)) { throw "Bounded process controller is missing: $boundedTool" }
         $probeTimeoutSeconds = 10
@@ -1121,23 +1188,29 @@ function Get-ApplicationHeadPose {
             }
             $probeTimeoutSeconds = [Math]::Max(1, [Math]::Min(10, [Math]::Floor(($remainingMilliseconds - 450) / 1000)))
         }
-        $bounded = & $boundedTool -FilePath $probePath -WorkingDirectory (Split-Path -Parent $probePath) -MaxAttempts 1 -TimeoutSeconds $probeTimeoutSeconds -TerminationGraceMilliseconds 100 -StreamDrainGraceMilliseconds 100 -NoExit -Compact | ConvertFrom-Json -Depth 30
+        $bounded = & $boundedTool -FilePath $probePath -ArgumentList @('--require-controllers') -WorkingDirectory (Split-Path -Parent $probePath) -MaxAttempts 1 -TimeoutSeconds $probeTimeoutSeconds -TerminationGraceMilliseconds 100 -StreamDrainGraceMilliseconds 100 -NoExit -Compact | ConvertFrom-Json -Depth 30
         $attempt = if (@($bounded.attempts).Count -gt 0) { $bounded.attempts[-1] } else { $null }
         if ($attempt -and [bool]$attempt.timedOut) {
             throw [TimeoutException]::new("Independent OpenVR pose probe exceeded its $probeTimeoutSeconds-second share of the SteamVR readiness deadline.")
         }
         if ($null -eq $attempt -or [string]::IsNullOrWhiteSpace([string]$attempt.stdout)) { throw "Independent OpenVR pose probe produced no bounded output. $($bounded.errors -join '; ')" }
         $payload = [string]$attempt.stdout | ConvertFrom-Json -ErrorAction Stop
+        $afterAuthority = Get-NullProviderAuthority -DeadlineUtc $DeadlineUtc
+        if (-not $afterAuthority.verified -or $afterAuthority.markerSha256 -ne $packageAuthority.markerSha256) { throw 'Provider package changed during probe execution.' }
+        $controllersQualified = Test-PassiveControllerProbeObservation $payload
         $qualified = $bounded.ok -and $payload.ok -and $payload.standing.connected -and $payload.standing.valid -and
             [double]$payload.standing.position[1] -ge [double]$Contract['minimumQualifiedEyeHeightMeters'] -and
-            [double]$payload.standing.position[1] -le [double]$Contract['maximumQualifiedEyeHeightMeters']
+            [double]$payload.standing.position[1] -le [double]$Contract['maximumQualifiedEyeHeightMeters'] -and $controllersQualified
         return [pscustomobject][ordered]@{
             available = $true
             qualified = $qualified
+            controllersRequired = $true
+            controllersQualified = $controllersQualified
             probePath = $probePath
             exitCode = $attempt.exitCode
             boundedProcess = $bounded
             observation = $payload
+            packageAuthority = $afterAuthority
         }
     }
     catch [TimeoutException] {
@@ -1177,6 +1250,7 @@ function Get-NullRuntimeEvidence {
     })
     $server = @($owned | Where-Object name -eq 'vrserver' | Sort-Object startTimeUtc | Select-Object -First 1)
     $serverStartUtc = if ($server.Count -eq 1 -and $server[0].startTimeUtc) { [DateTime]::Parse([string]$server[0].startTimeUtc).ToUniversalTime() } else { $null }
+    $packageAuthority = Get-NullProviderAuthority -DeadlineUtc $DeadlineUtc
     $loaded = $null
     $active = $null
     $headPoseLoaded = $null
@@ -1223,7 +1297,7 @@ function Get-NullRuntimeEvidence {
         }
     }
     $providerLogReady = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active -and $null -ne $headPoseLoaded -and $null -ne $headPoseRegistered
-    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -DeadlineUtc $DeadlineUtc } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider is not ready for an application-facing pose probe.' } }
+    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified -and $packageAuthority.verified -and $headPoseState.driverCreatorPid -eq $server[0].id -and [uint64][DateTime]::Parse($server[0].startTimeUtc).ToUniversalTime().ToFileTimeUtc() -eq $headPoseState.creatorAuthority.processStartFileTimeUtc) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -DeadlineUtc $DeadlineUtc } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider creator/package is not ready for an application-facing pose probe.' } }
     $runtimeEvidence = [pscustomobject][ordered]@{
         active = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active
         serverProcess = if ($server.Count -eq 1) { $server[0] } else { $null }
@@ -1250,8 +1324,10 @@ function Get-NullRuntimeEvidence {
         headPoseDriverLoaded = $headPoseLoaded
         headPoseDeviceRegistered = $headPoseRegistered
         headPoseState = $headPoseState
+        packageAuthority = $packageAuthority
         headPoseAuthorizationError = $headPoseAuthorizationError
         applicationHeadPose = $applicationHeadPose
+        controllersReady = $applicationHeadPose.PSObject.Properties['controllersQualified'] -and [bool]$applicationHeadPose.controllersQualified
         headPoseReady = $providerLogReady -and [bool]$headPoseState.qualified -and [bool]$applicationHeadPose.qualified
         dashboardProcesses = @($owned | Where-Object name -eq 'vrdashboard')
         dashboardSuppressed = $Profile['dashboard'].ContainsKey('enableDashboard') -and -not [bool]$Profile['dashboard']['enableDashboard']
@@ -1281,6 +1357,7 @@ function Get-NullRuntimeEvidence {
     if ($fixtureMode -and $InternalTestFailurePoint -in $fixtureReadyPoints) {
         $runtimeEvidence.active = $true
         $runtimeEvidence.headPoseReady = $true
+        $runtimeEvidence.controllersReady = $true
         $runtimeEvidence.headPoseAuthorizationError = $null
     }
     return $runtimeEvidence
@@ -1449,14 +1526,24 @@ function Get-RuntimeInputContract {
     $contract = ($BaseContract | ConvertTo-Json -Depth 8 | ConvertFrom-Json -AsHashtable)
     $blockers = [Collections.Generic.List[string]]::new()
     if (-not [bool]$Effective.active) { $blockers.Add('null-profile-not-effective') }
+    if (-not [bool]$Effective.controllerInactivitySuppressed) { $blockers.Add('controller-inactivity-timeout-not-suppressed') }
     if (-not [bool]$Runtime.active) { $blockers.Add('null-runtime-not-active') }
     if (-not [bool]$Runtime.headPoseReady) { $blockers.Add('head-pose-not-qualified') }
+    $packageReady = $Runtime.PSObject.Properties['packageAuthority'] -and [bool]$Runtime.packageAuthority.verified
+    if (-not $packageReady) { $blockers.Add('head-pose-package-not-qualified') }
+    $controllersReady = $Runtime.PSObject.Properties['controllersReady'] -and [bool]$Runtime.controllersReady
+    if (-not $controllersReady) { $blockers.Add('passive-controller-pair-not-qualified') }
     if ($ExternalDrivers.errors.Count -gt 0) { $blockers.Add('external-driver-inventory-incomplete') }
     if ($ExternalDrivers.conflicts.Count -gt 0) { $blockers.Add('external-display-redirector-present') }
     if ($DiagnosticDisplayOverride) { $blockers.Add('diagnostic-display-override') }
     $contract['measurementReady'] = $blockers.Count -eq 0
+    $contract['controllerPresenceReady'] = [bool]$controllersReady
+    $contract['controllerInactivitySuppressed'] = [bool]$Effective.controllerInactivitySuppressed
+    $contract['controllerInput'] = 'passive-neutral'
+    $contract['replayReady'] = $false
     $contract['measurementBlockers'] = @($blockers)
     $contract['dashboardProcessTelemetryOnly'] = $true
+    $contract['providerPackageVerified'] = [bool]$packageReady
     return $contract
 }
 
@@ -1550,6 +1637,7 @@ try {
     foreach ($section in @('steamvr', 'dashboard', 'driver_null', 'driver_codex_head_pose', 'TrackingOverrides', 'headPoseProviderContract', 'automationInputContract')) {
         if (-not $profile.ContainsKey($section)) { throw "Null-HMD profile is missing '$section'." }
     }
+    if ($Command -in @('apply', 'start')) { Assert-ControllerPowerProfile -Profile $profile -Settings $settings }
     $processes = @(Get-SteamVRProcesses)
     $resolvedSteamVRRoot = [IO.Path]::GetFullPath($SteamVRRoot).TrimEnd('\') + '\'
     $ownedProcesses = @($processes | Where-Object {
@@ -1628,7 +1716,7 @@ try {
         }
     }
     elseif ($Command -eq 'inspect') {
-        $providerDriver = @($externalDrivers.drivers | Where-Object name -eq ([string]$profile['headPoseProviderContract']['driverName']))
+        $providerDriver = @($externalDrivers.drivers | Where-Object { $_.name -ceq 'codex_head_pose' -and (Get-NormalizedPath $_.root) -eq (Get-NormalizedPath $HeadPoseDriverRoot) })
         $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers
         $state = if ($externalDrivers.errors.Count -gt 0) { 'external-driver-inventory-failed' } elseif ($providerDriver.Count -ne 1) { 'head-pose-provider-unavailable' } elseif ($externalDrivers.conflicts.Count -gt 0) { 'external-driver-conflict' } elseif ($runtime.headPoseAuthorizationError) { 'head-pose-provider-authorization-failed' } elseif ($runtime.active -and -not $runtime.headPoseReady) { 'head-pose-provider-not-ready' } elseif ($runtime.active -and $effective.active) { 'null-runtime-active-head-pose-ready' } elseif ($effective.active) { 'null-configured-runtime-stopped' } else { 'null-inactive' }
         $result = New-Result -Ok (-not [bool]$runtime.headPoseAuthorizationError) -State $state -Data @{
@@ -1647,12 +1735,15 @@ try {
         }
     }
     elseif ($Command -eq 'start') {
-        $providerDriver = @($externalDrivers.drivers | Where-Object name -eq ([string]$profile['headPoseProviderContract']['driverName']))
+        $providerDriver = @($externalDrivers.drivers | Where-Object { $_.name -ceq 'codex_head_pose' -and (Get-NormalizedPath $_.root) -eq (Get-NormalizedPath $HeadPoseDriverRoot) })
         if ($externalDrivers.errors.Count -gt 0) {
             $result = New-Result -Ok $false -State 'external-driver-inventory-failed' -Data @{ effective = $effective; runtime = $runtime; externalDrivers = $externalDrivers } -Errors @('The external OpenVR driver inventory could not be read reliably; refusing null-HMD startup.')
         }
         elseif ($providerDriver.Count -ne 1) {
             $result = New-Result -Ok $false -State 'head-pose-provider-unavailable' -Data @{ effective = $effective; runtime = $runtime; externalDrivers = $externalDrivers; requiredDriverName = $profile['headPoseProviderContract']['driverName'] } -Errors @('The CSX SteamVR head-pose driver must be installed and registered exactly once before null-HMD startup.')
+        }
+        elseif (-not $runtime.packageAuthority.verified) {
+            $result = New-Result -Ok $false -State 'head-pose-package-not-qualified' -Data @{ effective = $effective; runtime = $runtime; externalDrivers = $externalDrivers } -Errors @($runtime.packageAuthority.errors)
         }
         elseif ($externalDrivers.conflicts.Count -gt 0 -and -not $AllowExternalDisplayRedirector) {
             $names = @($externalDrivers.conflicts | ForEach-Object { if ([string]::IsNullOrWhiteSpace([string]$_.name)) { $_.root } else { $_.name } })
@@ -2029,9 +2120,11 @@ try {
                 foreach ($section in @('steamvr', 'dashboard', 'driver_null', 'driver_codex_head_pose', 'TrackingOverrides', 'headPoseProviderContract', 'automationInputContract')) {
                     if (-not $profile.ContainsKey($section)) { throw "Staged null-HMD profile is missing '$section'." }
                 }
+                Assert-ControllerPowerProfile -Profile $profile -Settings $settings
                 if ($InternalTestFailurePoint -eq 'apply-source-drift-after-stage') {
                     $driftedSourceProfile = Read-JsonHashtable -Path $NullProfilePath
                     $driftedSourceProfile['driver_codex_head_pose']['eyeHeightMeters'] = 9.25
+                    if ($driftedSourceProfile.ContainsKey('power')) { $driftedSourceProfile['power']['turnOffControllersTimeout'] = 30 }
                     Write-JsonAtomic -Path $NullProfilePath -Value $driftedSourceProfile
                 }
                 $effective = Get-EffectiveState -Settings $settings -Profile $profile
@@ -2078,7 +2171,8 @@ try {
                         $openVRPathsIsolatedHash = Get-HashOrNull $OpenVRPathsPath
                         $openVRPathsIsolatedSemanticHash = Get-JsonSemanticSha256 -Path $OpenVRPathsPath
                     }
-                    foreach ($section in @('steamvr', 'dashboard', 'driver_null', 'driver_codex_head_pose', 'TrackingOverrides')) {
+                    foreach ($section in @('steamvr', 'dashboard', 'driver_null', 'driver_codex_head_pose', 'TrackingOverrides', 'power')) {
+                        if (-not $profile.ContainsKey($section)) { continue }
                         if (-not $settings.ContainsKey($section)) { $settings[$section] = [ordered]@{} }
                         foreach ($key in $profile[$section].Keys) { $settings[$section][$key] = $profile[$section][$key] }
                     }

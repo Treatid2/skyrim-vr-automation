@@ -48,6 +48,8 @@
   },
   "headPoseProviderContract": {
     "driverName": "codex_head_pose",
+    "packageAuthority": "committed-owned-install-and-independent-provenance-digest",
+    "requiredInstallMarkerSchemaVersion": 3,
     "registeredDevicePath": "/devices/codex_head_pose/CSX-NULL-HMD-POSE-1",
     "semanticTarget": "/user/head",
     "sharedMemoryName": "Local\\CSXVRHeadPose-v2",

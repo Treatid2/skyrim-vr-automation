@@ -215,3 +215,21 @@ not be used for Skyrim through MO2. A running null SteamVR instance does not
 prove an application bypassing SteamVR is attached to it.
 
 Run `Test-SteamVRNullControl.ps1` after changing the control contract.
+
+Runtime startup and every application-facing probe also require the exact
+owned `HeadPoseDriverRoot` and committed schema-3 installation custody described
+in the head-pose README. Exactly one canonical registration and one same-name
+provider are required. Manifest/driver/probe/OpenVR DLL/settings/input-profile
+hashes are enforced against independent bundled provenance, not merely reported.
+An explicitly authorized custom build uses
+`-HeadPoseExpectedProvenanceSha256 <sha256>`; it retains distinct digest authority.
+The selected profile cannot substitute another executable as its probe.
+
+The creator must match the configured `vrserver.exe`, loaded driver module, and
+current runtime server PID/start identity. `runtime.packageAuthority` retains
+the root, committed transaction, provenance and verified artifact hashes.
+`head-pose-package-not-qualified` is a measurement blocker and refuses startup
+before launch; behavioral head/controller readiness cannot override it. Old
+install markers require an explicit closed-state upgrade, not an automatic
+rewrite. Source fixtures, installation custody and standalone presence still do
+not prove in-game controller roles or game fixture qualification.

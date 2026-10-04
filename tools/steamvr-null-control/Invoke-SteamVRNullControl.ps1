@@ -18,6 +18,8 @@ param(
 
     [string]$HeadPoseDriverRoot = $(if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { Join-Path $env:LOCALAPPDATA 'CSX-VR-Automation\SteamVR\drivers\codex_head_pose' } else { $null }),
 
+    [string]$HeadPoseExpectedProvenanceSha256,
+
     [string]$EvidenceDirectory,
 
     [string]$MO2AccessId,
@@ -77,6 +79,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '..\steamvr-head-pose-control\DriverPackageAuthority.ps1')
 
 if (-not ('SkyrimVRAutomation.Native.SharedPoseAtomics' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -1051,14 +1054,12 @@ function Read-HeadPoseAtomicUInt64([IO.MemoryMappedFiles.MemoryMappedViewAccesso
 }
 
 function Test-HeadPoseDriverIdentity([uint32]$CreatorPid, [uint64]$DriverStartedFileTimeUtc) {
-    if ($CreatorPid -eq 0 -or $DriverStartedFileTimeUtc -eq 0) { return $false }
-    try {
-        $process = Get-Process -Id $CreatorPid -ErrorAction Stop
-        $processStart = [uint64]$process.StartTime.ToUniversalTime().ToFileTimeUtc()
-        $now = [uint64][DateTime]::UtcNow.AddSeconds(5).ToFileTimeUtc()
-        return $processStart -le $DriverStartedFileTimeUtc -and $DriverStartedFileTimeUtc -le $now
-    }
-    catch { return $false }
+    $script:LastCreatorAuthority = Get-HeadPoseCreatorAuthority -CreatorPid $CreatorPid -DriverStartedFileTimeUtc $DriverStartedFileTimeUtc -SteamVRRoot $SteamVRRoot -DriverRoot $HeadPoseDriverRoot
+    return [bool]$script:LastCreatorAuthority.verified
+}
+
+function Get-NullProviderAuthority([DateTime]$DeadlineUtc = [DateTime]::MaxValue) {
+    return Get-HeadPosePackageAuthority -Root $HeadPoseDriverRoot -RegistrationPath $OpenVRPathsPath -BundledProvenancePath (Join-Path $PSScriptRoot '..\..\drivers\codex_head_pose\build-provenance.json') -ExpectedProvenanceSha256 $HeadPoseExpectedProvenanceSha256 -DeadlineUtc $DeadlineUtc
 }
 
 function Get-HeadPoseSharedState {
@@ -1117,12 +1118,13 @@ function Get-HeadPoseSharedState {
             $state['eyeHeightQualified'] = $state.position[1] -ge [double]$Contract['minimumQualifiedEyeHeightMeters'] -and $state.position[1] -le [double]$Contract['maximumQualifiedEyeHeightMeters']
             if ($expectedVersion -eq 2) {
                 $state['driverIdentityVerified'] = Test-HeadPoseDriverIdentity -CreatorPid $state.driverCreatorPid -DriverStartedFileTimeUtc $state.driverStartedFileTimeUtc
+                $state['creatorAuthority'] = $script:LastCreatorAuthority
                 $state['acknowledged'] = $state.requestedSequence -gt 0 -and $state.appliedSequence -eq $state.requestedSequence -and $state.writerNonce -ne 0 -and $state.acknowledgedWriterNonce -eq $state.writerNonce -and $state.status -eq 1
                 $state['qualified'] = $state.protocolValid -and $state.driverIdentityVerified -and $state.driverInstanceNonce -ne 0 -and $state.acknowledged -and $state.eyeHeightQualified -and (($state.flags -band 1) -eq 1)
             }
             else {
                 $state['acknowledged'] = $state.requestedSequence -gt 0 -and $state.appliedSequence -eq $state.requestedSequence -and $state.status -eq 1
-                $state['qualified'] = $state.protocolValid -and $state.acknowledged -and $state.eyeHeightQualified -and (($state.flags -band 1) -eq 1)
+                $state['qualified'] = $false # Legacy v1 has no creator/module identity authority.
             }
             return [pscustomobject]$state
         }
@@ -1173,6 +1175,9 @@ function Get-ApplicationHeadPose {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; probePath = $probePath; error = 'The independent OpenVR pose probe is not installed.' }
     }
     try {
+        $packageAuthority = Get-NullProviderAuthority -DeadlineUtc $DeadlineUtc
+        if (-not $packageAuthority.verified) { throw "Provider package refused before probe execution: $($packageAuthority.errors -join '; ')" }
+        if ((Get-HeadPoseCanonicalPath $probePath) -ne (Get-HeadPoseCanonicalPath (Join-Path $HeadPoseDriverRoot 'tools\csx_openvr_pose_probe.exe'))) { throw 'The profile cannot substitute a probe outside the exact owned package member.' }
         $boundedTool = Join-Path (Split-Path -Parent $PSScriptRoot) 'process-control\Invoke-BoundedProcess.ps1'
         if (-not (Test-Path -LiteralPath $boundedTool -PathType Leaf)) { throw "Bounded process controller is missing: $boundedTool" }
         $probeTimeoutSeconds = 10
@@ -1190,6 +1195,8 @@ function Get-ApplicationHeadPose {
         }
         if ($null -eq $attempt -or [string]::IsNullOrWhiteSpace([string]$attempt.stdout)) { throw "Independent OpenVR pose probe produced no bounded output. $($bounded.errors -join '; ')" }
         $payload = [string]$attempt.stdout | ConvertFrom-Json -ErrorAction Stop
+        $afterAuthority = Get-NullProviderAuthority -DeadlineUtc $DeadlineUtc
+        if (-not $afterAuthority.verified -or $afterAuthority.markerSha256 -ne $packageAuthority.markerSha256) { throw 'Provider package changed during probe execution.' }
         $controllersQualified = Test-PassiveControllerProbeObservation $payload
         $qualified = $bounded.ok -and $payload.ok -and $payload.standing.connected -and $payload.standing.valid -and
             [double]$payload.standing.position[1] -ge [double]$Contract['minimumQualifiedEyeHeightMeters'] -and
@@ -1203,6 +1210,7 @@ function Get-ApplicationHeadPose {
             exitCode = $attempt.exitCode
             boundedProcess = $bounded
             observation = $payload
+            packageAuthority = $afterAuthority
         }
     }
     catch [TimeoutException] {
@@ -1242,6 +1250,7 @@ function Get-NullRuntimeEvidence {
     })
     $server = @($owned | Where-Object name -eq 'vrserver' | Sort-Object startTimeUtc | Select-Object -First 1)
     $serverStartUtc = if ($server.Count -eq 1 -and $server[0].startTimeUtc) { [DateTime]::Parse([string]$server[0].startTimeUtc).ToUniversalTime() } else { $null }
+    $packageAuthority = Get-NullProviderAuthority -DeadlineUtc $DeadlineUtc
     $loaded = $null
     $active = $null
     $headPoseLoaded = $null
@@ -1288,7 +1297,7 @@ function Get-NullRuntimeEvidence {
         }
     }
     $providerLogReady = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active -and $null -ne $headPoseLoaded -and $null -ne $headPoseRegistered
-    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -DeadlineUtc $DeadlineUtc } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider is not ready for an application-facing pose probe.' } }
+    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified -and $packageAuthority.verified -and $headPoseState.driverCreatorPid -eq $server[0].id -and [uint64][DateTime]::Parse($server[0].startTimeUtc).ToUniversalTime().ToFileTimeUtc() -eq $headPoseState.creatorAuthority.processStartFileTimeUtc) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -DeadlineUtc $DeadlineUtc } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider creator/package is not ready for an application-facing pose probe.' } }
     $runtimeEvidence = [pscustomobject][ordered]@{
         active = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active
         serverProcess = if ($server.Count -eq 1) { $server[0] } else { $null }
@@ -1315,6 +1324,7 @@ function Get-NullRuntimeEvidence {
         headPoseDriverLoaded = $headPoseLoaded
         headPoseDeviceRegistered = $headPoseRegistered
         headPoseState = $headPoseState
+        packageAuthority = $packageAuthority
         headPoseAuthorizationError = $headPoseAuthorizationError
         applicationHeadPose = $applicationHeadPose
         controllersReady = $applicationHeadPose.PSObject.Properties['controllersQualified'] -and [bool]$applicationHeadPose.controllersQualified
@@ -1519,6 +1529,8 @@ function Get-RuntimeInputContract {
     if (-not [bool]$Effective.controllerInactivitySuppressed) { $blockers.Add('controller-inactivity-timeout-not-suppressed') }
     if (-not [bool]$Runtime.active) { $blockers.Add('null-runtime-not-active') }
     if (-not [bool]$Runtime.headPoseReady) { $blockers.Add('head-pose-not-qualified') }
+    $packageReady = $Runtime.PSObject.Properties['packageAuthority'] -and [bool]$Runtime.packageAuthority.verified
+    if (-not $packageReady) { $blockers.Add('head-pose-package-not-qualified') }
     $controllersReady = $Runtime.PSObject.Properties['controllersReady'] -and [bool]$Runtime.controllersReady
     if (-not $controllersReady) { $blockers.Add('passive-controller-pair-not-qualified') }
     if ($ExternalDrivers.errors.Count -gt 0) { $blockers.Add('external-driver-inventory-incomplete') }
@@ -1531,6 +1543,7 @@ function Get-RuntimeInputContract {
     $contract['replayReady'] = $false
     $contract['measurementBlockers'] = @($blockers)
     $contract['dashboardProcessTelemetryOnly'] = $true
+    $contract['providerPackageVerified'] = [bool]$packageReady
     return $contract
 }
 
@@ -1703,7 +1716,7 @@ try {
         }
     }
     elseif ($Command -eq 'inspect') {
-        $providerDriver = @($externalDrivers.drivers | Where-Object name -eq ([string]$profile['headPoseProviderContract']['driverName']))
+        $providerDriver = @($externalDrivers.drivers | Where-Object { $_.name -ceq 'codex_head_pose' -and (Get-NormalizedPath $_.root) -eq (Get-NormalizedPath $HeadPoseDriverRoot) })
         $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers
         $state = if ($externalDrivers.errors.Count -gt 0) { 'external-driver-inventory-failed' } elseif ($providerDriver.Count -ne 1) { 'head-pose-provider-unavailable' } elseif ($externalDrivers.conflicts.Count -gt 0) { 'external-driver-conflict' } elseif ($runtime.headPoseAuthorizationError) { 'head-pose-provider-authorization-failed' } elseif ($runtime.active -and -not $runtime.headPoseReady) { 'head-pose-provider-not-ready' } elseif ($runtime.active -and $effective.active) { 'null-runtime-active-head-pose-ready' } elseif ($effective.active) { 'null-configured-runtime-stopped' } else { 'null-inactive' }
         $result = New-Result -Ok (-not [bool]$runtime.headPoseAuthorizationError) -State $state -Data @{
@@ -1722,12 +1735,15 @@ try {
         }
     }
     elseif ($Command -eq 'start') {
-        $providerDriver = @($externalDrivers.drivers | Where-Object name -eq ([string]$profile['headPoseProviderContract']['driverName']))
+        $providerDriver = @($externalDrivers.drivers | Where-Object { $_.name -ceq 'codex_head_pose' -and (Get-NormalizedPath $_.root) -eq (Get-NormalizedPath $HeadPoseDriverRoot) })
         if ($externalDrivers.errors.Count -gt 0) {
             $result = New-Result -Ok $false -State 'external-driver-inventory-failed' -Data @{ effective = $effective; runtime = $runtime; externalDrivers = $externalDrivers } -Errors @('The external OpenVR driver inventory could not be read reliably; refusing null-HMD startup.')
         }
         elseif ($providerDriver.Count -ne 1) {
             $result = New-Result -Ok $false -State 'head-pose-provider-unavailable' -Data @{ effective = $effective; runtime = $runtime; externalDrivers = $externalDrivers; requiredDriverName = $profile['headPoseProviderContract']['driverName'] } -Errors @('The CSX SteamVR head-pose driver must be installed and registered exactly once before null-HMD startup.')
+        }
+        elseif (-not $runtime.packageAuthority.verified) {
+            $result = New-Result -Ok $false -State 'head-pose-package-not-qualified' -Data @{ effective = $effective; runtime = $runtime; externalDrivers = $externalDrivers } -Errors @($runtime.packageAuthority.errors)
         }
         elseif ($externalDrivers.conflicts.Count -gt 0 -and -not $AllowExternalDisplayRedirector) {
             $names = @($externalDrivers.conflicts | ForEach-Object { if ([string]::IsNullOrWhiteSpace([string]$_.name)) { $_.root } else { $_.name } })
