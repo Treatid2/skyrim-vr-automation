@@ -2,7 +2,8 @@
 
 [CmdletBinding()]
 param(
-    [switch]$IncludeLive
+    [switch]$IncludeLive,
+    [string]$FixtureRoot = [IO.Path]::GetTempPath()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,7 +41,7 @@ $retentionFixture = & $mo2Module {
 }
 Assert-MO2Test (-not $retentionFixture.stable -and $retentionFixture.samples.Count -eq 2 -and -not $retentionFixture.samples[-1].ownerPresent) 'MO2 retention stability detects an owner that exits immediately after game shutdown'
 
-$fixture = Join-Path ([IO.Path]::GetTempPath()) ('mo2-control-test-' + [guid]::NewGuid().ToString('N'))
+$fixture = Join-Path ([IO.Path]::GetFullPath($FixtureRoot)) ('mo2-control-test-' + [guid]::NewGuid().ToString('N'))
 try {
     $mo2Root = Join-Path $fixture 'MO2'
     $profileRoot = Join-Path $mo2Root 'profiles'
@@ -138,6 +139,59 @@ selected_profile=@ByteArray(Codex)
     Assert-MO2Test ($inspection.command -eq 'inspect' -and $inspection.ok) 'clean fixture inspection succeeds'
     Assert-MO2Test ($validation.command -eq 'validate' -and $validation.ok) 'clean fixture validation succeeds'
     Assert-MO2Test ($validation.state -eq 'ready') 'clean fixture is ready'
+    # Caller WhatIf must suppress writes, never read-only profile discovery.
+    $iniHashBeforePreview = (Get-FileHash -LiteralPath $ini).Hash
+    $modlistHashBeforePreview = (Get-FileHash -LiteralPath (Join-Path $profile 'modlist.txt')).Hash
+    $previewInspection = & $mo2Module {
+        param($fixtureConfig)
+        $WhatIfPreference = $true
+        Invoke-MO2Inspect -Config $fixtureConfig
+    } $config
+    Assert-MO2Test ($previewInspection.ok -and @($previewInspection.data.profiles).Count -eq 1 -and $previewInspection.data.profiles[0] -ceq 'Codex') 'inherited WhatIf preserves single exact profile inspection'
+    $previewValidation = & $mo2Module {
+        param($fixtureConfig)
+        $WhatIfPreference = $true
+        Invoke-MO2Validate -Config $fixtureConfig -RequireClosed
+    } $config
+    Assert-MO2Test ($previewValidation.ok -and @($previewValidation.checks | Where-Object name -eq 'requested-profile')[0].status -eq 'pass') 'inherited WhatIf validates the existing exact profile'
+    $missingPreviewProfile = & $mo2Module {
+        param($fixtureConfig)
+        $WhatIfPreference = $true
+        Invoke-MO2Validate -Config $fixtureConfig -Profile 'Not present' -RequireClosed
+    } $config
+    Assert-MO2Test (-not $missingPreviewProfile.ok -and @($missingPreviewProfile.checks | Where-Object name -eq 'requested-profile')[0].status -eq 'fail') 'inherited WhatIf still rejects a missing profile without fallback'
+    Assert-MO2Test (@($missingPreviewProfile.errors).Count -gt 0 -and ($missingPreviewProfile.errors -join '|') -match 'Exact profile does not exist') 'inherited WhatIf retains the actual profile refusal message'
+    $previewMessages = & $mo2Module {
+        param($fixtureConfig)
+        $WhatIfPreference = $true
+        ConvertTo-MO2Result -Config $fixtureConfig -Command 'validate' -Checks @(
+            (New-MO2Check -Name 'fixture-blocker' -Status fail -Message 'exact fixture error'),
+            (New-MO2Check -Name 'fixture-warning' -Status warn -Message 'exact fixture warning')
+        ) -Data @{}
+    } $config
+    Assert-MO2Test (-not $previewMessages.ok -and $previewMessages.errors[0] -ceq 'exact fixture error' -and $previewMessages.warnings[0] -ceq 'exact fixture warning') 'inherited WhatIf preserves error and warning text and fail-closed result'
+    foreach ($extraProfile in @('Zed fixture', 'Alpha fixture')) { New-Item -ItemType Directory -Path (Join-Path $profileRoot $extraProfile) | Out-Null }
+    $multiNormal = Invoke-MO2Inspect -Config $config
+    $multiPreview = & $mo2Module {
+        param($fixtureConfig)
+        $WhatIfPreference = $true
+        Invoke-MO2Inspect -Config $fixtureConfig
+    } $config
+    Assert-MO2Test (@($multiPreview.data.profiles).Count -eq 3 -and (@($multiPreview.data.profiles) -join '|') -ceq (@($multiNormal.data.profiles) -join '|')) 'inherited WhatIf preserves multiple sorted profile names exactly'
+    $emptyProfiles = Join-Path $fixture 'empty-profiles'
+    New-Item -ItemType Directory -Path $emptyProfiles | Out-Null
+    $oldProfilesDirectory = $config.mo2.profilesDirectory
+    try {
+        $config.mo2.profilesDirectory = $emptyProfiles
+        $emptyPreview = & $mo2Module {
+            param($fixtureConfig)
+            $WhatIfPreference = $true
+            Invoke-MO2Validate -Config $fixtureConfig -RequireClosed
+        } $config
+        Assert-MO2Test (@($emptyPreview.data.profiles).Count -eq 0 -and -not $emptyPreview.ok) 'inherited WhatIf handles an empty profile inventory without inventing a profile'
+    }
+    finally { $config.mo2.profilesDirectory = $oldProfilesDirectory }
+    Assert-MO2Test ((Get-FileHash -LiteralPath $ini).Hash -ceq $iniHashBeforePreview -and (Get-FileHash -LiteralPath (Join-Path $profile 'modlist.txt')).Hash -ceq $modlistHashBeforePreview) 'preview profile reads leave INI and modlist bytes unchanged'
     Assert-MO2Test ($validation.data.selectedProfile -eq 'Codex') 'ByteArray profile is decoded'
     Assert-MO2Test (@($validation.data.executables | Where-Object title -eq 'Launch MGO - Do Not Unlock').Count -eq 1) 'registered executable is parsed exactly once'
     Assert-MO2Test (@($validation.data.executables | Where-Object title -eq 'Launch MGO - Do Not Unlock').capabilities -contains 'skse-loader') 'registered SKSE executable advertises its inferred capability'
@@ -545,6 +599,15 @@ catch [IO.IOException] {
     $sessionAccessId = [string]$sessionAccess.data.access.accessId
     $prepareDryRun = Invoke-MO2Prepare -Config $config -Label 'fixture test' -RequireSKSE -AccessId $sessionAccessId -WhatIf
     Assert-MO2Test ($prepareDryRun.ok -and $prepareDryRun.state -eq 'dry-run') 'prepare dry-run succeeds'
+    $publicPreparePreview = & (Join-Path $packageRoot 'Invoke-MO2Control.ps1') prepare -ConfigPath $configPath -AccessId $sessionAccessId -Profile Codex -RequireSKSE -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-MO2Test ($publicPreparePreview.ok -and $publicPreparePreview.state -eq 'dry-run' -and @($publicPreparePreview.errors).Count -eq 0) 'public prepare WhatIf keeps exact profile admission without false missing-profile errors'
+    Assert-MO2Test (-not (Test-Path -LiteralPath $publicPreparePreview.data.sessionPath)) 'public prepare WhatIf creates no session tree'
+    $previewBundle = & $mo2Module {
+        param($fixtureConfig, $candidateSessionPath)
+        $WhatIfPreference = $true
+        New-MO2DurableSessionController -Config $fixtureConfig -SessionPath $candidateSessionPath -WhatIf
+    } $config $prepareDryRun.data.sessionPath
+    Assert-MO2Test (@($previewBundle.wouldCopy).Count -eq 6 -and $previewBundle.wouldCopy -contains 'MO2Control.psm1' -and $previewBundle.wouldCopy -contains 'CSXConfigCustodyProof.ps1') 'inherited WhatIf retains complete planned controller-file inventory including config custody proof'
     $dryRunLease = Invoke-MO2AccessStatus -Config $config -AccessId $sessionAccessId
     Assert-MO2Test ($dryRunLease.state -eq 'access-owned' -and [string]::IsNullOrWhiteSpace([string]$dryRunLease.data.access.sessionId)) 'prepare dry-run leaves the access-only lease unbound'
     Assert-MO2Test (-not (Test-Path -LiteralPath $prepareDryRun.data.sessionPath -PathType Container)) 'prepare dry-run creates no evidence directory'

@@ -2,6 +2,7 @@
 
 Set-StrictMode -Version Latest
 $script:MO2ControlContractVersion = '1.1.0'
+. (Join-Path $PSScriptRoot 'CSXConfigCustodyProof.ps1')
 
 if (-not ('SkyrimVRAutomation.Native.DirectoryIdentity' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -903,6 +904,10 @@ function Get-MO2TaskWorkspaceIsolation {
         }
     }
 
+    if ($RequirePreparedCache) {
+        try { Assert-CSXConfigCustodyIsolation $Config $manifest -AllowGrowth:$AllowPreparedCacheGrowth }
+        catch { $errors.Add("CSX configuration custody admission failed: $($_.Exception.Message)") }
+    }
     $output = $manifest.runtimeOutput
     foreach ($requiredField in @('mode', 'executable')) {
         if (-not $output.PSObject.Properties[$requiredField] -or [string]::IsNullOrWhiteSpace([string]$output.$requiredField)) {
@@ -1772,7 +1777,8 @@ function Get-MO2InspectionData {
     $selectedProfile = if ($ini.Count -gt 0) { ConvertFrom-MO2ByteArrayValue (Find-MO2IniValue -Ini $ini -Key 'selected_profile') } else { $null }
     $selectedTaskWorkspace = Get-MO2SelectedTaskWorkspace -Config $Config -Profile $selectedProfile
     $profiles = if (Test-Path -LiteralPath $profilesRoot -PathType Container) {
-        @(Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction Stop | Sort-Object Name | ForEach-Object Name)
+        # Member-name ForEach-Object inherits WhatIf and suppresses this read.
+        @(Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction Stop | Sort-Object Name | ForEach-Object { $_.Name })
     }
     else {
         @()
@@ -1831,8 +1837,8 @@ function ConvertTo-MO2Result {
         [string]$PreferredState
     )
 
-    $errors = @($Checks | Where-Object status -eq 'fail' | ForEach-Object message)
-    $warnings = @($Checks | Where-Object status -eq 'warn' | ForEach-Object message)
+    $errors = @($Checks | Where-Object status -eq 'fail' | ForEach-Object { $_.message })
+    $warnings = @($Checks | Where-Object status -eq 'warn' | ForEach-Object { $_.message })
     $ok = $errors.Count -eq 0
 
     if (-not [string]::IsNullOrWhiteSpace($PreferredState)) {
@@ -2258,11 +2264,12 @@ function New-MO2DurableSessionController {
         [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'Invoke-MO2Control.ps1'); relativePath = 'Invoke-MO2Control.ps1' },
         [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'ConfigResolution.psm1'); relativePath = 'ConfigResolution.psm1' },
         [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'MO2Control.psm1'); relativePath = 'MO2Control.psm1' },
+        [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'CSXConfigCustodyProof.ps1'); relativePath = 'CSXConfigCustodyProof.ps1' },
         [pscustomobject]@{ source = (Join-Path (Split-Path -Parent $PSScriptRoot) 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'); relativePath = 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1' },
         [pscustomobject]@{ source = (Join-Path (Split-Path -Parent $PSScriptRoot) 'shader-cache-control\ShaderCacheInventory.ps1'); relativePath = 'shader-cache-control\ShaderCacheInventory.ps1' }
     )
     if ($WhatIf) {
-        return [pscustomobject][ordered]@{ controllerPath = $entryPath; configPath = $configPath; receiptPath = $receiptPath; durable = $true; wouldCopy = @($sourceFiles | ForEach-Object relativePath) }
+        return [pscustomobject][ordered]@{ controllerPath = $entryPath; configPath = $configPath; receiptPath = $receiptPath; durable = $true; wouldCopy = @($sourceFiles | ForEach-Object { $_.relativePath }) }
     }
     New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
     $files = @()
@@ -2726,6 +2733,10 @@ function Invoke-MO2ReleaseAccess {
     $activeBuildData = @($inspection.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
     if ($accessKind -ne 'human' -and ($inspection.processes.mo2.Count -gt 0 -or $inspection.processes.game.Count -gt 0 -or $activeBuildData.Count -gt 0)) {
         return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $false -State 'blocked' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $owned; processes = $inspection.processes; activeBuildData = $activeBuildData } -Errors @('Access cannot be released while MO2, the game, or a RootBuilder deployment transaction remains active.')
+    }
+    $configOwnerPath = Join-Path ([string]$Config.mo2.overwriteDirectory) '.codex-csx-config-owner.json'
+    if ($accessKind -ne 'human' -and (Test-Path -LiteralPath $configOwnerPath)) {
+        return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $false -State 'config-completion-required' -Data @{ ownerMarkerPath = $configOwnerPath } -Errors @('Shared CSX configuration custody remains active. Run exact workspace complete-config/complete-output before yielding access; task configuration is retained.')
     }
     if ($WhatIf) {
         return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $true -State 'dry-run' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $owned; wouldRemoveLock = $true; liveStateRetained = $accessKind -eq 'human'; processes = $inspection.processes; activeBuildData = $activeBuildData }
@@ -3739,7 +3750,7 @@ function Invoke-MO2UnlockOnly {
     } while ([DateTime]::UtcNow -lt $deadline)
     $final = Get-MO2InspectionData -Config $Config
     $remainingBuildData = @($final.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
-    return [pscustomobject][ordered]@{ restored = $remainingBuildData.Count -eq 0; actions=@($actions); remainingBuildData=@($remainingBuildData | ForEach-Object path); mo2Processes=@($final.processes.mo2); gameProcesses=@($final.processes.game) }
+    return [pscustomobject][ordered]@{ restored = $remainingBuildData.Count -eq 0; actions=@($actions); remainingBuildData=@($remainingBuildData | ForEach-Object { $_.path }); mo2Processes=@($final.processes.mo2); gameProcesses=@($final.processes.game) }
 }
 
 function Test-MO2OpeningReady {
@@ -3804,7 +3815,7 @@ function Get-MO2HumanMutationValidationUnderLock {
         return New-MO2ActionResult -Config $Config -Command 'validate-human-mutation' -Ok $false -State 'game-close-required' -Data @{ leaseId = $leaseId; profile = $expectedProfile; processes = $inspection.processes } -Errors @('Human-authorized profile mutation requires Skyrim and its loader to be closed.')
     }
     if ($activeBuildData.Count -gt 0) {
-        return New-MO2ActionResult -Config $Config -Command 'validate-human-mutation' -Ok $false -State 'known-ground-state-required' -Data @{ leaseId = $leaseId; profile = $expectedProfile; activeBuildData = @($activeBuildData | ForEach-Object path); recovery = 'Close or recover-close the exact MO2 state, then recover RootBuilder before mutation.' } -Errors @('Active RootBuilder deployment makes the live MO2 state uncertain; establish a known closed state before mutation.')
+        return New-MO2ActionResult -Config $Config -Command 'validate-human-mutation' -Ok $false -State 'known-ground-state-required' -Data @{ leaseId = $leaseId; profile = $expectedProfile; activeBuildData = @($activeBuildData | ForEach-Object { $_.path }); recovery = 'Close or recover-close the exact MO2 state, then recover RootBuilder before mutation.' } -Errors @('Active RootBuilder deployment makes the live MO2 state uncertain; establish a known closed state before mutation.')
     }
     if ([string]$inspection.selectedProfile -cne $expectedProfile) {
         return New-MO2ActionResult -Config $Config -Command 'validate-human-mutation' -Ok $false -State 'profile-drift' -Data @{ leaseId = $leaseId; authorizedProfile = $expectedProfile; selectedProfile = [string]$inspection.selectedProfile } -Errors @('MO2 selected a different profile after the human lease was established.')
@@ -3944,7 +3955,7 @@ function Invoke-MO2Refresh {
             return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'game-close-required' -Data @{ authorityKind = $authorityKind; profile = $expectedProfile; processes = $inspection.processes } -Errors @('Refresh refuses while Skyrim or its loader is running. Close Skyrim first so the next launch begins from the changed mod state.')
         }
         if ($activeBuildData.Count -gt 0) {
-            return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'known-ground-state-required' -Data @{ authorityKind = $authorityKind; profile = $expectedProfile; activeBuildData = @($activeBuildData | ForEach-Object path); recovery = 'Use the owned close/recover-close and RootBuilder recovery route before refreshing.' } -Errors @('Active RootBuilder deployment makes the live MO2 state uncertain; establish a known closed state before mutation or refresh.')
+            return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'known-ground-state-required' -Data @{ authorityKind = $authorityKind; profile = $expectedProfile; activeBuildData = @($activeBuildData | ForEach-Object { $_.path }); recovery = 'Use the owned close/recover-close and RootBuilder recovery route before refreshing.' } -Errors @('Active RootBuilder deployment makes the live MO2 state uncertain; establish a known closed state before mutation or refresh.')
         }
         if ([string]$inspection.selectedProfile -cne $expectedProfile) {
             return New-MO2ActionResult -Config $Config -Command 'refresh' -Ok $false -State 'profile-drift' -Data @{ authorityKind = $authorityKind; authorizedProfile = $expectedProfile; selectedProfile = [string]$inspection.selectedProfile } -Errors @('MO2 selected a different profile after authority was established; coordinate the exact profile before refreshing.')
@@ -4086,7 +4097,7 @@ function Invoke-MO2Status {
         lockStatus = if ($owned) { [string]$owned.data.status } else { $null }
         windows = @($windows)
         headlessMO2 = $headlessMO2
-        activeBuildData = @($buildData | ForEach-Object path)
+        activeBuildData = @($buildData | ForEach-Object { $_.path })
         ownershipResolution = $ownershipResolution
         openingCompleted = $openingCompleted
         launchPending = $launchPending
@@ -4249,7 +4260,7 @@ function Invoke-MO2RecoverRootBuilder {
         return New-MO2ActionResult -Config $Config -Command 'recover-rootbuilder' -Ok $true -State 'no-recovery-required' -Data @{ sessionId = $SessionId; activeBuildData = @(); sessionPath = $owned.data.sessionPath }
     }
     if ($buildData.Count -ne 1) {
-        return New-MO2ActionResult -Config $Config -Command 'recover-rootbuilder' -Ok $false -State 'blocked' -Data @{ sessionId = $SessionId; activeBuildData = @($buildData | ForEach-Object path); sessionPath = $owned.data.sessionPath } -Errors @('RootBuilder recovery requires exactly one active BuildData.json; multiple deployment records require manual classification.')
+        return New-MO2ActionResult -Config $Config -Command 'recover-rootbuilder' -Ok $false -State 'blocked' -Data @{ sessionId = $SessionId; activeBuildData = @($buildData | ForEach-Object { $_.path }); sessionPath = $owned.data.sessionPath } -Errors @('RootBuilder recovery requires exactly one active BuildData.json; multiple deployment records require manual classification.')
     }
 
     if (-not $WhatIf) {

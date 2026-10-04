@@ -2,6 +2,7 @@
 
 Set-StrictMode -Version Latest
 $script:MO2ControlContractVersion = '1.1.0'
+. (Join-Path $PSScriptRoot 'CSXConfigCustodyProof.ps1')
 
 if (-not ('SkyrimVRAutomation.Native.DirectoryIdentity' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -903,6 +904,10 @@ function Get-MO2TaskWorkspaceIsolation {
         }
     }
 
+    if ($RequirePreparedCache) {
+        try { Assert-CSXConfigCustodyIsolation $Config $manifest -AllowGrowth:$AllowPreparedCacheGrowth }
+        catch { $errors.Add("CSX configuration custody admission failed: $($_.Exception.Message)") }
+    }
     $output = $manifest.runtimeOutput
     foreach ($requiredField in @('mode', 'executable')) {
         if (-not $output.PSObject.Properties[$requiredField] -or [string]::IsNullOrWhiteSpace([string]$output.$requiredField)) {
@@ -2259,6 +2264,7 @@ function New-MO2DurableSessionController {
         [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'Invoke-MO2Control.ps1'); relativePath = 'Invoke-MO2Control.ps1' },
         [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'ConfigResolution.psm1'); relativePath = 'ConfigResolution.psm1' },
         [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'MO2Control.psm1'); relativePath = 'MO2Control.psm1' },
+        [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'CSXConfigCustodyProof.ps1'); relativePath = 'CSXConfigCustodyProof.ps1' },
         [pscustomobject]@{ source = (Join-Path (Split-Path -Parent $PSScriptRoot) 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'); relativePath = 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1' },
         [pscustomobject]@{ source = (Join-Path (Split-Path -Parent $PSScriptRoot) 'shader-cache-control\ShaderCacheInventory.ps1'); relativePath = 'shader-cache-control\ShaderCacheInventory.ps1' }
     )
@@ -2727,6 +2733,10 @@ function Invoke-MO2ReleaseAccess {
     $activeBuildData = @($inspection.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
     if ($accessKind -ne 'human' -and ($inspection.processes.mo2.Count -gt 0 -or $inspection.processes.game.Count -gt 0 -or $activeBuildData.Count -gt 0)) {
         return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $false -State 'blocked' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $owned; processes = $inspection.processes; activeBuildData = $activeBuildData } -Errors @('Access cannot be released while MO2, the game, or a RootBuilder deployment transaction remains active.')
+    }
+    $configOwnerPath = Join-Path ([string]$Config.mo2.overwriteDirectory) '.codex-csx-config-owner.json'
+    if ($accessKind -ne 'human' -and (Test-Path -LiteralPath $configOwnerPath)) {
+        return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $false -State 'config-completion-required' -Data @{ ownerMarkerPath = $configOwnerPath } -Errors @('Shared CSX configuration custody remains active. Run exact workspace complete-config/complete-output before yielding access; task configuration is retained.')
     }
     if ($WhatIf) {
         return New-MO2ActionResult -Config $Config -Command 'release-access' -Ok $true -State 'dry-run' -Data @{ access = Get-MO2AccessLeaseSummary -Lock $owned; wouldRemoveLock = $true; liveStateRetained = $accessKind -eq 'human'; processes = $inspection.processes; activeBuildData = $activeBuildData }
