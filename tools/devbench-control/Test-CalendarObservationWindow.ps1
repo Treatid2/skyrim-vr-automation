@@ -97,6 +97,79 @@ foreach($mode in $modes) {
         Require (@($script:calls|Where-Object name -ne 'calendar').Count -eq 0) "$mode allowed an observation"
     }
 }
+# Model native Handle's Tick-before-dispatch ordering. Successful scene_lost
+# restoration moves exact custody to last/history; release returns that outcome
+# idempotently without another write. Other modes deliberately corrupt public
+# evidence after this native-equivalent transition, not native write authority.
+$automaticModes=@('status','release','release-restored-false','release-ok-false','release-lease-id','release-original-binding','status-generation','status-process-session','status-globals','status-unavailable','status-foreign-rate','status-no-transition','status-transition-ok-false','status-transition-restored-false','status-transition-reason','status-unknown-reason')
+foreach($automaticMode in $automaticModes) {
+    $script:autoMode=$automaticMode; $script:autoCalls=[Collections.Generic.List[object]]::new()
+    $script:autoLease=$null; $script:autoRestored=$false; $script:autoCell=7; $script:autoWrites=0
+    $script:autoBinding=[pscustomobject]@{processSession='123:456';pid=123;loadGeneration=1;cellFormId=7;globalFormIds=@(1,2,3,4,5,6)}
+    $script:autoValues=[pscustomobject]@{year=201;month=1;day=1;gameHour=12;daysPassed=1;calendarRate=20;engineMultiplier=1}
+    $call={
+        param($name,$arguments,$mutation,$bound)
+        $script:autoCalls.Add([pscustomobject]@{name=$name;arguments=$arguments;mutation=$mutation;cell=$script:autoCell})
+        if($name -cne 'calendar') {
+            # Cell changes after this admitted observation, before release entry.
+            Require ($script:autoCell -eq 7) 'Observation dispatched after native scene loss'
+            $script:autoCell=8
+            return [pscustomobject]@{content=@([pscustomobject]@{ok=$false;error='fixture observation failed before cell transition cleanup'})}
+        }
+        if($arguments.action -ceq 'hold') {
+            $script:autoLease=[pscustomobject]@{id='automatic-lease';owner=$arguments.owner;commandId=$arguments.commandId;binding=(Clone $script:autoBinding);applied=$true;captured=(Clone $script:autoValues);cleanupAttempted=$false}
+        }
+        elseif($script:autoLease -and -not $script:autoRestored -and ($script:autoCell -eq 8 -or ($script:autoMode -cne 'release' -and $arguments.action -ceq 'status'))) {
+            # Native Tick runs before ExecuteRequest, whether this is status
+            # or release. Preserve original lease binding in retained history.
+            $script:autoCell=8; $script:autoRestored=$true; $script:autoWrites++
+            $script:autoLease.cleanupAttempted=$true
+        }
+        if($arguments.action -ceq 'release') {
+            Require ($arguments.leaseId -ceq 'automatic-lease' -and $arguments.owner -ceq $script:autoLease.owner -and $arguments.commandId -cne $script:autoLease.commandId) 'Automatic cleanup release lost exact command/owner/lease'
+            Require (($arguments.binding|ConvertTo-Json -Depth 10 -Compress) -ceq ($script:autoBinding|ConvertTo-Json -Depth 10 -Compress)) 'Automatic cleanup adopted current binding'
+            Require $script:autoRestored 'Release did not follow positive native Tick restoration'
+            # No restore write here: exact retired lease returns prior result.
+        }
+        $active=$null -ne $script:autoLease -and -not $script:autoRestored
+        $b=Clone $script:autoBinding; $b.cellFormId=$script:autoCell
+        $v=Clone $script:autoValues; if($active){$v.calendarRate=0}
+        $reason=if($script:autoRestored){'scene_lost'}elseif($arguments.action -ceq 'hold'){'held'}else{'observed'}
+        $payload=[pscustomobject]@{ok=$true;action=$arguments.action;status=$reason;schemaVersion=1;plugin='devbench';binding=$b;frame=1;readbackFresh=$true;available=$true;worldLoaded=$true;values=$v;outstanding=$active;leaseActive=$active;expiryDue=$false;cleanupPending=$false;holdValid=$active;serviceStopping=$false;restored=$script:autoRestored;lastTransition=[pscustomobject]@{ok=$true;status=$reason;restored=$script:autoRestored}}
+        if($script:autoLease){$payload|Add-Member lease (Clone $script:autoLease)}
+        if($script:autoRestored -and $arguments.action -ceq 'release') {
+            switch($script:autoMode) {
+                'release-restored-false' {$payload.restored=$false}
+                'release-ok-false' {$payload.ok=$false}
+                'release-lease-id' {$payload.lease.id='foreign'}
+                'release-original-binding' {$payload.lease.binding.cellFormId=8}
+            }
+        }
+        if($script:autoRestored -and $arguments.action -ceq 'status') {
+            switch($script:autoMode) {
+                'status-generation' {$payload.binding.loadGeneration=2}
+                'status-process-session' {$payload.binding.processSession='foreign-incarnation'}
+                'status-globals' {$payload.binding.globalFormIds[0]=9}
+                'status-unavailable' {$payload.available=$false}
+                'status-foreign-rate' {$payload.values.calendarRate=21}
+                'status-no-transition' {$payload.lastTransition=$null}
+                'status-transition-ok-false' {$payload.lastTransition.ok=$false}
+                'status-transition-restored-false' {$payload.lastTransition.restored=$false}
+                'status-transition-reason' {$payload.lastTransition.status='released'}
+            }
+        }
+        if($script:autoMode -ceq 'status-unknown-reason' -and $script:autoRestored){$payload.status='unclassified';$payload.lastTransition.status='unclassified'}
+        return [pscustomobject]@{content=@($payload)}
+    }
+    $result=Invoke-DevBenchCalendarWindow -Call $call -AssertSession {} -Owner fixture-owner -Observations @(@{tool='inspect';arguments=@{kind='state'}}) -DeadlineUtc ([datetime]::UtcNow.AddSeconds(60)) -CleanupSeconds 5 -ExpectedProcessId 123
+    $positive=$automaticMode -cin @('status','release')
+    Require (-not $result.ok -and -not $result.continuityVerified) "$automaticMode converted scene loss into scientific success"
+    Require ($result.restorationVerified -eq $positive -and $result.indeterminate -ne $positive) "$automaticMode misclassified positive cleanup or corrupted proof"
+    Require (@($script:autoCalls|Where-Object {$_.arguments.Contains('action') -and $_.arguments.action -ceq 'hold'}).Count -eq 1) "$automaticMode replayed hold"
+    Require (@($script:autoCalls|Where-Object {$_.arguments.Contains('action') -and $_.arguments.action -ceq 'release'}).Count -eq 1) "$automaticMode omitted/replayed release"
+    Require ($script:autoWrites -eq 1) "$automaticMode performed a second native restore"
+    Require (@($script:autoCalls|Where-Object {$_.name -cne 'calendar' -and $_.cell -ne 7}).Count -eq 0) "$automaticMode dispatched after scene loss"
+}
 # Exercise refusal through the actual public production entry point before it
 # opens any network session. Native operation tests above substitute only RPC.
 $temp=Join-Path ([IO.Path]::GetTempPath()) ('calendar-admission-'+[guid]::NewGuid().ToString('N'))
@@ -109,4 +182,4 @@ try {
         Require (-not $actual.ok -and -not $actual.dispatchReached -and $actual.sessionCleanup.state -eq 'not_opened') 'Production entry accepted an intrusive observation'
     }
 }finally{Remove-Item -LiteralPath $temp -Recurse -Force}
-[pscustomobject]@{ok=$true;checks=$checks;cases=$modes.Count;liveQualification=$false} | ConvertTo-Json -Compress
+[pscustomobject]@{ok=$true;checks=$checks;cases=($modes.Count+$automaticModes.Count);liveQualification=$false} | ConvertTo-Json -Compress

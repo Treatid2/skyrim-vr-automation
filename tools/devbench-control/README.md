@@ -36,7 +36,12 @@ Native restoration must positively succeed after its private SameStorage/owned-z
 check. Both the release receipt and a fresh status must preserve process session,
 PID, load generation and all six global IDs, retain the exact original lease and
 captured rate, and show no outstanding custody and the restored prior rate; fresh
-`lastTransition` must also affirm restoration. Only the current contextual cell may
+`lastTransition` must also affirm restoration with the same exact reason as the
+release receipt. Supported positive reasons are only `released`, `expired`, and
+`scene_lost`: native Tick may already have restored and retired the original
+lease before explicit release, which then returns that same result without a
+second write. A reason by itself never proves restoration; every custody and
+fresh-readback guard still applies. Only the current contextual cell may
 differ for cleanup proof. No current-binding substitution, foreign-rate overwrite,
 generation adoption, lease disappearance inference or automatic retry is permitted.
 Raw release/status remain evidence; public IDs do not expose or replace native
