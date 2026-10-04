@@ -1165,6 +1165,8 @@ function Test-PassiveControllerProbeObservation($Payload) {
 function Get-ApplicationHeadPose {
     param(
         [Parameter(Mandatory)]$Contract,
+        [Parameter(Mandatory)]$PreProbePose,
+        [Parameter(Mandatory)]$PreProbePackageAuthority,
         [DateTime]$DeadlineUtc = [DateTime]::MaxValue
     )
     if ([string]::IsNullOrWhiteSpace($HeadPoseDriverRoot)) {
@@ -1177,6 +1179,9 @@ function Get-ApplicationHeadPose {
     try {
         $packageAuthority = Get-NullProviderAuthority -DeadlineUtc $DeadlineUtc
         if (-not $packageAuthority.verified) { throw "Provider package refused before probe execution: $($packageAuthority.errors -join '; ')" }
+        $continuityBefore = New-HeadPoseContinuityIdentity -Pose $PreProbePose -PackageAuthority $PreProbePackageAuthority
+        $continuityAtDispatch = New-HeadPoseContinuityIdentity -Pose $PreProbePose -PackageAuthority $packageAuthority
+        Assert-HeadPoseContinuity -Before $continuityBefore -After $continuityAtDispatch
         if ((Get-HeadPoseCanonicalPath $probePath) -ne (Get-HeadPoseCanonicalPath (Join-Path $HeadPoseDriverRoot 'tools\csx_openvr_pose_probe.exe'))) { throw 'The profile cannot substitute a probe outside the exact owned package member.' }
         $boundedTool = Join-Path (Split-Path -Parent $PSScriptRoot) 'process-control\Invoke-BoundedProcess.ps1'
         if (-not (Test-Path -LiteralPath $boundedTool -PathType Leaf)) { throw "Bounded process controller is missing: $boundedTool" }
@@ -1197,6 +1202,9 @@ function Get-ApplicationHeadPose {
         $payload = [string]$attempt.stdout | ConvertFrom-Json -ErrorAction Stop
         $afterAuthority = Get-NullProviderAuthority -DeadlineUtc $DeadlineUtc
         if (-not $afterAuthority.verified -or $afterAuthority.markerSha256 -ne $packageAuthority.markerSha256) { throw 'Provider package changed during probe execution.' }
+        $afterPose = Get-HeadPoseSharedState -Contract $Contract
+        $continuityAfter = New-HeadPoseContinuityIdentity -Pose $afterPose -PackageAuthority $afterAuthority
+        Assert-HeadPoseContinuity -Before $continuityBefore -After $continuityAfter
         $controllersQualified = Test-PassiveControllerProbeObservation $payload
         $qualified = $bounded.ok -and $payload.ok -and $payload.standing.connected -and $payload.standing.valid -and
             [double]$payload.standing.position[1] -ge [double]$Contract['minimumQualifiedEyeHeightMeters'] -and
@@ -1211,6 +1219,8 @@ function Get-ApplicationHeadPose {
             boundedProcess = $bounded
             observation = $payload
             packageAuthority = $afterAuthority
+            providerContinuity = $continuityAfter
+            poseAfterProbe = $afterPose
         }
     }
     catch [TimeoutException] {
@@ -1297,7 +1307,7 @@ function Get-NullRuntimeEvidence {
         }
     }
     $providerLogReady = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active -and $null -ne $headPoseLoaded -and $null -ne $headPoseRegistered
-    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified -and $packageAuthority.verified -and $headPoseState.driverCreatorPid -eq $server[0].id -and [uint64][DateTime]::Parse($server[0].startTimeUtc).ToUniversalTime().ToFileTimeUtc() -eq $headPoseState.creatorAuthority.processStartFileTimeUtc) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -DeadlineUtc $DeadlineUtc } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider creator/package is not ready for an application-facing pose probe.' } }
+    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified -and $packageAuthority.verified -and $headPoseState.driverCreatorPid -eq $server[0].id -and [uint64][DateTime]::Parse($server[0].startTimeUtc).ToUniversalTime().ToFileTimeUtc() -eq $headPoseState.creatorAuthority.processStartFileTimeUtc) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -PreProbePose $headPoseState -PreProbePackageAuthority $packageAuthority -DeadlineUtc $DeadlineUtc } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider creator/package is not ready for an application-facing pose probe.' } }
     $runtimeEvidence = [pscustomobject][ordered]@{
         active = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active
         serverProcess = if ($server.Count -eq 1) { $server[0] } else { $null }
@@ -1327,6 +1337,7 @@ function Get-NullRuntimeEvidence {
         packageAuthority = $packageAuthority
         headPoseAuthorizationError = $headPoseAuthorizationError
         applicationHeadPose = $applicationHeadPose
+        providerContinuity = if ($applicationHeadPose.qualified) { $applicationHeadPose.providerContinuity } else { $null }
         controllersReady = $applicationHeadPose.PSObject.Properties['controllersQualified'] -and [bool]$applicationHeadPose.controllersQualified
         headPoseReady = $providerLogReady -and [bool]$headPoseState.qualified -and [bool]$applicationHeadPose.qualified
         dashboardProcesses = @($owned | Where-Object name -eq 'vrdashboard')
@@ -1544,6 +1555,7 @@ function Get-RuntimeInputContract {
     $contract['measurementBlockers'] = @($blockers)
     $contract['dashboardProcessTelemetryOnly'] = $true
     $contract['providerPackageVerified'] = [bool]$packageReady
+    $contract['providerContinuity'] = if ($Runtime.PSObject.Properties['providerContinuity']) { $Runtime.providerContinuity } else { $null }
     return $contract
 }
 

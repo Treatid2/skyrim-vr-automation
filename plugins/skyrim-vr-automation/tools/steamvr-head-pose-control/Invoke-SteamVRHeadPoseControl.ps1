@@ -531,6 +531,7 @@ function Test-PassiveControllerProbeObservation($Payload) {
 }
 
 function Invoke-PoseProbe {
+    param([Parameter(Mandatory)]$PreProbePose)
     $resolvedProbe = if (-not [string]::IsNullOrWhiteSpace($PoseProbePath)) { $PoseProbePath } elseif (-not [string]::IsNullOrWhiteSpace($InstallRoot)) { Join-Path $InstallRoot 'tools\csx_openvr_pose_probe.exe' } else { $null }
     if ([string]::IsNullOrWhiteSpace($resolvedProbe) -or -not (Test-Path -LiteralPath $resolvedProbe -PathType Leaf)) {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; probePath = $resolvedProbe; error = 'The independent OpenVR pose probe is not installed.' }
@@ -539,6 +540,7 @@ function Invoke-PoseProbe {
         $bundledProvenance = Join-Path $PSScriptRoot '..\..\drivers\codex_head_pose\build-provenance.json'
         $packageAuthority = Get-HeadPosePackageAuthority -Root $InstallRoot -RegistrationPath $OpenVRPathsPath -BundledProvenancePath $bundledProvenance -ExpectedProvenanceSha256 $ExpectedPackageProvenanceSha256
         if (-not $packageAuthority.verified) { throw "Package qualification refused before probe execution: $($packageAuthority.errors -join '; ')" }
+        $continuityBefore = New-HeadPoseContinuityIdentity -Pose $PreProbePose -PackageAuthority $packageAuthority
         if ((Get-HeadPoseCanonicalPath $resolvedProbe) -ne (Get-HeadPoseCanonicalPath (Join-Path $InstallRoot 'tools\csx_openvr_pose_probe.exe'))) { throw 'PoseProbePath may identify only the exact owned package probe; use an explicitly digest-authorized custom package instead.' }
         $boundedRunner = Join-Path (Split-Path -Parent $PSScriptRoot) 'process-control\Invoke-BoundedProcess.ps1'
         if (-not (Test-Path -LiteralPath $boundedRunner -PathType Leaf)) { throw "The bounded process controller is unavailable: $boundedRunner" }
@@ -552,6 +554,9 @@ function Invoke-PoseProbe {
         $payload = [string]$attempt.stdout | ConvertFrom-Json -ErrorAction Stop
         $afterAuthority = Get-HeadPosePackageAuthority -Root $InstallRoot -RegistrationPath $OpenVRPathsPath -BundledProvenancePath $bundledProvenance -ExpectedProvenanceSha256 $ExpectedPackageProvenanceSha256
         if (-not $afterAuthority.verified -or $afterAuthority.markerSha256 -ne $packageAuthority.markerSha256) { throw 'Package identity changed during the independent probe.' }
+        $afterPose = Read-PoseState
+        $continuityAfter = New-HeadPoseContinuityIdentity -Pose $afterPose -PackageAuthority $afterAuthority
+        Assert-HeadPoseContinuity -Before $continuityBefore -After $continuityAfter
         $stereoQualified = $payload.stereo -and $payload.stereo.valid -and [double]$payload.stereo.eyeSeparationMeters -ge 0.01 -and [double]$payload.stereo.eyeSeparationMeters -le 0.20
         $controllersQualified = Test-PassiveControllerProbeObservation $payload
         return [pscustomobject][ordered]@{
@@ -568,6 +573,8 @@ function Invoke-PoseProbe {
             boundedRun = $run
             observation = $payload
             packageAuthority = $afterAuthority
+            providerContinuity = $continuityAfter
+            poseAfterProbe = $afterPose
         }
     }
     catch {
@@ -816,9 +823,9 @@ try {
         }
         'qualify' {
             $pose = Read-PoseState
-            $applicationPose = if ($SkipOpenVRProbe) { [pscustomobject][ordered]@{ available = $false; qualified = $false; skipped = $true; error = 'Independent stereo qualification was explicitly skipped.' } } elseif (-not $pose.qualified) { [pscustomobject]@{ available = $false; qualified = $false; error = 'Exact provider creator/pose authority is not qualified; probe was not executed.' } } else { Invoke-PoseProbe }
+            $applicationPose = if ($SkipOpenVRProbe) { [pscustomobject][ordered]@{ available = $false; qualified = $false; skipped = $true; error = 'Independent stereo qualification was explicitly skipped.' } } elseif (-not $pose.qualified) { [pscustomobject]@{ available = $false; qualified = $false; error = 'Exact provider creator/pose authority is not qualified; probe was not executed.' } } else { Invoke-PoseProbe -PreProbePose $pose }
             if ($applicationPose.qualified) {
-                $pose = Read-PoseState
+                $pose = $applicationPose.poseAfterProbe
             }
             $qualified = [bool]$pose.qualified -and [bool]$applicationPose.qualified
             $qualificationErrors = @()

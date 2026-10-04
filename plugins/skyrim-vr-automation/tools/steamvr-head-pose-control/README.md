@@ -111,6 +111,18 @@ of the in-memory image, OS isolation or protection against a hostile same-user
 process. Package reads are limited to six artifacts/64 MiB, 128 registrations,
 256 KiB per JSON authority and a 15-second budget (or the shorter outer deadline).
 
-Run `Test-DriverPackageAuthority.ps1`, `Test-SteamVRHeadPoseControl.ps1` and
+Admission now pins one immutable continuity identity across the probe: canonical
+package root, committed transaction/provenance and all six artifact digests,
+exact creator vrserver executable/PID/process-start identity, loaded module,
+driver start/instance nonce and shared-memory writer/acknowledged nonces plus
+pose sequence. Any handoff or pose writer change fails closed without replay.
+Shared-memory v2 exposes writer nonces, not writer PID/start fields; no invented
+OS writer identity is claimed. Qualified probe evidence retains canonical JSON
+and its SHA256 independently of later mutable observations. The null runtime
+and its measurement contract retain that same identity. This is bounded
+pre/post continuity evidence, not atomic future liveness or hostile-user proof.
+
+Run `Test-DriverPackageAuthority.ps1`, `Test-SteamVRHeadPoseControl.ps1`,
+`Test-ProviderContinuity.ps1 -FixtureRoot <owned-fixture-directory>` and
 `Test-PassiveControllerAdmission.ps1` after changes. These isolated fixtures do
 not substitute for live OpenVR or in-game acceptance.
