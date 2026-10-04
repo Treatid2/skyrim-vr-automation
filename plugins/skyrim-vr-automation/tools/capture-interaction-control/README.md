@@ -35,6 +35,17 @@ limits/ownership/encoding fields. Raw controller evidence remains in
 These reads start no recording, input sequence or screenshot capture. Runtime
 identity bootstrap expectations remain mandatory where selected.
 
+After a qualified start, `observe`, `act`, `stop` and partial-start cleanup
+forward `ArtifactPath`, `ExpectedArtifactSha256` and `ExpectedBuildId` from the
+complete persisted accepting runtime identity, in addition to the full exact
+expected identity itself. The README's SessionDirectory-only examples therefore
+retain full mutation-capable artifact admission, including on-demand capture.
+Explicitly repeated expectations must exactly match the accepting values;
+contradictions fail before controller dispatch and cannot rebind a session.
+Incomplete identity is not filled from bootstrap flags or an adjacent runtime.
+Outer `observe.ok` means an observation report was produced; a screenshot error
+or null `frameSubmission` is not a successful image capture.
+
 Every recording and screenshot start records its attempted command identity
 before dispatch. Failed controller envelopes, indeterminate flags, and journal
 paths survive the wrapper boundary. A definite qualified rejection may release
