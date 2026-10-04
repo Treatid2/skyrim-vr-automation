@@ -52,13 +52,20 @@ try {
         Require (@($errors).Count -eq 0) "$lane source parses"
         $names=if($lane -eq 'head'){@('Invoke-PoseProbe','Test-PassiveControllerProbeObservation','Get-HashOrNull')}else{@('Get-ApplicationHeadPose','Test-PassiveControllerProbeObservation','Get-NullRuntimeEvidence','Get-LogTimestampUtc','Get-RuntimeInputContract')}
         foreach($name in $names){$node=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true))[0];$declarationRoot=(Split-Path -Parent $entry).Replace("'","''");Invoke-Expression ($node.Extent.Text.Replace('$PSScriptRoot',"'$declarationRoot'"))}
-        foreach($case in @('unchanged','driver-nonce','creator-pid','creator-start','driver-start','module-path','executable-path','writer-nonce','pose-sequence','package-root','provenance','artifact','transaction','whole-restart')){
+        foreach($case in @('unchanged','pose-refresh','driver-nonce','creator-pid','creator-start','driver-start','module-path','executable-path','writer-nonce','pose-sequence','package-root','provenance','artifact','transaction','whole-restart')){
+            $acceptExpected=$case -in @('unchanged','pose-refresh')
             $artifacts=@{};foreach($relative in (Get-HeadPoseArtifactPaths).Values){$artifacts[$relative]='1'*64}
             $global:AutoContinuityPackageBefore=[pscustomobject]@{verified=$true;root=$root;provenanceSha256=('2'*64);markerSha256=('3'*64);transactionId='fixture-committed';sourceCommit=('4'*40);artifacts=$artifacts}
             $global:AutoContinuityPackageAfter=Clone $global:AutoContinuityPackageBefore
             $start=[datetime]::UtcNow.AddSeconds(-10)
             $global:AutoContinuityPoseBefore=[pscustomobject]@{qualified=$true;driverCreatorPid=123;driverStartedFileTimeUtc=[uint64]$start.AddSeconds(1).ToFileTimeUtc();driverInstanceNonce=[uint64]200;writerNonce=[uint64]300;acknowledgedWriterNonce=[uint64]300;requestedSequence=[uint64]2;appliedSequence=[uint64]2;creatorAuthority=[pscustomobject]@{verified=$true;pid=123;processStartFileTimeUtc=[uint64]$start.ToFileTimeUtc();executablePath=(Join-Path $SteamVRRoot 'bin/win64/vrserver.exe');loadedModulePath=(Join-Path $root 'bin/win64/driver_codex_head_pose.dll')}}
             $global:AutoContinuityPoseAfter=Clone $global:AutoContinuityPoseBefore
+            if($case -eq 'pose-refresh'){
+                $global:AutoContinuityPoseBefore | Add-Member -NotePropertyName observedPose -NotePropertyValue @{position=@(0.0,1.68,0.0);sample='before'}
+                $global:AutoContinuityPoseAfter.observedPose=@{position=@(0.25,1.72,-0.5);sample='after'}
+                $global:AutoContinuityPackageBefore | Add-Member -NotePropertyName observationPhase -NotePropertyValue 'before'
+                $global:AutoContinuityPackageAfter.observationPhase='after'
+            }
             switch($case){
                 driver-nonce {$global:AutoContinuityPoseAfter.driverInstanceNonce++}
                 creator-pid {$global:AutoContinuityPoseAfter.driverCreatorPid++;$global:AutoContinuityPoseAfter.creatorAuthority.pid++}
@@ -82,15 +89,32 @@ try {
                 $runtime=Get-NullRuntimeEvidence -Processes $processes -Profile $profile
                 $observation=$runtime.applicationHeadPose
                 $contract=Get-RuntimeInputContract -BaseContract @{} -Effective @{active=$true;controllerInactivitySuppressed=$true} -Runtime $runtime -ExternalDrivers @{errors=@();conflicts=@()}
-                Require ($runtime.headPoseReady -eq ($case -eq 'unchanged')) "null head readiness $case"
-                Require ($runtime.controllersReady -eq ($case -eq 'unchanged')) "null controller readiness $case"
-                Require ($contract.measurementReady -eq ($case -eq 'unchanged')) "null measurement admission $case"
-                if($case -eq 'unchanged'){Require ($contract.providerContinuity.sha256 -ceq $runtime.providerContinuity.sha256) 'measurement receipt carries exact tuple'}
+                Require ($runtime.headPoseReady -eq $acceptExpected) "null head readiness $case"
+                Require ($runtime.controllersReady -eq $acceptExpected) "null controller readiness $case"
+                Require ($contract.measurementReady -eq $acceptExpected) "null measurement admission $case"
+                if($acceptExpected){
+                    Require ($contract.providerContinuity.sha256 -ceq $runtime.providerContinuity.sha256) 'measurement receipt carries exact tuple'
+                    Require ([object]::ReferenceEquals($runtime.headPoseState,$observation.poseAfterProbe)) 'null current pose is the validated post-probe snapshot'
+                    Require ([object]::ReferenceEquals($runtime.packageAuthority,$observation.packageAuthority)) 'null current package is the validated post-probe authority'
+                    Require ($runtime.serverProcessEvidence -ceq 'validated-post-probe-creator-authority') 'accepted server observation has explicit post-probe provenance'
+                    Require ($runtime.serverProcess.id -eq $runtime.headPoseState.creatorAuthority.pid -and $runtime.serverProcess.path -ceq $runtime.headPoseState.creatorAuthority.executablePath -and [DateTime]::Parse($runtime.serverProcess.startTimeUtc).ToUniversalTime().ToFileTimeUtc() -eq $runtime.headPoseState.creatorAuthority.processStartFileTimeUtc) 'accepted server identity is bound to post-probe creator'
+                    Require ($runtime.steamVrProcessesEvidence -ceq 'pre-probe-process-inventory') 'historical process inventory explicitly labelled'
+                    if($case -eq 'pose-refresh'){
+                        Require ($runtime.headPoseState.observedPose.sample -ceq 'after' -and $runtime.packageAuthority.observationPhase -ceq 'after') 'nonidentity post-probe fields replace earlier authority'
+                        Require (-not [object]::ReferenceEquals($runtime.headPoseState,$global:AutoContinuityPoseBefore)) 'pre-probe pose is not published as current'
+                        # Production start embeds this runtime object; serialized receipt
+                        # must retain post-pose and the same measurement tuple.
+                        $receipt=@{accepted=$true;runtime=$runtime;inputContract=$contract}|ConvertTo-Json -Depth 30|ConvertFrom-Json -Depth 30
+                        Require ($receipt.runtime.headPoseState.observedPose.sample -ceq 'after') 'serialized start runtime carries post-pose'
+                        Require ($receipt.inputContract.providerContinuity.sha256 -ceq $receipt.runtime.providerContinuity.sha256) 'serialized measurement binds same post-probe tuple'
+                        Require (($receipt.runtime.headPoseState|ConvertTo-Json -Depth 20 -Compress) -ceq ($receipt.runtime.applicationHeadPose.poseAfterProbe|ConvertTo-Json -Depth 20 -Compress)) 'serialized outward and application post-pose value parity'
+                    }
+                }
             }
-            Require ($observation.qualified -eq ($case -eq 'unchanged')) "$lane continuity admission ${case}: $($observation | ConvertTo-Json -Depth 8 -Compress)"
+            Require ($observation.qualified -eq $acceptExpected) "$lane continuity admission ${case}: $($observation | ConvertTo-Json -Depth 8 -Compress)"
             $expectedDispatches=if($lane -eq 'null' -and $case -in @('package-root','provenance','artifact','transaction')){0}else{1}
             Require ($global:AutoContinuityDispatches -eq $expectedDispatches) "$lane no replay/predispatch custody $case"
-            if($case -eq 'unchanged'){
+            if($acceptExpected){
                 Require ($observation.providerContinuity.verified -and $observation.providerContinuity.sha256 -match '^[a-f0-9]{64}$') "$lane immutable tuple receipt"
                 $immutable=$observation.providerContinuity.canonicalJson
                 $global:AutoContinuityPoseAfter.driverInstanceNonce++
@@ -100,7 +124,7 @@ try {
             }
         }
     }
-    [pscustomobject]@{ok=$true;checks=$checks;casesPerLane=14;publicLanes=2;nativeExecuted=$false;runtimeChanged=$false;scope='Exact production probe/runtime admission functions; OS observations/transport are finite fixtures, not live startup acceptance'}|ConvertTo-Json -Compress
+    [pscustomobject]@{ok=$true;checks=$checks;casesPerLane=15;publicLanes=2;nativeExecuted=$false;runtimeChanged=$false;scope='Exact production probe/runtime admission functions; OS observations/transport are finite fixtures, not live startup acceptance'}|ConvertTo-Json -Compress
 } finally {
     foreach($name in @('AutoContinuityDispatches','AutoContinuityPoseBefore','AutoContinuityPoseAfter','AutoContinuityPackageBefore','AutoContinuityPackageAfter','AutoContinuityPackageReads','AutoContinuityPoseReads')){Remove-Variable -Scope Global -Name $name -ErrorAction SilentlyContinue}
 }

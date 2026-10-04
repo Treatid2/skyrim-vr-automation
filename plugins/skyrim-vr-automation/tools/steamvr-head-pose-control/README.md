@@ -122,6 +122,14 @@ and its SHA256 independently of later mutable observations. The null runtime
 and its measurement contract retain that same identity. This is bounded
 pre/post continuity evidence, not atomic future liveness or hostile-user proof.
 
+On successful null qualification, current runtime pose and package authority
+come from that validated post-probe snapshot, including non-identity fields.
+The exposed server identity is derived from its validated creator authority;
+the earlier process inventory and preProbeServerProcess are explicitly historical.
+Equal continuity tuples do not make an earlier pose sample current. Measurement
+and serialized start evidence retain the same post-probe authority without a
+second probe or transport replay.
+
 Run `Test-DriverPackageAuthority.ps1`, `Test-SteamVRHeadPoseControl.ps1`,
 `Test-ProviderContinuity.ps1 -FixtureRoot <owned-fixture-directory>` and
 `Test-PassiveControllerAdmission.ps1` after changes. These isolated fixtures do
