@@ -49,7 +49,7 @@ try {
     Assert-Test ($inspect.ok -and $inspect.state -eq 'provider-running' -and $inspect.data.pose.eyeHeightMeters -eq 1.68) 'inspect reads the versioned pose map'
 
     $qualify = & $entry qualify -MapName $mapName -SkipOpenVRProbe -Compact -NoExit | ConvertFrom-Json
-    Assert-Test (-not $qualify.ok -and $qualify.state -eq 'head-pose-not-qualified' -and $qualify.data.pose.qualified -and $qualify.data.applicationPose.skipped) 'skipping the independent stereo probe remains explicitly unqualified'
+    Assert-Test (-not $qualify.ok -and $qualify.state -eq 'head-pose-not-qualified' -and -not $qualify.data.pose.qualified -and $qualify.data.applicationPose.skipped) 'skipping the independent probe cannot qualify a map created by unrelated PowerShell'
     $aggregateProbeError = 'The independent OpenVR application pose qualification did not succeed; inspect the retained probe result for the failed component or execution error.'
     Assert-Test ($qualify.errors -contains $aggregateProbeError -and -not ($qualify.errors -match 'did not observe a valid standing HMD')) 'skipped application qualification does not invent an invalid HMD observation'
     $skippedControllers = & $entry qualify -MapName $mapName -RequireControllers -SkipOpenVRProbe -Compact -NoExit | ConvertFrom-Json
@@ -61,16 +61,16 @@ try {
     $invalidProbe = Join-Path $fixture 'invalid-probe.exe'
     [IO.File]::WriteAllText($invalidProbe, 'not an executable; fixture only')
     $failedApplication = & $entry qualify -MapName $mapName -RequireControllers -PoseProbePath $invalidProbe -InstallRoot $fixture -OpenVRPathsPath (Join-Path $fixture 'unused-openvrpaths.json') -EvidenceDirectory (Join-Path $fixture 'invalid-probe-evidence') -ProbeTimeoutSeconds 1 -Compact -NoExit | ConvertFrom-Json
-    Assert-Test (-not $failedApplication.ok -and $failedApplication.data.pose.qualified -and -not $failedApplication.data.applicationPose.boundedRun.ok) 'failed application probe remains negative despite an acknowledged fixture head pose'
+    Assert-Test (-not $failedApplication.ok -and -not $failedApplication.data.pose.qualified -and $failedApplication.data.applicationPose.error -match 'probe was not executed') 'forged creator identity prevents probe execution despite an acknowledged fixture header'
     Assert-Test ($failedApplication.errors -contains $aggregateProbeError -and -not ($failedApplication.errors -match 'did not observe a valid standing HMD') -and ($failedApplication.errors -match 'required passive left/right controller pair')) 'aggregate probe error preserves controller refusal without falsely blaming the HMD'
 
     $set = & $entry set -MapName $mapName -EyeHeightMeters 1.72 -YawDegrees 15 -NoWait -Compact -NoExit | ConvertFrom-Json
-    Assert-Test ($set.ok -and $set.state -eq 'pose-submitted' -and $set.data.writerNonce -ne 0 -and ($view.ReadUInt64(8) % 2) -eq 0) 'set publishes an atomic even pose sequence with a unique writer nonce'
-    Assert-Test ([Math]::Abs($view.ReadDouble(40) - 1.72) -lt 0.000001) 'set writes the requested eye height'
+    Assert-Test (-not $set.ok -and $set.errors[0] -match 'not owned by a live') 'set refuses an unrelated process forging a driver header'
+    Assert-Test ([Math]::Abs($view.ReadDouble(40) - 1.68) -lt 0.000001) 'refused set leaves the mapped pose unchanged'
 
     $view.Write(16, $view.ReadUInt64(8)); $view.Write(96, $view.ReadUInt64(88)); $view.Write(24, [uint32]1); $view.Flush()
     $requalified = & $entry qualify -MapName $mapName -SkipOpenVRProbe -Compact -NoExit | ConvertFrom-Json
-    Assert-Test (-not $requalified.ok -and $requalified.data.pose.qualified -and [Math]::Abs($requalified.data.pose.eyeHeightMeters - 1.72) -lt 0.000001) 'exact nonce acknowledgement requalifies the shared pose while skipped stereo evidence remains unqualified'
+    Assert-Test (-not $requalified.ok -and -not $requalified.data.pose.qualified -and $requalified.data.pose.acknowledged) 'exact nonce acknowledgement alone does not qualify an unrelated creator'
 
     $view.Write(96, [uint64]($view.ReadUInt64(88) + 1)); $view.Flush()
     $wrongNonce = & $entry inspect -MapName $mapName -Compact -NoExit | ConvertFrom-Json
@@ -81,7 +81,7 @@ try {
         foreach ($height in @(1.73, 1.74)) {
             $stdout = Join-Path $fixture "writer-$height.stdout.json"
             $stderr = Join-Path $fixture "writer-$height.stderr.log"
-            $process = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile', '-File', $entry, 'set', '-MapName', $mapName, '-EyeHeightMeters', [string]$height, '-NoWait', '-Compact', '-NoExit') -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+            $process = Start-Process -WindowStyle Hidden -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile', '-File', $entry, 'set', '-MapName', $mapName, '-EyeHeightMeters', [string]$height, '-NoWait', '-Compact', '-NoExit') -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
             [pscustomobject]@{ process = $process; stdout = $stdout; stderr = $stderr }
         }
     )
@@ -90,7 +90,7 @@ try {
         if ($run.process.ExitCode -ne 0) { throw "Concurrent writer failed: $([IO.File]::ReadAllText($run.stderr))" }
     }
     $writerResults = @($writerRuns | ForEach-Object { [IO.File]::ReadAllText($_.stdout) | ConvertFrom-Json })
-    Assert-Test (@($writerResults.data.requestedSequence | Sort-Object -Unique).Count -eq 2 -and @($writerResults.data.writerNonce | Sort-Object -Unique).Count -eq 2) 'concurrent writers serialize to distinct sequences and command nonces'
+    Assert-Test (@($writerResults | Where-Object ok).Count -eq 0 -and $view.ReadUInt64(8) -eq 2) 'concurrent production writers refuse a forged creator without mutating the map'
 
     $installRoot = Join-Path $fixture 'installed\codex_head_pose'
     $oldDll = Join-Path $installRoot 'bin\win64\driver_codex_head_pose.dll'

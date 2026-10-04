@@ -16,8 +16,8 @@ independent OpenVR probe.
 The profile sets `dashboard.enableDashboard=false` so the generic-HMD
 laser-mouse/dashboard route cannot be summoned. A resident `vrdashboard.exe`
 is retained as process telemetry; its presence alone is not an input-conflict
-signal. The controller never edits Valve's bindings and does not invent
-controller devices.
+signal. The controller never edits Valve's bindings. The separately packaged
+native provider supplies the opt-in passive controller devices.
 
 Valve's null display driver does not provide the controlled standing pose this
 automation requires. The separately installed `codex_head_pose` server driver
@@ -25,9 +25,39 @@ supplies one HMD pose and is mapped to `/user/head` with SteamVR
 `TrackingOverrides`. Its default eye height is 1.68 metres; the controller can
 update the pose through `Local\CSXVRHeadPose-v2`. The returned `inputContract`
 marks the HMD pose provider ready only after both driver acknowledgement and an
-application-observed OpenVR qualification. Controller input remains
-unavailable, replay readiness remains false, and the broader measurement policy
+application-observed OpenVR qualification. The default null profile enables
+the native passive left/right pair. Every null-route application probe passes
+`--require-controllers`: exact passive serial/provider identity, distinct hand
+roles, valid connected finite standing and compositor poses, 100 neutral legacy
+input samples and zero button/touch events must pass before runtime admission.
+Head-only or legacy probe output fails this gate. The returned input contract
+distinguishes `controllerPresenceReady` from `controllerInput=passive-neutral`;
+replay readiness remains false, and the broader measurement policy
 remains fail-closed until its other runtime conflicts are separately qualified.
+
+Passive devices must not rely on synthetic activity to avoid standby. The
+controller-required production profile declares
+`power.turnOffControllersTimeout=0` (Never in the installed SteamVR schema).
+Apply stages and hash-binds that exact profile, changes only this power leaf,
+and preserves other existing power settings. Effective-state inspection checks
+the typed integer value; measurement readiness additionally requires
+`controllerInactivitySuppressed=true`. This is not proof that controller roles
+remain valid: the independent required-controller probe is still mandatory.
+
+An explicitly selected `-Standalone` diagnostic profile may declare a positive
+integer timeout for a bounded idle-standby comparison. Pass the same explicit
+profile and `-Standalone` to apply/start; this never authorizes Skyrim through
+MO2. Its effective timeout can match and startup can qualify initial presence,
+but `controller-inactivity-timeout-not-suppressed` blocks measurement readiness.
+Non-standalone apply/start require Never when power is declared. Profile power
+must contain only this one nonnegative Int32-range JSON integer; malformed
+values or an existing non-object power section fail before mutation.
+
+Restore reconstructs this controlled leaf from the receipt-bound profile and
+rejects timeout drift as well as unclassified changes to other power leaves.
+The exact original bytes are restored, including absence of a power section.
+Historical receipt-bound profiles without power remain restorable and acquire
+no new power ownership; they cannot establish inactivity-suppressed readiness.
 
 Before `start`, the controller reads the OpenVR registration file (normally
 `%LOCALAPPDATA%\openvr\openvrpaths.vrpath`) and inventories every external
@@ -87,8 +117,19 @@ in the receipt, so plugin-cache replacement cannot strand a later restore. A
 legacy receipt may use a caller-supplied profile only when its SHA-256 matches
 the receipt. Restore accepts byte-only
 formatting changes and runtime-managed changes confined to the top-level
-`GpuSpeed` and `LastKnown` sections only when every controller-owned null-HMD
-setting still matches. Changes to a controller-owned key or any other section
+`GpuSpeed` and `LastKnown` sections, plus the exact string-valued
+`dashboard.lastAccessedExternalOverlayKey` history leaf (addition/removal included)
+only when every controller-owned null-HMD setting still matches. Authorization
+uses actual JSON structure, not dotted diagnostic spelling: literal root keys
+containing dots cannot borrow history or runtime-managed authority.
+Scalar comparison preserves JSON kinds: Booleans never equal numbers or
+strings, and null equals only null. Numbers compare exact normalized decimal
+coefficient/exponent identities from their JSON representations, without
+coercing integers or decimals through a rounded floating-point type. Numerically
+identical spellings (`90.0`/`90`, `0.0`/`0`, and equivalent exponent forms) are
+formatting-only changes; actual value differences and non-finite values fail
+closed, including large integers that would become equal after lossy rounding.
+Changes to a controller-owned key or any other section
 remain unclassified drift and fail closed. The validation route and exact
 difference paths are returned as `settingsRestoreValidation`; rollback retains
 the exact accepted live bytes rather than assuming they equal the originally
@@ -182,9 +223,33 @@ before applying or starting null-HMD. Pass that exact lease's bearer
 `-MO2AccessId` and selected `-MO2Profile` to both `apply` and `start`. The
 controller independently repeats the `runtime-route-provider` check, requires
 the `SteamVRNull` route, and binds the public admission proof into the apply
-receipt. `start` rejects lease, profile, or provider-inventory drift. The
+receipt. `start` rejects lease, profile, or semantic provider-inventory drift.
+New receipts retain the complete inventory and a versioned canonical fingerprint.
+Only provider `lineNumber` is excluded; object property order is canonicalized.
+Array order, profile/modlist path, names, paths, enable/marker state, classification,
+marker inventory and all other fields remain significant. Legacy hash-only receipts
+keep exact-hash matching and are not migrated: restore, then apply a new transaction
+under the admitted current lease. The
 explicit `-Standalone` escape is for non-MO2 SteamVR diagnostics only and must
 not be used for Skyrim through MO2. A running null SteamVR instance does not
 prove an application bypassing SteamVR is attached to it.
 
 Run `Test-SteamVRNullControl.ps1` after changing the control contract.
+
+Runtime startup and every application-facing probe also require the exact
+owned `HeadPoseDriverRoot` and committed schema-3 installation custody described
+in the head-pose README. Exactly one canonical registration and one same-name
+provider are required. Manifest/driver/probe/OpenVR DLL/settings/input-profile
+hashes are enforced against independent bundled provenance, not merely reported.
+An explicitly authorized custom build uses
+`-HeadPoseExpectedProvenanceSha256 <sha256>`; it retains distinct digest authority.
+The selected profile cannot substitute another executable as its probe.
+
+The creator must match the configured `vrserver.exe`, loaded driver module, and
+current runtime server PID/start identity. `runtime.packageAuthority` retains
+the root, committed transaction, provenance and verified artifact hashes.
+`head-pose-package-not-qualified` is a measurement blocker and refuses startup
+before launch; behavioral head/controller readiness cannot override it. Old
+install markers require an explicit closed-state upgrade, not an automatic
+rewrite. Source fixtures, installation custody and standalone presence still do
+not prove in-game controller roles or game fixture qualification.

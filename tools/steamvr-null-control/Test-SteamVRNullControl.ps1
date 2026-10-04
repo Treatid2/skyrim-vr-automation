@@ -15,6 +15,8 @@ if (-not $resolvedFixture.StartsWith($resolvedTemp, [StringComparison]::OrdinalI
 $failures = [Collections.Generic.List[string]]::new()
 $passes = [Collections.Generic.List[string]]::new()
 $priorTransactionRoot = $env:CSX_STEAMVR_TRANSACTION_ROOT
+$priorInstallControlRoot = $env:CSX_HEAD_POSE_INSTALL_CONTROL_ROOT
+$priorDefaults = $PSDefaultParameterValues.Clone()
 $poseMapping = $null
 $poseView = $null
 
@@ -85,10 +87,26 @@ try {
     $openVrPathsPath = Join-Path $fixture 'openvrpaths.vrpath'
     $externalDriverRoot = Join-Path $fixture 'VirtualDesktopDriver'
     $headPoseDriverRoot = Join-Path $fixture 'HeadPoseDriver'
+    $PSDefaultParameterValues['Invoke-SteamVRNullControl.ps1:HeadPoseDriverRoot'] = $headPoseDriverRoot
+    $env:CSX_HEAD_POSE_INSTALL_CONTROL_ROOT = Join-Path $fixture 'install-control'
     New-Item -ItemType Directory -Path $externalDriverRoot | Out-Null
     New-Item -ItemType Directory -Path $headPoseDriverRoot | Out-Null
     [ordered]@{ name = 'codex_head_pose'; alwaysActivate = $true; redirectsDisplay = $false } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $headPoseDriverRoot 'driver.vrdrivermanifest') -Encoding utf8
     [ordered]@{ version = 1; external_drivers = @($headPoseDriverRoot) } | ConvertTo-Json | Set-Content -LiteralPath $openVrPathsPath -Encoding utf8
+    [IO.File]::WriteAllText((Join-Path $headPoseDriverRoot '.csx-vr-automation-driver.json'), '{"schemaVersion":1,"driverName":"codex_head_pose"}')
+    $headEntry = Join-Path $PSScriptRoot '..\steamvr-head-pose-control\Invoke-SteamVRHeadPoseControl.ps1'
+    $fixtureBundle = Join-Path $PSScriptRoot '..\..\drivers\codex_head_pose'
+    # Actual install transaction; no vrpathreg execution because this exact
+    # temporary root is already registered. Mask only named SteamVR queries.
+    function Get-Process {
+        [CmdletBinding(DefaultParameterSetName='Name')]
+        param([Parameter(ParameterSetName='Name')][string[]]$Name, [Parameter(ParameterSetName='Id')][int[]]$Id)
+        if ($PSCmdlet.ParameterSetName -eq 'Name' -and @($Name).Count -gt 0 -and @($Name | Where-Object { $_ -notin @('vrserver','vrmonitor','vrcompositor','vrstartup','vrdashboard','vrwebhelper') }).Count -eq 0) { return }
+        return Microsoft.PowerShell.Management\Get-Process @PSBoundParameters
+    }
+    $fixtureInstall = & $headEntry install -DriverPackagePath $fixtureBundle -InstallRoot $headPoseDriverRoot -VRPathRegPath $headEntry -OpenVRPathsPath $openVrPathsPath -Upgrade -Compact -NoExit | ConvertFrom-Json
+    Remove-Item -LiteralPath Function:\Get-Process
+    if (-not $fixtureInstall.ok) { throw ($fixtureInstall | ConvertTo-Json -Depth 16) }
     New-Item -ItemType Directory -Path $evidence | Out-Null
     New-Item -ItemType Directory -Path $isolationEvidence | Out-Null
     New-Item -ItemType Directory -Path $failureEvidence | Out-Null
@@ -145,7 +163,7 @@ try {
 
     $inspectBefore = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json
     Assert-Test ($inspectBefore.ok -and $inspectBefore.state -eq 'null-inactive') 'inspect identifies inactive null profile'
-    Assert-Test ($inspectBefore.data.runtime.headPoseState.qualified -and $inspectBefore.data.runtime.headPoseState.protocolValid -and $inspectBefore.data.runtime.headPoseState.driverIdentityVerified) 'inspect accepts a fully acknowledged v2 head-pose provider with verified live-process identity'
+    Assert-Test (-not $inspectBefore.data.runtime.headPoseState.qualified -and $inspectBefore.data.runtime.headPoseState.protocolValid -and -not $inspectBefore.data.runtime.headPoseState.driverIdentityVerified) 'inspect refuses PowerShell PID as a runtime creator even with a fully acknowledged v2 header'
     $poseView.Write(96, [uint64]42)
     $nonceMismatch = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json
     Assert-Test (-not $nonceMismatch.data.runtime.headPoseState.qualified -and -not $nonceMismatch.data.runtime.headPoseState.acknowledged) 'inspect rejects a v2 provider whose acknowledged writer nonce does not match'
@@ -1064,10 +1082,23 @@ try {
     Assert-Test ($crossEvidenceRecovery.ok -and $crossEvidenceRecovery.data.recoveredTransaction.phase -eq 'recovered' -and [IO.File]::ReadAllText($settingsPath) -ceq $originalText) 'a caller with a different evidence directory recovers the authoritative pending target transaction before inspection'
     Assert-Test ($recoveredAuthority.phase -eq 'recovered' -and $recoveredMirror.phase -eq 'recovered') 'authoritative recovery is mirrored back to the secondary evidence journal'
 }
+catch {
+    [Console]::Error.WriteLine($_.ToString())
+    throw
+}
 finally {
     $env:CSX_STEAMVR_TRANSACTION_ROOT = $priorTransactionRoot
+    $env:CSX_HEAD_POSE_INSTALL_CONTROL_ROOT = $priorInstallControlRoot
+    $PSDefaultParameterValues = $priorDefaults
     if ($poseView) { $poseView.Dispose() }
     if ($poseMapping) { $poseMapping.Dispose() }
+    # Failed assertions must not strand the fixture-only copied command shell.
+    foreach ($process in @(Microsoft.PowerShell.Management\Get-Process -Name vrstartup -ErrorAction SilentlyContinue)) {
+        if ($process.Path -and [IO.Path]::GetFullPath($process.Path).StartsWith($resolvedFixture.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction Stop
+            if (-not $process.WaitForExit(5000)) { throw 'Exact fixture startup process did not exit during final cleanup.' }
+        }
+    }
     if (Test-Path -LiteralPath $resolvedFixture) { Remove-Item -LiteralPath $resolvedFixture -Recurse -Force }
 }
 
