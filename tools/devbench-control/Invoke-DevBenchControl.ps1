@@ -1225,7 +1225,7 @@ try {
     elseif ($Command -eq 'calendar-window') {
         $calendarSessionId=[string]$headers['Mcp-Session-Id']
         $calendarDeadline=$operationDeadlineUtc
-        $data=Invoke-DevBenchCalendarWindow -Owner $CalendarOwner -Observations $calendarObservations -HoldMilliseconds $CalendarHoldMilliseconds -DeadlineUtc $calendarDeadline -AssertSession {
+        $data=Invoke-DevBenchCalendarWindow -Owner $CalendarOwner -Observations $calendarObservations -HoldMilliseconds $CalendarHoldMilliseconds -DeadlineUtc $calendarDeadline -ExpectedProcessId $runtimeIdentity.listenerPid -AssertSession {
             if ($script:transport -cne 'mcp' -or [string]::IsNullOrWhiteSpace($calendarSessionId) -or [string]$headers['Mcp-Session-Id'] -cne $calendarSessionId) { throw 'Calendar MCP session changed; no rebind/release on a replacement.' }
         } -Call {
             param($name,$argsMap,$mutation,$bound)

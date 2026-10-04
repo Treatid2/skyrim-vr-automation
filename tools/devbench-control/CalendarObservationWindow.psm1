@@ -23,7 +23,7 @@ function Assert-CalendarReadback($Payload) {
     if ($Payload -isnot [pscustomobject]) { throw 'Calendar requires one structured native payload.' }
     foreach ($name in @('ok','readbackFresh','available','worldLoaded')) { if (-not $Payload.PSObject.Properties[$name] -or $Payload.$name -isnot [bool] -or -not $Payload.$name) { throw "Calendar $name is not positively qualified." } }
     foreach ($name in @('outstanding','leaseActive','expiryDue','cleanupPending','holdValid','serviceStopping','restored')) { if (-not $Payload.PSObject.Properties[$name] -or $Payload.$name -isnot [bool]) { throw "Calendar $name must be Boolean." } }
-    if ($Payload.serviceStopping -or $Payload.schemaVersion -ne 1 -or $Payload.plugin -cne 'devbench' -or $Payload.status -isnot [string]) { throw 'Unsupported calendar state/schema.' }
+    if ($Payload.serviceStopping -or $null -eq $Payload.schemaVersion -or $Payload.schemaVersion.GetType() -notin @([int],[long],[uint32],[uint64]) -or $Payload.schemaVersion -ne 1 -or $Payload.plugin -isnot [string] -or $Payload.plugin -cne 'devbench' -or $Payload.status -isnot [string]) { throw 'Unsupported calendar state/schema.' }
     Assert-CalendarBinding $Payload.binding
     if ($Payload.values -isnot [pscustomobject]) { throw 'Fresh calendar values are missing.' }
     foreach ($name in @('year','month','day','gameHour','daysPassed','calendarRate','engineMultiplier')) {
@@ -38,7 +38,7 @@ function Assert-CalendarLease($Payload,[string]$Owner,[string]$CommandId,$Bindin
     if (-not $lease -or $lease.Value -isnot [pscustomobject]) { throw 'Exact calendar lease receipt is absent.' }
     $lease=$lease.Value
     if ($lease.id -isnot [string] -or [string]::IsNullOrWhiteSpace($lease.id) -or $lease.owner -cne $Owner -or $lease.commandId -cne $CommandId -or $lease.applied -isnot [bool] -or -not $lease.applied -or -not (Test-CalendarBindingEqual $lease.binding $Binding)) { throw 'Calendar lease owner/command/binding/applied mismatch.' }
-    if ($lease.captured -isnot [pscustomobject] -or $lease.captured.calendarRate -isnot [ValueType] -or -not [double]::IsFinite([double]$lease.captured.calendarRate) -or $lease.captured.calendarRate -le 0) { throw 'Captured prior calendar rate is unqualified.' }
+    if ($lease.captured -isnot [pscustomobject] -or $null -eq $lease.captured.calendarRate -or $lease.captured.calendarRate.GetType() -notin @([int],[long],[uint32],[uint64],[double],[single],[decimal]) -or -not [double]::IsFinite([double]$lease.captured.calendarRate) -or $lease.captured.calendarRate -le 0) { throw 'Captured prior calendar rate is unqualified.' }
     return $lease
 }
 
@@ -50,6 +50,7 @@ function Invoke-DevBenchCalendarWindow {
           [Parameter(Mandatory)][array]$Observations,
           [ValidateRange(1,300000)][int]$HoldMilliseconds=60000,
           [Parameter(Mandatory)][datetime]$DeadlineUtc,
+          [Parameter(Mandatory)][ValidateRange(1,2147483647)][int]$ExpectedProcessId,
           [ValidateRange(5,30)][int]$CleanupSeconds=15)
     $holdId=[guid]::NewGuid().ToString(); $releaseId=[guid]::NewGuid().ToString()
     $trace=[Collections.Generic.List[object]]::new(); $errors=[Collections.Generic.List[string]]::new()
@@ -61,7 +62,15 @@ function Invoke-DevBenchCalendarWindow {
         if ([datetime]::UtcNow -ge $Bound) { throw 'Calendar workflow deadline expired before dispatch.' }
         $entry=[ordered]@{ tool=$Name; arguments=$Arguments; mutation=$Mutation; intendedUtc=[datetime]::UtcNow.ToString('o'); data=$null; error=$null }
         $trace.Add($entry)
-        try { $entry.data=& $Call $Name $Arguments $Mutation $Bound; if([datetime]::UtcNow -ge $Bound){throw 'Calendar response arrived at or after its deadline.'}; return $entry.data }
+        try {
+            $entry.data=& $Call $Name $Arguments $Mutation $Bound
+            if([datetime]::UtcNow -ge $Bound){throw 'Calendar response arrived at or after its deadline.'}
+            if($Name -ceq 'calendar') {
+                $payload=Get-CalendarPayload $entry.data
+                if($payload.action -isnot [string] -or $payload.action -cne $Arguments.action -or $payload.binding.pid -ne $ExpectedProcessId){throw 'Calendar response action/process differs from the exact runtime binding.'}
+            }
+            return $entry.data
+        }
         catch { $entry.error=$_.Exception.Message; throw }
     }
     function Get-CalendarPayload($Data) {
