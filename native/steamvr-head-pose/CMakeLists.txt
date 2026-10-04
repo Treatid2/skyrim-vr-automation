@@ -55,6 +55,7 @@ set(_package_root "${CMAKE_BINARY_DIR}/package/codex_head_pose")
 add_custom_command(TARGET driver_codex_head_pose POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${_package_root}/bin/win64"
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${_package_root}/resources/settings"
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "${_package_root}/resources/input"
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
           "$<TARGET_FILE:driver_codex_head_pose>"
           "${_package_root}/bin/win64/driver_codex_head_pose.dll"
@@ -64,6 +65,9 @@ add_custom_command(TARGET driver_codex_head_pose POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
           "${CMAKE_CURRENT_SOURCE_DIR}/resources/settings/default.vrsettings"
           "${_package_root}/resources/settings/default.vrsettings"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+          "${CMAKE_CURRENT_SOURCE_DIR}/resources/input/passive_controller_profile.json"
+          "${_package_root}/resources/input/passive_controller_profile.json"
   VERBATIM
 )
 

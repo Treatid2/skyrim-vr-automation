@@ -13,8 +13,28 @@ separately reviewed build.
 
 .\Invoke-SteamVRHeadPoseControl.ps1 inspect -Compact
 .\Invoke-SteamVRHeadPoseControl.ps1 qualify -Compact
+.\Invoke-SteamVRHeadPoseControl.ps1 qualify -RequireControllers -Compact
 .\Invoke-SteamVRHeadPoseControl.ps1 set -EyeHeightMeters 1.68 -YawDegrees 0
 ```
+
+For native PowerShell7 `-File` argv, pass the nullable Boolean as **one**
+argument, `-Enabled:true` or `-Enabled:false`. Do not pass `-Enabled` followed
+by the literal text `$true`/`$false`: separate file arguments are strings and
+that shape fails parameter transformation before this controller executes.
+Omit `Enabled` to preserve the current enabled state during coordinate-only
+updates. An in-process PowerShell script invocation may still use
+`-Enabled $true`/`$false` as actual Boolean expressions.
+
+```text
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <exact-current-controller.ps1> set -Enabled:true -EyeHeightMeters 1.68 -YawDegrees 0 -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <same-current-controller.ps1> set -Enabled:false -Compact
+```
+
+`Test-HeadPoseFileArgv.ps1` checks the actual `-File` parameter boundary on an
+isolated random map, including refusal/no mutation when creator authority is
+unqualified. It does not enable/disable a live HMD or prove driver
+acknowledgement. This syntax applies to the existing nullable Boolean
+interface; no new wrapper, controller/driver upgrade or host refresh is needed.
 
 The runtime contract is the owner-only, version-2 memory map
 `Local\CSXVRHeadPose-v2`. Writers take a named single-writer lease, use
@@ -27,6 +47,14 @@ but is deliberately not required to bootstrap the pose.
 observe the standing pose, finite and distinct left/right eye transforms, a
 plausible eye separation, and a valid recommended render target. Using
 `-SkipOpenVRProbe` is diagnostic and explicitly unqualified.
+
+`-RequireControllers` passes `--require-controllers` to the same bounded
+independent probe. It additionally requires the exact passive provider's
+distinct left/right roles, valid connected standing and compositor poses,
+100 neutral legacy input samples and zero button/touch events. Missing or
+head-only probe output cannot satisfy it. Skipping the probe remains
+unqualified even with an acknowledged head pose. This is passive controller
+presence, not interactive input or replay support.
 
 `install` requires SteamVR to be stopped. It copies a validated package to a
 stable user-local directory, records an ownership marker, registers the driver
@@ -45,6 +73,64 @@ whose result was not journalled is accepted for rollback only when its semantic
 driver inventory differs from the preimage solely by the one canonical target.
 Unclassified target or registration drift fails for manual recovery.
 
+Controller-capable packages (including an explicit `enableControllers=false`
+default) must include `resources/input/passive_controller_profile.json`.
+The installer validates its driver/class identity, copies it, and binds its
+SHA-256 plus the default-settings hash into the source journal, ownership marker
+and installation receipt. Those installed hashes must match the exact source
+package. Historical head-only packages without the controller setting remain
+installable, but cannot pass required-controller qualification.
+
 The install lock is bounded by `-InstallLockTimeoutMilliseconds`. Its control
 root is fixed under Windows LocalApplicationData; the fixture-only environment
 override is accepted only for targets within the OS temporary directory.
+
+## Installed artifact and creator authority
+
+Qualification requires a schema-3 ownership marker bound to the exact canonical
+install root and committed target-owned installer journal. Older installations
+remain inspectable/restorable, but must receive an attributable closed-SteamVR
+upgrade before they can qualify. No command silently repairs a legacy marker.
+
+Before and after a probe, admission independently compares the manifest, driver
+DLL, probe EXE, OpenVR DLL, default settings and passive input profile against
+both install custody and `build-provenance.json`. The installed provenance must
+match this controller distribution's bundled provenance. Explicitly authorized
+custom packages instead require `-ExpectedPackageProvenanceSha256 <sha256>` of
+their independently selected provenance file; this authority is recorded
+separately and does not attribute that build to the bundled release. An explicit
+`-PoseProbePath` may identify only the owned package's standard probe, not an
+arbitrary executable. Missing or drifted authority refuses probe execution.
+
+The shared-memory creator must be the exact `bin/win64/vrserver.exe` under
+`-SteamVRRoot`, with one exact installed driver module loaded. Proof retains
+PID, process-start identity and module path. Inaccessible module evidence is
+unqualified; no weaker timestamp-only fallback exists. This corroborates loaded
+module path and independently hashed disk artifacts, not a cryptographic hash
+of the in-memory image, OS isolation or protection against a hostile same-user
+process. Package reads are limited to six artifacts/64 MiB, 128 registrations,
+256 KiB per JSON authority and a 15-second budget (or the shorter outer deadline).
+
+Admission now pins one immutable continuity identity across the probe: canonical
+package root, committed transaction/provenance and all six artifact digests,
+exact creator vrserver executable/PID/process-start identity, loaded module,
+driver start/instance nonce and shared-memory writer/acknowledged nonces plus
+pose sequence. Any handoff or pose writer change fails closed without replay.
+Shared-memory v2 exposes writer nonces, not writer PID/start fields; no invented
+OS writer identity is claimed. Qualified probe evidence retains canonical JSON
+and its SHA256 independently of later mutable observations. The null runtime
+and its measurement contract retain that same identity. This is bounded
+pre/post continuity evidence, not atomic future liveness or hostile-user proof.
+
+On successful null qualification, current runtime pose and package authority
+come from that validated post-probe snapshot, including non-identity fields.
+The exposed server identity is derived from its validated creator authority;
+the earlier process inventory and preProbeServerProcess are explicitly historical.
+Equal continuity tuples do not make an earlier pose sample current. Measurement
+and serialized start evidence retain the same post-probe authority without a
+second probe or transport replay.
+
+Run `Test-DriverPackageAuthority.ps1`, `Test-SteamVRHeadPoseControl.ps1`,
+`Test-ProviderContinuity.ps1 -FixtureRoot <owned-fixture-directory>` and
+`Test-PassiveControllerAdmission.ps1` after changes. These isolated fixtures do
+not substitute for live OpenVR or in-game acceptance.

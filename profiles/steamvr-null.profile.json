@@ -14,6 +14,9 @@
   "dashboard": {
     "enableDashboard": false
   },
+  "power": {
+    "turnOffControllersTimeout": 0
+  },
   "driver_null": {
     "enable": true,
     "loadPriority": -999,
@@ -30,6 +33,7 @@
   },
   "driver_codex_head_pose": {
     "enable": true,
+    "enableControllers": true,
     "serialNumber": "CSX-NULL-HMD-POSE-1",
     "modelNumber": "CSX Synthetic Head Pose",
     "positionX": 0.0,
@@ -44,6 +48,8 @@
   },
   "headPoseProviderContract": {
     "driverName": "codex_head_pose",
+    "packageAuthority": "committed-owned-install-and-independent-provenance-digest",
+    "requiredInstallMarkerSchemaVersion": 3,
     "registeredDevicePath": "/devices/codex_head_pose/CSX-NULL-HMD-POSE-1",
     "semanticTarget": "/user/head",
     "sharedMemoryName": "Local\\CSXVRHeadPose-v2",
@@ -56,10 +62,11 @@
   "automationInputContract": {
     "hmdPoseProvider": "codex-head-pose-v2",
     "hmdPoseControl": "shared-memory-v2",
-    "controllerInput": "unavailable",
+    "controllerInput": "passive-neutral",
+    "controllerPresenceReady": false,
     "dashboardInput": "disabled",
     "replayReady": false,
     "measurementReady": false,
-    "qualificationRequired": "driver acknowledgement of a finite standing head pose plus application-observed stereo eye transforms"
+    "qualificationRequired": "driver acknowledgement of a finite standing head pose, application-observed stereo eye transforms, and exact passive left/right controller roles with valid finite poses and 100 neutral legacy input samples"
   }
 }

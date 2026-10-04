@@ -3,11 +3,13 @@
 #include <openvr.h>
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -49,10 +51,116 @@ bool IsFiniteEyeTransform(const vr::HmdMatrix34_t& transform)
     return true;
 }
 
+bool ValidPose(const vr::TrackedDevicePose_t& pose)
+{
+    if (!pose.bDeviceIsConnected || !pose.bPoseIsValid ||
+        pose.eTrackingResult != vr::TrackingResult_Running_OK ||
+        !IsFiniteEyeTransform(pose.mDeviceToAbsoluteTracking)) { return false; }
+    for (int i = 0; i < 3; ++i) {
+        if (!std::isfinite(pose.vVelocity.v[i]) || !std::isfinite(pose.vAngularVelocity.v[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool NeutralState(const vr::VRControllerState_t& state)
+{
+    if (state.ulButtonPressed != 0 || state.ulButtonTouched != 0) { return false; }
+    for (const auto& axis : state.rAxis) {
+        if (!std::isfinite(axis.x) || !std::isfinite(axis.y) || axis.x != 0.0F || axis.y != 0.0F) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct ControllerCheck {
+    vr::TrackedDeviceIndex_t left{vr::k_unTrackedDeviceIndexInvalid};
+    vr::TrackedDeviceIndex_t right{vr::k_unTrackedDeviceIndexInvalid};
+    std::array<std::uint32_t, 2> packets{};
+    unsigned samples{0};
+    unsigned inputEvents{0};
+    bool valid{false};
+};
+
+ControllerCheck CheckControllers(vr::IVRSystem* system)
+{
+    ControllerCheck result{};
+    result.left = system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
+    result.right = system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
+    const std::array indices{result.left, result.right};
+    if (result.left == result.right || !vr::VRCompositor()) { return result; }
+    for (const auto index : indices) {
+        if (index >= vr::k_unMaxTrackedDeviceCount || index == vr::k_unTrackedDeviceIndex_Hmd) {
+            return result;
+        }
+    }
+    for (std::size_t hand = 0; hand < indices.size(); ++hand) {
+        std::array<char, 128> serial{}, trackingSystem{};
+        vr::ETrackedPropertyError propertyError = vr::TrackedProp_Success;
+        const auto serialSize = system->GetStringTrackedDeviceProperty(indices[hand],
+            vr::Prop_SerialNumber_String, serial.data(), static_cast<std::uint32_t>(serial.size()), &propertyError);
+        const auto expected = hand == 0 ? "CSX-NULL-CONTROLLER-LEFT-1" : "CSX-NULL-CONTROLLER-RIGHT-1";
+        if (propertyError != vr::TrackedProp_Success || serialSize > serial.size() ||
+            std::string(serial.data()) != expected) { return result; }
+        const auto trackingSize = system->GetStringTrackedDeviceProperty(indices[hand],
+            vr::Prop_TrackingSystemName_String, trackingSystem.data(),
+            static_cast<std::uint32_t>(trackingSystem.size()), &propertyError);
+        if (propertyError != vr::TrackedProp_Success || trackingSize > trackingSystem.size() ||
+            std::string(trackingSystem.data()) != "codex_head_pose") { return result; }
+    }
+    std::array<vr::TrackedDevicePose_t, vr::k_unMaxTrackedDeviceCount> game{}, render{}, standing{};
+    // Observe a stable neutral pair for two seconds, including the compositor
+    // arrays consumed by VR Tools. One good registration snapshot is insufficient.
+    for (unsigned sample = 0; sample < 100; ++sample) {
+        if (system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand) != result.left ||
+            system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand) != result.right ||
+            vr::VRCompositor()->GetLastPoses(render.data(), static_cast<std::uint32_t>(render.size()),
+                game.data(), static_cast<std::uint32_t>(game.size())) != vr::VRCompositorError_None) {
+            return result;
+        }
+        system->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0F,
+            standing.data(), static_cast<std::uint32_t>(standing.size()));
+        for (std::size_t hand = 0; hand < indices.size(); ++hand) {
+            const auto index = indices[hand];
+            vr::VRControllerState_t state{};
+            const auto role = hand == 0 ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_RightHand;
+            if (system->GetTrackedDeviceClass(index) != vr::TrackedDeviceClass_Controller ||
+                system->GetControllerRoleForTrackedDeviceIndex(index) != role ||
+                !ValidPose(standing[index]) || !ValidPose(game[index]) || !ValidPose(render[index]) ||
+                !system->GetControllerState(index, &state, sizeof(state)) || !NeutralState(state)) {
+                return result;
+            }
+            result.packets[hand] = state.unPacketNum;
+        }
+        vr::VREvent_t event{};
+        unsigned drained = 0;
+        while (drained < 256 && system->PollNextEvent(&event, sizeof(event))) {
+            ++drained;
+            if ((event.trackedDeviceIndex == result.left || event.trackedDeviceIndex == result.right) &&
+                (event.eventType == vr::VREvent_ButtonPress || event.eventType == vr::VREvent_ButtonUnpress ||
+                 event.eventType == vr::VREvent_ButtonTouch || event.eventType == vr::VREvent_ButtonUntouch)) {
+                ++result.inputEvents;
+            }
+        }
+        if (drained == 256 || result.inputEvents != 0) { return result; }
+        ++result.samples;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    result.valid = true;
+    return result;
+}
+
 }  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    const auto requireControllers = argc == 2 && std::string(argv[1]) == "--require-controllers";
+    if (argc != 1 && !requireControllers) {
+        std::cout << "{\"ok\":false,\"state\":\"invalid-arguments\"}\n";
+        return 4;
+    }
     vr::EVRInitError error = vr::VRInitError_None;
     auto* system = vr::VR_Init(&error, vr::VRApplication_Background);
     if (error != vr::VRInitError_None || !system) {
@@ -84,9 +192,13 @@ int main()
     const auto stereoValid = IsFiniteEyeTransform(leftEye) && IsFiniteEyeTransform(rightEye) &&
         eyeSeparation >= 0.01 && eyeSeparation <= 0.20 && renderWidth > 0 && renderHeight > 0 &&
         runtimePathAvailable && requiredRuntimePath > 1 && requiredRuntimePath <= runtimePath.size();
+    const auto controllers = requireControllers ? CheckControllers(system) : ControllerCheck{};
+    const auto qualified = stereoValid && (!requireControllers ||
+        (ValidPose(standing[vr::k_unTrackedDeviceIndex_Hmd]) && controllers.valid));
 
     std::cout << std::fixed << std::setprecision(6);
-    std::cout << "{\"ok\":true,\"state\":\"pose-observed\",\"hmdIndex\":0,";
+    std::cout << "{\"ok\":" << (qualified ? "true" : "false")
+              << ",\"state\":\"pose-observed\",\"hmdIndex\":0,";
     PrintPose("standing", standing[vr::k_unTrackedDeviceIndex_Hmd]);
     std::cout << ',';
     PrintPose("raw", raw[vr::k_unTrackedDeviceIndex_Hmd]);
@@ -97,7 +209,12 @@ int main()
     std::cout << "\"eyeSeparationMeters\":" << eyeSeparation << ',';
     std::cout << "\"recommendedRenderTarget\":[" << renderWidth << ',' << renderHeight << "]},";
     std::cout << "\"runtimePath\":\"" << JsonEscape(runtimePath.data()) << "\"";
+    std::cout << ",\"controllers\":{\"required\":" << (requireControllers ? "true" : "false")
+              << ",\"valid\":" << (controllers.valid ? "true" : "false")
+              << ",\"leftIndex\":" << controllers.left << ",\"rightIndex\":" << controllers.right
+              << ",\"neutralSamples\":" << controllers.samples << ",\"inputEvents\":" << controllers.inputEvents
+              << ",\"packetNumbers\":[" << controllers.packets[0] << ',' << controllers.packets[1] << "]}";
     std::cout << "}\n";
     vr::VR_Shutdown();
-    return stereoValid ? 0 : 3;
+    return qualified ? 0 : 3;
 }

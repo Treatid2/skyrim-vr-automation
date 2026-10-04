@@ -36,6 +36,10 @@ param(
 
     [string]$PoseProbePath,
 
+    [string]$ExpectedPackageProvenanceSha256,
+
+    [string]$SteamVRRoot = 'C:\Program Files (x86)\Steam\steamapps\common\SteamVR',
+
     [string]$VRPathRegPath = 'C:\Program Files (x86)\Steam\steamapps\common\SteamVR\bin\win64\vrpathreg.exe',
 
     [string]$OpenVRPathsPath = $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'openvr\openvrpaths.vrpath' } else { $null }),
@@ -46,6 +50,8 @@ param(
     [int]$InstallLockTimeoutMilliseconds = 5000,
 
     [switch]$SkipOpenVRProbe,
+
+    [switch]$RequireControllers,
     [switch]$Upgrade,
 
     [Parameter(DontShow)]
@@ -63,6 +69,7 @@ $script:PoseMagic = 0x48505343
 $script:PoseVersion = 2
 $script:PoseSize = 128
 $script:InstallControl = $null
+. (Join-Path $PSScriptRoot 'DriverPackageAuthority.ps1')
 
 if (-not ('SkyrimVRAutomation.Native.SharedPoseAtomics' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -348,14 +355,8 @@ function Get-WriterMutexName {
 }
 
 function Test-DriverIdentity([uint32]$CreatorPid, [uint64]$DriverStartedFileTimeUtc) {
-    if ($CreatorPid -eq 0 -or $DriverStartedFileTimeUtc -eq 0) { return $false }
-    try {
-        $process = Get-Process -Id $CreatorPid -ErrorAction Stop
-        $processStart = [uint64]$process.StartTime.ToUniversalTime().ToFileTimeUtc()
-        $now = [uint64][DateTime]::UtcNow.AddSeconds(5).ToFileTimeUtc()
-        return $processStart -le $DriverStartedFileTimeUtc -and $DriverStartedFileTimeUtc -le $now
-    }
-    catch { return $false }
+    $script:LastCreatorAuthority = Get-HeadPoseCreatorAuthority -CreatorPid $CreatorPid -DriverStartedFileTimeUtc $DriverStartedFileTimeUtc -SteamVRRoot $SteamVRRoot -DriverRoot $InstallRoot
+    return [bool]$script:LastCreatorAuthority.verified
 }
 
 function Read-PoseState {
@@ -399,6 +400,7 @@ function Read-PoseState {
                 $state['stable'] = $true
                 $state['protocolValid'] = $state.magic -eq $script:PoseMagic -and $state.version -eq $script:PoseVersion -and $state.size -eq $script:PoseSize
                 $state['driverIdentityVerified'] = Test-DriverIdentity -CreatorPid $state.driverCreatorPid -DriverStartedFileTimeUtc $state.driverStartedFileTimeUtc
+                $state['creatorAuthority'] = $script:LastCreatorAuthority
                 $state['acknowledged'] = $state.requestedSequence -gt 0 -and $state.appliedSequence -eq $state.requestedSequence -and $state.writerNonce -ne 0 -and $state.acknowledgedWriterNonce -eq $state.writerNonce -and $state.status -eq 1
                 $state['eyeHeightQualified'] = $state.eyeHeightMeters -ge $MinimumEyeHeightMeters -and $state.eyeHeightMeters -le $MaximumEyeHeightMeters
                 $state['qualified'] = $state.protocolValid -and $state.driverIdentityVerified -and $state.driverInstanceNonce -ne 0 -and $state.acknowledged -and $state.eyeHeightQualified -and $state.enabled
@@ -511,24 +513,57 @@ function Set-PoseState {
     }
 }
 
+function Test-PassiveControllerProbeObservation($Payload) {
+    try {
+        $pair = $Payload.controllers
+        if ($pair.required -isnot [bool] -or -not $pair.required -or
+            $pair.valid -isnot [bool] -or -not $pair.valid) { return $false }
+        foreach ($value in @($pair.leftIndex, $pair.rightIndex, $pair.neutralSamples, $pair.inputEvents)) {
+            if ($value -isnot [int] -and $value -isnot [long] -and $value -isnot [uint32]) { return $false }
+        }
+        # Matches the pinned OpenVR tracked-device array; index zero is the HMD.
+        return $pair.leftIndex -gt 0 -and $pair.leftIndex -lt 64 -and
+            $pair.rightIndex -gt 0 -and $pair.rightIndex -lt 64 -and
+            $pair.leftIndex -ne $pair.rightIndex -and
+            $pair.neutralSamples -eq 100 -and $pair.inputEvents -eq 0
+    }
+    catch { return $false }
+}
+
 function Invoke-PoseProbe {
+    param([Parameter(Mandatory)]$PreProbePose)
     $resolvedProbe = if (-not [string]::IsNullOrWhiteSpace($PoseProbePath)) { $PoseProbePath } elseif (-not [string]::IsNullOrWhiteSpace($InstallRoot)) { Join-Path $InstallRoot 'tools\csx_openvr_pose_probe.exe' } else { $null }
     if ([string]::IsNullOrWhiteSpace($resolvedProbe) -or -not (Test-Path -LiteralPath $resolvedProbe -PathType Leaf)) {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; probePath = $resolvedProbe; error = 'The independent OpenVR pose probe is not installed.' }
     }
     try {
+        $bundledProvenance = Join-Path $PSScriptRoot '..\..\drivers\codex_head_pose\build-provenance.json'
+        $packageAuthority = Get-HeadPosePackageAuthority -Root $InstallRoot -RegistrationPath $OpenVRPathsPath -BundledProvenancePath $bundledProvenance -ExpectedProvenanceSha256 $ExpectedPackageProvenanceSha256
+        if (-not $packageAuthority.verified) { throw "Package qualification refused before probe execution: $($packageAuthority.errors -join '; ')" }
+        $continuityBefore = New-HeadPoseContinuityIdentity -Pose $PreProbePose -PackageAuthority $packageAuthority
+        if ((Get-HeadPoseCanonicalPath $resolvedProbe) -ne (Get-HeadPoseCanonicalPath (Join-Path $InstallRoot 'tools\csx_openvr_pose_probe.exe'))) { throw 'PoseProbePath may identify only the exact owned package probe; use an explicitly digest-authorized custom package instead.' }
         $boundedRunner = Join-Path (Split-Path -Parent $PSScriptRoot) 'process-control\Invoke-BoundedProcess.ps1'
         if (-not (Test-Path -LiteralPath $boundedRunner -PathType Leaf)) { throw "The bounded process controller is unavailable: $boundedRunner" }
-        $run = & $boundedRunner -FilePath $resolvedProbe -WorkingDirectory (Split-Path -Parent $resolvedProbe) -MaxAttempts 1 -TimeoutSeconds $ProbeTimeoutSeconds -RetryPatterns @() -EvidenceDirectory $EvidenceDirectory -NoExit -Compact | ConvertFrom-Json
+        $probeArguments = @()
+        if ($RequireControllers) { $probeArguments += '--require-controllers' }
+        $run = & $boundedRunner -FilePath $resolvedProbe -ArgumentList $probeArguments -WorkingDirectory (Split-Path -Parent $resolvedProbe) -MaxAttempts 1 -TimeoutSeconds $ProbeTimeoutSeconds -RetryPatterns @() -EvidenceDirectory $EvidenceDirectory -NoExit -Compact | ConvertFrom-Json
         if (-not $run.ok -or @($run.attempts).Count -ne 1) {
             return [pscustomobject][ordered]@{ available = $true; qualified = $false; probePath = $resolvedProbe; probeSha256 = Get-HashOrNull $resolvedProbe; boundedRun = $run; error = 'The independent OpenVR pose probe did not complete successfully within its bounded budget.' }
         }
         $attempt = @($run.attempts)[0]
         $payload = [string]$attempt.stdout | ConvertFrom-Json -ErrorAction Stop
+        $afterAuthority = Get-HeadPosePackageAuthority -Root $InstallRoot -RegistrationPath $OpenVRPathsPath -BundledProvenancePath $bundledProvenance -ExpectedProvenanceSha256 $ExpectedPackageProvenanceSha256
+        if (-not $afterAuthority.verified -or $afterAuthority.markerSha256 -ne $packageAuthority.markerSha256) { throw 'Package identity changed during the independent probe.' }
+        $afterPose = Read-PoseState
+        $continuityAfter = New-HeadPoseContinuityIdentity -Pose $afterPose -PackageAuthority $afterAuthority
+        Assert-HeadPoseContinuity -Before $continuityBefore -After $continuityAfter
         $stereoQualified = $payload.stereo -and $payload.stereo.valid -and [double]$payload.stereo.eyeSeparationMeters -ge 0.01 -and [double]$payload.stereo.eyeSeparationMeters -le 0.20
+        $controllersQualified = Test-PassiveControllerProbeObservation $payload
         return [pscustomobject][ordered]@{
             available = $true
-            qualified = $run.ok -and $payload.ok -and $payload.standing.connected -and $payload.standing.valid -and [double]$payload.standing.position[1] -ge $MinimumEyeHeightMeters -and [double]$payload.standing.position[1] -le $MaximumEyeHeightMeters -and $stereoQualified
+            qualified = $run.ok -and $payload.ok -and $payload.standing.connected -and $payload.standing.valid -and [double]$payload.standing.position[1] -ge $MinimumEyeHeightMeters -and [double]$payload.standing.position[1] -le $MaximumEyeHeightMeters -and $stereoQualified -and (-not $RequireControllers -or $controllersQualified)
+            controllersRequired = [bool]$RequireControllers
+            controllersQualified = $controllersQualified
             probePath = [IO.Path]::GetFullPath($resolvedProbe)
             probeSha256 = Get-HashOrNull $resolvedProbe
             driverDllPath = $(if ($InstallRoot) { [IO.Path]::GetFullPath((Join-Path $InstallRoot 'bin\win64\driver_codex_head_pose.dll')) } else { $null })
@@ -537,6 +572,9 @@ function Invoke-PoseProbe {
             openVrPathsSha256 = $(if ($OpenVRPathsPath) { Get-HashOrNull $OpenVRPathsPath } else { $null })
             boundedRun = $run
             observation = $payload
+            packageAuthority = $afterAuthority
+            providerContinuity = $continuityAfter
+            poseAfterProbe = $afterPose
         }
     }
     catch {
@@ -562,6 +600,18 @@ function Install-DriverCore {
     $source = [IO.Path]::GetFullPath($DriverPackagePath)
     foreach ($relative in @('driver.vrdrivermanifest', 'bin\win64\driver_codex_head_pose.dll', 'resources\settings\default.vrsettings', 'tools\csx_openvr_pose_probe.exe', 'tools\openvr_api.dll', 'licenses\OpenVR-LICENSE.txt')) {
         if (-not (Test-Path -LiteralPath (Join-Path $source $relative) -PathType Leaf)) { throw "Driver package is missing $relative" }
+    }
+    $inputProfileRelativePath = 'resources\input\passive_controller_profile.json'
+    $defaultSettings = Get-Content -LiteralPath (Join-Path $source 'resources\settings\default.vrsettings') -Raw | ConvertFrom-Json -AsHashtable
+    $hasControllerContract = $defaultSettings['driver_codex_head_pose'].ContainsKey('enableControllers')
+    if ($hasControllerContract -and -not (Test-Path -LiteralPath (Join-Path $source $inputProfileRelativePath) -PathType Leaf)) {
+        throw "Controller-capable driver package is missing $inputProfileRelativePath"
+    }
+    if (Test-Path -LiteralPath (Join-Path $source $inputProfileRelativePath) -PathType Leaf) {
+        $inputProfile = Get-Content -LiteralPath (Join-Path $source $inputProfileRelativePath) -Raw | ConvertFrom-Json
+        if ($inputProfile.jsonid -cne 'input_profile' -or $inputProfile.driver_name -cne 'codex_head_pose' -or $inputProfile.device_class -cne 'TrackedDeviceClass_Controller') {
+            throw 'The passive controller input profile does not identify the expected driver and Controller class.'
+        }
     }
     $target = [IO.Path]::GetFullPath($InstallRoot)
     $previousInstall = $null
@@ -615,6 +665,10 @@ function Install-DriverCore {
             manifestSha256 = Get-HashOrNull (Join-Path $source 'driver.vrdrivermanifest')
             dllSha256 = Get-HashOrNull (Join-Path $source 'bin\win64\driver_codex_head_pose.dll')
             poseProbeSha256 = Get-HashOrNull (Join-Path $source 'tools\csx_openvr_pose_probe.exe')
+            defaultSettingsSha256 = Get-HashOrNull (Join-Path $source 'resources\settings\default.vrsettings')
+            passiveControllerInputProfileSha256 = Get-HashOrNull (Join-Path $source $inputProfileRelativePath)
+            openVrApiSha256 = Get-HashOrNull (Join-Path $source 'tools\openvr_api.dll')
+            buildProvenanceSha256 = Get-HashOrNull (Join-Path $source 'build-provenance.json')
         }
         createdUtc = [DateTime]::UtcNow.ToString('o')
     }
@@ -622,12 +676,19 @@ function Install-DriverCore {
     try {
         Copy-Item -LiteralPath $source -Destination $staging -Recurse
         $marker = [ordered]@{
-            schemaVersion = 1
+            schemaVersion = 3
             driverName = 'codex_head_pose'
+            installRoot = $target
+            transactionId = $transactionId
             installedUtc = [DateTime]::UtcNow.ToString('o')
             sourcePackage = $source
             dllSha256 = Get-HashOrNull (Join-Path $staging 'bin\win64\driver_codex_head_pose.dll')
             poseProbeSha256 = Get-HashOrNull (Join-Path $staging 'tools\csx_openvr_pose_probe.exe')
+            defaultSettingsSha256 = Get-HashOrNull (Join-Path $staging 'resources\settings\default.vrsettings')
+            passiveControllerInputProfileSha256 = Get-HashOrNull (Join-Path $staging $inputProfileRelativePath)
+            manifestSha256 = Get-HashOrNull (Join-Path $staging 'driver.vrdrivermanifest')
+            openVrApiSha256 = Get-HashOrNull (Join-Path $staging 'tools\openvr_api.dll')
+            buildProvenanceSha256 = Get-HashOrNull (Join-Path $staging 'build-provenance.json')
         }
         Write-JsonAtomic -Path (Join-Path $staging '.csx-vr-automation-driver.json') -Value $marker
         $journal.phase = 'replacement-command-uncommitted'
@@ -654,7 +715,12 @@ function Install-DriverCore {
         $installedManifestSha256 = Get-HashOrNull (Join-Path $target 'driver.vrdrivermanifest')
         $installedDllSha256 = Get-HashOrNull (Join-Path $target 'bin\win64\driver_codex_head_pose.dll')
         $installedPoseProbeSha256 = Get-HashOrNull (Join-Path $target 'tools\csx_openvr_pose_probe.exe')
-        if ($installedManifestSha256 -ne [string]$journal.sourceProvenance.manifestSha256 -or $installedDllSha256 -ne [string]$journal.sourceProvenance.dllSha256 -or $installedPoseProbeSha256 -ne [string]$journal.sourceProvenance.poseProbeSha256) {
+        $installedDefaultSettingsSha256 = Get-HashOrNull (Join-Path $target 'resources\settings\default.vrsettings')
+        $installedInputProfileSha256 = Get-HashOrNull (Join-Path $target $inputProfileRelativePath)
+        foreach ($member in @('openVrApiSha256', 'buildProvenanceSha256')) {
+            if ($marker[$member] -ne $journal.sourceProvenance[$member]) { throw 'Installed runtime/provenance hash does not match the source package.' }
+        }
+        if ($installedManifestSha256 -ne $journal.sourceProvenance.manifestSha256 -or $installedDllSha256 -ne $journal.sourceProvenance.dllSha256 -or $installedPoseProbeSha256 -ne $journal.sourceProvenance.poseProbeSha256 -or $installedDefaultSettingsSha256 -ne $journal.sourceProvenance.defaultSettingsSha256 -or $installedInputProfileSha256 -ne $journal.sourceProvenance.passiveControllerInputProfileSha256) {
             throw 'Installed driver provenance does not match the receipt-bound source package.'
         }
         $receipt = [ordered]@{
@@ -665,6 +731,11 @@ function Install-DriverCore {
             manifestSha256 = $installedManifestSha256
             dllSha256 = $installedDllSha256
             poseProbeSha256 = $installedPoseProbeSha256
+            defaultSettingsSha256 = $installedDefaultSettingsSha256
+            passiveControllerInputProfileSha256 = $installedInputProfileSha256
+            openVrApiSha256 = $marker.openVrApiSha256
+            buildProvenanceSha256 = $marker.buildProvenanceSha256
+            markerSha256 = Get-HashOrNull (Join-Path $target '.csx-vr-automation-driver.json')
             previousInstallRoot = $previousInstall
             openVrPathsPath = $registration.openVrPathsPath
             openVrPathsSha256 = $registration.openVrPathsSha256
@@ -685,6 +756,7 @@ function Install-DriverCore {
         $journal.phase = 'committed'
         $journal.committedUtc = [DateTime]::UtcNow.ToString('o')
         $journal.installedDllSha256 = $receipt.dllSha256
+        $journal.installedMarkerSha256 = $receipt.markerSha256
         Write-InstallJournal -Journal $journal -Control $script:InstallControl
         return New-Result -Ok $true -State $(if ($previousInstall) { 'driver-upgraded' } else { 'driver-installed' }) -Data $receipt
     }
@@ -751,12 +823,18 @@ try {
         }
         'qualify' {
             $pose = Read-PoseState
-            $applicationPose = if ($SkipOpenVRProbe) { [pscustomobject][ordered]@{ available = $false; qualified = $false; skipped = $true; error = 'Independent stereo qualification was explicitly skipped.' } } else { Invoke-PoseProbe }
+            $applicationPose = if ($SkipOpenVRProbe) { [pscustomobject][ordered]@{ available = $false; qualified = $false; skipped = $true; error = 'Independent stereo qualification was explicitly skipped.' } } elseif (-not $pose.qualified) { [pscustomobject]@{ available = $false; qualified = $false; error = 'Exact provider creator/pose authority is not qualified; probe was not executed.' } } else { Invoke-PoseProbe -PreProbePose $pose }
+            if ($applicationPose.qualified) {
+                $pose = $applicationPose.poseAfterProbe
+            }
             $qualified = [bool]$pose.qualified -and [bool]$applicationPose.qualified
             $qualificationErrors = @()
             if (-not $pose.qualified) { $qualificationErrors += 'The running provider does not expose an acknowledged standing head pose within the configured height range.' }
-            if (-not $applicationPose.qualified) { $qualificationErrors += 'The independent OpenVR client did not observe a valid standing HMD pose within the configured height range.' }
-            $result = New-Result -Ok $qualified -State $(if ($qualified) { 'head-pose-qualified' } else { 'head-pose-not-qualified' }) -Data @{ mapName = $MapName; pose = $pose; applicationPose = $applicationPose; minimumEyeHeightMeters = $MinimumEyeHeightMeters; maximumEyeHeightMeters = $MaximumEyeHeightMeters } -Errors $qualificationErrors
+            # Aggregate probe failure can be controller-only, stereo-only,
+            # skipped, or an execution failure; it is not proof of a bad HMD.
+            if (-not $applicationPose.qualified) { $qualificationErrors += 'The independent OpenVR application pose qualification did not succeed; inspect the retained probe result for the failed component or execution error.' }
+            if ($RequireControllers -and -not $applicationPose.qualified) { $qualificationErrors += 'The required passive left/right controller pair was not independently qualified; skipping the probe cannot satisfy this gate.' }
+            $result = New-Result -Ok $qualified -State $(if ($qualified) { 'head-pose-qualified' } else { 'head-pose-not-qualified' }) -Data @{ mapName = $MapName; pose = $pose; applicationPose = $applicationPose; controllersRequired = [bool]$RequireControllers; minimumEyeHeightMeters = $MinimumEyeHeightMeters; maximumEyeHeightMeters = $MaximumEyeHeightMeters } -Errors $qualificationErrors
         }
         'set' { $result = Set-PoseState }
         'install' { $result = Install-Driver }
