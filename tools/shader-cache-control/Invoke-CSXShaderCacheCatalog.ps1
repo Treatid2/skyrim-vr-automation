@@ -1156,9 +1156,14 @@ function Get-SameTaskResume($Binding, [string]$CurrentEvidence) {
     if (Test-SamePath $priorEvidence $CurrentEvidence) { throw 'Same-task resume requires a new evidence directory, not its completed source.' }
     if ((Get-FileHash -LiteralPath $completionPath -Algorithm SHA256).Hash -cne $expected) { throw 'Same-task completion SHA-256 mismatch.' }
     $completion = Get-Content -LiteralPath $completionPath -Raw | ConvertFrom-Json -Depth 40
+    if (-not (Test-Property $completion 'planSha256')) {
+        throw 'Same-task resume requires immutable finalized plan SHA-256; legacy completions are ineligible.'
+    }
+    $expectedPlanHash = Assert-Hash ([string]$completion.planSha256) 'completion.planSha256'
     $priorPlanPath = Join-Path $priorEvidence 'shader-cache-task.plan.json'
     Assert-CSXNoCacheReparsePoint -Path $priorPlanPath -Purpose 'Same-task plan'
     $planHash = (Get-FileHash -LiteralPath $priorPlanPath -Algorithm SHA256).Hash
+    if ($planHash -ine $expectedPlanHash) { throw 'Same-task finalized plan SHA-256 mismatch before plan parsing or cache mutation.' }
     $priorPlan = Get-Content -LiteralPath $priorPlanPath -Raw | ConvertFrom-Json -Depth 40
     if ([string]$completion.state -cne 'complete' -or [string]$priorPlan.state -cne 'restored' -or
         -not (Test-SamePath ([string]$completion.planPath) $priorPlanPath) -or
@@ -1477,6 +1482,7 @@ function Complete-TaskCache($Storage) {
         completedUtc = [DateTime]::UtcNow.ToString('o')
         planPath = $planPath
         cacheBinding = $cacheBinding
+        planSha256 = (Get-FileHash -LiteralPath $planPath -Algorithm SHA256).Hash
         workingTree = [pscustomobject][ordered]@{ status = $WorkingSetStatus; inventory = $currentBeforeRestore.data; materializedFiles = $materializedEntries.Count; unchangedPreparedFailure = [bool]$unchangedPreparedFailure; preservedPath = [string]$restore.data.displacedPath }
         restoredTreeSha256 = [string]$restore.data.baseline.treeSha256
         promoted = $promoted

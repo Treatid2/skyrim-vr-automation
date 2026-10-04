@@ -835,6 +835,48 @@ try {
     $r = Invoke-Catalog $bad
     Assert-Test (-not $r.ok -and $r.errors[0] -match 'only to prepare') 'resume cannot relax general catalog selection'
     $oldCompletionText = Get-Content -LiteralPath $resumeArgs.ResumeCompletionPath -Raw
+    $historicalPlanPath = Join-Path $overwriteEvidence 'shader-cache-task.plan.json'
+    $historicalPlanBytes = [IO.File]::ReadAllBytes($historicalPlanPath)
+    $historicalPlanSha = (Get-FileHash -LiteralPath $historicalPlanPath -Algorithm SHA256).Hash
+    $historicalCompletion = $oldCompletionText | ConvertFrom-Json -Depth 40
+    Assert-Test ($historicalCompletion.planSha256 -ceq $historicalPlanSha) 'immutable completion pins finalized restored plan bytes including exact compatibility request'
+    foreach ($edit in @(
+        @{request='shaderSourceSha256';argument='ShaderSourceSha256';value=('F'*64)},
+        @{request='buildId';argument='BuildId';value='changed-build'},
+        @{request='featureSetSha256';argument='FeatureSetSha256';value=('F'*64)},
+        @{request='presetSha256';argument='PresetSha256';value=('F'*64)},
+        @{request='tags';argument='Tags';value=@('changed-tag')}
+    )) {
+        try {
+            $editedPlan = [Text.Encoding]::UTF8.GetString($historicalPlanBytes) | ConvertFrom-Json -Depth 40
+            $editedPlan.request | Add-Member -NotePropertyName $edit.request -NotePropertyValue $edit.value -Force
+            [IO.File]::WriteAllText($historicalPlanPath, ($editedPlan | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+            $bad = @{} + $resumeArgs
+            $bad[$edit.argument] = $edit.value
+            $bad.WhatIf = $false
+            $bad.EvidenceDirectory = Join-Path $resolvedTestRoot ('edited-history-'+$edit.request)
+            $r = Invoke-Catalog $bad
+            # Build ID has an earlier exact currently-enabled plugin guard.
+            # Preserve that stronger refusal; don't change plugin provenance
+            # merely to force execution through the later historical-plan gate.
+            $pinRefusal = $r.errors[0] -match 'finalized plan SHA-256 mismatch'
+            $earlierBuildRefusal = $edit.request -eq 'buildId' -and $r.errors[0] -match 'winning Community Shaders provider .* has build'
+            Assert-Test (-not $r.ok -and ($pinRefusal -or $earlierBuildRefusal)) "pinned original completion refuses edited historical request: $($edit.request)"
+            Assert-Test (-not (Test-Path -LiteralPath $bad.EvidenceDirectory)) "edited request refused before new evidence/snapshot/seed: $($edit.request)"
+            Assert-Test ((Get-FileHash -LiteralPath $resumeArgs.ResumeCompletionPath -Algorithm SHA256).Hash -ceq $resumeArgs.ExpectedResumeCompletionSha256) "edited plan leaves original completion bytes pinned: $($edit.request)"
+        } finally { [IO.File]::WriteAllBytes($historicalPlanPath, $historicalPlanBytes) }
+    }
+    try {
+        $legacy = $oldCompletionText | ConvertFrom-Json -Depth 40
+        $legacy.PSObject.Properties.Remove('planSha256')
+        [IO.File]::WriteAllText($resumeArgs.ResumeCompletionPath, ($legacy | ConvertTo-Json -Depth 40), [Text.UTF8Encoding]::new($false))
+        $bad = @{} + $resumeArgs
+        $bad.ExpectedResumeCompletionSha256 = (Get-FileHash -LiteralPath $resumeArgs.ResumeCompletionPath -Algorithm SHA256).Hash
+        $bad.WhatIf = $false; $bad.EvidenceDirectory = Join-Path $resolvedTestRoot 'legacy-history'
+        $r = Invoke-Catalog $bad
+        Assert-Test (-not $r.ok -and $r.errors[0] -match 'legacy completions are ineligible') 'externally pinned legacy completion cannot authenticate current plan bytes'
+        Assert-Test (-not (Test-Path -LiteralPath $bad.EvidenceDirectory)) 'legacy refusal precedes snapshot/seed/evidence creation'
+    } finally { [IO.File]::WriteAllText($resumeArgs.ResumeCompletionPath, $oldCompletionText, [Text.UTF8Encoding]::new($false)) }
     foreach ($mutation in @('status', 'state', 'workspaceId', 'ownershipId', 'profileSha256', 'artifactSha256', 'preservedPath', 'files', 'bytes')) {
         $changed = $oldCompletionText | ConvertFrom-Json -Depth 40
         switch ($mutation) {
@@ -891,6 +933,8 @@ try {
     Assert-Test ((Test-Path -LiteralPath (Join-Path $overwriteCache 'later-area.bin')) -and $warmResume.data.task.seed.ok) 'resume seeds the preserved working cache through the existing attributable transaction'
     $repeatWarm = Invoke-Catalog $resumeArgs
     Assert-Test ($repeatWarm.ok -and $repeatWarm.state -eq 'already-prepared') 'same exact resume proof is idempotent'
+    Assert-Test ($warmResume.data.task.resume.planSha256 -ceq $historicalPlanSha -and $repeatWarm.data.task.resume.planSha256 -ceq $historicalPlanSha -and
+        (Get-FileHash -LiteralPath $historicalPlanPath -Algorithm SHA256).Hash -ceq $historicalPlanSha) 'first resume and prepared retry preserve immutable historical finalized-plan digest'
     $omitProof = @{} + $resumeArgs; $omitProof.Remove('ResumeCompletionPath'); $omitProof.Remove('ExpectedResumeCompletionSha256')
     $r = Invoke-Catalog $omitProof
     Assert-Test (-not $r.ok -and $r.errors[0] -match 'immutable resume proof') 'prepared resume cannot be silently reinterpreted as default selection'
