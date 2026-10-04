@@ -330,6 +330,38 @@ event-byte estimate is smaller. A service ceiling is still an absolute limit.
 Do not reduce a workload silently: the experiment owner must explicitly select
 and justify smaller estimates, and saturation remains incomplete evidence.
 
+An explicit owner-delivered source/PDB allocation recipe may qualify enlarged
+catalogues without extrapolating defaults. Pass all five parameters together:
+`-AllocationRecipePath`, `-ExpectedAllocationRecipeSha256`,
+`-AllocationLayoutPath`, `-ProducerBuildManifestPath`, and
+`-ExpectedProducerBuildManifestSha256`. Keep adjacent
+`RenderMapAllocationRecipe.ps1` with the planner. JSON evidence is bounded to
+256 KiB each and parsed from the same bytes as its SHA256. The caller pins the
+trusted recipe and native manifest; the recipe pins the paired PDB-layout
+receipt. Partial selection, malformed evidence or any identity mismatch fails
+without falling back to default sizing.
+
+The qualifier matches source commit/tree, owner BuildKey, PDB GUID/age and
+paired DLL receipt; the native manifest connects source and DLL hash/size to
+the fresh registry's producerBuildId. BuildKey and native buildId are distinct
+identifiers, not interchangeable. The qualifier checks each catalogue term
+against two paired-PDB record copies plus the source recipe's hash-entry/bool
+budgets, checks the recipe's default accounting against the fresh registry,
+and calculates costs from the actual selected capacities. It retains hashes,
+source/build/PDB provenance and scope in `allocationEvidence`. This is a
+hash-pinned owner derivation, not a new PDB inspection, runtime artifact
+measurement, measured heap/RSS or successful collector allocation/capture.
+
+Optional `-MaxBytes` retains an explicit byte budget such as 67108864. It must
+fit the full headroom-sized workload and remain at or below both the fresh
+registry ceiling and the qualified recipe ceiling. `requiredStorageBytes` and
+`byteBudgetHeadroom` expose the accounting. Without this option, the planner
+selects the calculated required budget. A recipe never raises registry limits:
+the narrower native/recipe bound applies, including the65536 event maximum.
+Native event selection/dependency expansion stays authoritative and receives
+no catalogue-cost discount. Historical registry snapshots do not establish a
+fresh runtime identity; retain a new registry for the actual start.
+
 Use optional `-EventKinds @('draw','resource-flow','eye-submitted')` only for an
 experiment-selected subset. Every name must be distinct and match the retained
 registry's `eventKinds` exactly. Unknown/planned kinds, duplicates or an empty

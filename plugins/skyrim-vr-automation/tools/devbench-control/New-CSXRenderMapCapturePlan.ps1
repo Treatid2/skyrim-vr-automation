@@ -9,6 +9,12 @@ param(
     [Parameter(Mandatory)][string]$OutputPath,
     [ValidateRange(1.0, 10.0)][double]$HeadroomFactor = 2.0,
     [string[]]$EventKinds,
+    [string]$AllocationRecipePath,
+    [string]$ExpectedAllocationRecipeSha256,
+    [string]$AllocationLayoutPath,
+    [string]$ProducerBuildManifestPath,
+    [string]$ExpectedProducerBuildManifestSha256,
+    [ValidateRange(1, [long]::MaxValue)][long]$MaxBytes,
     [ValidateSet('none', 'receipt-hash')][string]$InternalTestFailurePoint = 'none',
     [switch]$NoExit,
     [switch]$Compact
@@ -16,6 +22,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'RenderMapAllocationRecipe.ps1')
 
 function Get-Property($Value, [string]$Name, $Default = $null) {
     if ($null -eq $Value) { return $Default }
@@ -191,6 +198,12 @@ try {
     $defaults = Get-Property $registry 'defaults'
     $limits = Get-Property $registry 'limits'
     if ($null -eq $defaults -or $null -eq $limits) { throw 'Registry result must publish defaults and limits.' }
+    $recipeBinding = $null
+    $recipeFields = @('AllocationRecipePath','ExpectedAllocationRecipeSha256','AllocationLayoutPath','ProducerBuildManifestPath','ExpectedProducerBuildManifestSha256')
+    if (@($recipeFields | Where-Object { $PSBoundParameters.ContainsKey($_) }).Count -gt 0) {
+        if (@($recipeFields | Where-Object { -not $PSBoundParameters.ContainsKey($_) -or [string]::IsNullOrWhiteSpace([string]$PSBoundParameters[$_]) }).Count -gt 0) { throw 'Allocation recipe selection requires all five explicit evidence parameters; no fallback.' }
+        $recipeBinding = Get-RenderMapAllocationRecipe $resolvedRegistry $AllocationRecipePath $ExpectedAllocationRecipeSha256 $AllocationLayoutPath $ProducerBuildManifestPath $ExpectedProducerBuildManifestSha256
+    }
     $requestedEventKinds = $null
     if ($PSBoundParameters.ContainsKey('EventKinds')) {
         $selection = Get-Property $registry 'eventSelection'
@@ -241,17 +254,26 @@ try {
         $desired = Get-ScaledBound $spec.expected $HeadroomFactor "workload bound $($spec.argument)"
         $ceiling = Require-PositiveLong (Get-Property $limits $spec.limit) "registry.limits.$($spec.limit)"
         $selected[$spec.argument] = $desired
+        if ($recipeBinding -and ($spec.argument -like 'max*Observations' -or $spec.argument -eq 'maxEvents')) {
+            $ceiling = [Math]::Min($ceiling, (Require-PositiveLong (Get-Property $recipeBinding.recipe.limits $spec.argument) "recipe.limits.$($spec.argument)"))
+        }
         if ($desired -gt $ceiling) {
             $exceeded.Add([pscustomobject]@{ bound = $spec.argument; desired = $desired; ceiling = $ceiling })
         }
         if ($spec.argument -like 'max*Observations') {
             $defaultCapacity = Require-PositiveLong (Get-Property $defaults $spec.argument) "registry.defaults.$($spec.argument)"
-            if ($desired -gt $defaultCapacity) {
+            if ($desired -gt $defaultCapacity -and -not $recipeBinding) {
                 $unprovenCatalogueBounds.Add([pscustomobject]@{ bound = $spec.argument; desired = $desired; defaultCapacity = $defaultCapacity })
             }
         }
     }
     $fixedCatalogueBytes = Require-PositiveLong (Get-Property $defaults 'fixedCatalogueBytes') 'registry.defaults.fixedCatalogueBytes'
+    if ($recipeBinding) {
+        $catalogueCost = [decimal]$recipeBinding.recipe.baseBytes
+        foreach ($family in $recipeBinding.families.Keys) { $catalogueCost += [decimal]$selected[$family] * [decimal](Get-Property $recipeBinding.recipe.perCapacityBytes $family) }
+        if ($catalogueCost -gt [decimal][long]::MaxValue) { throw 'Recipe catalogue allocation exceeds 64-bit capture accounting.' }
+        $fixedCatalogueBytes = [long]$catalogueCost
+    }
     $eventStorageUnitBytes = Require-PositiveLong (Get-Property $defaults 'eventStorageUnitBytes') 'registry.defaults.eventStorageUnitBytes'
     $eventBytesWithHeadroom = Get-ScaledBound $expectedEventBytes $HeadroomFactor 'workload.expectedEventBytes'
     $requiredEventBytesDecimal = [decimal]$selected['maxEvents'] * [decimal]$eventStorageUnitBytes
@@ -265,9 +287,11 @@ try {
     }
     $desiredBytes = [long]$desiredBytesDecimal
     $maximumBytes = Require-PositiveLong (Get-Property $limits 'maximumBytes') 'registry.limits.maximumBytes'
-    $selected['maxBytes'] = $desiredBytes
-    if ($desiredBytes -gt $maximumBytes) {
-        $exceeded.Add([pscustomobject]@{ bound = 'maxBytes'; desired = $desiredBytes; ceiling = $maximumBytes })
+    if ($recipeBinding) { $maximumBytes = [Math]::Min($maximumBytes, (Require-PositiveLong $recipeBinding.recipe.limits.maxBytes 'recipe.limits.maxBytes')) }
+    $selected['maxBytes'] = if ($PSBoundParameters.ContainsKey('MaxBytes')) { $MaxBytes } else { $desiredBytes }
+    if ($selected['maxBytes'] -lt $desiredBytes) { $exceeded.Add([pscustomobject]@{ bound='maxBytes'; desired=$desiredBytes; ceiling=$selected['maxBytes']; reason='explicit-byte-budget-cannot-fit-workload' }) }
+    if ($selected['maxBytes'] -gt $maximumBytes) {
+        $exceeded.Add([pscustomobject]@{ bound = 'maxBytes'; desired = $selected['maxBytes']; ceiling = $maximumBytes })
     }
 
     $admissible = $exceeded.Count -eq 0 -and $unprovenCatalogueBounds.Count -eq 0
@@ -299,10 +323,13 @@ try {
         headroomFactor = $HeadroomFactor
         requestedEventKinds = $requestedEventKinds
         eventSelectionBasis = if ($null -ne $requestedEventKinds) { 'Exact advertised requested kinds; native dependency expansion/resolved selection must be retained from start response. Selection does not reduce catalogue allocation.' } else { 'Omitted selection retains native all-events default.' }
-        rationale = 'Every count is the stated workload multiplied by explicit headroom. Byte budget is the registry default-catalogue upper bound plus the greater of workload event bytes with headroom and selected events times the native event storage unit. Default catalogue bytes qualify only capacities at or below the published defaults.'
+        rationale = 'Every count is the stated workload multiplied by explicit headroom. Byte requirement is the qualified catalogue allocation plus the greater of workload event bytes with headroom and selected events times the native event unit. An explicit MaxBytes may add budget, never remove required headroom. Without a matched recipe, default catalogue bytes qualify only capacities at or below registry defaults. With a matched owner source/PDB recipe, exact selected capacities determine catalogue cost. Fresh service ceilings always remain binding.'
         saturationPolicy = 'Any capture limit hit makes the evidence run incomplete unless saturation is the declared subject of the experiment.'
         fixedCatalogueBytes = $fixedCatalogueBytes
-        catalogueStorageBasis = 'registry-default-catalogue-upper-bound; no extrapolation to larger capacities'
+        catalogueStorageBasis = if ($recipeBinding) { 'exact-owner-source-and-paired-PDB-allocation-recipe' } else { 'registry-default-catalogue-upper-bound; no extrapolation to larger capacities' }
+        allocationEvidence = if ($recipeBinding) { $recipeBinding.evidence } else { $null }
+        requiredStorageBytes = $desiredBytes
+        byteBudgetHeadroom = [long]$selected['maxBytes'] - $desiredBytes
         eventStorageUnitBytes = $eventStorageUnitBytes
         selectedEventBytes = $eventBytesWithHeadroom
         selectedBounds = [pscustomobject]$selected
