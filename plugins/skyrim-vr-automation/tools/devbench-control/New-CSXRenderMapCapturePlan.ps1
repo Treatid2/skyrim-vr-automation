@@ -9,6 +9,11 @@ param(
     [Parameter(Mandatory)][string]$OutputPath,
     [ValidateRange(1.0, 10.0)][double]$HeadroomFactor = 2.0,
     [string[]]$EventKinds,
+    [object]$Activation,
+    [object]$MaxActivationWaitMs,
+    [object]$ExecutionWithinSelectedGeometry,
+    [string]$InputSchemaPath,
+    [string]$ExpectedInputSchemaSha256,
     [string]$AllocationRecipePath,
     [string]$ExpectedAllocationRecipeSha256,
     [string]$AllocationLayoutPath,
@@ -23,6 +28,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'RenderMapAllocationRecipe.ps1')
+. (Join-Path $PSScriptRoot 'RenderMapStartSelection.ps1')
 
 function Get-Property($Value, [string]$Name, $Default = $null) {
     if ($null -eq $Value) { return $Default }
@@ -223,6 +229,7 @@ try {
         }
         $requestedEventKinds = @($EventKinds)
     }
+    $startSelection = Get-RenderMapStartSelection -BoundParameters $PSBoundParameters -ResolvedRegistry $resolvedRegistry -EventKinds $requestedEventKinds
 
     $expectedDurationMs = Require-PositiveLong (Get-Property $workload 'expectedDurationMs') 'workload.expectedDurationMs'
     $expectedFrames = Require-PositiveLong (Get-Property $workload 'expectedFrames') 'workload.expectedFrames'
@@ -308,6 +315,7 @@ try {
         } + $selected
     } else { $null }
     if ($arguments -and $null -ne $requestedEventKinds) { $arguments['eventKinds'] = $requestedEventKinds }
+    if ($arguments) { foreach ($name in $startSelection.arguments.Keys) { $arguments[$name] = $startSelection.arguments[$name] } }
     $receipt = [pscustomobject][ordered]@{
         schemaVersion = 1
         state = $planState
@@ -322,6 +330,7 @@ try {
         workload = $workload
         headroomFactor = $HeadroomFactor
         requestedEventKinds = $requestedEventKinds
+        startSelection = $startSelection.evidence
         eventSelectionBasis = if ($null -ne $requestedEventKinds) { 'Exact advertised requested kinds; native dependency expansion/resolved selection must be retained from start response. Selection does not reduce catalogue allocation.' } else { 'Omitted selection retains native all-events default.' }
         rationale = 'Every count is the stated workload multiplied by explicit headroom. Byte requirement is the qualified catalogue allocation plus the greater of workload event bytes with headroom and selected events times the native event unit. An explicit MaxBytes may add budget, never remove required headroom. Without a matched recipe, default catalogue bytes qualify only capacities at or below registry defaults. With a matched owner source/PDB recipe, exact selected capacities determine catalogue cost. Fresh service ceilings always remain binding.'
         saturationPolicy = 'Any capture limit hit makes the evidence run incomplete unless saturation is the declared subject of the experiment.'
