@@ -9,7 +9,8 @@ launch Skyrim, build/install a provider, calibrate poses or change bindings.
 The experimental live adapter is source-only until exact native fixture hashes,
 ABI and injected entry-point evidence are reconciled. Offline PASS is not live
 qualification or authority to execute. A live run requires a separately selected
-diagnostic and the mandatory `-Live -PlanPath` interface. It rejects running
+diagnostic and the `-Live -PlanPath -ExpectedPlanSha256` interface. Direct Live
+without an independently selected hash fails before admission. It rejects running
 Skyrim/loader, an existing runtime, non-null baseline ownership and changed pins.
 
 The plan schema is `null-grip-session.1`, diagnostic `fixed-grip-neutral-A-B`,
@@ -64,6 +65,31 @@ inherit the binding; no global/service environment rewrite or Python fallback
 occurs. `-ValidateOnly` verifies this same binding and all plan pins without
 creating evidence or invoking runtime controls. A new live attempt still needs
 its own explicit selection, unique completion job and new evidence root.
+
+Selection is retained across every stage, not merely checked at initial launch.
+The wrapper locks and hashes the proposal and coordinator before executing it.
+The coordinator authenticates Common before loading it, and holds read-only
+handles denying write/delete to the plan, all primary pins and finite dependency
+pins until its stages terminate. Coordinator, Worker and Common each require
+exactly one lifecycle pin. It stages the original plan bytes with CreateNew in
+the unique run root and retains its exact hash in `selected-inputs.json`.
+Every session, recovery, publication and native worker receives that expected
+plan hash plus Worker/Common hashes and verifies them before loading Common or
+entering lifecycle cleanup. Concurrent in-place deployment is refused by the OS;
+it cannot silently replace the originally selected recovery authority. Handles
+are released after terminal completion. Coordinator death still requires the
+explicit stale-owner recovery procedure above, not adoption of its old plan.
+This is cooperative same-user selection custody, not a hostile-user security
+boundary or permission to modify any pinned input while the run is active.
+
+`Test-GripSelectedCustody.ps1` uses a disposable pinned toolkit to exercise
+missing/changed plan admission, changed Common/Worker before execution, exact
+staged bytes, and attempted write/replace at session/recovery/publication launch
+boundaries. It invokes real worker admission with a different self-consistent
+plan, requiring refusal before controls or cleanup. Its process-owner responses
+are deliberately injected failures: it must not publish or claim clean handoff.
+These selection tests complement, rather than replace, actual bounded-job and
+offline lifecycle tests. No installed runtime or native provider is invoked.
 
 ## Selected observational boundary
 
