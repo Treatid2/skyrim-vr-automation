@@ -49,6 +49,12 @@ function Assert-CalendarLease($Payload,[string]$Owner,[string]$CommandId,$Bindin
     return $lease
 }
 
+function Test-CalendarPositiveCleanupReason($Reason) {
+    # Native Tick may retire the same lease before explicit release dispatch.
+    # Reason is corroboration only; callers still require all custody/readback proof.
+    return $Reason -is [string] -and $Reason -cin @('released','expired','scene_lost')
+}
+
 function Invoke-DevBenchCalendarWindow {
     [CmdletBinding()]
     param([Parameter(Mandatory)][scriptblock]$Call,
@@ -129,7 +135,7 @@ function Invoke-DevBenchCalendarWindow {
                 $released=Get-CalendarPayload (Invoke-WindowCall calendar @{action='release';owner=$Owner;commandId=$releaseId;binding=$lease.binding;leaseId=$lease.id} $true $DeadlineUtc)
                 Assert-CalendarReadback $released
                 $releasedLease=Assert-CalendarLease $released $Owner $holdId $binding
-                if ($releasedLease.id -cne $lease.id -or $releasedLease.captured.calendarRate -ne $lease.captured.calendarRate -or -not (Test-CalendarStorageBindingEqual $released.binding $binding) -or -not $released.restored -or $released.outstanding -or $released.leaseActive -or $released.expiryDue -or $released.cleanupPending -or $released.values.calendarRate -ne $lease.captured.calendarRate -or $released.status -cnotin @('released','expired')) { throw 'Calendar release did not prove restoration of the exact original lease.' }
+                if ($releasedLease.id -cne $lease.id -or $releasedLease.captured.calendarRate -ne $lease.captured.calendarRate -or -not (Test-CalendarStorageBindingEqual $released.binding $binding) -or -not $released.restored -or $released.outstanding -or $released.leaseActive -or $released.expiryDue -or $released.cleanupPending -or $released.values.calendarRate -ne $lease.captured.calendarRate -or -not (Test-CalendarPositiveCleanupReason $released.status)) { throw 'Calendar release did not prove restoration of the exact original lease.' }
                 $after=Get-CalendarPayload (Invoke-WindowCall calendar @{action='status'} $false $DeadlineUtc)
                 Assert-CalendarReadback $after
                 $afterLease=Assert-CalendarLease $after $Owner $holdId $binding
@@ -138,7 +144,7 @@ function Invoke-DevBenchCalendarWindow {
                 # by exact retained custody plus positive native restoration and
                 # fresh same-process/generation/global readback. No new authority,
                 # binding substitution, lease adoption or automatic retry.
-                if ($afterLease.id -cne $lease.id -or $afterLease.captured.calendarRate -ne $lease.captured.calendarRate -or -not (Test-CalendarStorageBindingEqual $after.binding $binding) -or $after.outstanding -or $after.leaseActive -or $after.expiryDue -or $after.cleanupPending -or $after.values.calendarRate -ne $lease.captured.calendarRate -or $after.lastTransition.restored -isnot [bool] -or -not $after.lastTransition.restored -or $after.lastTransition.ok -isnot [bool] -or -not $after.lastTransition.ok -or $after.lastTransition.status -cnotin @('released','expired')) { throw 'Fresh calendar restoration proof is incomplete.' }
+                if ($afterLease.id -cne $lease.id -or $afterLease.captured.calendarRate -ne $lease.captured.calendarRate -or -not (Test-CalendarStorageBindingEqual $after.binding $binding) -or $after.outstanding -or $after.leaseActive -or $after.expiryDue -or $after.cleanupPending -or $after.values.calendarRate -ne $lease.captured.calendarRate -or $after.lastTransition.restored -isnot [bool] -or -not $after.lastTransition.restored -or $after.lastTransition.ok -isnot [bool] -or -not $after.lastTransition.ok -or -not (Test-CalendarPositiveCleanupReason $after.lastTransition.status) -or $after.lastTransition.status -cne $released.status) { throw 'Fresh calendar restoration proof is incomplete.' }
                 $restorationVerified=$true
             }
             catch { $errors.Add("Calendar cleanup: $($_.Exception.Message)"); $uncertain=$true }
