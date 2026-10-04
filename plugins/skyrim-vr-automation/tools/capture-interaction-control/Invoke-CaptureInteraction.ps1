@@ -155,6 +155,21 @@ function Invoke-DevBench([string]$Tool, [hashtable]$Arguments, [string]$Runtime,
     }
     if ($SkipRuntimeIdentityVerification) { $parameters['SkipRuntimeIdentityVerification'] = $true }
     try {
+        if ($null -ne $ExpectedRuntimeIdentity) {
+            if (-not (Test-CaptureRuntimeIdentity -Identity $ExpectedRuntimeIdentity)) {
+                throw 'Persisted accepting runtime identity is incomplete; no artifact/build expectation was inferred.'
+            }
+            foreach ($binding in @(@('ArtifactPath','artifactPath'), @('ExpectedArtifactSha256','artifactSha256'), @('ExpectedBuildId','buildId'))) {
+                $name = $binding[0]
+                $boundExpectation = [string]$ExpectedRuntimeIdentity.($binding[1])
+                if ($parameters.ContainsKey($name) -and [string]$parameters[$name] -cne $boundExpectation) {
+                    throw "Explicit $name contradicts the persisted accepting runtime identity; no controller dispatch."
+                }
+                # The exact accepting identity is still supplied independently. These
+                # parameters enable current artifact verification, not an identity bypass.
+                $parameters[$name] = $boundExpectation
+            }
+        }
         $attempt.dispatchAttempted = $true
         $raw = & $DevBenchScriptPath call @parameters
         $response = $raw | ConvertFrom-Json -Depth 100

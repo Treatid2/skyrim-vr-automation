@@ -64,6 +64,7 @@ if ($env:CAPTURE_INTERACTION_REQUIRE_BOOTSTRAP -eq '1' -and
     return
 }
 $argsObject = $ArgumentsJson | ConvertFrom-Json -Depth 80
+if (-not $argsObject.PSObject.Properties['action']) { $argsObject | Add-Member action '' }
 $listenerPid = if ($env:CAPTURE_INTERACTION_RUNTIME_PID) { [int]$env:CAPTURE_INTERACTION_RUNTIME_PID } else { 101 }
 $processStartTimeUtc = if ($env:CAPTURE_INTERACTION_RUNTIME_START) { [string]$env:CAPTURE_INTERACTION_RUNTIME_START } else { "2026-09-11T00:00:$('{0:d2}' -f ($listenerPid % 60)).0000000Z" }
 $buildId = if ($env:CAPTURE_INTERACTION_RUNTIME_BUILD) { [string]$env:CAPTURE_INTERACTION_RUNTIME_BUILD } else { ('a' * 64) -join '' }
@@ -217,9 +218,28 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     $bootstrapSession = Join-Path $root 'bootstrap-session'
     $bootstrapStart = & $entry start -SessionDirectory $bootstrapSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 10 -DevBenchScriptPath $fake @bootstrap -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test ($bootstrapStart.ok -and $bootstrapStart.data.runtimeIdentity.listenerPid -eq 101) 'bootstrap expectations reach sequence preflight and first record mutation without identity bypass'
-    Remove-Item Env:CAPTURE_INTERACTION_REQUIRE_BOOTSTRAP
+    $bootstrapObserve = & $entry observe -SessionDirectory $bootstrapSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test ($bootstrapObserve.ok -and $null -eq $bootstrapObserve.data.observation.screenshot.error -and $bootstrapObserve.data.observation.input.trackedSet.ok -and $bootstrapObserve.data.observation.latestFrame.ordinal -eq 4) 'SessionDirectory-only observe derives all exact expectations from persisted accepting identity while bootstrap admission remains enforced'
+    $demandSession=Join-Path $root 'bootstrap-demand-session'
+    $demandStart = & $entry start -SessionDirectory $demandSession -RuntimePath $runtime -VisualMode on-demand -DevBenchScriptPath $fake @bootstrap -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test $demandStart.ok 'guarded on-demand session starts with exact bootstrap identity'
+    $demandObserve = & $entry observe -SessionDirectory $demandSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test ($demandObserve.ok -and $null -eq $demandObserve.data.observation.screenshot.error -and $demandObserve.data.observation.frameSubmission.path) 'README SessionDirectory-only on-demand observation passes full artifact admission and returns a committed frame'
+    foreach($binding in @(@('ArtifactPath','C:\fixture\foreign.dll'),@('ExpectedArtifactSha256',('c'*64)),@('ExpectedBuildId',('d'*64)))) {
+        $callsBefore=Get-Content -LiteralPath (Join-Path $root 'calls.log') -Raw
+        $conflicting=@{}; $conflicting[$binding[0]]=$binding[1]
+        $rejectedObserve = & $entry observe -SessionDirectory $demandSession -DevBenchScriptPath $fake @conflicting -Compact -NoExit | ConvertFrom-Json -Depth 100
+        Assert-Test ($null -eq $rejectedObserve.data.observation.frameSubmission -and $rejectedObserve.data.observation.screenshot.error -match 'contradicts the persisted accepting runtime identity' -and (Get-Content -LiteralPath (Join-Path $root 'calls.log') -Raw) -ceq $callsBefore) 'conflicting explicit artifact/hash/build is rejected before every controller dispatch, not silently overwritten'
+    }
+    $demandPartial = & $entry observe -SessionDirectory $demandSession -DevBenchScriptPath $fake -ExpectedBuildId ('a'*64) -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test ($null -eq $demandPartial.data.observation.screenshot.error -and $demandPartial.data.observation.frameSubmission.path) 'a matching partial explicit expectation fills the remaining parameters from the same accepting identity'
+    $guardedAct = & $entry act -SessionDirectory $demandSession -ActionName accept -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test $guardedAct.ok 'named input action forwards persisted artifact/build expectations under the same identity guard'
+    $demandStop = & $entry stop -SessionDirectory $demandSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test $demandStop.ok 'on-demand stop forwards accepting expectations without bootstrap flags repeated'
     $bootstrapStop = & $entry stop -SessionDirectory $bootstrapSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test ($bootstrapStop.ok) 'later stop uses persisted accepting identity without requiring bootstrap arguments again'
+    Remove-Item Env:CAPTURE_INTERACTION_REQUIRE_BOOTSTRAP
     Remove-Item Env:CAPTURE_INTERACTION_NATIVE_CAPABILITIES
     $oversizedSession = Join-Path $root 'oversized-session'
     $oversized = & $entry start -SessionDirectory $oversizedSession -RuntimePath $runtime -VisualMode sequence -MaximumFrames 60000 -FrameIntervalMs 1000 -DevBenchScriptPath $fake -SkipRuntimeIdentityVerification -Compact -NoExit | ConvertFrom-Json -Depth 100
