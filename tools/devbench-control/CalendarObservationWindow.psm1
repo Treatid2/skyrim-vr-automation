@@ -12,11 +12,18 @@ function Assert-CalendarBinding($Binding) {
     foreach ($id in $Binding.globalFormIds) { if ($null -eq $id -or $id.GetType() -notin @([int],[long],[uint32],[uint64]) -or $id -lt 1 -or $id -gt [uint32]::MaxValue) { throw 'Invalid calendar global form ID.' } }
 }
 
-function Test-CalendarBindingEqual($Left,$Right) {
+function Test-CalendarStorageBindingEqual($Left,$Right) {
     Assert-CalendarBinding $Left; Assert-CalendarBinding $Right
-    if ($Left.processSession -cne $Right.processSession -or $Left.pid -ne $Right.pid -or $Left.loadGeneration -ne $Right.loadGeneration -or $Left.cellFormId -ne $Right.cellFormId) { return $false }
+    # Public identities corroborate the native SameStorage proof; raw calendar
+    # and global addresses remain native-only and are not guessed by this client.
+    if ($Left.processSession -cne $Right.processSession -or $Left.pid -ne $Right.pid -or $Left.loadGeneration -ne $Right.loadGeneration) { return $false }
     for($i=0;$i -lt 6;$i++) { if($Left.globalFormIds[$i] -ne $Right.globalFormIds[$i]) { return $false } }
     return $true
+}
+
+function Test-CalendarBindingEqual($Left,$Right) {
+    if (-not (Test-CalendarStorageBindingEqual $Left $Right)) { return $false }
+    return $Left.cellFormId -eq $Right.cellFormId
 }
 
 function Assert-CalendarReadback($Payload) {
@@ -121,11 +128,17 @@ function Invoke-DevBenchCalendarWindow {
                 }
                 $released=Get-CalendarPayload (Invoke-WindowCall calendar @{action='release';owner=$Owner;commandId=$releaseId;binding=$lease.binding;leaseId=$lease.id} $true $DeadlineUtc)
                 Assert-CalendarReadback $released
-                if (-not $released.restored -or $released.outstanding -or $released.status -cnotin @('released','expired')) { throw 'Calendar release did not prove restoration.' }
+                $releasedLease=Assert-CalendarLease $released $Owner $holdId $binding
+                if ($releasedLease.id -cne $lease.id -or $releasedLease.captured.calendarRate -ne $lease.captured.calendarRate -or -not (Test-CalendarStorageBindingEqual $released.binding $binding) -or -not $released.restored -or $released.outstanding -or $released.leaseActive -or $released.expiryDue -or $released.cleanupPending -or $released.values.calendarRate -ne $lease.captured.calendarRate -or $released.status -cnotin @('released','expired')) { throw 'Calendar release did not prove restoration of the exact original lease.' }
                 $after=Get-CalendarPayload (Invoke-WindowCall calendar @{action='status'} $false $DeadlineUtc)
                 Assert-CalendarReadback $after
-                $null=Assert-CalendarLease $after $Owner $holdId $binding
-                if (-not (Test-CalendarBindingEqual $after.binding $binding) -or $after.outstanding -or $after.leaseActive -or $after.expiryDue -or $after.cleanupPending -or $after.values.calendarRate -ne $lease.captured.calendarRate -or $after.lastTransition.restored -isnot [bool] -or -not $after.lastTransition.restored -or $after.lastTransition.ok -isnot [bool] -or -not $after.lastTransition.ok -or $after.lastTransition.status -cnotin @('released','expired')) { throw 'Fresh calendar restoration proof is incomplete.' }
+                $afterLease=Assert-CalendarLease $after $Owner $holdId $binding
+                # Cell drift still invalidates observation continuity above.
+                # Cleanup may be independently proved in a different cell only
+                # by exact retained custody plus positive native restoration and
+                # fresh same-process/generation/global readback. No new authority,
+                # binding substitution, lease adoption or automatic retry.
+                if ($afterLease.id -cne $lease.id -or $afterLease.captured.calendarRate -ne $lease.captured.calendarRate -or -not (Test-CalendarStorageBindingEqual $after.binding $binding) -or $after.outstanding -or $after.leaseActive -or $after.expiryDue -or $after.cleanupPending -or $after.values.calendarRate -ne $lease.captured.calendarRate -or $after.lastTransition.restored -isnot [bool] -or -not $after.lastTransition.restored -or $after.lastTransition.ok -isnot [bool] -or -not $after.lastTransition.ok -or $after.lastTransition.status -cnotin @('released','expired')) { throw 'Fresh calendar restoration proof is incomplete.' }
                 $restorationVerified=$true
             }
             catch { $errors.Add("Calendar cleanup: $($_.Exception.Message)"); $uncertain=$true }

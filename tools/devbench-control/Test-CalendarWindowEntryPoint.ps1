@@ -7,7 +7,8 @@ $checks=0
 function Require([bool]$Condition,[string]$Message){if(-not $Condition){throw $Message};$script:checks++}
 $root=Join-Path ([IO.Path]::GetFullPath($FixtureRoot)) ('calendar-entry-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
-foreach($case in @('healthy','failed-observation','generation','release-failed')) {
+$cases=@('healthy','failed-observation','generation','release-failed','cell-recovered','cell-foreign-rate','cell-new-globals','cell-unavailable','cell-no-transition','cell-lease-id')
+foreach($case in $cases) {
     $fixture=Join-Path $root $case;New-Item -ItemType Directory -Path $fixture | Out-Null
     $start=[Diagnostics.ProcessStartInfo]::new()
     # The stable entry point is a cmd shim on Windows; invoke its selected
@@ -28,10 +29,18 @@ foreach($case in @('healthy','failed-observation','generation','release-failed')
         Require (@($events | Where-Object {$_.method -eq 'tools/call' -and $_.arguments.name -eq 'calendar' -and $_.arguments.arguments.action -eq 'hold'}).Count -eq 1) "$case replayed hold"
         Require (@($events | Where-Object {$_.method -eq 'tools/call' -and $_.arguments.name -eq 'calendar' -and $_.arguments.arguments.action -eq 'release'}).Count -eq 1) "$case omitted or replayed exact release"
         Require (@($events | Where-Object {$_.method -eq 'tools/call' -and $_.session -cne 'calendar-test-session'}).Count -eq 0) "$case changed actual session"
+        $hold=@($events|Where-Object {$_.method -eq 'tools/call' -and $_.arguments.name -eq 'calendar' -and $_.arguments.arguments.action -eq 'hold'})[0].arguments.arguments
+        $release=@($events|Where-Object {$_.method -eq 'tools/call' -and $_.arguments.name -eq 'calendar' -and $_.arguments.arguments.action -eq 'release'})[0].arguments.arguments
+        Require (($release.binding|ConvertTo-Json -Depth 10 -Compress) -ceq ($hold.binding|ConvertTo-Json -Depth 10 -Compress) -and $release.leaseId -ceq 'fixture-lease' -and $release.owner -ceq $hold.owner -and $release.commandId -cne $hold.commandId) "$case lost original release custody"
         Require ($events[-1].method -eq 'DELETE' -and $response.sessionCleanup.ok) "$case closed session before terminal calendar work"
-        Require ($response.data.restorationVerified -eq ($case -in @('healthy','failed-observation'))) "$case incorrect restoration claim"
+        Require ($response.data.restorationVerified -eq ($case -in @('healthy','failed-observation','cell-recovered'))) "$case incorrect restoration claim"
+        if($case.StartsWith('cell-')) {
+            Require (-not $response.data.continuityVerified -and -not $response.ok) "$case turned cell drift into a successful observation"
+            Require ($response.data.indeterminate -eq ($case -ne 'cell-recovered')) "$case confused positively verified cleanup and uncertainty"
+            Require (@($events|Where-Object {$_.method -eq 'tools/call' -and $_.arguments.name -eq 'inspect' -and $_.arguments.arguments.kind -eq 'state'}).Count -eq 0) "$case dispatched observation after cell drift"
+        }
         $journal=Get-Content -LiteralPath $response.invocationEvidencePath -Raw | ConvertFrom-Json -Depth 50
         Require ($journal.calendarDispatchArguments.action -eq 'release' -and $journal.sessionCleanup.ok) "$case lost dispatch/cleanup custody"
     } finally {if(-not $worker.HasExited){$worker.Kill();$worker.WaitForExit(5000)|Out-Null};$worker.Dispose()}
 }
-[pscustomobject]@{ok=$true;checks=$checks;cases=4;root=$root;nativeLiveQualification=$false}|ConvertTo-Json -Compress
+[pscustomobject]@{ok=$true;checks=$checks;cases=$cases.Count;root=$root;nativeLiveQualification=$false}|ConvertTo-Json -Compress
