@@ -170,6 +170,9 @@ if ($Tool -eq 'communityshaders.screenshot') {
   $correlationId = if ($argsObject.PSObject.Properties['correlationId']) { $argsObject.correlationId } else { $null }
   $recordingPath = if ($argsObject.action -ne 'stop') { $null } elseif ($env:CAPTURE_INTERACTION_MALFORMED_RECORD_STOP -eq '1') { $false } else { 'recording.json' }
   $value=[pscustomobject]@{action=$argsObject.action;recording=($argsObject.action -ne 'stop');correlationId=$correlationId;path=$recordingPath}
+} elseif ($Tool -eq 'input' -and $argsObject.action -eq 'capabilities') {
+  $value=Get-Content -LiteralPath $env:CAPTURE_INTERACTION_INPUT_CAPABILITIES_PATH -Raw | ConvertFrom-Json -Depth 40
+  if ($env:CAPTURE_INTERACTION_INPUT_NOT_READY -eq '1') { $value.capabilities.vrTrackedSet.ready=$false }
 } elseif ($Tool -eq 'input' -and $argsObject.action -eq 'observe') {
   $value=[pscustomobject]@{action='observe';source='physical_openvr';frame=$frame}
 } elseif ($Tool -eq 'input' -and $argsObject.action -eq 'status' -and $argsObject.device -eq 'vrTrackedSet') {
@@ -192,12 +195,19 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     '{}' | Set-Content -LiteralPath $runtime -Encoding utf8
     $env:CAPTURE_INTERACTION_FAKE_ROOT = $root
     $env:CAPTURE_INTERACTION_SEMANTIC_MODULE = Join-Path (Split-Path -Parent $PSScriptRoot) 'devbench-control\DevBenchControl.psm1'
+    $env:CAPTURE_INTERACTION_INPUT_CAPABILITIES_PATH = Join-Path (Split-Path -Parent $PSScriptRoot) 'devbench-control\fixtures\native-input-capabilities.v2.json'
     $entry = Join-Path $PSScriptRoot 'Invoke-CaptureInteraction.ps1'
     $env:CAPTURE_INTERACTION_REQUIRE_BOOTSTRAP = '1'
     $env:CAPTURE_INTERACTION_NATIVE_CAPABILITIES = '1'
     $bootstrap = @{ArtifactPath='C:\fixture\CommunityShaders.dll';ExpectedArtifactSha256=('b' * 64);ExpectedBuildId=('a' * 64)}
     $capabilities = & $entry capabilities -RuntimePath $runtime -DevBenchScriptPath $fake @bootstrap -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test ($capabilities.ok -and $capabilities.data.input.ok -and $capabilities.data.screenshots.ok -and $capabilities.data.screenshots.value.limits.maximumSequenceFrames -eq 60000 -and $capabilities.data.screenshots.envelope.data.content[0].contract.name -eq 'csx.screenshot') 'bootstrap expectations reach both probes and nested capabilities are qualified while raw envelope is retained'
+    Assert-Test ($capabilities.data.input.value.contract.name -ceq 'devbench.input' -and $capabilities.data.input.value.capabilities.vrTrackedSet.ready -and $capabilities.data.input.envelope.data.content[0].capabilities.keyboard.keys.Count -eq 102) 'native input v2 capabilities retain complete controller-qualified input and raw evidence'
+    $env:CAPTURE_INTERACTION_INPUT_NOT_READY='1'
+    $notReady = & $entry capabilities -RuntimePath $runtime -DevBenchScriptPath $fake @bootstrap -Compact -NoExit | ConvertFrom-Json -Depth 100
+    Assert-Test (-not $notReady.data.input.ok -and $notReady.data.screenshots.ok) 'unready native input is refused independently of screenshot capability success'
+    Assert-Test (-not ((Get-Content -LiteralPath (Join-Path $root 'calls.log') -Raw) -match 'record/start|input/sequence|sequence_start')) 'capability reads dispatch no recording, input or screenshot mutations'
+    Remove-Item Env:\CAPTURE_INTERACTION_INPUT_NOT_READY
     $unbound = & $entry capabilities -RuntimePath $runtime -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test (-not $unbound.data.input.ok -and -not $unbound.data.screenshots.ok) 'omitting identity expectations cannot pass the guarded bootstrap fixture'
     $wrongBootstrap = $bootstrap.Clone(); $wrongBootstrap.ExpectedBuildId = 'foreign-build'

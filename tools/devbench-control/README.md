@@ -2,6 +2,37 @@
 
 ## Current native read contracts
 
+Exact `input {action:capabilities}` accepts only the complete native
+`devbench.input` 2.0 capability payload: ready/available Boolean keyboard v1
+and tracked-set v1.1, all 102 canonical key/scancode bindings,
+declared action sets, bounded positive integral limits, atomic hmd/left/right
+devices and exact ownership/encoding/lifecycle metadata. Missing, foreign,
+multiple, unready or malformed payloads fail even with a generic success flag.
+`semantic.qualifiedInputCapabilities` is provided only after qualification;
+capture uses that projection and keeps the untouched raw envelope. This does
+not qualify any input mutation, recording start or observed physical pose.
+
+Exact `communityshaders.fsr_color_contract {action:status}` accepts the native
+typed requested flags/revision, both context states/generations, the successful
+dispatch and two eye-dispatch records, producer identity and source-contract
+flag. Optional `expectedBuildId` must match the producer. Invalid dispatch
+sharpness/sharpening/QPC fields must be explicit nulls; valid dispatches require
+finite numerical sharpness, positive dimensions/generations/serial/QPC and a
+supported native FSR path. No generic `ok` marker is required. Explicit errors
+still veto acceptance. Set receipts and mutation parameters do not qualify as
+status. Acceptance is **read-schema-only**, not proof of matching requested
+flags, current synchronized eyes, HDR admission, vendor convergence or runtime
+artifact verification. Those postconditions belong to the experiment.
+
+`upscalingStable` still requires genuinely revision-correlated API and
+render-scale observations. Native f362 `renderscale/status` lacks the required
+`status.upscalingSnapshot`; its physical controller revision is not the API
+state revision. That combination fails closed, even when native frames advance
+and the effective profile matches. Do not substitute controller revision, drop
+the correlation check, or replay a mutation/wait to manufacture qualification.
+Repair requires a native correlated snapshot or a proven same-runtime read
+bracket; neither is claimed by these two read adapters.
+
 Explicit `camera {action:get}` is read-only and requires one complete typed
 observation: finite JSON position/pitch/yaw numbers, supported exact POV/backend,
 uint32 stateId, and Boolean freeCam/freeCamOwned without contradictory ownership.

@@ -1,0 +1,14 @@
+[
+  {
+    "source": "mapping-rsoff-input-capability-diagnostic-20261004-0252-001/stdout.log",
+    "sha256": "b911c2fe6997ee65331c3fef1e0318ab86ecd7de3817b94bbf2871a5b0175d46",
+    "bytes": 25204,
+    "scope": "data.content[0], exact parsed native payload; enclosing rawResult/runtime evidence not copied"
+  },
+  {
+    "source": "mapping-rsoff-colour-contract-status-20261004-0306-001/stdout.log",
+    "sha256": "7d2cfb42da6c6e8425f6a3e4f98d7973ad481638732763b4943ef79d3ff343ef",
+    "bytes": 15973,
+    "scope": "data.content[0], exact parsed native payload; enclosing rawResult/runtime evidence not copied"
+  }
+]
