@@ -556,6 +556,7 @@ function Test-DevBenchReadOnlyRequest {
     if ($ToolName -eq 'record') { return $action -eq 'status' }
     if ($ToolName -ceq 'input') { return $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -cin @('observe', 'status', 'capabilities') }
     if ($ToolName -ceq 'communityshaders.fsr_color_contract') { return $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status' -and -not $Arguments.Contains('expectedRevision') -and -not $Arguments.Contains('highDynamicRangeInput') -and -not $Arguments.Contains('autoExposure') }
+    if ($ToolName -ceq 'communityshaders.colour_pipeline_probe') { return $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status' -and @($Arguments.Keys | Where-Object { $_ -cnotin @('action','expectedBuildId') }).Count -eq 0 }
     if ($ToolName -eq 'communityshaders.renderscale') { return $action -eq 'status' }
     if ($ToolName -eq 'communityshaders.upscaling_api') { return $action -eq 'snapshot' }
     if ($ToolName -eq 'communityshaders.screenshot') {
@@ -633,7 +634,8 @@ function Get-DevBenchCallSemanticStatus {
     } else { Get-DevBenchSemanticStatus -Content $Content }
     $payloads = @($Content)
     $nativeReadKind = if ($ToolName -ceq 'input' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'capabilities') { 'input-capabilities' }
-        elseif ($ToolName -ceq 'communityshaders.fsr_color_contract' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status') { 'fsr-colour-status' } else { $null }
+        elseif ($ToolName -ceq 'communityshaders.fsr_color_contract' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status') { 'fsr-colour-status' }
+        elseif ($ToolName -ceq 'communityshaders.colour_pipeline_probe' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status') { 'colour-probe-status' } else { $null }
     if ($nativeReadKind) {
         $reasons = [Collections.Generic.List[string]]::new()
         if ($semantic.known -and -not $semantic.ok) { foreach ($reason in $semantic.reasons) { $reasons.Add([string]$reason) } }
@@ -644,6 +646,7 @@ function Get-DevBenchCallSemanticStatus {
         $semantic.reasons = @($reasons | Select-Object -Unique)
         $semantic.explicitOutcomeEvidence = if ($semantic.ok) { @("native-$nativeReadKind-typed-observation") } else { @() }
         if ($nativeReadKind -ceq 'input-capabilities') { $semantic | Add-Member -NotePropertyName qualifiedInputCapabilities -NotePropertyValue $(if ($semantic.ok) { $payload } else { $null }) }
+        if ($nativeReadKind -ceq 'colour-probe-status') { $semantic | Add-Member -NotePropertyName qualifiedColourProbeStatus -NotePropertyValue $(if ($semantic.ok) { $payload } else { $null }) }
         $semantic | Add-Member -NotePropertyName completionBasis -NotePropertyValue 'read-schema-only'
         return $semantic
     }

@@ -79,6 +79,24 @@ status. Acceptance is **read-schema-only**, not proof of matching requested
 flags, current synchronized eyes, HDR admission, vendor convergence or runtime
 artifact verification. Those postconditions belong to the experiment.
 
+Exact `communityshaders.colour_pipeline_probe {action:status}` qualifies native
+schema3 copied status with source-bound states, producer/build binding, uint64
+generation/revision/QPC/payload counters, ten stage-eye slots, 1 GiB staging
+payload ceiling and the 15-second native deadline. Initial idle zero generation
+is valid; reset may leave a nonzero idle generation. Idle cleared fields and
+active/completed slot/QPC consistency remain required. `cpuFrame` is explicit
+null or positive uint32; schema3 scene/submission epochs must be explicit null,
+because the producer withholds that attribution. Zero QPC is a native fallback,
+not proof of timing quality. No generic `ok` marker is required; explicit failure
+evidence still vetoes acceptance. `semantic.qualifiedColourProbeStatus` is
+available only after qualification and the raw envelope remains untouched.
+Only explicit exact status and optional `expectedBuildId` arguments are admitted;
+arm, reset and capture-page read contracts are not extended. A successful read
+is **read-schema-only**, not capture acceptance, sample quality, performance
+neutrality, vendor convergence, epoch correlation, HDR admission or runtime
+artifact verification. Native status may service its existing expiry policy;
+the controller does not arm, reset or change that policy.
+
 `upscalingStable` still requires genuinely revision-correlated API and
 render-scale observations. Native f362 `renderscale/status` lacks the required
 `status.upscalingSnapshot`; its physical controller revision is not the API
