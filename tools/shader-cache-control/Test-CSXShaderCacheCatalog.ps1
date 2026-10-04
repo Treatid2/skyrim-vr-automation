@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 [CmdletBinding()]
-param()
+param([string]$FixtureRoot)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -17,13 +17,21 @@ function Invoke-Catalog([hashtable]$Arguments) {
     return $raw | ConvertFrom-Json -Depth 40
 }
 
-$testRoot = Join-Path ([IO.Path]::GetTempPath()) ('csx-shader-cache-catalog-test-' + [guid]::NewGuid().ToString('N'))
-$resolvedTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+$resolvedTemp = if ($FixtureRoot) { [IO.Path]::GetFullPath($FixtureRoot) } else { [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) }
+$testRoot = Join-Path $resolvedTemp ('csx-shader-cache-catalog-test-' + [guid]::NewGuid().ToString('N'))
 $resolvedTestRoot = [IO.Path]::GetFullPath($testRoot)
 if (-not $resolvedTestRoot.StartsWith($resolvedTemp, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Test root escaped the temporary directory: $resolvedTestRoot"
 }
 $priorControlRoot = $env:CSX_SHADER_CACHE_CONTROL_ROOT
+$priorFixtureTemp = $env:TEMP
+$priorFixtureTmp = $env:TMP
+if ($FixtureRoot) {
+    New-Item -ItemType Directory -Path $resolvedTemp -Force | Out-Null
+    # Private test process only: satisfy the fixture-only control-root boundary.
+    $env:TEMP = $resolvedTemp
+    $env:TMP = $resolvedTemp
+}
 $env:CSX_SHADER_CACHE_CONTROL_ROOT = Join-Path $resolvedTestRoot 'target-controls'
 
 $transactionTool = Join-Path $PSScriptRoot 'Invoke-CSXShaderCacheTransaction.ps1'
@@ -801,6 +809,8 @@ try {
 }
 finally {
     $env:CSX_SHADER_CACHE_CONTROL_ROOT = $priorControlRoot
+    $env:TEMP = $priorFixtureTemp
+    $env:TMP = $priorFixtureTmp
     if (Test-Path -LiteralPath $resolvedTestRoot -PathType Container) {
         Remove-Item -LiteralPath $resolvedTestRoot -Recurse -Force
     }

@@ -22,6 +22,16 @@
 - Keep task-local environment retention separate from restoration of shared or
   global transient state. Restoring SteamVR or another shared runtime must not
   rewrite, revert, or retire the task-owned MO2 profile.
+- Auto-Tools owns shared-state cleanup, recovery, and verified environment
+  handoff; calling tasks own their experiment setup and calibration, not a
+  bespoke reset procedure. Preserve their configured workspaces on yield and
+  resume the exact requested environment later. A request for a clean
+  environment selects an explicit known-good baseline without resetting or
+  retiring another retained setup. Require observed postconditions before
+  handing off access; unresolved cleanup is not a clean-state claim. Use the
+  existing ownership-guarded controls, not duplicate wrappers or speculative
+  process kills. This responsibility does not expand mutation authority or
+  change the coordination-only meaning of human `Release`.
 - A task may delete or replace only uniquely named mods that its workspace
   proves did not predate the task and explicitly records as task-owned.
 - Do not inherit unknown-provenance saves, and do not treat COC as New Game.
