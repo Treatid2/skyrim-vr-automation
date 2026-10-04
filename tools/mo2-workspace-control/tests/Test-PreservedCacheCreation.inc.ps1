@@ -34,8 +34,18 @@ try {
     $unsafe = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label unsafe -SavePolicy VerifiedFixture -WorkspaceContent Modlist -Confirm:$false -NoExit | ConvertFrom-Json
     Assert-Preserved (-not $unsafe.ok -and ($unsafe.errors -join ';') -match 'reparse point') 'Cache reparse point was accepted.'
 } finally { if (Test-Path -LiteralPath $link) { Remove-Item -LiteralPath $link -Force } }
-$overBudget = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label budget -SavePolicy VerifiedFixture -WorkspaceContent Modlist -MaxProfileBytes 1 -Confirm:$false -NoExit | ConvertFrom-Json
-Assert-Preserved (-not $overBudget.ok) 'Bounded baseline admission ignored the byte limit.'
+$budgetFile = Join-Path $cache 'over-budget.bin'
+try {
+    [IO.File]::WriteAllBytes($budgetFile, [byte[]]::new(1048577))
+    $overBudget = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label budget -SavePolicy VerifiedFixture -WorkspaceContent Modlist -MaxProfileBytes 1048576 -Confirm:$false -NoExit | ConvertFrom-Json
+    Assert-Preserved (-not $overBudget.ok -and ($overBudget.errors -join ';') -match 'byte') 'Bounded baseline admission ignored the byte limit.'
+} finally { if (Test-Path -LiteralPath $budgetFile) { Remove-Item -LiteralPath $budgetFile } }
+$openConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+$openConfig.mo2.processNames = @((Get-Process -Id $PID).ProcessName)
+$openConfigPath = Join-Path $fixture 'open-process-config.json'
+$openConfig | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $openConfigPath -Encoding utf8
+$openState = & $entry create -ConfigPath $openConfigPath -AccessId $accessId -TaskId $taskId -Label open-state -SavePolicy VerifiedFixture -WorkspaceContent Modlist -Confirm:$false -NoExit | ConvertFrom-Json
+Assert-Preserved (-not $openState.ok -and ($openState.errors -join ';') -match 'closed-state') 'Open process state was admitted.'
 $preview = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label preview -SavePolicy VerifiedFixture -WorkspaceContent Modlist -WhatIf -NoExit | ConvertFrom-Json
 Assert-Preserved ($preview.ok -and $preview.state -eq 'dry-run' -and -not (Test-Path -LiteralPath $marker)) 'Preserved baseline preview changed state or failed.'
 $rollback = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label rollback -SavePolicy VerifiedFixture -WorkspaceContent Modlist -InternalTestFailurePoint creation-fail-after-backup-snapshot -Confirm:$false -NoExit | ConvertFrom-Json
