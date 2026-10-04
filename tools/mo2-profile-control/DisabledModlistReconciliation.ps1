@@ -39,7 +39,9 @@ function Get-DisabledModlistReconciliation([byte[]]$Bytes, [string]$ModRoot, [st
                 Assert-InstalledModName $requested $ModRoot
             }
             if ((Get-BytesSha256 $after) -cne $pinned) {
-                $bom = if ($text.StartsWith([string][char]0xFEFF)) { [string][char]0xFEFF } else { '' }
+                # Culture-sensitive comparison can treat U+FEFF as ignorable and
+                # falsely detect a BOM in an ordinary '# ...' header.
+                $bom = if ($text.StartsWith([string][char]0xFEFF, [StringComparison]::Ordinal)) { [string][char]0xFEFF } else { '' }
                 $content = $text.Substring($bom.Length)
                 foreach ($requested in $RequestedNames) {
                     if ([DateTime]::UtcNow -ge $deadline) { throw 'Explicit disabled recovery exceeds its 30-second budget.' }
