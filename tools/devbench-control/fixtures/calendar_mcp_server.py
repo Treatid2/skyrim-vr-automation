@@ -58,24 +58,31 @@ class Handler(BaseHTTPRequestHandler):
                 action=query['action']
                 if action=='hold':
                     lease=dict(id='fixture-lease',owner=query['owner'],commandId=query['commandId'],
-                               binding=binding.copy(),applied=True,captured=values.copy(),cleanupAttempted=False)
+                               binding=json.loads(json.dumps(binding)),applied=True,captured=values.copy(),cleanupAttempted=False)
                 if action=='release':
-                    if not lease or query['owner']!=lease['owner'] or query['leaseId']!=lease['id'] or query['binding']!=lease['binding'] or query['binding']!=binding:
+                    if not lease or query['owner']!=lease['owner'] or query['leaseId']!=lease['id'] or query['binding']!=lease['binding'] or any(binding[key]!=lease['binding'][key] for key in ('processSession','pid','loadGeneration','globalFormIds')):
                         self.reply({'error':'foreign release'},400); return
-                    restored=mode!='release-failed'
+                    restored=mode not in ('release-failed','cell-foreign-rate','cell-unavailable')
+                    lease['cleanupAttempted']=True
                 if action=='status':status_calls+=1
                 if mode=='generation' and lease and not restored and action=='status' and status_calls>1:
                     binding['loadGeneration']=2
+                if mode.startswith('cell-') and lease and status_calls>1:
+                    binding['cellFormId']=8
+                    if mode=='cell-new-globals':binding['globalFormIds'][0]=9
                 active=lease is not None and not restored
-                payload=dict(ok=not(action=='release' and mode=='release-failed'),action=action,
+                unavailable=mode=='cell-unavailable' and lease is not None and status_calls>1
+                payload=dict(ok=not(action=='release' and not restored),action=action,
                              status='held' if action=='hold' else 'released' if action=='release' else 'observed',
                              schemaVersion=1,plugin='devbench',binding=binding.copy(),frame=1,
-                             readbackFresh=True,available=True,worldLoaded=True,
-                             values=dict(values,calendarRate=0 if active else 20),
+                             readbackFresh=True,available=not unavailable,worldLoaded=True,
+                             values=dict(values,calendarRate=21 if mode=='cell-foreign-rate' and lease and status_calls>1 else 0 if active else 20),
                              outstanding=active,leaseActive=active,expiryDue=False,cleanupPending=False,
                              holdValid=active,serviceStopping=False,restored=restored,
-                             lastTransition=dict(ok=True,status='released',restored=restored))
-                if lease:payload['lease']=lease
+                             lastTransition=dict(ok=True,status='released',restored=restored and mode!='cell-no-transition'))
+                if lease:
+                    payload['lease']=json.loads(json.dumps(lease))
+                    if restored and action=='status' and mode=='cell-lease-id':payload['lease']['id']='foreign-lease'
             else:
                 self.reply({'error':'unexpected fixture tool'},400); return
             result=dict(isError=False,content=[dict(type='text',text=json.dumps(payload))])

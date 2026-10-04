@@ -7,7 +7,8 @@ Import-Module (Join-Path $PSScriptRoot 'CalendarObservationWindow.psm1') -Force
 $checks=0
 function Require([bool]$Condition,[string]$Message) { if(-not $Condition){throw $Message}; $script:checks++ }
 function Clone($Object){return $Object | ConvertTo-Json -Depth 30 | ConvertFrom-Json -Depth 30}
-foreach($mode in @('healthy','failed-observation','expired','generation','globals','cell','foreign-owner','wrong-session','lost-hold','late-hold','late-response','release-failed','restore-proof','no-prior-rate','boolean-prior-rate','schema-string','wrong-pid','uncertain-no-lease','stale-initial','deadline')) {
+$modes=@('healthy','failed-observation','expired','generation','globals','cell','foreign-owner','wrong-session','lost-hold','late-hold','late-response','release-failed','restore-proof','no-prior-rate','boolean-prior-rate','schema-string','wrong-pid','uncertain-no-lease','stale-initial','deadline','cell-generation','cell-globals','cell-process-session','cell-unavailable','cell-foreign-rate','cell-lease-id','cell-captured-rate','cell-release-lease-id','cell-no-transition','cell-release-failed')
+foreach($mode in $modes) {
     $script:mode=$mode; $script:calls=[Collections.Generic.List[object]]::new(); $script:held=$false; $script:released=$false; $script:statusCount=0; $script:holdId=$null; $script:owner=$null
     $script:binding=[pscustomobject]@{processSession='123:456';pid=123;loadGeneration=1;cellFormId=7;globalFormIds=@(1,2,3,4,5,6)}
     $script:values=[pscustomobject]@{year=201;month=1;day=1;gameHour=12;daysPassed=1;calendarRate=20;engineMultiplier=1}
@@ -26,7 +27,9 @@ foreach($mode in @('healthy','failed-observation','expired','generation','global
         if($arguments.action -eq 'release') {
             Require ($arguments.leaseId -ceq 'fixture-lease') 'Exact lease was not released'
             Require ($arguments.owner -ceq $script:owner) 'Exact owner was not released'
-            if($script:mode -eq 'release-failed'){throw 'fixture release failure'}
+            Require (($arguments.binding|ConvertTo-Json -Depth 10 -Compress) -ceq ($script:binding|ConvertTo-Json -Depth 10 -Compress)) 'Cleanup substituted current scene binding'
+            Require ($arguments.commandId -cne $script:holdId) 'Cleanup reused hold command ID'
+            if($script:mode -in @('release-failed','cell-release-failed')){throw 'fixture release failure'}
             $script:released=$true
         }
         if($arguments.action -eq 'status'){$script:statusCount++}
@@ -53,6 +56,24 @@ foreach($mode in @('healthy','failed-observation','expired','generation','global
             }
         }
         if($script:mode -eq 'restore-proof' -and $script:released){$payload.lastTransition.restored=$false}
+        if($script:held -and $script:statusCount -gt 1 -and ($script:mode -eq 'cell' -or $script:mode.StartsWith('cell-'))) {
+            # Drift persists through release and fresh status, unlike the old
+            # transient cell negative. The retained lease binding stays original.
+            $payload.binding.cellFormId=8
+            switch($script:mode) {
+                'cell-generation' {$payload.binding.loadGeneration=2}
+                'cell-globals' {$payload.binding.globalFormIds[0]=9}
+                'cell-process-session' {$payload.binding.processSession='123:other-incarnation'}
+                'cell-unavailable' {$payload.available=$false}
+                'cell-foreign-rate' {if($script:released){$payload.values.calendarRate=21;$payload.restored=$false}}
+                'cell-release-lease-id' {if($arguments.action -eq 'release'){$payload.lease.id='foreign-lease'}}
+                'cell-no-transition' {if($script:released){$payload.lastTransition.restored=$false}}
+            }
+            if($script:released -and $arguments.action -eq 'status') {
+                if($script:mode -eq 'cell-lease-id'){$payload.lease.id='foreign-lease'}
+                if($script:mode -eq 'cell-captured-rate'){$payload.lease.captured.calendarRate=21}
+            }
+        }
         return [pscustomobject]@{content=@($payload)}
     }
     $assertSession={if($script:mode -eq 'wrong-session' -and $script:held){throw 'fixture session mismatch'}}
@@ -66,6 +87,15 @@ foreach($mode in @('healthy','failed-observation','expired','generation','global
     if($mode -in @('failed-observation','expired','generation','globals','cell','foreign-owner','lost-hold','late-hold','late-response')){Require $script:released "$mode skipped same-session original exact cleanup"}
     if($mode -in @('wrong-session','uncertain-no-lease','no-prior-rate','boolean-prior-rate')){Require (-not $script:released) "$mode adopted unknown cleanup authority"}
     if($mode -in @('stale-initial','deadline','schema-string','wrong-pid')){Require (-not $script:held) "$mode dispatched despite rejected admission"}
+    if($mode -eq 'cell') {
+        Require $result.restorationVerified 'Cell drift hid positively verified native restoration'
+        Require (-not $result.continuityVerified -and -not $result.indeterminate) 'Cell cleanup was confused with scientific continuity or uncertainty'
+        Require (@($script:calls|Where-Object name -ne 'calendar').Count -eq 0) 'Cell drift allowed an observation'
+    }
+    if($mode.StartsWith('cell-')) {
+        Require (-not $result.restorationVerified -and -not $result.continuityVerified -and $result.indeterminate) "$mode falsely qualified cleanup"
+        Require (@($script:calls|Where-Object name -ne 'calendar').Count -eq 0) "$mode allowed an observation"
+    }
 }
 # Exercise refusal through the actual public production entry point before it
 # opens any network session. Native operation tests above substitute only RPC.
@@ -79,4 +109,4 @@ try {
         Require (-not $actual.ok -and -not $actual.dispatchReached -and $actual.sessionCleanup.state -eq 'not_opened') 'Production entry accepted an intrusive observation'
     }
 }finally{Remove-Item -LiteralPath $temp -Recurse -Force}
-[pscustomobject]@{ok=$true;checks=$checks;cases=20;liveQualification=$false} | ConvertTo-Json -Compress
+[pscustomobject]@{ok=$true;checks=$checks;cases=$modes.Count;liveQualification=$false} | ConvertTo-Json -Compress

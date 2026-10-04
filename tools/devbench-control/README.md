@@ -29,6 +29,19 @@ downgrade, or unrelated lease adoption. An absent/failed cleanup proof is
 explicitly indeterminate. A failed observation may still have separately
 verified restoration; it never becomes a successful observation window.
 
+Cell drift invalidates observation continuity, but cleanup can independently be
+verified in a different cell. Release still uses the original exact `lease.binding`
+and lease ID on the same actual MCP session, with a distinct release command ID.
+Native restoration must positively succeed after its private SameStorage/owned-zero
+check. Both the release receipt and a fresh status must preserve process session,
+PID, load generation and all six global IDs, retain the exact original lease and
+captured rate, and show no outstanding custody and the restored prior rate; fresh
+`lastTransition` must also affirm restoration. Only the current contextual cell may
+differ for cleanup proof. No current-binding substitution, foreign-rate overwrite,
+generation adoption, lease disappearance inference or automatic retry is permitted.
+Raw release/status remain evidence; public IDs do not expose or replace native
+storage-address checks. Offline proof is not a live restoration guarantee.
+
 This first interface admits only existing allowlisted non-mutating reads. It
 does not start capture, arm probes, change quality/weather/physics, save, jump
 time, or promise an atomic rendered frame or invariant lighting. Experiment
