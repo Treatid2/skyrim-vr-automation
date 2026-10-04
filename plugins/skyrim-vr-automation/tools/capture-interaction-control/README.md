@@ -56,6 +56,15 @@ Incomplete identity is not filled from bootstrap flags or an adjacent runtime.
 Outer `observe.ok` means an observation report was produced; a screenshot error
 or null `frameSubmission` is not a successful image capture.
 
+Native v1 still `request_get` uses only the controller-qualified owned receipt,
+not a guessed terminal flag or file-existence test. On-demand observation binds
+it to the original accepted capture command, reads that request through native
+encoding/finalization, and submits only a successful committed artifact. A
+qualified failed terminal request retains its receipt and errors but produces
+no `frameSubmission`; successful query and successful capture remain separate.
+This adapter does not claim support for native sequence receipts or qualify an
+experiment's stereo/frame correlation. Reconciliation never repeats capture.
+
 `-MaximumFrames` accepts up to 60,000 frames, matching the current DevBench
 recording ceiling. Sequence admission still uses the live screenshot capability
 receipt, so a lower server frame or duration limit fails before mutation. Stop

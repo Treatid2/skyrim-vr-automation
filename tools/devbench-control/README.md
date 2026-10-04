@@ -226,9 +226,20 @@ capabilities require the version-1 schema plus positive integral frame and
 duration limits before clients may use them for mutation preflight. Screenshot
 `status`, `settings_get`, `request_get`, `request_list`, and `events_poll` each
 have an action-specific structured read contract. In particular, `request_get`
-requires the exact requested ID, a non-empty state, and a Boolean terminal flag;
-this admits both valid running and terminal receipts without accepting a foreign
-or malformed receipt.
+requires the exact requested ID, a non-empty state, and a Boolean terminal flag
+for legacy flat receipts. Native `csx.screenshot` 1.0/schemaRevision1 **still**
+receipts instead qualify exact query/client/request/original-capture bindings,
+producer build/session, native RequestRecord state, explicit UTC chronology,
+settled publication, typed progress/output inventories and committed artifact
+byte/hash/encoding evidence. Only then does `semantic.qualifiedScreenshotRequest`
+derive terminal/requestSucceeded and flatten nested artifact metadata for frame
+selection. The raw envelope is unchanged. Native sequence/sequence-frame receipts
+are not qualified by this still adapter. `staging` is not an accepted native
+RequestRecord state; unresolved publication and contradictory terminal evidence
+fail closed. Typed source-bound historical capture errors/warnings remain in the
+projection: a valid read of a failed capture is **not** successful capture.
+Outer query errors and other nested failures still veto qualification. This is
+owned-request observation only, not frame synchronization or science admission.
 Replay completion receipts containing only scheduler facts such as `done`,
 `runId`, and `stepsRun` are classified as
 `scheduler-complete-unverified`, not semantic success. A replay response must
