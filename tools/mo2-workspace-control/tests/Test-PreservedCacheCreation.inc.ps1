@@ -9,6 +9,7 @@ $cache = Join-Path $mo2 'overwrite\ShaderCache'
 $originalCacheHash = (Get-FileHash -LiteralPath (Join-Path $cache 'fixture.bin')).Hash
 $originalSourceHash = Get-TestProfileFingerprint $source
 $originalFixtureHash = (Get-FileHash -LiteralPath $fixtureManifestPath).Hash
+if ($DisabledInventoryOnly) { [void][IO.Directory]::CreateDirectory((Join-Path $mods 'Installed unlisted fixture')) }
 $originalModCount = @(Get-ChildItem -LiteralPath $mods -Directory).Count
 $originalProfileCount = @(Get-ChildItem -LiteralPath $profiles -Directory).Count
 $legacy = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label legacy -SavePolicy VerifiedFixture -WorkspaceContent Modlist -Confirm:$false -NoExit | ConvertFrom-Json
@@ -66,6 +67,7 @@ $prepared = & $catalogEntry prepare -CatalogRoot $catalogRoot -CachePath $output
 Assert-Preserved ($prepared.ok) 'Ordinary cache prepare did not snapshot/materialize the preserved baseline.'
 $isolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $createdBaseline.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
 Assert-Preserved ($isolation.ok -and $isolation.cachePlan.verification.ok) 'Prepared provider/owner/cache proof failed.'
+if ($DisabledInventoryOnly) { . (Join-Path $PSScriptRoot 'Test-DisabledInventoryRecovery.inc.ps1') }
 [IO.File]::WriteAllText((Join-Path $cache 'generated-task.pso'),'isolated-fixture-output')
 $completed = & $catalogEntry complete -CatalogRoot $catalogRoot -CachePath $output.cachePath -EvidenceDirectory $output.cacheEvidenceDirectory -WorkingSetStatus unverified -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json
 Assert-Preserved ($completed.ok) 'Catalog completion failed.'
@@ -73,6 +75,21 @@ $completedOutput = & $entry complete-output -ConfigPath $configPath -AccessId $a
 Assert-Preserved ($completedOutput.ok -and -not (Test-Path -LiteralPath $marker)) 'Workspace completion failed to restore/release exact output ownership.'
 Assert-Preserved ((Get-FileHash -LiteralPath (Join-Path $cache 'fixture.bin')).Hash -ceq $originalCacheHash -and @(Get-ChildItem -LiteralPath $cache -File -Recurse).Count -eq 1 -and -not (Test-Path -LiteralPath (Join-Path $cache 'generated-task.pso'))) 'Completion did not restore the exact cache baseline.'
 Assert-Preserved ((Get-TestProfileFingerprint $source) -ceq $originalSourceHash -and (Get-FileHash -LiteralPath $fixtureManifestPath).Hash -ceq $originalFixtureHash) 'Completion changed maintained fixture state.'
+if ($DisabledInventoryOnly) {
+    $normalized = Invoke-DisabledCase normalize-installed
+    Assert-Preserved ($normalized.ok -and $normalized.state -eq 'disabled-inventory-normalized-resume-required') "Completed profile normalization failed: $($normalized.errors -join ';')"
+    Assert-Preserved (([IO.File]::ReadAllText($createdBaseline.data.modListPath)).Contains('-Late installed two')) 'Normalization omitted an installed disabled mod.'
+    $newHash = (Get-FileHash -LiteralPath $createdBaseline.data.modListPath).Hash
+    $resumed = & $entry resume -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $createdBaseline.data.workspaceId -NoExit -Confirm:$false | ConvertFrom-Json
+    Assert-Preserved ($resumed.ok -and $resumed.data.runtimeOutput.communityShadersPlugin.profileSha256 -ceq $newHash) "Resume did not freshly pin normalized bytes: $($resumed.errors -join ';')"
+    $output = $resumed.data.runtimeOutput
+    $prepared = & $catalogEntry prepare -CatalogRoot $catalogRoot -CachePath $output.cachePath -ProfilePath $createdBaseline.data.modListPath -ModsPath $mods -BindToOverwrite -EvidenceDirectory $output.cacheEvidenceDirectory -BuildId $output.cachePrepareArguments.BuildId -ShaderCacheAbi $output.cachePrepareArguments.ShaderCacheAbi -WorkspaceId $createdBaseline.data.workspaceId -OwnershipId $createdBaseline.data.ownershipId -OwnerMarkerPath $output.ownerMarkerPath -OwnerMarkerSha256 $output.ownerMarkerSha256 -ShaderSourceSha256 ([string]::new([char]'A',64)) -RequireMaterializedOutput -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json
+    Assert-Preserved ($prepared.ok) 'Normalized generation did not prepare.'
+    $completed = & $catalogEntry complete -CatalogRoot $catalogRoot -CachePath $output.cachePath -EvidenceDirectory $output.cacheEvidenceDirectory -WorkingSetStatus unverified -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json
+    Assert-Preserved ($completed.ok) 'Normalized generation did not complete.'
+    $completedOutput = & $entry complete-output -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $createdBaseline.data.workspaceId -Confirm:$false -NoExit | ConvertFrom-Json
+    Assert-Preserved ($completedOutput.ok -and -not (Test-Path -LiteralPath $marker)) 'Normalized resumed generation did not release output custody.'
+}
 $releasedAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
 Assert-Preserved ([bool]$releasedAccess.ok) 'Fixture access release failed.'
-[pscustomobject]@{ok=$true;checks=$script:preservedChecks;mode='preserved-cache-only';runtimeQualified=$false} | ConvertTo-Json -Compress
+[pscustomobject]@{ok=$true;checks=$script:preservedChecks;mode=$(if ($DisabledInventoryOnly) { 'disabled-inventory-only' } else { 'preserved-cache-only' });runtimeQualified=$false} | ConvertTo-Json -Compress
