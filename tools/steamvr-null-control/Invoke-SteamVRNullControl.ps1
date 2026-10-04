@@ -1366,10 +1366,28 @@ function Get-NullRuntimeEvidence {
     }
     $providerLogReady = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active -and $null -ne $headPoseLoaded -and $null -ne $headPoseRegistered
     $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified -and $packageAuthority.verified -and $headPoseState.driverCreatorPid -eq $server[0].id -and [uint64][DateTime]::Parse($server[0].startTimeUtc).ToUniversalTime().ToFileTimeUtc() -eq $headPoseState.creatorAuthority.processStartFileTimeUtc) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -PreProbePose $headPoseState -PreProbePackageAuthority $packageAuthority -DeadlineUtc $DeadlineUtc } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider creator/package is not ready for an application-facing pose probe.' } }
+    $preProbeServerProcess = if ($server.Count -eq 1) { $server[0] } else { $null }
+    $serverProcess = $preProbeServerProcess
+    if ($applicationHeadPose.qualified) {
+        # Continuity proves identity, not freshness of non-identity pose fields.
+        # Publish the already-validated post-probe snapshot without another probe.
+        $headPoseState = $applicationHeadPose.poseAfterProbe
+        $packageAuthority = $applicationHeadPose.packageAuthority
+        $creator = $headPoseState.creatorAuthority
+        $serverProcess = [pscustomobject][ordered]@{
+            name = 'vrserver'
+            id = $creator.pid
+            path = $creator.executablePath
+            startTimeUtc = [DateTime]::FromFileTimeUtc([long]$creator.processStartFileTimeUtc).ToString('o')
+        }
+    }
     $runtimeEvidence = [pscustomobject][ordered]@{
         active = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active
-        serverProcess = if ($server.Count -eq 1) { $server[0] } else { $null }
+        serverProcess = $serverProcess
+        serverProcessEvidence = if ($applicationHeadPose.qualified) { 'validated-post-probe-creator-authority' } else { 'pre-probe-process-inventory-unqualified' }
+        preProbeServerProcess = $preProbeServerProcess
         steamVrProcesses = $owned
+        steamVrProcessesEvidence = 'pre-probe-process-inventory'
         unprovenProcesses = @($Processes | Where-Object { $_ -notin $owned })
         serverLogPath = $ServerLogPath
         serverLogSha256 = if ($tailState -and [bool]$tailState.stable -and [bool]$tailState.usable) { [string]$tailState.continuitySha256 } else { $null }
