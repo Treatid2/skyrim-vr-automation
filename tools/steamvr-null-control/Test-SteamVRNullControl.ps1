@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([string]$FixtureDriverPackagePath)
 
 Set-StrictMode -Version Latest
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -96,6 +96,10 @@ try {
     [IO.File]::WriteAllText((Join-Path $headPoseDriverRoot '.csx-vr-automation-driver.json'), '{"schemaVersion":1,"driverName":"codex_head_pose"}')
     $headEntry = Join-Path $PSScriptRoot '..\steamvr-head-pose-control\Invoke-SteamVRHeadPoseControl.ps1'
     $fixtureBundle = Join-Path $PSScriptRoot '..\..\drivers\codex_head_pose'
+    if ($FixtureDriverPackagePath) {
+        $fixtureBundle = [IO.Path]::GetFullPath($FixtureDriverPackagePath)
+        $PSDefaultParameterValues['Invoke-SteamVRNullControl.ps1:HeadPoseExpectedProvenanceSha256'] = (Get-FileHash -LiteralPath (Join-Path $fixtureBundle 'build-provenance.json') -Algorithm SHA256).Hash
+    }
     # Actual install transaction; no vrpathreg execution because this exact
     # temporary root is already registered. Mask only named SteamVR queries.
     function Get-Process {
@@ -591,6 +595,7 @@ try {
 
     Copy-Item -LiteralPath $env:ComSpec -Destination $startupPath -Force
     $authorizationDeniedStart = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint head-pose-access-denied-after-start -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    if (-not (Test-Path -LiteralPath (Join-Path $evidence 'steamvr-null-runtime.receipt.json'))) { throw "Authorization-denial fixture produced no receipt: $($authorizationDeniedStart | ConvertTo-Json -Depth 12 -Compress)" }
     $authorizationDeniedReceipt = Get-Content -LiteralPath (Join-Path $evidence 'steamvr-null-runtime.receipt.json') -Raw | ConvertFrom-Json
     if (-not $authorizationDeniedStart.data.PSObject.Properties['startupCleanup']) { throw "Fixture authorization-denied start did not reach cleanup: $($authorizationDeniedStart | ConvertTo-Json -Depth 12 -Compress)" }
     Assert-Test (-not $authorizationDeniedStart.ok -and $authorizationDeniedStart.state -eq 'head-pose-provider-authorization-failed' -and $authorizationDeniedStart.data.startupCleanup -and @($authorizationDeniedStart.data.startupCleanup.remaining).Count -eq 0) 'startup authorization denial stops every exact SteamVR process started by the attempt'
