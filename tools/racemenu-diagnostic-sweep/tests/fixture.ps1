@@ -4,10 +4,14 @@
 param([Parameter(Position=0)][string]$Command,[string]$SessionPath,
  [string]$DevBenchScriptPath,[string]$DirectTool,[string]$DirectArgumentsJson,
  [string]$Tool,[string]$ArgumentsJson,[string]$RuntimePath,[string]$ExpectedRuntimeIdentityJson,
+ [string]$ArtifactPath,[string]$ExpectedBuildId,[string]$ExpectedArtifactSha256,
  [switch]$Compact,[switch]$NoExit,[switch]$RequireSuccess,
  [int]$MaxTransientRetries,[int]$TimeoutSeconds,[int]$RequestTimeoutSeconds)
 $ErrorActionPreference='Stop'
 if ($Command -eq 'call') {
+ # Current real CaptureInteraction inherits these exact bootstrap expectations.
+ # Older scoped capture context supplies only ExpectedRuntimeIdentityJson.
+ if ($ArtifactPath -and ($ArtifactPath -cne 'fixture.dll' -or $ExpectedBuildId -cne 'fixture' -or $ExpectedArtifactSha256 -cne ('a'*64))) { throw 'Fixture capture artifact expectations drifted.' }
  $state=Get-Content -LiteralPath $RuntimePath -Raw | ConvertFrom-Json
  if ($state.PSObject.Properties['hang'] -and $state.hang -eq $true) { Start-Sleep -Seconds 20 }
  $state | Add-Member -NotePropertyName retries -NotePropertyValue $MaxTransientRetries -Force
