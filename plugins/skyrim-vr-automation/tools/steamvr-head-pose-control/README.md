@@ -17,6 +17,25 @@ separately reviewed build.
 .\Invoke-SteamVRHeadPoseControl.ps1 set -EyeHeightMeters 1.68 -YawDegrees 0
 ```
 
+For native PowerShell7 `-File` argv, pass the nullable Boolean as **one**
+argument, `-Enabled:true` or `-Enabled:false`. Do not pass `-Enabled` followed
+by the literal text `$true`/`$false`: separate file arguments are strings and
+that shape fails parameter transformation before this controller executes.
+Omit `Enabled` to preserve the current enabled state during coordinate-only
+updates. An in-process PowerShell script invocation may still use
+`-Enabled $true`/`$false` as actual Boolean expressions.
+
+```text
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <exact-current-controller.ps1> set -Enabled:true -EyeHeightMeters 1.68 -YawDegrees 0 -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <same-current-controller.ps1> set -Enabled:false -Compact
+```
+
+`Test-HeadPoseFileArgv.ps1` checks the actual `-File` parameter boundary on an
+isolated random map, including refusal/no mutation when creator authority is
+unqualified. It does not enable/disable a live HMD or prove driver
+acknowledgement. This syntax applies to the existing nullable Boolean
+interface; no new wrapper, controller/driver upgrade or host refresh is needed.
+
 The runtime contract is the owner-only, version-2 memory map
 `Local\CSXVRHeadPose-v2`. Writers take a named single-writer lease, use
 interlocked odd/even sequence publication, and include a random command nonce.
