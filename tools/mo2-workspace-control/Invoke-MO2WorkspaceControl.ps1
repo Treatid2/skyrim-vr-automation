@@ -2560,13 +2560,22 @@ try {
         $resolvedTaskId = Resolve-TaskId -RequestedTaskId $TaskId -Required
         $sourceName = if (-not [string]::IsNullOrWhiteSpace($SourceProfile)) { $SourceProfile } elseif ($config.defaults.PSObject.Properties['testProfileSource']) { [string]$config.defaults.testProfileSource } else { throw 'defaults.testProfileSource is required; test workspaces never infer a stable source from the ordinary session default.' }
         $sourcePath = Resolve-DirectProfilePath -ProfilesRoot $profilesRoot -ProfileName $sourceName
-        $validation = Assert-AccessAndClosed -Config $config -OwnedAccessId $AccessId -Profile $sourceName
+        $validation = Assert-AccessAndClosed -Config $config -OwnedAccessId $AccessId -Profile $sourceName -AllowOverwriteShaderCaches
         $accessStatus = Invoke-MO2AccessStatus -Config $config -AccessId $AccessId
         if (-not $accessStatus.ok -or -not $accessStatus.data.owned) { throw 'The exact MO2 access lease is not owned by this task.' }
         $runtimeRoute = $accessStatus.data.access.runtimeRoute
         if (-not (Test-Path -LiteralPath $sourcePath -PathType Container)) { throw "Stable source profile does not exist: $sourceName" }
         $unmanagedCaches = @(Get-OverwriteShaderCacheDirectories -Config $config)
-        if ($unmanagedCaches.Count -gt 0) { throw "Overwrite contains ShaderCache folders. Run prepare-source for '$sourceName' before creating a task workspace: $($unmanagedCaches.FullName -join ', ')" }
+        $canonicalCache = Join-Path ([IO.Path]::GetFullPath([string]$config.mo2.overwriteDirectory)) 'ShaderCache'
+        $legacyCaches = @($unmanagedCaches | Where-Object { -not (Test-WorkspaceSamePath -Left $_.FullName -Right $canonicalCache) })
+        if ($legacyCaches.Count -gt 0) { throw "Overwrite contains legacy ShaderCache folders outside the preserved canonical baseline. Run prepare-source for '$sourceName' only with explicit migration authority: $($legacyCaches.FullName -join ', ')" }
+        if ($validation.data.overwrite.truncated -or @($validation.data.overwrite.errors).Count -gt 0) { throw 'Overwrite baseline inspection is incomplete or failed; workspace creation cannot preserve unclassified state.' }
+        if (Test-Path -LiteralPath $canonicalCache) {
+            if (-not (Test-Path -LiteralPath $canonicalCache -PathType Container)) { throw 'Canonical Overwrite ShaderCache baseline is not a directory.' }
+            # Read-only bounded inventory before cloning/claiming. Creation leaves these
+            # bytes untouched; catalog prepare snapshots them before materialization.
+            $null = Get-WorkspaceOutputInventory -Path $canonicalCache -Purpose 'Preserved Overwrite ShaderCache baseline'
+        }
         $localWorkCatalog = Get-LocalWorkModCatalog -Config $config -SourcePath $sourcePath -ModsRoot $modsRoot
         $localWorkSelection = Resolve-LocalWorkModSelection -Catalog $localWorkCatalog -Content $WorkspaceContent -RequestedIds $resolvedLocalWorkModIds
         $workspaceId = '{0}-{1}-{2}' -f ([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ').ToLowerInvariant()), (Get-SafeName $Label), ([guid]::NewGuid().ToString('N').Substring(0, 8))

@@ -28,6 +28,15 @@ sources; `-WhatIf` reports the planned mutation without moving anything.
 `create` snapshots the exact Overwrite `backup` tree and later cache `prepare`
 snapshots the exact Overwrite `ShaderCache` tree.
 
+Fresh `create` may preserve an existing canonical `overwrite\ShaderCache`
+baseline without running `prepare-source` or changing the maintained profile
+and its fixture fingerprint. It inventories that exact tree read-only under
+the workspace bounds, rejects incomplete scans/reparse points, and leaves its
+bytes untouched. Legacy `.previous`, `.swap` or nested cache roots still require
+explicit migration authority. Creation is not launch readiness: ordinary catalog
+`prepare -BindToOverwrite` must snapshot the baseline and materialize provider
+shadows, and normal completion must preserve task output and restore the baseline.
+
 The task must own an MO2 access lease. MO2, Skyrim, loaders, and active
 RootBuilder deployment must be closed before `create`, `resume`, `register-mod`,
 or `retire`. Release any evidence session before mutating the workspace. All

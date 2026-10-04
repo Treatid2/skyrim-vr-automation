@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 [CmdletBinding()]
-param([switch]$DiscoveryOnly, [switch]$RequalificationOnly, [switch]$UnchangedCompletionOnly, [switch]$ConfigCustodyOnly, [string]$FixtureRoot)
+param([switch]$DiscoveryOnly, [switch]$RequalificationOnly, [switch]$UnchangedCompletionOnly, [switch]$ConfigCustodyOnly, [switch]$PreservedCacheOnly, [string]$FixtureRoot)
 
 $ErrorActionPreference = 'Stop'
 $entry = Join-Path (Split-Path -Parent $PSScriptRoot) 'Invoke-MO2WorkspaceControl.ps1'
@@ -204,6 +204,10 @@ try {
         $releasedAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
         if (-not $releasedAccess.ok) { throw 'Discovery-only access release failed.' }
         [pscustomobject]@{ ok = $true; assertions = 2; mode = 'discovery-only' } | ConvertTo-Json
+        return
+    }
+    if ($PreservedCacheOnly) {
+        . (Join-Path $PSScriptRoot 'Test-PreservedCacheCreation.inc.ps1')
         return
     }
     $profileCountBeforeMissingContent = @(Get-ChildItem -LiteralPath $profiles -Directory -Force).Count
