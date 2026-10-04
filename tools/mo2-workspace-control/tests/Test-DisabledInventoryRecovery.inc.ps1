@@ -3,6 +3,7 @@
 function Invoke-DisabledCase([string]$Operation, [hashtable]$Extra = @{}) {
     $arguments = @{ ConfigPath = $configPath; AccessId = $accessId; TaskId = $taskId; WorkspaceId = $createdBaseline.data.workspaceId; ExpectedCurrentSha256 = (Get-FileHash -LiteralPath $createdBaseline.data.modListPath).Hash; NoExit = $true; Confirm = $false; Compact = $true }
     foreach ($key in $Extra.Keys) { $arguments[$key] = $Extra[$key] }
+    if ($Operation -eq 'recover-disabled-append') { $arguments.DisabledModNamesFile = $disabledNamesFile }
     return & $entry $Operation @arguments | ConvertFrom-Json -Depth 40
 }
 $profile = $createdBaseline.data.modListPath
@@ -18,7 +19,10 @@ Assert-Preserved $staged.ok 'Fixture config stage failed.'
 $bound = & $entry bind-config -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $createdBaseline.data.workspaceId -NoExit -Confirm:$false | ConvertFrom-Json
 Assert-Preserved $bound.ok 'Fixture config bind failed.'
 foreach ($name in @('Late installed one','Late installed two')) { [void][IO.Directory]::CreateDirectory((Join-Path $mods $name)) }
-[IO.File]::AppendAllText($profile, "-Late installed one`r`n-Late installed two`r`n", [Text.UTF8Encoding]::new($false))
+$disabledNamesFile=Join-Path $fixture 'inserted-disabled-names.json'
+[IO.File]::WriteAllText($disabledNamesFile,'["Late installed one","Late installed two"]',[Text.UTF8Encoding]::new($false))
+$pinnedText=[Text.Encoding]::UTF8.GetString($pinnedBytes)
+[IO.File]::WriteAllBytes($profile,[Text.Encoding]::UTF8.GetBytes($pinnedText.Insert($pinnedText.IndexOf("`n")+1,"-Late installed one`r`n-Late installed two`r`n")))
 $driftHash = (Get-FileHash -LiteralPath $profile).Hash
 $configHeld = Invoke-DisabledCase recover-disabled-append
 Assert-Preserved (-not $configHeld.ok -and ($configHeld.errors -join ';') -match 'Complete configuration custody' -and (Get-FileHash -LiteralPath $profile).Hash -ceq $driftHash) 'Recovery bypassed active config custody.'

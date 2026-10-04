@@ -12,6 +12,7 @@ param(
     [string]$TaskId,
     [ValidatePattern('^[A-Fa-f0-9]{64}$')]
     [string]$ExpectedCurrentSha256,
+    [string]$DisabledModNamesFile,
     [string]$UnmanagedConfigPath,
     [string]$ConfigScopeNote,
     [string]$Label = 'task',
