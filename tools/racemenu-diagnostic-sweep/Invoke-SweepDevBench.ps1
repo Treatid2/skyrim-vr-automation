@@ -5,6 +5,7 @@ param(
     [Parameter(Position=0)][ValidateSet('call')][string]$Command,
     [string]$Tool, [string]$ArgumentsJson, [string]$RuntimePath,
     [string]$ExpectedRuntimeIdentityJson,
+    [string]$ArtifactPath, [string]$ExpectedBuildId, [string]$ExpectedArtifactSha256,
     [switch]$RequireSuccess, [switch]$Compact, [switch]$NoExit
 )
 $ErrorActionPreference = 'Stop'
@@ -16,8 +17,13 @@ if ([string]::IsNullOrWhiteSpace($env:RACEMENU_SWEEP_DEVBENCH_SCRIPT) -or
 $remaining = ([DateTimeOffset]::Parse($env:RACEMENU_SWEEP_DEADLINE_UTC) - [DateTimeOffset]::UtcNow).TotalSeconds
 if ($remaining -le 0) { throw 'Sweep call deadline expired before dispatch.' }
 $budget = [Math]::Max(1, [Math]::Min(30, [Math]::Ceiling($remaining)))
+$artifactExpectations=@{}
+foreach($name in @('ArtifactPath','ExpectedBuildId','ExpectedArtifactSha256')) {
+    if($PSBoundParameters.ContainsKey($name)) { $artifactExpectations[$name]=$PSBoundParameters[$name] }
+}
 $raw = & $env:RACEMENU_SWEEP_DEVBENCH_SCRIPT call -Tool $Tool -ArgumentsJson $ArgumentsJson `
     -RuntimePath $RuntimePath -ExpectedRuntimeIdentityJson $ExpectedRuntimeIdentityJson `
+    @artifactExpectations `
     -RequireSuccess:$RequireSuccess -Compact:$Compact -NoExit:$NoExit `
     -MaxTransientRetries 0 -TimeoutSeconds $budget -RequestTimeoutSeconds $budget
 $response = $raw | ConvertFrom-Json -Depth 100
