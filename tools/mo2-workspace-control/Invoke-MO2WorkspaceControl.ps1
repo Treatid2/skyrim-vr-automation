@@ -1115,8 +1115,15 @@ function New-RearmedWorkspaceRuntimeOutput($Config, $Workspace, [string]$Operati
     $old = $Workspace.data.runtimeOutput
     if ([string]$old.mode -cne 'mo2-overwrite-output') { throw 'Only MO2 Overwrite output transactions can be rearmed.' }
     if (Test-Path -LiteralPath ([string]$old.ownerMarkerPath) -PathType Leaf) { throw 'A retained workspace still owns an active MO2 Overwrite transaction; complete it before resuming.' }
-    if ($null -eq $RequalificationProof) { $null = Get-WorkspaceCompletedRuntimeOutputEvidence -Config $Config -Workspace $Workspace }
-    else { Assert-WorkspaceRequalificationBoundary -Config $Config -Workspace $Workspace -Proof $RequalificationProof }
+    if ($null -ne $RequalificationProof) {
+        Assert-WorkspaceRequalificationBoundary -Config $Config -Workspace $Workspace -Proof $RequalificationProof
+    }
+    else {
+        # The complete terminal proof includes the strict unchanged-failure
+        # cache proof when no output was generated. Requalification instead
+        # uses its separate exact admission above, not fabricated completion.
+        $null = Get-WorkspaceCompletedRuntimeOutputEvidence -Config $Config -Workspace $Workspace
+    }
 
     $workspaceId = [string]$Workspace.data.workspaceId
     $ownershipId = [string]$Workspace.data.ownershipId
