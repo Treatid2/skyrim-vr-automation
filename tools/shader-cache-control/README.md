@@ -144,6 +144,50 @@ different. With no match it safely leaves the current tree in use; add
 Repeating `prepare` with the same immutable cache, evidence, and catalog
 identities reconciles and returns the existing prepared plan.
 
+### Opt-in same-task preserved working-cache resume
+
+To resume a completed **unverified** working cache from the same retained MO2
+workspace, add both `-ResumeCompletionPath <shader-cache-task.completion.json>`
+and `-ExpectedResumeCompletionSha256 <exact file SHA-256>` to `prepare` in a
+**new** evidence directory. This explicit source takes precedence over catalog
+selection for this preparation only. The normal `selection` remains an honest
+known-working catalog result; the separate `resume` receipt identifies the
+unverified source. A cold target reports `seed-same-task-unverified`, and an
+already-identical target reports `use-current-resume-exact`. Omitting this
+option retains the existing known-working-only default. `select` never admits
+these task results.
+
+Resume requires `-BindToOverwrite`, the exact currently verified workspace and
+ownership IDs, unchanged profile path/hash and mods/cache roots, and the exact
+Community Shaders DLL and manifest identities. The prior session's owner-marker
+hash may differ: a new marker is verified independently, not mistaken for the
+old session. ABI, shader-source hash, build, game runtime, bytecode class, exact
+render path, tags, and optional feature/preset fingerprints must agree with
+the original plan. A supplied fingerprint cannot substitute for an absent old
+one. Unknown fingerprints remain explicitly unknown in the resume receipt;
+matching nulls do not establish effective-feature or preset equivalence.
+
+The controller validates the completed/restored plan, original snapshot,
+unique committed restore receipt and existing journal, and the preserved
+tree's bounded file/hash/byte inventory. Failed, promoted, incomplete,
+foreign-owner, incompatible, missing, empty, ambiguous or drifted evidence
+refuses **before** snapshot/seed; it never silently falls back to a cold cache.
+Historical proof validates preserved data, not today's shared live baseline,
+and never repairs an old journal. `-WhatIf` validates without mutation.
+`-AllowSourceMismatch` and `-RequireMatch` cannot be combined with this option;
+the latter retains its meaning of requiring a known-working catalog match.
+Prepared-plan retries must retain the same pinned resume proof.
+
+The existing seed transaction snapshots the **new** pre-task tree and runs
+normal provider shadowing. Completion preserves the task result and restores
+that new baseline. Resume never changes the old completion or publishes an
+unverified global catalog object. Later promotion still requires independently
+affirmative known-working evidence and explicit `complete -Promote` authority.
+Same-task here means the same retained workspace/ownership identity, not an
+arbitrary label or a new task borrowing another task's directory. It does not
+guarantee CSX will accept every bytecode file, avoid recompilation, or reproduce
+visual results. Retain native cache-validation and compile logs separately.
+
 With `-BindToOverwrite`, `prepare` binds the exact profile hash, mods root, and
 physical `overwrite\ShaderCache` path. After optional seeding it inventories
 all enabled providers in exact modlist priority order and copies every missing
