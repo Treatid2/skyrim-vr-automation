@@ -43,7 +43,7 @@ Assert-Preserved (-not $activeNormalize.ok) 'Normalization rewrote active pinned
 $preview = Invoke-DisabledCase recover-disabled-append @{WhatIf=$true}
 Assert-Preserved ($preview.ok -and $preview.state -eq 'dry-run' -and (Get-FileHash -LiteralPath $profile).Hash -ceq $driftHash -and -not (Test-Path -LiteralPath $preview.data.profile.receiptPath)) 'Recovery preview changed bytes or wrote evidence.'
 $recovered = Invoke-DisabledCase recover-disabled-append
-Assert-Preserved ($recovered.ok -and $recovered.state -eq 'pinned-profile-restored-completion-required' -and (Get-FileHash -LiteralPath $profile).Hash -ceq $pinnedHash) "Exact suffix recovery failed: $($recovered.errors -join ';')"
+Assert-Preserved ($recovered.ok -and $recovered.state -eq 'pinned-profile-restored-completion-required' -and (Get-FileHash -LiteralPath $profile).Hash -ceq $pinnedHash) "Exact suffix recovery failed: $($recovered | ConvertTo-Json -Depth 12 -Compress)"
 Assert-Preserved ((Get-FileHash -LiteralPath $recovered.data.profile.backupPath).Hash -ceq $driftHash -and (Test-Path -LiteralPath $recovered.data.profile.receiptPath)) 'Recovery did not retain exact drift bytes/receipt.'
 for ($i=0; $i -lt $immutablePaths.Count; $i++) { Assert-Preserved ((Get-FileHash -LiteralPath $immutablePaths[$i]).Hash -ceq $immutableHashes[$i]) 'Recovery changed immutable plan/manifest/owner bytes.' }
 $retry = Invoke-DisabledCase recover-disabled-append
