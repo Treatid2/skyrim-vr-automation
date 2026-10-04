@@ -2,6 +2,9 @@
 param(
     [Parameter(Mandatory)][ValidateSet('session','recovery','publication','native-A','native-B')][string]$Stage,
     [Parameter(Mandatory)][string]$Root,
+    [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{32}$')][string]$OuterNonce,
+    [Parameter(Mandatory)][int]$OuterCreatorPid,
+    [Parameter(Mandatory)][string]$OuterCreatorFileTime,
     [Parameter(Mandatory)][uint64]$DeadlineTickMs,
     [Parameter(Mandatory)][uint64]$PositiveDeadlineTickMs,
     [Parameter(Mandatory)][uint64]$CommonDeadlineTickMs,
@@ -11,6 +14,10 @@ param(
 )
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'GripLifecycle.Common.ps1')
+# Admission is outside the lifecycle try/finally. A foreign worker must not
+# inspect fixed ownership files, publish errors, stop or recover this session.
+$script:outerSession=Get-GripOuterIdentity $Root $OuterNonce $OuterCreatorPid $OuterCreatorFileTime
+Assert-GripOuterSession $script:outerSession
 $script:phase='preflight'
 $script:plan=$null
 $script:firstFailure=$null
@@ -21,9 +28,11 @@ $script:assayBoundary=$null
 $script:probeBoundary=$null
 $script:lastControlInterval=$null
 $script:beganUtc=[DateTime]::UtcNow.ToString('o')
-function Save([string]$Name,$Data){Write-GripJson (Join-Path $Root ($Name+'.json')) $Data $DeadlineTickMs}
+function Save([string]$Name,$Data){Assert-GripOuterSession $script:outerSession;$Data.outerSession=$script:outerSession;Write-GripJson (Join-Path $Root ($Name+'.json')) $Data $DeadlineTickMs}
+function Read-Owned([string]$Name){Assert-GripOuterSession $script:outerSession;$record=Read-GripJson (Join-Path $Root ($Name+'.json'));Assert-GripOuterRecord $record $script:outerSession;return $record}
 function Fail-Once([string]$Reason){if($null -eq $script:firstFailure){$script:firstFailure=@{phase=$script:phase;reason=$Reason;observedTickMs=(Get-GripTick).ToString()};Save 'first-failure' $script:firstFailure}}
 function Call-Control([string]$Name,[string]$Command,[hashtable]$Options=@{}){
+    Assert-GripOuterSession $script:outerSession
     $script:phase=$Name+'-'+$Command
     Assert-GripDeadline $DeadlineTickMs
     if($OfflineCase){$data=Invoke-GripFixture $Name $Command $Options}
@@ -70,11 +79,12 @@ function Stop-OwnedRuntime {
     if(@($closed.data.runtime.steamVrProcesses).Count -ne 0){throw 'Runtime survivors remain after stop'}
 }
 function Run-Assay([string]$Mode){
+    Assert-GripOuterSession $script:outerSession
     $script:phase='assay-'+$Mode
     Assert-GripDeadline $PositiveDeadlineTickMs
     $output=Join-Path $Root ($(if($OfflineCase){'injected-assay-'}else{'assay-'})+$Mode+'.json')
     $pwsh=(Get-Process -Id $PID).Path
-    $phaseArgs=@('-NoProfile','-File',$PSCommandPath,'-Stage',('native-'+$Mode),'-Root',$Root,'-DeadlineTickMs',$PositiveDeadlineTickMs.ToString(),'-PositiveDeadlineTickMs',$PositiveDeadlineTickMs.ToString(),'-CommonDeadlineTickMs',$CommonDeadlineTickMs.ToString())
+    $phaseArgs=@('-NoProfile','-File',$PSCommandPath,'-Stage',('native-'+$Mode),'-Root',$Root,'-OuterNonce',$OuterNonce,'-OuterCreatorPid',$OuterCreatorPid.ToString(),'-OuterCreatorFileTime',$OuterCreatorFileTime,'-DeadlineTickMs',$PositiveDeadlineTickMs.ToString(),'-PositiveDeadlineTickMs',$PositiveDeadlineTickMs.ToString(),'-CommonDeadlineTickMs',$CommonDeadlineTickMs.ToString())
     if($OfflineCase){$phaseArgs+=@('-OfflineCase',$OfflineCase,'-PlanPath',$PlanPath);$runner=$PlanPath;$working=$PSScriptRoot}else{$phaseArgs+=@('-PlanPath',$PlanPath);$runner=$plan.boundedProcess.path;$working=Split-Path -Parent $plan.fixture.path}
     $cap=if($Mode -eq 'A'){60}else{7}
     $seconds=[int][Math]::Floor(([Math]::Min([long]$PositiveDeadlineTickMs-[long](Get-GripTick),$cap*1000)-750)/1000)
@@ -107,8 +117,8 @@ try{
     if($Stage -in @('native-A','native-B')){
         Assert-GripDeadline $PositiveDeadlineTickMs
         $mode=if($Stage -eq 'native-A'){'A'}else{'B'}
-        if($OfflineCase){$script:binding=Read-GripJson (Join-Path $Root 'binding.json');[void](Invoke-GripFixtureAssay $mode);return}
-        $binding=Read-GripJson (Join-Path $Root 'binding.json')
+        if($OfflineCase){$script:binding=Read-Owned 'binding';[void](Invoke-GripFixtureAssay $mode);return}
+        $binding=Read-Owned 'binding'
         $nativeArgs=@('-B',$plan.fixture.path,'--live','--mode',$mode,'--output',(Join-Path $Root ('assay-'+$mode+'.json')),'--deadline-tick-ms',$PositiveDeadlineTickMs.ToString(),'--expected-pid',([int]$binding.creatorPid).ToString(),'--expected-creation-filetime',$binding.creatorFileTime,'--expected-driver-nonce',$binding.driverNonce,'--atomics',$plan.atomics.path,'--atomics-sha256',$plan.atomics.sha256)
         # A pinned stable python.cmd is supported through this existing worker,
         # not passed as a non-executable .cmd to native CreateProcess.
@@ -173,10 +183,10 @@ try{
     }
     elseif($Stage -eq 'recovery'){
         if(-not (Test-Path -LiteralPath (Join-Path $Root 'ownership.json'))){throw 'No exact session ownership record; recovery is unverified'}
-        $ownership=Read-GripJson (Join-Path $Root 'ownership.json');$script:beganUtc=$ownership.beganUtc
-        if(Test-Path -LiteralPath (Join-Path $Root 'binding.json')){$script:binding=Read-GripJson (Join-Path $Root 'binding.json')}
+        $ownership=Read-Owned 'ownership';$script:beganUtc=$ownership.beganUtc
+        if(Test-Path -LiteralPath (Join-Path $Root 'binding.json')){$script:binding=Read-Owned 'binding'}
         Stop-OwnedRuntime
-        $before=Read-GripJson (Join-Path $Root 'before.json')
+        $before=Read-Owned 'before'
         $current=Call-Control 'nullControl' 'inspect'
         if($current.state -cne 'null-inactive' -or $current.data.settingsSha256 -cne $before.data.settingsSha256){
             $preview=Call-Control 'nullControl' 'restore' @{WhatIf=$true};Assert-True $preview.ok 'Receipt-bound restore preview failed; no restore dispatch'
@@ -188,16 +198,16 @@ try{
     }
     else{
         if($OfflineCase -eq 'publication-stall'){Start-Sleep -Seconds 3600}
-        $recovery=if(Test-Path -LiteralPath (Join-Path $Root 'recovery-result.json')){Read-GripJson (Join-Path $Root 'recovery-result.json')}else{@{verified=$false}}
-        $primary=if(Test-Path -LiteralPath (Join-Path $Root 'first-failure.json')){Read-GripJson (Join-Path $Root 'first-failure.json')}else{$null}
+        $recovery=if(Test-Path -LiteralPath (Join-Path $Root 'recovery-result.json')){Read-Owned 'recovery-result'}else{@{verified=$false}}
+        $primary=if(Test-Path -LiteralPath (Join-Path $Root 'first-failure.json')){Read-Owned 'first-failure'}else{$null}
         if($null -eq $primary -and $CoordinatorFailureBase64){$primary=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($CoordinatorFailureBase64)) | ConvertFrom-Json -AsHashtable}
-        $group=if(Test-Path -LiteralPath (Join-Path $Root 'session-worker-result.json')){Read-GripJson (Join-Path $Root 'session-worker-result.json')}else{@{completed=$false}}
-        $recoveryErrors=if(Test-Path -LiteralPath (Join-Path $Root 'recovery-errors.json')){Read-GripJson (Join-Path $Root 'recovery-errors.json')}else{$null}
+        $group=if(Test-Path -LiteralPath (Join-Path $Root 'session-worker-result.json')){Read-Owned 'session-worker-result'}else{@{completed=$false}}
+        $recoveryErrors=if(Test-Path -LiteralPath (Join-Path $Root 'recovery-errors.json')){Read-Owned 'recovery-errors'}else{$null}
         # Never certify a clean state or publish an acceptance pointer. A unique
         # diagnostic result can report both the primary failure and unknown cleanup.
         $report=@{schemaVersion='null-grip-session-result.1';scope=if($OfflineCase){'injected lifecycle with real worker trees'}else{'unqualified live diagnostic'};runtimeResponsesSimulated=[bool]$OfflineCase;firstFailure=$primary;session=$group;recovery=$recovery;recoveryErrors=$recoveryErrors;cleanHandoffVerified=([bool]$recovery.verified);productAcceptancePassed=$false;commonDeadlineTickMs=$CommonDeadlineTickMs.ToString();publicationDeadlineTickMs=$DeadlineTickMs.ToString()}
         Save 'session-result' $report
-        @{published=$true;cleanHandoffVerified=[bool]$recovery.verified;resultPath=(Join-Path $Root 'session-result.json')} | ConvertTo-Json -Compress
+        @{published=$true;cleanHandoffVerified=[bool]$recovery.verified;resultPath=(Join-Path $Root 'session-result.json');outerSession=$script:outerSession} | ConvertTo-Json -Compress
         return
     }
 }catch{
@@ -209,5 +219,5 @@ try{
     }
     elseif($Stage -eq 'recovery' -and $script:postErrors.Count -gt 0){Save 'recovery-errors' @{verified=$false;errors=$script:postErrors.ToArray()}}
 }
-@{completed=$true;stage=$Stage;firstFailure=$script:firstFailure;postErrors=$script:postErrors.ToArray()} | ConvertTo-Json -Depth 5 -Compress
+@{completed=$true;stage=$Stage;firstFailure=$script:firstFailure;postErrors=$script:postErrors.ToArray();outerSession=$script:outerSession} | ConvertTo-Json -Depth 5 -Compress
 if($Stage -in @('native-A','native-B') -and $script:postErrors.Count -gt 0){exit 2}

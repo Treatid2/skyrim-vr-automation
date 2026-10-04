@@ -36,7 +36,16 @@ foreach($case in $cases){
         'baseline-failure' {if($report.firstFailure.phase -cne 'assay-A' -or -not $report.cleanHandoffVerified -or (Test-Path -LiteralPath (Join-Path $root 'injected-assay-B.json'))){throw 'Baseline failure did not stop later dispatch'}}
         {$_ -in @('startup-stall','assay-stall')} {
             $active=@($coordinator.stages | Where-Object stage -eq 'session')[0]
-            if(-not $active.receipt.attempts[-1].terminationRequested -or -not $active.receipt.attempts[-1].jobQuiescent -or -not $report.cleanHandoffVerified -or $null -eq $report.firstFailure){throw 'Actual session cancellation/recovery was not verified'}
+            $cancelled=$active.receipt.attempts[-1].terminationRequested -and $active.receipt.attempts[-1].jobQuiescent
+            if($case -eq 'assay-stall' -and -not $cancelled){
+                # At a larger fixture budget the nested assay deadline can
+                # cancel its job before the encompassing session deadline.
+                # Require that actual owned cancellation, never just a failure
+                # label, and still require the common verified recovery.
+                $assayProcess=Get-Content -LiteralPath (Join-Path $root 'assay-A-process.json') -Raw | ConvertFrom-Json -AsHashtable
+                $cancelled=$assayProcess.attempts[-1].terminationRequested -and $assayProcess.attempts[-1].jobQuiescent -and $assayProcess.attempts[-1].exitVerified -and $active.receipt.attempts[-1].jobQuiescent
+            }
+            if(-not $cancelled -or -not $report.cleanHandoffVerified -or $null -eq $report.firstFailure -or (Test-Path -LiteralPath (Join-Path $root 'after-close-probe-boundary.json'))){throw 'Actual owned session/assay cancellation and recovery was not verified'}
         }
         'cleanup-unknown' {if($exit -ne 2 -or $report.cleanHandoffVerified -or $null -eq $report.recoveryErrors){throw 'Unknown cleanup became verified'}}
         'baseline-cleanup-unknown' {if($report.firstFailure.phase -cne 'assay-A' -or $report.cleanHandoffVerified -or $null -eq $report.recoveryErrors){throw 'Cleanup replaced the primary baseline failure'}}

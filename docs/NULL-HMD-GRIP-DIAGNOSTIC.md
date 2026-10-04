@@ -23,9 +23,36 @@ address `CODEX_PYTHON`; batch delegation runs within the owned native A/B worker
 Explicit runtime paths: `settingsPath`, `openVRPathsPath`, `steamVRRoot`,
 `serverLogPath`, `driverRoot`. The coordinator additionally requires the exact
 bounded-process path/hash. Do not manufacture a plan before the native handoff.
+Use the current supported bounded-process owner with `launched`, `exitVerified`,
+`jobQuiescent` and `deadlineSatisfied` attempt proofs. The older contract-v2
+callee on an isolated historical branch cannot establish these facts and is
+not a supported diagnostic owner. Pin the all-integrated owner until its
+reviewed dependency is present in curated main; do not weaken the receipt gate.
 The live evidence root must be new and beneath that fixed fixture's `evidence`
 directory, with ordinary non-reparse ancestors. Invalid output placement is
 rejected before the coordinator creates the root or starts a worker.
+
+The coordinator exclusively claims the whole lifecycle with `CreateNew` on
+`<EvidenceDirectory>.outer-session.json` before creating the evidence directory.
+The claim records a random session nonce, canonical root, coordinator PID and
+creation FILETIME. Its handle prevents competing writes for the entire run;
+its immutable bytes remain retained afterwards. An existing claim or root is a
+refusal, not permission to adopt or recover its files. A losing contender never
+launches a worker or enters stop, restore or publication.
+
+Every worker launch carries that exact identity. Workers verify the claim and
+live creator before reading lifecycle ownership, invoking controls, publishing,
+or cleanup. Lifecycle records carry the same `outerSession` and are checked on
+read; separately pinned native payloads retain their existing producer schema
+and are consumed only inside the admitted owned worker. A foreign or stale
+creator is rejected outside the worker's cleanup `try/finally`.
+
+Abrupt worker death still uses the original live coordinator's separate bounded
+recovery worker. Coordinator death retains the claim and receipts and refuses
+automatic takeover. Auto-Tools must explicitly recover using the existing exact
+receipt-bound owner controls after verifying the stale creator and owned
+survivors; restarting this diagnostic is not a recovery interface and must not
+delete its claim or reuse its root. A new run requires a distinct evidence root.
 
 When the completion service does not inherit shell-only `CODEX_PYTHON`, use the
 task-shaped `Invoke-NullHmdGripSelectedRun.ps1` envelope. Supply the exact selected
@@ -51,7 +78,8 @@ dispatch and enters Main-owned recovery. A fresh controller inspection must
 then prove the same instance, owner/deadline zero, healthy input, and both hands'
 native masks/scalars/axes neutral before the compiled probe can run.
 
-`externalUnregistrationVerified:false` remains explicit. Shutdown return and
+`applicationClose.externalUnregistrationVerified:false` is mandatory Boolean
+false; omission, null, a number/string, or true is rejected. Shutdown return and
 OS/job exit do not prove that SteamVR completed its internal client removal.
 No extra Background observer, guessed server-log disconnect marker or arbitrary
 delay is introduced. This diagnostic cannot attribute later behavior to runtime
@@ -102,3 +130,8 @@ restore-preview case exercise the real
 nested A worker's exit/job receipt. Runtime responses and clock/result failure
 injections remain simulated; these tests do not qualify live SteamVR inheritance,
 client unregistration, input consumption, or the experimental adapter itself.
+`Test-GripOuterCustody.ps1` concurrently releases two real coordinators against
+one absent root, checks exclusive winner-bound lifecycle evidence and clean
+winner completion, and rejects a foreign recovery worker before cleanup.
+`Test-GripNativeContract.ps1` additionally rejects six missing/malformed
+unregistration-field variants of an otherwise accepted native result.

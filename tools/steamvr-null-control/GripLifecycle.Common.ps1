@@ -21,6 +21,29 @@ function Write-GripJson([string]$Path,$Value,[uint64]$Deadline){
     [IO.File]::Move($stage,$Path,$false)
 }
 function Assert-GripDeadline([uint64]$Deadline){if((Get-GripTick) -ge $Deadline){throw 'Inherited absolute deadline expired'}}
+function Get-GripOuterIdentity([string]$Root,[string]$Nonce,[int]$CreatorPid,[string]$CreatorFileTime){
+    return @{schemaVersion='null-grip-outer-session.1';evidenceRoot=[IO.Path]::GetFullPath($Root);nonce=$Nonce;creatorPid=$CreatorPid;creatorFileTime=$CreatorFileTime}
+}
+function Assert-GripOuterSession($Expected){
+    $claimPath=$Expected.evidenceRoot+'.outer-session.json'
+    $item=Get-Item -LiteralPath $claimPath
+    if($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Outer session claim must be an ordinary file'}
+    $actual=Read-GripJson $claimPath
+    foreach($key in @('schemaVersion','evidenceRoot','nonce','creatorPid','creatorFileTime')){
+        if($actual[$key] -cne $Expected[$key]){throw 'Outer session claim does not match this exact creator and nonce'}
+    }
+    if($actual.nonce -cnotmatch '^[0-9a-f]{32}$' -or $actual.creatorPid -isnot [long] -and $actual.creatorPid -isnot [int]){throw 'Malformed outer session identity'}
+    $creator=Get-Process -Id ([int]$actual.creatorPid) -ErrorAction Stop
+    try{if($creator.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -cne $actual.creatorFileTime){throw 'Outer coordinator creation identity changed'}}finally{$creator.Dispose()}
+    $directory=Get-Item -LiteralPath $Expected.evidenceRoot
+    if(-not $directory.PSIsContainer -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Outer session evidence root changed'}
+}
+function Assert-GripOuterRecord($Record,$Expected){
+    if($Record -isnot [Collections.IDictionary] -or -not $Record.Contains('outerSession') -or $Record.outerSession -isnot [Collections.IDictionary]){throw 'Lifecycle record is missing its exact outer session identity'}
+    foreach($key in @('schemaVersion','evidenceRoot','nonce','creatorPid','creatorFileTime')){
+        if($Record.outerSession[$key] -cne $Expected[$key]){throw 'Lifecycle record belongs to a different outer session'}
+    }
+}
 function Convert-GripUInt64($Value){
     [uint64]$number=0
     if($Value -isnot [string] -or $Value -cnotmatch '^(0|[1-9][0-9]*)$' -or -not [uint64]::TryParse($Value,[ref]$number)){throw 'Canonical uint64 decimal string required'}
@@ -38,7 +61,7 @@ function Assert-GripNativeResult($Body,[string]$Mode,$Binding,[uint64]$Ceiling,[
     $closeStates=if($Injected){@('completed-return','injected-completed')}else{@('completed-return')}
     if($Body.applicationClose.attempted -isnot [bool] -or -not $Body.applicationClose.attempted -or $Body.applicationClose.completed -isnot [bool] -or -not $Body.applicationClose.completed -or $Body.applicationClose.state -cnotin $closeStates){throw 'Native shutdown did not reach recorded completed-return'}
     # This experiment does not assert external SteamVR client removal.
-    if($Body.applicationClose.ContainsKey('externalUnregistrationVerified') -and $Body.applicationClose.externalUnregistrationVerified -ne $false){throw 'Unsupported external-unregistration claim'}
+    if($Body.applicationClose -isnot [Collections.IDictionary] -or -not $Body.applicationClose.Contains('externalUnregistrationVerified') -or $Body.applicationClose.externalUnregistrationVerified -isnot [bool] -or $Body.applicationClose.externalUnregistrationVerified){throw 'Native close must explicitly record Boolean false externalUnregistrationVerified'}
     foreach($key in @('workerCeilingExceeded','localRunCeilingExceeded')){if($Body.closeBoundary[$key] -isnot [bool] -or $Body.closeBoundary[$key]){throw 'Unknown or exceeded native close ceiling'}}
     foreach($key in @('start','end')){if($Body.closeBoundary[$key].state -cne 'known'){throw 'Native close clock is unknown'};[void](Convert-GripUInt64 $Body.closeBoundary[$key].tickMs)}
     if([uint64]$Body.closeBoundary.start.tickMs -gt [uint64]$Body.closeBoundary.end.tickMs -or [uint64]$Body.closeBoundary.end.tickMs -ge $Ceiling){throw 'Native close interval is invalid or late'}
