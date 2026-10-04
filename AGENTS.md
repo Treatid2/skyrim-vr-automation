@@ -1,7 +1,10 @@
 # Automation repository rules
 
-- Treat `main` as the sole integration line and keep local `main` aligned with
-  the latest merged `origin/main`. Develop in scoped feature branches; a
+- Treat `main` as the reviewed, curated line and keep local `main` aligned with
+  the latest merged `origin/main`. `codex/auto-tools-all-integrated` is the live
+  development and plugin-publication source, including pending reviewed PR
+  corrections; publication does not require those PRs to have merged to main.
+  Never merge the aggregate wholesale into main. Develop in scoped feature branches; a
   temporary worktree is not complete until its commits are pushed to its named
   branch and represented by a pull request targeting `main`. Never push
   directly to `main`. Open or merge that pull request only when the user
@@ -66,15 +69,17 @@
   explicit parameters, or documented environment variables.
 - Never rotate an installed Codex plugin cache while any automation protocol
   is active in any chat. Feature branches validate source/package parity but do
-  not rotate the installed cache. After an authorized merge to `main` that
-  affects installed plugin behavior, skills, tools, MCP configuration,
-  manifests, or packaged AI guidance, rotate both plugin manifest cache
-  identities once from the final integrated tree, rebuild the managed
+  not rotate the installed cache independently. For an authorized live publication,
+  use one exact committed `codex/auto-tools-all-integrated` tree, rotate both
+  plugin manifest cache identities once, and rebuild the managed
   marketplace package, and reinstall it with the guarded repository installer
   instead of direct `codex plugin add`. Verify the registered version plus
   source, marketplace, and installed-cache hashes, then fully reload the Codex
   host; a new chat alone is not a safe pickup boundary. If a protocol is
-  active, defer installation until every run is terminal.
+  active, defer installation until every run is terminal. Preserve the previous
+  installed package and a hash-complete publication receipt for rollback. Record
+  the exact integrated commit and pending-review boundary; live publication is
+  not review PASS or permission to merge into curated main.
 - When an automation command behaves unexpectedly, its contract is ambiguous,
   or a concrete safety issue or enhancement is discovered, submit it through
   `tools/feedback-control/Invoke-AutomationFeedback.ps1`. Claim that feedback
