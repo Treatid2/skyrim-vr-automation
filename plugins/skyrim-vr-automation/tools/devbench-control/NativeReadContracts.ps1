@@ -48,6 +48,14 @@ function Get-DevBenchNativeReadReasons {
         # Canonical v1 binding inventory, not an alias or a caller-supplied map.
         $bindings = 'escape:1 1:2 2:3 3:4 4:5 5:6 6:7 7:8 8:9 9:10 0:11 minus:12 equals:13 backspace:14 tab:15 q:16 w:17 e:18 r:19 t:20 y:21 u:22 i:23 o:24 p:25 leftBracket:26 rightBracket:27 enter:28 leftControl:29 a:30 s:31 d:32 f:33 g:34 h:35 j:36 k:37 l:38 semicolon:39 apostrophe:40 grave:41 leftShift:42 backslash:43 z:44 x:45 c:46 v:47 b:48 n:49 m:50 comma:51 period:52 slash:53 rightShift:54 numpadMultiply:55 leftAlt:56 space:57 capsLock:58 f1:59 f2:60 f3:61 f4:62 f5:63 f6:64 f7:65 f8:66 f9:67 f10:68 numLock:69 scrollLock:70 numpad7:71 numpad8:72 numpad9:73 numpadSubtract:74 numpad4:75 numpad5:76 numpad6:77 numpadAdd:78 numpad1:79 numpad2:80 numpad3:81 numpad0:82 numpadDecimal:83 f11:87 f12:88 numpadEnter:156 rightControl:157 numpadDivide:181 rightAlt:184 home:199 up:200 pageUp:201 left:203 right:205 end:207 down:208 pageDown:209 insert:210 delete:211 leftWindows:219 rightWindows:220 menu:221' -split ' '
         $keys = Member $keyboard 'keys'
+        # ca3e145/current native v1 adds exactly three mouse button leases.
+        # Never accept arbitrary extras or a partial extension as legacy keys.
+        if ($keyboard -is [pscustomobject] -and $keyboard.PSObject.Properties['mouseButtons']) {
+            $mouse = Member $keyboard 'mouseButtons'
+            Require (UInt (Member $mouse 'codeBase') 256 256) 'keyboard.mouseButtons.codeBase (256)'
+            Strings (Member $mouse 'keys') @('mouseLeft','mouseRight','mouseMiddle') 'keyboard.mouseButtons.keys'
+            $bindings += @('mouseLeft:256','mouseRight:257','mouseMiddle:258')
+        }
         Require ($keys -is [array] -and $keys.Count -eq $bindings.Count) 'keyboard.keys complete canonical inventory'
         if ($keys -is [array]) {
             foreach ($binding in $bindings) {
