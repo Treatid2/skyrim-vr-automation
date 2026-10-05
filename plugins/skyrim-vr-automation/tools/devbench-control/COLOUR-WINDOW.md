@@ -52,6 +52,12 @@ script, observation list, tool argument or expected-error override is admitted.
 
 ## Native sequence and guards
 
+On exact217, `preExposure=1.0`, `exposureResourceBound=false` and
+`sourceColorContractChanged=false` are source literals, not dynamic measurements.
+They remain in raw receipts but are not settlement gates or exposure/source-transfer
+science evidence. Requested/context flags, revision, active runtime context and
+successful eye records are the dynamic gates.
+
 1. Fresh complete runtime/build/artifact and exact calendar/colour/probe schema
    admission, current source binding and exact calibrated cell; no existing
    calendar or probe custody may be adopted. One native finite calendar hold.
