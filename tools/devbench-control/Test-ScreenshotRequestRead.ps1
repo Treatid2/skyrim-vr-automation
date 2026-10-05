@@ -91,4 +91,44 @@ foreach($action in @('capture','request_cancel','REQUEST_GET')){
 }
 $multiple=Get-DevBenchCallSemanticStatus -ToolName communityshaders.screenshot -Arguments (Query-Args $completed) -Content @($completed,$completed)
 Check (-not $multiple.ok) 'multiple native receipts refuse qualification'
+$schema2=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/native-screenshot-schema2-completed.json') -Raw|ConvertFrom-Json -Depth 80
+$schema2Query=Query-Args $schema2
+$schema2Before=$schema2|ConvertTo-Json -Depth 80 -Compress
+$read=Read-Receipt $schema2 $schema2Query
+Check ($read.ok -and $read.qualifiedScreenshotRequest.requestSucceeded -and $read.qualifiedScreenshotRequest.terminal) 'exact retained e03 1.1/schema2 owned completed still qualifies'
+Check (($schema2|ConvertTo-Json -Depth 80 -Compress) -ceq $schema2Before) 'schema2 raw receipt remains unchanged'
+Check ($read.qualifiedScreenshotRequest.nativeContract.minor -eq 1 -and $read.qualifiedScreenshotRequest.nativeContract.schemaRevision -eq 2) 'derived receipt retains exact admitted contract pair'
+Check ($read.qualifiedScreenshotRequest.actual.acquisition.planes.Count -eq 2 -and $read.qualifiedScreenshotRequest.artifacts[0].bytes -eq 2980983) 'schema2 acquisition planes and committed byte evidence retained'
+foreach($view in @('left_eye','right_eye')){
+    $frame=Get-CaptureInteractionLatestFrame -Receipt $read.qualifiedScreenshotRequest -PreferredView $view
+    $expected=@($schema2.result.artifacts|Where-Object {$_.actual.view -ceq $view})[0]
+    Check ($frame.view -ceq $view -and $frame.engineFrame -eq 24867 -and $frame.sha256 -ceq $expected.sha256) "schema2 exact $view frame projection"
+}
+foreach($defect in $defects){
+    $bad=Copy-Fixture $schema2;Change $bad $defect[0] $defect[1]
+    # These two old negative values are the new valid pair's actual values.
+    if($defect[0] -ceq 'contract.minor'){$bad.contract.minor=0}
+    if($defect[0] -ceq 'contract.schemaRevision'){$bad.contract.schemaRevision=1}
+    Check (-not (Read-Receipt $bad $schema2Query).ok) "schema2 refuses malformed $($defect[0])"
+}
+foreach($pair in @(@(0,2),@(1,1),@(2,2),@(1,3),@('1',2),@(1,'2'),@(1.5,2),@($null,2),@(1,$null))){
+    $bad=Copy-Fixture $schema2;$bad.contract.minor=$pair[0];$bad.contract.schemaRevision=$pair[1]
+    Check (-not (Read-Receipt $bad $schema2Query).ok) 'refuse unsupported/mistyped/minor-revision pair'
+}
+foreach($defect in @('uncommitted','hash','bytes','duplicateView','duplicatePath','dimension','encoding')){
+    $bad=Copy-Fixture $schema2
+    switch($defect){
+        uncommitted {$bad.result.artifacts[0].committed=$false}
+        hash {$bad.result.artifacts[0].sha256='bad'}
+        bytes {$bad.result.artifacts[0].bytes=0}
+        duplicateView {$bad.result.artifacts[1].actual.view='left_eye'}
+        duplicatePath {$bad.result.artifacts[1].path=$bad.result.artifacts[0].path}
+        dimension {$bad.result.artifacts[0].actual.height='1680'}
+        encoding {$bad.result.artifacts[0].actual.format='bmp'}
+    }
+    Check (-not (Read-Receipt $bad $schema2Query).ok) "schema2 artifact $defect refuses frame qualification"
+}
+foreach($name in @('requestId','clientId','commandId','expectedBuildId')){$query=Query-Args $schema2;$query[$name]='foreign';Check (-not (Read-Receipt $schema2 $query).ok) "schema2 exact query $name binding"}
+$bad=Copy-Fixture $schema2;$bad.result.state='preparing';$bad.result.terminalUtc=$null
+Check (-not (Read-Receipt $bad $schema2Query).ok) 'schema2 sequence preparation is not admitted as a still state'
 [pscustomobject]@{ok=$true;assertions=$script:assertions;scope='offline retained native still request_get and adversarial schema/correlation fixtures; no runtime dispatch'}|ConvertTo-Json -Compress
