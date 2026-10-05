@@ -95,6 +95,9 @@ dimensions and configured/effective sharpness. Context/signature or compiler
 drift invalidates coverage rather than restarting it. Preserve original startup,
 burn-in and spacing replies/classification separately in each condition/capture.
 Coverage deadlines never extend the original work budget or its reserved cleanup.
+An exact transport refusal to start another compiler RPC within the remaining
+budget is incomplete coverage, retaining its READ_UNAVAILABLE diagnostic. Other
+unavailable reads and actual compiler failures still invalidate admission.
 Incomplete burn-in stops all subsequent arms/conditions; initially matched native
 dispatch remains a distinct fact, not a successful measurement or converged state.
 Captures require CPU-frame/serial/QPC advancement beyond the final burn-in sample.
@@ -110,8 +113,30 @@ native timeouts. All work must fit the original180s total, with its final15s
 reserved for shared cleanup. Thresholds are declared experimental coverage
 choices, not SDK settlement guarantees or statistical significance criteria.
 Experiment owners still evaluate repeatability, drift and calibrated scientific
-postconditions separately. Optional future native input telemetry is not implied
-by this policy; do not infer reset/jitter/frame-time or exposure internals.
+postconditions separately. Do not infer reset/jitter/frame-time or exposure internals.
+
+## Optional submitted SDK inputs
+
+Native cb1e44e9 adds optional `submittedInputs` to successful status dispatches
+and each probe-page/slot dispatch. When absent, old f4/schema3 receipts remain
+compatible but input evidence is unavailable. When present, require exactly
+schemaVersion (actual integer1), available (Boolean), reset, jitterOffsetPixels,
+and frameTimeDeltaMilliseconds. Available inputs require a successful dispatch,
+an actual Boolean reset, two finite numeric jitter coordinates, and a finite
+nonnegative numeric delta. Unavailable inputs require all three values explicitly
+null. Unknown versions, malformed values and coerced strings refuse admission.
+
+Availability means a retained successful descriptor in its matching context,
+not the engine's current frame. Existing exact build/revision/context/eye/frame/
+serial/QPC and relative advancement guards still qualify observations; available
+inputs never make a stale sample fresh. Probe pages must retain identical input
+metadata for their same eye/dispatch across all stages and page/slot projections.
+Do not demand jitter/reset equality across different frames or between eyes.
+Raw unavailable values stay unavailable; there is no synthetic input reconstruction,
+vendor-history/convergence claim, extra SDK setter or cross-thread current-frame read.
+
+Run `Test-SubmittedInputsContract.ps1` and `Test-ColourTimingCoverage.ps1` for
+strict schema negatives and runner availability/freshness/page consistency fixtures.
 
 Run `Test-ColourTimingCoverage.ps1` for typed/real-clock offline fixtures; no
 live environment, calibration, native history or exposure claim is made by it.
