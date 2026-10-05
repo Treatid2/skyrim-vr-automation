@@ -24,7 +24,7 @@ param(
     [string]$ExpectedBuildId,
     [string]$ExpectedArtifactSha256,
     [string]$ExpectedRuntimeIdentityJson,
-    [ValidateSet('noBlockingMenu', 'mainMenuReady', 'playerLoaded', 'upscalingStable', 'toolAvailable', 'serviceReady')]
+    [ValidateSet('noBlockingMenu', 'mainMenuReady', 'playerLoaded', 'compilerHealthy', 'upscalingStable', 'toolAvailable', 'serviceReady')]
     [string]$Condition = 'noBlockingMenu',
     [ValidateRange(1, 3600)]
     [int]$TimeoutSeconds = 30,
@@ -106,12 +106,12 @@ function Get-ShaderCompilerGuard {
         $guard.health=Get-DevBenchShaderCompilerHealth -Arguments $argsMap -Content @($guard.reply.content)
         $guard.state=$guard.health.state
         $guard.reasons=@($guard.health.reasons)
-        if (-not $guard.health.admissible) { return $guard }
+        if (-not $guard.health.readQualified) { return $guard }
         $sources=@($Identity.build.sources | Where-Object tool -CEQ 'communityshaders.shader_api')
         if ($sources.Count -ne 1 -or $sources[0].producer.serviceSessionId -cne $guard.health.serviceSessionId) { throw 'Shader service session differs from the accepting runtime registry.' }
         $age=([DateTimeOffset]::UtcNow - [DateTimeOffset]$guard.health.timestampUtc).TotalSeconds
         if ($age -lt -5 -or $age -gt 10) { throw 'Compiler snapshot is stale or future-dated; no current-health admission.' }
-        $guard.admissible=$true
+        $guard.admissible=$guard.health.admissible
     } catch {
         $guard.admissible=$false; $guard.reasons=@($guard.reasons)+$_.Exception.Message
     }
@@ -1387,6 +1387,7 @@ try {
         }
     }
     else {
+        if ($Condition -ceq 'compilerHealthy' -and ($SkipRuntimeIdentityVerification -or -not [string]::IsNullOrWhiteSpace($Tool) -or $argumentsJsonSupplied)) { throw 'compilerHealthy requires verified runtime identity and accepts no target tool or target arguments.' }
         if ($Condition -in @('toolAvailable', 'serviceReady') -and [string]::IsNullOrWhiteSpace($Tool)) { throw "Condition '$Condition' requires -Tool." }
         if ($DismissBlockingMenus.Count -gt 0 -and $Condition -ne 'noBlockingMenu') { throw '-DismissBlockingMenus is valid only with -Condition noBlockingMenu.' }
         if ($MinimumMenuStableSeconds -gt 0 -and $Condition -ne 'noBlockingMenu') { throw '-MinimumMenuStableSeconds is valid only with -Condition noBlockingMenu.' }
@@ -1423,7 +1424,7 @@ try {
         if ($Condition -eq 'serviceReady') {
             try { $waitArguments = $ArgumentsJson | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { throw "ArgumentsJson is invalid: $($_.Exception.Message)" }
         }
-        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        $deadline = if ($Condition -ceq 'compilerHealthy') { $operationDeadlineUtc } else { [DateTime]::UtcNow.AddSeconds($TimeoutSeconds) }
         $script:operationDeadlineUtc = $deadline
         $waitStartedUtc = [DateTime]::UtcNow
         $attempts = 0
@@ -1433,6 +1434,7 @@ try {
         $lastProgressUtc = [DateTime]::MinValue
         $firstCpu = $null
         $lastCpu = $null
+        $compilerWaitIdentity = $null
         $menuDismissals = [Collections.Generic.List[object]]::new()
         $menuStableSinceUtc = $null
         $stableCandidateCount = 0
@@ -1542,6 +1544,53 @@ try {
                 $observation | Add-Member -NotePropertyName baseSatisfied -NotePropertyValue $baseSatisfied -Force
                 $observation | Add-Member -NotePropertyName stableSeconds -NotePropertyValue $stableSeconds -Force
                 $observation | Add-Member -NotePropertyName requiredStableSeconds -NotePropertyValue $MinimumMenuStableSeconds -Force
+            }
+            elseif ($Condition -ceq 'compilerHealthy') {
+                # Read-only barrier; never retry a load/camera/target mutation.
+                if (($deadline - [DateTime]::UtcNow).TotalSeconds -lt 1 -and $null -ne $observation) {
+                    $observation | Add-Member -NotePropertyName waitStopReason -NotePropertyValue 'Insufficient remaining allowance for another bounded request.' -Force
+                    break
+                }
+                if ($null -eq $compilerWaitIdentity) { $compilerWaitIdentity = $runtimeIdentity }
+                if (-not $compilerWaitIdentity.complete -or -not $compilerWaitIdentity.verified -or
+                    [string]::IsNullOrWhiteSpace($compilerWaitIdentity.process.startTimeUtc)) { throw 'Compiler wait requires complete verified process/artifact/start identity.' }
+                $guard = $null
+                foreach ($boundary in @(0,1)) {
+                    $listenerPid = Get-ListenerPid ([int]$compilerWaitIdentity.expectations.port)
+                    $process = if ($listenerPid) { Get-Process -Id $listenerPid -ErrorAction Stop } else { $null }
+                    if ($listenerPid -ne $compilerWaitIdentity.listenerPid -or $null -eq $process -or
+                        $process.Path -cne $compilerWaitIdentity.process.path -or
+                        $process.StartTime.ToUniversalTime().ToString('o') -cne $compilerWaitIdentity.process.startTimeUtc) { throw 'Compiler wait runtime identity changed; no readiness or mutation replay.' }
+                    if ($boundary -eq 0) { $guard = Get-ShaderCompilerGuard -Tools $tools -Headers $headers -Identity $compilerWaitIdentity }
+                }
+                if ($null -eq $guard.health -and ($deadline - [DateTime]::UtcNow).TotalSeconds -lt 1 -and
+                    $null -ne $observation -and $observation.PSObject.Properties['compilerGuard']) {
+                    # Preserve last qualified diagnostics, not invented current counters.
+                    $observation | Add-Member -NotePropertyName deadlineReadFailure -NotePropertyValue $guard -Force
+                    $observation | Add-Member -NotePropertyName compilerSnapshotBasis -NotePropertyValue 'last-qualified-observation-before-deadline' -Force
+                    $observation.satisfied = $false
+                    break
+                }
+                $retryable = $null -ne $guard.health -and (
+                    ($guard.health.readQualified -and $guard.state -cin @('COMPILATION_UNPROVEN','COMPILATION_PENDING','UNAVAILABLE') -and
+                     @($guard.reasons).Count -eq @($guard.health.reasons).Count) -or
+                    ($guard.state -ceq 'READ_UNAVAILABLE' -and $guard.health.state -ceq 'READ_UNAVAILABLE'))
+                $observation = [pscustomobject][ordered]@{
+                    satisfied = $guard.admissible
+                    retryable = $retryable
+                    terminalFailure = -not $guard.admissible -and -not $retryable
+                    classification = $guard.state
+                    compilerGuard = $guard
+                    completionBasis = 'current-state-compiler-snapshot'
+                    scope = 'Compiler readiness only; not loaded-cell, pixel, full-render-pipeline or future-health proof.'
+                }
+                if ($observation.satisfied -and [DateTime]::UtcNow -ge $deadline) {
+                    $observation.satisfied = $false
+                    $observation.retryable = $false
+                    $observation.terminalFailure = $true
+                    $observation.classification = 'late-positive-compiler-observation'
+                }
+                if ($observation.terminalFailure -or [DateTime]::UtcNow -ge $deadline) { break }
             }
             elseif ($Condition -eq 'playerLoaded') {
                 $stateProbe = $null

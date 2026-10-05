@@ -1,5 +1,36 @@
 # DevBench Control
 
+## Bounded compiler readiness after an accepted load
+
+`playerLoaded` proves the current loaded cell, not compiler initialization.
+After the separately accepted load and exact-cell `playerLoaded` barrier, use
+`Invoke-DevBenchControl.ps1 wait -Condition compilerHealthy` on the already
+selected controller lane, with the same exact runtime/artifact/build pins,
+an explicit `-TimeoutSeconds` budget and `-MaxTransientRetries 0`. It takes only
+fresh shader snapshot reads; it never dispatches or repeats a load, camera
+change or other target action. No `-Tool`, `-ArgumentsJson`, or identity skip
+is accepted for this condition.
+
+Only `COMPILER_HEALTHY_AT_SNAPSHOT` completes the barrier. Zero tasks remain
+`COMPILATION_UNPROVEN`, not a compile failure; pending initialization/compilation
+and recognized native read-unavailable states may be observed again within
+the original absolute deadline. Actual failures/history, disabled custom shaders,
+malformed, replayed, stale, foreign or changed-process/service evidence refuse
+readiness. The receipt retains the last guard, exact process/build identity,
+attempts and elapsed time; a timeout retains the unproven diagnosis without
+extending its budget. No late positive read is accepted after the deadline.
+If less than one second remains for another request, the barrier stops with
+its last qualified diagnostic instead of inventing a new counter snapshot.
+
+Readiness is compiler-snapshot scoped, not proof of correct pixels, full rendering
+initialization, a stable scene or an atomic frame join. Continue to use
+`-RequireCompilerHealthy` on the subsequent target so fresh before/after
+boundaries bracket that target; a successful wait is not a reusable waiver.
+On an established direct MCP lane, do not open this controller as a second
+transport: use fresh exact shader snapshots and the exported pure classifier
+in that same connection, with the experiment's fixed deadline and verified
+runtime/service identity. Calibration remains the experiment owner's work.
+
 ## Current-session shader compiler admission
 
 A successful API/readiness call is not healthy rendering. The existing native

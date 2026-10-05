@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$FixtureRoot)
+param([Parameter(Mandatory)][string]$FixtureRoot,[string]$EntryCaseFilter)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 Import-Module (Join-Path $PSScriptRoot 'DevBenchControl.psm1') -Force
@@ -89,7 +89,8 @@ foreach($case in @('session','build','revision','newTask','newCompile','cacheHit
 }
 $root=Join-Path ([IO.Path]::GetFullPath($FixtureRoot)) ('compiler-health-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
-foreach($case in @('healthy','failed','pending','main-thread-unavailable','after-failed','after-session','after-task','mcp-error','schema-missing','no-guard','skip-refused')) {
+foreach($case in @('healthy','failed','pending','main-thread-unavailable','after-failed','after-session','after-task','mcp-error','schema-missing','no-guard','skip-refused','wait-initializing','wait-zero-timeout','wait-unavailable-timeout','wait-failed','wait-foreign-session','wait-malformed','wait-stale','wait-replay','wait-schema-missing','wait-skip-refused','wait-target-refused','wait-late','wait-listener-lost')) {
+    if($EntryCaseFilter -and $case -cne $EntryCaseFilter){continue}
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0);$listener.Start()
     $port=$listener.LocalEndpoint.Port
     $events=[Collections.Concurrent.ConcurrentQueue[object]]::new()
@@ -117,10 +118,10 @@ foreach($case in @('healthy','failed','pending','main-thread-unavailable','after
                         $Events.Enqueue([pscustomobject]@{kind=$rpc.method;tool=$toolName;session=$headers['Mcp-Session-Id']})
                         $result=@{}
                         switch($rpc.method) {
-                            initialize {$replyHeaders="Mcp-Session-Id: compiler-fixture" + [char]13 + [char]10;$result=@{protocolVersion='2025-03-26';capabilities=@{};serverInfo=@{name='fixture';version='ad8'}}}
+                            initialize {$lateReplyUtc=[DateTime]::UtcNow.AddMilliseconds(2050);$replyHeaders="Mcp-Session-Id: compiler-fixture" + [char]13 + [char]10;$result=@{protocolVersion='2025-03-26';capabilities=@{};serverInfo=@{name='fixture';version='ad8'}}}
                             'notifications/initialized' {$status='204 No Content';$body=''}
                             'tools/list' {
-                                $enum=if($Case -ceq 'schema-missing'){@('registry')}else{@('registry','snapshot')}
+                                $enum=if($Case -cin @('schema-missing','wait-schema-missing')){@('registry')}else{@('registry','snapshot')}
                                 $result=@{tools=@(@{name='inspect';inputSchema=@{}},@{name='fixture.target';inputSchema=@{}},@{name='communityshaders.shader_api';inputSchema=@{type='object';required=@('contractMajor','clientId','commandId','action');properties=@{contractMajor=@{type='integer';const=1};clientId=@{type='string'};commandId=@{type='string'};action=@{type='string';enum=$enum}}}})}
                             }
                             'tools/call' {
@@ -137,6 +138,15 @@ foreach($case in @('healthy','failed','pending','main-thread-unavailable','after
                                     if($Case -ceq 'main-thread-unavailable') {$payload.ok=$false;$payload.PSObject.Properties.Remove('result');$payload | Add-Member error ([pscustomobject]@{code='main_thread_dispatch_failed';message='main thread did not run within 5000ms';retryable=$true;phase='execution'})}
                                     if($Case -ceq 'after-session' -and $snapshots -eq 2) {$payload.server.serviceSessionId='replaced';$payload.server.sessionId='replaced'}
                                     if($Case -ceq 'after-task' -and $snapshots -eq 2) {$payload.result.snapshot.compilation.totalTasks++;$payload.result.snapshot.compilation.completedTasks++}
+                                    if($Case -ceq 'wait-zero-timeout' -or ($Case -ceq 'wait-initializing' -and $snapshots -eq 1)) {$payload.result.snapshot.compilation.totalTasks=0;$payload.result.snapshot.compilation.completedTasks=0}
+                                    if($Case -ceq 'wait-initializing' -and $snapshots -eq 2) {$payload.result.snapshot.compilation.active=$true}
+                                    if($Case -ceq 'wait-failed') {$payload.result.snapshot.compilation.failedTasks=1;$payload.result.snapshot.compilation.currentFailedShaders=1}
+                                    if($Case -ceq 'wait-foreign-session') {$payload.server.sessionId='foreign';$payload.server.serviceSessionId='foreign'}
+                                    if($Case -ceq 'wait-malformed') {$payload.result.snapshot.compilation.totalTasks='100'}
+                                    if($Case -ceq 'wait-stale') {$payload.timestampUtc=[DateTimeOffset]::UtcNow.AddSeconds(-60).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')}
+                                    if($Case -ceq 'wait-replay') {$payload.result|Add-Member idempotentReplay $true}
+                                    if($Case -ceq 'wait-unavailable-timeout') {$payload.ok=$false;$payload.PSObject.Properties.Remove('result');$payload|Add-Member error ([pscustomobject]@{code='main_thread_dispatch_failed';message='bounded fixture read unavailable';retryable=$true;phase='execution'})}
+                                    if($Case -ceq 'wait-late') {$remaining=($lateReplyUtc-[DateTime]::UtcNow).TotalMilliseconds;if($remaining -gt 0){Start-Sleep -Milliseconds ([int][Math]::Ceiling($remaining))}}
                                 }
                                 $result=@{isError=$Case -ceq 'mcp-error' -and $rpc.params.name -ceq 'communityshaders.shader_api' -and $rpc.params.arguments.action -ceq 'snapshot';content=@(@{type='text';text=($payload|ConvertTo-Json -Depth 30 -Compress)})}
                             }
@@ -147,6 +157,7 @@ foreach($case in @('healthy','failed','pending','main-thread-unavailable','after
                     $crlf=[string][char]13+[char]10
                     $header=[Text.Encoding]::ASCII.GetBytes("HTTP/1.1 $status"+$crlf+"Content-Type: application/json"+$crlf+"Content-Length: $($bytes.Length)"+$crlf+$replyHeaders+"Connection: close"+$crlf+$crlf)
                     $stream.Write($header,0,$header.Length);$stream.Write($bytes,0,$bytes.Length);$stream.Flush()
+                    if($Case -ceq 'wait-listener-lost' -and $snapshots -gt 0) {$Listener.Stop();break}
                 } finally {$client.Close()}
             }
         } finally {$Listener.Stop()}
@@ -156,10 +167,49 @@ foreach($case in @('healthy','failed','pending','main-thread-unavailable','after
         $artifact=Join-Path $fixture 'fixture.dll';[IO.File]::WriteAllText($artifact,'not-a-native-artifact')
         $runtime=Join-Path $fixture 'runtime.json'
         @{port=$port;pid=$PID;buildId='ad8-fixture';artifactPath=$artifact;artifactSha256=(Get-FileHash $artifact -Algorithm SHA256).Hash}|ConvertTo-Json|Set-Content -LiteralPath $runtime
-        $flags=@{};if($case -cne 'no-guard'){$flags.RequireCompilerHealthy=$true};if($case -ceq 'skip-refused'){$flags.SkipRuntimeIdentityVerification=$true}
-        $reply=& (Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1') call -Tool fixture.target -ArgumentsJson '{}' -RuntimePath $runtime -EvidenceDirectory $fixture -TimeoutSeconds 15 -MaxTransientRetries 0 -Compact -NoExit @flags | ConvertFrom-Json -Depth 60
+        $isWait=$case.StartsWith('wait-')
+        $flags=@{}
+        if($isWait) {
+            $flags.Command='wait';$flags.Condition='compilerHealthy';$flags.PollMilliseconds=50
+            $flags.TimeoutSeconds=if($case -ceq 'wait-late'){2}elseif($case -cin @('wait-zero-timeout','wait-unavailable-timeout')){3}else{10}
+            if($case -ceq 'wait-skip-refused'){$flags.SkipRuntimeIdentityVerification=$true}
+            if($case -ceq 'wait-target-refused'){$flags.Tool='fixture.target';$flags.ArgumentsJson='{}'}
+        } else {
+            $flags.Command='call';$flags.Tool='fixture.target';$flags.ArgumentsJson='{}';$flags.TimeoutSeconds=15
+            if($case -cne 'no-guard'){$flags.RequireCompilerHealthy=$true}
+            if($case -ceq 'skip-refused'){$flags.SkipRuntimeIdentityVerification=$true}
+        }
+        $clock=[Diagnostics.Stopwatch]::StartNew()
+        $reply=& (Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1') -RuntimePath $runtime -EvidenceDirectory $fixture -MaxTransientRetries 0 -Compact -NoExit @flags | ConvertFrom-Json -Depth 60
+        $clock.Stop()
+        $reply|ConvertTo-Json -Depth 60|Set-Content -LiteralPath (Join-Path $fixture 'result.json')
         $calls=@($events.ToArray());$targets=@($calls|Where-Object kind -eq 'target').Count
-        if($case -cin @('healthy','no-guard')) {Check ($reply.ok -and $targets -eq 1) "$case production entry dispatches target exactly once"}
+        if($isWait) {
+            Check ($targets -eq 0 -and @($calls|Where-Object {$_.kind -ceq 'tools/call' -and $_.tool -cnotin @('inspect','communityshaders.shader_api')}).Count -eq 0) "$case wait issues no load/camera/target mutation"
+            $snapshots=@($calls|Where-Object kind -eq 'snapshot')
+            if($case -ceq 'wait-initializing') {
+                Check ($reply.ok -and $reply.data.satisfied -and $snapshots.Count -eq 3 -and $reply.data.observation.compilerGuard.health.compilation.totalTasks -gt 0) 'wait admits zero-to-pending-to-healthy only after fresh positive tasks'
+                Check (@($snapshots.commandId|Sort-Object -Unique).Count -eq 3) 'wait snapshot IDs never replay accepted reads or mutations'
+                Check (@($calls|Where-Object kind -eq 'initialize').Count -eq 1) 'normal readiness wait retains one selected MCP session'
+            } else {
+                Check (-not $reply.ok) "$case wait refuses readiness"
+                if($case -cin @('wait-zero-timeout','wait-unavailable-timeout')) {
+                    $expected=if($case -ceq 'wait-zero-timeout'){'COMPILATION_UNPROVEN'}else{'READ_UNAVAILABLE'}
+                    Check (-not $reply.data.satisfied -and $reply.data.observation.classification -ceq $expected -and $snapshots.Count -ge 1 -and $clock.Elapsed.TotalSeconds -lt 8) "$case bounded timeout preserves actionable non-failure diagnosis"
+                } elseif($case -cin @('wait-failed','wait-foreign-session','wait-malformed','wait-stale','wait-replay')) {
+                    Check ($reply.data.observation.terminalFailure -and $snapshots.Count -eq 1) "$case stops on first terminal snapshot rather than waiting for recovery"
+                } elseif($case -ceq 'wait-schema-missing') {
+                    Check ($reply.data.observation.terminalFailure -and $snapshots.Count -eq 0) 'wait missing snapshot capability refused without snapshot or target dispatch'
+                } elseif($case -cin @('wait-skip-refused','wait-target-refused')) {
+                    Check (@($calls|Where-Object kind -eq 'initialize').Count -eq 0) "$case rejected before session creation"
+                } elseif($case -ceq 'wait-late') {
+                    Check ($clock.Elapsed.TotalSeconds -lt 5 -and -not $reply.ok) 'late compiler read cannot become successful readiness beyond fixed budget'
+                } elseif($case -ceq 'wait-listener-lost') {
+                    Check (@($reply.errors|Where-Object {$_ -match 'runtime identity changed'}).Count -gt 0) 'listener loss across snapshot refuses ready identity'
+                }
+            }
+        }
+        elseif($case -cin @('healthy','no-guard')) {Check ($reply.ok -and $targets -eq 1) "$case production entry dispatches target exactly once"}
         else {Check (-not $reply.ok) "$case production entry refuses healthy promotion"}
         if($case -cin @('failed','pending','main-thread-unavailable','mcp-error','schema-missing','skip-refused')) {Check ($targets -eq 0 -and -not $reply.dispatchReached) "$case production entry proves zero target dispatch"}
         if($case -ceq 'main-thread-unavailable') {Check ($reply.data.compilerGuard.state -ceq 'READ_UNAVAILABLE' -and $reply.data.compilerGuard.reply.content[0].error.code -ceq 'main_thread_dispatch_failed' -and $null -eq $reply.data.compilerGuard.health.compilation) 'production entry retains native unavailable read without accepting counters or touching compile'}
@@ -170,7 +220,7 @@ foreach($case in @('healthy','failed','pending','main-thread-unavailable','after
             $ids=@($calls|Where-Object kind -eq 'snapshot'|ForEach-Object commandId)
             Check ($ids.Count -eq 2 -and $ids[0] -cne $ids[1]) 'guard uses fresh non-replayed snapshot command IDs'
         }
-        if($case -cne 'skip-refused') {Check ($reply.sessionCleanup.ok -and @($calls|Where-Object kind -eq 'delete').Count -eq 1) "$case closes one owned fixture MCP session"}
+        if($case -cnotin @('skip-refused','wait-skip-refused','wait-target-refused','wait-listener-lost')) {Check ($reply.sessionCleanup.ok -and @($calls|Where-Object kind -eq 'delete').Count -eq 1) "$case closes one owned fixture MCP session"}
         $reply|ConvertTo-Json -Depth 60|Set-Content -LiteralPath (Join-Path $fixture 'result.json')
     } finally {$listener.Stop();Stop-Job $server;Remove-Job $server}
 }
