@@ -12,6 +12,7 @@ $probe=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/native-colour
 $probe.producer=CloneFixture $colour.producer
 $cases=@('healthy','literal-not-gates','compiler','foreign-build','foreign-revision','lost-set','lost-arm','lost-reset','bad-set','bad-arm','bad-reset','wrong-page','wrong-generation','partial-page','wrong-frame','wrong-context','wrong-eye-dispatch','unsettled','native-failure','foreign-probe','changed-context','compiler-change','string-set-revision','string-arm-generation','string-page-generation','string-page-frame','string-page-flag','string-sample-count','string-sampling-grid','string-grid-coordinate','bad-source-pixel','wrong-metadata','short-sample-inventory','odd-raw-hex','nonfinite-decoded','string-reset-generation','cleanup-malformed-status','cleanup-malformed-reset','cleanup-malformed-idle','cleanup-native-failed')
 if($FixtureOnly){$cases=@($FixtureMode)}
+if(-not $FixtureOnly){$cases+=@('foreign-native-failure','malformed-native-failure')}
 foreach($mode in $cases){
     $script:mode=$mode;$script:revision=1;$script:auto=$true;$script:generation=0;$script:id='';$script:reset=$true;$script:guardCount=0;$script:setCount=0
     $script:calls=[Collections.Generic.List[object]]::new()
@@ -57,7 +58,11 @@ foreach($mode in $cases){
                     $p=CloneFixture $probe;$p.generation=$script:generation
                     if(-not $script:reset){$p.captureId=$script:id;$p.state='complete';$p.cpuFrame=61039;$p.queuedStageEyeSlots=10;$p.mappedStageEyeSlots=10;$p.expectedColourContractRevision=$script:revision;$p.stagingPayloadBytes=1024;$p.armedQpc=1;$p.queryQueuedQpc=2;$p.completedQpc=3}
                     if($script:mode -ceq 'foreign-probe'){$p.captureId='foreign';$p.state='armed';$p.generation=3;$p.expectedColourContractRevision=1;$p.armedQpc=1}
-                    if($script:mode -ceq 'native-failure' -and -not $script:reset){$p.state='failed';$p.error='native fixture failure'}
+                    if($script:mode -ceq 'native-failure' -and -not $script:reset){$p.state='failed';$p.error='the captured frame did not contain every required stage and eye';$p.cpuFrame=18960;$p.queuedStageEyeSlots=6;$p.mappedStageEyeSlots=0;$p.stagingPayloadBytes=49674240}
+                    if($script:mode -cin @('foreign-native-failure','malformed-native-failure') -and -not $script:reset){
+                        $p.state='failed';$p.error='untrusted native failure'
+                        if($script:mode -ceq 'foreign-native-failure'){$p.producer.buildId='f'*64}else{$p.generation=[string]$p.generation}
+                    }
                     if($script:mode -ceq 'cleanup-native-failed' -and -not $script:reset){$p.state='failed';$p.error='native fixture failure'}
                     if($script:cleanupPhase -and $script:mode -ceq 'cleanup-malformed-status'){$p.generation=[string]$p.generation}
                     if($script:cleanupPhase -and $script:mode -ceq 'cleanup-malformed-idle' -and $script:reset){$p.generation=[string]$p.generation}
@@ -107,6 +112,15 @@ foreach($mode in $cases){
     }else{Check ($script:setCount -le 1) 'stop before successor condition after failure'}
     if($mode -cin @('lost-set','lost-arm','lost-reset')){Check $r.indeterminate 'lost mutation stays indeterminate';Check (@($script:calls|Where-Object {$_.arguments.action -ceq $mode.Substring(5)}).Count -eq 1) 'lost mutation never replayed'}
     if($mode -cin @('wrong-page','partial-page','native-failure')){Check ($r.captures.Count -eq 1 -and -not $r.captures[0].complete -and $null -ne $r.retainedProbe) 'partial owned evidence not erased by reset'}
+    if($mode -ceq 'native-failure'){
+        Check (($r.errors -join ';') -cmatch 'Native colour probe capture failed: the captured frame did not contain every required stage and eye') 'exact native failure reason retained, not foreign producer'
+        Check (($r.errors -join ';') -cmatch 'cpuFrame=18960; queuedStageEyeSlots=6/10; mappedStageEyeSlots=0; stagingPayloadBytes=49674240') 'source-bound native failure counters retained in terminal diagnostic'
+        Check ($r.captures[0].status.state -ceq 'failed' -and $r.captures[0].status.captureId -ceq $r.captures[0].captureId -and $r.captures[0].status.generation -eq $r.captures[0].generation) 'typed native failed status retained in exact capture record'
+    }
+    if($mode -cin @('foreign-native-failure','malformed-native-failure')){
+        Check (($r.errors -join ';') -cnotmatch 'Native colour probe capture failed: untrusted') 'foreign/malformed status cannot gain source-bound native failure classification'
+        Check ($null -eq $r.captures[0].status) 'unqualified native failed payload not promoted into capture status'
+    }
     if($mode -clike 'cleanup-*'){
         Check ($r.probeCleanup.attempted -and $r.probeCleanup.verified -eq ($mode -ceq 'cleanup-native-failed')) 'cleanup result independent of failed measurement'
         Check (@($script:calls|Where-Object {$_.arguments.action -ceq 'reset'}).Count -le 1) 'cleanup never repeats reset'

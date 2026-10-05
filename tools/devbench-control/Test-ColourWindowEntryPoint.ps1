@@ -95,6 +95,10 @@ foreach($mode in @('healthy','partial-page','compiler','schema-missing','lost-ar
         }
         if($mode -ceq 'healthy'){Check ($reply.data.measurement.captures.Count -eq 3 -and @($reply.data.measurement.captures|ForEach-Object {$_.pages}).Count -eq 30) 'public three conditions/all30 pages complete'}
         if($mode -cin @('partial-page','string-page-generation','native-failure')){Check ($reply.data.measurement.probeCleanup.verified -and -not $reply.data.measurement.captures[0].complete) 'partial/malformed/failed capture and successful owned cleanup separate'}
+        if($mode -ceq 'native-failure'){
+            Check (($reply.errors -join ';') -cmatch 'Native colour probe capture failed: the captured frame did not contain every required stage and eye' -and ($reply.errors -join ';') -cmatch 'queuedStageEyeSlots=6/10; mappedStageEyeSlots=0') 'public terminal diagnostic retains exact native failure and slot counts'
+            Check ($reply.data.measurement.captures[0].status.state -ceq 'failed' -and -not $reply.indeterminate) 'known native failure remains determinate after owned restoration'
+        }
         if($mode -cin @('lost-arm','lost-reset')){Check $reply.data.measurement.indeterminate 'lost mutation remains indeterminate';Check (@($all|Where-Object {$_.name -ceq 'communityshaders.colour_pipeline_probe' -and $_.arguments.action -ceq $mode.Substring(5)}).Count -eq 1) 'lost mutation not replayed'}
     }finally{$listener.Stop();Stop-Job $server;Remove-Job $server}
 }
