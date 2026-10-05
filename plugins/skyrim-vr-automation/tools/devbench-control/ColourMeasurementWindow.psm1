@@ -59,7 +59,19 @@ function Invoke-DevBenchColourMeasurement {
     function Guard([datetime]$Bound) {
         if ([datetime]::UtcNow -ge $Bound) { throw 'Colour work deadline expired.' }
         $g=& $CompilerGuard $Bound; $guards.Add($g)
-        if ($g.admissible -isnot [bool] -or -not $g.admissible) { throw 'Compiler boundary refused colour measurement.' }
+        if ($g.admissible -isnot [bool] -or -not $g.admissible) {
+            # Preserve the transport's exact pre-request budget refusal, without
+            # relabelling other unavailable reads or compiler failures as timeout.
+            if ($g.admissible -is [bool] -and -not $g.admissible -and
+                $g.PSObject.Properties['state'] -and $g.state -ceq 'READ_UNAVAILABLE' -and
+                $g.PSObject.Properties['health'] -and $null -eq $g.health -and
+                $g.PSObject.Properties['reasons'] -and @($g.reasons).Count -eq 1 -and
+                $g.reasons[0] -is [string] -and
+                $g.reasons[0] -ceq 'The DevBench operation deadline expired before another request could start.') {
+                throw 'Colour work deadline exhausted before another qualified compiler read could start.'
+            }
+            throw 'Compiler boundary refused colour measurement.'
+        }
         return $g
     }
     function Status([string]$Name,[datetime]$Bound,$Observations=$null) {
@@ -243,6 +255,7 @@ function Invoke-DevBenchColourMeasurement {
                     if($page.immediateContext.kind -cne 'immediate' -or $page.immediateContext.pointer -isnot [string] -or $page.immediateContext.pointer -notmatch '^0x[0-9a-fA-F]+$' -or $page.immediateContext.pointer -match '^0x0+$'){throw 'Capture immediate context is unproven.'}
                     if($null -eq $context){$context=$page.immediateContext.pointer}else{if($context -cne $page.immediateContext.pointer){throw 'Capture pages changed immediate context.'}}
                     if($d.attribution -cne 'observed-successful-dispatch' -or $d.colourContractRevision -ne $revision -or $d.contextGeneration -ne $s.runtimeContext.generation -or $d.contextIndex -ne $eye -or $d.frame -ne $p.cpuFrame -or $d.requestedHighDynamicRangeInput -cne $Plan.highDynamicRangeInput -or $d.effectiveHighDynamicRangeInput -cne $Plan.highDynamicRangeInput -or $d.requestedAutoExposure -cne $auto -or $d.effectiveAutoExposure -cne $auto -or $d.dispatchSerial -le 0){throw 'Page lacks matching actual successful eye dispatch.'}
+                    if(@(Get-DevBenchSubmittedInputReasons -Dispatch $d -Successful $true).Count){throw 'Page submittedInputs is malformed or unsupported; raw page retained.'}
                     if($null -ne $burnPolicy){
                         foreach($field in @('renderWidth','renderHeight','displayWidth','displayHeight','configuredSharpnessAtDispatch','effectiveSharpness','sharpeningEnabled')){if(-not $d.PSObject.Properties[$field] -or $d.$field -cne $s.lastSuccessfulEyeDispatches[$eye].$field){throw "Burn-in qualified page signature changed: $field."}}
                         if(-not $d.PSObject.Properties['dispatchQpc'] -or -not (UInt $d.dispatchQpc 1) -or $d.dispatchSerial -le $lastFresh.lastSuccessfulEyeDispatches[$eye].serial -or $d.dispatchQpc -le $lastFresh.lastSuccessfulEyeDispatches[$eye].dispatchQpc){throw 'Capture eye dispatch did not advance beyond final burn-in observation.'}

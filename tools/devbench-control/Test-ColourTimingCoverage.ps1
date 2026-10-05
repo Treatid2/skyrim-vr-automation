@@ -4,7 +4,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $script:timingChecks=0
 function TCheck($value,$message){if(-not $value){throw ($script:timingMode+': '+$message)};$script:timingChecks++}
-$modes=@('healthy','transient','stale','regression','dimensions','sharpness','context','compiler','deadline','off-incomplete','lost-restore','lost-set','spacing-only')
+$modes=@('healthy','transient','stale','regression','dimensions','sharpness','context','compiler','deadline','off-incomplete','lost-restore','lost-set','spacing-only','read-budget','read-unavailable','compiler-refusal','inputs-available','inputs-unavailable','inputs-stale','inputs-malformed','page-inputs-malformed','page-inputs-conflict')
 $summaries=[Collections.Generic.List[object]]::new()
 foreach($timingMode in $modes){
     $fixture=. (Join-Path $PSScriptRoot 'Test-ColourMeasurementWindow.ps1') -FixtureOnly
@@ -23,7 +23,7 @@ foreach($timingMode in $modes){
             $script:timingStatuses++
             $n=$script:timingStatuses
             $frame=61039+$n
-            if($script:timingMode -ceq 'stale' -or ($script:timingMode -cin @('off-incomplete','lost-restore') -and -not $script:auto)){$frame=61039}
+            if($script:timingMode -cin @('stale','inputs-stale') -or ($script:timingMode -cin @('off-incomplete','lost-restore') -and -not $script:auto)){$frame=61039}
             if($script:timingMode -ceq 'regression' -and $n -ge 3){$frame=61034}
             foreach($eye in 0,1){
                 $d=$p.lastSuccessfulEyeDispatches[$eye]
@@ -54,12 +54,27 @@ foreach($timingMode in $modes){
                 $p.stages[0].dispatch=CloneFixture $d
             }
         }
+        if($script:timingMode -clike '*inputs*'){
+            $dispatches=if($name -ceq 'communityshaders.fsr_color_contract'){@($p.lastSuccessfulDispatch)+@($p.lastSuccessfulEyeDispatches)}elseif($argsMap.action -ceq 'read'){@($p.dispatch,$p.stages[0].dispatch)}else{@()}
+            foreach($d in $dispatches){
+                $input=if($script:timingMode -ceq 'inputs-unavailable'){[pscustomobject]@{schemaVersion=1;available=$false;reset=$null;jitterOffsetPixels=$null;frameTimeDeltaMilliseconds=$null}}else{[pscustomobject]@{schemaVersion=1;available=$true;reset=$false;jitterOffsetPixels=@(-0.25,0.125);frameTimeDeltaMilliseconds=13.5}}
+                $d|Add-Member -NotePropertyName submittedInputs -NotePropertyValue $input -Force
+            }
+            if($script:timingMode -ceq 'inputs-malformed' -and $name -ceq 'communityshaders.fsr_color_contract' -and $argsMap.action -ceq 'status' -and $script:timingStatuses -ge 3 -and -not $script:timingCleanup){$p.lastSuccessfulEyeDispatches[1].submittedInputs.reset='false'}
+            if($script:timingMode -ceq 'page-inputs-malformed' -and $name -ceq 'communityshaders.colour_pipeline_probe' -and $argsMap.action -ceq 'read'){$p.dispatch.submittedInputs.frameTimeDeltaMilliseconds=-1}
+            if($script:timingMode -ceq 'page-inputs-conflict' -and $name -ceq 'communityshaders.colour_pipeline_probe' -and $argsMap.action -ceq 'read'){$p.stages[0].dispatch.submittedInputs.reset=$true}
+        }
         if($script:timingCleanup -and $script:timingMode -ceq 'lost-restore' -and $name -ceq 'communityshaders.fsr_color_contract' -and $argsMap.action -ceq 'set'){throw 'fixture lost accepted original-AE restore'}
         return $reply
     }
     $guard={param($bound)
         $g=& $nativeGuard $bound
         if($script:timingMode -ceq 'compiler' -and $script:timingStatuses -ge 2){$g.health.stateRevision=2}
+        if($script:timingMode -cin @('read-budget','read-unavailable','compiler-refusal') -and $script:timingStatuses -ge 2){
+            $state=if($script:timingMode -ceq 'compiler-refusal'){'COMPILATION_FAILED'}else{'READ_UNAVAILABLE'}
+            $reason=if($script:timingMode -ceq 'read-budget'){'The DevBench operation deadline expired before another request could start.'}elseif($script:timingMode -ceq 'read-unavailable'){'Native shader read unavailable; no counters admitted.'}else{'A compiler failure remains after an earlier deadline.'}
+            return [pscustomobject]@{admissible=$false;health=$null;state=$state;reasons=@($reason)}
+        }
         return $g
     }
     $cleanup={param($name,$argsMap,$mutation,$bound)$script:timingCleanup=$true;& $call $name $argsMap $mutation $bound}
@@ -67,7 +82,7 @@ foreach($timingMode in $modes){
     if($timingMode -ceq 'deadline'){$deadline=[datetime]::UtcNow.AddMilliseconds(100)}
     $started=[Diagnostics.Stopwatch]::StartNew()
     $r=Invoke-DevBenchColourMeasurement -Call $call -CompilerGuard $guard -Plan $plan -DeadlineUtc $deadline -CleanupCall $cleanup -CleanupDeadlineUtc $deadline.AddSeconds(2) -PollMilliseconds 10
-    $expected=$timingMode -cin @('healthy','transient','spacing-only')
+    $expected=$timingMode -cin @('healthy','transient','spacing-only','inputs-available','inputs-unavailable')
     TCheck ($r.ok -eq $expected) "$timingMode outcome: $($r.errors -join ';')"
     TCheck (-not $r.vendorExposureConvergenceKnown) 'No hidden vendor convergence claim'
     if($expected){
@@ -81,15 +96,24 @@ foreach($timingMode in $modes){
             TCheck (@($r.conditions|Where-Object {$null -ne $_.burnIn.successfulEyeFrameCount}).Count -eq 0) 'Unobserved successful frame count remains null'
         }
         if($timingMode -ceq 'transient'){TCheck (@($r.conditions|ForEach-Object {$_.burnIn.observations}|Where-Object {$_.classification -ceq 'transient-unmatched-dispatch'}).Count -ge 1) 'Transient observation retained without successful promotion'}
+        if($timingMode -cin @('inputs-available','inputs-unavailable')){TCheck (@($r.captures|ForEach-Object {$_.pages}|Where-Object {$_.dispatch.submittedInputs.available -ne ($script:timingMode -ceq 'inputs-available')}).Count -eq 0) 'Native optional input availability retained without requiring it for legacy coverage'}
         if($timingMode -ceq 'spacing-only'){
             TCheck (-not $r.burnInRequested) 'Spacing does not secretly request burn-in'
             foreach($capture in $r.captures){TCheck $capture.spacing.verified 'Inter-arm spacing qualified';if($null -ne $capture.spacing.priorArmAcknowledgedElapsedMilliseconds){TCheck (($capture.spacing.armIntentElapsedMilliseconds-$capture.spacing.priorArmAcknowledgedElapsedMilliseconds) -ge 1000) 'Monotonic floor since previous positive arm acknowledgement'}}
         }
     }else{
-        if($timingMode -cne 'lost-set'){TCheck (@($r.conditions|Where-Object {$null -ne $_.burnIn -and -not $_.burnIn.complete}).Count -ge 1) 'Coverage failure separate from captured native dispatch'}
+        if($timingMode -cnotin @('lost-set','page-inputs-malformed','page-inputs-conflict')){TCheck (@($r.conditions|Where-Object {$null -ne $_.burnIn -and -not $_.burnIn.complete}).Count -ge 1) 'Coverage failure separate from captured native dispatch'}
         if($timingMode -cne 'lost-set'){TCheck $r.conditions[-1].nativeDispatchMatched 'Initial matched dispatch is not burn-in completion'}
         if($timingMode -cin @('stale','deadline','regression','dimensions','sharpness','context','compiler')){TCheck ($r.captures.Count -eq 0 -and $r.conditions.Count -eq 1) 'No arm/next condition after coverage failure'}
         if($timingMode -ceq 'stale'){TCheck ($r.conditions[0].burnIn.distinctFreshSuccessfulBothEyeObservations -eq 1 -and $r.conditions[0].burnIn.observedCpuFrameIdAdvancePerEye[0] -eq 0) 'Advancing serial alone never counts stale CPU frames'}
+        if($timingMode -ceq 'inputs-stale'){TCheck ($r.captures.Count -eq 0 -and $r.conditions[0].burnIn.distinctFreshSuccessfulBothEyeObservations -eq 1) 'Available input telemetry never makes stale CPU frames fresh'}
+        if($timingMode -cin @('read-budget','read-unavailable','compiler-refusal')){
+            $code=if($timingMode -ceq 'read-budget'){'burn-in-incomplete'}else{'burn-in-invalidated'}
+            TCheck ($r.conditions[0].burnIn.failureCode -ceq $code -and $r.captures.Count -eq 0) 'Exact pre-request budget refusal remains distinct from unavailable/failed compiler evidence'
+            TCheck ($r.compilerBoundaries[-1].reasons.Count -eq 1) 'Original compiler diagnostic retained'
+        }
+        if($timingMode -ceq 'inputs-malformed'){TCheck ($r.captures.Count -eq 0) 'Malformed available stereo input telemetry refuses before arm'}
+        if($timingMode -cin @('page-inputs-malformed','page-inputs-conflict')){TCheck ($r.captures.Count -eq 1 -and -not $r.captures[0].complete -and $r.probeCleanup.verified) 'Malformed/inconsistent owned page retained, never promoted, owned cleanup verified'}
         if($timingMode -cin @('off-incomplete','lost-restore')){
             TCheck ($r.conditions.Count -eq 2 -and $script:setCount -eq 3 -and $r.colourCleanup.attempted) 'One original-AE compensation, not another condition or replay'
             TCheck ($r.colourCleanup.verified -eq ($timingMode -ceq 'off-incomplete')) 'Lost restore remains explicitly unresolved'

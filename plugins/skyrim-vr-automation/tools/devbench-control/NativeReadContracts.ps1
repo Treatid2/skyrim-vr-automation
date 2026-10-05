@@ -1,5 +1,35 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Exact native read schemas. No mutation outcome or runtime admission is inferred.
+function Get-DevBenchSubmittedInputReasons {
+    param($Dispatch,[bool]$Successful=$false)
+    $reasons=[Collections.Generic.List[string]]::new()
+    if($Dispatch -isnot [pscustomobject]){return @('submittedInputs dispatch must be an object.')}
+    # Absent optional telemetry is legacy compatibility, not available evidence.
+    $property=$Dispatch.PSObject.Properties['submittedInputs']
+    if(-not $property){return @($reasons)}
+    $inputs=$property.Value
+    $fields=@('schemaVersion','available','reset','jitterOffsetPixels','frameTimeDeltaMilliseconds')
+    if($property.Name -cne 'submittedInputs' -or $inputs -isnot [pscustomobject] -or
+        @($inputs.PSObject.Properties).Count -ne $fields.Count -or
+        @($fields|Where-Object {-not $inputs.PSObject.Properties[$_] -or $inputs.PSObject.Properties[$_].Name -cne $_}).Count){
+        return @('submittedInputs requires the exact schema1 object.')
+    }
+    if($null -eq $inputs.schemaVersion -or $inputs.schemaVersion.GetType() -notin @([int],[long],[uint32],[uint64]) -or $inputs.schemaVersion -ne 1 -or $inputs.available -isnot [bool]){
+        return @('submittedInputs version/availability requires actual schema1 integer/Boolean.')
+    }
+    if(-not $inputs.available){
+        if($null -ne $inputs.reset -or $null -ne $inputs.jitterOffsetPixels -or $null -ne $inputs.frameTimeDeltaMilliseconds){$reasons.Add('Unavailable submittedInputs values must all be explicit null.')}
+        return @($reasons)
+    }
+    if(-not $Successful){$reasons.Add('Available submittedInputs requires qualified successful dispatch evidence.')}
+    if($inputs.reset -isnot [bool]){$reasons.Add('submittedInputs.reset requires an actual Boolean.')}
+    function FiniteInput($Value){return $null -ne $Value -and $Value.GetType() -in @([byte],[sbyte],[int16],[uint16],[int],[uint32],[long],[uint64],[single],[double],[decimal]) -and [double]::IsFinite([double]$Value)}
+    if($inputs.jitterOffsetPixels -isnot [array] -or $inputs.jitterOffsetPixels.Count -ne 2 -or
+        @($inputs.jitterOffsetPixels|Where-Object {-not (FiniteInput $_)}).Count){$reasons.Add('submittedInputs.jitterOffsetPixels requires two finite actual numbers.')}
+    if(-not (FiniteInput $inputs.frameTimeDeltaMilliseconds) -or $inputs.frameTimeDeltaMilliseconds -lt 0){$reasons.Add('submittedInputs.frameTimeDeltaMilliseconds requires a finite nonnegative actual number.')}
+    return @($reasons)
+}
+
 function Get-DevBenchNativeReadReasons {
     param([string]$Kind, $Payload, [Collections.IDictionary]$Arguments)
     $reasons = [Collections.Generic.List[string]]::new()
@@ -123,6 +153,7 @@ function Get-DevBenchNativeReadReasons {
         if ($eyes -is [array]) { $dispatches += @($eyes) }
         for ($i=0;$i -lt $dispatches.Count;$i++) {
             $d=$dispatches[$i]; $path="dispatch[$i]"; $valid=Member $d 'valid'
+            foreach($reason in @(Get-DevBenchSubmittedInputReasons -Dispatch $d -Successful ($valid -is [bool] -and $valid))){$reasons.Add("$path $reason")}
             foreach ($flag in @('valid','highDynamicRangeInput','autoExposure','exposureResourceBound')) { Boolean $d $flag $path }
             foreach ($name in @('frame','path','contextIndex','renderWidth','renderHeight','displayWidth','displayHeight')) { Require (UInt (Member $d $name) ([uint32]::MaxValue)) "$path.$name" }
             foreach ($name in @('serial','contextGeneration')) { Require (UInt (Member $d $name)) "$path.$name" }
@@ -202,5 +233,3 @@ function Get-DevBenchNativeReadReasons {
     else { Require $false 'unregistered read contract' }
     return @($reasons)
 }
-
-
