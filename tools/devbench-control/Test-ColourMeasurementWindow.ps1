@@ -10,7 +10,7 @@ function CloneFixture($Value){return $Value|ConvertTo-Json -Depth 35|ConvertFrom
 $colour=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/native-fsr-colour-status.json') -Raw|ConvertFrom-Json
 $probe=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/native-colour-probe-status.v3.json') -Raw|ConvertFrom-Json
 $probe.producer=CloneFixture $colour.producer
-$cases=@('healthy','compiler','foreign-build','foreign-revision','lost-set','lost-arm','lost-reset','bad-set','bad-arm','bad-reset','wrong-page','wrong-generation','partial-page','wrong-frame','wrong-context','wrong-eye-dispatch','unsettled','native-failure','foreign-probe','changed-context','compiler-change')
+$cases=@('healthy','literal-not-gates','compiler','foreign-build','foreign-revision','lost-set','lost-arm','lost-reset','bad-set','bad-arm','bad-reset','wrong-page','wrong-generation','partial-page','wrong-frame','wrong-context','wrong-eye-dispatch','unsettled','native-failure','foreign-probe','changed-context','compiler-change','string-set-revision','string-arm-generation','string-page-generation','string-page-frame','string-page-flag','string-sample-count','string-sampling-grid','string-grid-coordinate','bad-source-pixel','wrong-metadata','short-sample-inventory','odd-raw-hex','nonfinite-decoded','string-reset-generation','cleanup-malformed-status','cleanup-malformed-reset','cleanup-malformed-idle','cleanup-native-failed')
 if($FixtureOnly){$cases=@($FixtureMode)}
 foreach($mode in $cases){
     $script:mode=$mode;$script:revision=1;$script:auto=$true;$script:generation=0;$script:id='';$script:reset=$true;$script:guardCount=0;$script:setCount=0
@@ -36,6 +36,11 @@ foreach($mode in $cases){
             $p=CloneFixture $colour;$p.requested.revision=$script:revision;$p.requested.autoExposure=$script:auto;$p.runtimeContext.autoExposure=$script:auto
             foreach($d in @($p.lastSuccessfulDispatch)+@($p.lastSuccessfulEyeDispatches)){$d.autoExposure=$script:auto}
             if($argsMap.action -ceq 'set'){$p|Add-Member accepted ($script:mode -cne 'bad-set');$p|Add-Member resultingRevision $script:revision}
+            if($script:mode -ceq 'string-set-revision' -and $argsMap.action -ceq 'set'){$p.resultingRevision=[string]$p.resultingRevision}
+            if($script:mode -ceq 'literal-not-gates'){
+                foreach($d in @($p.lastSuccessfulDispatch)+@($p.lastSuccessfulEyeDispatches)){$d.preExposure=0.5;$d.exposureResourceBound=$true}
+                $p.sourceColorContractChanged=$true
+            }
             if($script:mode -ceq 'foreign-revision' -and $argsMap.action -ceq 'status'){$p.requested.revision=9}
             if($script:mode -ceq 'foreign-build'){$p.producer.buildId='f'*64}
             if($script:mode -ceq 'unsettled'){$p.runtimeContext.valid=$false}
@@ -46,40 +51,67 @@ foreach($mode in $cases){
                     $script:generation++;$script:id=$argsMap.captureId;$script:reset=$false
                     if($script:mode -ceq 'lost-arm'){throw 'fixture lost accepted arm'}
                     $p=[pscustomobject]@{action='arm';accepted=($script:mode -cne 'bad-arm');captureId=$script:id;generation=$script:generation;error=$null;producer=(CloneFixture $colour.producer)}
+                    if($script:mode -ceq 'string-arm-generation'){$p.generation=[string]$p.generation}
                 }
                 'status' {
                     $p=CloneFixture $probe;$p.generation=$script:generation
                     if(-not $script:reset){$p.captureId=$script:id;$p.state='complete';$p.cpuFrame=61039;$p.queuedStageEyeSlots=10;$p.mappedStageEyeSlots=10;$p.expectedColourContractRevision=$script:revision;$p.stagingPayloadBytes=1024;$p.armedQpc=1;$p.queryQueuedQpc=2;$p.completedQpc=3}
                     if($script:mode -ceq 'foreign-probe'){$p.captureId='foreign';$p.state='armed';$p.generation=3;$p.expectedColourContractRevision=1;$p.armedQpc=1}
                     if($script:mode -ceq 'native-failure' -and -not $script:reset){$p.state='failed';$p.error='native fixture failure'}
+                    if($script:mode -ceq 'cleanup-native-failed' -and -not $script:reset){$p.state='failed';$p.error='native fixture failure'}
+                    if($script:cleanupPhase -and $script:mode -ceq 'cleanup-malformed-status'){$p.generation=[string]$p.generation}
+                    if($script:cleanupPhase -and $script:mode -ceq 'cleanup-malformed-idle' -and $script:reset){$p.generation=[string]$p.generation}
                 }
                 'read' {
                     $d=[pscustomobject]@{attribution='observed-successful-dispatch';colourContractRevision=$script:revision;contextGeneration=2;contextIndex=$argsMap.eye;path=3;frame=61039;requestedHighDynamicRangeInput=$true;effectiveHighDynamicRangeInput=$true;requestedAutoExposure=$script:auto;effectiveAutoExposure=$script:auto;dispatchSerial=(21879+$argsMap.eye)}
                     $slot=[pscustomobject]@{stage=$argsMap.stage;eye=@('left','right')[$argsMap.eye];eyeMask=(1 -shl $argsMap.eye);queued=$true;mapped=$true;frame=[pscustomobject]@{cpuFrame=61039};dispatch=(CloneFixture $d);readback=[pscustomobject]@{map=[pscustomobject]@{succeeded=$true;matchedMap=$true;readable=$true};sampling=[pscustomobject]@{transferConversion='none';gridSize=17;sampleCount=289;samples=@(for($i=0;$i -lt 289;$i++){[pscustomobject]@{grid=@(($i%17),([int][Math]::Floor($i/17)));rawLittleEndianHex='00000000';decodedRgba=$null}})}}}
                     $p=[pscustomobject]@{schema='csx-colour-pipeline-probe-v3';producer=(CloneFixture $colour.producer);metadata=[pscustomobject]@{calibratedScene='fixture-owner-calibration'};captureId=$script:id;generation=$script:generation;state='complete';error=$null;frame=[pscustomobject]@{cpuFrame=61039;eye='both';eyeMask=3;sceneEpoch=$null;submissionEpoch=$null};samplingContract=[pscustomobject]@{gridSize=17;rawBytesRetainedPerSample=$true;implicitTransferConversion=$false};immediateContext=[pscustomobject]@{pointer='0x1234';kind='immediate'};dispatch=$d;stages=@($slot)}
-                    switch($script:mode){'wrong-page'{$slot.stage='foreign'};'wrong-generation'{$p.generation++};'partial-page'{$slot.mapped=$false};'wrong-frame'{$p.frame.cpuFrame++};'wrong-context'{$p.immediateContext.pointer='0x0000'};'wrong-eye-dispatch'{$p.dispatch.contextIndex=3}}
+                    foreach($sample in $slot.readback.sampling.samples){$sample|Add-Member sourcePixel @($sample.grid[0],$sample.grid[1])}
+                    switch($script:mode){
+                        'wrong-page'{$slot.stage='foreign'};'wrong-generation'{$p.generation++};'partial-page'{$slot.mapped=$false};'wrong-frame'{$p.frame.cpuFrame++};'wrong-context'{$p.immediateContext.pointer='0x0000'};'wrong-eye-dispatch'{$p.dispatch.contextIndex=3}
+                        'string-page-generation'{$p.generation=[string]$p.generation}
+                        'string-page-frame'{$p.frame.cpuFrame=[string]$p.frame.cpuFrame}
+                        'string-page-flag'{$p.dispatch.requestedAutoExposure=[string]$p.dispatch.requestedAutoExposure}
+                        'string-sample-count'{$slot.readback.sampling.sampleCount='289'}
+                        'string-sampling-grid'{$p.samplingContract.gridSize='17'}
+                        'string-grid-coordinate'{$slot.readback.sampling.samples[0].grid[0]='0'}
+                        'bad-source-pixel'{$slot.readback.sampling.samples[0].sourcePixel[0]=$true}
+                        'wrong-metadata'{$p.metadata.calibratedScene='different-owner'}
+                        'short-sample-inventory'{$slot.readback.sampling.samples=$slot.readback.sampling.samples[0..287]}
+                        'odd-raw-hex'{$slot.readback.sampling.samples[0].rawLittleEndianHex='000'}
+                        'nonfinite-decoded'{$slot.readback.sampling.samples[0].decodedRgba=@(1,2,3,[double]::NaN)}
+                        {$_ -clike 'cleanup-malformed-*'}{$slot.mapped=$false}
+                    }
                 }
                 'reset' {
                     Check ($argsMap.captureId -ceq $script:id -and $argsMap.generation -eq $script:generation) 'reset owns exact arm tuple'
                     if($script:mode -ceq 'lost-reset'){throw 'fixture lost accepted reset'}
                     $script:generation++;$script:reset=$true;$p=[pscustomobject]@{action='reset';accepted=($script:mode -cne 'bad-reset');captureId=$script:id;generation=$script:generation;error=$null;producer=(CloneFixture $colour.producer)}
+                    if($script:mode -cin @('string-reset-generation','cleanup-malformed-reset')){$p.generation=[string]$p.generation}
                 }
             }
         }
         return [pscustomobject]@{content=@($p);rawResult=[pscustomobject]@{isError=$false}}
     }
+    $script:cleanupPhase=$false
+    $cleanup={param($name,$argsMap,$mutation,$bound)$script:cleanupPhase=$true;& $call $name $argsMap $mutation $bound}
     if($FixtureOnly){return [pscustomobject]@{Call=$call;Guard=$guard;Plan=$plan;Producer=$colour.producer}}
     $deadline=[datetime]::UtcNow.AddSeconds($(if($mode -ceq 'unsettled'){0.1}else{20}))
-    $r=Invoke-DevBenchColourMeasurement -Call $call -CompilerGuard $guard -Plan $plan -DeadlineUtc $deadline -PollMilliseconds 10
-    Check ($r.ok -eq ($mode -ceq 'healthy')) "$mode outcome: $($r.errors -join ';')"
+    $r=if($mode -clike 'cleanup-*'){Invoke-DevBenchColourMeasurement -Call $call -CompilerGuard $guard -Plan $plan -DeadlineUtc $deadline -CleanupCall $cleanup -CleanupDeadlineUtc $deadline -PollMilliseconds 10}else{Invoke-DevBenchColourMeasurement -Call $call -CompilerGuard $guard -Plan $plan -DeadlineUtc $deadline -PollMilliseconds 10}
+    Check ($r.ok -eq ($mode -cin @('healthy','literal-not-gates'))) "$mode outcome: $($r.errors -join ';')"
     Check (@($script:calls|Where-Object {$_.mutation -and $_.name -cnotin @('communityshaders.fsr_color_contract','communityshaders.colour_pipeline_probe')}).Count -eq 0) 'no generic mutation'
-    if($mode -ceq 'healthy'){
+    if($mode -cin @('healthy','literal-not-gates')){
         Check ($r.conditions.Count -eq 3 -and $r.captures.Count -eq 6 -and @($r.captures|Where-Object {-not $_.complete -or -not $_.resetVerified}).Count -eq 0) 'all three conditions/two captures complete'
         Check (@($r.captures|ForEach-Object {$_.pages}).Count -eq 60) 'all sixty stage-eye pages retained'
         Check ($r.conditions[0].autoExposure -and -not $r.conditions[1].autoExposure -and $r.conditions[2].autoExposure -and $r.finalRevision -eq 3) 'on/off/on exactCAS sequence'
     }else{Check ($script:setCount -le 1) 'stop before successor condition after failure'}
     if($mode -cin @('lost-set','lost-arm','lost-reset')){Check $r.indeterminate 'lost mutation stays indeterminate';Check (@($script:calls|Where-Object {$_.arguments.action -ceq $mode.Substring(5)}).Count -eq 1) 'lost mutation never replayed'}
     if($mode -cin @('wrong-page','partial-page','native-failure')){Check ($r.captures.Count -eq 1 -and -not $r.captures[0].complete -and $null -ne $r.retainedProbe) 'partial owned evidence not erased by reset'}
+    if($mode -clike 'cleanup-*'){
+        Check ($r.probeCleanup.attempted -and $r.probeCleanup.verified -eq ($mode -ceq 'cleanup-native-failed')) 'cleanup result independent of failed measurement'
+        Check (@($script:calls|Where-Object {$_.arguments.action -ceq 'reset'}).Count -le 1) 'cleanup never repeats reset'
+        Check (-not $r.captures[0].complete) 'cleanup does not promote incomplete measurement'
+    }
 }
 foreach($name in @('expectedBuildId','expectedRevision','expectedCellFormId','highDynamicRangeInput','capturesPerCondition','metadata')){
     $bad=$plan.Clone();$bad.Remove($name);$rejected=$false;try{Assert-ColourMeasurementPlan $bad}catch{$rejected=$true};Check $rejected "missing plan$name refuses before mutation"
