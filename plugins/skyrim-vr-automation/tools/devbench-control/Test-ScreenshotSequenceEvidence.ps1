@@ -5,7 +5,7 @@ $script:checks=0
 function Check([bool]$Good,[string]$Message) { $script:checks++; if (-not $Good) { throw $Message } }
 function Obj($Value) { return $Value|ConvertTo-Json -Depth 80|ConvertFrom-Json -Depth 80 -DateKind String }
 function Change($Value,[string]$Path,$Replacement) { $names=$Path.Split('.');$node=$Value;for($i=0;$i -lt $names.Count-1;$i++){$node=$node.($names[$i])};$node.($names[-1])=$Replacement }
-$build='a'*64; $service='service-fixture'; $destination='C:\fixture\pr51'; $directory=$destination+'\CS_sequence_owned'
+$build='a'*64; $service='service-fixture'; $destination='C:\fixture\pr51'; $directory=$destination+'\CS_sequence_parent-owned'
 $capture=Obj @{source=@{kind='hmd_submission';fallback='reject'};outputs=@(@{view='left_eye';encoding=@{format='png';colourContract='sdr_srgb'}},@{view='right_eye';encoding=@{format='png';colourContract='sdr_srgb'}});destination=@{policy='absolute';directory=$destination;baseName='frame';overwrite='never'};clipboard='none'}
 $startArgs=@{action='sequence_start';clientId='pr51-owner';commandId='start-once';contractMajor=1;expectedBuildId=$build;sequence=@{frameCount=3;useSettings=$false;capture=$capture;schedule=@{basis='wall_clock';intervalMs=500;startDelayMs=0;pausePolicy='hold'};backpressure=@{policy='abort';maximumConsecutiveSkips=1};failurePolicy='abort';packaging=@{frameManifest=$true;previewVideo=@{requested=$false;required=$false}}}}
 function Envelope($CommandArgs,$Receipt) { return Obj @{contract=@{name='csx.screenshot';major=1;minor=1;schemaRevision=2};command=@{action=$CommandArgs.action;clientId=$CommandArgs.clientId;commandId=$CommandArgs.commandId};server=@{component='CommunityShaders';buildId=$build;serviceSessionId=$service};timestampUtc='2026-10-05T20:00:05Z';ok=$true;result=$Receipt} }
@@ -38,6 +38,8 @@ for ($ordinal=1;$ordinal -le 3;$ordinal++) {
 $done=Obj $running;$done.state='completed';$done.terminalUtc='2026-10-05T20:00:04Z';$done.counts.scheduled=3;$done.counts.acquired=3;$done.counts.written=3;$done.termination.finalizationCommitted=$true;$done.termination.committedOutcome='completed';$done.packaging.frameManifest.state='written';$done.packaging.frameManifest|Add-Member path ($directory+'\sequence.json');$done.manifest.finalPath=$directory+'\sequence.json';$done.artifactProgress.terminal=1;$done.artifactProgress.successful=1
 $manifest=Obj @{contract=$start.contract;producer=@{component='CommunityShaders';buildId=$build};sessionId=$service;requestId='parent-owned';state='final';terminalOutcome='completed';client=@{clientId='pr51-owner';commandId='start-once'};acceptedUtc=$base.acceptedUtc;completedUtc='2026-10-05T20:00:03.5Z';requested=$startArgs.sequence;effective=$frames[0].raw.result.effective;actual=@{children=3;fallbacksPresent=$false};counts=$done.counts;warnings=@();errors=@();packaging=$done.packaging;updatedUtc='2026-10-05T20:00:03.5Z';children=$children}
 function Bytes($Value) { return ,[Text.Encoding]::UTF8.GetBytes(($Value|ConvertTo-Json -Depth 80 -Compress)) }
+$manifest.effective=Obj $capture
+$manifest.effective.destination|Add-Member resolvedDirectory $destination
 $bytes=Bytes $manifest
 $done.artifacts=@(Obj @{path=$done.manifest.finalPath;bytes=$bytes.Length;sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant();committed=$true})
 $donePayload=Envelope $query $done;$doneRead=ParentRead $donePayload $query $accepted
@@ -69,9 +71,21 @@ Check ($cancelledRead.ok -and $cancelledRead.terminal -and -not $cancelledRead.r
 $storage=Obj $terminalCancel;$storage.state='failed';$storage.termination.cancelRequested=$false;$storage.packaging.frameManifest.state='failed';$storage.error.code='destination_preparation_failed';$storage.error.message='isolated worker fixture';$storage.error.phase='preparation';$storage.errors=@($storage.error)
 $storageRead=ParentRead (Envelope $query $storage) $query $accepted
 Check ($storageRead.ok -and $storageRead.terminal -and -not $storageRead.requestSucceeded -and $storageRead.raw.result.errors[0].code -ceq 'destination_preparation_failed') 'safe fixture shape is read-qualified, not runtime worker evidence'
+$emptyStorage=Obj $storage;$emptyStorage.manifest.partialPath=''
+$emptyRead=ParentRead (Envelope $query $emptyStorage) $query $accepted
+Check ($emptyRead.ok -and $emptyRead.raw.result.manifest.partialPath -is [string] -and $emptyRead.raw.result.manifest.partialPath -ceq '' -and -not $emptyRead.requestSucceeded) 'native empty uncreated partial path retained in exact zero-output preparation failure'
+foreach($defect in @('state','code','phase','packaging','scheduled','partialType','final')) {
+    $bad=Obj $emptyStorage
+    switch($defect){state{$bad.state='cancelled'};code{$bad.error.code='other'};phase{$bad.error.phase='packaging'};packaging{$bad.packaging.frameManifest.state='cancelled'};scheduled{$bad.counts.scheduled=1};partialType{$bad.manifest.partialPath=0};final{$bad.manifest.finalPath=$directory+'\sequence.json'}}
+    Check (-not (ParentRead (Envelope $query $bad) $query $accepted).ok) "empty partial path cannot escape $defect guard"
+}
 $storage|Add-Member errorOutside 'query failed'
 Check (-not (ParentRead (Envelope $query $storage) $query $accepted).ok) 'unknown extra failure field is not masked'
 $frameArgs=@{action='request_get';clientId='pr51-owner';commandId='read-frame-1';contractMajor=1;requestId='frame-id-1';expectedBuildId=$build}
+foreach($foreignDirectory in @($destination,($destination+'\CS_sequence_foreign'))){
+    $bad=Obj $frames[0].raw;$bad.result.effective.destination.directory=$foreignDirectory
+    Check (-not (Get-DevBenchScreenshotSequenceFrameEvidence -Payload $bad -Arguments $frameArgs -ParentEvidence $accepted).ok) 'only exact generated request leaf admits frame directory'
+}
 foreach ($defect in @(@('server.serviceSessionId','foreign'),@('result.parentRequestId','foreign'),@('result.clientId','pr51-owner'),@('result.commandId','frame:2'),@('result.sequenceOrdinal',4),@('result.actual.acquisition.engineFrame','101'),@('result.artifactProgress.expected',1),@('result.publication.state','unresolved'))) {
     $bad=Obj $frames[0].raw;Change $bad $defect[0] $defect[1]
     Check (-not (Get-DevBenchScreenshotSequenceFrameEvidence -Payload $bad -Arguments $frameArgs -ParentEvidence $accepted).ok) "refuse frame $($defect[0])"
@@ -108,13 +122,15 @@ foreach ($defect in @('outerError','unknownWarning','scalarError','nestedError',
     }
     Check (-not (Get-DevBenchScreenshotSequenceFrameEvidence -Payload $bad -Arguments $frameArgs -ParentEvidence $parent).ok) "refuse frame $defect"
 }
-foreach ($defect in @('duplicateChild','wrongChildState','wrongImageHash','foreignDirectory','missingChild','oversizedImages','unknownManifestField','badPartialOutcome')) {
+foreach ($defect in @('duplicateChild','wrongChildState','wrongImageHash','foreignDirectory','generatedInsteadOfRequested','foreignResolvedParent','missingChild','oversizedImages','unknownManifestField','badPartialOutcome')) {
     $bad=Obj $manifest;$parent=Obj $doneRead;$ownedFrames=Obj $frames
     switch ($defect) {
         duplicateChild {$bad.children[1]=$bad.children[0]}
         wrongChildState {$bad.children[0].state='cancelled'}
         wrongImageHash {$bad.children[0].artifacts[0].sha256=('d'*64)}
         foreignDirectory {$bad.effective.destination.directory='C:\outside'}
+        generatedInsteadOfRequested {$bad.effective.destination.directory=$directory}
+        foreignResolvedParent {$bad.effective.destination.resolvedDirectory=$directory}
         missingChild {$bad.children=@($bad.children[0]);$bad.actual.children=1;$ownedFrames=@($ownedFrames[0])}
         oversizedImages {$bad.children[0].artifacts[0].bytes=134217728;$ownedFrames[0].raw.result.artifacts[0].bytes=134217728}
         unknownManifestField {$bad|Add-Member error 'foreign failure'}

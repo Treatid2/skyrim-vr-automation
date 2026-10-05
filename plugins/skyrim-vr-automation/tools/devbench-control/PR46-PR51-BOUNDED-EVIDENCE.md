@@ -1,5 +1,16 @@
 # PR46 / PR51 finite source-bound evidence
 
+Native destination correction (confirmed exact f4): the manifest's effective
+capture retains the requested parent directory (and optional resolved parent).
+Native DirectoryLease generates exactly `CS_sequence_<requestId>` beneath it;
+child effective captures, image files and manifest publication belong to that
+exact leaf. The qualifier derives this owned leaf without filesystem access and
+never substitutes it into the raw manifest's effective recipe. A parent or a
+different request's leaf cannot qualify a child. Preparation failure may retain
+`partialPath:""` only in the exact failed/destination_preparation_failed/
+preparation, zero-scheduled/zero-artifact/unwritten-final shape. Empty strings
+are preserved, not converted to null or accepted as ordinary artifact paths.
+
 This is a small evidence service, not another runtime orchestrator. Use native
 DevBench controls on the already-selected transport. The two modules below only
 inspect retained payloads; they do not connect, dispatch, wait, retry, launch,
