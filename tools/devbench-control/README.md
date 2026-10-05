@@ -44,6 +44,13 @@ Only an admitted bracket **and** a successful target set
 completed target/evidence, reports invalidation, and never replays, cancels,
 clears caches, rebuilds, relaunches or alters the profile.
 
+Native main-thread read timeout/service unavailability is `READ_UNAVAILABLE`,
+not a known shader compilation failure. Retain the error and accept no counter
+values. Cold compilation may legitimately be making useful progress while that
+read is unavailable: healthy admission fails, but the gate does not stop or
+restart compilation. The experiment owner retains its separately bounded startup
+budget and current logs; this admission check never extends it.
+
 Compiler status is scoped: `COMPILER_HEALTHY_AT_SNAPSHOT` is not proof of
 correct pixels, complete Data-root/include/provider closure, future areas,
 performance neutrality or scientific acceptance. `recentFailures` contains
