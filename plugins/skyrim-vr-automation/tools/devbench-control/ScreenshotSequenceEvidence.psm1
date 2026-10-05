@@ -36,6 +36,11 @@ function Contract-SE($Contract) {
     Fields-SE $Contract @('name','major','minor','schemaRevision')
     Assert-SE ((Exact-SE $Contract.name 'csx.screenshot') -and (UInt-SE $Contract.major 1 1) -and (UInt-SE $Contract.minor 1 1) -and (UInt-SE $Contract.schemaRevision 2 2)) 'only exact contract1.1/schema2 is supported.'
 }
+function SequenceDirectory-SE($Owner) {
+    Assert-SE ($Owner.requestId -is [string] -and $Owner.requestId -cmatch '^[A-Za-z0-9-]+$') 'native safe request-directory suffix required.'
+    Assert-SE ([IO.Path]::IsPathFullyQualified($Owner.destinationDirectory)) 'explicit absolute parent destination required.'
+    return [IO.Path]::Combine([IO.Path]::GetFullPath($Owner.destinationDirectory),('CS_sequence_'+$Owner.requestId))
+}
 function Envelope-SE($Payload,[Collections.IDictionary]$Arguments,[string]$Build,[string]$Session) {
     Fields-SE $Payload @('contract','command','server','timestampUtc','ok','result')
     Contract-SE $Payload.contract
@@ -165,7 +170,16 @@ function Get-DevBenchScreenshotSequenceEvidence {
             Assert-SE ($pack.requested -is [bool] -and $pack.requested -and $pack.state -cin @('pending','partial','written','failed','cancelled')) 'manifest packaging state.'
             Fields-SE $r.packaging.previewVideo @('requested','required','state')
             Assert-SE ($r.packaging.previewVideo.requested -is [bool] -and -not $r.packaging.previewVideo.requested -and $r.packaging.previewVideo.required -is [bool] -and -not $r.packaging.previewVideo.required -and (Exact-SE $r.packaging.previewVideo.state 'not_requested')) 'unexpected preview state.'
-            foreach ($n in @('partialPath','finalPath')) { if ($null -ne $r.manifest.$n) { $null=Path-SE $r.manifest.$n $DestinationDirectory } }
+            $sequenceDirectory=SequenceDirectory-SE ([pscustomobject]@{requestId=$r.requestId;destinationDirectory=$DestinationDirectory})
+            $emptyPartial=Exact-SE $r.manifest.partialPath ''
+            if($emptyPartial) {
+                Assert-SE ($terminal -and $r.state -ceq 'failed' -and $pack.state -ceq 'failed' -and $null -eq $r.manifest.finalPath -and $null -eq (Field-SE $pack 'path') -and $r.artifacts.Count -eq 0 -and $r.counts.scheduled -eq 0 -and (Exact-SE (Field-SE $r.error 'code') 'destination_preparation_failed') -and (Exact-SE (Field-SE $r.error 'phase') 'preparation')) 'empty uncreated partial path only qualifies exact zero-output preparation failure.'
+            }
+            foreach ($n in @('partialPath','finalPath')) { if ($null -ne $r.manifest.$n -and -not ($n -ceq 'partialPath' -and $emptyPartial)) {
+                $path=Path-SE $r.manifest.$n $sequenceDirectory
+                $file=if($n -ceq 'partialPath'){'sequence.json.partial'}else{'sequence.json'}
+                Assert-SE ([string]::Equals($path,[IO.Path]::Combine($sequenceDirectory,$file),[StringComparison]::OrdinalIgnoreCase)) 'manifest path must be the exact owned generated sequence file.'
+            } }
             if ($r.termination.preparationPending) { Assert-SE ($null -eq $r.manifest.partialPath -and $null -eq $r.manifest.finalPath -and $r.artifacts.Count -eq 0) 'preparation cannot invent manifest publication.' }
             if ($pack.state -ceq 'written') {
                 Assert-SE ($terminal -and (Text-SE $r.manifest.finalPath) -and (Exact-SE $pack.path $r.manifest.finalPath) -and $r.artifacts.Count -eq 1 -and (Exact-SE $r.artifacts[0].path $r.manifest.finalPath)) 'final manifest publication inventory.'
@@ -196,7 +210,8 @@ function Get-DevBenchScreenshotSequenceFrameEvidence {
         Assert-SE ((Exact-SE $r.requested.action 'capture') -and (Exact-SE $r.requested.clientId $r.clientId) -and (Exact-SE $r.requested.commandId $r.commandId) -and (UInt-SE $r.requested.contractMajor 1 1)) 'native generated frame command required; do not invent requested.capture.'
         $terminal=BaseReceipt-SE $r $observed
         Assert-SE ($r.state -cne 'preparing' -and (Utc-SE $r.acceptedUtc) -ge (Utc-SE $owner.acceptedUtc)) 'frame state/parent admission chronology.'
-        $directory=Field-SE $r.effective.destination 'directory'; $null=Path-SE $directory $owner.destinationDirectory
+        $directory=Field-SE $r.effective.destination 'directory'; $generated=SequenceDirectory-SE $owner
+        Assert-SE ((Text-SE $directory) -and [IO.Path]::IsPathFullyQualified($directory) -and [string]::Equals([IO.Path]::GetFullPath($directory),$generated,[StringComparison]::OrdinalIgnoreCase)) 'frame must use the exact native generated request directory.'
         Capture-SE $r.effective $directory
         Assert-SE ($r.artifactProgress.expected -eq 2) 'exact stereo output progress required.'
         for ($i=0;$i -lt 2;$i++) {
@@ -273,9 +288,14 @@ function Get-DevBenchScreenshotSequenceManifestEvidence {
             Fields-SE $m.counts @('requested','scheduled','acquired','written','dropped','failed','cancelled','inFlight')
             foreach ($p in $m.counts.PSObject.Properties) { Assert-SE ((UInt-SE $p.Value 3) -and $p.Value -le $r.counts.($p.Name)) 'partial checkpoint cannot exceed fresh parent counters.' }
         }
-        $directory=Field-SE $m.effective.destination 'directory'; $null=Path-SE $directory $owner.destinationDirectory
-        Capture-SE $m.effective $directory
-        Assert-SE ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($ManifestPath)) -ceq [IO.Path]::GetFullPath($directory)) 'manifest must be in its frozen effective directory.'
+        # Native manifest effective is sequence.capture with requested parent
+        # directory; the lease-generated child directory belongs to artifacts.
+        Capture-SE $m.effective $owner.destinationDirectory
+        if($m.effective.destination.PSObject.Properties['resolvedDirectory']) {
+            Assert-SE ((Text-SE $m.effective.destination.resolvedDirectory) -and [string]::Equals([IO.Path]::GetFullPath($m.effective.destination.resolvedDirectory),[IO.Path]::GetFullPath($owner.destinationDirectory),[StringComparison]::OrdinalIgnoreCase)) 'manifest resolved parent destination changed.'
+        }
+        $directory=SequenceDirectory-SE $owner
+        Assert-SE ([string]::Equals([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($ManifestPath)),$directory,[StringComparison]::OrdinalIgnoreCase)) 'manifest must be in its exact generated request directory.'
         Assert-SE ($m.children -is [array] -and $m.children.Count -le 3 -and $FrameEvidence.Count -eq $m.children.Count -and $m.actual.children -eq $m.children.Count -and $m.actual.fallbacksPresent -is [bool] -and -not $m.actual.fallbacksPresent) 'exact bounded non-fallback child inventory required.'
         $ids=@(); $ordinals=@(); $projected=@()
         $artifactPaths=@(); [uint64]$artifactBytes=$ManifestBytes.Length
