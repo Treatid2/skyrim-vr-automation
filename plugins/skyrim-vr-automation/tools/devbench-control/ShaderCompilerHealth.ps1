@@ -99,6 +99,11 @@ function Get-DevBenchShaderCompilerHealth {
         if ($object -is [pscustomobject] -and $object.PSObject.Properties['idempotentReplay'] -and $object.idempotentReplay -isnot [bool]) { $reasons.Add('idempotentReplay must be Boolean when present.'); $readQualified=$false }
     }
     $state='INDETERMINATE'
+    $nativeError=Shader-Member $p 'error'
+    if (-not $readQualified -and $ok -is [bool] -and -not $ok -and (Shader-Member $contract 'name') -ceq 'csx.shader' -and $nativeError -is [pscustomobject] -and (Shader-Member $nativeError 'code') -is [string] -and (Shader-Member $nativeError 'code') -cin @('main_thread_dispatch_failed','service_unavailable','main_thread_busy')) {
+        $state='READ_UNAVAILABLE'
+        $reasons.Add('Native compiler read unavailable; no compiler failure or counter values inferred.')
+    }
     if ($readQualified) {
         if (-not $available) { $state='UNAVAILABLE'; $reasons.Add('Shader snapshot is unavailable.') }
         elseif ($compile.failedTasks -gt 0 -or $compile.currentFailedShaders -gt 0) { $state='FAILED_COMPILATION'; $reasons.Add('Native shader task/current-entry failures prohibit healthy evidence.') }
