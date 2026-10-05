@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'ConsoleExecutionEvidence.ps1')
 . (Join-Path $PSScriptRoot 'ShaderCompilerHealth.ps1')
 Export-ModuleMember -Function Get-DevBenchShaderCompilerHealth, Test-DevBenchShaderCompilerWindow, Test-DevBenchShaderSnapshotRequest
 . (Join-Path $PSScriptRoot 'NativeReadContracts.ps1')
@@ -630,6 +631,9 @@ function Get-DevBenchCallSemanticStatus {
         [AllowEmptyCollection()][object[]]$Content
     )
 
+    if ($ToolName -ceq 'console' -and $Arguments.Contains('action') -and $Arguments.action -is [string] -and $Arguments.action -ceq 'exec' -and $Arguments.Contains('capture') -and ($Arguments.capture -isnot [bool] -or $Arguments.capture)) {
+        return Get-DevBenchConsoleExecutionStatus -Arguments $Arguments -Content $Content
+    }
     if ($ToolName -ceq 'communityshaders.shader_api' -and $Arguments.Contains('action') -and $Arguments.action -ceq 'snapshot') {
         $health=Get-DevBenchShaderCompilerHealth -Arguments $Arguments -Content $Content
         return [pscustomobject]@{
