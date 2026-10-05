@@ -79,6 +79,13 @@ successful eye records are the dynamic gates.
    all ten mapped slots and all289 raw17×17 sample records per page. Keep raw
    storage hex and explicit null decoding; no gamma/transfer conversion or
    synthetic scene/submission epochs. Reads of a partial/failed page do not pass.
+   Native probe-read `dispatch.path` is the exact string
+   `Runtime FSR4 (amd_fidelityfx_upscaler_dx12.dll)`, retained unchanged in both
+   page and slot dispatches. The separate colour-status contract uses numeric
+   path3. Neither numeric3 nor string`"3"` qualifies a probe-read page. This is
+   source-bound to native ColourPipelineProbe DispatchMetadata/Dispatch and
+   FidelityFX path-label serialization (including admitted f4), not a coercion
+   or support for arbitrary future path labels.
 6. Fresh compiler snapshots bracket each set and each complete capture; same
    service/build/revision/counters required. Compiler failures abort without
    cache manipulation, build, load replay or runtime repair. Fresh calendar

@@ -12,7 +12,7 @@ $probe=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures/native-colour
 $probe.producer=CloneFixture $colour.producer
 $cases=@('healthy','literal-not-gates','compiler','foreign-build','foreign-revision','lost-set','lost-arm','lost-reset','bad-set','bad-arm','bad-reset','wrong-page','wrong-generation','partial-page','wrong-frame','wrong-context','wrong-eye-dispatch','unsettled','native-failure','foreign-probe','changed-context','compiler-change','string-set-revision','string-arm-generation','string-page-generation','string-page-frame','string-page-flag','string-sample-count','string-sampling-grid','string-grid-coordinate','bad-source-pixel','wrong-metadata','short-sample-inventory','odd-raw-hex','nonfinite-decoded','string-reset-generation','cleanup-malformed-status','cleanup-malformed-reset','cleanup-malformed-idle','cleanup-native-failed')
 if($FixtureOnly){$cases=@($FixtureMode)}
-if(-not $FixtureOnly){$cases+=@('foreign-native-failure','malformed-native-failure')}
+if(-not $FixtureOnly){$cases+=@('foreign-native-failure','malformed-native-failure','numeric-page-path','numeric-string-page-path','null-page-path','foreign-page-path','late-page-path')}
 foreach($mode in $cases){
     $script:mode=$mode;$script:revision=1;$script:auto=$true;$script:generation=0;$script:id='';$script:reset=$true;$script:guardCount=0;$script:setCount=0
     $script:calls=[Collections.Generic.List[object]]::new()
@@ -68,12 +68,17 @@ foreach($mode in $cases){
                     if($script:cleanupPhase -and $script:mode -ceq 'cleanup-malformed-idle' -and $script:reset){$p.generation=[string]$p.generation}
                 }
                 'read' {
-                    $d=[pscustomobject]@{attribution='observed-successful-dispatch';colourContractRevision=$script:revision;contextGeneration=2;contextIndex=$argsMap.eye;path=3;frame=61039;requestedHighDynamicRangeInput=$true;effectiveHighDynamicRangeInput=$true;requestedAutoExposure=$script:auto;effectiveAutoExposure=$script:auto;dispatchSerial=(21879+$argsMap.eye)}
+                    $d=[pscustomobject]@{attribution='observed-successful-dispatch';colourContractRevision=$script:revision;contextGeneration=2;contextIndex=$argsMap.eye;path='Runtime FSR4 (amd_fidelityfx_upscaler_dx12.dll)';frame=61039;requestedHighDynamicRangeInput=$true;effectiveHighDynamicRangeInput=$true;requestedAutoExposure=$script:auto;effectiveAutoExposure=$script:auto;dispatchSerial=(21879+$argsMap.eye)}
                     $slot=[pscustomobject]@{stage=$argsMap.stage;eye=@('left','right')[$argsMap.eye];eyeMask=(1 -shl $argsMap.eye);queued=$true;mapped=$true;frame=[pscustomobject]@{cpuFrame=61039};dispatch=(CloneFixture $d);readback=[pscustomobject]@{map=[pscustomobject]@{succeeded=$true;matchedMap=$true;readable=$true};sampling=[pscustomobject]@{transferConversion='none';gridSize=17;sampleCount=289;samples=@(for($i=0;$i -lt 289;$i++){[pscustomobject]@{grid=@(($i%17),([int][Math]::Floor($i/17)));rawLittleEndianHex='00000000';decodedRgba=$null}})}}}
                     $p=[pscustomobject]@{schema='csx-colour-pipeline-probe-v3';producer=(CloneFixture $colour.producer);metadata=[pscustomobject]@{calibratedScene='fixture-owner-calibration'};captureId=$script:id;generation=$script:generation;state='complete';error=$null;frame=[pscustomobject]@{cpuFrame=61039;eye='both';eyeMask=3;sceneEpoch=$null;submissionEpoch=$null};samplingContract=[pscustomobject]@{gridSize=17;rawBytesRetainedPerSample=$true;implicitTransferConversion=$false};immediateContext=[pscustomobject]@{pointer='0x1234';kind='immediate'};dispatch=$d;stages=@($slot)}
                     foreach($sample in $slot.readback.sampling.samples){$sample|Add-Member sourcePixel @($sample.grid[0],$sample.grid[1])}
                     switch($script:mode){
                         'wrong-page'{$slot.stage='foreign'};'wrong-generation'{$p.generation++};'partial-page'{$slot.mapped=$false};'wrong-frame'{$p.frame.cpuFrame++};'wrong-context'{$p.immediateContext.pointer='0x0000'};'wrong-eye-dispatch'{$p.dispatch.contextIndex=3}
+                        'numeric-page-path'{$p.dispatch.path=3;$slot.dispatch.path=3}
+                        'numeric-string-page-path'{$p.dispatch.path='3';$slot.dispatch.path='3'}
+                        'null-page-path'{$p.dispatch.path=$null;$slot.dispatch.path=$null}
+                        'foreign-page-path'{$p.dispatch.path='Runtime FSR3';$slot.dispatch.path='Runtime FSR3'}
+                        'late-page-path'{if($argsMap.stage -ceq 'imagespace_output' -and $argsMap.eye -eq 1){$p.dispatch.path=3;$slot.dispatch.path=3}}
                         'string-page-generation'{$p.generation=[string]$p.generation}
                         'string-page-frame'{$p.frame.cpuFrame=[string]$p.frame.cpuFrame}
                         'string-page-flag'{$p.dispatch.requestedAutoExposure=[string]$p.dispatch.requestedAutoExposure}
@@ -108,8 +113,10 @@ foreach($mode in $cases){
     if($mode -cin @('healthy','literal-not-gates')){
         Check ($r.conditions.Count -eq 3 -and $r.captures.Count -eq 6 -and @($r.captures|Where-Object {-not $_.complete -or -not $_.resetVerified}).Count -eq 0) 'all three conditions/two captures complete'
         Check (@($r.captures|ForEach-Object {$_.pages}).Count -eq 60) 'all sixty stage-eye pages retained'
+        foreach($capture in $r.captures){foreach($stage in @('fsr_input','fsr_output','combined_main','imagespace_input','imagespace_output')){foreach($eye in @('left','right')){Check (@($capture.pages|Where-Object {$_.stages[0].stage -ceq $stage -and $_.stages[0].eye -ceq $eye -and $_.dispatch.path -is [string] -and $_.dispatch.path -ceq 'Runtime FSR4 (amd_fidelityfx_upscaler_dx12.dll)'}).Count -eq 1) 'each of ten stage-eye pages preserves exact string path'}}}
         Check ($r.conditions[0].autoExposure -and -not $r.conditions[1].autoExposure -and $r.conditions[2].autoExposure -and $r.finalRevision -eq 3) 'on/off/on exactCAS sequence'
     }else{Check ($script:setCount -le 1) 'stop before successor condition after failure'}
+    if($mode -ceq 'late-page-path'){Check ($r.captures[0].pages.Count -eq 10 -and -not $r.captures[0].complete -and $script:setCount -eq 1) 'tenth malformed stage-eye cannot qualify capture or start next condition'}
     if($mode -cin @('lost-set','lost-arm','lost-reset')){Check $r.indeterminate 'lost mutation stays indeterminate';Check (@($script:calls|Where-Object {$_.arguments.action -ceq $mode.Substring(5)}).Count -eq 1) 'lost mutation never replayed'}
     if($mode -cin @('wrong-page','partial-page','native-failure')){Check ($r.captures.Count -eq 1 -and -not $r.captures[0].complete -and $null -ne $r.retainedProbe) 'partial owned evidence not erased by reset'}
     if($mode -ceq 'native-failure'){
