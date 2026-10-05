@@ -58,6 +58,11 @@ Check ($cancelRead.ok -and $cancelRead.commandAccepted -and -not $cancelRead.can
 $late=Obj $done;$late|Add-Member commandAccepted $false
 $lateRead=ParentRead (Envelope $cancelArgs $late) $cancelArgs $accepted
 Check ($lateRead.ok -and -not $lateRead.commandAccepted -and -not $lateRead.cancelCoverage) 'late cancellation does not claim race coverage'
+$already=Obj $done;foreach($name in @('counts','manifest','packaging','termination')){$already.PSObject.Properties.Remove($name)};$already|Add-Member alreadyTerminal $true
+$alreadyRead=ParentRead (Envelope $cancelArgs $already) $cancelArgs $accepted
+Check ($alreadyRead.ok -and $alreadyRead.terminal -and -not $alreadyRead.commandAccepted -and -not $alreadyRead.requestSucceeded -and -not $alreadyRead.cancelCoverage) 'base already-terminal receipt is command observation only'
+$bypass=Obj $done;$bypass|Add-Member alreadyTerminal $true;$bypass.counts.inFlight=1
+Check (-not (ParentRead (Envelope $cancelArgs $bypass) $cancelArgs $accepted).ok) 'alreadyTerminal cannot bypass malformed extended sequence state'
 $terminalCancel=Obj $base;$terminalCancel.state='cancelled';$terminalCancel.terminalUtc='2026-10-05T20:00:04Z';$terminalCancel.termination.cancelRequested=$true;$terminalCancel.termination.preparationPending=$false;$terminalCancel.termination.finalizationCommitted=$true;$terminalCancel.packaging.frameManifest.state='cancelled';$terminalCancel.packaging.frameManifest|Add-Member path $null;$terminalCancel.packaging.frameManifest|Add-Member error '';$terminalCancel.error=Obj @{code='preparation_cancelled';message='queued destination preparation was cancelled';phase='preparation'};$terminalCancel.errors=@($terminalCancel.error);$terminalCancel.artifactProgress.terminal=1
 $cancelledRead=ParentRead (Envelope $query $terminalCancel) $query $accepted
 Check ($cancelledRead.ok -and $cancelledRead.terminal -and -not $cancelledRead.requestSucceeded) 'typed cancelled preparation retained as unsuccessful terminal read'
