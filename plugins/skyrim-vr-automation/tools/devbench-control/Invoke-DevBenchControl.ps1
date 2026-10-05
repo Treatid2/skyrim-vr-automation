@@ -12,6 +12,7 @@ param(
     [switch]$NamesOnly,
     [switch]$RequireSuccess,
     [switch]$RequirePerformanceNeutral,
+    [switch]$RequireCompilerHealthy,
     [switch]$SkipRuntimeIdentityVerification,
     [string]$EvidenceDirectory,
     [string]$EvidenceLabel,
@@ -84,6 +85,32 @@ $serverTimeoutMilliseconds = $null
 $serverTimeoutDispatchRemainingSeconds = $null
 Import-Module (Join-Path $PSScriptRoot 'DevBenchControl.psm1') -Force
 $script:requestTimeoutSecondsForRpc = $RequestTimeoutSeconds
+
+function Get-ShaderCompilerGuard {
+    param([object[]]$Tools,[hashtable]$Headers,$Identity)
+    $guard=[pscustomobject][ordered]@{admissible=$false; health=$null; reply=$null; arguments=$null; reasons=@()}
+    try {
+        if ($null -eq $Identity -or -not $Identity.complete -or -not $Identity.verified) { throw 'Compiler admission requires complete verified current runtime/artifact identity.' }
+        $matches=@($Tools | Where-Object name -CEQ 'communityshaders.shader_api')
+        if ($matches.Count -ne 1) { throw 'toolSchemaUnresolved: exact shader_api is not registered.' }
+        $schema=$matches[0].inputSchema
+        if ($schema.properties.contractMajor.const -ne 1 -or $schema.properties.contractMajor.type -cne 'integer' -or $schema.properties.action.type -cne 'string' -or 'snapshot' -cnotin @($schema.properties.action.enum) -or @($schema.required).Count -ne 4 -or @($schema.required | Where-Object { $_ -cnotin @('contractMajor','clientId','commandId','action') }).Count -gt 0 -or $schema.properties.clientId.type -cne 'string' -or $schema.properties.commandId.type -cne 'string') { throw 'toolSchemaUnresolved: current shader snapshot input schema is unsupported.' }
+        $argsMap=@{contractMajor=1;clientId='auto-tools-compiler-admission';commandId=[guid]::NewGuid().ToString('N');action='snapshot';expectedBuildId=[string]$Identity.build.buildId}
+        $guard.arguments=$argsMap
+        $guard.reply=Invoke-ToolRpc -Name 'communityshaders.shader_api' -Arguments $argsMap -Headers $Headers
+        $guard.health=Get-DevBenchShaderCompilerHealth -Arguments $argsMap -Content @($guard.reply.content)
+        $guard.reasons=@($guard.health.reasons)
+        if (-not $guard.health.admissible) { return $guard }
+        $sources=@($Identity.build.sources | Where-Object tool -CEQ 'communityshaders.shader_api')
+        if ($sources.Count -ne 1 -or $sources[0].producer.serviceSessionId -cne $guard.health.serviceSessionId) { throw 'Shader service session differs from the accepting runtime registry.' }
+        $age=([DateTimeOffset]::UtcNow - [DateTimeOffset]$guard.health.timestampUtc).TotalSeconds
+        if ($age -lt -5 -or $age -gt 10) { throw 'Compiler snapshot is stale or future-dated; no current-health admission.' }
+        $guard.admissible=$true
+    } catch {
+        $guard.admissible=$false; $guard.reasons=@($guard.reasons)+$_.Exception.Message
+    }
+    return $guard
+}
 
 function Get-RequestTimeoutSeconds {
     if ($null -eq $script:operationDeadlineUtc) { return $script:requestTimeoutSecondsForRpc }
@@ -556,7 +583,10 @@ function Invoke-ToolRpc {
     $parsed = @()
     foreach ($item in @($rpc.json.result.content)) {
         if ($item.type -eq 'text') {
-            try { $parsed += ,($item.text | ConvertFrom-Json -Depth 50) } catch { $parsed += ,([string]$item.text) }
+            try {
+                if ($Name -ceq 'communityshaders.shader_api') { $parsed += ,($item.text | ConvertFrom-Json -Depth 50 -DateKind String) }
+                else { $parsed += ,($item.text | ConvertFrom-Json -Depth 50) }
+            } catch { $parsed += ,([string]$item.text) }
         }
         else { $parsed += ,$item }
     }
@@ -1075,6 +1105,7 @@ function Write-RuntimeEvidence($Binding) {
 
 try {
     Initialize-InvocationEvidence
+    if ($RequireCompilerHealthy -and ($Command -cne 'call' -or $SkipRuntimeIdentityVerification -or -not [string]::IsNullOrWhiteSpace($ExpectedErrorCode))) { throw '-RequireCompilerHealthy requires call, verified runtime identity and no expected-error override.' }
     if ([string]::IsNullOrWhiteSpace($RuntimePath)) { throw 'RuntimePath is required. Pass -RuntimePath or set CSX_DEVBENCH_RUNTIME_PATH.' }
     if (-not (Test-Path -LiteralPath $RuntimePath -PathType Leaf)) { throw "DevBench runtime metadata does not exist: $RuntimePath" }
     $runtime = Get-Content -LiteralPath $RuntimePath -Raw | ConvertFrom-Json
@@ -1129,11 +1160,16 @@ try {
     }
     elseif ($Command -eq 'call') {
         $toolAvailable = @($tools | Where-Object name -eq $Tool).Count -eq 1
-        $performanceGuard = if ($RequirePerformanceNeutral) {
+        $compilerGuard = if ($RequireCompilerHealthy) { Get-ShaderCompilerGuard -Tools $tools -Headers $headers -Identity $runtimeIdentity } else { $null }
+        $performanceGuard = if ($RequirePerformanceNeutral -and (-not $compilerGuard -or $compilerGuard.admissible)) {
             Get-PerformanceMeasurementGuard -Tools $tools -Headers $headers
         }
         else { $null }
-        if ($performanceGuard -and -not $performanceGuard.neutral) {
+        if ($compilerGuard -and -not $compilerGuard.admissible) {
+            $data=[pscustomobject]@{tool=$Tool;toolCallSkipped=$true;compilerGuard=$compilerGuard;healthyEvidenceAdmitted=$false}
+            $semantic=[pscustomobject]@{known=$true;ok=$false;outcome='compiler-admission-refused';guarded=$true;transient=$false;codes=@('compiler_health_unproven');states=@();reasons=@($compilerGuard.reasons)}
+        }
+        elseif ($performanceGuard -and -not $performanceGuard.neutral) {
             $data = [pscustomobject][ordered]@{
                 tool = $Tool
                 toolCallSkipped = $true
@@ -1709,7 +1745,23 @@ try {
         $semantic = $waitCompletion.semantic
     }
 
-    if (($RequireSuccess -or $RequirePerformanceNeutral) -and -not $semantic.known) {
+    if ($RequireCompilerHealthy -and $null -ne $data -and $invocationRecord.dispatchedUtc) {
+        # Bracket only this invocation. An async capture's later completion needs
+        # its own guarded request_get/finalization; this is not whole-run health.
+        $data | Add-Member -NotePropertyName targetSemantic -NotePropertyValue $semantic -Force
+        $data | Add-Member -NotePropertyName compilerGuard -NotePropertyValue $compilerGuard -Force
+        $compilerGuardAfter=Get-ShaderCompilerGuard -Tools $tools -Headers $headers -Identity $runtimeIdentity
+        $compilerWindow=Test-DevBenchShaderCompilerWindow -Before $compilerGuard.health -After $compilerGuardAfter.health
+        $data | Add-Member -NotePropertyName compilerGuardAfter -NotePropertyValue $compilerGuardAfter -Force
+        $data | Add-Member -NotePropertyName compilerWindow -NotePropertyValue $compilerWindow -Force
+        $compilerAdmitted=$compilerGuard.admissible -and $compilerGuardAfter.admissible -and $compilerWindow.valid
+        if ($Tool -ceq 'communityshaders.shader_api' -and $arguments.action -ceq 'snapshot') { $compilerAdmitted=$compilerAdmitted -and $semantic.compilerHealth.admissible }
+        $data | Add-Member -NotePropertyName healthyEvidenceAdmitted -NotePropertyValue ([bool]($compilerAdmitted -and $semantic.known -and $semantic.ok)) -Force
+        if (-not $compilerAdmitted) {
+            $semantic=[pscustomobject]@{known=$true;ok=$false;outcome='compiler-admission-invalidated';guarded=$true;transient=$false;codes=@('compiler_health_invalidated');states=@();reasons=@($compilerGuardAfter.reasons)+@($compilerWindow.reasons);completionBasis='compiler-boundary-bracket-only'}
+        }
+    }
+    if (($RequireSuccess -or $RequirePerformanceNeutral -or $RequireCompilerHealthy) -and -not $semantic.known) {
         $semantic.outcome = 'unverified'
         $semantic.reasons = @($semantic.reasons) + 'A verified semantic outcome was required, but the response did not provide one.'
     }

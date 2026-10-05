@@ -5,6 +5,16 @@ description: "Inspect and call the MCP tools exposed by a running CSX DevBench s
 
 # DevBench Control
 
+Before healthy image/performance evidence, independently admit the exact current
+CSX shader snapshot through the existing selected transport. Read the compiler
+admission section of the controller README: API/readiness PASS is not compiler
+health. On the controller lane use call -RequireCompilerHealthy with exact
+runtime/build/artifact identity; on the direct lane qualify the native snapshots
+with the exported offline classifier without opening a second live lane.
+Retain current log and stereo evidence. Failure/pending/unproven compilation
+allows explicit diagnostic evidence only, never healthy promotion. This gate
+does not repair or clear caches, change profiles, relaunch, or assign cleanup.
+
 Choose exactly one live transport before the first live call. When the
 plugin-provided direct MCP tools are callable, they are the mandatory and
 exclusive lane for live discovery, calls, waits, screenshots, and performance

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'ShaderCompilerHealth.ps1')
+Export-ModuleMember -Function Get-DevBenchShaderCompilerHealth, Test-DevBenchShaderCompilerWindow, Test-DevBenchShaderSnapshotRequest
 . (Join-Path $PSScriptRoot 'NativeReadContracts.ps1')
 . (Join-Path $PSScriptRoot 'ScreenshotRequestRead.ps1')
 
@@ -324,6 +326,7 @@ function Test-DevBenchReadOnlyRequest {
         [Parameter(Mandatory)][Collections.IDictionary]$Arguments
     )
 
+    if ($ToolName -ceq 'communityshaders.shader_api') { return Test-DevBenchShaderSnapshotRequest -Arguments $Arguments }
     $action = if ($Arguments.Contains('action')) { [string]$Arguments['action'] } else { '' }
     $kind = if ($Arguments.Contains('kind')) { [string]$Arguments['kind'] } else { '' }
     if ($ToolName -eq 'inspect') {
@@ -404,6 +407,16 @@ function Get-DevBenchCallSemanticStatus {
         [AllowEmptyCollection()][object[]]$Content
     )
 
+    if ($ToolName -ceq 'communityshaders.shader_api' -and $Arguments.Contains('action') -and $Arguments.action -ceq 'snapshot') {
+        $health=Get-DevBenchShaderCompilerHealth -Arguments $Arguments -Content $Content
+        return [pscustomobject]@{
+            known=$true; ok=$health.readQualified; outcome='shader-snapshot-read-contract'
+            guarded=-not $health.readQualified; transient=$false; codes=@(); states=@()
+            reasons=$(if ($health.readQualified) { @() } else { @($health.reasons) })
+            completionBasis='read-schema-only'; compilerHealth=$health
+            explicitOutcomeEvidence=@('native-csx.shader-1.0-schema1-snapshot')
+        }
+    }
     $semantic = if ($ToolName -ceq 'communityshaders.renderscale' -and $Arguments.Contains('action') -and $Arguments['action'] -ceq 'status') {
         Get-DevBenchSemanticStatus -Content $Content -UnsignedTelemetryStatePaths 'content.status.vendorWorkGate.state'
     } else { Get-DevBenchSemanticStatus -Content $Content }

@@ -5,6 +5,16 @@ description: "Inspect and call the MCP tools exposed by a running CSX DevBench s
 
 # DevBench Control
 
+Before healthy image/performance evidence, independently admit the exact current
+CSX shader snapshot through the existing selected transport. Read the compiler
+admission section of the controller README: API/readiness PASS is not compiler
+health. On the controller lane use call -RequireCompilerHealthy with exact
+runtime/build/artifact identity; on the direct lane qualify the native snapshots
+with the exported offline classifier without opening a second live lane.
+Retain current log and stereo evidence. Failure/pending/unproven compilation
+allows explicit diagnostic evidence only, never healthy promotion. This gate
+does not repair or clear caches, change profiles, relaunch, or assign cleanup.
+
 For a newly added typed action such as `game/newGame`, determine availability
 for that exact workflow before its first live call. If the complete direct
 catalog exposes `game` but its action/phase schema cannot express `newGame`,
