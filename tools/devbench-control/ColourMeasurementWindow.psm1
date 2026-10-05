@@ -29,11 +29,12 @@ function Invoke-DevBenchColourMeasurement {
     $errors=[Collections.Generic.List[string]]::new(); $guards=[Collections.Generic.List[object]]::new()
     $revision=$Plan.expectedRevision; $owned=$null; $uncertain=$false; $resetVerified=$true; $mutationPending=$false
     $probeCleanup=[ordered]@{attempted=$false;verified=$true;errors=[Collections.Generic.List[string]]::new()}
+    function UInt($Value,[decimal]$Minimum=0){return $null -ne $Value -and $Value.GetType() -in @([byte],[int16],[uint16],[int],[uint32],[long],[uint64]) -and [decimal]$Value -ge $Minimum -and [decimal]$Value -le [uint64]::MaxValue}
     function One($Reply,[bool]$AllowNativeFailure=$false) {
         if ($null -eq $Reply -or @($Reply.content).Count -ne 1 -or $Reply.content[0] -isnot [pscustomobject]) { throw 'Colour action requires exactly one native payload.' }
         if ($Reply.PSObject.Properties['rawResult'] -and $Reply.rawResult.PSObject.Properties['isError'] -and ($Reply.rawResult.isError -isnot [bool] -or $Reply.rawResult.isError)) { throw 'Native MCP error cannot qualify colour action.' }
         $p=$Reply.content[0]
-        if (-not $p.PSObject.Properties['producer'] -or $p.producer.component -cne 'CommunityShaders' -or $p.producer.buildId -cne $Plan.expectedBuildId -or (-not $AllowNativeFailure -and $p.PSObject.Properties['error'] -and $null -ne $p.error)) { throw 'Colour action carries foreign producer or native error; raw reply retained.' }
+        if (-not $p.PSObject.Properties['producer'] -or $p.producer -isnot [pscustomobject] -or $p.producer.component -isnot [string] -or $p.producer.component -cne 'CommunityShaders' -or $p.producer.buildId -isnot [string] -or $p.producer.buildId -cne $Plan.expectedBuildId -or (-not $AllowNativeFailure -and $p.PSObject.Properties['error'] -and $null -ne $p.error)) { throw 'Colour action carries foreign producer or native error; raw reply retained.' }
         return $p
     }
     function Guard([datetime]$Bound) {
@@ -68,7 +69,7 @@ function Invoke-DevBenchColourMeasurement {
         return $true
     }
     function Assert-ProbeOwner($Status,$Owned) {
-        if ($Status.captureId -cne $Owned.captureId -or $Status.generation -ne $Owned.generation -or $Status.expectedColourContractRevision -ne $revision) { throw 'Probe capture/generation/revision changed; no foreign adoption.' }
+        if ($Status.captureId -isnot [string] -or -not (UInt $Status.generation 1) -or -not (UInt $Status.expectedColourContractRevision 1) -or $Status.captureId -cne $Owned.captureId -or $Status.generation -ne $Owned.generation -or $Status.expectedColourContractRevision -ne $revision) { throw 'Probe capture/generation/revision changed or malformed; no foreign adoption.' }
     }
     try {
         $null=Guard $DeadlineUtc
@@ -87,6 +88,9 @@ function Invoke-DevBenchColourMeasurement {
             if ($set.accepted -isnot [bool] -or -not $set.accepted) { throw 'Colour set did not carry positive native CAS acceptance.' }
             $condition.setAccepted=$true
             $mutationPending=$false
+            $setProjection=$set|ConvertTo-Json -Depth 20|ConvertFrom-Json -Depth 20
+            $setProjection.PSObject.Properties.Remove('accepted');$setProjection.PSObject.Properties.Remove('resultingRevision')
+            if(-not (UInt $set.resultingRevision 1) -or @(Get-DevBenchNativeReadReasons -Kind 'fsr-colour-status' -Payload $setProjection -Arguments @{action='status';expectedBuildId=$Plan.expectedBuildId}).Count){throw 'Accepted set has malformed native status/revision; raw accepted action retained.'}
             $next=$revision+$(if($initial.requested.autoExposure -cne $auto){1}else{0})
             if ($set.resultingRevision -ne $next -or $set.requested.revision -ne $next) { throw 'Colour set resulting revision violates exact CAS transition.' }
             $revision=$next
@@ -111,7 +115,7 @@ function Invoke-DevBenchColourMeasurement {
                 $mutationPending=$true
                 $record.armReply=& $Call $probe @{action='arm';expectedBuildId=$Plan.expectedBuildId;expectedRevision=$revision;captureId=$record.captureId;metadata=$Plan.metadata} $true $captureBound
                 $arm=One $record.armReply
-                if($arm.action -cne 'arm' -or $arm.accepted -isnot [bool] -or -not $arm.accepted -or $arm.captureId -cne $record.captureId -or $null -eq $arm.generation -or $arm.generation.GetType() -notin @([int],[long],[uint32],[uint64]) -or $arm.generation -le 0){throw 'Probe arm acceptance/identity unproven; no replay or foreign reset.'}
+                if($arm.action -isnot [string] -or $arm.action -cne 'arm' -or $arm.accepted -isnot [bool] -or -not $arm.accepted -or $arm.captureId -isnot [string] -or $arm.captureId -cne $record.captureId -or -not (UInt $arm.generation 1)){throw 'Probe arm acceptance/identity unproven; no replay or foreign reset.'}
                 $record.generation=$arm.generation; $owned=$record; $resetVerified=$false
                 $mutationPending=$false
                 do {
@@ -128,7 +132,10 @@ function Invoke-DevBenchColourMeasurement {
                     $record.pages.Add($page)
                     if($page.schema -cne 'csx-colour-pipeline-probe-v3' -or $page.captureId -cne $owned.captureId -or $page.generation -ne $owned.generation -or $page.state -cne 'complete' -or $page.frame.cpuFrame -ne $p.cpuFrame -or $page.frame.eye -cne 'both' -or $page.frame.eyeMask -ne 3 -or $null -ne $page.frame.sceneEpoch -or $null -ne $page.frame.submissionEpoch -or @($page.stages).Count -ne 1){throw 'Capture page schema/identity/frame/epochs mismatch.'}
                     $slot=$page.stages[0]; $d=$page.dispatch
-                    if($page.metadata.calibratedScene -cne $Plan.metadata.calibratedScene){throw 'Owner calibration metadata differs from the arm request.'}
+                    foreach($value in @($page.generation,$page.frame.cpuFrame,$page.frame.eyeMask,$slot.eyeMask,$slot.frame.cpuFrame,$d.colourContractRevision,$d.contextGeneration,$d.frame,$d.dispatchSerial)){if(-not (UInt $value 1)){throw 'Page ownership/frame/dispatch IDs require typed positive unsigned integers.'}}
+                    foreach($value in @($d.contextIndex,$d.path,$slot.readback.sampling.gridSize,$slot.readback.sampling.sampleCount,$page.samplingContract.gridSize)){if(-not (UInt $value)){throw 'Page numeric fields cannot be strings/Booleans/fractions.'}}
+                    foreach($value in @($d.requestedHighDynamicRangeInput,$d.effectiveHighDynamicRangeInput,$d.requestedAutoExposure,$d.effectiveAutoExposure)){if($value -isnot [bool]){throw 'Page dynamic flags require actual Booleans.'}}
+                    if($page.metadata -isnot [pscustomobject] -or $page.metadata.calibratedScene -isnot [string] -or $page.metadata.calibratedScene -cne $Plan.metadata.calibratedScene){throw 'Owner calibration metadata differs from the arm request.'}
                     if($slot.stage -cne $stage -or $slot.eye -cne @('left','right')[$eye] -or $slot.eyeMask -ne (1 -shl $eye) -or $slot.queued -isnot [bool] -or -not $slot.queued -or $slot.mapped -isnot [bool] -or -not $slot.mapped -or $slot.frame.cpuFrame -ne $p.cpuFrame){throw 'Capture page is incomplete or wrong stage/eye.'}
                     if($page.immediateContext.kind -cne 'immediate' -or $page.immediateContext.pointer -isnot [string] -or $page.immediateContext.pointer -notmatch '^0x[0-9a-fA-F]+$' -or $page.immediateContext.pointer -match '^0x0+$'){throw 'Capture immediate context is unproven.'}
                     if($null -eq $context){$context=$page.immediateContext.pointer}else{if($context -cne $page.immediateContext.pointer){throw 'Capture pages changed immediate context.'}}
@@ -140,7 +147,8 @@ function Invoke-DevBenchColourMeasurement {
                     if($sampling.gridSize -ne 17 -or $sampling.sampleCount -ne 289 -or $page.samplingContract.gridSize -ne 17 -or $page.samplingContract.rawBytesRetainedPerSample -isnot [bool] -or -not $page.samplingContract.rawBytesRetainedPerSample -or $page.samplingContract.implicitTransferConversion -isnot [bool] -or $page.samplingContract.implicitTransferConversion){throw 'Native17x17 lossless sampling contract unproven.'}
                     for($sampleIndex=0;$sampleIndex -lt 289;$sampleIndex++){
                         $sample=$sampling.samples[$sampleIndex]
-                        if(@($sample.grid).Count -ne 2 -or $sample.grid[0] -ne ($sampleIndex%17) -or $sample.grid[1] -ne [int][Math]::Floor($sampleIndex/17) -or $sample.rawLittleEndianHex -isnot [string] -or $sample.rawLittleEndianHex -notmatch '^[0-9a-fA-F]{2,32}$' -or ($sample.rawLittleEndianHex.Length%2) -ne 0 -or -not $sample.PSObject.Properties['decodedRgba']){throw 'Raw sample inventory/bytes incomplete.'}
+                        if(@($sample.sourcePixel).Count -ne 2 -or -not (UInt $sample.sourcePixel[0]) -or -not (UInt $sample.sourcePixel[1])){throw 'Raw sample source pixel coordinates are malformed.'}
+                        if(@($sample.grid).Count -ne 2 -or -not (UInt $sample.grid[0]) -or -not (UInt $sample.grid[1]) -or $sample.grid[0] -ne ($sampleIndex%17) -or $sample.grid[1] -ne [int][Math]::Floor($sampleIndex/17) -or $sample.rawLittleEndianHex -isnot [string] -or $sample.rawLittleEndianHex -notmatch '^[0-9a-fA-F]{2,32}$' -or ($sample.rawLittleEndianHex.Length%2) -ne 0 -or -not $sample.PSObject.Properties['decodedRgba']){throw 'Raw sample inventory/bytes incomplete.'}
                         if($null -ne $sample.decodedRgba){if(@($sample.decodedRgba).Count -ne 4 -or @($sample.decodedRgba|Where-Object {$null -eq $_ -or $_.GetType() -notin @([int],[long],[double],[single],[decimal],[uint32],[uint64]) -or -not [double]::IsFinite([double]$_)}).Count){throw 'Decoded sample is malformed; no implicit transfer conversion.'}}
                     }
                 }}
@@ -152,7 +160,7 @@ function Invoke-DevBenchColourMeasurement {
                 $mutationPending=$true
                 $record.resetAttempted=$true
                 $reset=One (& $Call $probe @{action='reset';expectedBuildId=$Plan.expectedBuildId;captureId=$owned.captureId;generation=$owned.generation} $true $DeadlineUtc)
-                if($reset.action -cne 'reset' -or $reset.accepted -isnot [bool] -or -not $reset.accepted -or $reset.captureId -cne $owned.captureId -or $reset.generation -ne ($owned.generation+1)){throw 'Exact owned probe reset unverified; no retry.'}
+                if($reset.action -isnot [string] -or $reset.action -cne 'reset' -or $reset.accepted -isnot [bool] -or -not $reset.accepted -or $reset.captureId -isnot [string] -or $reset.captureId -cne $owned.captureId -or -not (UInt $reset.generation 1) -or $reset.generation -ne ($owned.generation+1)){throw 'Exact owned probe reset unverified; no retry.'}
                 $idle=Status $probe $DeadlineUtc
                 if($idle.state -cne 'idle' -or $idle.generation -ne $reset.generation){throw 'Fresh probe reset readback failed.'}
                 $resetVerified=$true; $record.resetVerified=$true; $owned=$null
@@ -170,15 +178,17 @@ function Invoke-DevBenchColourMeasurement {
                 if(-not $owned.resetAttempted){
                     do{
                         $status=One (& $CleanupCall $probe @{action='status';expectedBuildId=$Plan.expectedBuildId} $false $CleanupDeadlineUtc) $true
+                        if(@(Get-DevBenchNativeReadReasons -Kind 'colour-probe-status' -Payload $status -Arguments @{action='status';expectedBuildId=$Plan.expectedBuildId}).Count){throw 'Owned failure cleanup status schema unverified.'}
                         Assert-ProbeOwner $status $owned
                         if($status.state -cin @('armed','capturing','readback_pending')){Start-Sleep -Milliseconds ([Math]::Min(100,[Math]::Max(0,($CleanupDeadlineUtc-[datetime]::UtcNow).TotalMilliseconds)))}
                     }while($status.state -cin @('armed','capturing','readback_pending') -and [datetime]::UtcNow -lt $CleanupDeadlineUtc)
                     if($status.state -cnotin @('complete','failed') -or [datetime]::UtcNow -ge $CleanupDeadlineUtc){throw 'Native probe remains active; no forbidden reset, bounded cleanup unverified.'}
                     $owned.resetAttempted=$true
                     $reset=One (& $CleanupCall $probe @{action='reset';expectedBuildId=$Plan.expectedBuildId;captureId=$owned.captureId;generation=$owned.generation} $true $CleanupDeadlineUtc)
-                    if($reset.action -cne 'reset' -or $reset.accepted -isnot [bool] -or -not $reset.accepted -or $reset.captureId -cne $owned.captureId -or $reset.generation -ne ($owned.generation+1)){throw 'Owned failure cleanup reset unverified.'}
+                    if($reset.action -isnot [string] -or $reset.action -cne 'reset' -or $reset.accepted -isnot [bool] -or -not $reset.accepted -or $reset.captureId -isnot [string] -or $reset.captureId -cne $owned.captureId -or -not (UInt $reset.generation 1) -or $reset.generation -ne ($owned.generation+1)){throw 'Owned failure cleanup reset unverified.'}
                 }
                 $status=One (& $CleanupCall $probe @{action='status';expectedBuildId=$Plan.expectedBuildId} $false $CleanupDeadlineUtc)
+                if(@(Get-DevBenchNativeReadReasons -Kind 'colour-probe-status' -Payload $status -Arguments @{action='status';expectedBuildId=$Plan.expectedBuildId}).Count){throw 'Owned cleanup fresh idle status schema unverified.'}
                 if($status.state -cne 'idle' -or $status.generation -ne ($owned.generation+1) -or $status.captureId -cne ''){throw 'Owned probe cleanup fresh idle readback unverified.'}
                 $probeCleanup.verified=$true;$resetVerified=$true;$owned.resetVerified=$true
             }catch{$probeCleanup.errors.Add($_.Exception.Message)}
