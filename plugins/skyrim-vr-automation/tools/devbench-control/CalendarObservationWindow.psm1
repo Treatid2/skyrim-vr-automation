@@ -60,14 +60,16 @@ function Invoke-DevBenchCalendarWindow {
     param([Parameter(Mandatory)][scriptblock]$Call,
           [Parameter(Mandatory)][scriptblock]$AssertSession,
           [Parameter(Mandatory)][string]$Owner,
-          [Parameter(Mandatory)][array]$Observations,
+          [AllowEmptyCollection()][array]$Observations=@(),
+          [Collections.IDictionary]$ColourPlan,
+          [scriptblock]$CompilerGuard,
           [ValidateRange(1,300000)][int]$HoldMilliseconds=60000,
           [Parameter(Mandatory)][datetime]$DeadlineUtc,
           [Parameter(Mandatory)][ValidateRange(1,2147483647)][int]$ExpectedProcessId,
           [ValidateRange(5,30)][int]$CleanupSeconds=15)
     $holdId=[guid]::NewGuid().ToString(); $releaseId=[guid]::NewGuid().ToString()
     $trace=[Collections.Generic.List[object]]::new(); $errors=[Collections.Generic.List[string]]::new()
-    $lease=$null; $binding=$null; $holdAttempted=$false; $restorationVerified=$false; $continuity=$false; $uncertain=$false
+    $lease=$null; $binding=$null; $holdAttempted=$false; $restorationVerified=$false; $continuity=$false; $uncertain=$false; $measurement=$null
     # Reserve a bounded cleanup budget from the outset, not an indefinite finally.
     $workDeadline=$DeadlineUtc.AddSeconds(-$CleanupSeconds)
     function Invoke-WindowCall([string]$Name,[hashtable]$Arguments,[bool]$Mutation,[datetime]$Bound) {
@@ -91,7 +93,11 @@ function Invoke-DevBenchCalendarWindow {
         return $Data.content[0]
     }
     try {
-        if ([string]::IsNullOrWhiteSpace($Owner) -or $Owner.Length -gt 128 -or $Observations.Count -lt 1 -or $Observations.Count -gt 16) { throw 'Calendar owner and finite 1..16 observations are required.' }
+        if ([string]::IsNullOrWhiteSpace($Owner) -or $Owner.Length -gt 128) { throw 'Calendar owner is required.' }
+        if ($null -ne $ColourPlan) {
+            Assert-ColourMeasurementPlan $ColourPlan
+            if($Observations.Count -ne 0 -or $null -eq $CompilerGuard){throw 'Typed colour workflow cannot mix generic observations or omit compiler admission.'}
+        } elseif($Observations.Count -lt 1 -or $Observations.Count -gt 16){throw 'Calendar finite1..16 observations are required.'}
         foreach($item in $Observations) {
             if($item -isnot [Collections.IDictionary] -or -not $item.Contains('tool') -or -not $item.Contains('arguments') -or $item.tool -isnot [string] -or $item.arguments -isnot [Collections.IDictionary] -or $item.tool -ceq 'calendar' -or -not (Test-DevBenchReadOnlyRequest -ToolName $item.tool -Arguments $item.arguments)) { throw 'Calendar composition rejects intrusive or unsupported observations.' }
         }
@@ -99,6 +105,7 @@ function Invoke-DevBenchCalendarWindow {
         Assert-CalendarReadback $before
         if ($before.outstanding -or $before.expiryDue -or $before.cleanupPending -or $before.values.calendarRate -le 0) { throw 'Calendar initial state already has custody or unsupported progression.' }
         $binding=$before.binding
+        if($null -ne $ColourPlan -and $binding.cellFormId -ne $ColourPlan.expectedCellFormId){throw 'Colour calibrated cell differs from fresh calendar binding.'}
         $holdAttempted=$true
         $held=Get-CalendarPayload (Invoke-WindowCall calendar @{action='hold';owner=$Owner;commandId=$holdId;binding=$binding;holdMs=$HoldMilliseconds} $true $workDeadline)
         # Retain only an exact owner/command/source lease for finally, even if
@@ -106,6 +113,24 @@ function Invoke-DevBenchCalendarWindow {
         $lease=Assert-CalendarLease $held $Owner $holdId $binding
         Assert-CalendarReadback $held
         if (-not (Test-CalendarBindingEqual $held.binding $binding) -or $held.status -cne 'held' -or -not $held.holdValid -or -not $held.outstanding -or -not $held.leaseActive -or $held.expiryDue -or $held.cleanupPending -or $held.values.calendarRate -ne 0) { throw 'Calendar hold was not currently valid.' }
+        if($null -ne $ColourPlan){
+            $measurement=Invoke-DevBenchColourMeasurement -Plan $ColourPlan -DeadlineUtc $workDeadline -CompilerGuard $CompilerGuard -CleanupDeadlineUtc $DeadlineUtc.AddSeconds(-5) -CleanupCall {
+                param($name,$argsMap,$mutation,$bound)
+                if($name -cne 'communityshaders.colour_pipeline_probe' -or $argsMap.action -cnotin @('status','reset')){throw 'Probe cleanup accepts only native exact status/reset.'}
+                Invoke-WindowCall $name $argsMap $mutation $bound
+            } -Call {
+                param($name,$argsMap,$mutation,$bound)
+                foreach($side in @('before','after')){
+                    if($side -ceq 'after'){$response=Invoke-WindowCall $name $argsMap $mutation $bound}
+                    $current=Get-CalendarPayload (Invoke-WindowCall calendar @{action='status'} $false $bound)
+                    Assert-CalendarReadback $current
+                    $currentLease=Assert-CalendarLease $current $Owner $holdId $binding
+                    if($currentLease.id -cne $lease.id -or -not (Test-CalendarBindingEqual $current.binding $binding) -or -not $current.holdValid -or -not $current.leaseActive -or -not $current.outstanding -or $current.expiryDue -or $current.cleanupPending -or $current.values.calendarRate -ne 0){throw "Calendar continuity invalidated $side colour action."}
+                }
+                return $response
+            }
+            if(-not $measurement.ok){$uncertain=[bool]$measurement.indeterminate;throw ('Colour measurement: '+($measurement.errors -join '; '))}
+        }
         foreach ($observation in $Observations) {
             $current=Get-CalendarPayload (Invoke-WindowCall calendar @{action='status'} $false $workDeadline)
             Assert-CalendarReadback $current
@@ -150,6 +175,6 @@ function Invoke-DevBenchCalendarWindow {
             catch { $errors.Add("Calendar cleanup: $($_.Exception.Message)"); $uncertain=$true }
         }
     }
-    return [pscustomobject]@{ ok=($errors.Count -eq 0 -and $continuity -and $restorationVerified); continuityVerified=$continuity; restorationVerified=$restorationVerified; indeterminate=$uncertain; owner=$Owner; holdCommandId=$holdId; releaseCommandId=$releaseId; lease=$lease; calls=@($trace); errors=@($errors); completionBasis='bounded-calendar-state-bracket-not-atomic-render'; disconnectRestorationClaimed=$false }
+    return [pscustomobject]@{ ok=($errors.Count -eq 0 -and $continuity -and $restorationVerified); continuityVerified=$continuity; restorationVerified=$restorationVerified; indeterminate=$uncertain; measurement=$measurement; owner=$Owner; holdCommandId=$holdId; releaseCommandId=$releaseId; lease=$lease; calls=@($trace); errors=@($errors); completionBasis='bounded-calendar-state-bracket-not-atomic-render'; disconnectRestorationClaimed=$false }
 }
 Export-ModuleMember -Function Invoke-DevBenchCalendarWindow

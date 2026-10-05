@@ -1232,7 +1232,7 @@ Assert-Test ($entryPointText -match '\$waitCompletion = Get-DevBenchWaitCompleti
 Assert-Test ($entryPointText -match '-not \$runtimeIdentity\.complete -or -not \$runtimeIdentity\.verified') 'mutation-capable calls require complete and positively verified runtime identity'
 Assert-Test ($entryPointText -match '\[string\]\$ExpectedRuntimeIdentityJson') 'controller accepts an exact prior runtime identity for pre-dispatch continuity'
 Assert-Test ($entryPointText.IndexOf('Expected runtime identity is invalid:') -lt $entryPointText.IndexOf("Update-InvocationEvidence -State 'dispatching'")) 'runtime identity continuity is verified before mutation dispatch'
-Assert-Test ($entryPointText -match 'if \(\$Command -in @\(''call'',''calendar-window''\)\) \{[\s\S]{0,100}-not \$semantic\.known -or -not \$semantic\.ok') 'ordinary and composed mutation-capable calls fail closed on unknown semantic outcomes'
+Assert-Test ($entryPointText -match 'if \(\$Command -in @\(''call'',''calendar-window'',''colour-window''\)\) \{[\s\S]{0,100}-not \$semantic\.known -or -not \$semantic\.ok') 'ordinary and composed mutation-capable calls fail closed on unknown semantic outcomes'
 Assert-Test ($entryPointText -match '\$Tool -eq ''communityshaders\.profiler''') 'profiler calls have an explicit semantic contract adapter'
 Assert-Test ($entryPointText -match '\$requestedAction -eq ''status''[\s\S]{0,180}\.status\.PSObject\.Properties\[''frame_count''\]') 'profiler status requires a frame-bearing status payload'
 Assert-Test ($entryPointText -match '\$requestedAction -eq ''enable''[\s\S]{0,160}\[bool\]\$profilerPayload\[0\]\.enabled') 'profiler enable requires observed enabled state'
