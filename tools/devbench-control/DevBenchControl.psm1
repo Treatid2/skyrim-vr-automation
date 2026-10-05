@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'ConsoleExecutionEvidence.ps1')
 
 function Get-DevBenchSemanticStatus {
     [CmdletBinding()]
@@ -175,6 +176,9 @@ function Get-DevBenchCallSemanticStatus {
         [AllowEmptyCollection()][object[]]$Content
     )
 
+    if ($ToolName -ceq 'console' -and $Arguments.Contains('action') -and $Arguments.action -is [string] -and $Arguments.action -ceq 'exec' -and $Arguments.Contains('capture') -and ($Arguments.capture -isnot [bool] -or $Arguments.capture)) {
+        return Get-DevBenchConsoleExecutionStatus -Arguments $Arguments -Content $Content
+    }
     $semantic = Get-DevBenchSemanticStatus -Content $Content
     if ($semantic.known) { return $semantic }
     $payloads = @($Content)
