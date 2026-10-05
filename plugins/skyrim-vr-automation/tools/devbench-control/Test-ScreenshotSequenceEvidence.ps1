@@ -140,6 +140,11 @@ foreach ($defect in @('duplicateChild','wrongChildState','wrongImageHash','forei
     $badBytes=Bytes $bad;$parent.receipt.artifacts[0].bytes=$badBytes.Length;$parent.receipt.artifacts[0].sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($badBytes)).ToLowerInvariant()
     Check (-not (Get-DevBenchScreenshotSequenceManifestEvidence -ManifestBytes $badBytes -ManifestPath $done.manifest.finalPath -ParentEvidence $parent -FrameEvidence $ownedFrames).ok) "refuse manifest $defect"
 }
+$sameInstant=Obj $frames;$sameInstant[0].raw.result.actual.acquisition.utcTimestamp='2026-10-05T20:00:02.500Z'
+$sameInstant[0].raw.result.actual.acquisition.schedule.requestedUtc='2026-10-05T20:00:02.000Z'
+Check (Get-DevBenchScreenshotSequenceManifestEvidence -ManifestBytes $bytes -ManifestPath $done.manifest.finalPath -ParentEvidence $doneRead -FrameEvidence $sameInstant).ok 'only native acquisition/schedule UTC trailing zeros compare by exact instant'
+$differentInstant=Obj $sameInstant;$differentInstant[0].raw.result.actual.acquisition.utcTimestamp='2026-10-05T20:00:02.501Z'
+Check (-not (Get-DevBenchScreenshotSequenceManifestEvidence -ManifestBytes $bytes -ManifestPath $done.manifest.finalPath -ParentEvidence $doneRead -FrameEvidence $differentInstant).ok) 'one millisecond actual acquisition drift refuses'
 $duplicateFrames=@($frames[0],$frames[0],$frames[2])
 Check (-not (Get-DevBenchScreenshotSequenceManifestEvidence -ManifestBytes $bytes -ManifestPath $done.manifest.finalPath -ParentEvidence $doneRead -FrameEvidence $duplicateFrames).ok) 'native frame identity must be unique and complete'
 $tooLarge=[byte[]]::new(1048577)

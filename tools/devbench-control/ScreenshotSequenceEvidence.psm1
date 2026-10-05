@@ -24,7 +24,19 @@ function Canonical-SE($Value,[int]$Depth=0) {
     return ,$Value
 }
 function Equal-SE($Left,$Right) { return (Canonical-SE $Left|ConvertTo-Json -Depth 60 -Compress) -ceq (Canonical-SE $Right|ConvertTo-Json -Depth 60 -Compress) }
-function Copy-SE($Value) { return $Value|ConvertTo-Json -Depth 80|ConvertFrom-Json -Depth 80 }
+function Copy-SE($Value) { return $Value|ConvertTo-Json -Depth 80|ConvertFrom-Json -Depth 80 -DateKind String }
+function Equal-FrameActual-SE($Left,$Right) {
+    $a=Copy-SE $Left;$b=Copy-SE $Right
+    # Retained PowerShell receipts may omit trailing zero fractional digits.
+    # Only these native UTC fields compare by instant; all other fields stay exact.
+    if($null -ne (Field-SE $a 'acquisition') -and $null -ne (Field-SE $b 'acquisition')){
+        foreach($node in @($a,$b)){
+            $node.acquisition.utcTimestamp=(Utc-SE $node.acquisition.utcTimestamp).ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
+            $node.acquisition.schedule.requestedUtc=(Utc-SE $node.acquisition.schedule.requestedUtc).ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
+        }
+    }
+    return Equal-SE $a $b
+}
 function Path-SE($Value,[string]$Root) {
     Assert-SE (Text-SE $Value) 'non-empty artifact path required.'
     Assert-SE ([IO.Path]::IsPathFullyQualified($Value) -and [IO.Path]::IsPathFullyQualified($Root)) 'absolute paths required.'
@@ -308,7 +320,8 @@ function Get-DevBenchScreenshotSequenceManifestEvidence {
             $f=$matches[0].raw.result
             Assert-SE ($f.sequenceOrdinal -eq $child.ordinal) 'manifest/frame ordinal mismatch.'
             Assert-SE (Exact-SE $f.effective.destination.directory $directory) 'child belongs to a different sequence directory.'
-            foreach ($name in @('state','requested','effective','actual','artifacts','warnings','errors','error')) { Assert-SE (Equal-SE $child.$name $f.$name) "manifest child $name differs from owned native frame." }
+            foreach ($name in @('state','requested','effective','artifacts','warnings','errors','error')) { Assert-SE (Equal-SE $child.$name $f.$name) "manifest child $name differs from owned native frame." }
+            Assert-SE (Equal-FrameActual-SE $child.actual $f.actual) 'manifest child actual differs from owned native frame.'
             $acquisition=Field-SE $f.actual 'acquisition'
             if ($null -ne $acquisition) { Assert-SE ($child.scheduledEngineFrame -eq $acquisition.schedule.requestedEngineFrame -and $child.scheduledTimestampUs -eq $acquisition.schedule.requestedMonotonicTimestampUs) 'manifest/native schedule identity mismatch.' }
             foreach ($artifact in $f.artifacts) {
