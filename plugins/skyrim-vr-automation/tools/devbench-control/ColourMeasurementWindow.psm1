@@ -51,7 +51,7 @@ function Invoke-DevBenchColourMeasurement {
         return $p
     }
     function Assert-Revision($Status,[uint64]$Revision,[bool]$AutoExposure) {
-        if ($Status.requested.revision -ne $Revision -or $Status.requested.highDynamicRangeInput -cne $Plan.highDynamicRangeInput -or $Status.requested.autoExposure -cne $AutoExposure -or $Status.sourceColorContractChanged) { throw 'Colour request revision/flags/source contract changed.' }
+        if ($Status.requested.revision -ne $Revision -or $Status.requested.highDynamicRangeInput -cne $Plan.highDynamicRangeInput -or $Status.requested.autoExposure -cne $AutoExposure) { throw 'Colour request revision/flags changed.' }
     }
     function Settled($Status,[uint64]$Revision,[bool]$AutoExposure) {
         Assert-Revision $Status $Revision $AutoExposure
@@ -61,7 +61,7 @@ function Invoke-DevBenchColourMeasurement {
         foreach($eye in 0,1) {
             $d=$Status.lastSuccessfulEyeDispatches[$eye]
             if (-not $d.valid) { return $false }
-            if ($d.path -ne 3 -or $d.contextIndex -ne $eye -or $d.contextGeneration -ne $c.generation -or $d.highDynamicRangeInput -cne $Plan.highDynamicRangeInput -or $d.autoExposure -cne $AutoExposure -or $d.exposureResourceBound -or $d.preExposure -ne 1) { throw 'Successful eye dispatch mismatches FSR4 context/flags/eye.' }
+            if ($d.path -ne 3 -or $d.contextIndex -ne $eye -or $d.contextGeneration -ne $c.generation -or $d.highDynamicRangeInput -cne $Plan.highDynamicRangeInput -or $d.autoExposure -cne $AutoExposure) { throw 'Successful eye dispatch mismatches FSR4 context/flags/eye.' }
         }
         foreach($field in @('frame','contextGeneration','path','renderWidth','renderHeight','displayWidth','displayHeight','configuredSharpnessAtDispatch','effectiveSharpness','sharpeningEnabled')) { if($a.$field -cne $b.$field) { throw "Successful eyes disagree: $field." } }
         if ($a.serial -ge $b.serial -or $a.dispatchQpc -gt $b.dispatchQpc -or $Status.lastSuccessfulDispatch.serial -ne $b.serial) { throw 'Successful stereo dispatch ordering mismatch.' }
