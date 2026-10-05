@@ -1582,6 +1582,12 @@ try {
                     classification = $guard.state
                     compilerGuard = $guard
                     completionBasis = 'current-state-compiler-snapshot'
+                    semantic = [pscustomobject][ordered]@{
+                        known = $true; ok = [bool]$guard.admissible
+                        outcome = if ($guard.admissible) { 'compiler-ready' } else { 'compiler-readiness-refused' }
+                        guarded = $true; transient = [bool]$retryable
+                        codes = @(); states = @($guard.state); reasons = @($guard.reasons)
+                    }
                     scope = 'Compiler readiness only; not loaded-cell, pixel, full-render-pipeline or future-health proof.'
                 }
                 if ($observation.satisfied -and [DateTime]::UtcNow -ge $deadline) {
@@ -1589,6 +1595,10 @@ try {
                     $observation.retryable = $false
                     $observation.terminalFailure = $true
                     $observation.classification = 'late-positive-compiler-observation'
+                    $observation.semantic.ok = $false
+                    $observation.semantic.outcome = 'wait-timeout'
+                    $observation.semantic.codes = @('wait_timeout')
+                    $observation.semantic.reasons = @('Positive compiler observation completed after the fixed operation deadline.')
                 }
                 if ($observation.terminalFailure -or [DateTime]::UtcNow -ge $deadline) { break }
             }
