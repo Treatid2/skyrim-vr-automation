@@ -131,4 +131,3 @@ must not silently revert it.
 All source/fixture success is offline. Independent owner live admission remains
 required; scientific colour, headset, pixels, exposure convergence, performance
 neutrality and vendor timing acceptance remain the experiment owner's judgement.
-
