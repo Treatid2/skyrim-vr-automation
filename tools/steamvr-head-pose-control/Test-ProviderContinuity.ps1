@@ -46,6 +46,12 @@ try {
         $stamp=[datetime]::Now.ToString('ddd MMM d yyyy HH:mm:ss.fff',[cultureinfo]::InvariantCulture)
         @("$stamp [Info] Loaded server driver null fixture driver_null.dll","$stamp [Info] Active HMD set to null.fixture-null","$stamp [Info] Loaded server driver codex_head_pose fixture driver_codex_head_pose.dll","$stamp [Info] codex_head_pose: registered synthetic head-pose device at configured standing pose")
     }
+    function Get-NullStartupLogProof {
+        param($Path,$Server,$SerialNumber,$MaxBytes,$DeadlineUtc)
+        $lines = @(Get-SharedTextTail -Path $Path -Count 2000 -MaxBytes $MaxBytes -DeadlineUtc $DeadlineUtc)
+        [pscustomobject]@{stable=$true;complete=$true;driverLoaded=$lines[0];activeHmd=$lines[1];headPoseDriverLoaded=$lines[2];headPoseDeviceRegistered=$lines[3]}
+    }
+    $script:NullStartupLogProofState=@{}
     foreach($lane in @('head','null')){
         $entry=if($lane -eq 'head'){Microsoft.PowerShell.Management\Join-Path $PSScriptRoot 'Invoke-SteamVRHeadPoseControl.ps1'}else{Microsoft.PowerShell.Management\Join-Path $repositoryRoot 'tools/steamvr-null-control/Invoke-SteamVRNullControl.ps1'}
         $tokens=$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($entry,[ref]$tokens,[ref]$errors)

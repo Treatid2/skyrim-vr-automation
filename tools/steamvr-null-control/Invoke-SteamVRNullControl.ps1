@@ -80,6 +80,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..\steamvr-head-pose-control\DriverPackageAuthority.ps1')
+. (Join-Path $PSScriptRoot 'StartupLogProof.ps1')
 
 if (-not ('SkyrimVRAutomation.Native.SharedPoseAtomics' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -1267,27 +1268,21 @@ function Get-NullRuntimeEvidence {
     $headPoseRegistered = $null
     $tail = @()
     $tailState = $null
-    if ($serverStartUtc -and (Test-Path -LiteralPath $ServerLogPath -PathType Leaf)) {
-        $tail = @(Get-SharedTextTail -Path $ServerLogPath -Count 2000 -MaxBytes $LogTailMaxBytes -DeadlineUtc $DeadlineUtc)
-        $tailState = @($script:SharedTextTailState.Values | Select-Object -First 1)[0]
-        $minimumUtc = $serverStartUtc.AddSeconds(-3)
-        foreach ($line in $tail) {
-            $timestampUtc = Get-LogTimestampUtc -Line $line
-            if (-not $timestampUtc -or $timestampUtc -lt $minimumUtc) { continue }
-            if ($line -match 'Loaded server driver null .*driver_null\.dll') {
-                $loaded = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line }
-            }
-            if ($line -match "Active HMD set to null\.$([regex]::Escape([string]$Profile['driver_null']['serialNumber']))") {
-                $active = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line }
-            }
-            if ($line -match 'Loaded server driver codex_head_pose .*driver_codex_head_pose\.dll') {
-                $headPoseLoaded = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line }
-            }
-            if ($line -match 'codex_head_pose: registered synthetic head-pose device at configured standing pose') {
-                $headPoseRegistered = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line }
-            }
+    $startupLogProof = $null
+    if ($serverStartUtc) {
+        if (Test-Path -LiteralPath $ServerLogPath -PathType Leaf) {
+            $tail = @(Get-SharedTextTail -Path $ServerLogPath -Count 2000 -MaxBytes $LogTailMaxBytes -DeadlineUtc $DeadlineUtc)
+            $tailState = @($script:SharedTextTailState.Values | Select-Object -First 1)[0]
+        }
+        $startupLogProof = Get-NullStartupLogProof -Path $ServerLogPath -Server $server[0] -SerialNumber ([string]$Profile['driver_null']['serialNumber']) -MaxBytes $LogTailMaxBytes -DeadlineUtc $DeadlineUtc
+        if ($tailState -and $tailState.stable -and $tailState.usable -and $startupLogProof.stable -and $startupLogProof.complete) {
+            $loaded = $startupLogProof.driverLoaded
+            $active = $startupLogProof.activeHmd
+            $headPoseLoaded = $startupLogProof.headPoseDriverLoaded
+            $headPoseRegistered = $startupLogProof.headPoseDeviceRegistered
         }
     }
+    else { $script:NullStartupLogProofState.Clear() }
     $headPoseAuthorizationError = $null
     try {
         $denyAfterStart = $InternalTestFailurePoint -eq 'head-pose-access-denied-after-start' -and
@@ -1348,6 +1343,7 @@ function Get-NullRuntimeEvidence {
             error = if ($tailState -and $tailState.PSObject.Properties['error']) { [string]$tailState.error } else { $null }
         }
         driverLoaded = $loaded
+        startupLogProof = $startupLogProof
         activeHmd = $active
         headPoseDriverLoaded = $headPoseLoaded
         headPoseDeviceRegistered = $headPoseRegistered

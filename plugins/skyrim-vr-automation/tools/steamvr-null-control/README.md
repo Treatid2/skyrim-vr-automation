@@ -162,6 +162,26 @@ in-place mutation before lines are published. Runtime evidence reports payload
 and proof byte counts plus cache usability, reuse, and resynchronization state.
 Decoding, hashing, and publication are charged to the startup deadline, so a
 large historical log cannot turn one poll into an unbounded whole-file read.
+Startup proof is separate from this moving diagnostic tail. The controller
+reads a prefix from byte zero, bounded by `LogTailMaxBytes` and 10,000 lines,
+and accepts only fully newline-framed proof lines of at most 4,096 bytes with
+the current server timestamp and exact configured HMD serial. Once all four
+startup lines are found, their complete prefix is pinned rather than forgotten
+when noise scrolls past the tail. Each later observation revalidates the prefix
+hash, Windows file identity and nondecreasing observed length against the
+currently selected path. `runtime.startupLogProof` retains the server identity,
+file identity, prefix offset/length/hash, physical line byte spans and bounded
+I/O counts. Replacement, rotation, truncation or proof-prefix drift invalidates
+that server's cache; the same invocation never silently reacquires rejected
+proof. A new server identity cannot inherit it. Missing proof beyond the byte
+or line budget fails explicitly instead of scanning historical logs without
+bound. This proves the retained prefix and current diagnostic tail, not every
+intervening log byte or future runtime health. Package/creator, shared-memory,
+independent application/controller and absolute-deadline checks remain required.
+Run `Test-StartupLogProof.ps1 -FixtureRoot <owned-fixture-directory>` for the
+production runtime-function fixtures, including delayed first observation,
+tail rollover and selected-path drift. These tests never launch SteamVR.
+
 The polling loop reserves a final bounded log-read window and records its
 deadlines, attempt count, and confirmation outcome in the runtime receipt. A
 timed-out confirmation invalidates readiness and performs exact-attempt cleanup
