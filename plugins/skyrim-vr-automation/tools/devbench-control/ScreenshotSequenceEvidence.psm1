@@ -116,6 +116,7 @@ function Get-DevBenchScreenshotSequenceEvidence {
         $r=$Payload.result
         Fields-SE $r @('requestId','kind','state','clientId','commandId','acceptedUtc','terminalUtc','requested','effective','actual','artifacts','warnings','errors','error','acknowledged','publication','artifactProgress') @('counts','manifest','packaging','termination','commandAccepted','alreadyTerminal','finalizationCommitted')
         Assert-SE ((Exact-SE $r.kind 'sequence') -and (Exact-SE $r.clientId $Arguments.clientId)) 'sequence parent/client ownership required.'
+        Assert-SE ($r.state -cin @('preparing','running','stop_requested','cancel_requested','finalizing','completed','completed_with_warnings','failed','failed_partial','cancelled','cancelled_partial','stopped')) 'unsupported native parent lifecycle state.'
         $terminal=BaseReceipt-SE $r $observed
         Assert-SE ($r.requested -is [pscustomobject] -and (Exact-SE $r.requested.action 'sequence_start') -and (UInt-SE $r.requested.contractMajor 1 1) -and (Exact-SE $r.requested.clientId $r.clientId) -and (Exact-SE $r.requested.commandId $r.commandId)) 'original sequence-start identity required.'
         $seq=$r.requested.sequence
@@ -140,7 +141,10 @@ function Get-DevBenchScreenshotSequenceEvidence {
         if ($r.PSObject.Properties['alreadyTerminal']) { Assert-SE ($r.alreadyTerminal -is [bool] -and $r.alreadyTerminal -and $terminal -and $Arguments.action -cin @('request_cancel','sequence_stop')) 'invalid alreadyTerminal command receipt.' }
         $commandAccepted=$null
         if ($Arguments.action -cin @('request_cancel','sequence_stop')) {
-            if ($alreadyTerminal) { $commandAccepted=$false }
+            if ($alreadyTerminal) {
+                foreach ($name in @('counts','manifest','packaging','termination','commandAccepted','finalizationCommitted')) { Assert-SE (-not $r.PSObject.Properties[$name]) 'alreadyTerminal must be the source-bound base receipt, not an extended-state bypass.' }
+                $commandAccepted=$false
+            }
             else { Assert-SE ($r.commandAccepted -is [bool]) 'cancellation/stop acknowledgement required.'; $commandAccepted=$r.commandAccepted }
         } else { Assert-SE (-not $r.PSObject.Properties['commandAccepted'] -and -not $alreadyTerminal) 'unexpected command acknowledgement.' }
         if (-not $alreadyTerminal) {
@@ -242,6 +246,7 @@ function Get-DevBenchScreenshotSequenceManifestEvidence {
     [CmdletBinding()]
     param([Parameter(Mandatory)][byte[]]$ManifestBytes,[Parameter(Mandatory)][string]$ManifestPath,
         [Parameter(Mandatory)]$ParentEvidence,[Parameter(Mandatory)][AllowEmptyCollection()][object[]]$FrameEvidence)
+    $text=$null
     try {
         Assert-SE ($ParentEvidence.ok -is [bool] -and $ParentEvidence.ok -and $ParentEvidence.receipt.PSObject.Properties['counts']) 'fresh full parent receipt required.'
         $r=$ParentEvidence.receipt; $owner=$ParentEvidence.owner
@@ -295,6 +300,6 @@ function Get-DevBenchScreenshotSequenceManifestEvidence {
         }
         if ($final) { Assert-SE ($m.children.Count -eq $r.counts.scheduled -and $m.counts.inFlight -eq 0) 'terminal manifest cannot omit scheduled children.' }
         return [pscustomobject]@{ok=$true;rawManifest=$m;manifestSha256=$hash;manifestBytes=$ManifestBytes.Length;declaredArtifactBytes=$artifactBytes;final=$final;terminalProof=$final;frames=$projected;requestSucceeded=($final -and $ParentEvidence.requestSucceeded -and @($FrameEvidence|Where-Object { -not $_.requestSucceeded }).Count -eq 0);errors=@()}
-    } catch { return [pscustomobject]@{ok=$false;rawManifestText=$(if ($null -ne (Get-Variable text -ErrorAction SilentlyContinue)) {$text}else{$null});final=$false;terminalProof=$false;requestSucceeded=$false;frames=@();errors=@($_.Exception.Message)} }
+    } catch { return [pscustomobject]@{ok=$false;rawManifestText=$text;final=$false;terminalProof=$false;requestSucceeded=$false;frames=@();errors=@($_.Exception.Message)} }
 }
 Export-ModuleMember -Function Get-DevBenchScreenshotSequenceEvidence, Get-DevBenchScreenshotSequenceFrameEvidence, Get-DevBenchScreenshotSequenceManifestEvidence
