@@ -3,10 +3,13 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('list', 'call', 'wait')]
+    [ValidateSet('list', 'call', 'wait', 'calendar-window')]
     [string]$Command = 'list',
     [string]$Tool,
     [string]$ArgumentsJson = '{}',
+    [string]$CalendarOwner,
+    [ValidateRange(1,300000)][int]$CalendarHoldMilliseconds = 60000,
+    [string]$CalendarObservationsJson,
     [string]$RuntimePath = $env:CSX_DEVBENCH_RUNTIME_PATH,
     [string]$ToolFilter,
     [switch]$NamesOnly,
@@ -84,6 +87,7 @@ $effectiveOperationTimeoutSeconds = $TimeoutSeconds
 $serverTimeoutMilliseconds = $null
 $serverTimeoutDispatchRemainingSeconds = $null
 Import-Module (Join-Path $PSScriptRoot 'DevBenchControl.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'CalendarObservationWindow.psm1') -Force
 $script:requestTimeoutSecondsForRpc = $RequestTimeoutSeconds
 
 function Get-ShaderCompilerGuard {
@@ -304,7 +308,8 @@ function Get-GameMutationRequests {
     $requests = [Collections.Generic.List[object]]::new()
     if ($ToolName -eq 'game' -and $Arguments -is [Collections.IDictionary]) {
         $action = if ($Arguments.Contains('action')) { [string]$Arguments['action'] } else { '' }
-        if ($action -in @('load', 'loadLast', 'save')) {
+        if ($action -in @('load', 'loadLast', 'save') -or ($action -ceq 'newGame' -and
+            $Arguments.Contains('phase') -and $Arguments['phase'] -cne 'inspect')) {
             $requests.Add([pscustomobject][ordered]@{ path = $Path; action = $action; arguments = $Arguments })
         }
         return @($requests)
@@ -321,7 +326,9 @@ function Get-GameMutationRequests {
             if ($Value.Contains('tool') -and [string]$Value['tool'] -eq 'game' -and $Value.Contains('args') -and $Value['args'] -is [Collections.IDictionary]) {
                 $args = $Value['args']
                 $action = if ($args.Contains('action')) { [string]$args['action'] } else { '' }
-                if ($action -in @('load', 'loadLast', 'save')) {
+                # Nested lane admission is independent of direct mutation
+                # classification: even default/explicit inspect must not tunnel.
+                if ($action -in @('load', 'loadLast', 'save') -or $action -ceq 'newGame') {
                     $requests.Add([pscustomobject][ordered]@{ path = "$CurrentPath.args"; action = $action; arguments = $args })
                 }
             }
@@ -347,6 +354,16 @@ function Get-GameMutationRequests {
 
 function Test-GameMutationPolicy {
     param([Parameter(Mandatory)]$Request)
+    if ($Request.action -ceq 'newGame') {
+        if ($Request.path -cne '$') { return [pscustomobject]@{ allowed=$false; override=$false; error='New Game requires the typed game tool, not a nested/scenario dispatcher.' } }
+        $args = $Request.arguments
+        if ($args['phase'] -isnot [string] -or $args['phase'] -cnotin @('request','confirm') -or
+            -not $args.Contains('requestId') -or $args['requestId'] -isnot [string] -or [string]::IsNullOrWhiteSpace($args['requestId']) -or
+            [Text.Encoding]::UTF8.GetByteCount($args['requestId']) -gt 128 -or
+            ($args['phase'] -ceq 'confirm' -and (-not $args.Contains('confirmNewGame') -or $args['confirmNewGame'] -isnot [bool] -or -not $args['confirmNewGame']))) {
+            return [pscustomobject]@{ allowed=$false; override=$false; error='New Game requires typed phase, exact 1..128-byte requestId and explicit Boolean confirmNewGame for confirmation.' }
+        }
+    }
     if ($AllowUnprovenGameMutation) { return [pscustomobject]@{ allowed = $true; override = $true; error = $null } }
     if ([string]::IsNullOrWhiteSpace($WorkspaceManifestPath)) {
         return [pscustomobject]@{ allowed = $false; override = $false; error = "DevBench game action '$($Request.action)' at $($Request.path) requires -WorkspaceManifestPath. Pass -AllowUnprovenGameMutation only when the caller explicitly accepts bypassing workspace save policy." }
@@ -360,6 +377,9 @@ function Test-GameMutationPolicy {
     $workspaceStatus = if ($workspace.PSObject.Properties['status']) { [string]$workspace.status } else { '' }
     if ($workspaceStatus -notin @('ready', 'retained')) {
         return [pscustomobject]@{ allowed = $false; override = $false; error = "Workspace status '$workspaceStatus' is not authorized for a DevBench game mutation." }
+    }
+    if ($Request.action -ceq 'newGame' -and $policy -ceq 'FreshGame') {
+        return [pscustomobject]@{ allowed=$true; override=$false; error=$null; policy=$policy; manifestPath=$resolvedManifest }
     }
     if ($policy -in @('MainMenuOnly', 'FreshGame')) {
         return [pscustomobject]@{ allowed = $false; override = $false; error = "Workspace save policy '$policy' forbids DevBench game action '$($Request.action)' at $($Request.path)." }
@@ -388,6 +408,25 @@ function Test-GameMutationPolicy {
         return [pscustomobject]@{ allowed = $false; override = $false; error = "VerifiedFixture saves directory mismatch at $($Request.path): requested '$actualDirectory', expected '$expectedDirectory'." }
     }
     return [pscustomobject]@{ allowed = $true; override = $false; error = $null; policy = $policy; manifestPath = $resolvedManifest; loadName = $expectedName }
+}
+
+function Test-NewGameCatalog {
+    param([object[]]$Tools, [Collections.IDictionary]$Arguments)
+    $game = @($Tools | Where-Object { $_.name -ceq 'game' })
+    if ($game.Count -ne 1 -or -not $game[0].PSObject.Properties['inputSchema']) { return $false }
+    $schema = $game[0].inputSchema
+    if (-not $schema.PSObject.Properties['properties']) { return $false }
+    $properties = $schema.properties
+    foreach ($name in @('action','phase','requestId','confirmNewGame')) {
+        if (-not $properties.PSObject.Properties[$name] -or $properties.PSObject.Properties[$name].Value -isnot [pscustomobject]) { return $false }
+    }
+    $phase = if ($Arguments.Contains('phase')) { $Arguments['phase'] } else { 'inspect' }
+    return ($properties.action.PSObject.Properties['type'] -and $properties.action.type -ceq 'string' -and
+        $properties.action.PSObject.Properties['enum'] -and @($properties.action.enum) -ccontains 'newGame' -and
+        $properties.phase.PSObject.Properties['type'] -and $properties.phase.type -ceq 'string' -and
+        $properties.phase.PSObject.Properties['enum'] -and @($properties.phase.enum) -ccontains $phase -and
+        $properties.requestId.PSObject.Properties['type'] -and $properties.requestId.type -ceq 'string' -and
+        $properties.confirmNewGame.PSObject.Properties['type'] -and $properties.confirmNewGame.type -ceq 'boolean')
 }
 
 function Get-McpSessionHeaderValue {
@@ -567,7 +606,8 @@ function Invoke-RestRequest {
 }
 
 function Invoke-ToolRpc {
-    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation)
+    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation, [switch]$RetainHealthToolError)
+    if ($RetainHealthToolError -and ($Name -cne 'inspect' -or [string]$Arguments['kind'] -cne 'health' -or $Mutation)) { throw 'Decoded tool-error retention is restricted to the read-only identity health probe.' }
     Set-ServerWaitBudgetAtDispatch -Arguments $Arguments
     if ($script:transport -eq 'rest') {
         $escapedName = [Uri]::EscapeDataString($Name)
@@ -576,7 +616,7 @@ function Invoke-ToolRpc {
     }
     $rpc = Invoke-McpRequest -Endpoint $endpoint -Headers $Headers -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/call'; params = @{ name = $Name; arguments = $Arguments } } -Mutation:$Mutation
     if ($rpc.json.PSObject.Properties['error']) { throw "DevBench tools/call failed: $($rpc.json.error | ConvertTo-Json -Compress)" }
-    if ($rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
+    if (-not $RetainHealthToolError -and $rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
         $message = ($rpc.json.result.content | ForEach-Object { $_.text }) -join "`n"
         throw "DevBench tool '$Name' failed: $message"
     }
@@ -928,6 +968,31 @@ function Assert-RuntimeIdentityContent {
     }
     return $Content[0]
 }
+function Assert-RuntimeHealthReply {
+    param([Parameter(Mandatory)]$Reply)
+    $content = @($Reply.content)
+    $semantic = Get-DevBenchHealthSemanticStatus -Content $content
+    $rawResult = if ($Reply.PSObject.Properties['rawResult']) { $Reply.rawResult } else { $null }
+    $toolError = $null -ne $rawResult -and $rawResult.PSObject.Properties['isError'] -and ($rawResult.isError -isnot [bool] -or $rawResult.isError)
+    if ($toolError) {
+        $semantic.ok = $false; $semantic.affirmative = $false; $semantic.outcome = 'health-read-contract-failed'
+        $semantic.reasons = @($semantic.reasons) + 'Decoded MCP health tool error.'
+        if ($rawResult.isError -isnot [bool]) { $semantic.rejectedOutcomeEvidence = @($semantic.rejectedOutcomeEvidence) + 'rawResult.isError' }
+    }
+    $probe = [pscustomobject]@{ capturedUtc = [DateTime]::UtcNow.ToString('o'); tool = 'inspect'; arguments = @{ kind = 'health' }; rawResult = if ($Reply.PSObject.Properties['rawResult']) { $Reply.rawResult } else { $null }; parsedContent = $content; semantic = $semantic; qualified = [bool]$semantic.ok }
+    if ($null -ne $script:invocationRecord -and -not [string]::IsNullOrWhiteSpace($script:invocationEvidencePath)) {
+        $script:invocationRecord['identityHealthProbe'] = $probe
+        if (-not $semantic.ok) { $script:invocationRecord['identityHealthFailedProbe'] = $probe }
+        Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord
+    }
+    if (-not $semantic.ok) {
+        $exception = [InvalidOperationException]::new("Unqualified runtime identity from inspect health: $(@($semantic.reasons) -join '; ')")
+        $exception.Data['DevBenchIdentitySemanticFailure'] = $true
+        $exception.Data['DevBenchIdentityRetryable'] = $semantic.transient -and -not $semantic.guarded -and @($semantic.rejectedOutcomeEvidence).Count -eq 0 -and @($semantic.reasons | Where-Object { $_ -match 'must be|requires|out of range' }).Count -eq 0
+        throw $exception
+    }
+    return $content[0]
+}
 
 function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [switch]$AllowDeferredBuildIdentity, [switch]$PropagateRetryable) {
     $expectations = Get-DevBenchRuntimeExpectations -Runtime $Runtime
@@ -940,8 +1005,7 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
     $errors = [Collections.Generic.List[string]]::new()
     if ($inspectAvailable) {
         try {
-            $healthContent = @(Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'health' } -Headers $Headers).content
-            $qualifiedHealth = Assert-RuntimeIdentityContent -Content @($healthContent) -Source 'inspect health'
+            $qualifiedHealth = Assert-RuntimeHealthReply -Reply (Invoke-ToolRpc -Name 'inspect' -Arguments @{ kind = 'health' } -Headers $Headers -RetainHealthToolError)
             if (-not $qualifiedHealth.PSObject.Properties['pid'] -or
                 ($qualifiedHealth.pid -isnot [int] -and $qualifiedHealth.pid -isnot [long]) -or
                 $qualifiedHealth.pid -le 0 -or $qualifiedHealth.pid -gt [int]::MaxValue -or
@@ -952,7 +1016,7 @@ function Get-RuntimeIdentity($Runtime, [hashtable]$Headers, [object[]]$Tools, [s
             $health = $qualifiedHealth
         }
         catch {
-            if ($PropagateRetryable -and (Test-WaitRetryableException -Exception $_.Exception)) { throw }
+            if ($PropagateRetryable -and ([bool]$_.Exception.Data['DevBenchIdentitySemanticFailure'] -or (Test-WaitRetryableException -Exception $_.Exception))) { throw }
             $errors.Add($_.Exception.Message)
         }
     }
@@ -1113,6 +1177,19 @@ try {
     $baseEndpoint = "http://127.0.0.1:$([int]$runtime.port)"
     $endpoint = "$baseEndpoint/mcp"
     $arguments = $null
+    $calendarObservations = @()
+    if ($Command -eq 'calendar-window') {
+        if ($SkipRuntimeIdentityVerification -or $MaxTransientRetries -ne 0 -or $TimeoutSeconds -lt 20 -or $RequirePerformanceNeutral) { throw 'calendar-window requires identity verification, -MaxTransientRetries 0, at least 20 seconds and no performance-neutrality claim.' }
+        if ([string]::IsNullOrWhiteSpace($CalendarOwner) -or $CalendarOwner.Length -gt 128) { throw 'calendar-window requires a bounded explicit CalendarOwner.' }
+        $calendarObservations = @($CalendarObservationsJson | ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop)
+        if ($calendarObservations.Count -lt 1 -or $calendarObservations.Count -gt 16) { throw 'calendar-window requires 1..16 observations.' }
+        foreach ($item in $calendarObservations) {
+            if ($item -isnot [Collections.IDictionary] -or $item.Count -ne 2 -or -not $item.Contains('tool') -or -not $item.Contains('arguments') -or $item.tool -isnot [string] -or $item.arguments -isnot [Collections.IDictionary] -or $item.tool -ceq 'calendar' -or -not (Test-DevBenchReadOnlyRequest -ToolName $item.tool -Arguments $item.arguments) -or $item.arguments.Contains('timeoutMs')) { throw 'calendar-window accepts only exact supported non-mutating observation requests; no calendar/save/time/quality/weather mutations.' }
+        }
+        $script:invocationRecord.requestMode = 'finite-calendar-hold-with-read-only-observations'
+        $script:invocationRecord.requestedArguments = $CalendarObservationsJson
+        Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord
+    }
     if ($Command -eq 'call') {
         if ([string]::IsNullOrWhiteSpace($Tool)) { throw 'Tool is required for call.' }
         try { $arguments = $ArgumentsJson | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { throw "ArgumentsJson is invalid: $($_.Exception.Message)" }
@@ -1141,10 +1218,28 @@ try {
     $tools = @()
     $evidencePath = $null
     if ($Command -ne 'wait') {
-        $session = Open-DevBenchSession -Runtime $runtime
+        # Ownership-bearing composition deliberately selects MCP before its
+        # first request; no REST downgrade or replacement session is allowed.
+        $session = if ($Command -eq 'calendar-window') {
+            $script:transport = 'mcp'
+            Open-McpSession -Runtime $runtime
+        } else { Open-DevBenchSession -Runtime $runtime }
         $headers = $session.headers
         $tools = @($session.tools)
         $runtimeIdentity = $session.runtimeIdentity
+        if ($Command -eq 'calendar-window') {
+            if (-not $runtimeIdentity.complete -or -not $runtimeIdentity.verified) { throw 'calendar-window requires complete verified runtime identity.' }
+            $calendarTools=@($tools | Where-Object name -CEQ 'calendar')
+            if ($calendarTools.Count -ne 1) { throw 'toolSchemaUnresolved: exact calendar is absent.' }
+            $schema=$calendarTools[0].inputSchema
+            if (@($schema.properties.action.enum).Count -ne 3 -or @($schema.properties.action.enum | Where-Object { $_ -cnotin @('status','hold','release') }).Count -gt 0 -or $schema.properties.holdMs.maximum -ne 300000 -or @($schema.properties.binding.required).Count -ne 5 -or @($schema.oneOf).Count -ne 3) { throw 'toolSchemaUnresolved: current calendar schema cannot establish the native finite ownership contract.' }
+            foreach ($item in $calendarObservations) { if (@($tools | Where-Object name -CEQ $item.tool).Count -ne 1) { throw "toolSchemaUnresolved: observation $($item.tool) is absent." } }
+        }
+        if ($Command -eq 'call' -and $Tool -ceq 'game' -and $arguments.Contains('action') -and
+            $arguments['action'] -ceq 'newGame' -and -not (Test-NewGameCatalog -Tools $tools -Arguments $arguments)) {
+            Update-InvocationEvidence -State 'guard-rejected' -Errors @('toolSchemaUnresolved: current catalog cannot express typed game/newGame phase and correlation fields.')
+            throw 'toolSchemaUnresolved: current catalog cannot express typed game/newGame phase and correlation fields; no dispatch or scenario fallback.'
+        }
         if (-not $SkipRuntimeIdentityVerification) {
             if ($Command -eq 'call' -and -not $readOnlyCall -and (-not $runtimeIdentity.complete -or -not $runtimeIdentity.verified)) {
                 throw "Mutation-capable DevBench calls require complete runtime identity. Missing: $($runtimeIdentity.missing -join ', ')."
@@ -1157,6 +1252,24 @@ try {
     if ($Command -eq 'list') {
         if (-not [string]::IsNullOrWhiteSpace($ToolFilter)) { $tools = @($tools | Where-Object { $_.name -like "*$ToolFilter*" }) }
         $data = if ($NamesOnly) { [pscustomobject][ordered]@{ names = @($tools | ForEach-Object name); count = $tools.Count } } else { [pscustomobject][ordered]@{ tools = $tools } }
+    }
+    elseif ($Command -eq 'calendar-window') {
+        $calendarSessionId=[string]$headers['Mcp-Session-Id']
+        $calendarDeadline=$operationDeadlineUtc
+        $data=Invoke-DevBenchCalendarWindow -Owner $CalendarOwner -Observations $calendarObservations -HoldMilliseconds $CalendarHoldMilliseconds -DeadlineUtc $calendarDeadline -ExpectedProcessId $runtimeIdentity.listenerPid -AssertSession {
+            if ($script:transport -cne 'mcp' -or [string]::IsNullOrWhiteSpace($calendarSessionId) -or [string]$headers['Mcp-Session-Id'] -cne $calendarSessionId) { throw 'Calendar MCP session changed; no rebind/release on a replacement.' }
+        } -Call {
+            param($name,$argsMap,$mutation,$bound)
+            $script:operationDeadlineUtc=$bound
+            try {
+                if ($mutation) {
+                    $script:invocationRecord.commandId=[string]$argsMap.commandId
+                    $script:invocationRecord['calendarDispatchArguments']=$argsMap
+                    Invoke-DevBenchTargetDispatch -InvocationRecord $invocationRecord -PersistIntent { Update-InvocationEvidence -State 'dispatching' } -TargetAction { Invoke-ToolRpc -Name $name -Arguments $argsMap -Headers $headers -Mutation }
+                } else { Invoke-ToolRpc -Name $name -Arguments $argsMap -Headers $headers }
+            } finally { $script:operationDeadlineUtc=$calendarDeadline }
+        }
+        $semantic=[pscustomobject]@{known=$true;ok=$data.ok;outcome='calendar-window';guarded=$false;transient=$false;codes=@();states=@();reasons=@($data.errors);completionBasis=$data.completionBasis}
     }
     elseif ($Command -eq 'call') {
         $toolAvailable = @($tools | Where-Object name -eq $Tool).Count -eq 1
@@ -1247,7 +1360,8 @@ try {
                     }
                 }
             }
-            if (-not [string]::IsNullOrWhiteSpace($ExpectedErrorCode)) {
+            if (-not [string]::IsNullOrWhiteSpace($ExpectedErrorCode) -and
+                -not ($Tool -ceq 'game' -and $arguments.Contains('action') -and $arguments['action'] -ceq 'newGame')) {
                 $semantic = Get-DevBenchExpectedGuardStatus -ToolName $Tool -Arguments $arguments -Content @($data.content) -ExpectedErrorCode $ExpectedErrorCode
             }
             if ($performanceGuard) {
@@ -1765,7 +1879,7 @@ try {
         $semantic.outcome = 'unverified'
         $semantic.reasons = @($semantic.reasons) + 'A verified semantic outcome was required, but the response did not provide one.'
     }
-    $semanticFailure = if ($Command -eq 'call') {
+    $semanticFailure = if ($Command -in @('call','calendar-window')) {
         -not $semantic.known -or -not $semantic.ok
     }
     elseif ($RequireSuccess -or $Command -eq 'wait') {
@@ -1777,7 +1891,7 @@ try {
         ok = -not $semanticFailure
         transportOk = $true
         state = $(if ($Command -eq 'wait') { [string]$waitCompletion.state } elseif ($semanticFailure) { 'semantic-failed' } else { 'completed' })
-        indeterminate = $false
+        indeterminate = [bool]($Command -eq 'calendar-window' -and $data.indeterminate)
         dispatchReached = [bool]$dispatch.dispatchReached
         responseDataRetained = [bool]$dispatch.responseDataRetained
         acceptedDataRetained = [bool]$dispatch.acceptedDataRetained

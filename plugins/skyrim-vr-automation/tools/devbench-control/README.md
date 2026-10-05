@@ -74,7 +74,132 @@ positive admission, failure/pending refusal with zero target dispatch, changed
 post-boundaries with preserved target receipt, no replay and exact session
 cleanup. They are offline validation, not a live ca3/ad8 health qualification.
 
+## Finite same-session calendar observation
+
+`calendar-window` is a bounded ownership composition in this controller, not
+a second DevBench transport or a general scenario/mutation wrapper. Select the
+controller MCP lane only when direct MCP is unavailable for that workflow
+before its first live request (direct-only protocols remain direct-only). It
+opens exactly one actual MCP session, discovers the native
+calendar schema and complete runtime/artifact identity, reads fresh status,
+copies the exact source binding into one finite hold, brackets 1..16 qualified
+read-only observations with current calendar state, then releases the original
+exact lease and verifies fresh prior-rate restoration before session close.
+The hold's captured values—not an earlier status's date—are authoritative.
+
+```powershell
+.\Invoke-DevBenchControl.ps1 calendar-window -RuntimePath '<exact-runtime.json>' `
+  -CalendarOwner '<task-owner>' -CalendarHoldMilliseconds 60000 `
+  -CalendarObservationsJson '[{"tool":"inspect","arguments":{"kind":"scene"}},{"tool":"camera","arguments":{"action":"get"}}]' `
+  -MaxTransientRetries 0 -TimeoutSeconds 60 -EvidenceDirectory '<owned-evidence>'
+```
+
+Supply build/artifact expectations as for other ownership-bearing calls. The
+total invocation budget reserves its final 15 seconds for bounded same-session
+cleanup. Hold maximum is 300000 ms; there is no renewal. Late responses fail
+their phase deadline. Lost/already-started hold responses are reconciled once
+by the same session and hold command ID: no replay, replacement session, REST
+downgrade, or unrelated lease adoption. An absent/failed cleanup proof is
+explicitly indeterminate. A failed observation may still have separately
+verified restoration; it never becomes a successful observation window.
+
+Cell drift invalidates observation continuity, but cleanup can independently be
+verified in a different cell. Release still uses the original exact `lease.binding`
+and lease ID on the same actual MCP session, with a distinct release command ID.
+Native restoration must positively succeed after its private SameStorage/owned-zero
+check. Both the release receipt and a fresh status must preserve process session,
+PID, load generation and all six global IDs, retain the exact original lease and
+captured rate, and show no outstanding custody and the restored prior rate; fresh
+`lastTransition` must also affirm restoration with the same exact reason as the
+release receipt. Supported positive reasons are only `released`, `expired`, and
+`scene_lost`: native Tick may already have restored and retired the original
+lease before explicit release, which then returns that same result without a
+second write. A reason by itself never proves restoration; every custody and
+fresh-readback guard still applies. Only the current contextual cell may
+differ for cleanup proof. No current-binding substitution, foreign-rate overwrite,
+generation adoption, lease disappearance inference or automatic retry is permitted.
+Raw release/status remain evidence; public IDs do not expose or replace native
+storage-address checks. Offline proof is not a live restoration guarantee.
+
+This first interface admits only existing allowlisted non-mutating reads. It
+does not start capture, arm probes, change quality/weather/physics, save, jump
+time, or promise an atomic rendered frame or invariant lighting. Experiment
+owners retain calibration and scientific acceptance. Native expiry needs a
+serviced main thread; disconnect/crash is not verified restoration. Closing the
+MCP session is separately reported, never substituted for calendar cleanup.
+Source/offline validation does not qualify native runtime operation.
+
+Run `Test-CalendarObservationWindow.ps1` for the finite offline RPC negatives
+and public production-entry refusal tests.
+
+## Phase-aware genuine New Game
+
+The existing `call -Tool game` interface supports the native DevBench
+4407a937 New Game contract without a second wrapper. Use exact JSON:
+`{"action":"newGame","phase":"inspect"}`, then one request with
+`phase:request` and a fresh UUID `requestId`, and one confirmation with the
+same ID, `phase:confirm` and Boolean `confirmNewGame:true`. Request/confirm
+require a ready/retained `FreshGame` workspace manifest and full runtime
+identity; `MainMenuOnly`, `VerifiedFixture`, absent or unknown policies refuse.
+Known-ID inspection uses `phase:inspect,requestId:<same-id>` and requires a
+matching receipt rather than accepting a general menu snapshot.
+
+Inspection qualifies typed menu state, including valid not-ready or closed
+menus; callers must inspect `semantic.readyToRequest/readyToConfirm` before
+dispatch. A staged request returns `completionBasis:staged-request`; a
+confirmed dispatch returns `completionBasis:dispatch-only`. Neither proves
+game initialization. Observe expected character creation and player/cell state
+separately. Failures/expiry, malformed fields, foreign IDs and explicit errors
+remain failures, even beside positive generic flags. Sticky unresolved
+dispatch is retained with its exact ID and blocks fresh requests; do not replay
+or infer non-execution from menu changes or elapsed time. Transport failures
+after mutation dispatch remain indeterminate and are never retried.
+
+Select one transport before this workflow's first call. If a complete direct
+catalog's `game` action enum omits `newGame`, a separately selected supported
+controller-only workflow may bind the explicit runtime/build/artifact and
+discover the fresh typed schema through `list`. This pre-call unavailable-action
+selection is not permission to switch after an uncertain call or tunnel through
+`scenario`. Direct-only protocols remain direct-only. Missing current schema
+means `toolSchemaUnresolved` with no dispatch, not a game/VR restart. Source
+support does not imply the installed cache or host catalog has been refreshed.
+
+Runtime `inspect health` has its own typed read contract. A non-error plain
+health object requires positive bounded integral PID/port, non-empty executable,
+integral frame/task counters and Boolean VR state; it need not invent a generic
+`ok` marker. Explicit negative/malformed health still fails. Existing listener,
+runtime metadata, executable, producer/build and artifact guards remain required.
+The invocation journal retains the raw MCP result/text, parsed health and typed
+qualification under `identityHealthProbe` before identity admission, including
+failed health. This is diagnosis evidence, never permission to bypass identity
+checks or attribute a manually launched process to an old MO2 session.
+The health classifier is independent of generic action-classifier extensions:
+outcome flags must be actual Booleans, status/code fields must be supported
+typed outcomes, and non-empty `error`/`errors` take precedence over affirmative
+markers. Incomplete legacy identity requires an explicit typed affirmative
+marker; retryability alone is never success. A decoded MCP `isError` result is
+retained and rejected even if its content otherwise looks like valid health.
+`identityHealthFailedProbe` retains the last failed decoded probe when a later
+successful health check replaces `identityHealthProbe`. Transport failure before
+a decoded result exists remains a transport diagnostic, not a fabricated probe.
+Bounded waits preserve typed health failure classification through session open
+and identity refresh. Only classified transient failures may rebind, after
+successful cleanup of the prior MCP session; malformed, guarded, terminal and
+unknown failures cannot be made retryable by message text.
+
 ## Current native read contracts
+
+Exact `communityshaders.menu {action:status}` qualifies one typed native
+action/status/producer receipt, empty path and explicit null delegatedRequest.
+Core menu/overlay/scene flags remain Booleans, counters unsigned telemetry and
+placement values finite numbers, with a positive scale. A disabled/closed menu
+is a valid observation; it is not interaction failure or proof of readiness.
+Producer/build/source/ABI fields are retained and optional expectedBuildId must
+match. Explicit errors, foreign/malformed/multiple receipts and mutation fields
+fail. No synthetic generic `ok` is inserted into the original payload.
+`semantic.qualifiedMenuStatus` is **read-schema-only**, not calibration,
+visibility, rendering, setting/save success or deployment qualification.
+Only exact status enters this adapter; mutation/read admission is not broadened.
 
 Exact `input {action:capabilities}` accepts only the complete native
 `devbench.input` 2.0 capability payload: ready/available Boolean keyboard v1

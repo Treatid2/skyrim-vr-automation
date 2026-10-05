@@ -6,6 +6,112 @@ Export-ModuleMember -Function Get-DevBenchShaderCompilerHealth, Test-DevBenchSha
 . (Join-Path $PSScriptRoot 'NativeReadContracts.ps1')
 . (Join-Path $PSScriptRoot 'ScreenshotRequestRead.ps1')
 
+function Get-DevBenchHealthSemanticStatus {
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][object[]]$Content)
+    $reasons = [Collections.Generic.List[string]]::new()
+    $rejected = [Collections.Generic.List[string]]::new()
+    $signals = [Collections.Generic.List[string]]::new()
+    $transients = [Collections.Generic.List[string]]::new()
+    $guards = [Collections.Generic.List[string]]::new()
+    $retryHints = [Collections.Generic.List[bool]]::new()
+    $successNames = @('success','ok','ready','completed','accepted','idle','available')
+    $transientNames = @('main_thread_busy','service_unavailable','initializing','starting','waiting_for_safe_point','loading_transition','relatch_pending','compiling','pending','queued','running')
+    $guardNames = @('producer_mismatch','contract_mismatch','unsupported_contract_major','idempotency_conflict')
+    # Health must stand alone on the scoped baseline. Do not depend on optional
+    # properties or truthiness rules of the generic action classifier.
+    function Visit-HealthOutcome($Value, [string]$Path, [int]$Depth = 0) {
+        if ($Depth -gt 32) { $reasons.Add('Health outcome nesting is out of range.'); $rejected.Add($Path); return }
+        if ($null -eq $Value -or $Value -is [string] -or $Value -is [ValueType]) { return }
+        if ($Value -is [Collections.IDictionary]) {
+            $properties = @($Value.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Key; Value = $_.Value } })
+        }
+        elseif ($Value -is [Collections.IEnumerable] -and $Value -isnot [pscustomobject]) {
+            $index = 0
+            foreach ($entry in $Value) { Visit-HealthOutcome $entry "$Path[$index]" ($Depth + 1); $index++ }
+            return
+        }
+        else { $properties = @($Value.PSObject.Properties) }
+        foreach ($property in $properties) {
+            $name = [string]$property.Name; $child = $property.Value; $childPath = "$Path.$name"
+            if ($name -in @('ok','success','passed','failed','aborted','retryable')) {
+                if ($child -isnot [bool]) { $reasons.Add("Health $childPath must be Boolean."); $rejected.Add($childPath) }
+                elseif ($name -eq 'retryable') { $retryHints.Add($child) }
+                elseif (($name -in @('ok','success','passed') -and -not $child) -or ($name -in @('failed','aborted') -and $child)) { $reasons.Add("Health $childPath is negative.") }
+                elseif ($name -in @('ok','success','passed') -and $child -and $Path -ceq 'health') { $signals.Add($childPath) }
+            }
+            elseif ($name -in @('code','state','status','resultStatus')) {
+                $values = @()
+                if ($child -is [string] -and -not [string]::IsNullOrWhiteSpace($child)) { $values = @($child) }
+                elseif ($name -in @('status','resultStatus') -and $child -is [pscustomobject]) {
+                    $statusName = $child.PSObject.Properties['name']; $statusValue = $child.PSObject.Properties['value']
+                    if (-not $statusName -and -not $statusValue) { $reasons.Add("Health $childPath requires name or value."); $rejected.Add($childPath) }
+                    if ($statusName) {
+                        if ($statusName.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($statusName.Value)) { $reasons.Add("Health $childPath.name must be a non-empty string."); $rejected.Add($childPath) }
+                        else { $values = @($statusName.Value) }
+                    }
+                    if ($statusValue) {
+                        if ($null -eq $statusValue.Value -or $statusValue.Value.GetType() -notin $integers) { $reasons.Add("Health $childPath.value must be integral."); $rejected.Add($childPath) }
+                        elseif ($statusValue.Value -ne 0) { $reasons.Add("Health $childPath.value is negative.") }
+                        elseif ($Path -ceq 'health') { $signals.Add($childPath) }
+                    }
+                }
+                else { $reasons.Add("Health $childPath must be a supported outcome."); $rejected.Add($childPath) }
+                foreach ($outcomeValue in $values) {
+                    if ($outcomeValue -notin $successNames) { $reasons.Add("Health $childPath is '$outcomeValue'.") }
+                    elseif ($Path -ceq 'health') { $signals.Add($childPath) }
+                    if ($outcomeValue -in $transientNames) { $transients.Add($childPath) }
+                    if ($outcomeValue -in $guardNames) { $guards.Add($childPath) }
+                }
+            }
+            elseif ($name -in @('error','errors')) {
+                $hasError = $null -ne $child -and -not ($child -is [string] -and [string]::IsNullOrWhiteSpace($child)) -and
+                    -not ($child -is [Collections.IEnumerable] -and $child -isnot [string] -and @($child).Count -eq 0)
+                if ($hasError) {
+                    $reasons.Add("Health $childPath contains failure evidence.")
+                    if ($child -is [string] -and $child -in $transientNames) { $transients.Add($childPath) }
+                    if ($child -is [string] -and $child -in $guardNames) { $guards.Add($childPath) }
+                }
+            }
+            Visit-HealthOutcome $child $childPath ($Depth + 1)
+        }
+    }
+    $payload = if (@($Content).Count -eq 1 -and $Content[0] -is [pscustomobject]) { $Content[0] } else { $null }
+    $integers = @([byte],[sbyte],[int16],[uint16],[int32],[uint32],[int64],[uint64])
+    foreach ($item in @($Content)) { Visit-HealthOutcome $item 'health' }
+    if ($null -eq $payload) { $reasons.Add('Health requires exactly one structured payload.') }
+    else {
+        $pidValue = $payload.PSObject.Properties['pid']
+        $exeValue = $payload.PSObject.Properties['exe']
+        if (-not $pidValue -or $null -eq $pidValue.Value -or $pidValue.Value.GetType() -notin $integers -or $pidValue.Value -le 0 -or $pidValue.Value -gt [int]::MaxValue) { $reasons.Add('Health PID must be a positive bounded integer.') }
+        if (-not $exeValue -or $exeValue.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($exeValue.Value)) { $reasons.Add('Health executable must be a non-empty string.') }
+        # DevBench health is a typed read result, not a generic action verdict.
+        # Unknown plain objects require the complete supported health shape.
+        foreach ($name in @('port','frame','lastTaskFrame','pendingTasks','vr')) {
+            $property = $payload.PSObject.Properties[$name]
+            if (-not $property) {
+                if ($signals.Count -eq 0) { $reasons.Add("Plain health requires $name.") }
+                continue
+            }
+            if ($name -eq 'vr') {
+                if ($property.Value -isnot [bool]) { $reasons.Add('Health vr must be Boolean.') }
+                continue
+            }
+            if ($null -eq $property.Value -or $property.Value.GetType() -notin $integers) { $reasons.Add("Health $name must be integral."); continue }
+            $minimum = if ($name -eq 'lastTaskFrame') { -1 } elseif ($name -eq 'port') { 1 } else { 0 }
+            if ($property.Value -lt $minimum -or ($name -eq 'port' -and $property.Value -gt 65535)) { $reasons.Add("Health $name is out of range.") }
+        }
+    }
+    if ($retryHints.Contains($true)) { $reasons.Add('Health declares a retryable negative outcome.') }
+    return [pscustomobject]@{
+        known = $true; ok = $reasons.Count -eq 0; affirmative = $reasons.Count -eq 0
+        outcome = if ($reasons.Count -eq 0) { 'health-read-contract-satisfied' } else { 'health-read-contract-failed' }
+        reasons = @($reasons | Select-Object -Unique); guarded = $guards.Count -gt 0
+        transient = ($retryHints.Contains($true) -or $transients.Count -gt 0) -and -not $retryHints.Contains($false)
+        rejectedOutcomeEvidence = @($rejected | Select-Object -Unique)
+    }
+}
+
 function Get-DevBenchSemanticStatus {
     [CmdletBinding()]
     param([AllowEmptyCollection()][object[]]$Content,
@@ -319,6 +425,119 @@ function Get-DevBenchSemanticStatus {
     }
 }
 
+function Get-DevBenchNewGameSemanticStatus {
+    [CmdletBinding()]
+    param([Collections.IDictionary]$Arguments, [AllowEmptyCollection()][object[]]$Content)
+    # Native contract: DevBench 4407a937, NewGameControl/RequestLedger. This is
+    # an action adapter, not a generic positive-flag override or a dispatcher.
+    $reasons = [Collections.Generic.List[string]]::new()
+    $phase = if ($Arguments.Contains('phase')) { $Arguments['phase'] } else { 'inspect' }
+    $id = if ($Arguments.Contains('requestId')) { $Arguments['requestId'] } else { '' }
+    $outcome = 'game-newGame-contract-failed'; $basis = 'unverified'
+    $uncertain = $false; $blocked = $false; $unresolvedId = ''; $readyRequest = $false; $readyConfirm = $false
+    if ($phase -isnot [string] -or $phase -cnotin @('inspect','request','confirm')) { $reasons.Add('request.phase must be inspect, request or confirm') }
+    if ($id -isnot [string] -or [Text.Encoding]::UTF8.GetByteCount([string]$id) -gt 128 -or
+        ($phase -cne 'inspect' -and [string]::IsNullOrWhiteSpace([string]$id))) { $reasons.Add('request.requestId must be an exact non-empty 1..128-byte string for mutation') }
+    if ($phase -ceq 'confirm' -and (-not $Arguments.Contains('confirmNewGame') -or
+        $Arguments['confirmNewGame'] -isnot [bool] -or -not $Arguments['confirmNewGame'])) { $reasons.Add('request.confirmNewGame must be Boolean true') }
+    $payload = if (@($Content).Count -eq 1 -and $Content[0] -is [pscustomobject]) { $Content[0] } else { $null }
+    if ($null -eq $payload) { $reasons.Add('content must contain exactly one structured New Game payload') }
+    function Read-NewGameField([string]$Name, [type]$Type) {
+        $property = if ($null -ne $payload) { $payload.PSObject.Properties[$Name] } else { $null }
+        if (-not $property -or $property.Value -isnot $Type) { $reasons.Add("content.$Name must be $($Type.Name)"); return $null }
+        return $property.Value
+    }
+    # Do not inherit generic coercions. Negative/error evidence anywhere stays
+    # negative, while the native top-level staged flags and menu state are
+    # interpreted only by their owning phase below.
+    function Visit-NewGameFailure($Value, [string]$Path, [int]$Depth = 0) {
+        if ($Depth -gt 24) { $reasons.Add('New Game outcome nesting exceeds contract limit'); return }
+        if ($null -eq $Value -or $Value -is [string] -or $Value -is [ValueType]) { return }
+        $properties = if ($Value -is [Collections.IDictionary]) { @($Value.GetEnumerator() | ForEach-Object { [pscustomobject]@{Name=[string]$_.Key;Value=$_.Value} }) }
+            elseif ($Value -is [Collections.IEnumerable] -and $Value -isnot [pscustomobject]) { $i=0; foreach ($entry in $Value) { Visit-NewGameFailure $entry "$Path[$i]" ($Depth+1); $i++ }; return }
+            else { @($Value.PSObject.Properties) }
+        foreach ($property in $properties) {
+            $name = [string]$property.Name; $child = $property.Value; $next = "$Path.$name"
+            if ($Path -ceq 'content' -and $name -cin @('accepted','completed','state')) { continue }
+            if ($name -cin @('ok','success','passed','failed','aborted','isError','retryable','accepted','completed')) {
+                if ($child -isnot [bool]) { $reasons.Add("$next must be Boolean") }
+                elseif (($name -cin @('ok','success','passed','accepted','completed') -and -not $child) -or
+                    ($name -cin @('failed','aborted','isError','retryable') -and $child)) { $reasons.Add("$next contains negative outcome evidence") }
+            }
+            elseif ($name -cin @('error','errors')) {
+                if ($null -ne $child -and -not ($child -is [string] -and [string]::IsNullOrWhiteSpace($child)) -and
+                    -not ($child -is [Collections.IEnumerable] -and $child -isnot [string] -and @($child).Count -eq 0)) { $reasons.Add("$next contains failure evidence") }
+            }
+            elseif ($name -cin @('code','status','resultStatus','state')) {
+                if ($child -is [string]) { if ($child -cnotin @('success','ok','ready','completed','accepted','idle','available')) { $reasons.Add("$next is not a positive status") } }
+                elseif ($child -is [pscustomobject] -and $name -cin @('status','resultStatus')) {
+                    $statusName = $child.PSObject.Properties['name']; $statusValue = $child.PSObject.Properties['value']
+                    if (-not $statusName -and -not $statusValue) { $reasons.Add("$next requires name or value") }
+                    if ($statusName -and ($statusName.Value -isnot [string] -or $statusName.Value -cnotin @('success','ok','ready','completed','accepted','idle','available'))) { $reasons.Add("$next.name is negative or malformed") }
+                    if ($statusValue -and ($null -eq $statusValue.Value -or $statusValue.Value.GetType() -notin @([byte],[sbyte],[int16],[uint16],[int32],[uint32],[int64],[uint64]) -or $statusValue.Value -ne 0)) { $reasons.Add("$next.value is negative or malformed") }
+                }
+                else { $reasons.Add("$next is malformed outcome evidence") }
+            }
+            Visit-NewGameFailure $child $next ($Depth+1)
+        }
+    }
+    Visit-NewGameFailure $payload 'content'
+    if ($null -ne $payload -and $payload.PSObject.Properties['requestId']) {
+        $receiptId = Read-NewGameField 'requestId' ([string]); $receiptPhase = Read-NewGameField 'phase' ([string])
+        $accepted = Read-NewGameField 'accepted' ([bool]); $completed = Read-NewGameField 'completed' ([bool])
+        $uncertainValue = Read-NewGameField 'unresolvedDispatch' ([bool]); $uncertain = $uncertainValue -eq $true
+        $blocked = $uncertain; if ($uncertain) { $unresolvedId = [string]$receiptId }
+        if ([string]::IsNullOrWhiteSpace([string]$id) -or $receiptId -cne $id) { $reasons.Add('content.requestId does not match the exact requested ID') }
+        if ($completed -eq $true) { $reasons.Add('Native New Game receipt cannot prove completion/world entry') }
+        if ($receiptPhase -ceq 'requested') {
+            $basis = 'staged-request'; $outcome = 'game-newGame-request-staged'
+            if ($accepted -ne $false -or $uncertainValue -ne $false -or $phase -ceq 'confirm') { $reasons.Add('requested receipt has contradictory flags or confirmation phase') }
+            $state = Read-NewGameField 'state' ([string]); if ([string]::IsNullOrWhiteSpace([string]$state)) { $reasons.Add('requested receipt lacks observed menu state') }
+        }
+        elseif ($receiptPhase -ceq 'dispatched') {
+            $basis = 'dispatch-only'; $outcome = 'game-newGame-dispatch-acknowledged'
+            if ($accepted -ne $true -or $uncertainValue -ne $false) { $reasons.Add('dispatched receipt has contradictory acceptance/uncertainty') }
+        }
+        elseif ($receiptPhase -ceq 'dispatchUncertain') {
+            $basis = 'unresolved-dispatch'; $outcome = 'game-newGame-dispatch-unresolved'
+            $reasons.Add('Dispatch remains unresolved: inspect this same ID, never replay or escape with a fresh ID')
+            if ($uncertainValue -ne $true -or $accepted -ne $false) { $reasons.Add('dispatchUncertain receipt has contradictory flags') }
+        }
+        else { $basis = 'failed-request'; $reasons.Add("Request phase '$receiptPhase' is failed, invalidated, expired or unsupported") }
+        $invalid = $payload.PSObject.Properties['invalidationReason']
+        if ($invalid -and ($invalid.Value -isnot [string] -or -not [string]::IsNullOrWhiteSpace([string]$invalid.Value))) { $reasons.Add('content.invalidationReason prevents qualification; invalidation does not clear uncertainty') }
+        $row = $payload.PSObject.Properties['newRow']
+        if (-not $row -or $null -eq $row.Value -or $row.Value.GetType() -notin @([byte],[sbyte],[int16],[uint16],[int32],[uint32],[int64],[uint64]) -or $row.Value -lt 0 -or $row.Value -gt 31) { $reasons.Add('content.newRow must be a bounded integral row') }
+    }
+    elseif ($null -ne $payload) {
+        $basis = 'current-menu-state'; $outcome = 'game-newGame-menu-observed'
+        if ($phase -cne 'inspect' -or -not [string]::IsNullOrEmpty([string]$id)) { $reasons.Add('Known-ID inspection or mutation requires a matching request receipt, not a menu snapshot') }
+        $open = Read-NewGameField 'mainMenuOpen' ([bool]); $rq = Read-NewGameField 'readyToRequest' ([bool]); $rc = Read-NewGameField 'readyToConfirm' ([bool])
+        $pending = Read-NewGameField 'pendingRequestId' ([string]); $unresolved = Read-NewGameField 'unresolvedRequestId' ([string]); $block = Read-NewGameField 'newRequestsBlocked' ([bool])
+        $blocked = $block -eq $true; $unresolvedId = [string]$unresolved; $uncertain = -not [string]::IsNullOrEmpty($unresolvedId)
+        $readyRequest = $rq -eq $true; $readyConfirm = $rc -eq $true
+        if ($blocked -ne $uncertain) { $reasons.Add('newRequestsBlocked and unresolvedRequestId disagree') }
+        if ($blocked) { $reasons.Add('Native unresolved dispatch blocks fresh requests and confirmation') }
+        if ($rq -eq $true -and $rc -eq $true) { $reasons.Add('Request and confirmation cannot both be ready') }
+        if ($open -eq $false -and ($rq -eq $true -or $rc -eq $true)) { $reasons.Add('Closed menu cannot be ready') }
+        if ($open -eq $true) {
+            $state = Read-NewGameField 'state' ([string]); $movie = Read-NewGameField 'moviePath' ([string])
+            if ($movie -cne '_root.MenuHolder.Menu_mc' -or [string]::IsNullOrWhiteSpace([string]$state)) { $reasons.Add('Open menu requires the exact native movie path and state') }
+            $selected = $payload.PSObject.Properties['selectedEntryId']
+            if (-not $selected -or ($null -ne $selected.Value -and ($selected.Value.GetType() -notin @([byte],[sbyte],[int16],[uint16],[int32],[uint32],[int64],[uint64],[single],[double],[decimal]) -or -not [double]::IsFinite([double]$selected.Value)))) { $reasons.Add('selectedEntryId must be a finite number or null') }
+            if ($rq -eq $true -and ($state -cne 'Main' -or -not [string]::IsNullOrEmpty([string]$pending) -or $blocked)) { $reasons.Add('Request readiness is inconsistent with Main/pending/barrier state') }
+            if ($rc -eq $true -and ($state -cne 'MainConfirm' -or [string]::IsNullOrWhiteSpace([string]$pending) -or -not $selected -or $selected.Value -ne 1 -or $blocked)) { $reasons.Add('Confirmation readiness is inconsistent with exact New entry/pending/barrier state') }
+        }
+    }
+    return [pscustomobject][ordered]@{
+        known = $true; ok = $reasons.Count -eq 0; outcome = $outcome; completionBasis = $basis
+        guarded = $reasons.Count -gt 0; transient = $false; codes = @(); states = @(); reasons = @($reasons | Select-Object -Unique)
+        schedulerOnly = $false; schedulerReceiptPaths = @(); explicitOutcomeEvidence = @('native-newGame-phase-contract')
+        readyToRequest = $readyRequest -and $reasons.Count -eq 0; readyToConfirm = $readyConfirm -and $reasons.Count -eq 0
+        unresolvedDispatch = $uncertain; unresolvedRequestId = $unresolvedId; newRequestsBlocked = $blocked
+    }
+}
+
 function Test-DevBenchReadOnlyRequest {
     [CmdletBinding()]
     param(
@@ -329,11 +548,15 @@ function Test-DevBenchReadOnlyRequest {
     if ($ToolName -ceq 'communityshaders.shader_api') { return Test-DevBenchShaderSnapshotRequest -Arguments $Arguments }
     $action = if ($Arguments.Contains('action')) { [string]$Arguments['action'] } else { '' }
     $kind = if ($Arguments.Contains('kind')) { [string]$Arguments['kind'] } else { '' }
+    if ($ToolName -ceq 'game' -and $action -ceq 'newGame') {
+        return (-not $Arguments.Contains('phase') -or ($Arguments['phase'] -is [string] -and $Arguments['phase'] -ceq 'inspect'))
+    }
     if ($ToolName -eq 'inspect') {
         return $kind -in @('state', 'health', 'vm', 'scene', 'mods', 'player', 'inventory', 'quests', 'effects', 'refs', 'registrants', 'screenshots', 'extensions')
     }
     if ($ToolName -eq 'menu') { return $action -eq 'list' }
     if ($ToolName -ceq 'camera') { return $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'get' }
+    if ($ToolName -ceq 'communityshaders.menu') { return $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status' -and @($Arguments.Keys | Where-Object { $_ -cnotin @('action','expectedBuildId') }).Count -eq 0 }
     if ($ToolName -eq 'record') { return $action -eq 'status' }
     if ($ToolName -ceq 'input') { return $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -cin @('observe', 'status', 'capabilities') }
     if ($ToolName -ceq 'communityshaders.fsr_color_contract') { return $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status' -and -not $Arguments.Contains('expectedRevision') -and -not $Arguments.Contains('highDynamicRangeInput') -and -not $Arguments.Contains('autoExposure') }
@@ -417,11 +640,15 @@ function Get-DevBenchCallSemanticStatus {
             explicitOutcomeEvidence=@('native-csx.shader-1.0-schema1-snapshot')
         }
     }
+    if ($ToolName -ceq 'game' -and $Arguments.Contains('action') -and $Arguments['action'] -ceq 'newGame') {
+        return Get-DevBenchNewGameSemanticStatus -Arguments $Arguments -Content $Content
+    }
     $semantic = if ($ToolName -ceq 'communityshaders.renderscale' -and $Arguments.Contains('action') -and $Arguments['action'] -ceq 'status') {
         Get-DevBenchSemanticStatus -Content $Content -UnsignedTelemetryStatePaths 'content.status.vendorWorkGate.state'
     } else { Get-DevBenchSemanticStatus -Content $Content }
     $payloads = @($Content)
-    $nativeReadKind = if ($ToolName -ceq 'input' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'capabilities') { 'input-capabilities' }
+    $nativeReadKind = if ($ToolName -ceq 'communityshaders.menu' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status') { 'menu-status' }
+        elseif ($ToolName -ceq 'input' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'capabilities') { 'input-capabilities' }
         elseif ($ToolName -ceq 'communityshaders.fsr_color_contract' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status') { 'fsr-colour-status' }
         elseif ($ToolName -ceq 'communityshaders.colour_pipeline_probe' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status') { 'colour-probe-status' } else { $null }
     if ($nativeReadKind) {
@@ -435,6 +662,7 @@ function Get-DevBenchCallSemanticStatus {
         $semantic.explicitOutcomeEvidence = if ($semantic.ok) { @("native-$nativeReadKind-typed-observation") } else { @() }
         if ($nativeReadKind -ceq 'input-capabilities') { $semantic | Add-Member -NotePropertyName qualifiedInputCapabilities -NotePropertyValue $(if ($semantic.ok) { $payload } else { $null }) }
         if ($nativeReadKind -ceq 'colour-probe-status') { $semantic | Add-Member -NotePropertyName qualifiedColourProbeStatus -NotePropertyValue $(if ($semantic.ok) { $payload } else { $null }) }
+        if ($nativeReadKind -ceq 'menu-status') { $semantic | Add-Member -NotePropertyName qualifiedMenuStatus -NotePropertyValue $(if ($semantic.ok) { $payload } else { $null }) }
         $semantic | Add-Member -NotePropertyName completionBasis -NotePropertyValue 'read-schema-only'
         return $semantic
     }
@@ -2235,4 +2463,4 @@ function Get-DevBenchRestMutationFailureDisposition {
     return Get-DevBenchMutationFailureDisposition @PSBoundParameters
 }
 
-Export-ModuleMember -Function Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchWaitDeadlineAcceptance, Get-DevBenchWaitProbeAssessment, Select-DevBenchWaitProbeFailure, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Test-DevBenchExecutableIdentityMatch, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow, Test-DevBenchInitialMcpCapabilityMiss, Test-DevBenchMcpRestFallbackAllowed, Get-DevBenchMutationFailureDisposition, Get-DevBenchRestMutationFailureDisposition
+Export-ModuleMember -Function Get-DevBenchHealthSemanticStatus, Get-DevBenchSemanticStatus, Get-DevBenchCallSemanticStatus, Test-DevBenchReadOnlyRequest, Get-DevBenchServiceState, Test-DevBenchServiceReady, Test-DevBenchWaitDeadlineAcceptance, Get-DevBenchWaitProbeAssessment, Select-DevBenchWaitProbeFailure, Test-DevBenchNoBlockingMenu, Test-DevBenchMainMenuReady, Get-DevBenchMenuDismissalPlan, Get-DevBenchNamedValue, Get-DevBenchResourcePublicationTelemetry, Get-DevBenchRenderScalePreparationTelemetry, Test-DevBenchUpscalingProfileShape, Test-DevBenchUpscalingProfilesEqual, Test-DevBenchUpscalingStable, Get-DevBenchRuntimeExpectations, Test-DevBenchExecutableIdentityMatch, Resolve-DevBenchServiceProbeArguments, Test-DevBenchPerformanceNeutral, Test-DevBenchPerformanceWindow, Test-DevBenchInitialMcpCapabilityMiss, Test-DevBenchMcpRestFallbackAllowed, Get-DevBenchMutationFailureDisposition, Get-DevBenchRestMutationFailureDisposition
