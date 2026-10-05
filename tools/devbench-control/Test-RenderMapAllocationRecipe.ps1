@@ -14,7 +14,8 @@ $recipe=Get-Content -LiteralPath $RecipePath -Raw | ConvertFrom-Json
 $manifest=Get-Content -LiteralPath $BuildManifestPath -Raw | ConvertFrom-Json
 $names=[ordered]@{maxShaderObservations='maximumShaderObservations';maxStageShaderObservations='maximumStageShaderObservations';maxResourceObservations='maximumResourceObservations';maxTargetViewObservations='maximumTargetViewObservations';maxTargetBindingObservations='maximumTargetBindingObservations';maxSceneObjectObservations='maximumSceneObjectObservations';maxGeometryObservations='maximumGeometryObservations';maxMaterialStateObservations='maximumMaterialStateObservations'}
 $defaults=[ordered]@{};foreach($property in $recipe.defaults.PSObject.Properties){$defaults[$property.Name]=$property.Value}
-$defaults.fixedCatalogueBytes=29821088;$defaults.eventStorageUnitBytes=520
+$baseDelta=[long]$recipe.baseBytes-2144
+$defaults.fixedCatalogueBytes=29821088+$baseDelta;$defaults.eventStorageUnitBytes=520
 $limits=[ordered]@{maximumDurationMs=60000;maximumFrames=10000;maximumEvents=65536;maximumScopeDepth=64;maximumBytes=67108864}
 foreach($name in $names.Keys){$limits[$names[$name]]=$recipe.limits.$name}
 $registry=[pscustomobject]@{ok=$true;result=[pscustomobject]@{service='communityshaders.render-map';major=1;producerBuildId=$manifest.buildId;defaults=[pscustomobject]$defaults;limits=[pscustomobject]$limits;eventSelection=[pscustomobject]@{optional=$true};eventKinds=@('draw','eye-submitted','resource-flow')}}
@@ -26,7 +27,7 @@ function Invoke-TestPlan([hashtable]$Changes=@{}) { $args=@{};foreach($key in $b
 $plan=Invoke-TestPlan
 Assert-RecipeTest $plan.ok 'exact recipe candidate admitted offline'
 $receipt=Get-Content $plan.receiptPath -Raw | ConvertFrom-Json
-Assert-RecipeTest ($receipt.fixedCatalogueBytes -eq 40981664 -and $receipt.requiredStorageBytes -eq 58021024 -and $receipt.byteBudgetHeadroom -eq 9087840) 'stage2048 views4096 events32768 exact accounting matches owner recipe'
+Assert-RecipeTest ($receipt.fixedCatalogueBytes -eq (40981664+$baseDelta) -and $receipt.requiredStorageBytes -eq (58021024+$baseDelta) -and $receipt.byteBudgetHeadroom -eq (9087840-$baseDelta)) 'stage2048 views4096 events32768 exact accounting matches owner recipe'
 Assert-RecipeTest ($plan.arguments.maxBytes -eq 67108864 -and $plan.arguments.maxEvents -eq 32768) 'explicit64MiB budget retained without raising event ceiling'
 Assert-RecipeTest ($receipt.allocationEvidence.sourceCommit -ceq $recipe.commit -and $receipt.allocationEvidence.pdbGuid -ceq $recipe.pdbGuid -and $receipt.allocationEvidence.producerBuildId -ceq $manifest.buildId) 'source build PDB identity retained'
 Assert-RecipeTest ($receipt.catalogueStorageBasis -ceq 'exact-owner-source-and-paired-PDB-allocation-recipe') 'recipe admission separated from live allocation proof'
@@ -43,9 +44,9 @@ foreach($case in @('producer','major','fixed-cost','event-unit','default-stage',
     $failed=Invoke-TestPlan @{RegistryPath=(Write-TestJson "registry-$case.json" $changed)}
     Assert-RecipeTest (-not $failed.ok -and $null -eq $failed.arguments) "native $case mismatch or tighter limit refused"
 }
-foreach($case in @('commit','tree','buildKey','pdbGuid','pdbAge','coefficient','base','event','fraction','negative','parse','changed','layout-hash')){
+foreach($case in @('commit','tree','buildKey','pdbGuid','pdbAge','coefficient','base','event','fraction','negative','parse','changed','layout-hash','failed-status','foreign-status','wrong-case')){
     $changed=$recipe|ConvertTo-Json -Depth 30|ConvertFrom-Json
-    switch($case){'commit'{$changed.commit='0'*40};'tree'{$changed.tree='0'*40};'buildKey'{$changed.buildKey='sha256:'+('0'*64)};'pdbGuid'{$changed.pdbGuid=[guid]::NewGuid().ToString()};'pdbAge'{$changed.pdbAge++};'coefficient'{$changed.perCapacityBytes.maxStageShaderObservations++};'base'{$changed.baseBytes++};'event'{$changed.eventStorageUnitBytes++};'fraction'{$changed.perCapacityBytes.maxShaderObservations=1.5};'negative'{$changed.perCapacityBytes.maxShaderObservations=-1};'parse'{$changed.parseErrors=@('error')};'changed'{$changed.sourceChanged=$true};'layout-hash'{$changed.layoutReceipt.sha256='0'*64}}
+    switch($case){'commit'{$changed.commit='0'*40};'tree'{$changed.tree='0'*40};'buildKey'{$changed.buildKey='sha256:'+('0'*64)};'pdbGuid'{$changed.pdbGuid=[guid]::NewGuid().ToString()};'pdbAge'{$changed.pdbAge++};'coefficient'{$changed.perCapacityBytes.maxStageShaderObservations++};'base'{$changed.baseBytes++};'event'{$changed.eventStorageUnitBytes++};'fraction'{$changed.perCapacityBytes.maxShaderObservations=1.5};'negative'{$changed.perCapacityBytes.maxShaderObservations=-1};'parse'{$changed.parseErrors=@('error')};'changed'{$changed.sourceChanged=$true};'layout-hash'{$changed.layoutReceipt.sha256='0'*64};'failed-status'{$changed.status='FAIL'};'foreign-status'{$changed.status='PASS_SOURCE_AND_EXACT_OTHER_PDB_ALLOCATION_RECIPE'};'wrong-case'{$changed.status=$changed.status.ToLowerInvariant()}}
     $path=Write-TestJson "recipe-$case.json" $changed
     $failed=Invoke-TestPlan @{AllocationRecipePath=$path;ExpectedAllocationRecipeSha256=(Get-FileHash $path -Algorithm SHA256).Hash}
     Assert-RecipeTest (-not $failed.ok -and -not $failed.receiptPublished -and $null -eq $failed.arguments) "recipe $case inconsistency fails before publication"
@@ -53,12 +54,12 @@ foreach($case in @('commit','tree','buildKey','pdbGuid','pdbAge','coefficient','
 $events=$workload|ConvertTo-Json -Depth 30|ConvertFrom-Json;$events.expectedEvents=65537
 $failed=Invoke-TestPlan @{WorkloadPath=(Write-TestJson 'too-many-events.json' $events)}
 Assert-RecipeTest (-not $failed.ok -and $null -eq $failed.arguments -and @($failed.exceededCeilings|Where-Object bound -eq 'maxEvents').Count -eq 1) '65536 event ceiling remains absolute'
-$failed=Invoke-TestPlan @{MaxBytes=58021023}
+$failed=Invoke-TestPlan @{MaxBytes=(58021023+$baseDelta)}
 Assert-RecipeTest (-not $failed.ok -and $null -eq $failed.arguments) 'one byte below required storage refused'
 $failed=Invoke-TestPlan @{MaxBytes=67108865}
 Assert-RecipeTest (-not $failed.ok -and $null -eq $failed.arguments) 'one byte beyond registry64MiB refused'
 $minimal=Invoke-TestPlan @{MaxBytes=$null}
-Assert-RecipeTest ($minimal.ok -and $minimal.arguments.maxBytes -eq 58021024) 'omitted budget selects exact required recipe accounting'
+Assert-RecipeTest ($minimal.ok -and $minimal.arguments.maxBytes -eq (58021024+$baseDelta)) 'omitted budget selects exact required recipe accounting'
 foreach($nativeCase in $recipe.cases){
     $caseWorkload=$workload|ConvertTo-Json -Depth 30|ConvertFrom-Json
     $caseWorkload.expectedEvents=$nativeCase.config.maxEvents
@@ -74,9 +75,9 @@ foreach($case in @('source','dirty','artifact')){
     $failed=Invoke-TestPlan @{ProducerBuildManifestPath=$path;ExpectedProducerBuildManifestSha256=(Get-FileHash $path -Algorithm SHA256).Hash}
     Assert-RecipeTest (-not $failed.ok -and $null -eq $failed.arguments) "native manifest $case cannot bind recipe"
 }
-foreach($case in @('record-size','missing-type','duplicate-type')){
+foreach($case in @('record-size','missing-type','duplicate-type','failed-status','mixed-status')){
     $badLayout=Get-Content $LayoutPath -Raw|ConvertFrom-Json
-    switch($case){'record-size'{$badLayout.types[5].bytes++};'missing-type'{$badLayout.types=@($badLayout.types|Where-Object type -cne 'CSX::RenderMap::StageShaderObservationRecord')};'duplicate-type'{$badLayout.types+=@($badLayout.types[0])}}
+    switch($case){'record-size'{$badLayout.types[5].bytes++};'missing-type'{$badLayout.types=@($badLayout.types|Where-Object type -cne 'CSX::RenderMap::StageShaderObservationRecord')};'duplicate-type'{$badLayout.types+=@($badLayout.types[0])};'failed-status'{$badLayout.status='FAIL'};'mixed-status'{$badLayout.status=if($recipe.status -ceq 'PASS_SOURCE_AND_EXACT_AD8_PDB_ALLOCATION_RECIPE'){'PASS_EXACT_F362_PDB_LAYOUT'}else{'PASS_EXACT_AD8_PDB_LAYOUT'}}}
     $path=Write-TestJson "layout-$case.json" $badLayout
     $badRecipe=$recipe|ConvertTo-Json -Depth 30|ConvertFrom-Json;$badRecipe.layoutReceipt.sha256=(Get-FileHash $path -Algorithm SHA256).Hash
     $recipeFixture=Write-TestJson "layout-recipe-$case.json" $badRecipe

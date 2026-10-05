@@ -21,11 +21,19 @@ function Read-RenderMapAllocationEvidence([string]$Path, [string]$ExpectedSha256
 function Get-RenderMapAllocationRecipe($ResolvedRegistry, [string]$RecipePath, [string]$RecipeSha256, [string]$LayoutPath, [string]$ManifestPath, [string]$ManifestSha256) {
     $capture = Read-RenderMapAllocationEvidence $RecipePath $RecipeSha256
     $recipe = $capture.data
-    if ($recipe.status -cne 'PASS_SOURCE_AND_EXACT_PDB_ALLOCATION_RECIPE' -or
+    $expectedLayoutStatus = switch -CaseSensitive ($recipe.status) {
+        'PASS_SOURCE_AND_EXACT_PDB_ALLOCATION_RECIPE' { 'PASS_EXACT_F362_PDB_LAYOUT' }
+        'PASS_SOURCE_AND_EXACT_AD8_PDB_ALLOCATION_RECIPE' {
+            if ($recipe.commit -cne 'ad8c7a2a8cf7dc9295d40dadd3f45da85fec4dd0') { throw 'AD8 receipt marker requires exact qualified AD8 source.' }
+            'PASS_EXACT_AD8_PDB_LAYOUT'
+        }
+        default { throw 'Unsupported allocation recipe qualification status.' }
+    }
+    if ($recipe.status -isnot [string] -or
         $recipe.sourceChanged -isnot [bool] -or $recipe.sourceChanged -or @($recipe.parseErrors).Count -ne 0) { throw 'Allocation recipe does not establish unchanged, parsed source/PDB evidence.' }
     $layoutCapture = Read-RenderMapAllocationEvidence $LayoutPath ([string]$recipe.layoutReceipt.sha256)
     $layout = $layoutCapture.data
-    if ($layout.status -cne 'PASS_EXACT_F362_PDB_LAYOUT' -or $layout.sourceChanged -isnot [bool] -or $layout.sourceChanged -or @($layout.parseErrors).Count -ne 0) { throw 'Allocation layout is not a qualified immutable PDB receipt.' }
+    if ($layout.status -isnot [string] -or $layout.status -cne $expectedLayoutStatus -or $layout.sourceChanged -isnot [bool] -or $layout.sourceChanged -or @($layout.parseErrors).Count -ne 0) { throw 'Allocation layout is not a qualified immutable PDB receipt.' }
     foreach ($field in @('commit','tree','buildKey','pdbGuid')) {
         if ([string]::IsNullOrWhiteSpace([string]$recipe.$field) -or [string]$recipe.$field -cne [string]$layout.$field) { throw "Recipe/PDB identity mismatch: $field" }
     }
