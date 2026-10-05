@@ -207,4 +207,3 @@ function Invoke-DevBenchColourMeasurement {
     return [pscustomobject]@{ok=($errors.Count -eq 0);conditions=@($conditions);captures=@($captures);compilerBoundaries=@($guards);errors=@($errors);indeterminate=($uncertain -or -not $probeCleanup.verified);probeResetVerified=$resetVerified;probeCleanup=$probeCleanup;retainedProbe=$owned;finalRevision=$revision;completionBasis='native-stereo-dispatch-and-ten-owned-pages-not-scientific-colour';nativeCaptureDeadlineSeconds=15;nativeReadbackFrameLimit=120;calibrationOwnedByCaller=$true;qualityAndRenderScaleAdmissionOwnedByCaller=$true}
 }
 Export-ModuleMember -Function Assert-ColourMeasurementPlan,Invoke-DevBenchColourMeasurement
-

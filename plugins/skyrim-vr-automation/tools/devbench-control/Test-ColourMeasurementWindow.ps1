@@ -138,4 +138,3 @@ foreach($name in @('expectedBuildId','expectedRevision','expectedCellFormId','hi
     $bad=$plan.Clone();$bad.Remove($name);$rejected=$false;try{Assert-ColourMeasurementPlan $bad}catch{$rejected=$true};Check $rejected "missing plan$name refuses before mutation"
 }
 [pscustomobject]@{ok=$true;checks=$checks;cases=$cases.Count;scope='offline finite typed engine; no runtime or scientific acceptance'}|ConvertTo-Json -Compress
-
