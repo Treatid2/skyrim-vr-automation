@@ -116,8 +116,25 @@ function Invoke-DevBenchCalendarWindow {
         if($null -ne $ColourPlan){
             $measurement=Invoke-DevBenchColourMeasurement -Plan $ColourPlan -DeadlineUtc $workDeadline -CompilerGuard $CompilerGuard -CleanupDeadlineUtc $DeadlineUtc.AddSeconds(-5) -CleanupCall {
                 param($name,$argsMap,$mutation,$bound)
-                if($name -cne 'communityshaders.colour_pipeline_probe' -or $argsMap.action -cnotin @('status','reset')){throw 'Probe cleanup accepts only native exact status/reset.'}
-                Invoke-WindowCall $name $argsMap $mutation $bound
+                $probeCleanup=$name -ceq 'communityshaders.colour_pipeline_probe' -and $argsMap.action -cin @('status','reset')
+                $colourCleanup=$name -ceq 'communityshaders.fsr_color_contract' -and $argsMap.action -cin @('status','set') -and ($ColourPlan.Contains('burnIn') -or $ColourPlan.Contains('minimumElapsedMillisecondsBetweenCaptureArms'))
+                if(-not $probeCleanup -and -not $colourCleanup){throw 'Cleanup accepts only owned probe status/reset or explicitly timed-workflow AE restoration.'}
+                if($colourCleanup){
+                    # Restore only within the original held scene/session; cell or
+                    # lease drift must not mutate another environment's colour state.
+                    $current=Get-CalendarPayload (Invoke-WindowCall calendar @{action='status'} $false $bound)
+                    Assert-CalendarReadback $current
+                    $currentLease=Assert-CalendarLease $current $Owner $holdId $binding
+                    if($currentLease.id -cne $lease.id -or -not (Test-CalendarBindingEqual $current.binding $binding) -or -not $current.holdValid -or -not $current.leaseActive -or -not $current.outstanding -or $current.expiryDue -or $current.cleanupPending -or $current.values.calendarRate -ne 0){throw 'Original calendar custody unavailable for AE restoration.'}
+                }
+                $cleanupReply=Invoke-WindowCall $name $argsMap $mutation $bound
+                if($colourCleanup){
+                    $current=Get-CalendarPayload (Invoke-WindowCall calendar @{action='status'} $false $bound)
+                    Assert-CalendarReadback $current
+                    $currentLease=Assert-CalendarLease $current $Owner $holdId $binding
+                    if($currentLease.id -cne $lease.id -or -not (Test-CalendarBindingEqual $current.binding $binding) -or -not $current.holdValid -or -not $current.leaseActive -or -not $current.outstanding -or $current.expiryDue -or $current.cleanupPending -or $current.values.calendarRate -ne 0){throw 'Calendar custody changed across original AE restoration.'}
+                }
+                return $cleanupReply
             } -Call {
                 param($name,$argsMap,$mutation,$bound)
                 foreach($side in @('before','after')){

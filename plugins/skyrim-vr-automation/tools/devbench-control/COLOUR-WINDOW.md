@@ -44,11 +44,77 @@ $plan = @{
     -EvidenceDirectory '<new retained evidence directory>' -RequireSuccess
 ```
 
-The plan accepts exactly six top-level fields shown above. Metadata is an object
+The plan requires the six top-level fields shown above. Only the optional
+`burnIn` and `minimumElapsedMillisecondsBetweenCaptureArms` fields below may
+also be supplied. Metadata is an object
 with a nonempty `calibratedScene` string, at most15000 UTF8 bytes before the native
 arm adds its own contract snapshot. Owner metadata slots may contain the
 calibration, tracking, stereo, profile and scene receipts. No arbitrary action,
 script, observation list, tool argument or expected-error override is admitted.
+
+## Optional bounded engineering burn-in and inter-arm spacing
+
+Existing six-field plans retain their dispatch-only settlement behavior. Neither
+that settlement nor the optional coverage below proves internal vendor exposure
+or history convergence. No native rebuild, input setter or hidden convergence
+field is required or inferred.
+
+```powershell
+$timedPlan = $plan | ConvertFrom-Json -AsHashtable
+$timedPlan.burnIn = @{
+    minimumElapsedMilliseconds = 8000
+    minimumObservedCpuFrameIdAdvancePerEye = 180
+    minimumDistinctFreshSuccessfulBothEyeObservations = 6
+    maximumElapsedMilliseconds = 20000
+}
+$timedPlan.minimumElapsedMillisecondsBetweenCaptureArms = 1000
+$timedPlan.capturesPerCondition = 4
+$timedPlanJson = $timedPlan | ConvertTo-Json -Depth 20 -Compress
+# Use this JSON as ColourPlanJson with total TimeoutSeconds180 and hold180000ms.
+```
+
+`burnIn` requires exactly those four positive, actual integer fields. Minimum
+elapsed must be less than maximum elapsed; maximum is at most20000ms. Frame-ID
+advance is at most uint32.MaxValue; fresh-observation count is at most2000.
+Optional inter-arm spacing is an actual integer1..10000ms. Strings, Booleans,
+fractions, nulls, unknown fields and invalid bounds refuse before mutation.
+Either option is independent. No implicit burn-in or spacing is added to old plans.
+
+After each admitted set, the maximum20s budget includes startup dispatch matching.
+Minimum elapsed starts at the first matching stereo observation, conservatively
+after a valid context is observed, using a monotonic clock. Count that baseline
+once, then require both eye CPU frame IDs, dispatch serials and QPCs to advance
+strictly for another distinct sample. Duplicate snapshots, serial-only changes
+and unmatched startup/transient observations are retained but do not count.
+Freshness here means advancement relative to retained successful snapshots, not
+an atomic claim about the engine's current frame. Serial deltas do not reveal
+the number of successfully rendered eye frames; that count stays null.
+
+Every matched sample must retain exact revision/context/flags, both eyes,
+dimensions and configured/effective sharpness. Context/signature or compiler
+drift invalidates coverage rather than restarting it. Preserve original startup,
+burn-in and spacing replies/classification separately in each condition/capture.
+Coverage deadlines never extend the original work budget or its reserved cleanup.
+Incomplete burn-in stops all subsequent arms/conditions; initially matched native
+dispatch remains a distinct fact, not a successful measurement or converged state.
+Captures require CPU-frame/serial/QPC advancement beyond the final burn-in sample.
+
+Spacing is conservative: at least the requested monotonic interval from the
+previous positively qualified arm reply to the next arm intent, across conditions
+as well as within them. This is not synthetic vendor timing. Native captured frame
+and dispatch QPC remain authoritative capture evidence. Fresh compiler/colour and
+calendar guards remain active while waiting; no accepted action is replayed.
+
+The example permits12 captures/120 pages but does not promise they fit worst-case
+native timeouts. All work must fit the original180s total, with its final15s
+reserved for shared cleanup. Thresholds are declared experimental coverage
+choices, not SDK settlement guarantees or statistical significance criteria.
+Experiment owners still evaluate repeatability, drift and calibrated scientific
+postconditions separately. Optional future native input telemetry is not implied
+by this policy; do not infer reset/jitter/frame-time or exposure internals.
+
+Run `Test-ColourTimingCoverage.ps1` for typed/real-clock offline fixtures; no
+live environment, calibration, native history or exposure claim is made by it.
 
 ## Native sequence and guards
 
@@ -125,8 +191,16 @@ Inspect separately: `data.measurement.ok`, each capture's `complete`,
 `data.restorationVerified`, `indeterminate`, and top-level `sessionCleanup`.
 Session deletion is not calendar restoration. Failed measurement with successful
 restoration remains failed. The final autoExposure state is the experiment's
-retained environment; a failed sequence may leave its last accepted state and
-must not silently revert it.
+retained environment. Legacy six-field failed sequences may leave their last
+accepted state and do not silently revert it. Explicit timing plans instead
+request bounded restoration of the original admitted requested AE state, separately
+reported as `colourCleanup`: fresh same-session revision/flags read, at most one
+exact CAS restore if needed, and fresh requested-state readback. This does not
+assert vendor-history convergence or restore an old revision number. Uncertain
+mutations, foreign revision/scene/lease, unresolved probe custody or lost restore
+prevent compensation/replay and remain explicitly unverified. AE/probe cleanup
+shares the original bounded cleanup phase; the final5s remain reserved for calendar
+release/readback. A failed burn-in remains failed even if restoration succeeds.
 
 All source/fixture success is offline. Independent owner live admission remains
 required; scientific colour, headset, pixels, exposure convergence, performance
