@@ -89,6 +89,11 @@ function Get-RenderMapAllocationRecipe($ResolvedRegistry, [string]$RecipePath, [
             if ($recipe.commit -cne 'e03bd1fd4790795f9dd205d9458f34ce96092ca8') { throw 'E03 receipt marker requires exact qualified E03 source.' }
             'VERIFIED_STATIC_NATIVE_PDB_LAYOUT'
         }
+        'PASS_SOURCE_AND_EXACT_217_PDB_ALLOCATION_RECIPE' {
+            if ($recipe.commit -cne '217992d1e29e55a707d6e41c3ca111b2154904fa') { throw '217 receipt marker requires exact qualified 217 source.' }
+            # The same static-native contract/identity guards apply; no parent layout is reused.
+            'VERIFIED_STATIC_NATIVE_PDB_LAYOUT'
+        }
         default { throw 'Unsupported allocation recipe qualification status.' }
     }
     if ($recipe.status -isnot [string] -or

@@ -11,6 +11,7 @@ $passes=[Collections.Generic.List[string]]::new()
 function Assert-RecipeTest([bool]$Condition,[string]$Name) { if (-not $Condition) { throw "FAIL: $Name" }; $passes.Add($Name) }
 function Write-TestJson([string]$Name,$Value) { $path=Join-Path $root $Name; $Value | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $path -Encoding utf8; return $path }
 $recipe=Get-Content -LiteralPath $RecipePath -Raw | ConvertFrom-Json
+$staticNativeRecipe = $recipe.status -cin @('PASS_SOURCE_AND_EXACT_E03_PDB_ALLOCATION_RECIPE','PASS_SOURCE_AND_EXACT_217_PDB_ALLOCATION_RECIPE')
 $manifest=Get-Content -LiteralPath $BuildManifestPath -Raw | ConvertFrom-Json
 $names=[ordered]@{maxShaderObservations='maximumShaderObservations';maxStageShaderObservations='maximumStageShaderObservations';maxResourceObservations='maximumResourceObservations';maxTargetViewObservations='maximumTargetViewObservations';maxTargetBindingObservations='maximumTargetBindingObservations';maxSceneObjectObservations='maximumSceneObjectObservations';maxGeometryObservations='maximumGeometryObservations';maxMaterialStateObservations='maximumMaterialStateObservations'}
 $defaults=[ordered]@{};foreach($property in $recipe.defaults.PSObject.Properties){$defaults[$property.Name]=$property.Value}
@@ -20,7 +21,7 @@ $limits=[ordered]@{maximumDurationMs=60000;maximumFrames=10000;maximumEvents=655
 foreach($name in $names.Keys){$limits[$names[$name]]=$recipe.limits.$name}
 $registry=[pscustomobject]@{ok=$true;result=[pscustomobject]@{service='communityshaders.render-map';major=1;producerBuildId=$manifest.buildId;defaults=[pscustomobject]$defaults;limits=[pscustomobject]$limits;eventSelection=[pscustomobject]@{optional=$true};eventKinds=@('draw','eye-submitted','resource-flow')}}
 $registryPath=Write-TestJson 'registry.json' $registry
-if ($recipe.status -ceq 'PASS_SOURCE_AND_EXACT_E03_PDB_ALLOCATION_RECIPE') {
+if ($staticNativeRecipe) {
     $registry.result | Add-Member -NotePropertyName minor -NotePropertyValue 24
     $registry.result | Add-Member -NotePropertyName schemaRevision -NotePropertyValue 26
     $registryPath=Write-TestJson 'registry-e03.json' $registry
@@ -82,7 +83,7 @@ foreach($case in @('source','dirty','artifact')){
 }
 foreach($case in @('record-size','missing-type','duplicate-type','failed-status','mixed-status')){
     $badLayout=Get-Content $LayoutPath -Raw|ConvertFrom-Json
-    if ($recipe.status -ceq 'PASS_SOURCE_AND_EXACT_E03_PDB_ALLOCATION_RECIPE') {
+    if ($staticNativeRecipe) {
         switch($case) {
             'record-size' { $badLayout.calculation.pdbTypeSizes.'CSX::RenderMap::StageShaderObservationRecord'++ }
             'missing-type' { $badLayout.calculation.pdbTypeSizes.PSObject.Properties.Remove('CSX::RenderMap::StageShaderObservationRecord') }
@@ -100,11 +101,15 @@ foreach($case in @('record-size','missing-type','duplicate-type','failed-status'
     Assert-RecipeTest (-not $failed.ok -and $null -eq $failed.arguments) "PDB $case inconsistency fails before dispatch"
 }
 $overflow=$workload|ConvertTo-Json -Depth 30|ConvertFrom-Json;$overflow.expectedObservations.stageShader=[long]::MaxValue
-if ($recipe.status -ceq 'PASS_SOURCE_AND_EXACT_E03_PDB_ALLOCATION_RECIPE') {
-    foreach($case in @('schema','source-hash','layout-pdb','guid','bool','hash-budget','scope')) {
+if ($staticNativeRecipe) {
+    foreach($case in @('schema','commit','tree','build-key','source-hash','layout-pdb','pdb-age','guid','bool','hash-budget','scope')) {
         $badLayout=Get-Content $LayoutPath -Raw|ConvertFrom-Json
         switch($case) {
             'schema' { $badLayout.schemaVersion='foreign' }
+            'commit' { $badLayout.commit='0'*40 }
+            'tree' { $badLayout.tree='0'*40 }
+            'build-key' { $badLayout.buildKey='sha256:'+('0'*64) }
+            'pdb-age' { $badLayout.pdbIdentity.age++ }
             'source-hash' { $badLayout.sourceHashes.'src/RenderMap/Collector.cpp'='0'*64 }
             'layout-pdb' { $badLayout.pdb.sha256='sha256:'+('0'*64) }
             'guid' { $badLayout.pdbIdentity.guid=[guid]::NewGuid().ToString() }
@@ -129,17 +134,59 @@ if ($recipe.status -ceq 'PASS_SOURCE_AND_EXACT_E03_PDB_ALLOCATION_RECIPE') {
         $failed=Invoke-TestPlan @{RegistryPath=(Write-TestJson "e03-registry-$field-type.json" $changed)}
         Assert-RecipeTest (-not $failed.ok -and $null -eq $failed.arguments) "E03 registry $field string refused"
     }
-    foreach($case in @('native-build','issued-dll','return-hash','return-duplicate')) {
+    foreach($case in @('native-build','issued-dll','issued-pdb','issued-manifest','return-hash','return-duplicate')) {
         $badRecipe=$recipe|ConvertTo-Json -Depth 30|ConvertFrom-Json
         switch($case) {
             'native-build' { $badRecipe.nativeBuildId='0'*64 }
             'issued-dll' { ($badRecipe.issuedArtifacts|Where-Object id -CEQ 'plugin-dll').sha256='sha256:'+('0'*64) }
+            'issued-pdb' { ($badRecipe.issuedArtifacts|Where-Object id -CEQ 'plugin-pdb').sha256='sha256:'+('0'*64) }
+            'issued-manifest' { ($badRecipe.issuedArtifacts|Where-Object id -CEQ 'build-manifest').sha256='sha256:'+('0'*64) }
             'return-hash' { ($badRecipe.verifiedFiles|Where-Object sha256 -CEQ ((Get-Content $LayoutPath -Raw|ConvertFrom-Json).nativeDeliverySha256)).sha256='0'*64 }
             'return-duplicate' { $badRecipe.verifiedFiles+=@($badRecipe.verifiedFiles|Where-Object sha256 -CEQ ((Get-Content $LayoutPath -Raw|ConvertFrom-Json).nativeDeliverySha256)) }
         }
         $path=Write-TestJson "e03-recipe-$case.json" $badRecipe
         $failed=Invoke-TestPlan @{AllocationRecipePath=$path;ExpectedAllocationRecipeSha256=(Get-FileHash $path -Algorithm SHA256).Hash}
         Assert-RecipeTest (-not $failed.ok -and $null -eq $failed.arguments) "E03 recipe $case pairing mismatch refused"
+    }
+    # Re-pin only private fixture copies: a new hash must not waive native identity.
+    foreach($case in @('schema','status','commit','build-key','dll','pdb','manifest','pdb-bytes')) {
+        $badLayout=Get-Content $LayoutPath -Raw|ConvertFrom-Json
+        $badRecipe=$recipe|ConvertTo-Json -Depth 30|ConvertFrom-Json
+        $reference=@($badRecipe.verifiedFiles|Where-Object sha256 -CEQ $badLayout.nativeDeliverySha256)[0]
+        $native=Get-Content $reference.path -Raw|ConvertFrom-Json
+        switch($case) {
+            'schema' { $native.schemaVersion='foreign' }
+            'status' { $native.status='FAIL' }
+            'commit' { $native.commit='0'*40 }
+            'build-key' { $native.buildKey='sha256:'+('0'*64) }
+            'dll' { ($native.files|Where-Object id -CEQ 'plugin-dll').sha256='sha256:'+('0'*64) }
+            'pdb' { ($native.files|Where-Object id -CEQ 'plugin-pdb').sha256='sha256:'+('0'*64) }
+            'manifest' { ($native.files|Where-Object id -CEQ 'build-manifest').sha256='sha256:'+('0'*64) }
+            'pdb-bytes' { ($native.files|Where-Object id -CEQ 'plugin-pdb').bytes++ }
+        }
+        $nativePath=Write-TestJson "native-return-$case.json" $native
+        $reference.path=$nativePath
+        $reference.sha256=(Get-FileHash $nativePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $badLayout.nativeDeliverySha256=$reference.sha256
+        $layoutFixture=Write-TestJson "native-layout-$case.json" $badLayout
+        $badRecipe.layoutReceipt.sha256=(Get-FileHash $layoutFixture -Algorithm SHA256).Hash
+        $recipeFixture=Write-TestJson "native-recipe-$case.json" $badRecipe
+        $failed=Invoke-TestPlan @{AllocationLayoutPath=$layoutFixture;AllocationRecipePath=$recipeFixture;ExpectedAllocationRecipeSha256=(Get-FileHash $recipeFixture -Algorithm SHA256).Hash}
+        Assert-RecipeTest (-not $failed.ok -and -not $failed.receiptPublished -and $null -eq $failed.arguments) "static native return $case refused after private re-pin"
+    }
+    if ($recipe.status -ceq 'PASS_SOURCE_AND_EXACT_217_PDB_ALLOCATION_RECIPE') {
+        foreach($case in @('e03-source','ad8-source','e03-marker','ad8-marker')) {
+            $badRecipe=$recipe|ConvertTo-Json -Depth 30|ConvertFrom-Json
+            switch($case) {
+                'e03-source' { $badRecipe.commit='e03bd1fd4790795f9dd205d9458f34ce96092ca8' }
+                'ad8-source' { $badRecipe.commit='ad8c7a2a8cf7dc9295d40dadd3f45da85fec4dd0' }
+                'e03-marker' { $badRecipe.status='PASS_SOURCE_AND_EXACT_E03_PDB_ALLOCATION_RECIPE' }
+                'ad8-marker' { $badRecipe.status='PASS_SOURCE_AND_EXACT_AD8_PDB_ALLOCATION_RECIPE' }
+            }
+            $path=Write-TestJson "217-$case.json" $badRecipe
+            $failed=Invoke-TestPlan @{AllocationRecipePath=$path;ExpectedAllocationRecipeSha256=(Get-FileHash $path -Algorithm SHA256).Hash}
+            Assert-RecipeTest (-not $failed.ok -and -not $failed.receiptPublished -and $null -eq $failed.arguments) "217 marker/source cross-pair $case refused"
+        }
     }
 }
 $failed=Invoke-TestPlan @{WorkloadPath=(Write-TestJson 'overflow.json' $overflow)}

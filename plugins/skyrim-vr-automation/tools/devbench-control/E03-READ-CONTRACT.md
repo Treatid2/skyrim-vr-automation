@@ -36,3 +36,15 @@ actual transform. Default pose is not experimental calibration. Keep the
 independent required-controller probe, exact installed package/creator
 custody, stable input owner and negotiated DevBench input catalog. No new
 wrapper, provider installation or runtime qualification is implied here.
+
+## Exact 217 successor recipe
+
+The planner also admits PASS_SOURCE_AND_EXACT_217_PDB_ALLOCATION_RECIPE only
+for source 217992d1e29e55a707d6e41c3ca111b2154904fa. It uses the same
+csx.exact-native-pdb-admission-layout.1/VERIFIED_STATIC_NATIVE_PDB_LAYOUT
+adapter and API minor24/schemaRevision26 checks, but requires the successor's
+own pinned recipe, layout, recovered native return and build manifest.
+Neither an E03 marker on 217 source nor a 217 marker on E03/AD8 source is
+accepted. Existing source/tree/build/DLL/PDB pairing, arithmetic and native
+ceilings remain unchanged. No receipt relabelling, parent-layout reuse,
+runtime mutation, successful allocation or capture-completeness claim follows.
