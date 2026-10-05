@@ -1227,7 +1227,7 @@ Assert-Test ($entryPointText -notmatch '(?im)^\s*\$pid\s*=') 'entry point never 
 Assert-Test ($entryPointText -match '\$expectations\.buildId\s+-and\s+\$actualBuildId\s+-and') 'deferred build identity never compares a missing runtime build ID'
 Assert-Test ($entryPointText -match '\$Command -eq ''wait'' -and \$statusCode -eq 404') 'transient MCP 404 recovery is restricted to bounded waits'
 Assert-Test ($entryPointText -match 'full-runtime-rebind-required') 'bounded waits route invalidated MCP sessions through a full runtime rebind'
-Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$RequirePerformanceNeutral\) -and -not \$semantic\.known') 'required semantic outcomes reject unknown responses'
+Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$RequirePerformanceNeutral -or \$RequireCompilerHealthy\) -and -not \$semantic\.known') 'required semantic and compiler outcomes reject unknown responses'
 Assert-Test ($entryPointText -match '\$waitCompletion = Get-DevBenchWaitCompletion -Observation \$observation' -and $entryPointText -match '\$semantic = \$waitCompletion\.semantic') 'wait semantics preserve terminal service failures and qualify ordinary expiry through one completion classifier'
 Assert-Test ($entryPointText -match '-not \$runtimeIdentity\.complete -or -not \$runtimeIdentity\.verified') 'mutation-capable calls require complete and positively verified runtime identity'
 Assert-Test ($entryPointText -match '\[string\]\$ExpectedRuntimeIdentityJson') 'controller accepts an exact prior runtime identity for pre-dispatch continuity'
