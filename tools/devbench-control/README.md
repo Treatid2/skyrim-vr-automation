@@ -335,6 +335,10 @@ initialization cannot downgrade to REST and returns
 `CSX_DEVBENCH_RUNTIME_PATH`; no machine-specific path is compiled into the
 client.
 
+For source-bound native colour-probe sample addressing, see
+[COLOUR-PROBE-COORDINATES.md](COLOUR-PROBE-COORDINATES.md). Sample pixels are
+crop-local; source texture origins do not belong in staging byte offsets.
+
 ```powershell
 .\Invoke-DevBenchControl.ps1 list -RuntimePath 'C:\Path\To\runtime.json'
 .\Invoke-DevBenchControl.ps1 call -Tool 'tool_name' -ArgumentsJson '{}'
