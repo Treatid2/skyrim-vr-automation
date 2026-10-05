@@ -3,13 +3,14 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('list', 'call', 'wait', 'calendar-window')]
+    [ValidateSet('list', 'call', 'wait', 'calendar-window', 'colour-window')]
     [string]$Command = 'list',
     [string]$Tool,
     [string]$ArgumentsJson = '{}',
     [string]$CalendarOwner,
     [ValidateRange(1,300000)][int]$CalendarHoldMilliseconds = 60000,
     [string]$CalendarObservationsJson,
+    [string]$ColourPlanJson,
     [string]$RuntimePath = $env:CSX_DEVBENCH_RUNTIME_PATH,
     [string]$ToolFilter,
     [switch]$NamesOnly,
@@ -80,6 +81,7 @@ $serverTimeoutMilliseconds = $null
 $serverTimeoutDispatchRemainingSeconds = $null
 Import-Module (Join-Path $PSScriptRoot 'DevBenchControl.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'CalendarObservationWindow.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'ColourMeasurementWindow.psm1') -Force
 $script:requestTimeoutSecondsForRpc = $RequestTimeoutSeconds
 
 function Get-ShaderCompilerGuard {
@@ -876,16 +878,24 @@ try {
     $endpoint = "http://127.0.0.1:$([int]$runtime.port)/mcp"
     $arguments = $null
     $calendarObservations = @()
-    if ($Command -eq 'calendar-window') {
+    $colourPlan=$null
+    if ($Command -in @('calendar-window','colour-window')) {
         if ($SkipRuntimeIdentityVerification -or $MaxTransientRetries -ne 0 -or $TimeoutSeconds -lt 20 -or $RequirePerformanceNeutral) { throw 'calendar-window requires identity verification, -MaxTransientRetries 0, at least 20 seconds and no performance-neutrality claim.' }
         if ([string]::IsNullOrWhiteSpace($CalendarOwner) -or $CalendarOwner.Length -gt 128) { throw 'calendar-window requires a bounded explicit CalendarOwner.' }
-        $calendarObservations = @($CalendarObservationsJson | ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop)
-        if ($calendarObservations.Count -lt 1 -or $calendarObservations.Count -gt 16) { throw 'calendar-window requires 1..16 observations.' }
+        if($Command -ceq 'colour-window'){
+            if($TimeoutSeconds -gt 180 -or $CalendarHoldMilliseconds -lt ($TimeoutSeconds*1000) -or [string]::IsNullOrWhiteSpace($EvidenceDirectory) -or -not [string]::IsNullOrWhiteSpace($Tool) -or $argumentsJsonSupplied -or -not [string]::IsNullOrWhiteSpace($CalendarObservationsJson) -or -not [string]::IsNullOrWhiteSpace($ExpectedErrorCode)){throw 'colour-window requires20..180s, hold covering total budget, explicit evidence directory and no generic arguments/observations/error override.'}
+            $colourPlan=$ColourPlanJson|ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop
+            Assert-ColourMeasurementPlan $colourPlan
+        }else{
+            if(-not [string]::IsNullOrWhiteSpace($ColourPlanJson)){throw 'Read-only calendar-window does not accept ColourPlanJson.'}
+            $calendarObservations = @($CalendarObservationsJson | ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop)
+            if ($calendarObservations.Count -lt 1 -or $calendarObservations.Count -gt 16) { throw 'calendar-window requires 1..16 observations.' }
+        }
         foreach ($item in $calendarObservations) {
             if ($item -isnot [Collections.IDictionary] -or $item.Count -ne 2 -or -not $item.Contains('tool') -or -not $item.Contains('arguments') -or $item.tool -isnot [string] -or $item.arguments -isnot [Collections.IDictionary] -or $item.tool -ceq 'calendar' -or -not (Test-DevBenchReadOnlyRequest -ToolName $item.tool -Arguments $item.arguments) -or $item.arguments.Contains('timeoutMs')) { throw 'calendar-window accepts only exact supported non-mutating observation requests; no calendar/save/time/quality/weather mutations.' }
         }
-        $script:invocationRecord.requestMode = 'finite-calendar-hold-with-read-only-observations'
-        $script:invocationRecord.requestedArguments = $CalendarObservationsJson
+        $script:invocationRecord.requestMode = if($colourPlan){'typed-finite-colour-calendar-window'}else{'finite-calendar-hold-with-read-only-observations'}
+        $script:invocationRecord.requestedArguments = if($colourPlan){$ColourPlanJson}else{$CalendarObservationsJson}
         Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord
     }
     if ($Command -eq 'call') {
@@ -916,17 +926,27 @@ try {
     $tools = @()
     $evidencePath = $null
     if ($Command -ne 'wait') {
+        $script:transport='mcp'
         $session = Open-McpSession -Runtime $runtime
         $headers = $session.headers
         $tools = @($session.tools)
         $runtimeIdentity = $session.runtimeIdentity
-        if ($Command -eq 'calendar-window') {
+        if ($Command -in @('calendar-window','colour-window')) {
             if (-not $runtimeIdentity.complete -or -not $runtimeIdentity.verified) { throw 'calendar-window requires complete verified runtime identity.' }
             $calendarTools=@($tools | Where-Object name -CEQ 'calendar')
             if ($calendarTools.Count -ne 1) { throw 'toolSchemaUnresolved: exact calendar is absent.' }
             $schema=$calendarTools[0].inputSchema
             if (@($schema.properties.action.enum).Count -ne 3 -or @($schema.properties.action.enum | Where-Object { $_ -cnotin @('status','hold','release') }).Count -gt 0 -or $schema.properties.holdMs.maximum -ne 300000 -or @($schema.properties.binding.required).Count -ne 5 -or @($schema.oneOf).Count -ne 3) { throw 'toolSchemaUnresolved: current calendar schema cannot establish the native finite ownership contract.' }
             foreach ($item in $calendarObservations) { if (@($tools | Where-Object name -CEQ $item.tool).Count -ne 1) { throw "toolSchemaUnresolved: observation $($item.tool) is absent." } }
+            if($colourPlan){
+                if($runtimeIdentity.build.buildId -cne $colourPlan.expectedBuildId -or [string]::IsNullOrWhiteSpace($runtimeIdentity.process.startTimeUtc)){throw 'Colour plan requires exact verified build/process start identity.'}
+                foreach($pair in @(@('communityshaders.fsr_color_contract',@('status','set')),@('communityshaders.colour_pipeline_probe',@('status','arm','read','reset')))){
+                    $matches=@($tools|Where-Object name -CEQ $pair[0])
+                    if($matches.Count -ne 1 -or $matches[0].inputSchema.additionalProperties -isnot [bool] -or $matches[0].inputSchema.additionalProperties -or @($matches[0].inputSchema.properties.action.enum).Count -ne $pair[1].Count -or @($pair[1]|Where-Object {$_ -cnotin @($matches[0].inputSchema.properties.action.enum)}).Count){throw 'toolSchemaUnresolved: exact finite colour action catalog required.'}
+                }
+                $probeSchema=($tools|Where-Object name -CEQ 'communityshaders.colour_pipeline_probe').inputSchema
+                if(@($probeSchema.properties.stage.enum).Count -ne 5 -or @('fsr_input','fsr_output','combined_main','imagespace_input','imagespace_output'|Where-Object {$_ -cnotin @($probeSchema.properties.stage.enum)}).Count -or @($probeSchema.properties.eye.enum).Count -ne 2 -or 0 -notin @($probeSchema.properties.eye.enum) -or 1 -notin @($probeSchema.properties.eye.enum)){throw 'toolSchemaUnresolved: exact five-stage/two-eye pages required.'}
+            }
         }
         if (-not $SkipRuntimeIdentityVerification) {
             if ($Command -eq 'call' -and -not $readOnlyCall -and -not $runtimeIdentity.complete) {
@@ -941,20 +961,41 @@ try {
         if (-not [string]::IsNullOrWhiteSpace($ToolFilter)) { $tools = @($tools | Where-Object { $_.name -like "*$ToolFilter*" }) }
         $data = if ($NamesOnly) { [pscustomobject][ordered]@{ names = @($tools | ForEach-Object name); count = $tools.Count } } else { [pscustomobject][ordered]@{ tools = $tools } }
     }
-    elseif ($Command -eq 'calendar-window') {
+    elseif ($Command -in @('calendar-window','colour-window')) {
         $calendarSessionId=[string]$headers['Mcp-Session-Id']
         $calendarDeadline=$operationDeadlineUtc
-        $data=Invoke-DevBenchCalendarWindow -Owner $CalendarOwner -Observations $calendarObservations -HoldMilliseconds $CalendarHoldMilliseconds -DeadlineUtc $calendarDeadline -ExpectedProcessId $runtimeIdentity.listenerPid -AssertSession {
+        $colourGuard={
+            param($bound)
+            $script:operationDeadlineUtc=$bound
+            try{
+                $pidNow=Get-ListenerPid ([int]$runtimeIdentity.expectations.port)
+                $processNow=Get-Process -Id $runtimeIdentity.listenerPid -ErrorAction Stop
+                if($pidNow -ne $runtimeIdentity.listenerPid -or $processNow.Path -cne $runtimeIdentity.process.path -or $processNow.StartTime.ToUniversalTime().ToString('o') -cne $runtimeIdentity.process.startTimeUtc){throw 'Colour runtime process/listener changed.'}
+                $guard=Get-ShaderCompilerGuard -Tools $tools -Headers $headers -Identity $runtimeIdentity
+                $rawGuardPath=Join-Path $EvidenceDirectory ('colour-compiler.'+[guid]::NewGuid().ToString('N')+'.json')
+                Write-JsonAtomic -Path $rawGuardPath -Value ([pscustomobject]@{receivedUtc=[datetime]::UtcNow.ToString('o');sessionId=$calendarSessionId;runtimeIdentity=$runtimeIdentity;guard=$guard})
+                $guard|Add-Member -NotePropertyName immutableReceiptPath -NotePropertyValue $rawGuardPath
+                if((Get-ListenerPid ([int]$runtimeIdentity.expectations.port)) -ne $runtimeIdentity.listenerPid -or $processNow.HasExited){throw 'Colour runtime changed during compiler snapshot.'}
+                return $guard
+            }finally{$script:operationDeadlineUtc=$calendarDeadline}
+        }
+        $data=Invoke-DevBenchCalendarWindow -Owner $CalendarOwner -Observations $calendarObservations -ColourPlan $colourPlan -CompilerGuard $colourGuard -HoldMilliseconds $CalendarHoldMilliseconds -DeadlineUtc $calendarDeadline -ExpectedProcessId $runtimeIdentity.listenerPid -AssertSession {
             if ($script:transport -cne 'mcp' -or [string]::IsNullOrWhiteSpace($calendarSessionId) -or [string]$headers['Mcp-Session-Id'] -cne $calendarSessionId) { throw 'Calendar MCP session changed; no rebind/release on a replacement.' }
         } -Call {
             param($name,$argsMap,$mutation,$bound)
             $script:operationDeadlineUtc=$bound
             try {
                 if ($mutation) {
-                    $script:invocationRecord.commandId=[string]$argsMap.commandId
+                    $script:invocationRecord.commandId=if($argsMap.Contains('commandId')){[string]$argsMap.commandId}else{[guid]::NewGuid().ToString('N')}
                     $script:invocationRecord['calendarDispatchArguments']=$argsMap
-                    Invoke-DevBenchTargetDispatch -InvocationRecord $invocationRecord -PersistIntent { Update-InvocationEvidence -State 'dispatching' } -TargetAction { Invoke-ToolRpc -Name $name -Arguments $argsMap -Headers $headers -Mutation }
-                } else { Invoke-ToolRpc -Name $name -Arguments $argsMap -Headers $headers }
+                    $reply=Invoke-DevBenchTargetDispatch -InvocationRecord $invocationRecord -PersistIntent { Update-InvocationEvidence -State 'dispatching' } -TargetAction { Invoke-ToolRpc -Name $name -Arguments $argsMap -Headers $headers -Mutation }
+                } else { $reply=Invoke-ToolRpc -Name $name -Arguments $argsMap -Headers $headers }
+                if($colourPlan){
+                    $rawPath=Join-Path $EvidenceDirectory ('colour-rpc.'+[guid]::NewGuid().ToString('N')+'.json')
+                    Write-JsonAtomic -Path $rawPath -Value ([pscustomobject]@{tool=$name;arguments=$argsMap;mutation=$mutation;receivedUtc=[datetime]::UtcNow.ToString('o');sessionId=$calendarSessionId;runtimeIdentity=$runtimeIdentity;reply=$reply})
+                    $reply|Add-Member -NotePropertyName immutableReceiptPath -NotePropertyValue $rawPath
+                }
+                return $reply
             } finally { $script:operationDeadlineUtc=$calendarDeadline }
         }
         $semantic=[pscustomobject]@{known=$true;ok=$data.ok;outcome='calendar-window';guarded=$false;transient=$false;codes=@();states=@();reasons=@($data.errors);completionBasis=$data.completionBasis}
@@ -1508,7 +1549,7 @@ try {
         $semantic.outcome = 'unverified'
         $semantic.reasons = @($semantic.reasons) + 'A verified semantic outcome was required, but the response did not provide one.'
     }
-    $semanticFailure = if ($Command -in @('call','calendar-window')) {
+    $semanticFailure = if ($Command -in @('call','calendar-window','colour-window')) {
         -not $semantic.known -or -not $semantic.ok
     }
     elseif ($RequireSuccess -or $Command -eq 'wait') {
@@ -1520,7 +1561,7 @@ try {
         ok = -not $semanticFailure
         transportOk = $true
         state = $(if ($semanticFailure) { 'semantic-failed' } else { 'completed' })
-        indeterminate = [bool]($Command -eq 'calendar-window' -and $data.indeterminate)
+        indeterminate = [bool]($Command -in @('calendar-window','colour-window') -and $data.indeterminate)
         dispatchReached = [bool]$dispatch.dispatchReached
         responseDataRetained = [bool]$dispatch.responseDataRetained
         acceptedDataRetained = [bool]$dispatch.acceptedDataRetained

@@ -178,3 +178,4 @@ function Invoke-DevBenchCalendarWindow {
     return [pscustomobject]@{ ok=($errors.Count -eq 0 -and $continuity -and $restorationVerified); continuityVerified=$continuity; restorationVerified=$restorationVerified; indeterminate=$uncertain; measurement=$measurement; owner=$Owner; holdCommandId=$holdId; releaseCommandId=$releaseId; lease=$lease; calls=@($trace); errors=@($errors); completionBasis='bounded-calendar-state-bracket-not-atomic-render'; disconnectRestorationClaimed=$false }
 }
 Export-ModuleMember -Function Invoke-DevBenchCalendarWindow
+

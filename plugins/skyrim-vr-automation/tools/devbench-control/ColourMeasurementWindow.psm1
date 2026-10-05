@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'NativeReadContracts.ps1')
+
+function Assert-ColourMeasurementPlan([Collections.IDictionary]$Plan) {
+    $keys=@('expectedBuildId','expectedRevision','expectedCellFormId','highDynamicRangeInput','capturesPerCondition','metadata')
+    if ($null -eq $Plan -or $Plan.Count -ne $keys.Count -or @($keys | Where-Object {-not $Plan.Contains($_)}).Count) { throw 'Colour plan requires exactly the six documented fields.' }
+    if ($Plan.expectedBuildId -isnot [string] -or $Plan.expectedBuildId -cnotmatch '^[0-9a-f]{64}$' -or $Plan.highDynamicRangeInput -isnot [bool]) { throw 'Colour plan requires exact build and fixed Boolean HDR input.' }
+    foreach($name in @('expectedRevision','expectedCellFormId','capturesPerCondition')) {
+        if ($null -eq $Plan[$name] -or $Plan[$name].GetType() -notin @([int],[long],[uint32],[uint64]) -or $Plan[$name] -lt 1) { throw "Colour plan $name requires a positive integer." }
+    }
+    if ($Plan.capturesPerCondition -gt 4 -or $Plan.expectedCellFormId -gt [uint32]::MaxValue) { throw 'Colour plan exceeds finite capture/cell bounds.' }
+    if ($Plan.metadata -isnot [Collections.IDictionary] -or -not $Plan.metadata.Contains('calibratedScene') -or $Plan.metadata.calibratedScene -isnot [string] -or [string]::IsNullOrWhiteSpace($Plan.metadata.calibratedScene) -or [Text.Encoding]::UTF8.GetByteCount(($Plan.metadata|ConvertTo-Json -Depth 20 -Compress)) -gt 15000) { throw 'Explicit experiment-owner calibratedScene metadata (at most15000 UTF8 bytes) is required.' }
+}
+
+function Invoke-DevBenchColourMeasurement {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][scriptblock]$Call,
+          [Parameter(Mandatory)][scriptblock]$CompilerGuard,
+          [Parameter(Mandatory)][Collections.IDictionary]$Plan,
+          [Parameter(Mandatory)][datetime]$DeadlineUtc,
+          [scriptblock]$CleanupCall,
+          [datetime]$CleanupDeadlineUtc=$DeadlineUtc,
+          [ValidateRange(10,1000)][int]$PollMilliseconds=100)
+    Assert-ColourMeasurementPlan $Plan
+    $colour='communityshaders.fsr_color_contract'; $probe='communityshaders.colour_pipeline_probe'
+    $stages=@('fsr_input','fsr_output','combined_main','imagespace_input','imagespace_output')
+    $captures=[Collections.Generic.List[object]]::new(); $conditions=[Collections.Generic.List[object]]::new()
+    $errors=[Collections.Generic.List[string]]::new(); $guards=[Collections.Generic.List[object]]::new()
+    $revision=$Plan.expectedRevision; $owned=$null; $uncertain=$false; $resetVerified=$true; $mutationPending=$false
+    $probeCleanup=[ordered]@{attempted=$false;verified=$true;errors=[Collections.Generic.List[string]]::new()}
+    function One($Reply,[bool]$AllowNativeFailure=$false) {
+        if ($null -eq $Reply -or @($Reply.content).Count -ne 1 -or $Reply.content[0] -isnot [pscustomobject]) { throw 'Colour action requires exactly one native payload.' }
+        if ($Reply.PSObject.Properties['rawResult'] -and $Reply.rawResult.PSObject.Properties['isError'] -and ($Reply.rawResult.isError -isnot [bool] -or $Reply.rawResult.isError)) { throw 'Native MCP error cannot qualify colour action.' }
+        $p=$Reply.content[0]
+        if (-not $p.PSObject.Properties['producer'] -or $p.producer.component -cne 'CommunityShaders' -or $p.producer.buildId -cne $Plan.expectedBuildId -or (-not $AllowNativeFailure -and $p.PSObject.Properties['error'] -and $null -ne $p.error)) { throw 'Colour action carries foreign producer or native error; raw reply retained.' }
+        return $p
+    }
+    function Guard([datetime]$Bound) {
+        if ([datetime]::UtcNow -ge $Bound) { throw 'Colour work deadline expired.' }
+        $g=& $CompilerGuard $Bound; $guards.Add($g)
+        if ($g.admissible -isnot [bool] -or -not $g.admissible) { throw 'Compiler boundary refused colour measurement.' }
+        return $g
+    }
+    function Status([string]$Name,[datetime]$Bound) {
+        $argsMap=@{action='status';expectedBuildId=$Plan.expectedBuildId}
+        $reply=& $Call $Name $argsMap $false $Bound
+        $p=One $reply
+        $kind=if($Name -ceq $colour){'fsr-colour-status'}else{'colour-probe-status'}
+        if (@(Get-DevBenchNativeReadReasons -Kind $kind -Payload $p -Arguments $argsMap).Count) { throw "Native status schema failed: $Name." }
+        return $p
+    }
+    function Assert-Revision($Status,[uint64]$Revision,[bool]$AutoExposure) {
+        if ($Status.requested.revision -ne $Revision -or $Status.requested.highDynamicRangeInput -cne $Plan.highDynamicRangeInput -or $Status.requested.autoExposure -cne $AutoExposure -or $Status.sourceColorContractChanged) { throw 'Colour request revision/flags/source contract changed.' }
+    }
+    function Settled($Status,[uint64]$Revision,[bool]$AutoExposure) {
+        Assert-Revision $Status $Revision $AutoExposure
+        $c=$Status.runtimeContext
+        if (-not $c.valid -or $c.highDynamicRangeInput -cne $Plan.highDynamicRangeInput -or $c.autoExposure -cne $AutoExposure) { return $false }
+        $a=$Status.lastSuccessfulEyeDispatches[0]; $b=$Status.lastSuccessfulEyeDispatches[1]
+        foreach($eye in 0,1) {
+            $d=$Status.lastSuccessfulEyeDispatches[$eye]
+            if (-not $d.valid) { return $false }
+            if ($d.path -ne 3 -or $d.contextIndex -ne $eye -or $d.contextGeneration -ne $c.generation -or $d.highDynamicRangeInput -cne $Plan.highDynamicRangeInput -or $d.autoExposure -cne $AutoExposure -or $d.exposureResourceBound -or $d.preExposure -ne 1) { throw 'Successful eye dispatch mismatches FSR4 context/flags/eye.' }
+        }
+        foreach($field in @('frame','contextGeneration','path','renderWidth','renderHeight','displayWidth','displayHeight','configuredSharpnessAtDispatch','effectiveSharpness','sharpeningEnabled')) { if($a.$field -cne $b.$field) { throw "Successful eyes disagree: $field." } }
+        if ($a.serial -ge $b.serial -or $a.dispatchQpc -gt $b.dispatchQpc -or $Status.lastSuccessfulDispatch.serial -ne $b.serial) { throw 'Successful stereo dispatch ordering mismatch.' }
+        return $true
+    }
+    function Assert-ProbeOwner($Status,$Owned) {
+        if ($Status.captureId -cne $Owned.captureId -or $Status.generation -ne $Owned.generation -or $Status.expectedColourContractRevision -ne $revision) { throw 'Probe capture/generation/revision changed; no foreign adoption.' }
+    }
+    try {
+        $null=Guard $DeadlineUtc
+        $initial=Status $colour $DeadlineUtc
+        if ($initial.requested.revision -ne $revision -or $initial.requested.highDynamicRangeInput -cne $Plan.highDynamicRangeInput) { throw 'Initial colour revision/fixed HDR mismatch.' }
+        $idle=Status $probe $DeadlineUtc
+        if ($idle.state -cne 'idle') { throw 'Existing probe custody is not ours; refusing arm/reset.' }
+        foreach($auto in @($true,$false,$true)) {
+            $condition=[ordered]@{autoExposure=$auto;setAttempted=$false;setAccepted=$false;setReply=$null;settled=$null;complete=$false}
+            $conditions.Add($condition)
+            $pre=Guard $DeadlineUtc
+            $condition.setAttempted=$true
+            $mutationPending=$true
+            $condition.setReply=& $Call $colour @{action='set';expectedBuildId=$Plan.expectedBuildId;expectedRevision=$revision;highDynamicRangeInput=$Plan.highDynamicRangeInput;autoExposure=$auto} $true $DeadlineUtc
+            $set=One $condition.setReply
+            if ($set.accepted -isnot [bool] -or -not $set.accepted) { throw 'Colour set did not carry positive native CAS acceptance.' }
+            $condition.setAccepted=$true
+            $mutationPending=$false
+            $next=$revision+$(if($initial.requested.autoExposure -cne $auto){1}else{0})
+            if ($set.resultingRevision -ne $next -or $set.requested.revision -ne $next) { throw 'Colour set resulting revision violates exact CAS transition.' }
+            $revision=$next
+            Assert-Revision $set $revision $auto
+            $post=Guard $DeadlineUtc
+            if (-not (Test-DevBenchShaderCompilerWindow -Before $pre.health -After $post.health).valid) { throw 'Compiler changed across accepted colour set; no replay.' }
+            do {
+                $s=Status $colour $DeadlineUtc
+                $settled=Settled $s $revision $auto
+                if(-not $settled){Start-Sleep -Milliseconds ([Math]::Min($PollMilliseconds,[Math]::Max(0,($DeadlineUtc-[datetime]::UtcNow).TotalMilliseconds)))}
+            } while(-not $settled -and [datetime]::UtcNow -lt $DeadlineUtc)
+            if(-not $settled -or [datetime]::UtcNow -ge $DeadlineUtc){throw 'Stereo dispatch settlement deadline expired.'}
+            $condition.settled=$s
+            for($iteration=0;$iteration -lt $Plan.capturesPerCondition;$iteration++) {
+                $record=[ordered]@{autoExposure=$auto;iteration=$iteration;revision=$revision;captureId=[guid]::NewGuid().ToString('N');generation=$null;armReply=$null;status=$null;pages=[Collections.Generic.List[object]]::new();complete=$false;resetVerified=$false;resetAttempted=$false}
+                $captures.Add($record)
+                $before=Guard $DeadlineUtc
+                $current=Status $colour $DeadlineUtc
+                if(-not (Settled $current $revision $auto) -or $current.runtimeContext.generation -ne $s.runtimeContext.generation){throw 'Settled context changed before arm.'}
+                $captureBound=[datetime]::UtcNow.AddSeconds(15)
+                if($captureBound -gt $DeadlineUtc){$captureBound=$DeadlineUtc}
+                $mutationPending=$true
+                $record.armReply=& $Call $probe @{action='arm';expectedBuildId=$Plan.expectedBuildId;expectedRevision=$revision;captureId=$record.captureId;metadata=$Plan.metadata} $true $captureBound
+                $arm=One $record.armReply
+                if($arm.action -cne 'arm' -or $arm.accepted -isnot [bool] -or -not $arm.accepted -or $arm.captureId -cne $record.captureId -or $null -eq $arm.generation -or $arm.generation.GetType() -notin @([int],[long],[uint32],[uint64]) -or $arm.generation -le 0){throw 'Probe arm acceptance/identity unproven; no replay or foreign reset.'}
+                $record.generation=$arm.generation; $owned=$record; $resetVerified=$false
+                $mutationPending=$false
+                do {
+                    $p=Status $probe $captureBound; Assert-ProbeOwner $p $owned; $record.status=$p
+                    if($p.state -cnotin @('armed','capturing','readback_pending','complete')){throw 'Probe failed or lost custody.'}
+                    $current=Status $colour $captureBound
+                    if(-not (Settled $current $revision $auto) -or $current.runtimeContext.generation -ne $s.runtimeContext.generation){throw 'Colour context/eyes changed during capture.'}
+                    if($p.state -cne 'complete'){Start-Sleep -Milliseconds ([Math]::Min($PollMilliseconds,[Math]::Max(0,($captureBound-[datetime]::UtcNow).TotalMilliseconds)))}
+                } while($p.state -cne 'complete' -and [datetime]::UtcNow -lt $captureBound)
+                if($p.state -cne 'complete' -or [datetime]::UtcNow -ge $captureBound){throw 'Native fifteen-second capture/readback deadline expired; partial capture retained.'}
+                $context=$null; $eyeDispatch=@{}
+                foreach($stage in $stages){foreach($eye in 0,1){
+                    $page=One (& $Call $probe @{action='read';expectedBuildId=$Plan.expectedBuildId;captureId=$owned.captureId;generation=$owned.generation;stage=$stage;eye=$eye} $false $captureBound)
+                    $record.pages.Add($page)
+                    if($page.schema -cne 'csx-colour-pipeline-probe-v3' -or $page.captureId -cne $owned.captureId -or $page.generation -ne $owned.generation -or $page.state -cne 'complete' -or $page.frame.cpuFrame -ne $p.cpuFrame -or $page.frame.eye -cne 'both' -or $page.frame.eyeMask -ne 3 -or $null -ne $page.frame.sceneEpoch -or $null -ne $page.frame.submissionEpoch -or @($page.stages).Count -ne 1){throw 'Capture page schema/identity/frame/epochs mismatch.'}
+                    $slot=$page.stages[0]; $d=$page.dispatch
+                    if($page.metadata.calibratedScene -cne $Plan.metadata.calibratedScene){throw 'Owner calibration metadata differs from the arm request.'}
+                    if($slot.stage -cne $stage -or $slot.eye -cne @('left','right')[$eye] -or $slot.eyeMask -ne (1 -shl $eye) -or $slot.queued -isnot [bool] -or -not $slot.queued -or $slot.mapped -isnot [bool] -or -not $slot.mapped -or $slot.frame.cpuFrame -ne $p.cpuFrame){throw 'Capture page is incomplete or wrong stage/eye.'}
+                    if($page.immediateContext.kind -cne 'immediate' -or $page.immediateContext.pointer -isnot [string] -or $page.immediateContext.pointer -notmatch '^0x[0-9a-fA-F]+$' -or $page.immediateContext.pointer -match '^0x0+$'){throw 'Capture immediate context is unproven.'}
+                    if($null -eq $context){$context=$page.immediateContext.pointer}else{if($context -cne $page.immediateContext.pointer){throw 'Capture pages changed immediate context.'}}
+                    if($d.attribution -cne 'observed-successful-dispatch' -or $d.colourContractRevision -ne $revision -or $d.contextGeneration -ne $s.runtimeContext.generation -or $d.contextIndex -ne $eye -or $d.path -ne 3 -or $d.frame -ne $p.cpuFrame -or $d.requestedHighDynamicRangeInput -cne $Plan.highDynamicRangeInput -or $d.effectiveHighDynamicRangeInput -cne $Plan.highDynamicRangeInput -or $d.requestedAutoExposure -cne $auto -or $d.effectiveAutoExposure -cne $auto -or $d.dispatchSerial -le 0){throw 'Page lacks matching actual successful eye dispatch.'}
+                    $dispatchKey=$d|ConvertTo-Json -Depth 8 -Compress
+                    if($eyeDispatch.ContainsKey($eye)){if($eyeDispatch[$eye] -cne $dispatchKey){throw 'Stage pages disagree on eye dispatch.'}}else{$eyeDispatch[$eye]=$dispatchKey}
+                    if(($slot.dispatch|ConvertTo-Json -Depth 8 -Compress) -cne $dispatchKey -or $slot.readback.map.succeeded -isnot [bool] -or -not $slot.readback.map.succeeded -or $slot.readback.map.matchedMap -isnot [bool] -or -not $slot.readback.map.matchedMap -or $slot.readback.map.readable -isnot [bool] -or -not $slot.readback.map.readable -or $slot.readback.sampling.transferConversion -cne 'none' -or @($slot.readback.sampling.samples).Count -ne $slot.readback.sampling.sampleCount){throw 'Raw sample readback/dispatch completeness unproven.'}
+                    $sampling=$slot.readback.sampling
+                    if($sampling.gridSize -ne 17 -or $sampling.sampleCount -ne 289 -or $page.samplingContract.gridSize -ne 17 -or $page.samplingContract.rawBytesRetainedPerSample -isnot [bool] -or -not $page.samplingContract.rawBytesRetainedPerSample -or $page.samplingContract.implicitTransferConversion -isnot [bool] -or $page.samplingContract.implicitTransferConversion){throw 'Native17x17 lossless sampling contract unproven.'}
+                    for($sampleIndex=0;$sampleIndex -lt 289;$sampleIndex++){
+                        $sample=$sampling.samples[$sampleIndex]
+                        if(@($sample.grid).Count -ne 2 -or $sample.grid[0] -ne ($sampleIndex%17) -or $sample.grid[1] -ne [int][Math]::Floor($sampleIndex/17) -or $sample.rawLittleEndianHex -isnot [string] -or $sample.rawLittleEndianHex -notmatch '^[0-9a-fA-F]{2,32}$' -or ($sample.rawLittleEndianHex.Length%2) -ne 0 -or -not $sample.PSObject.Properties['decodedRgba']){throw 'Raw sample inventory/bytes incomplete.'}
+                        if($null -ne $sample.decodedRgba){if(@($sample.decodedRgba).Count -ne 4 -or @($sample.decodedRgba|Where-Object {$null -eq $_ -or $_.GetType() -notin @([int],[long],[double],[single],[decimal],[uint32],[uint64]) -or -not [double]::IsFinite([double]$_)}).Count){throw 'Decoded sample is malformed; no implicit transfer conversion.'}}
+                    }
+                }}
+                $after=Guard $captureBound
+                if(-not (Test-DevBenchShaderCompilerWindow -Before $before.health -After $after.health).valid){throw 'Compiler boundary changed across capture; pages remain diagnostic.'}
+                $current=Status $colour $captureBound
+                if(-not (Settled $current $revision $auto) -or $current.runtimeContext.generation -ne $s.runtimeContext.generation){throw 'Colour context changed after pages.'}
+                $record.complete=$true
+                $mutationPending=$true
+                $record.resetAttempted=$true
+                $reset=One (& $Call $probe @{action='reset';expectedBuildId=$Plan.expectedBuildId;captureId=$owned.captureId;generation=$owned.generation} $true $DeadlineUtc)
+                if($reset.action -cne 'reset' -or $reset.accepted -isnot [bool] -or -not $reset.accepted -or $reset.captureId -cne $owned.captureId -or $reset.generation -ne ($owned.generation+1)){throw 'Exact owned probe reset unverified; no retry.'}
+                $idle=Status $probe $DeadlineUtc
+                if($idle.state -cne 'idle' -or $idle.generation -ne $reset.generation){throw 'Fresh probe reset readback failed.'}
+                $resetVerified=$true; $record.resetVerified=$true; $owned=$null
+                $mutationPending=$false
+            }
+            $condition.complete=$true; $initial=$s
+        }
+    } catch { $errors.Add($_.Exception.Message); $uncertain=$mutationPending -or @($conditions | Where-Object {$_.setAttempted -and -not $_.setAccepted}).Count -gt 0 }
+    finally {
+        # Evidence is already retained before cleanup. Never repeat reset after
+        # an attempted/lost reset and never adopt a foreign or unproven arm.
+        if($null -ne $owned -and $null -ne $CleanupCall){
+            $probeCleanup.attempted=$true;$probeCleanup.verified=$false
+            try{
+                if(-not $owned.resetAttempted){
+                    do{
+                        $status=One (& $CleanupCall $probe @{action='status';expectedBuildId=$Plan.expectedBuildId} $false $CleanupDeadlineUtc) $true
+                        Assert-ProbeOwner $status $owned
+                        if($status.state -cin @('armed','capturing','readback_pending')){Start-Sleep -Milliseconds ([Math]::Min(100,[Math]::Max(0,($CleanupDeadlineUtc-[datetime]::UtcNow).TotalMilliseconds)))}
+                    }while($status.state -cin @('armed','capturing','readback_pending') -and [datetime]::UtcNow -lt $CleanupDeadlineUtc)
+                    if($status.state -cnotin @('complete','failed') -or [datetime]::UtcNow -ge $CleanupDeadlineUtc){throw 'Native probe remains active; no forbidden reset, bounded cleanup unverified.'}
+                    $owned.resetAttempted=$true
+                    $reset=One (& $CleanupCall $probe @{action='reset';expectedBuildId=$Plan.expectedBuildId;captureId=$owned.captureId;generation=$owned.generation} $true $CleanupDeadlineUtc)
+                    if($reset.action -cne 'reset' -or $reset.accepted -isnot [bool] -or -not $reset.accepted -or $reset.captureId -cne $owned.captureId -or $reset.generation -ne ($owned.generation+1)){throw 'Owned failure cleanup reset unverified.'}
+                }
+                $status=One (& $CleanupCall $probe @{action='status';expectedBuildId=$Plan.expectedBuildId} $false $CleanupDeadlineUtc)
+                if($status.state -cne 'idle' -or $status.generation -ne ($owned.generation+1) -or $status.captureId -cne ''){throw 'Owned probe cleanup fresh idle readback unverified.'}
+                $probeCleanup.verified=$true;$resetVerified=$true;$owned.resetVerified=$true
+            }catch{$probeCleanup.errors.Add($_.Exception.Message)}
+        }elseif($null -ne $owned -or $mutationPending){$probeCleanup.verified=$false}
+    }
+    return [pscustomobject]@{ok=($errors.Count -eq 0);conditions=@($conditions);captures=@($captures);compilerBoundaries=@($guards);errors=@($errors);indeterminate=($uncertain -or -not $probeCleanup.verified);probeResetVerified=$resetVerified;probeCleanup=$probeCleanup;retainedProbe=$owned;finalRevision=$revision;completionBasis='native-stereo-dispatch-and-ten-owned-pages-not-scientific-colour';nativeCaptureDeadlineSeconds=15;nativeReadbackFrameLimit=120;calibrationOwnedByCaller=$true;qualityAndRenderScaleAdmissionOwnedByCaller=$true}
+}
+Export-ModuleMember -Function Assert-ColourMeasurementPlan,Invoke-DevBenchColourMeasurement
+

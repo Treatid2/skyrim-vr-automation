@@ -1,5 +1,16 @@
 # DevBench Control
 
+## Typed finite colour measurement
+
+Use `colour-window` only for the separate finite FSR autoExposure on/off/on
+experiment described in [COLOUR-WINDOW.md](COLOUR-WINDOW.md). It retains one MCP
+session and native calendar custody, fixed HDR input, exact revision/build CAS,
+successful per-eye FSR4 dispatch settlement and ten owned stage-eye pages per
+capture. Compiler/identity/partial-capture/calendar/probe/session cleanup outcomes
+remain distinct. This does not broaden the read-only `calendar-window` allowlist,
+set quality or render scale, take ownership from the live experiment, or qualify
+scientific colour. No mutation replay or second transport lane is permitted.
+
 ## Bounded compiler readiness after an accepted load
 
 `playerLoaded` proves the current loaded cell, not compiler initialization.

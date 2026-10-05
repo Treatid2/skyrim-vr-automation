@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "owner": "Mapping retained native status; Auto-Tools derived fixture",
+  "sourceCommit": "f3623871660d0d5073957458daeb8055dddc40ce",
+  "sourceBlobs": {
+    "src/Api/ColourPipelineProbeDevBenchBridge.cpp": "c1a96656770163b2964b3743abc2fcea5db5facc",
+    "src/Features/Upscaling/ColourPipelineProbe.cpp": "bc73bcaffa8fa5f77b0f92c9c2497cd00d9f7cce",
+    "src/Features/Upscaling/ColourPipelineProbePolicy.h": "008e2280a1a86b1b87c7aac5ac99b62750a67666"
+  },
+  "sourceReceipt": {
+    "name": "mapping-rsoff-colour-probe-status-20261004-0315-001/stdout.log",
+    "bytes": 12925,
+    "sha256": "ffb30a099b7400d2a7fd4a462b543040999bb66645dd7e1fd9df1e4fe6895a69",
+    "timestampUtc": "2026-10-04T02:51:26.7366972Z"
+  },
+  "fixture": "native-colour-probe-status.v3.json",
+  "representation": "JSON data.content[0] only; key/type/value semantics preserved; no machine paths in selected payload",
+  "accessMode": "read-only retained receipt and immutable Git source inspection; no runtime calls",
+  "sourceChangedDuringInspection": false,
+  "parseErrors": [],
+  "boundaries": "Schema3 status only; no capture page, arm/reset result, scientific admission or runtime artifact qualification"
+}
+
+
