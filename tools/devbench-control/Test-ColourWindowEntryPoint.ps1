@@ -79,7 +79,9 @@ foreach($mode in @('healthy','partial-page','compiler','schema-missing','lost-ar
     try{
         $fixture=& (Join-Path $PSScriptRoot 'Test-ColourMeasurementWindow.ps1') -FixtureOnly
         $plan=$fixture.Plan;$plan.capturesPerCondition=1
-        if($mode -ceq 'burnin-incomplete'){$plan.burnIn=@{minimumElapsedMilliseconds=10;minimumObservedCpuFrameIdAdvancePerEye=1;minimumDistinctFreshSuccessfulBothEyeObservations=2;maximumElapsedMilliseconds=300}}
+        # The real public transport refuses to start an RPC with less than1s
+        # remaining; allow startup matching, then reject stagnant frame evidence.
+        if($mode -ceq 'burnin-incomplete'){$plan.burnIn=@{minimumElapsedMilliseconds=10;minimumObservedCpuFrameIdAdvancePerEye=1;minimumDistinctFreshSuccessfulBothEyeObservations=2;maximumElapsedMilliseconds=4000}}
         $artifact=Join-Path $PSScriptRoot 'Test-ColourWindowEntryPoint.ps1'
         $runtime=Join-Path $dir 'runtime.json';@{port=$port;pid=$PID;buildId=$plan.expectedBuildId;artifactPath=$artifact;artifactSha256=(Get-FileHash $artifact).Hash}|ConvertTo-Json|Set-Content -LiteralPath $runtime
         $reply=& (Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1') colour-window -RuntimePath $runtime -ColourPlanJson ($plan|ConvertTo-Json -Depth 20 -Compress) -CalendarOwner fixture-owner -CalendarHoldMilliseconds 30000 -TimeoutSeconds 30 -MaxTransientRetries 0 -EvidenceDirectory $dir -NoExit -Compact|ConvertFrom-Json -Depth 80
