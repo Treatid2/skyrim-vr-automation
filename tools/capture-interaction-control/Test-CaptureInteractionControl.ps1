@@ -172,7 +172,9 @@ if ($Tool -eq 'communityshaders.screenshot') {
       $capture=Get-Content -LiteralPath (Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'native-capture-command.json') -Raw | ConvertFrom-Json -Depth 80
       $queryCount=@(Get-Content -LiteralPath (Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'calls.log') | Where-Object {$_ -ceq 'communityshaders.screenshot/request_get'}).Count
       $stateFile=if($queryCount -eq [int]$env:CAPTURE_INTERACTION_NATIVE_FIRST_QUERY){'native-screenshot-encoding.json'}else{'native-screenshot-completed.json'}
+      if ($env:CAPTURE_INTERACTION_NATIVE_SCHEMA2 -eq '1' -and $stateFile -ceq 'native-screenshot-completed.json') { $stateFile='native-screenshot-schema2-completed.json' }
       $value=Get-Content -LiteralPath (Join-Path $env:CAPTURE_INTERACTION_SCREENSHOT_FIXTURES $stateFile) -Raw | ConvertFrom-Json -Depth 80
+      if ($env:CAPTURE_INTERACTION_NATIVE_SCHEMA2 -eq '1') { $value.contract.minor=1; $value.contract.schemaRevision=2 }
       $value.command.action='request_get';$value.command.clientId=$argsObject.clientId;$value.command.commandId=$argsObject.commandId
       $value.server.buildId=$buildId;$value.result.requestId=$argsObject.requestId
       $value.result.clientId=$capture.clientId;$value.result.commandId=$capture.commandId
@@ -260,14 +262,17 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     Assert-Test $guardedAct.ok 'named input action forwards persisted artifact/build expectations under the same identity guard'
     $demandStop = & $entry stop -SessionDirectory $demandSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test $demandStop.ok 'on-demand stop forwards accepting expectations without bootstrap flags repeated'
-    $nativeSession=Join-Path $root 'native-demand-session'
+    foreach ($nativeSchema in @(1,2)) {
+    $env:CAPTURE_INTERACTION_NATIVE_SCHEMA2=$(if ($nativeSchema -eq 2) {'1'} else {'0'})
+    $nativeSession=Join-Path $root "native-demand-session-schema$nativeSchema"
     $nativeStart=& $entry start -SessionDirectory $nativeSession -RuntimePath $runtime -VisualMode on-demand -DevBenchScriptPath $fake @bootstrap -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test $nativeStart.ok 'native request fixture session uses exact persisted bootstrap expectations'
     $callsBefore=@(Get-Content -LiteralPath (Join-Path $root 'calls.log'))
     $env:CAPTURE_INTERACTION_NATIVE_REQUEST='1'
     $env:CAPTURE_INTERACTION_NATIVE_FIRST_QUERY=[string](@($callsBefore | Where-Object {$_ -ceq 'communityshaders.screenshot/request_get'}).Count+1)
     $nativeObserve=& $entry observe -SessionDirectory $nativeSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
-    Assert-Test ($nativeObserve.ok -and $null -eq $nativeObserve.data.observation.screenshot.error -and $nativeObserve.data.observation.screenshot.receipt.terminal -and $nativeObserve.data.observation.screenshot.receipt.requestSucceeded -and $nativeObserve.data.observation.frameSubmission.engineFrame -eq 159016 -and $nativeObserve.data.observation.frameSubmission.view -ceq 'left_eye') 'native encoding then completed reads produce owned qualified nested-artifact frame through SessionDirectory-only orchestration'
+    Assert-Test ($nativeObserve.ok -and $null -eq $nativeObserve.data.observation.screenshot.error -and $nativeObserve.data.observation.screenshot.receipt.terminal -and $nativeObserve.data.observation.screenshot.receipt.requestSucceeded -and $nativeObserve.data.observation.frameSubmission.engineFrame -eq $(if ($nativeSchema -eq 2) {24867} else {159016}) -and $nativeObserve.data.observation.frameSubmission.view -ceq 'left_eye') 'native encoding then completed reads produce owned qualified nested-artifact frame through SessionDirectory-only orchestration'
+    Assert-Test ($nativeObserve.data.observation.screenshot.receipt.nativeContract.schemaRevision -eq $nativeSchema) 'interaction retains exact admitted native schema revision'
     $newCalls=@(Get-Content -LiteralPath (Join-Path $root 'calls.log')) | Select-Object -Skip $callsBefore.Count
     Assert-Test (@($newCalls|Where-Object {$_ -ceq 'communityshaders.screenshot/capture'}).Count -eq 1 -and @($newCalls|Where-Object {$_ -ceq 'communityshaders.screenshot/request_get'}).Count -eq 2) 'one capture dispatch; exact owner read reconciliation never replays the mutation'
     $env:CAPTURE_INTERACTION_NATIVE_FAILURE='1'
@@ -281,6 +286,8 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     Remove-Item Env:CAPTURE_INTERACTION_NATIVE_REQUEST
     $nativeStop=& $entry stop -SessionDirectory $nativeSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test $nativeStop.ok 'native still session finalizes recording and input without screenshot replay'
+    }
+    Remove-Item Env:CAPTURE_INTERACTION_NATIVE_SCHEMA2
     $bootstrapStop = & $entry stop -SessionDirectory $bootstrapSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test ($bootstrapStop.ok) 'later stop uses persisted accepting identity without requiring bootstrap arguments again'
     Remove-Item Env:CAPTURE_INTERACTION_REQUIRE_BOOTSTRAP
@@ -437,6 +444,7 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     [pscustomobject]@{ ok=$true; sessionPath=$started.data.statePath; actionCount=(Get-CaptureInteractionActionCatalog).actions.Count } | ConvertTo-Json -Compress
 }
 finally {
+    Remove-Item Env:CAPTURE_INTERACTION_NATIVE_SCHEMA2 -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_NATIVE_REQUEST -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_NATIVE_FAILURE -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_NATIVE_FOREIGN_COMMAND -ErrorAction SilentlyContinue

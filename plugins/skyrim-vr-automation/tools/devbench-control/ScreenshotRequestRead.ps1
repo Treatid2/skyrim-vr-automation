@@ -18,7 +18,11 @@ function Get-DevBenchNativeScreenshotRequest {
     Check ($Payload -is [pscustomobject]) 'one structured native payload'
     $contract=Field $Payload 'contract'; $command=Field $Payload 'command'; $server=Field $Payload 'server'; $receipt=Field $Payload 'result'
     Check ((Field $Payload 'ok') -is [bool] -and (Field $Payload 'ok')) 'outer ok Boolean true'
-    Check ((Exact (Field $contract 'name') 'csx.screenshot') -and (UInt (Field $contract 'major') 1 1) -and (UInt (Field $contract 'minor') 0) -and (UInt (Field $contract 'schemaRevision') 1 1)) 'csx.screenshot contract1.0/schemaRevision1'
+    # e03's 1.1/schema2 adds sequence I/O lanes; MakeReceipt's still contract is
+    # unchanged. Admit only these source-verified pairs, never arbitrary minors.
+    $minor=Field $contract 'minor'; $revision=Field $contract 'schemaRevision'
+    $supportedPair=((UInt $minor 0) -and (UInt $revision 1 1)) -or ((UInt $minor 1 1) -and (UInt $revision 2 2))
+    Check ((Exact (Field $contract 'name') 'csx.screenshot') -and (UInt (Field $contract 'major') 1 1) -and $supportedPair) 'csx.screenshot contract1.0/schemaRevision1 or contract1.1/schemaRevision2'
     Check ($receipt -is [pscustomobject]) 'result'
     foreach($name in @('clientId','commandId')){Check ($Arguments.Contains($name) -and (Text $Arguments[$name]) -and (Field $command $name) -is [string] -and (Field $command $name) -ceq $Arguments[$name]) "query command.$name binding"}
     Check ((Exact (Field $command 'action') 'request_get') -and $Arguments.Contains('contractMajor') -and (UInt $Arguments['contractMajor'] 1 1)) 'exact request_get command/major'
@@ -108,6 +112,7 @@ function Get-DevBenchNativeScreenshotRequest {
     }
     if($reasons.Count -eq 0){
         $projection=$receipt|ConvertTo-Json -Depth 80|ConvertFrom-Json -Depth 80
+        $projection|Add-Member nativeContract ($contract|ConvertTo-Json -Depth 10|ConvertFrom-Json -Depth 10) -Force
         $projection|Add-Member terminal ([bool]$terminal) -Force
         $projection|Add-Member terminalBasis 'native-v1-state/UTC/progress/settled-publication' -Force
         $projection|Add-Member requestSucceeded ([bool]($terminal -and $state -cin @('completed','completed_with_warnings'))) -Force
