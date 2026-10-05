@@ -1,5 +1,79 @@
 # DevBench Control
 
+## Current-session shader compiler admission
+
+A successful API/readiness call is not healthy rendering. The existing native
+`communityshaders.shader_api` `snapshot` contract (CSX ad8,
+`csx.shader` 1.0/schemaRevision1) exposes actual compilation task counters,
+current failed shader entries and bounded recent failure diagnostics. Auto-Tools
+qualifies that exact typed request/receipt with matched command, producer and
+service-session identity. Ordinary calls expose `semantic.compilerHealth` but
+remain `completionBasis:read-schema-only`: even a valid failed/pending snapshot
+is a successful diagnostic read.
+
+On an already-selected controller lane, add `-RequireCompilerHealthy` to
+`call` for a healthy image/performance evidence boundary. Keep exact
+`-RuntimePath`, `-ArtifactPath`, `-ExpectedArtifactSha256`,
+`-ExpectedBuildId` and the accepting `-ExpectedRuntimeIdentityJson`.
+The flag requires complete verified listener/process/build/artifact identity;
+it refuses identity bypasses, waits/list commands and expected-error overrides.
+It discovers the current shader snapshot input schema and reads that service on
+the **same actual MCP session/selected transport** as the target call, with new
+command IDs (no idempotent replay). Failure, pending work, disabled custom
+shaders, zero-task initialization, malformed/foreign/stale receipts or unproven
+identity refuse the target **before dispatch**.
+
+```powershell
+# Read-only current-session admission; this does not launch or repair anything.
+.\Invoke-DevBenchControl.ps1 call -Tool communityshaders.shader_api `
+  -ArgumentsJson '{"contractMajor":1,"clientId":"mapping","commandId":"<fresh-uuid>","action":"snapshot","expectedBuildId":"<exact-build-id>"}' `
+  -RuntimePath '<exact-running-runtime.json>' `
+  -ArtifactPath '<exact-deployed-CommunityShaders.dll>' `
+  -ExpectedArtifactSha256 '<expected-sha256>' -ExpectedBuildId '<exact-build-id>' `
+  -RequireCompilerHealthy -MaxTransientRetries 0 -TimeoutSeconds 30 `
+  -EvidenceDirectory '<owned-retained-evidence>'
+```
+
+For an admitted target, a second fresh snapshot brackets the call. Both
+boundaries must pass and retain the same producer/service session/state revision
+and task/source-compile/cache-hit counters. Native diagnostics and raw replies
+remain in `data.compilerGuard`, `compilerGuardAfter`, `compilerWindow`;
+the original target semantic receipt is retained as `data.targetSemantic`.
+Only an admitted bracket **and** a successful target set
+`data.healthyEvidenceAdmitted:true`. A failed post-boundary retains the
+completed target/evidence, reports invalidation, and never replays, cancels,
+clears caches, rebuilds, relaunches or alters the profile.
+
+Compiler status is scoped: `COMPILER_HEALTHY_AT_SNAPSHOT` is not proof of
+correct pixels, complete Data-root/include/provider closure, future areas,
+performance neutrality or scientific acceptance. `recentFailures` contains
+history with epochs; absent current failure counts cannot silently clear that
+history. Nonempty history fails healthy admission conservatively and remains
+diagnostic evidence. Independently preserve exact current log identity,
+compilation completion/failure records and stereo inspection. A window does not
+prove every intermediate frame, and an asynchronous screenshot/sequence start
+is **not** capture completion: guard its owned final request/status as well,
+retain the start/end boundaries, and classify intervening failures diagnostically.
+Timing/CPU/GPU measurements still require the separate
+`-RequirePerformanceNeutral` guard.
+
+On the direct MCP lane, call the exact exposed shader snapshot with a fresh ID;
+use exported `Get-DevBenchShaderCompilerHealth` and
+`Test-DevBenchShaderCompilerWindow` offline on those untouched receipts and
+match them to the direct connection's separately verified current identity.
+Do not open the bundled controller as a second lane. Parse retained native JSON
+with `ConvertFrom-Json -DateKind String` on PowerShell 7.5+ to retain UTC strings.
+The pure classifier proves schema/compiler state only; it cannot establish
+current runtime identity or freshness by itself. Explicit diagnostic capture
+remains permitted on the existing lane, but **no** successful unguarded capture,
+API/readiness pass or failed compiler boundary authorizes healthy promotion.
+
+Run `Test-ShaderCompilerHealth.ps1 -FixtureRoot '<managed-general-workPath>'`.
+Its source-derived fixtures and test-owned loopback production entry prove
+positive admission, failure/pending refusal with zero target dispatch, changed
+post-boundaries with preserved target receipt, no replay and exact session
+cleanup. They are offline validation, not a live ca3/ad8 health qualification.
+
 `Invoke-DevBenchControl.ps1` lists and calls the MCP tools exposed by a running
 CSX DevBench server. Supply runtime metadata with `-RuntimePath` or set
 `CSX_DEVBENCH_RUNTIME_PATH`; no machine-specific path is compiled into the
