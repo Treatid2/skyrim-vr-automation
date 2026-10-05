@@ -1128,6 +1128,10 @@ $runtimeIdentityAst = @($entryPointAst.FindAll({ param($node) $node -is [Managem
 $retryableExceptionAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-WaitRetryableException' }, $true))[0]
 $identityProbeResult = & {
     param([string]$RuntimeIdentityFunction, [string]$RetryableFunction)
+    $script:invocationRecord = $null
+    $script:invocationEvidencePath = $null
+    $healthReplyAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-RuntimeHealthReply' }, $true))[0]
+    Invoke-Expression $healthReplyAst.Extent.Text
     Invoke-Expression $RetryableFunction
     $identityContentAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-RuntimeIdentityContent' }, $true))[0]
     Invoke-Expression $identityContentAst.Extent.Text
@@ -1158,6 +1162,10 @@ $identityProbeResult = & {
 Assert-Test ($identityProbeResult.nonWait.errors.Count -eq 0 -and $identityProbeResult.nonWait.build.buildId -eq 'fixture-build' -and $identityProbeResult.nonWait.build.sources[0].error -match 'main thread busy') 'non-wait identity discovery retains one transient candidate failure and continues to a valid sibling producer'
 Assert-Test $identityProbeResult.waitPropagated 'wait identity discovery propagates a retryable producer failure into the bounded rebind loop'
 $identitySemanticCases = & {
+    $script:invocationRecord = $null
+    $script:invocationEvidencePath = $null
+    $healthReplyAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-RuntimeHealthReply' }, $true))[0]
+    Invoke-Expression $healthReplyAst.Extent.Text
     $ExpectedRuntimeIdentityJson = ''
     Invoke-Expression $retryableExceptionAst.Extent.Text
     $contentAst = @($entryPointAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-RuntimeIdentityContent' }, $true))[0]
@@ -1174,7 +1182,7 @@ $identitySemanticCases = & {
     function Invoke-ToolRpc {
         param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers)
         $payload = if ($Name -eq 'inspect') {
-            [pscustomobject]@{ ok = $true; pid = $PID; exe = 'pwsh.exe' }
+            [pscustomobject]@{ ok = $true; pid = $PID; exe = 'pwsh.exe'; port = 1; vr = $true; frame = 1L; lastTaskFrame = -1L; pendingTasks = 0L }
         } else { [pscustomobject]@{ ok = $true; producer = [pscustomobject]@{ buildId = 'fixture-build' } } }
         if (($mode -like 'health-*' -and $Name -eq 'inspect') -or
             ($mode -like 'producer-*' -and $Name -eq 'communityshaders.first_api')) {
@@ -1182,7 +1190,7 @@ $identitySemanticCases = & {
             $payload | Add-Member retryable ($mode -like '*retryable')
             $payload | Add-Member error 'identity unavailable'
             if ($mode -like '*malformed') { $payload.ok = 'false' }
-            if ($mode -like '*unknown') { $payload.PSObject.Properties.Remove('ok'); $payload.PSObject.Properties.Remove('error') }
+            if ($mode -like '*unknown') { $payload.PSObject.Properties.Remove('ok'); $payload.PSObject.Properties.Remove('error'); $payload.PSObject.Properties.Remove('frame') }
         }
         # Real MCP and REST content is JSON-decoded; PID integers become Int64.
         [pscustomobject]@{ content = @(($payload | ConvertTo-Json -Depth 8) | ConvertFrom-Json) }
@@ -1224,7 +1232,7 @@ Assert-Test ($entryPointText -match '\$waitCompletion = Get-DevBenchWaitCompleti
 Assert-Test ($entryPointText -match '-not \$runtimeIdentity\.complete -or -not \$runtimeIdentity\.verified') 'mutation-capable calls require complete and positively verified runtime identity'
 Assert-Test ($entryPointText -match '\[string\]\$ExpectedRuntimeIdentityJson') 'controller accepts an exact prior runtime identity for pre-dispatch continuity'
 Assert-Test ($entryPointText.IndexOf('Expected runtime identity is invalid:') -lt $entryPointText.IndexOf("Update-InvocationEvidence -State 'dispatching'")) 'runtime identity continuity is verified before mutation dispatch'
-Assert-Test ($entryPointText -match 'if \(\$Command -eq ''call''\) \{[\s\S]{0,100}-not \$semantic\.known -or -not \$semantic\.ok') 'mutation-capable calls fail closed on unknown semantic outcomes'
+Assert-Test ($entryPointText -match 'if \(\$Command -in @\(''call'',''calendar-window''\)\) \{[\s\S]{0,100}-not \$semantic\.known -or -not \$semantic\.ok') 'ordinary and composed mutation-capable calls fail closed on unknown semantic outcomes'
 Assert-Test ($entryPointText -match '\$Tool -eq ''communityshaders\.profiler''') 'profiler calls have an explicit semantic contract adapter'
 Assert-Test ($entryPointText -match '\$requestedAction -eq ''status''[\s\S]{0,180}\.status\.PSObject\.Properties\[''frame_count''\]') 'profiler status requires a frame-bearing status payload'
 Assert-Test ($entryPointText -match '\$requestedAction -eq ''enable''[\s\S]{0,160}\[bool\]\$profilerPayload\[0\]\.enabled') 'profiler enable requires observed enabled state'
@@ -1271,7 +1279,7 @@ Assert-Test ($entryPointText -match "invocationRecord\['sessionCleanup'\]") 'fin
 Assert-Test ($entryPointText -match "Session cleanup evidence could not be journaled" -and $entryPointText -match 'evidenceJournalFinalized') 'a final journal failure is reported without suppressing the completed controller result'
 Assert-Test ($entryPointText -match "outcome = 'tool-unavailable'" -and $entryPointText -match "codes = @\('tool_unavailable'\)") 'missing optional tools retain a structured unavailable outcome without dispatch'
 Assert-Test ($entryPointText -match 'method = ''tools/list''[\s\S]{0,400}currentTools') 'performance boundaries refresh the live tool registry'
-Assert-Test ($entryPointText -match 'function Invoke-ToolRpc[\s\S]{0,1200}Invoke-McpRequest' -and $entryPointText -match 'function Invoke-ToolRpc[\s\S]{0,500}Invoke-RestRequest') 'tool calls use the shared deadline-bounded request path for both negotiated transports'
+Assert-Test ($entryPointText -match 'function Invoke-ToolRpc[\s\S]{0,2400}Invoke-McpRequest' -and $entryPointText -match 'function Invoke-ToolRpc[\s\S]{0,1600}Invoke-RestRequest') 'tool calls use the shared deadline-bounded request path for both negotiated transports'
 Assert-Test ($entryPointText -match 'requestTimeoutSeconds = \$script:requestTimeoutSecondsForRpc') 'receipts expose the effective request timeout'
 Assert-Test ($entryPointText -match '\[string\]\$EvidenceLabel') 'runtime binding evidence accepts an explicit invocation label'
 Assert-Test ($entryPointText -match 'devbench-runtime-binding\.\$safeLabel\.\$stamp\.\$PID\.json') 'parallel runtime bindings use invocation-unique filenames'
