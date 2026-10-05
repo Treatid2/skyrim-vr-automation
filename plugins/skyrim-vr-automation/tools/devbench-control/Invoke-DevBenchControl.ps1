@@ -92,7 +92,7 @@ $script:requestTimeoutSecondsForRpc = $RequestTimeoutSeconds
 
 function Get-ShaderCompilerGuard {
     param([object[]]$Tools,[hashtable]$Headers,$Identity)
-    $guard=[pscustomobject][ordered]@{admissible=$false; health=$null; reply=$null; arguments=$null; reasons=@()}
+    $guard=[pscustomobject][ordered]@{admissible=$false; state='READ_UNAVAILABLE'; health=$null; reply=$null; arguments=$null; reasons=@()}
     try {
         if ($null -eq $Identity -or -not $Identity.complete -or -not $Identity.verified) { throw 'Compiler admission requires complete verified current runtime/artifact identity.' }
         $matches=@($Tools | Where-Object name -CEQ 'communityshaders.shader_api')
@@ -101,8 +101,10 @@ function Get-ShaderCompilerGuard {
         if ($schema.properties.contractMajor.const -ne 1 -or $schema.properties.contractMajor.type -cne 'integer' -or $schema.properties.action.type -cne 'string' -or 'snapshot' -cnotin @($schema.properties.action.enum) -or @($schema.required).Count -ne 4 -or @($schema.required | Where-Object { $_ -cnotin @('contractMajor','clientId','commandId','action') }).Count -gt 0 -or $schema.properties.clientId.type -cne 'string' -or $schema.properties.commandId.type -cne 'string') { throw 'toolSchemaUnresolved: current shader snapshot input schema is unsupported.' }
         $argsMap=@{contractMajor=1;clientId='auto-tools-compiler-admission';commandId=[guid]::NewGuid().ToString('N');action='snapshot';expectedBuildId=[string]$Identity.build.buildId}
         $guard.arguments=$argsMap
-        $guard.reply=Invoke-ToolRpc -Name 'communityshaders.shader_api' -Arguments $argsMap -Headers $Headers
+        $guard.reply=Invoke-ToolRpc -Name 'communityshaders.shader_api' -Arguments $argsMap -Headers $Headers -RetainShaderSnapshotToolError
+        if ($guard.reply.rawResult.PSObject.Properties['isError'] -and ($guard.reply.rawResult.isError -isnot [bool] -or $guard.reply.rawResult.isError)) { throw 'Decoded MCP compiler snapshot error retained; no native counters accepted.' }
         $guard.health=Get-DevBenchShaderCompilerHealth -Arguments $argsMap -Content @($guard.reply.content)
+        $guard.state=$guard.health.state
         $guard.reasons=@($guard.health.reasons)
         if (-not $guard.health.admissible) { return $guard }
         $sources=@($Identity.build.sources | Where-Object tool -CEQ 'communityshaders.shader_api')
@@ -606,7 +608,8 @@ function Invoke-RestRequest {
 }
 
 function Invoke-ToolRpc {
-    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation, [switch]$RetainHealthToolError)
+    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation, [switch]$RetainHealthToolError, [switch]$RetainShaderSnapshotToolError)
+    if ($RetainShaderSnapshotToolError -and ($Name -cne 'communityshaders.shader_api' -or $Mutation -or -not (Test-DevBenchShaderSnapshotRequest -Arguments $Arguments))) { throw 'Decoded compiler-error retention is restricted to the exact read-only shader snapshot.' }
     if ($RetainHealthToolError -and ($Name -cne 'inspect' -or [string]$Arguments['kind'] -cne 'health' -or $Mutation)) { throw 'Decoded tool-error retention is restricted to the read-only identity health probe.' }
     Set-ServerWaitBudgetAtDispatch -Arguments $Arguments
     if ($script:transport -eq 'rest') {
@@ -616,7 +619,7 @@ function Invoke-ToolRpc {
     }
     $rpc = Invoke-McpRequest -Endpoint $endpoint -Headers $Headers -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/call'; params = @{ name = $Name; arguments = $Arguments } } -Mutation:$Mutation
     if ($rpc.json.PSObject.Properties['error']) { throw "DevBench tools/call failed: $($rpc.json.error | ConvertTo-Json -Compress)" }
-    if (-not $RetainHealthToolError -and $rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
+    if (-not $RetainShaderSnapshotToolError -and -not $RetainHealthToolError -and $rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
         $message = ($rpc.json.result.content | ForEach-Object { $_.text }) -join "`n"
         throw "DevBench tool '$Name' failed: $message"
     }

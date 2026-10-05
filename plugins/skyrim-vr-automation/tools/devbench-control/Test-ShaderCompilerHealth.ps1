@@ -78,6 +78,10 @@ foreach ($case in @('stringCounter','fractional','boolCounter','negative','overf
     Check (-not $h.readQualified -and -not $h.admissible) "$case refuses malformed/foreign compiler evidence"
 }
 Check ((Test-DevBenchShaderCompilerWindow -Before $health -After $health).valid) 'unchanged admitted boundaries qualify bracket only'
+$unavailable=Clone-Seed;$unavailable.ok=$false;$unavailable.PSObject.Properties.Remove('result')
+$unavailable | Add-Member error ([pscustomobject]@{code='main_thread_dispatch_failed';message='main thread did not run within 5000ms';phase='execution';retryable=$true})
+$unavailableHealth=Get-DevBenchShaderCompilerHealth -Arguments $argsMap -Content @($unavailable)
+Check (-not $unavailableHealth.readQualified -and -not $unavailableHealth.admissible -and $unavailableHealth.state -ceq 'READ_UNAVAILABLE' -and $null -eq $unavailableHealth.compilation) 'main-thread read unavailable is not an invented compiler failure/counter snapshot'
 foreach($case in @('session','build','revision','newTask','newCompile','cacheHit')) {
     $after=$health | ConvertTo-Json -Depth 30 | ConvertFrom-Json -Depth 30 -DateKind String
     switch($case) {session {$after.serviceSessionId='foreign'};build {$after.buildId='foreign'};revision {$after.stateRevision++};newTask {$after.compilation.totalTasks++};newCompile {$after.compilation.sourceCompiles++};cacheHit {$after.compilation.diskCacheHits++}}
@@ -85,7 +89,7 @@ foreach($case in @('session','build','revision','newTask','newCompile','cacheHit
 }
 $root=Join-Path ([IO.Path]::GetFullPath($FixtureRoot)) ('compiler-health-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
-foreach($case in @('healthy','failed','pending','after-failed','after-session','after-task','mcp-error','schema-missing','no-guard','skip-refused')) {
+foreach($case in @('healthy','failed','pending','main-thread-unavailable','after-failed','after-session','after-task','mcp-error','schema-missing','no-guard','skip-refused')) {
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0);$listener.Start()
     $port=$listener.LocalEndpoint.Port
     $events=[Collections.Concurrent.ConcurrentQueue[object]]::new()
@@ -130,6 +134,7 @@ foreach($case in @('healthy','failed','pending','after-failed','after-session','
                                     $payload.timestampUtc=[DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
                                     if($Case -ceq 'failed' -or ($Case -ceq 'after-failed' -and $snapshots -eq 2)) {$payload.result.snapshot.compilation.failedTasks=1;$payload.result.snapshot.compilation.currentFailedShaders=1}
                                     if($Case -ceq 'pending') {$payload.result.snapshot.compilation.active=$true}
+                                    if($Case -ceq 'main-thread-unavailable') {$payload.ok=$false;$payload.PSObject.Properties.Remove('result');$payload | Add-Member error ([pscustomobject]@{code='main_thread_dispatch_failed';message='main thread did not run within 5000ms';retryable=$true;phase='execution'})}
                                     if($Case -ceq 'after-session' -and $snapshots -eq 2) {$payload.server.serviceSessionId='replaced';$payload.server.sessionId='replaced'}
                                     if($Case -ceq 'after-task' -and $snapshots -eq 2) {$payload.result.snapshot.compilation.totalTasks++;$payload.result.snapshot.compilation.completedTasks++}
                                 }
@@ -156,7 +161,9 @@ foreach($case in @('healthy','failed','pending','after-failed','after-session','
         $calls=@($events.ToArray());$targets=@($calls|Where-Object kind -eq 'target').Count
         if($case -cin @('healthy','no-guard')) {Check ($reply.ok -and $targets -eq 1) "$case production entry dispatches target exactly once"}
         else {Check (-not $reply.ok) "$case production entry refuses healthy promotion"}
-        if($case -cin @('failed','pending','mcp-error','schema-missing','skip-refused')) {Check ($targets -eq 0 -and -not $reply.dispatchReached) "$case production entry proves zero target dispatch"}
+        if($case -cin @('failed','pending','main-thread-unavailable','mcp-error','schema-missing','skip-refused')) {Check ($targets -eq 0 -and -not $reply.dispatchReached) "$case production entry proves zero target dispatch"}
+        if($case -ceq 'main-thread-unavailable') {Check ($reply.data.compilerGuard.state -ceq 'READ_UNAVAILABLE' -and $reply.data.compilerGuard.reply.content[0].error.code -ceq 'main_thread_dispatch_failed' -and $null -eq $reply.data.compilerGuard.health.compilation) 'production entry retains native unavailable read without accepting counters or touching compile'}
+        if($case -ceq 'mcp-error') {Check ($reply.data.compilerGuard.reply.rawResult.isError -and $null -eq $reply.data.compilerGuard.health) 'MCP error raw reply is retained without positive schema/counters'}
         if($case.StartsWith('after-')) {Check ($targets -eq 1 -and $reply.dispatchReached -and $reply.data.targetSemantic.ok -and -not $reply.data.healthyEvidenceAdmitted) "$case preserves completed target receipt without healthy promotion or replay"}
         if($case -ceq 'healthy') {
             Check ($reply.runtimeIdentity.complete -and $reply.runtimeIdentity.verified -and $reply.data.healthyEvidenceAdmitted -and $reply.data.compilerWindow.valid) 'healthy entry binds real fixture listener/process/artifact with two compiler boundaries'
