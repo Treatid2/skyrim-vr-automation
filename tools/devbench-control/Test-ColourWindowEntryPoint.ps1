@@ -6,7 +6,7 @@ $checks=0
 function Check([bool]$Value,[string]$Message){if(-not $Value){throw $Message};$script:checks++}
 $root=Join-Path $FixtureRoot ('colour-entry-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root|Out-Null
-foreach($mode in @('healthy','partial-page','compiler','schema-missing','lost-arm','lost-reset','string-page-generation','native-failure')){
+foreach($mode in @('healthy','partial-page','compiler','schema-missing','lost-arm','lost-reset','string-page-generation','native-failure','burnin-incomplete')){
     $dir=Join-Path $root $mode;New-Item -ItemType Directory -Path $dir|Out-Null
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0);$listener.Start();$port=$listener.LocalEndpoint.Port
     $events=[Collections.Concurrent.ConcurrentQueue[object]]::new()
@@ -79,6 +79,7 @@ foreach($mode in @('healthy','partial-page','compiler','schema-missing','lost-ar
     try{
         $fixture=& (Join-Path $PSScriptRoot 'Test-ColourMeasurementWindow.ps1') -FixtureOnly
         $plan=$fixture.Plan;$plan.capturesPerCondition=1
+        if($mode -ceq 'burnin-incomplete'){$plan.burnIn=@{minimumElapsedMilliseconds=10;minimumObservedCpuFrameIdAdvancePerEye=1;minimumDistinctFreshSuccessfulBothEyeObservations=2;maximumElapsedMilliseconds=300}}
         $artifact=Join-Path $PSScriptRoot 'Test-ColourWindowEntryPoint.ps1'
         $runtime=Join-Path $dir 'runtime.json';@{port=$port;pid=$PID;buildId=$plan.expectedBuildId;artifactPath=$artifact;artifactSha256=(Get-FileHash $artifact).Hash}|ConvertTo-Json|Set-Content -LiteralPath $runtime
         $reply=& (Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1') colour-window -RuntimePath $runtime -ColourPlanJson ($plan|ConvertTo-Json -Depth 20 -Compress) -CalendarOwner fixture-owner -CalendarHoldMilliseconds 30000 -TimeoutSeconds 30 -MaxTransientRetries 0 -EvidenceDirectory $dir -NoExit -Compact|ConvertFrom-Json -Depth 80
@@ -94,6 +95,11 @@ foreach($mode in @('healthy','partial-page','compiler','schema-missing','lost-ar
             Check (@(Get-ChildItem -LiteralPath $dir -Filter 'colour-rpc.*.json' -File).Count -gt 0) "$mode immutable raw replies retained"
         }
         if($mode -ceq 'healthy'){Check ($reply.data.measurement.captures.Count -eq 3 -and @($reply.data.measurement.captures|ForEach-Object {$_.pages}).Count -eq 30) 'public three conditions/all30 pages complete'}
+        if($mode -ceq 'burnin-incomplete'){
+            Check ($reply.data.measurement.captures.Count -eq 0 -and $reply.data.measurement.conditions.Count -eq 1) 'public burn-in failure stops all arms/next conditions'
+            Check ($reply.data.measurement.conditions[0].nativeDispatchMatched -and $reply.data.measurement.conditions[0].burnIn.failureCode -ceq 'burn-in-incomplete') 'public typed dispatch versus coverage failure distinction'
+            Check ($reply.data.measurement.colourCleanup.verified -and -not $reply.indeterminate) 'public same-session requested-AE verification and calendar cleanup remain determinate'
+        }
         if($mode -cin @('partial-page','string-page-generation','native-failure')){Check ($reply.data.measurement.probeCleanup.verified -and -not $reply.data.measurement.captures[0].complete) 'partial/malformed/failed capture and successful owned cleanup separate'}
         if($mode -ceq 'native-failure'){
             Check (($reply.errors -join ';') -cmatch 'Native colour probe capture failed: the captured frame did not contain every required stage and eye' -and ($reply.errors -join ';') -cmatch 'queuedStageEyeSlots=6/10; mappedStageEyeSlots=0') 'public terminal diagnostic retains exact native failure and slot counts'
@@ -102,4 +108,4 @@ foreach($mode in @('healthy','partial-page','compiler','schema-missing','lost-ar
         if($mode -cin @('lost-arm','lost-reset')){Check $reply.data.measurement.indeterminate 'lost mutation remains indeterminate';Check (@($all|Where-Object {$_.name -ceq 'communityshaders.colour_pipeline_probe' -and $_.arguments.action -ceq $mode.Substring(5)}).Count -eq 1) 'lost mutation not replayed'}
     }finally{$listener.Stop();Stop-Job $server;Remove-Job $server}
 }
-[pscustomobject]@{ok=$true;checks=$checks;cases=8;root=$root;scope='test-owned loopback real public entry; no Skyrim or live mutation'}|ConvertTo-Json -Compress
+[pscustomobject]@{ok=$true;checks=$checks;cases=9;root=$root;scope='test-owned loopback real public entry; no Skyrim or live mutation'}|ConvertTo-Json -Compress
