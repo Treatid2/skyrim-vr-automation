@@ -34,7 +34,11 @@ function Invoke-DevBenchColourMeasurement {
         if ($null -eq $Reply -or @($Reply.content).Count -ne 1 -or $Reply.content[0] -isnot [pscustomobject]) { throw 'Colour action requires exactly one native payload.' }
         if ($Reply.PSObject.Properties['rawResult'] -and $Reply.rawResult.PSObject.Properties['isError'] -and ($Reply.rawResult.isError -isnot [bool] -or $Reply.rawResult.isError)) { throw 'Native MCP error cannot qualify colour action.' }
         $p=$Reply.content[0]
-        if (-not $p.PSObject.Properties['producer'] -or $p.producer -isnot [pscustomobject] -or $p.producer.component -isnot [string] -or $p.producer.component -cne 'CommunityShaders' -or $p.producer.buildId -isnot [string] -or $p.producer.buildId -cne $Plan.expectedBuildId -or (-not $AllowNativeFailure -and $p.PSObject.Properties['error'] -and $null -ne $p.error)) { throw 'Colour action carries foreign producer or native error; raw reply retained.' }
+        if (-not $p.PSObject.Properties['producer'] -or $p.producer -isnot [pscustomobject] -or $p.producer.component -isnot [string] -or $p.producer.component -cne 'CommunityShaders' -or $p.producer.buildId -isnot [string] -or $p.producer.buildId -cne $Plan.expectedBuildId) { throw 'Colour action carries foreign or malformed producer; raw reply retained.' }
+        if (-not $AllowNativeFailure -and $p.PSObject.Properties['error'] -and $null -ne $p.error) {
+            if($p.error -isnot [string] -or [string]::IsNullOrWhiteSpace($p.error)){throw 'Matching producer returned malformed native error; raw reply retained.'}
+            throw "Matching producer returned native colour action error: $($p.error); raw reply retained."
+        }
         return $p
     }
     function Guard([datetime]$Bound) {
@@ -46,7 +50,9 @@ function Invoke-DevBenchColourMeasurement {
     function Status([string]$Name,[datetime]$Bound) {
         $argsMap=@{action='status';expectedBuildId=$Plan.expectedBuildId}
         $reply=& $Call $Name $argsMap $false $Bound
-        $p=One $reply
+        # Native probe failed is a typed observation, not foreign identity or
+        # measurement success. Preserve it for owner binding and diagnostics.
+        $p=One $reply ($Name -ceq $probe)
         $kind=if($Name -ceq $colour){'fsr-colour-status'}else{'colour-probe-status'}
         if (@(Get-DevBenchNativeReadReasons -Kind $kind -Payload $p -Arguments $argsMap).Count) { throw "Native status schema failed: $Name." }
         return $p
@@ -120,6 +126,7 @@ function Invoke-DevBenchColourMeasurement {
                 $mutationPending=$false
                 do {
                     $p=Status $probe $captureBound; Assert-ProbeOwner $p $owned; $record.status=$p
+                    if($p.state -ceq 'failed'){throw "Native colour probe capture failed: $($p.error) [captureId=$($p.captureId); generation=$($p.generation); cpuFrame=$($p.cpuFrame); queuedStageEyeSlots=$($p.queuedStageEyeSlots)/$($p.expectedStageEyeSlots); mappedStageEyeSlots=$($p.mappedStageEyeSlots); stagingPayloadBytes=$($p.stagingPayloadBytes)]. Raw reply retained; no capture replay."}
                     if($p.state -cnotin @('armed','capturing','readback_pending','complete')){throw 'Probe failed or lost custody.'}
                     $current=Status $colour $captureBound
                     if(-not (Settled $current $revision $auto) -or $current.runtimeContext.generation -ne $s.runtimeContext.generation){throw 'Colour context/eyes changed during capture.'}

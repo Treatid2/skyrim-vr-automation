@@ -91,6 +91,13 @@ successful eye records are the dynamic gates.
 
 ## Cleanup is owned by Auto-Tools
 
+A source-bound native failed probe status remains a failed measurement. After
+typed schema and exact captureId/generation/revision qualification, the terminal
+diagnostic retains the native error plus CPU frame, queued/expected stage-eye
+slots, mapped slots and staging bytes. The exact failed status is retained in its
+capture record before cleanup. Matching producer failure is not labelled foreign
+producer; foreign/malformed status cannot gain this qualified classification.
+
 Successful capture resets only its exact owned captureId/generation once and
 requires fresh idle generation+1 readback. On failure, retained diagnostics/pages
 remain separate from success. A confirmed owned probe may be observed boundedly
