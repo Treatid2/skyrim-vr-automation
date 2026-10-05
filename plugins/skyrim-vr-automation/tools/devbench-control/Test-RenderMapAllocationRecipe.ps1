@@ -20,6 +20,11 @@ $limits=[ordered]@{maximumDurationMs=60000;maximumFrames=10000;maximumEvents=655
 foreach($name in $names.Keys){$limits[$names[$name]]=$recipe.limits.$name}
 $registry=[pscustomobject]@{ok=$true;result=[pscustomobject]@{service='communityshaders.render-map';major=1;producerBuildId=$manifest.buildId;defaults=[pscustomobject]$defaults;limits=[pscustomobject]$limits;eventSelection=[pscustomobject]@{optional=$true};eventKinds=@('draw','eye-submitted','resource-flow')}}
 $registryPath=Write-TestJson 'registry.json' $registry
+if ($recipe.status -ceq 'PASS_SOURCE_AND_EXACT_E03_PDB_ALLOCATION_RECIPE') {
+    $registry.result | Add-Member -NotePropertyName minor -NotePropertyValue 24
+    $registry.result | Add-Member -NotePropertyName schemaRevision -NotePropertyValue 26
+    $registryPath=Write-TestJson 'registry-e03.json' $registry
+}
 $workload=[pscustomobject]@{expectedDurationMs=1000;expectedFrames=100;expectedEvents=32768;expectedEventBytes=1;expectedScopeDepth=4;expectedObservations=[pscustomobject]@{shader=64;stageShader=2048;resource=1024;targetView=4096;targetBinding=64;sceneObject=512;geometry=1024;materialState=1024}}
 $workloadPath=Write-TestJson 'workload.json' $workload
 $base=@{RegistryPath=$registryPath;WorkloadPath=$workloadPath;ClientId='allocation-fixture';CommandId='allocation-fixture';HeadroomFactor=1;MaxBytes=67108864;AllocationRecipePath=$RecipePath;ExpectedAllocationRecipeSha256=(Get-FileHash $RecipePath -Algorithm SHA256).Hash;AllocationLayoutPath=$LayoutPath;ProducerBuildManifestPath=$BuildManifestPath;ExpectedProducerBuildManifestSha256=(Get-FileHash $BuildManifestPath -Algorithm SHA256).Hash;NoExit=$true;Compact=$true}
@@ -77,7 +82,17 @@ foreach($case in @('source','dirty','artifact')){
 }
 foreach($case in @('record-size','missing-type','duplicate-type','failed-status','mixed-status')){
     $badLayout=Get-Content $LayoutPath -Raw|ConvertFrom-Json
-    switch($case){'record-size'{$badLayout.types[5].bytes++};'missing-type'{$badLayout.types=@($badLayout.types|Where-Object type -cne 'CSX::RenderMap::StageShaderObservationRecord')};'duplicate-type'{$badLayout.types+=@($badLayout.types[0])};'failed-status'{$badLayout.status='FAIL'};'mixed-status'{$badLayout.status=if($recipe.status -ceq 'PASS_SOURCE_AND_EXACT_AD8_PDB_ALLOCATION_RECIPE'){'PASS_EXACT_F362_PDB_LAYOUT'}else{'PASS_EXACT_AD8_PDB_LAYOUT'}}}
+    if ($recipe.status -ceq 'PASS_SOURCE_AND_EXACT_E03_PDB_ALLOCATION_RECIPE') {
+        switch($case) {
+            'record-size' { $badLayout.calculation.pdbTypeSizes.'CSX::RenderMap::StageShaderObservationRecord'++ }
+            'missing-type' { $badLayout.calculation.pdbTypeSizes.PSObject.Properties.Remove('CSX::RenderMap::StageShaderObservationRecord') }
+            'duplicate-type' { $badLayout.calculation.pdbTypeSizes | Add-Member -NotePropertyName 'foreign' -NotePropertyValue 128 }
+            'failed-status' { $badLayout.status='FAIL' }
+            'mixed-status' { $badLayout.status='PASS_EXACT_AD8_PDB_LAYOUT' }
+        }
+    } else {
+        switch($case){'record-size'{$badLayout.types[5].bytes++};'missing-type'{$badLayout.types=@($badLayout.types|Where-Object type -cne 'CSX::RenderMap::StageShaderObservationRecord')};'duplicate-type'{$badLayout.types+=@($badLayout.types[0])};'failed-status'{$badLayout.status='FAIL'};'mixed-status'{$badLayout.status=if($recipe.status -ceq 'PASS_SOURCE_AND_EXACT_AD8_PDB_ALLOCATION_RECIPE'){'PASS_EXACT_F362_PDB_LAYOUT'}else{'PASS_EXACT_AD8_PDB_LAYOUT'}}}
+    }
     $path=Write-TestJson "layout-$case.json" $badLayout
     $badRecipe=$recipe|ConvertTo-Json -Depth 30|ConvertFrom-Json;$badRecipe.layoutReceipt.sha256=(Get-FileHash $path -Algorithm SHA256).Hash
     $recipeFixture=Write-TestJson "layout-recipe-$case.json" $badRecipe
@@ -85,6 +100,48 @@ foreach($case in @('record-size','missing-type','duplicate-type','failed-status'
     Assert-RecipeTest (-not $failed.ok -and $null -eq $failed.arguments) "PDB $case inconsistency fails before dispatch"
 }
 $overflow=$workload|ConvertTo-Json -Depth 30|ConvertFrom-Json;$overflow.expectedObservations.stageShader=[long]::MaxValue
+if ($recipe.status -ceq 'PASS_SOURCE_AND_EXACT_E03_PDB_ALLOCATION_RECIPE') {
+    foreach($case in @('schema','source-hash','layout-pdb','guid','bool','hash-budget','scope')) {
+        $badLayout=Get-Content $LayoutPath -Raw|ConvertFrom-Json
+        switch($case) {
+            'schema' { $badLayout.schemaVersion='foreign' }
+            'source-hash' { $badLayout.sourceHashes.'src/RenderMap/Collector.cpp'='0'*64 }
+            'layout-pdb' { $badLayout.pdb.sha256='sha256:'+('0'*64) }
+            'guid' { $badLayout.pdbIdentity.guid=[guid]::NewGuid().ToString() }
+            'bool' { $badLayout.calculation.boolScalarBytes=2 }
+            'hash-budget' { $badLayout.calculation.hashEntryBudgetBytes=65 }
+            'scope' { $badLayout.artifactExecuted=$true }
+        }
+        $path=Write-TestJson "e03-layout-$case.json" $badLayout
+        $badRecipe=$recipe|ConvertTo-Json -Depth 30|ConvertFrom-Json
+        $badRecipe.layoutReceipt.sha256=(Get-FileHash $path -Algorithm SHA256).Hash
+        $recipeFixture=Write-TestJson "e03-layout-recipe-$case.json" $badRecipe
+        $failed=Invoke-TestPlan @{AllocationLayoutPath=$path;AllocationRecipePath=$recipeFixture;ExpectedAllocationRecipeSha256=(Get-FileHash $recipeFixture -Algorithm SHA256).Hash}
+        Assert-RecipeTest (-not $failed.ok -and $null -eq $failed.arguments) "E03 layout $case refused after caller re-pin"
+    }
+    foreach($field in @('minor','schemaRevision')) {
+        $changed=$registry|ConvertTo-Json -Depth 30|ConvertFrom-Json
+        $changed.result.$field++
+        $failed=Invoke-TestPlan @{RegistryPath=(Write-TestJson "e03-registry-$field.json" $changed)}
+        Assert-RecipeTest (-not $failed.ok -and $null -eq $failed.arguments) "E03 registry $field mismatch refused"
+        $changed=$registry|ConvertTo-Json -Depth 30|ConvertFrom-Json
+        $changed.result.$field=[string]$changed.result.$field
+        $failed=Invoke-TestPlan @{RegistryPath=(Write-TestJson "e03-registry-$field-type.json" $changed)}
+        Assert-RecipeTest (-not $failed.ok -and $null -eq $failed.arguments) "E03 registry $field string refused"
+    }
+    foreach($case in @('native-build','issued-dll','return-hash','return-duplicate')) {
+        $badRecipe=$recipe|ConvertTo-Json -Depth 30|ConvertFrom-Json
+        switch($case) {
+            'native-build' { $badRecipe.nativeBuildId='0'*64 }
+            'issued-dll' { ($badRecipe.issuedArtifacts|Where-Object id -CEQ 'plugin-dll').sha256='sha256:'+('0'*64) }
+            'return-hash' { ($badRecipe.verifiedFiles|Where-Object sha256 -CEQ ((Get-Content $LayoutPath -Raw|ConvertFrom-Json).nativeDeliverySha256)).sha256='0'*64 }
+            'return-duplicate' { $badRecipe.verifiedFiles+=@($badRecipe.verifiedFiles|Where-Object sha256 -CEQ ((Get-Content $LayoutPath -Raw|ConvertFrom-Json).nativeDeliverySha256)) }
+        }
+        $path=Write-TestJson "e03-recipe-$case.json" $badRecipe
+        $failed=Invoke-TestPlan @{AllocationRecipePath=$path;ExpectedAllocationRecipeSha256=(Get-FileHash $path -Algorithm SHA256).Hash}
+        Assert-RecipeTest (-not $failed.ok -and $null -eq $failed.arguments) "E03 recipe $case pairing mismatch refused"
+    }
+}
 $failed=Invoke-TestPlan @{WorkloadPath=(Write-TestJson 'overflow.json' $overflow)}
 Assert-RecipeTest (-not $failed.ok -and $null -eq $failed.arguments) 'recipe multiplication overflow refused'
 $late=Invoke-TestPlan @{InternalTestFailurePoint='receipt-hash'}
