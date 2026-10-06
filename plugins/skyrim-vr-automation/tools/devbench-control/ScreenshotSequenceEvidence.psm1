@@ -98,7 +98,8 @@ function BaseReceipt-SE($Receipt,$Observed) {
     return $terminal
 }
 function Capture-SE($Capture,[string]$Destination) {
-    Fields-SE $Capture @('source','outputs','destination') @('clipboard','tags')
+    Fields-SE $Capture @('source','outputs','destination','clipboard') @('tags')
+    Assert-SE (Exact-SE $Capture.clipboard 'none') 'explicit clipboard none required; no settings/clipboard side effect.'
     Assert-SE ($Capture -is [pscustomobject] -and $Capture.outputs -is [array] -and $Capture.outputs.Count -eq 2) 'exact two-eye capture required.'
     Assert-SE ((Exact-SE (Field-SE $Capture.source 'kind') 'hmd_submission') -and (Exact-SE (Field-SE $Capture.source 'fallback') 'reject')) 'explicit HMD submission without fallback required.'
     Assert-SE ((Exact-SE (Field-SE $Capture.destination 'policy') 'absolute') -and (Exact-SE (Field-SE $Capture.destination 'overwrite') 'never') -and (Exact-SE (Field-SE $Capture.destination 'directory') $Destination)) 'exact explicit non-overwrite destination required.'
@@ -138,7 +139,8 @@ function Get-DevBenchScreenshotSequenceEvidence {
         Assert-SE ($r.requested -is [pscustomobject] -and (Exact-SE $r.requested.action 'sequence_start') -and (UInt-SE $r.requested.contractMajor 1 1) -and (Exact-SE $r.requested.clientId $r.clientId) -and (Exact-SE $r.requested.commandId $r.commandId)) 'original sequence-start identity required.'
         $seq=$r.requested.sequence
         Assert-SE ($seq -is [pscustomobject] -and (UInt-SE $seq.frameCount 3 1) -and (Equal-SE $r.effective $seq) -and $r.actual -is [pscustomobject]) 'finite1..3-frame requested/effective sequence required.'
-        Fields-SE $seq @('frameCount','capture','schedule','backpressure','failurePolicy','packaging') @('useSettings')
+        Fields-SE $seq @('frameCount','capture','schedule','backpressure','failurePolicy','packaging','useSettings')
+        Assert-SE ($seq.useSettings -is [bool] -and -not $seq.useSettings) 'explicit Boolean useSettings false required.'
         Fields-SE $seq.schedule @('basis','intervalMs','startDelayMs','pausePolicy')
         Assert-SE ((Exact-SE $seq.schedule.basis 'wall_clock') -and (UInt-SE $seq.schedule.intervalMs 10000 1) -and (UInt-SE $seq.schedule.startDelayMs 10000) -and (Exact-SE $seq.schedule.pausePolicy 'hold')) 'finite explicit wall-clock schedule required.'
         Fields-SE $seq.backpressure @('policy','maximumConsecutiveSkips')
@@ -164,6 +166,7 @@ function Get-DevBenchScreenshotSequenceEvidence {
             }
             else { Assert-SE ($r.commandAccepted -is [bool]) 'cancellation/stop acknowledgement required.'; $commandAccepted=$r.commandAccepted }
         } else { Assert-SE (-not $r.PSObject.Properties['commandAccepted'] -and -not $alreadyTerminal) 'unexpected command acknowledgement.' }
+        $cancellationTerminal=$false
         if (-not $alreadyTerminal) {
             Fields-SE $r.counts @('requested','scheduled','acquired','written','dropped','failed','cancelled','inFlight')
             foreach ($p in $r.counts.PSObject.Properties) { Assert-SE (UInt-SE $p.Value 3) 'bounded typed sequence count required.' }
@@ -175,6 +178,20 @@ function Get-DevBenchScreenshotSequenceEvidence {
             Assert-SE ($null -eq $r.termination.policyAbortCode -or (Text-SE $r.termination.policyAbortCode)) 'abort code/null required.'
             Assert-SE ($null -eq $r.termination.committedOutcome -or $r.termination.committedOutcome -cin @('completed','completed_with_warnings','failed','failed_partial','cancelled','cancelled_partial','stopped')) 'unsupported committed outcome.'
             if ($terminal) { Assert-SE (-not $r.termination.preparationPending -and $r.termination.finalizationCommitted) 'terminal preparation/finalization contradiction.' }
+            if($r.state -cin @('cancelled','cancelled_partial')){
+                Assert-SE $r.termination.cancelRequested 'terminal cancellation requires the retained cancellation fact.'
+                if($null -ne $r.termination.committedOutcome){
+                    Assert-SE (Exact-SE $r.termination.committedOutcome $r.state) 'cancellation committed outcome must match terminal state.'
+                }else{
+                    # Native preparation cancellation predates a directory lease
+                    # and final manifest; it alone has no committed outcome.
+                    $prep=$r.error
+                    Assert-SE ($r.state -ceq 'cancelled' -and (Exact-SE (Field-SE $prep 'code') 'preparation_cancelled') -and (Exact-SE (Field-SE $prep 'phase') 'preparation') -and (Exact-SE (Field-SE $prep 'message') 'queued destination preparation was cancelled')) 'null cancellation outcome requires exact native preparation diagnostic.'
+                    foreach($n in @('scheduled','acquired','written','dropped','failed','cancelled','inFlight')){Assert-SE ($r.counts.$n -eq 0) 'preparation cancellation cannot contain scheduled or completed children.'}
+                    Assert-SE ($r.artifacts.Count -eq 0 -and $r.artifactProgress.terminal -eq 1 -and $r.artifactProgress.successful -eq 0 -and $null -eq $r.manifest.partialPath -and $null -eq $r.manifest.finalPath -and $r.packaging.frameManifest.state -ceq 'cancelled' -and $null -eq (Field-SE $r.packaging.frameManifest 'path') -and $r.errors.Count -eq 1 -and (Equal-SE $r.errors[0] $prep)) 'preparation cancellation must have zero artifacts, no manifest and one exact retained diagnostic.'
+                }
+                $cancellationTerminal=$true
+            }
             if ($r.state -ceq 'preparing') { Assert-SE ($r.termination.preparationPending -and -not $r.termination.finalizationCommitted) 'preparing state requires pending preparation.' }
             Fields-SE $r.manifest @('partialPath','finalPath')
             Fields-SE $r.packaging @('frameManifest','previewVideo')
@@ -204,7 +221,7 @@ function Get-DevBenchScreenshotSequenceEvidence {
         Artifacts-SE $r.artifacts $DestinationDirectory $false
         Assert-SE ($r.artifactProgress.expected -eq 1) 'parent progress describes one manifest, not stereo image count.'
         $owner=[pscustomobject]@{requestId=$r.requestId;clientId=$r.clientId;commandId=$r.commandId;acceptedUtc=$r.acceptedUtc;buildId=$ExpectedBuildId;serviceSessionId=$ExpectedServiceSessionId;destinationDirectory=$DestinationDirectory;requested=(Copy-SE $r.requested)}
-        return [pscustomobject]@{ok=$true;raw=$Payload;owner=$owner;receipt=(Copy-SE $r);terminal=$terminal;requestSucceeded=($terminal -and -not $alreadyTerminal -and $r.state -cin @('completed','completed_with_warnings'));commandAccepted=$commandAccepted;cancelCoverage=($Arguments.action -ceq 'request_cancel' -and $commandAccepted -eq $true -and $r.state -cin @('cancelled','cancelled_partial'));basis='owned-schema2-sequence-observation; not image/science success';errors=@()}
+        return [pscustomobject]@{ok=$true;raw=$Payload;owner=$owner;receipt=(Copy-SE $r);terminal=$terminal;requestSucceeded=($terminal -and -not $alreadyTerminal -and $r.state -cin @('completed','completed_with_warnings'));commandAccepted=$commandAccepted;cancelCoverage=($Arguments.action -ceq 'request_cancel' -and $commandAccepted -eq $true -and $cancellationTerminal);basis='owned-schema2-sequence-observation; not image/science success';errors=@()}
     } catch { return [pscustomobject]@{ok=$false;raw=$Payload;owner=$null;receipt=$null;terminal=$false;requestSucceeded=$false;commandAccepted=$null;cancelCoverage=$false;errors=@($_.Exception.Message)} }
 }
 function Get-DevBenchScreenshotSequenceFrameEvidence {
