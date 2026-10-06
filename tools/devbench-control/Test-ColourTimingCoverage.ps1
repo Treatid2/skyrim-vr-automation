@@ -13,7 +13,9 @@ foreach($timingMode in $modes){
     $script:timingEyes=$null;$script:timingCaptureEyes=$null;$script:timingCaptureFrame=61039
     $plan=$fixture.Plan.Clone();$plan.capturesPerCondition=4
     $plan.burnIn=@{minimumElapsedMilliseconds=20;minimumObservedCpuFrameIdAdvancePerEye=2;minimumDistinctFreshSuccessfulBothEyeObservations=3;maximumElapsedMilliseconds=600}
-    if($timingMode -ceq 'deadline'){$plan.burnIn.minimumElapsedMilliseconds=400}
+    # Leave startup enough real-clock budget to establish the matching dispatch.
+    # Then require coverage beyond the original deadline; 100ms raced startup.
+    if($timingMode -ceq 'deadline'){$plan.burnIn.minimumElapsedMilliseconds=2000;$plan.burnIn.maximumElapsedMilliseconds=3000}
     if($timingMode -ceq 'spacing-only'){$plan.Remove('burnIn');$plan.minimumElapsedMillisecondsBetweenCaptureArms=1000;$plan.capturesPerCondition=2}
     $call={param($name,$argsMap,$mutation,$bound)
         if($script:timingMode -ceq 'lost-set'){$script:mode='lost-set'}
@@ -79,7 +81,7 @@ foreach($timingMode in $modes){
     }
     $cleanup={param($name,$argsMap,$mutation,$bound)$script:timingCleanup=$true;& $call $name $argsMap $mutation $bound}
     $deadline=[datetime]::UtcNow.AddSeconds(25)
-    if($timingMode -ceq 'deadline'){$deadline=[datetime]::UtcNow.AddMilliseconds(100)}
+    if($timingMode -ceq 'deadline'){$deadline=[datetime]::UtcNow.AddSeconds(1)}
     $started=[Diagnostics.Stopwatch]::StartNew()
     $r=Invoke-DevBenchColourMeasurement -Call $call -CompilerGuard $guard -Plan $plan -DeadlineUtc $deadline -CleanupCall $cleanup -CleanupDeadlineUtc $deadline.AddSeconds(2) -PollMilliseconds 10
     $expected=$timingMode -cin @('healthy','transient','spacing-only','inputs-available','inputs-unavailable')
@@ -105,6 +107,7 @@ foreach($timingMode in $modes){
         if($timingMode -cnotin @('lost-set','page-inputs-malformed','page-inputs-conflict')){TCheck (@($r.conditions|Where-Object {$null -ne $_.burnIn -and -not $_.burnIn.complete}).Count -ge 1) 'Coverage failure separate from captured native dispatch'}
         if($timingMode -cne 'lost-set'){TCheck $r.conditions[-1].nativeDispatchMatched 'Initial matched dispatch is not burn-in completion'}
         if($timingMode -cin @('stale','deadline','regression','dimensions','sharpness','context','compiler')){TCheck ($r.captures.Count -eq 0 -and $r.conditions.Count -eq 1) 'No arm/next condition after coverage failure'}
+        if($timingMode -ceq 'deadline'){TCheck ([datetime]::UtcNow -ge $deadline -and $r.conditions[0].burnIn.failureCode -ceq 'burn-in-incomplete') 'Original deadline actually expired after initial match, without another arm'}
         if($timingMode -ceq 'stale'){TCheck ($r.conditions[0].burnIn.distinctFreshSuccessfulBothEyeObservations -eq 1 -and $r.conditions[0].burnIn.observedCpuFrameIdAdvancePerEye[0] -eq 0) 'Advancing serial alone never counts stale CPU frames'}
         if($timingMode -ceq 'inputs-stale'){TCheck ($r.captures.Count -eq 0 -and $r.conditions[0].burnIn.distinctFreshSuccessfulBothEyeObservations -eq 1) 'Available input telemetry never makes stale CPU frames fresh'}
         if($timingMode -cin @('read-budget','read-unavailable','compiler-refusal')){
