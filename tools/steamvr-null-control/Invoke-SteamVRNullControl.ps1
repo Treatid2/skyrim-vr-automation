@@ -582,7 +582,7 @@ function Get-NullSettingsExpectation([Collections.IDictionary]$Receipt, [string]
             $controlled.Add("$section.$key")
         }
     }
-    return [pscustomobject][ordered]@{ value = $expected; profile = $profile; controlledPaths = @($controlled); semanticSha256 = Get-JsonSemanticSha256 -Value $expected }
+    return [pscustomobject][ordered]@{ value = $expected; profile = $profile; profilePath = $profilePath; controlledPaths = @($controlled); semanticSha256 = Get-JsonSemanticSha256 -Value $expected }
 }
 
 function Get-SettingsRestoreValidation([Collections.IDictionary]$Receipt, [string]$BackupPath, [string]$CurrentPath) {

@@ -297,6 +297,15 @@ for this option is bounded to 1 MiB with duplicate keys refused.
 Untouched baseline values are copied as raw JSON, including full-precision
 numbers. Drift comparison uses exact decimal coefficient/exponent identities
 from the current raw JSON, so changes hidden by floating-point parsing refuse.
+For receipt-profile-owned floating-point leaves only, the exact declared decimal
+or the finite binary64 value's canonical invariant `G17` runtime spelling is
+accepted, with identical binary64 bits and floating-point type required. For
+example, profile `1.68` and runtime `1.6799999999999999` are the same controlled
+eye height. This is not a tolerance: changed bits (including signed zero), type
+changes and arbitrary extra precision still refuse. The whole-document check
+uses that same admitted owned-leaf result; unowned values and additional keys
+retain strict raw-decimal, type, case and structure comparison. Numeric settings
+are restored from the baseline, not preserved as additional selected UI leaves.
 
 Staging verifies the accepted preimage and selected result hashes again before
 dispatch. Failure after mutation rolls back to the exact accepted live bytes,
