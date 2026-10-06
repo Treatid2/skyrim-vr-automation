@@ -2,15 +2,18 @@
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'NativeReadContracts.ps1')
 
-function Assert-ColourMeasurementPlan([Collections.IDictionary]$Plan) {
+function Assert-ColourMeasurementPlan([Collections.IDictionary]$Plan,[switch]$FixedAutoExposure) {
     $keys=@('expectedBuildId','expectedRevision','expectedCellFormId','highDynamicRangeInput','capturesPerCondition','metadata')
     $optional=@('burnIn','minimumElapsedMillisecondsBetweenCaptureArms')
+    if($FixedAutoExposure){$keys+=@('autoExposure')+$optional;$optional=@()}
     if ($null -eq $Plan -or @($keys | Where-Object {-not $Plan.Contains($_)}).Count -or @($Plan.Keys | Where-Object {$_ -cnotin ($keys+$optional)}).Count) { throw 'Colour plan requires six documented fields and only supported optional timing fields.' }
     if ($Plan.expectedBuildId -isnot [string] -or $Plan.expectedBuildId -cnotmatch '^[0-9a-f]{64}$' -or $Plan.highDynamicRangeInput -isnot [bool]) { throw 'Colour plan requires exact build and fixed Boolean HDR input.' }
     foreach($name in @('expectedRevision','expectedCellFormId','capturesPerCondition')) {
         if ($null -eq $Plan[$name] -or $Plan[$name].GetType() -notin @([int],[long],[uint32],[uint64]) -or $Plan[$name] -lt 1) { throw "Colour plan $name requires a positive integer." }
     }
-    if ($Plan.capturesPerCondition -gt 4 -or $Plan.expectedCellFormId -gt [uint32]::MaxValue) { throw 'Colour plan exceeds finite capture/cell bounds.' }
+    $maximumCaptures=if($FixedAutoExposure){16}else{4}
+    if ($Plan.capturesPerCondition -gt $maximumCaptures -or $Plan.expectedCellFormId -gt [uint32]::MaxValue) { throw 'Colour plan exceeds finite capture/cell bounds.' }
+    if($FixedAutoExposure -and $Plan.autoExposure -isnot [bool]){throw 'Fixed-AE baseline requires an explicit actual Boolean autoExposure.'}
     if ($Plan.metadata -isnot [Collections.IDictionary] -or -not $Plan.metadata.Contains('calibratedScene') -or $Plan.metadata.calibratedScene -isnot [string] -or [string]::IsNullOrWhiteSpace($Plan.metadata.calibratedScene) -or [Text.Encoding]::UTF8.GetByteCount(($Plan.metadata|ConvertTo-Json -Depth 20 -Compress)) -gt 15000) { throw 'Explicit experiment-owner calibratedScene metadata (at most15000 UTF8 bytes) is required.' }
     if($Plan.Contains('burnIn')){
         $burn=$Plan.burnIn
@@ -30,8 +33,9 @@ function Invoke-DevBenchColourMeasurement {
           [Parameter(Mandatory)][datetime]$DeadlineUtc,
           [scriptblock]$CleanupCall,
           [datetime]$CleanupDeadlineUtc=$DeadlineUtc,
+          [switch]$FixedAutoExposure,
           [ValidateRange(10,1000)][int]$PollMilliseconds=100)
-    Assert-ColourMeasurementPlan $Plan
+    Assert-ColourMeasurementPlan $Plan -FixedAutoExposure:$FixedAutoExposure
     $colour='communityshaders.fsr_color_contract'; $probe='communityshaders.colour_pipeline_probe'
     $stages=@('fsr_input','fsr_output','combined_main','imagespace_input','imagespace_output')
     $captures=[Collections.Generic.List[object]]::new(); $conditions=[Collections.Generic.List[object]]::new()
@@ -110,6 +114,7 @@ function Invoke-DevBenchColourMeasurement {
             $d=$Status.lastSuccessfulEyeDispatches[$eye]
             if (-not $d.valid) { return $false }
             if ($d.path -ne 3 -or $d.contextIndex -ne $eye -or $d.contextGeneration -ne $c.generation -or $d.highDynamicRangeInput -cne $Plan.highDynamicRangeInput -or $d.autoExposure -cne $AutoExposure) { throw 'Successful eye dispatch mismatches FSR4 context/flags/eye.' }
+            if($FixedAutoExposure -and (-not $d.PSObject.Properties['submittedInputs'] -or $d.submittedInputs.available -isnot [bool] -or -not $d.submittedInputs.available)){throw 'Fixed-AE baseline requires available native submitted reset/jitter/delta telemetry; never synthesize it.'}
         }
         foreach($field in @('frame','contextGeneration','path','renderWidth','renderHeight','displayWidth','displayHeight','configuredSharpnessAtDispatch','effectiveSharpness','sharpeningEnabled')) { if($a.$field -cne $b.$field) { throw "Successful eyes disagree: $field." } }
         if ($a.serial -ge $b.serial -or $a.dispatchQpc -gt $b.dispatchQpc -or $Status.lastSuccessfulDispatch.serial -ne $b.serial) { throw 'Successful stereo dispatch ordering mismatch.' }
@@ -123,13 +128,19 @@ function Invoke-DevBenchColourMeasurement {
         $initial=Status $colour $DeadlineUtc
         if ($initial.requested.revision -ne $revision -or $initial.requested.highDynamicRangeInput -cne $Plan.highDynamicRangeInput) { throw 'Initial colour revision/fixed HDR mismatch.' }
         $originalAuto=$initial.requested.autoExposure;$knownAuto=$originalAuto;$knownColour=$true
+        if($FixedAutoExposure){
+            if($originalAuto -cne $Plan.autoExposure){throw 'Fixed-AE baseline current autoExposure differs from explicit admission; no colour set.'}
+            $colourCleanup.required=$true
+        }
         if($timed){$colourCleanup.verified=$true}
         $idle=Status $probe $DeadlineUtc
         if ($idle.state -cne 'idle') { throw 'Existing probe custody is not ours; refusing arm/reset.' }
-        foreach($auto in @($true,$false,$true)) {
+        $sequence=if($FixedAutoExposure){@($Plan.autoExposure)}else{@($true,$false,$true)}
+        foreach($auto in $sequence) {
             $condition=[ordered]@{autoExposure=$auto;setAttempted=$false;setAccepted=$false;setReply=$null;settled=$null;nativeDispatchMatched=$false;startupObservations=[Collections.Generic.List[object]]::new();burnIn=$null;complete=$false}
             $conditions.Add($condition)
             $pre=Guard $DeadlineUtc
+            if(-not $FixedAutoExposure){
             $condition.setAttempted=$true
             $colourCleanup.required=$timed;$colourCleanup.verified=(-not $timed)
             $knownColour=$false
@@ -147,6 +158,7 @@ function Invoke-DevBenchColourMeasurement {
             $revision=$next
             Assert-Revision $set $revision $auto
             $knownAuto=$auto;$knownColour=$true
+            }
             $settleDeadline=$DeadlineUtc
             if($null -ne $burnPolicy){
                 $burnStarted=$clock.Elapsed.TotalMilliseconds
@@ -256,6 +268,7 @@ function Invoke-DevBenchColourMeasurement {
                     if($null -eq $context){$context=$page.immediateContext.pointer}else{if($context -cne $page.immediateContext.pointer){throw 'Capture pages changed immediate context.'}}
                     if($d.attribution -cne 'observed-successful-dispatch' -or $d.colourContractRevision -ne $revision -or $d.contextGeneration -ne $s.runtimeContext.generation -or $d.contextIndex -ne $eye -or $d.frame -ne $p.cpuFrame -or $d.requestedHighDynamicRangeInput -cne $Plan.highDynamicRangeInput -or $d.effectiveHighDynamicRangeInput -cne $Plan.highDynamicRangeInput -or $d.requestedAutoExposure -cne $auto -or $d.effectiveAutoExposure -cne $auto -or $d.dispatchSerial -le 0){throw 'Page lacks matching actual successful eye dispatch.'}
                     if(@(Get-DevBenchSubmittedInputReasons -Dispatch $d -Successful $true).Count){throw 'Page submittedInputs is malformed or unsupported; raw page retained.'}
+                    if($FixedAutoExposure -and (-not $d.PSObject.Properties['submittedInputs'] -or $d.submittedInputs.available -isnot [bool] -or -not $d.submittedInputs.available)){throw 'Fixed-AE baseline page requires actual submitted reset/jitter/delta telemetry; raw page retained.'}
                     if($null -ne $burnPolicy){
                         foreach($field in @('renderWidth','renderHeight','displayWidth','displayHeight','configuredSharpnessAtDispatch','effectiveSharpness','sharpeningEnabled')){if(-not $d.PSObject.Properties[$field] -or $d.$field -cne $s.lastSuccessfulEyeDispatches[$eye].$field){throw "Burn-in qualified page signature changed: $field."}}
                         if(-not $d.PSObject.Properties['dispatchQpc'] -or -not (UInt $d.dispatchQpc 1) -or $d.dispatchSerial -le $lastFresh.lastSuccessfulEyeDispatches[$eye].serial -or $d.dispatchQpc -le $lastFresh.lastSuccessfulEyeDispatches[$eye].dispatchQpc){throw 'Capture eye dispatch did not advance beyond final burn-in observation.'}
@@ -331,6 +344,7 @@ function Invoke-DevBenchColourMeasurement {
                     if(@(Get-DevBenchNativeReadReasons -Kind 'fsr-colour-status' -Payload $read -Arguments $restoreArgs).Count){throw 'AE restoration read schema unqualified.'}
                     Assert-Revision $read $revision $knownAuto
                     if($knownAuto -cne $originalAuto){
+                        if($FixedAutoExposure){throw 'Fixed-AE baseline never writes the colour contract, including cleanup.'}
                         $colourCleanup.attempted=$true
                         $colourCleanup.reply=& $CleanupCall $colour @{action='set';expectedBuildId=$Plan.expectedBuildId;expectedRevision=$revision;highDynamicRangeInput=$Plan.highDynamicRangeInput;autoExposure=$originalAuto} $true $CleanupDeadlineUtc
                         $restored=One $colourCleanup.reply
@@ -347,6 +361,6 @@ function Invoke-DevBenchColourMeasurement {
             }catch{$colourCleanup.errors.Add($_.Exception.Message);$errors.Add('AE restoration: '+$_.Exception.Message)}
         }
     }
-    return [pscustomobject]@{ok=($errors.Count -eq 0 -and $colourCleanup.verified);conditions=@($conditions);captures=@($captures);compilerBoundaries=@($guards);errors=@($errors);indeterminate=($uncertain -or -not $probeCleanup.verified -or -not $colourCleanup.verified);probeResetVerified=$resetVerified;probeCleanup=$probeCleanup;colourCleanup=$colourCleanup;retainedProbe=$owned;finalRevision=$revision;completionBasis='native-stereo-dispatch-and-ten-owned-pages-not-scientific-colour';burnInRequested=($null -ne $burnPolicy);vendorExposureConvergenceKnown=$false;nativeCaptureDeadlineSeconds=15;nativeReadbackFrameLimit=120;calibrationOwnedByCaller=$true;qualityAndRenderScaleAdmissionOwnedByCaller=$true}
+    return [pscustomobject]@{ok=($errors.Count -eq 0 -and $colourCleanup.verified);conditions=@($conditions);captures=@($captures);compilerBoundaries=@($guards);errors=@($errors);indeterminate=($uncertain -or -not $probeCleanup.verified -or -not $colourCleanup.verified);probeResetVerified=$resetVerified;probeCleanup=$probeCleanup;colourCleanup=$colourCleanup;retainedProbe=$owned;finalRevision=$revision;completionBasis='native-stereo-dispatch-and-ten-owned-pages-not-scientific-colour';burnInRequested=($null -ne $burnPolicy);vendorExposureConvergenceKnown=$false;nativeCaptureDeadlineSeconds=15;nativeReadbackFrameLimit=120;calibrationOwnedByCaller=$true;qualityAndRenderScaleAdmissionOwnedByCaller=$true;fixedAutoExposureBaseline=[bool]$FixedAutoExposure}
 }
 Export-ModuleMember -Function Assert-ColourMeasurementPlan,Invoke-DevBenchColourMeasurement

@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-[CmdletBinding()]param([Parameter(Mandatory)][string]$FixtureRoot)
+[CmdletBinding()]param([Parameter(Mandatory)][string]$FixtureRoot,[switch]$FixedAutoExposure,[string[]]$FixtureModes)
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 $checks=0
 function Check([bool]$Value,[string]$Message){if(-not $Value){throw $Message};$script:checks++}
 $root=Join-Path $FixtureRoot ('colour-entry-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root|Out-Null
-foreach($mode in @('healthy','partial-page','compiler','schema-missing','lost-arm','lost-reset','string-page-generation','native-failure','burnin-incomplete','session-retired')){
+$modes=if($FixedAutoExposure){@('healthy','healthy-false','ae-mismatch','hdr-mismatch','foreign-revision','telemetry-unavailable','telemetry-malformed','page-telemetry-unavailable','partial-page','compiler','schema-missing','lost-arm','lost-reset','burnin-incomplete','budget-incomplete','foreign-cell','session-retired')}else{@('healthy','partial-page','compiler','schema-missing','lost-arm','lost-reset','string-page-generation','native-failure','burnin-incomplete','session-retired')}
+if($FixtureModes){if(@($FixtureModes|Where-Object {$_ -cnotin $modes}).Count){throw 'Unknown public fixture case'};$modes=@($FixtureModes)}
+foreach($mode in $modes){
     $dir=Join-Path $root $mode;New-Item -ItemType Directory -Path $dir|Out-Null
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0);$listener.Start();$port=$listener.LocalEndpoint.Port
     $events=[Collections.Concurrent.ConcurrentQueue[object]]::new()
-    $server=Start-ThreadJob -ArgumentList $listener,$mode,$PSScriptRoot,$events,$PID,$port -ScriptBlock {
-        param($Listener,$Mode,$Source,$Events,$OwnerPid,$Port)
+    $server=Start-ThreadJob -ArgumentList $listener,$mode,$PSScriptRoot,$events,$PID,$port,[bool]$FixedAutoExposure -ScriptBlock {
+        param($Listener,$Mode,$Source,$Events,$OwnerPid,$Port,$Baseline)
         $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
-        $fixture=. (Join-Path $Source 'Test-ColourMeasurementWindow.ps1') -FixtureOnly -FixtureMode $Mode
+        $fixture=. (Join-Path $Source $(if($Baseline){'Test-FixedAEColourBaseline.ps1'}else{'Test-ColourMeasurementWindow.ps1'})) -FixtureOnly -FixtureMode $Mode
         $binding=[pscustomobject]@{processSession='colour-calendar-fixture';pid=$OwnerPid;loadGeneration=1;cellFormId=7;globalFormIds=@(1,2,3,4,5,6)}
         $values=[pscustomobject]@{year=201;month=1;day=1;gameHour=12;daysPassed=1;calendarRate=20;engineMultiplier=1}
         $lease=$null;$restored=$false
@@ -57,9 +59,10 @@ foreach($mode in @('healthy','partial-page','compiler','schema-missing','lost-ar
                             if($headers['Mcp-Session-Id'] -cne 'colour-fixture'){throw 'fixture wrong session'}
                             if($name -ceq 'inspect'){$payload=@{pid=$OwnerPid;exe='pwsh.exe';port=$Port;frame=1;lastTaskFrame=-1;pendingTasks=0;vr=$true}}
                             elseif($name -ceq 'calendar'){
-                                if($query.action -ceq 'hold'){$lease=[pscustomobject]@{id='owned-colour-lease';owner=$query.owner;commandId=$query.commandId;binding=$binding;captured=$values;applied=$true}}
+                                if($Mode -ceq 'foreign-cell' -and $armCount -gt 0){$binding.cellFormId=8}
+                                if($query.action -ceq 'hold'){$lease=[pscustomobject]@{id='owned-colour-lease';owner=$query.owner;commandId=$query.commandId;binding=($binding|ConvertTo-Json|ConvertFrom-Json);captured=$values;applied=$true}}
                                 if($query.action -ceq 'release'){
-                                    if($query.leaseId -cne $lease.id -or $query.owner -cne $lease.owner -or ($query.binding|ConvertTo-Json -Compress) -cne ($binding|ConvertTo-Json -Compress)){throw 'fixture foreign calendar release'}
+                                    if($query.leaseId -cne $lease.id -or $query.owner -cne $lease.owner -or ($query.binding|ConvertTo-Json -Compress) -cne ($lease.binding|ConvertTo-Json -Compress)){throw 'fixture foreign calendar release'}
                                     $restored=$true
                                 }
                                 $active=$null -ne $lease -and -not $restored
@@ -77,6 +80,7 @@ foreach($mode in @('healthy','partial-page','compiler','schema-missing','lost-ar
                                 try{
                                     $map=$query|ConvertTo-Json -Depth 30|ConvertFrom-Json -AsHashtable -Depth 30
                                     $reply=& $fixture.Call $name $map ($query.action -cin @('set','arm','reset')) ([datetime]::UtcNow.AddSeconds(30));$payload=$reply.content[0]
+                                    if($Mode -ceq 'foreign-cell' -and $name -ceq 'communityshaders.colour_pipeline_probe' -and $query.action -ceq 'arm'){$armCount++}
                                     if($Mode -ceq 'session-retired'){
                                         if($name -ceq 'communityshaders.colour_pipeline_probe' -and $query.action -ceq 'arm'){$armCount++}
                                         if($name -ceq 'communityshaders.colour_pipeline_probe' -and $query.action -ceq 'status' -and $armCount -eq 8 -and $payload.state -ceq 'complete'){$eighthNativeComplete=$true}
@@ -96,27 +100,33 @@ foreach($mode in @('healthy','partial-page','compiler','schema-missing','lost-ar
         }}catch{if($Listener.Server.IsBound){throw}}finally{$Listener.Stop()}
     }
     try{
-        $fixture=& (Join-Path $PSScriptRoot 'Test-ColourMeasurementWindow.ps1') -FixtureOnly
+        $fixture=& (Join-Path $PSScriptRoot $(if($FixedAutoExposure){'Test-FixedAEColourBaseline.ps1'}else{'Test-ColourMeasurementWindow.ps1'})) -FixtureOnly -FixtureMode $mode
         $plan=$fixture.Plan;$plan.capturesPerCondition=1
-        if($mode -ceq 'session-retired'){$plan.capturesPerCondition=4;$plan.minimumElapsedMillisecondsBetweenCaptureArms=1}
+        if($FixedAutoExposure -and $mode -cin @('healthy','healthy-false','session-retired')){$plan.capturesPerCondition=16}
+        if($FixedAutoExposure){$plan.burnIn.maximumElapsedMilliseconds=4000}
+        if($mode -ceq 'session-retired' -and -not $FixedAutoExposure){$plan.capturesPerCondition=4;$plan.minimumElapsedMillisecondsBetweenCaptureArms=1}
+        if($mode -ceq 'budget-incomplete'){$plan.capturesPerCondition=16;$plan.minimumElapsedMillisecondsBetweenCaptureArms=10000}
         # The real public transport refuses to start an RPC with less than1s
         # remaining; allow startup matching, then reject stagnant frame evidence.
         if($mode -ceq 'burnin-incomplete'){$plan.burnIn=@{minimumElapsedMilliseconds=10;minimumObservedCpuFrameIdAdvancePerEye=1;minimumDistinctFreshSuccessfulBothEyeObservations=2;maximumElapsedMilliseconds=4000}}
         $artifact=Join-Path $PSScriptRoot 'Test-ColourWindowEntryPoint.ps1'
         $runtime=Join-Path $dir 'runtime.json';@{port=$port;pid=$PID;buildId=$plan.expectedBuildId;artifactPath=$artifact;artifactSha256=(Get-FileHash $artifact).Hash}|ConvertTo-Json|Set-Content -LiteralPath $runtime
-        $reply=& (Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1') colour-window -RuntimePath $runtime -ColourPlanJson ($plan|ConvertTo-Json -Depth 20 -Compress) -CalendarOwner fixture-owner -CalendarHoldMilliseconds 30000 -TimeoutSeconds 30 -MaxTransientRetries 0 -EvidenceDirectory $dir -NoExit -Compact|ConvertFrom-Json -Depth 80
+        $command=if($FixedAutoExposure){'colour-baseline-window'}else{'colour-window'}
+        $seconds=if($FixedAutoExposure -and $mode -cin @('healthy','healthy-false','session-retired')){180}else{30}
+        $reply=& (Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1') $command -RuntimePath $runtime -ColourPlanJson ($plan|ConvertTo-Json -Depth 20 -Compress) -CalendarOwner fixture-owner -CalendarHoldMilliseconds ($seconds*1000) -TimeoutSeconds $seconds -MaxTransientRetries 0 -EvidenceDirectory $dir -NoExit -Compact|ConvertFrom-Json -Depth 80
         $reply|ConvertTo-Json -Depth 80|Set-Content -LiteralPath (Join-Path $dir 'result.json')
-        Check ($reply.ok -eq ($mode -ceq 'healthy')) "$mode public outcome: $($reply.errors -join ';')"
+        Check ($reply.ok -eq ($mode -cin @('healthy','healthy-false'))) "$mode public outcome: $($reply.errors -join ';')"
         $all=@($events.ToArray())
         Check (@($all|Where-Object method -CEQ 'initialize').Count -eq 1) "$mode no session rebind"
         Check (@($all|Where-Object {$_.method -ceq 'tools/call' -and $_.session -cne 'colour-fixture'}).Count -eq 0) "$mode uses one actual session"
         Check ($all[-1].method -ceq 'DELETE' -and $reply.sessionCleanup.ok) "$mode session finalized separately"
-        if($mode -ceq 'schema-missing'){Check (@($all|Where-Object {$_.name -ceq 'calendar' -and $_.arguments.action -ceq 'hold'}).Count -eq 0) 'schema refusal before hold'}else{
+        if($FixedAutoExposure){Check (@($all|Where-Object {$_.name -ceq 'communityshaders.fsr_color_contract' -and $_.arguments.action -cne 'status'}).Count -eq 0) "$mode ZERO public colour writes"}
+        if($mode -cin @('schema-missing','budget-incomplete')){Check (@($all|Where-Object {$_.name -ceq 'calendar' -and $_.arguments.action -ceq 'hold'}).Count -eq 0) 'schema/budget refusal before hold'}else{
             Check ($reply.data.restorationVerified -eq ($mode -cne 'session-retired')) "$mode calendar restoration independently reported"
             Check (@($all|Where-Object {$_.name -ceq 'calendar' -and $_.arguments.action -ceq 'hold'}).Count -eq 1 -and @($all|Where-Object {$_.name -ceq 'calendar' -and $_.arguments.action -ceq 'release'}).Count -eq 1) "$mode exact hold/release once"
             Check (@(Get-ChildItem -LiteralPath $dir -Filter 'colour-rpc.*.json' -File).Count -gt 0) "$mode immutable raw replies retained"
         }
-        if($mode -ceq 'healthy'){Check ($reply.data.measurement.captures.Count -eq 3 -and @($reply.data.measurement.captures|ForEach-Object {$_.pages}).Count -eq 30) 'public three conditions/all30 pages complete'}
+        if($mode -cin @('healthy','healthy-false')){ $count=if($FixedAutoExposure){16}else{3};Check ($reply.data.measurement.captures.Count -eq $count -and @($reply.data.measurement.captures|ForEach-Object {$_.pages}).Count -eq 10*$count) 'public full capture/page inventory complete'}
         if($mode -ceq 'session-retired'){
             $m=$reply.data.measurement;$captures=@($m.captures);$last=$captures[-1]
             Check ($reply.indeterminate -and $m.indeterminate) 'session loss retains indeterminate custody'
@@ -124,7 +134,8 @@ foreach($mode in @('healthy','partial-page','compiler','schema-missing','lost-ar
             Check ($last.armReply.content[0].accepted -and $last.generation -eq 15 -and $last.status.state -ceq 'complete' -and $last.status.queuedStageEyeSlots -eq 10 -and $last.status.mappedStageEyeSlots -eq 10) 'eighth accepted native-complete capture preserved'
             Check ($last.pages.Count -eq 0 -and -not $last.complete -and -not $last.resetVerified -and $m.retainedProbe.captureId -ceq $last.captureId -and $m.retainedProbe.generation -eq $last.generation) 'no page or reset qualification after eighth native completion'
             Check (@($all|Where-Object {$_.name -ceq 'communityshaders.colour_pipeline_probe' -and $_.arguments.action -ceq 'arm'}).Count -eq 8 -and @($all|Where-Object {$_.name -ceq 'communityshaders.colour_pipeline_probe' -and $_.arguments.action -ceq 'reset'}).Count -eq 7 -and @($all|Where-Object {$_.name -ceq 'communityshaders.colour_pipeline_probe' -and $_.arguments.action -ceq 'read'}).Count -eq 70) 'no arm reset or page replay'
-            Check ($m.conditions.Count -eq 2 -and @($all|Where-Object {$_.name -ceq 'communityshaders.fsr_color_contract' -and $_.arguments.action -ceq 'set'}).Count -eq 2) 'no successor on condition or speculative AE compensation'
+            $expectedConditions=if($FixedAutoExposure){1}else{2};$expectedSets=if($FixedAutoExposure){0}else{2}
+            Check ($m.conditions.Count -eq $expectedConditions -and @($all|Where-Object {$_.name -ceq 'communityshaders.fsr_color_contract' -and $_.arguments.action -ceq 'set'}).Count -eq $expectedSets) 'no successor on condition or speculative AE compensation'
             Check ($m.probeCleanup.attempted -and -not $m.probeCleanup.verified -and -not $m.colourCleanup.attempted -and -not $m.colourCleanup.verified) 'unresolved probe forbids speculative AE restoration'
             $failures=@($all|Where-Object httpStatus -CEQ '404 Not Found')
             $firstFailure=$failures[0];$prior=$all[[Array]::IndexOf($all,$firstFailure)-1]
@@ -144,4 +155,4 @@ foreach($mode in @('healthy','partial-page','compiler','schema-missing','lost-ar
         if($mode -cin @('lost-arm','lost-reset')){Check $reply.data.measurement.indeterminate 'lost mutation remains indeterminate';Check (@($all|Where-Object {$_.name -ceq 'communityshaders.colour_pipeline_probe' -and $_.arguments.action -ceq $mode.Substring(5)}).Count -eq 1) 'lost mutation not replayed'}
     }finally{$listener.Stop();Stop-Job $server;Remove-Job $server}
 }
-[pscustomobject]@{ok=$true;checks=$checks;cases=10;root=$root;scope='test-owned loopback real public entry; no Skyrim or live mutation'}|ConvertTo-Json -Compress
+[pscustomobject]@{ok=$true;checks=$checks;cases=$modes.Count;fixedAutoExposure=[bool]$FixedAutoExposure;root=$root;scope='test-owned loopback real public entry; no Skyrim or live mutation'}|ConvertTo-Json -Compress

@@ -1,5 +1,14 @@
 # DevBench Control
 
+## Fixed-AE temporal baseline
+
+Use `colour-baseline-window` for the narrowly typed, single-condition 1..16
+capture baseline in [COLOUR-BASELINE-WINDOW.md](COLOUR-BASELINE-WINDOW.md).
+It pins actual admitted AE/HDR, never writes the colour contract, requires actual
+submitted reset/jitter/delta telemetry, and reuses finite same-session calendar,
+probe custody, compiler/identity, burn-in and spacing guards. The total20..180s
+budget includes service-owned cleanup; partial coverage is not scientific PASS.
+
 ## Typed finite colour measurement
 
 Use `colour-window` only for the separate finite FSR autoExposure on/off/on
