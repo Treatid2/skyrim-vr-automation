@@ -68,6 +68,43 @@ Check (-not (ParentRead (Envelope $cancelArgs $bypass) $cancelArgs $accepted).ok
 $terminalCancel=Obj $base;$terminalCancel.state='cancelled';$terminalCancel.terminalUtc='2026-10-05T20:00:04Z';$terminalCancel.termination.cancelRequested=$true;$terminalCancel.termination.preparationPending=$false;$terminalCancel.termination.finalizationCommitted=$true;$terminalCancel.packaging.frameManifest.state='cancelled';$terminalCancel.packaging.frameManifest|Add-Member path $null;$terminalCancel.packaging.frameManifest|Add-Member error '';$terminalCancel.error=Obj @{code='preparation_cancelled';message='queued destination preparation was cancelled';phase='preparation'};$terminalCancel.errors=@($terminalCancel.error);$terminalCancel.artifactProgress.terminal=1
 $cancelledRead=ParentRead (Envelope $query $terminalCancel) $query $accepted
 Check ($cancelledRead.ok -and $cancelledRead.terminal -and -not $cancelledRead.requestSucceeded) 'typed cancelled preparation retained as unsuccessful terminal read'
+$preparationCancel=Obj $terminalCancel;$preparationCancel|Add-Member commandAccepted $true
+$preparationCoverage=ParentRead (Envelope $cancelArgs $preparationCancel) $cancelArgs $accepted
+Check ($preparationCoverage.ok -and $preparationCoverage.cancelCoverage) 'exact zero-work preparation cancellation qualifies accepted command coverage'
+$finalCancel=Obj $done;$finalCancel.state='cancelled_partial';$finalCancel.termination.cancelRequested=$true;$finalCancel.termination.committedOutcome='cancelled_partial';$finalCancel|Add-Member commandAccepted $true
+$finalCoverage=ParentRead (Envelope $cancelArgs $finalCancel) $cancelArgs $accepted
+Check ($finalCoverage.ok -and $finalCoverage.cancelCoverage -and -not $finalCoverage.requestSucceeded) 'matching final-manifest cancellation is coverage, not successful sequence'
+foreach($state in @('cancelled','cancelled_partial')){
+ foreach($defect in @('falseCausality','completedOutcome','otherOutcome','nullOutcome')){
+  $bad=Obj $finalCancel;$bad.state=$state;$bad.termination.committedOutcome=$state
+  switch($defect){falseCausality{$bad.termination.cancelRequested=$false};completedOutcome{$bad.termination.committedOutcome='completed'};otherOutcome{$bad.termination.committedOutcome='failed_partial'};nullOutcome{$bad.termination.committedOutcome=$null}}
+  $refused=ParentRead (Envelope $cancelArgs $bad) $cancelArgs $accepted
+  Check (-not $refused.ok -and -not $refused.cancelCoverage) "contradictory $state/$defect fails closed"
+ }
+}
+$forged=Obj $done;$forged.state='cancelled';$forged|Add-Member commandAccepted $true
+Check (-not (ParentRead (Envelope $cancelArgs $forged) $cancelArgs $accepted).ok) 'forged cancellation label on successful receipt refuses'
+foreach($defect in @('falseCausality','wrongCode','wrongMessage','wrongPhase','scheduled','acquired','written','dropped','failed','cancelled','inFlight','partialManifest','extraDiagnostic','packaging','progress')){
+ $bad=Obj $preparationCancel
+ switch($defect){
+  falseCausality{$bad.termination.cancelRequested=$false};wrongCode{$bad.error.code='other'};wrongMessage{$bad.error.message='other'};wrongPhase{$bad.error.phase='packaging'}
+  {$_ -cin @('scheduled','acquired','written','dropped','failed','cancelled','inFlight')}{$bad.counts.$defect=1}
+  partialManifest{$bad.manifest.partialPath=$directory+'\sequence.json.partial'};extraDiagnostic{$bad.errors+=Obj $bad.error};packaging{$bad.packaging.frameManifest.state='pending'};progress{$bad.artifactProgress.terminal=0}
+ }
+ Check (-not (ParentRead (Envelope $cancelArgs $bad) $cancelArgs $accepted).ok) "preparation cancellation exception cannot escape $defect"
+}
+foreach($field in @('useSettings','clipboard')){
+ foreach($value in @('missing','coerced','enabled')){
+  $bad=Obj $start;$args=Obj $startArgs
+  foreach($seq in @($bad.result.requested.sequence,$bad.result.effective,$args.sequence)){
+   $node=if($field -ceq 'clipboard'){$seq.capture}else{$seq}
+   if($value -ceq 'missing'){$node.PSObject.Properties.Remove($field)}
+   else{$node.$field=if($field -ceq 'clipboard'){if($value -ceq 'coerced'){0}else{'image'}}else{if($value -ceq 'coerced'){'false'}else{$true}}}
+  }
+  $argsMap=$args|ConvertTo-Json -Depth 80|ConvertFrom-Json -AsHashtable -Depth 80
+  Check (-not (ParentRead $bad $argsMap).ok) "explicit recipe refuses $field/$value"
+ }
+}
 $storage=Obj $terminalCancel;$storage.state='failed';$storage.termination.cancelRequested=$false;$storage.packaging.frameManifest.state='failed';$storage.error.code='destination_preparation_failed';$storage.error.message='isolated worker fixture';$storage.error.phase='preparation';$storage.errors=@($storage.error)
 $storageRead=ParentRead (Envelope $query $storage) $query $accepted
 Check ($storageRead.ok -and $storageRead.terminal -and -not $storageRead.requestSucceeded -and $storageRead.raw.result.errors[0].code -ceq 'destination_preparation_failed') 'safe fixture shape is read-qualified, not runtime worker evidence'

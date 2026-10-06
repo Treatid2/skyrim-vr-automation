@@ -61,7 +61,10 @@ client ID for the finite case; every command gets its own fresh command ID.
 
 Require current capabilities to advertise absolute destination, HMD submission,
 stereo PNG and compatible frame/duration limits. Do not use global defaults or
-adopt an existing directory. Native preparation creates an exclusive child
+adopt an existing directory. Require explicit actual Boolean `useSettings:false`
+and exact `clipboard:"none"`; missing, coerced or enabled alternatives refuse.
+The parent retains `useSettings`, and parent/generated captures retain clipboard.
+Native preparation creates an exclusive child
 directory. `preparing` is successful admission, not image or terminal success.
 `publication:unresolved` never qualifies. Parent artifact progress describes
 **one manifest**, not six images. The actual image artifacts live in child
@@ -122,6 +125,16 @@ children. Require native `cancelled`/`cancelled_partial`, drained owned work and
 a responsive status read. `alreadyTerminal:true` or `commandAccepted:false`
 after finalization is a valid late-command observation but cancellation coverage
 **not achieved**. Do not loop until a race is won. No accepted mutation replay.
+
+Terminal cancellation additionally requires the actual Boolean
+`termination.cancelRequested:true` and a non-null committed outcome equal to
+the terminal state. Contradictory evidence fails qualification, not merely
+coverage. The only null-outcome exception is exact native `preparation_cancelled`
+with the preparation diagnostic, zero scheduled/acquired/written/dropped/failed/
+cancelled/in-flight children, no partial/final manifest or artifacts, and settled
+zero-success manifest progress. This exception supports cancellation before a
+directory lease exists; it cannot qualify a forged state label or partial work.
+`cancelCoverage` uses these validated facts plus the accepted cancel command.
 
 ### One safe failure
 
