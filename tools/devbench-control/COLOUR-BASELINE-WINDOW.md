@@ -95,6 +95,14 @@ After-completion records use the positively owned generation and captured frame.
 are separate main-thread observations; equal endpoints cannot prove interval
 invariance, eye-matrix equivalence or causal association.
 
+Retain the actual native `gameHour`/`daysPassed` in each scene reply and the
+calendar status values in the surrounding immutable RPC trace. The original
+within-window calendar lease/readback/custody guard stays in force. A retained
+workspace does not establish equal hours, weather or lighting across runs;
+different observed hours are a scene-condition boundary, not a controlled
+numerical effect comparison. These observations never set time or freeze
+simulation, and do not claim whole-scene invariance from a calendar hold.
+
 Scene cell/player loss, malformed typed values, explicit native/MCP errors,
 read failures and late replies stop the assay while preserving raw evidence
 and independent service-owned cleanup. Native omitted scene time/weather stays
