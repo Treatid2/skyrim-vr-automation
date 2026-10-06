@@ -13,6 +13,11 @@ function Assert-Test([bool]$Condition, [string]$Name) {
 }
 function Hash([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
 function Write-Settings($Value) { [IO.File]::WriteAllText($settings, ($Value | ConvertTo-Json -Depth 64), [Text.UTF8Encoding]::new($false)) }
+function Set-NumericLiteral([string]$Json, [string]$Key, [string]$Literal) {
+    $pattern = '("' + [regex]::Escape($Key) + '"\s*:\s*)-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?'
+    if ([regex]::Matches($Json, $pattern).Count -ne 1) { throw "Numeric fixture must select exactly one leaf: $Key" }
+    return [regex]::Replace($Json, $pattern, { param($m) $m.Groups[1].Value + $Literal }.GetNewClosure())
+}
 function Invoke-Control([string]$Command, [hashtable]$Options = @{}) {
     $lines = & $entry $Command @common @Options -Compact -NoExit
     return ($lines -join [Environment]::NewLine) | ConvertFrom-Json -Depth 64
@@ -45,7 +50,7 @@ try {
     Write-Settings ([ordered]@{
         steamvr=[ordered]@{enableHomeApp=$true}
         DesktopUI=[ordered]@{pairing='891,465,800,600,0';settings_desktop='1349,529,800,600,1';other='retained'}
-        unrelated=[ordered]@{flag=$false;large=9007199254740992L;value=7}
+        unrelated=[ordered]@{flag=$false;large=9007199254740992L;value=7;unownedFloat=1.68}
     })
     $baselineText=[IO.File]::ReadAllText($settings).Replace('"value": 7','"value": 7, "precise": 1.123456789012345678901234567890')
     [IO.File]::WriteAllText($settings,$baselineText,[Text.UTF8Encoding]::new($false))
@@ -63,6 +68,13 @@ try {
     $applied.LastKnown=@{runtime='updated'}
     $applied.dashboard.lastAccessedExternalOverlayKey='history'
     Write-Settings $applied
+    $runtimeJson = Set-NumericLiteral ([IO.File]::ReadAllText($settings)) 'eyeHeightMeters' '1.6799999999999999'
+    [IO.File]::WriteAllText($settings, $runtimeJson, [Text.UTF8Encoding]::new($false))
+    $profileEye = $profileValue.driver_codex_head_pose.eyeHeightMeters
+    $runtimeEye = ($runtimeJson | ConvertFrom-Json -AsHashtable).driver_codex_head_pose.eyeHeightMeters
+    Assert-Test ($profileEye -is [double] -and $runtimeEye -is [double] -and
+        [BitConverter]::DoubleToInt64Bits($profileEye) -eq [BitConverter]::DoubleToInt64Bits($runtimeEye) -and
+        $runtimeJson -match '1\.6799999999999999') 'realistic runtime eye-height serialization retains exact profile binary64 bits'
     $admittedBytes=[IO.File]::ReadAllBytes($settings)
     $admittedHash=Hash $settings
     Assert-Refusal 'default restore continues refusing DesktopUI drift' @{WhatIf=$true}
@@ -101,6 +113,15 @@ try {
         Assert-Refusal ("refuses "+$case.name)
     }
     $raw=[Text.Encoding]::UTF8.GetString($admittedBytes)
+    foreach ($numericCase in @(
+        @{key='eyeHeightMeters';literal='1.6800000000000002';name='changed controlled binary64 bits'}
+        @{key='eyeHeightMeters';literal='1.68000000000000001';name='noncanonical controlled decimal hidden by Double parsing'}
+        @{key='positionX';literal='-0.0';name='controlled signed-zero bit change'}
+        @{key='unownedFloat';literal='1.6799999999999999';name='unowned canonical binary64 reserialization'}
+    )) {
+        [IO.File]::WriteAllText($settings, (Set-NumericLiteral $raw $numericCase.key $numericCase.literal))
+        Assert-Refusal ('refuses ' + $numericCase.name)
+    }
     [IO.File]::WriteAllText($settings,$raw.Replace('"value": 7','"value": 7.00000000000000000001'))
     Assert-Refusal 'refuses decimal drift hidden by PowerShell floating-point parsing'
     $controlledRaw=$raw.Replace('"displayFrequency": 90.0','"displayFrequency": 90.00000000000000000001')

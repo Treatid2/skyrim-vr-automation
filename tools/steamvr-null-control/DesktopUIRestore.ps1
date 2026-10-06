@@ -96,6 +96,23 @@ function Read-DesktopUIRestoreInput([string]$Path) {
     }
 }
 
+function Test-DesktopUIRestoreControlledValueEquivalent($Expected, $Actual, $ExpectedExact, $ActualExact) {
+    # Only a profile-owned floating leaf may use a runtime's canonical G17
+    # binary64 spelling. This is not a tolerance or generic decimal coercion:
+    # arbitrary extra precision (even hidden by Double parsing) still refuses.
+    if ($Expected -is [double] -or $Actual -is [double]) {
+        if ($Expected -isnot [double] -or $Actual -isnot [double] -or
+            -not [double]::IsFinite($Expected) -or -not [double]::IsFinite($Actual) -or
+            [BitConverter]::DoubleToInt64Bits($Expected) -ne [BitConverter]::DoubleToInt64Bits($Actual)) { return $false }
+        if (Test-DesktopUIRestoreValueEquivalent $ExpectedExact $ActualExact) { return $true }
+        $canonical = [Text.Json.JsonDocument]::Parse($Expected.ToString('G17', [Globalization.CultureInfo]::InvariantCulture))
+        try { return Test-DesktopUIRestoreValueEquivalent (Get-DesktopUIRestoreExactValue $canonical.RootElement) $ActualExact }
+        finally { $canonical.Dispose() }
+    }
+    return (Test-DesktopUIRestoreValueEquivalent $Expected $Actual) -and
+        (Test-DesktopUIRestoreValueEquivalent $ExpectedExact $ActualExact)
+}
+
 function Get-DesktopUIRestoreStrings($Document) {
     if ($Document -isnot [Collections.IDictionary] -or 'DesktopUI' -cnotin @($Document.Keys) -or $Document['DesktopUI'] -isnot [Collections.IDictionary]) {
         throw 'DesktopUI preservation requires an actual exact-case DesktopUI JSON object.'
@@ -166,6 +183,8 @@ function Get-DesktopUISettingsRestorePlan($Receipt, [string]$BackupPath, [string
     $baseline = Read-DesktopUIRestoreInput $BackupPath
     if ($baseline.sha256 -cne [string]$Receipt['settingsSha256Before']) { throw 'DesktopUI restore baseline hash differs from apply receipt.' }
     $nullExpectation = Get-NullSettingsExpectation -Receipt $Receipt -BackupPath $BackupPath
+    $profileInput = Read-DesktopUIRestoreInput $nullExpectation.profilePath
+    if ($profileInput.sha256 -cne [string]$Receipt['profileSha256']) { throw 'DesktopUI restore profile hash differs from apply receipt.' }
     $current = Read-DesktopUIRestoreInput $CurrentPath
     $nullStrings = Get-DesktopUIRestoreStrings $nullExpectation.value
     $baselineStrings = Get-DesktopUIRestoreStrings $baseline.value
@@ -175,7 +194,7 @@ function Get-DesktopUISettingsRestorePlan($Receipt, [string]$BackupPath, [string
         $section, $key = $path -split '[.]', 2
         if ($section -cnotin @($current.value.Keys) -or $current.value[$section] -isnot [Collections.IDictionary] -or
             $key -cnotin @($current.value[$section].Keys) -or
-            -not (Test-DesktopUIRestoreValueEquivalent $nullExpectation.profile[$section][$key] $current.value[$section][$key])) {
+            -not (Test-DesktopUIRestoreControlledValueEquivalent $profileInput.value[$section][$key] $current.value[$section][$key] $profileInput.exactValue[$section][$key] $current.exactValue[$section][$key])) {
             throw "DesktopUI restore refuses controlled-key drift: $path"
         }
         if ($path -ceq 'power.turnOffControllersTimeout' -and
@@ -186,6 +205,13 @@ function Get-DesktopUISettingsRestorePlan($Receipt, [string]$BackupPath, [string
     $expectedDocument = [Text.Json.JsonDocument]::Parse(($nullExpectation.value | ConvertTo-Json -Depth 64 -Compress))
     try { $expectedExactValue = Get-DesktopUIRestoreExactValue $expectedDocument.RootElement }
     finally { $expectedDocument.Dispose() }
+    # Reconcile only already-admitted exact owned leaves with the whole-document
+    # projection. Never discard the containing section: its aliases/extra keys
+    # and every unowned raw numeric identity remain part of the strict check.
+    foreach ($path in @($nullExpectation.controlledPaths)) {
+        $section, $key = $path -split '[.]', 2
+        $current.exactValue[$section][$key] = $expectedExactValue[$section][$key]
+    }
     if (-not (Test-DesktopUIRestoreValueEquivalent (Get-DesktopUIRestoreProjection $expectedExactValue) (Get-DesktopUIRestoreProjection $current.exactValue))) {
         throw 'DesktopUI restore refuses other unclassified drift (including dotted-key or case aliases).'
     }
