@@ -5158,6 +5158,65 @@ function Read-MO2LaunchLogWindow {
     finally { $stream.Dispose() }
 }
 
+function Get-MO2LaunchBinaryDigest {
+    param([string]$Path)
+    # Bound file work and reject aliases before claiming a source/deployed binding.
+    Assert-MO2ControllerPhysicalPath -Path $Path
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -lt 1 -or $stream.Length -gt 16777216) { throw 'Loader binding exceeds the 16MiB digest budget.' }
+        $length = $stream.Length
+        $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream))
+        if ($stream.Length -ne $length -or $stream.Position -ne $length) { throw 'Loader changed during binding read.' }
+        return [pscustomobject]@{ bytes = $length; sha256 = $hash }
+    } finally { $stream.Dispose() }
+}
+
+function Get-MO2LaunchRootBinaryMapping {
+    param($Config, $Entry, [string]$Profile)
+    try {
+        $registered = [IO.Path]::GetFullPath([string]$Entry.binary)
+        $owner = Get-MO2ExecutableModOwner -Config $Config -Profile $Profile -Binary $registered
+        if (-not $owner.managedByMod -or $owner.state -cne 'enabled') { return $null }
+        $modRoot = Join-Path ([string]$owner.modsRoot) ([string]$owner.modName)
+        $root = [IO.Path]::GetFullPath((Join-Path $modRoot 'root')).TrimEnd('\')
+        if (-not $registered.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { return $null }
+        if (-not $Entry.PSObject.Properties['workingDirectory'] -or -not [IO.Path]::IsPathFullyQualified([string]$Entry.workingDirectory)) { return $null }
+        $destinationRoot = [IO.Path]::GetFullPath([string]$Entry.workingDirectory).TrimEnd('\')
+        if ($destinationRoot.StartsWith([string]$owner.modsRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { return $null }
+        Assert-MO2ControllerPhysicalPath -Path $destinationRoot
+        $relative = [IO.Path]::GetRelativePath($root, $registered)
+        $deployed = [IO.Path]::GetFullPath((Join-Path $destinationRoot $relative))
+        if (-not $deployed.StartsWith($destinationRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { return $null }
+        $digest = Get-MO2LaunchBinaryDigest -Path $registered
+        return [pscustomobject][ordered]@{
+            schemaVersion = 1; registeredBinary = $registered; sourceMod = $owner.modName; profile = $Profile
+            rootRelativePath = $relative; workingDirectory = $destinationRoot; expectedDeployedBinary = $deployed
+            sourceBytes = $digest.bytes; sourceSha256 = $digest.sha256
+            basis = 'enabled-registered-mod-root-relative-path-and-pre-dispatch-source-digest'
+        }
+    } catch { return $null } # Unavailable mapping never weakens exact-binary matching.
+}
+
+function Get-MO2LaunchBinaryBinding {
+    param($Boundary, [string]$ObservedBinary)
+    $actual = [IO.Path]::GetFullPath($ObservedBinary)
+    if ([string]::Equals($actual, [string]$Boundary.binary, [StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{ basis = 'exact-registered-binary'; registeredBinary = $Boundary.binary; actualBinary = $actual }
+    }
+    if (-not $Boundary.PSObject.Properties['rootBinaryMapping'] -or $null -eq $Boundary.rootBinaryMapping) { return $null }
+    $mapping = $Boundary.rootBinaryMapping
+    if ($mapping.schemaVersion -ne 1 -or $mapping.sourceSha256 -cnotmatch '^[0-9A-F]{64}$' -or
+        -not [string]::Equals([string]$mapping.registeredBinary, [string]$Boundary.binary, [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals($actual, [string]$mapping.expectedDeployedBinary, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+    $digest = Get-MO2LaunchBinaryDigest -Path $actual
+    if ($digest.bytes -ne $mapping.sourceBytes -or $digest.sha256 -cne $mapping.sourceSha256) { return $null }
+    return [pscustomobject]@{
+        basis = 'root-relative-path-and-equal-deployed-bytes'; registeredBinary = $Boundary.binary; actualBinary = $actual
+        sourceMapping = $mapping; deployedBytes = $digest.bytes; deployedSha256 = $digest.sha256
+    }
+}
+
 function New-MO2LaunchLogBoundary {
     param($Config, $Validation, [string]$AttemptId, [string]$Profile, [string]$Executable, [string]$ArgumentLine, [bool]$RetainedOwner)
     try {
@@ -5166,6 +5225,7 @@ function New-MO2LaunchLogBoundary {
         $path = Join-Path ([IO.Path]::GetFullPath([string]$Config.mo2.root)) 'logs\mo_interface.log'
         $boundary = [pscustomobject][ordered]@{
             available = $true; contractVersion = 1; attemptId = $AttemptId; profile = $Profile; executable = $Executable
+            rootBinaryMapping = Get-MO2LaunchRootBinaryMapping -Config $Config -Entry $entries[0] -Profile $Profile
             mo2Path = [IO.Path]::GetFullPath([string]$Config.mo2.executable); binary = [IO.Path]::GetFullPath([string]$entries[0].binary)
             path = $path; retainedOwner = $RetainedOwner; expectedCommandLine = ('"' + [IO.Path]::GetFullPath([string]$Config.mo2.executable) + '" ' + $ArgumentLine)
             existed = Test-Path -LiteralPath $path -PathType Leaf; length = 0L; anchorOffset = 0L; anchorLength = 0; anchorSha256 = $null; prefixLength = 0; prefixSha256 = $null
@@ -5232,14 +5292,17 @@ function Get-MO2LaunchFailureEvidence {
         $pattern = "(?m)^\[(?<stamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) E\] Error (?<code>[1-9]\d{0,9}) (?<message>[^\r\n]+)\r?\n\[\k<stamp> E\]  \. binary: '(?<binary>[^'\r\n]+)'\r?$"
         foreach ($match in @([regex]::Matches($text, $pattern))) {
             $errorUtc = [DateTime]::ParseExact($match.Groups['stamp'].Value, 'yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture, $styles)
-            if ($errorUtc -lt $dispatchUtc -or $errorUtc -gt [DateTime]::UtcNow -or
-                -not [string]::Equals([IO.Path]::GetFullPath($match.Groups['binary'].Value), [string]$boundary.binary, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ($errorUtc -lt $dispatchUtc -or $errorUtc -gt [DateTime]::UtcNow) { continue }
+            try { $binaryBinding = Get-MO2LaunchBinaryBinding -Boundary $boundary -ObservedBinary $match.Groups['binary'].Value }
+            catch { continue } # An unreadable/unproven alias cannot qualify this error.
+            if ($null -eq $binaryBinding) { continue }
             $verification = Read-MO2LaunchLogWindow -Path ([string]$boundary.path) -Offset $offset -MaximumBytes $window.bytesRead
             if ($verification.sha256 -cne $window.sha256) { return $null }
             return [pscustomobject][ordered]@{
                 schemaVersion = 1; classification = 'loader-spawn-failed'; sessionId = $Owned.sessionId; attemptId = $boundary.attemptId
                 observedUtc = [DateTime]::UtcNow.ToString('o'); dispatchStartedUtc = $dispatchUtc.ToString('o'); owner = $owner
-                binary = $boundary.binary; win32ErrorCode = [uint32]$match.Groups['code'].Value; message = $match.Groups['message'].Value
+                binary = $binaryBinding.actualBinary; registeredBinary = $boundary.binary; binaryBinding = $binaryBinding
+                win32ErrorCode = [uint32]$match.Groups['code'].Value; message = $match.Groups['message'].Value
                 cause = 'unassigned'; errorLogTimestampUtc = $errorUtc.ToString('o'); logPath = $boundary.path
                 byteOffset = $window.offset; byteLength = $window.bytesRead; bounds = '[offset,offset+length)'; windowSha256 = $window.sha256
                 matchedText = $match.Value; logBoundary = $boundary; windowStableAtVerification = $true
@@ -5319,6 +5382,20 @@ function Invoke-MO2Status {
         [string]$owned.data.launchFailure.attemptId -ceq [string]$owned.data.launchAttemptId) { $launchFailure = $owned.data.launchFailure }
     $buildData = @($data.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
     $windows = if ($data.processes.mo2.Count -gt 0) { @(Get-MO2WindowSnapshot -Processes @($data.processes.mo2)) } else { @() }
+    # A currently owned modal is a blocker, not detailed historical spawn proof.
+    # Never call an owned failed-to-run UI healthy because its log is unqualified.
+    $launchBlocker = $null
+    if ($owned -and [string]$owned.data.status -ceq 'launching' -and $data.processes.game.Count -eq 0 -and
+        $null -ne $ownershipResolution -and $ownershipResolution.ok -and @($ownershipResolution.targets).Count -eq 1 -and $data.processes.mo2.Count -eq 1) {
+        $blockedWindows = @($windows | Where-Object {
+            $_.PSObject.Properties['visible'] -and $_.visible -is [bool] -and $_.visible -and
+            $_.PSObject.Properties['processId'] -and [int]$_.processId -eq [int]$ownershipResolution.targets[0].id -and
+            $_.PSObject.Properties['dialogKind'] -and $_.dialogKind -cin @('failed-to-run','failed-to-write-settings')
+        })
+        if ($blockedWindows.Count -gt 0) {
+            $launchBlocker = [pscustomobject]@{classification='owned-blocking-launch-dialog';sessionId=$owned.sessionId;owner=$ownershipResolution.targets[0];windows=$blockedWindows;cause='unassigned';detailedSpawnProofAvailable=([bool]$launchFailure);observedUtc=[DateTime]::UtcNow.ToString('o')}
+        }
+    }
     $openingCompleted = $false
     if ($owned -and (Test-MO2OpeningReady -Owned $owned -OwnershipResolution $ownershipResolution -MO2Processes @($data.processes.mo2) -GameProcesses @($data.processes.game) -Windows @($windows))) {
         Set-MO2OwnedSessionStatus -Owned $owned -Status 'mo2-open' -TimestampProperty 'openCompletedUtc'
@@ -5339,7 +5416,7 @@ function Invoke-MO2Status {
         }
         catch { $launchStartedUtc = $null }
     }
-    $launchPending = $null -ne $launchStartedUtc -and $launchElapsedSeconds -lt $launchGraceSeconds
+    $launchPending = $null -eq $launchBlocker -and $null -ne $launchStartedUtc -and $launchElapsedSeconds -lt $launchGraceSeconds
     $recordedGameResolution = if ($owned -and $owned.data.PSObject.Properties['gameProcesses'] -and @($owned.data.gameProcesses).Count -gt 0) {
         Resolve-MO2RecordedGameProcessTargets -Recorded @($owned.data.gameProcesses) -Current @($data.processes.game)
     }
@@ -5348,14 +5425,17 @@ function Invoke-MO2Status {
     $state = if ($data.processes.game.Count -gt 0) {
         if ($ownedGameExact) { 'game-running' } else { 'game-running-unowned' }
     }
+    elseif ($launchFailure) {
+        'launch-failed'
+    }
+    elseif ($launchBlocker) {
+        'launch-blocked-dialog'
+    }
     elseif ($launchPending) {
         'launch-pending'
     }
     elseif ($buildData.Count -gt 0 -and ($headlessMO2 -or $data.processes.mo2.Count -eq 0)) {
         'rootbuilder-recovery-required'
-    }
-    elseif ($launchFailure) {
-        'launch-failed'
     }
     elseif ($data.processes.mo2.Count -gt 0) {
         'mo2-running'
@@ -5376,6 +5456,7 @@ function Invoke-MO2Status {
         recordedGameResolution = $recordedGameResolution
         openingCompleted = $openingCompleted
         launchFailure = $launchFailure
+        launchBlocker = $launchBlocker
         launchFailureReceiptPath = if ($launchFailure) { [string]$owned.data.launchFailureReceiptPath } else { $null }
         launchPending = $launchPending
         launchElapsedSeconds = $launchElapsedSeconds
@@ -5383,7 +5464,7 @@ function Invoke-MO2Status {
         launchGraceRemainingSeconds = if ($launchPending) { [math]::Max(0, [math]::Round($launchGraceSeconds - $launchElapsedSeconds, 3)) } else { 0 }
         recoveryCommand = if ($buildData.Count -gt 0 -and $owned -and -not $launchPending) { "recover-rootbuilder -SessionId $SessionId" } else { $null }
     }) -Force
-    return ConvertTo-MO2PublicResult -Result (New-MO2ActionResult -Config $Config -Command 'status' -Ok (-not [bool]$launchFailure) -State $state -Data $data -Errors $(if ($launchFailure) { @("MO2 failed to spawn '$($launchFailure.binary)': Win32 error $($launchFailure.win32ErrorCode) $($launchFailure.message). Cause is unassigned; no retry or cleanup was dispatched.") } else { @() }))
+    return ConvertTo-MO2PublicResult -Result (New-MO2ActionResult -Config $Config -Command 'status' -Ok (-not [bool]$launchFailure -and -not [bool]$launchBlocker) -State $state -Data $data -Errors $(if ($launchFailure) { @("MO2 failed to spawn '$($launchFailure.binary)': Win32 error $($launchFailure.win32ErrorCode) $($launchFailure.message). Cause is unassigned; no retry or cleanup was dispatched.") } elseif ($launchBlocker) { @('The exact owned MO2 shows a blocking launch-error dialog with no game/loader. Detailed current-attempt spawn proof is unavailable; cause remains unassigned. No launch replay or cleanup was dispatched.') } else { @() }))
 }
 
 function Get-MO2LaunchResumeDisposition {
@@ -5748,10 +5829,14 @@ function Invoke-MO2Launch {
         Start-Sleep -Milliseconds 500
         $status = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$lockData.profile) -RequestedExecutable ([string]$lockData.executable)
         if (@($status.processes.game | Where-Object { $_.name -ieq $primaryGameProcessName }).Count -gt 0) { break }
-        $blockingDialog = @(Get-MO2WindowSnapshot -Processes @($status.processes.mo2) | Where-Object { $_.dialogKind -eq 'failed-to-write-settings' } | Select-Object -First 1)
-        if ($blockingDialog.Count -gt 0) { break }
         $launchFailure = Get-MO2LaunchFailureEvidence -Config $Config -Owned $owned -MO2Processes @($status.processes.mo2) -GameProcesses @($status.processes.game)
         if ($launchFailure) { break }
+        $dialogOwner = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @($status.processes.mo2) -AdoptDetachedOwner
+        $blockingDialog = @()
+        if ($dialogOwner.ok -and @($dialogOwner.targets).Count -eq 1 -and @($status.processes.mo2).Count -eq 1) {
+            $blockingDialog = @(Get-MO2WindowSnapshot -Processes @($status.processes.mo2) | Where-Object { $_.PSObject.Properties['processId'] -and [int]$_.processId -eq [int]$dialogOwner.targets[0].id -and $_.visible -and $_.dialogKind -cin @('failed-to-write-settings','failed-to-run') } | Select-Object -First 1)
+        }
+        if ($blockingDialog.Count -gt 0) { break }
     } while ([DateTime]::UtcNow -lt $deadline)
 
     $gameObserved = @($status.processes.game | Where-Object { $_.name -ieq $primaryGameProcessName }).Count -gt 0
