@@ -40,7 +40,9 @@ function Test-DesktopUIRestoreValueEquivalent($Expected, $Actual) {
 
 function Assert-DesktopUIRestoreJsonElement($Element) {
     if ($Element.ValueKind -eq [Text.Json.JsonValueKind]::Object) {
-        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        # PowerShell ordered dictionaries can collapse case aliases. Reject
+        # them before projection instead of silently losing an additional key.
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($property in $Element.EnumerateObject()) {
             if (-not $seen.Add($property.Name)) { throw "Duplicate JSON key in DesktopUI restore input: $($property.Name)" }
             Assert-DesktopUIRestoreJsonElement $property.Value

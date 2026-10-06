@@ -101,6 +101,8 @@ try {
         @{name='literal dotted child';edit={param($d) $d.DesktopUI['pairing.extra']='forged'}}
         @{name='controlled Boolean numeric alias';edit={param($d) $d.steamvr.requireHmd=0}}
         @{name='controlled value drift';edit={param($d) $d.driver_null.renderWidth=100}}
+        @{name='controlled case alias alongside owned leaf';edit={param($d) $d.driver_codex_head_pose['EyeHeightMeters']=$d.driver_codex_head_pose.eyeHeightMeters}}
+        @{name='controlled dotted alias alongside owned leaf';edit={param($d) $d.driver_codex_head_pose['eyeHeightMeters.extra']=1.68}}
         @{name='other Boolean numeric alias';edit={param($d) $d.unrelated.flag=0}}
         @{name='large integer drift';edit={param($d) $d.unrelated.large=9007199254740993L}}
         @{name='power numeric kind';edit={param($d) $d.power.turnOffControllersTimeout=0.0}}
@@ -118,6 +120,7 @@ try {
         @{key='eyeHeightMeters';literal='1.68000000000000001';name='noncanonical controlled decimal hidden by Double parsing'}
         @{key='positionX';literal='-0.0';name='controlled signed-zero bit change'}
         @{key='unownedFloat';literal='1.6799999999999999';name='unowned canonical binary64 reserialization'}
+        @{key='displayFrequency';literal='90';name='controlled floating leaf changed to integer type'}
     )) {
         [IO.File]::WriteAllText($settings, (Set-NumericLiteral $raw $numericCase.key $numericCase.literal))
         Assert-Refusal ('refuses ' + $numericCase.name)
