@@ -34,6 +34,11 @@
   change the coordination-only meaning of human `Release`.
 - A task may delete or replace only uniquely named mods that its workspace
   proves did not predate the task and explicitly records as task-owned.
+- When a deployed mod must be added or enabled, use the profile controller's
+  `add-enable` transaction instead of manually calculating mod priority. Its
+  default may disable only enabled providers proven to contain no functional
+  content beyond exact matching DLL paths; mixed-content providers remain
+  enabled below the selected winner.
 - Do not inherit unknown-provenance saves, and do not treat COC as New Game.
 - Require Skyrim and its loader to be closed before profile or package
   mutation. The normal autonomous task flow also closes MO2 to establish a
@@ -60,6 +65,10 @@
   classified. Never delete unclassified MO2 overwrite or shader-cache content.
 - Keep automated waits bounded and report the observed postcondition. A CTD is
   useful evidence, not permission for unbounded retries.
+- Treat the render-scale tuning fixture, immediate positioning, and startup
+  admission sequence as frozen. Change that prefix only on explicit user
+  instruction or preserved evidence proving the prefix itself is defective;
+  post-position runner, telemetry, and reporting fixes must not alter it.
 - Tests must use temporary fixtures by default. Live checks must be explicitly
   selected and read-only unless the user has placed a state change in scope.
 - Machine-specific paths belong only in ignored `machine.local.json` files,
@@ -79,5 +88,8 @@
   or a concrete safety issue or enhancement is discovered, submit it through
   `tools/feedback-control/Invoke-AutomationFeedback.ps1`. Claim that feedback
   was recorded only when the controller returns a durable `AUTO-...` receipt.
+  When an in-scope safe fix is available, implement and validate it before
+  resolving or amending feedback; record feedback first only when evidence
+  would otherwise be lost or the implementation is blocked.
   Tasks report desires; they do not publish issues or edit automation source
   unless that work is explicitly in scope.

@@ -46,8 +46,10 @@ particular drive letter for the plugin itself.
 5. Create or select one attributable evidence directory for the test. The
    target-owned transaction journal, rather than this caller-selected folder,
    is authoritative. Preview
-   `apply` or `restore` with `-WhatIf`, then perform the authorized operation
-   using the same `-EvidenceDirectory`. For an MO2-backed `apply` or `start`,
+   Create the exact task-scoped evidence directory before preview; `-WhatIf`
+   deliberately never creates it. Preview `apply` or `restore` with `-WhatIf`,
+   then perform the authorized operation using the same `-EvidenceDirectory`.
+   For an MO2-backed `apply` or `start`,
    pass the exact admitted `-MO2AccessId <literal-access-id>` and
    `-MO2Profile <literal-profile-name>` on every call. The controller repeats
    the closed-state `SteamVRNull` provider admission and binds its public proof
@@ -58,6 +60,12 @@ particular drive letter for the plugin itself.
    requested, also require a conflict-free inventory and a receipt containing
    the exact registration and manifest hashes. After `restore`, require both
    the settings and OpenVR registration hashes to match their exact backups.
+   Exception only for an explicitly human-selected two-leaf preservation:
+   follow the README's `-PreserveDesktopUIWindowState` preview/commit contract,
+   pass its exact preimage `-ExpectedCurrentSettingsSha256`, and require the
+   settings hash to match the recorded selected result rather than claiming
+   whole-file backup restoration. OpenVR still restores its exact backup.
+   Never use this as a general drift bypass or repeat caller cleanup.
 7. Require `headPoseProvider.state` to be `ready` and independently run the
    head-pose controller's `qualify` command. Qualification requires both the
    driver's shared-memory acknowledgement and a valid standing HMD pose seen

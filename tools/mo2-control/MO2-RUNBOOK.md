@@ -253,6 +253,15 @@ When `-RequireSKSE` is supplied, that requirement is durable session state and
 
 ## Exact launch and monitoring
 
+For an explicitly authorized Run-button attempt, prepare a new durable controller
+containing this feature, then use its literal path for `open -SessionId ...` and
+require `mo2-open`. Preview `launch -SessionId ... -LaunchMethod RunButton -WhatIf`
+before `launch -SessionId ... -LaunchMethod RunButton -StartOnly`. Inspect the
+same session with `status`; dispatch is not game-readiness proof. The visible
+profile and executable must already match; do not change selections blindly.
+Do not run a visible interactive operation through the non-interactive completion
+service merely because that service was suitable for fixture tests.
+
 Open only the exact MO2/profile UI when no game launch is wanted:
 
 ```text
@@ -332,6 +341,33 @@ the actual route independently.
 6. Run `inspect` again and attach the post-session result to the notes.
 
 ## Failure and recovery matrix
+
+### Launch receipt exists but the owner commit failed
+
+When `mo2-launch-started.json` records a dispatched MO2 lifetime but the exact
+session remains `prepared`, stop retries and retain its receipt and exception.
+The owner may preview `recover-dispatch` from a repaired source entry point,
+using the old session controller's captured configuration plus private
+`AccessId`, exact `SessionId`, `TaskId`, `AttemptId`, and `ExpectedGeneration`.
+This explicitly supported source-upgrade command verifies the unchanged old
+controller bundle, coherent prepared lock/manifest, originally empty process
+sets, exact launch arguments and live PID/path/start. It refuses existing
+owner identity, stale/foreign authority, helper handoffs, or any game/loader.
+  The prepared authoritative lease must independently bind the old bundle
+  receipt and its complete versioned inventory; the manifest must project that
+  exact binding. Rewritten receipts/members, omitted dependencies, path aliases,
+  physical replacements and reparse paths are refused before a recovery commit.
+  Do not retrofit an unbound historical session from its own mutable receipt.
+  A legacy launch receipt lacks both generation and leaseId; a modern receipt
+  has both typed and exact. Either one-sided shape is invalid, and legacy launch
+  metadata does not waive the independent controller proof.
+
+Successful recovery returns `dispatch-owner-recovered` and a new durable
+`controllerPath`; it preserves the original bundle and receipt and keeps the
+lease. Nothing is launched or closed. Inspect the modal/log evidence using the
+new controller, then use normal exact-owner `close`/`stop` and RootBuilder
+Unlock cleanup. Do not infer that a generic antivirus suggestion explains the
+loader failure. Never hand-edit the ownership lock or deployment metadata.
 
 ### Missing profile or fallback warning
 
@@ -424,6 +460,15 @@ genuine Skyrim initialization route; until one is automated, classify it as an
 attended or unsupported step rather than substituting COC.
 
 ### MO2 command helper exits before the game appears
+
+For a proven current-attempt MO2 spawn error, `launch` or the exact session's
+`status` instead returns `launch-failed` with `launchFailure` and a retained
+attempt-specific receipt. The classifier binds exact MO2 lifetime and registered
+binary to a bounded stable log window; unknown or stale evidence is ignored.
+Preserve the numeric Win32 code/message. Do not infer antivirus from error5 or
+generic dialog advice, and do not replay launch or change ACL/elevation/security
+policy speculatively. Finish the existing attempt through normal exact-session
+stop/Unlock and preserve its RootBuilder cleanup proof before further work.
 
 Symptom: the process started for `ModOrganizer.exe --profile ... run ...` exits
 successfully while the retained MO2 UI remains open, and Skyrim appears a few

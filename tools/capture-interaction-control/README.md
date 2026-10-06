@@ -1,11 +1,26 @@
 # Capture interaction control
 
+For a newly deployed runtime, `capabilities` and `start` accept `-ArtifactPath`,
+`-ExpectedArtifactSha256` and `-ExpectedBuildId` and forward those exact
+expectations to every controller call, including initial input capabilities,
+screenshot preflight and recording start. These are expectations, not identity
+bypasses. Later commands use the complete accepting runtime identity persisted
+in session state; bootstrap expectations cannot replace that identity.
+Screenshot preflight consumes only the controller's qualifiedCapabilities
+projection, while probe receipts retain the original native contract/result
+envelope. Select this supported controller lane before the workflow begins;
+source delivery does not refresh an installed plugin or direct tool catalogue.
+
 `Invoke-CaptureInteraction.ps1` is the host-side observation/action layer over
 DevBench recording, atomic OpenVR tracked-set input, and the CSX screenshot v1
 service. It does not encode video and does not invent missing game state.
 
-Every session has one UUID and one durable session document. State recording
-starts first. Optional stereo capture starts second and rolls recording back if
+Every session has one UUID and one durable session document. Sequence mode first
+reads the screenshot API capabilities and verifies the requested frame count and
+wall-clock duration against the runtime's exact positive integral limits. An
+incompatible request fails with the largest compatible frame count before a
+session directory is created or state recording starts. State recording then
+starts first; optional stereo capture starts second and rolls recording back if
 it cannot be accepted. Stop reverses that order so the state trace encloses all
 captured frames. `none`, `on-demand`, and `sequence` visual modes all retain the
 same interaction and state contract.
@@ -15,7 +30,47 @@ accepted receipt, and a dispatched request whose result was lost. Accepted
 screenshot receipts remain available for exact cancel-and-wait cleanup even if
 the controller's final evidence write fails. A dispatched screenshot or
 recording without a retained identity remains `cleanup-uncertain`; stopping the
-other lane does not manufacture terminal proof for it.
+other lane does not manufacture terminal proof for it. Each attempted start
+retains its command or correlation identity plus the complete failed controller
+envelope and journal path. An ambiguous recording start never triggers an
+unscoped stop against potentially unrelated recording work.
+
+The `capabilities` command reports independent input and screenshot probe
+outcomes; its outer `ok` means the report was produced, not that every service
+passed. Require `data.input.ok` and its controller-qualified native
+`devbench.input` v2.0 projection. It includes ready keyboard v1 with the complete
+canonical binding inventory, plus ready atomic tracked-set v1.1 and its exact
+limits/ownership/encoding fields. Raw controller evidence remains in
+`data.input.envelope`. A generic success marker cannot replace those fields.
+These reads start no recording, input sequence or screenshot capture. Runtime
+identity bootstrap expectations remain mandatory where selected.
+
+After a qualified start, `observe`, `act`, `stop` and partial-start cleanup
+forward `ArtifactPath`, `ExpectedArtifactSha256` and `ExpectedBuildId` from the
+complete persisted accepting runtime identity, in addition to the full exact
+expected identity itself. The README's SessionDirectory-only examples therefore
+retain full mutation-capable artifact admission, including on-demand capture.
+Explicitly repeated expectations must exactly match the accepting values;
+contradictions fail before controller dispatch and cannot rebind a session.
+Incomplete identity is not filled from bootstrap flags or an adjacent runtime.
+Outer `observe.ok` means an observation report was produced; a screenshot error
+or null `frameSubmission` is not a successful image capture.
+
+Native v1 still `request_get` uses only the controller-qualified owned receipt,
+not a guessed terminal flag or file-existence test. On-demand observation binds
+it to the original accepted capture command, reads that request through native
+encoding/finalization, and submits only a successful committed artifact. A
+qualified failed terminal request retains its receipt and errors but produces
+no `frameSubmission`; successful query and successful capture remain separate.
+This adapter does not claim support for native sequence receipts or qualify an
+experiment's stereo/frame correlation. Reconciliation never repeats capture.
+
+`-MaximumFrames` accepts up to 60,000 frames, matching the current DevBench
+recording ceiling. Sequence admission still uses the live screenshot capability
+receipt, so a lower server frame or duration limit fails before mutation. Stop
+accepts exact already-inactive tracked-input cleanup and persisted recording
+receipts; failed controller envelopes retain their semantic outcome even when
+the server supplied an empty error array.
 
 ```powershell
 pwsh -NoProfile -File .\Invoke-CaptureInteraction.ps1 start `
@@ -54,6 +109,12 @@ returns, preventing a following action from colliding with an active owner.
 `key-tap` uses DevBench keyboard input. `-DirectTool` with
 `-DirectArgumentsJson` is an explicit passthrough for operations not represented
 by the catalog; every action is appended to `actions.ndjson`.
+
+A direct `game load` is dispatched once. Require its receipt to report
+`queued: true`, then verify current `playerLoaded` and the exact target cell
+through read-only observations or the DevBench `playerLoaded` state barrier.
+Do not wait for a transient load lifecycle event or replay the load when that
+event was not observed.
 
 `wait-save` uses the session start timestamp by default, parses explicit
 `-SinceUtc` values as `DateTimeOffset`, compares only UTC values, and requires a

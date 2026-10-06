@@ -1,0 +1,245 @@
+{
+  "command": {
+    "action": "request_get",
+    "clientId": "capture-interaction/d13c523f-0cbc-42a9-aa23-fa0f86c54533",
+    "commandId": "efc138eb7b8f4364a782555f7573950b"
+  },
+  "contract": {
+    "major": 1,
+    "minor": 1,
+    "name": "csx.screenshot",
+    "schemaRevision": 2
+  },
+  "ok": true,
+  "result": {
+    "acceptedUtc": "2026-10-05T12:27:24.200Z",
+    "acknowledged": false,
+    "actual": {
+      "acquisition": {
+        "compositorCycle": 20636,
+        "engineFrame": 24867,
+        "monotonicTimestampUs": 2253807196536,
+        "planes": [
+          {
+            "boundsApplied": true,
+            "colourSpace": 1,
+            "deviceIdentity": "0x145208fce10",
+            "dxgiFormat": 28,
+            "eye": "left",
+            "orientation": {
+              "flipHorizontal": false,
+              "flipVertical": false
+            },
+            "publicationGeneration": 4,
+            "sourceHeight": 1680,
+            "sourceWidth": 3024,
+            "stagedHeight": 1680,
+            "stagedWidth": 1512,
+            "submittedBounds": {
+              "uMax": 0.5,
+              "uMin": 0,
+              "vMax": 1,
+              "vMin": 0
+            },
+            "tonemapSceneHdr": false
+          },
+          {
+            "boundsApplied": true,
+            "colourSpace": 1,
+            "deviceIdentity": "0x145208fce10",
+            "dxgiFormat": 28,
+            "eye": "right",
+            "orientation": {
+              "flipHorizontal": false,
+              "flipVertical": false
+            },
+            "publicationGeneration": 4,
+            "sourceHeight": 1680,
+            "sourceWidth": 3024,
+            "stagedHeight": 1680,
+            "stagedWidth": 1512,
+            "submittedBounds": {
+              "uMax": 1,
+              "uMin": 0.5,
+              "vMax": 1,
+              "vMin": 0
+            },
+            "tonemapSceneHdr": false
+          }
+        ],
+        "sourceKind": "hmd_submission",
+        "utcTimestamp": "2026-10-05T12:27:24.220Z"
+      },
+      "artifacts": [
+        {
+          "colourContract": "sdr_srgb",
+          "format": "png",
+          "height": 1680,
+          "view": "left_eye",
+          "width": 1512
+        },
+        {
+          "colourContract": "sdr_srgb",
+          "format": "png",
+          "height": 1680,
+          "view": "right_eye",
+          "width": 1512
+        }
+      ],
+      "source": {
+        "fallback": "reject",
+        "kind": "hmd_submission"
+      }
+    },
+    "artifactProgress": {
+      "expected": 2,
+      "successful": 2,
+      "terminal": 2
+    },
+    "artifacts": [
+      {
+        "actual": {
+          "colourContract": "sdr_srgb",
+          "format": "png",
+          "height": 1680,
+          "view": "left_eye",
+          "width": 1512
+        },
+        "bytes": 2980983,
+        "committed": true,
+        "path": "C:\\fixture\\frames\\observe-20261005T122723526Z_left.png",
+        "sha256": "509f3bcfb69a1f854c0d6451c3e7ee42f67387cccbd7a2383cb5ee3a7f8af6ca"
+      },
+      {
+        "actual": {
+          "colourContract": "sdr_srgb",
+          "format": "png",
+          "height": 1680,
+          "view": "right_eye",
+          "width": 1512
+        },
+        "bytes": 2986741,
+        "committed": true,
+        "path": "C:\\fixture\\frames\\observe-20261005T122723526Z_right.png",
+        "sha256": "9b799edbf1a0de17cce7228b8a2cdd32a6b6efbbbf39f514e8cfc963bb7dc177"
+      }
+    ],
+    "clientId": "capture-interaction/d13c523f-0cbc-42a9-aa23-fa0f86c54533",
+    "commandId": "942aeb6737aa4085b3a7fa40faf43533",
+    "effective": {
+      "clipboard": "none",
+      "destination": {
+        "baseName": "observe-20261005T122723526Z",
+        "directory": "C:\\fixture\\frames",
+        "overwrite": "never",
+        "policy": "absolute",
+        "resolvedDirectory": "C:\\fixture\\frames"
+      },
+      "outputs": [
+        {
+          "encoding": {
+            "colourContract": "sdr_srgb",
+            "format": "png"
+          },
+          "nameSuffix": "left",
+          "view": "left_eye"
+        },
+        {
+          "encoding": {
+            "colourContract": "sdr_srgb",
+            "format": "png"
+          },
+          "nameSuffix": "right",
+          "view": "right_eye"
+        }
+      ],
+      "source": {
+        "fallback": "reject",
+        "kind": "hmd_submission"
+      },
+      "tags": {
+        "captureInteractionSessionId": "d13c523f-0cbc-42a9-aa23-fa0f86c54533"
+      }
+    },
+    "error": null,
+    "errors": [],
+    "kind": "still",
+    "publication": {
+      "artifactCommitted": null,
+      "state": "settled"
+    },
+    "requestId": "b22c214d-715a-4eab-6820-bd2c480391b0",
+    "requested": {
+      "action": "capture",
+      "capture": {
+        "clipboard": "none",
+        "destination": {
+          "baseName": "observe-20261005T122723526Z",
+          "directory": "C:\\fixture\\frames",
+          "overwrite": "never",
+          "policy": "absolute"
+        },
+        "outputs": [
+          {
+            "encoding": {
+              "colourContract": "sdr_srgb",
+              "format": "png"
+            },
+            "nameSuffix": "left",
+            "view": "left_eye"
+          },
+          {
+            "encoding": {
+              "colourContract": "sdr_srgb",
+              "format": "png"
+            },
+            "nameSuffix": "right",
+            "view": "right_eye"
+          }
+        ],
+        "source": {
+          "fallback": "reject",
+          "kind": "hmd_submission"
+        },
+        "tags": {
+          "captureInteractionSessionId": "d13c523f-0cbc-42a9-aa23-fa0f86c54533"
+        }
+      },
+      "clientId": "capture-interaction/d13c523f-0cbc-42a9-aa23-fa0f86c54533",
+      "commandId": "942aeb6737aa4085b3a7fa40faf43533",
+      "contractMajor": 1,
+      "contractMinor": 0,
+      "useSettings": false
+    },
+    "state": "completed",
+    "terminalUtc": "2026-10-05T12:27:24.646Z",
+    "warnings": []
+  },
+  "server": {
+    "artifactSha256": "",
+    "buildId": "dde9de88819ff96dc9353b438d2ffa746693feb7a207e35d2472124374855491",
+    "buildIdShort": "dde9de88819f",
+    "component": "CommunityShaders",
+    "configuration": "Release",
+    "csxBuild": 11,
+    "csxVersion": "CSX 3.19-VR",
+    "devBenchBuilt": true,
+    "devBenchRegistered": true,
+    "featureVersion": "1.0.0",
+    "manifestError": "runtime artifact verification delegated to deployment harness",
+    "manifestVerified": false,
+    "runtime": {
+      "game": "SkyrimVR",
+      "hmd": "unknown",
+      "presentation": "openvr"
+    },
+    "serviceSessionId": "e0ffdc1f-609b-7c5c-f615-49f2a887285a",
+    "sessionId": "e0ffdc1f-609b-7c5c-f615-49f2a887285a",
+    "shaderCacheAbiId": "c375dd96d5566516401cc2091195701f8d4656a209b80169267f1700e297cc54",
+    "shaderCompilerIdentity": "d3dcompiler_47.dll:10.0.26100.9168",
+    "sourceCommit": "e03bd1fd4790795f9dd205d9458f34ce96092ca8",
+    "sourceDescribe": "e03bd1f",
+    "sourceDirty": false
+  },
+  "timestampUtc": "2026-10-05T12:27:24.933Z"
+}

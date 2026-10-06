@@ -131,3 +131,4 @@ finally {
     # The unique fixture was validated beneath the exact OS temporary root.
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }
 }
+

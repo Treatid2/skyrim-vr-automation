@@ -51,6 +51,12 @@ if(MSVC)
   target_compile_options(csx_openvr_pose_probe PRIVATE /W4 /permissive- /EHsc)
 endif()
 
+add_executable(csx_controller_tests EXCLUDE_FROM_ALL src/controller_tests.cpp)
+target_compile_features(csx_controller_tests PRIVATE cxx_std_20)
+if(MSVC)
+  target_compile_options(csx_controller_tests PRIVATE /W4 /permissive- /EHsc)
+endif()
+
 set(_package_root "${CMAKE_BINARY_DIR}/package/codex_head_pose")
 add_custom_command(TARGET driver_codex_head_pose POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${_package_root}/bin/win64"
@@ -83,6 +89,12 @@ add_custom_command(TARGET csx_openvr_pose_probe POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
           "${_openvr_root}/LICENSE"
           "${_package_root}/licenses/OpenVR-LICENSE.txt"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+          "${CMAKE_CURRENT_SOURCE_DIR}/licenses/VMT-LICENSE.txt"
+          "${_package_root}/licenses/VMT-LICENSE.txt"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+          "${CMAKE_CURRENT_SOURCE_DIR}/THIRD-PARTY.md"
+          "${_package_root}/licenses/THIRD-PARTY.md"
   VERBATIM
 )
 

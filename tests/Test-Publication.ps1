@@ -15,6 +15,7 @@ $requiredFiles = @(
     'PRIVACY.md',
     'SUPPORT.md',
     'TERMS.md',
+    '.mcp.json',
     '.agents/plugins/marketplace.json',
     '.codex-plugin/plugin.json',
     'skills/feedback-control/SKILL.md',
@@ -32,9 +33,17 @@ $requiredFiles = @(
     'skills/devbench-control/agents/openai.yaml',
     'skills/profiler-control/SKILL.md',
     'skills/profiler-control/agents/openai.yaml',
+    'skills/renderscale-tuning-nvidia/SKILL.md',
+    'skills/renderscale-tuning-nvidia/references/matrix.v1.json',
+    'skills/renderscale-tuning-amd/SKILL.md',
+    'skills/renderscale-tuning-amd/references/matrix.v1.json',
+    'tools/renderscale-tuning-live/runner.js',
+    'tools/renderscale-tuning-finalizer/finalizer.js',
+    'tools/fork-reciprocal-search/validate-campaign.js',
     'skills/shader-cache-control/SKILL.md',
     'skills/shader-cache-control/agents/openai.yaml',
-    'plugins/skyrim-vr-automation/.codex-plugin/plugin.json'
+    'plugins/skyrim-vr-automation/.codex-plugin/plugin.json',
+    'plugins/skyrim-vr-automation/.mcp.json'
 )
 $forbidden = @(
     ('L:' + '\Codex'),
@@ -75,12 +84,24 @@ if ($manifest.license -ne 'GPL-3.0-or-later') {
     $violations.Add([pscustomobject]@{ file = 'toolset.manifest.json'; issue = 'license is not GPL-3.0-or-later' })
 }
 
-$pluginManifest = Get-Content -LiteralPath (Join-Path $repositoryRoot '.codex-plugin/plugin.json') -Raw | ConvertFrom-Json
-if ($pluginManifest.name -ne 'skyrim-vr-automation') {
-    $violations.Add([pscustomobject]@{ file = '.codex-plugin/plugin.json'; issue = 'plugin name does not match the public package' })
-}
-if ($pluginManifest.license -ne 'GPL-3.0-or-later') {
-    $violations.Add([pscustomobject]@{ file = '.codex-plugin/plugin.json'; issue = 'license is not GPL-3.0-or-later' })
+foreach ($manifestRelative in @(
+    '.codex-plugin/plugin.json',
+    'plugins/skyrim-vr-automation/.codex-plugin/plugin.json'
+)) {
+    $manifestPath = Join-Path $repositoryRoot $manifestRelative
+    $pluginManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if ($pluginManifest.name -ne 'skyrim-vr-automation') {
+        $violations.Add([pscustomobject]@{ file = $manifestRelative; issue = 'plugin name does not match the public package' })
+    }
+    if ($pluginManifest.license -ne 'GPL-3.0-or-later') {
+        $violations.Add([pscustomobject]@{ file = $manifestRelative; issue = 'license is not GPL-3.0-or-later' })
+    }
+    $pluginRoot = Split-Path -Parent (Split-Path -Parent $manifestPath)
+    $mcpPath = Join-Path -Path $pluginRoot -ChildPath ([string]$pluginManifest.mcpServers)
+    if ($pluginManifest.mcpServers -ne './.mcp.json' -or
+        -not (Test-Path -LiteralPath $mcpPath -PathType Leaf)) {
+        $violations.Add([pscustomobject]@{ file = $manifestRelative; issue = 'mcpServers does not resolve to the packaged MCP configuration' })
+    }
 }
 
 $pluginToolsetManifest = Get-Content -LiteralPath (Join-Path $repositoryRoot 'plugins/skyrim-vr-automation/toolset.manifest.json') -Raw | ConvertFrom-Json

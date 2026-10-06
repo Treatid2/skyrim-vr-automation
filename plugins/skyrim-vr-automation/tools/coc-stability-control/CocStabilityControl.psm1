@@ -1,0 +1,1221 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+Import-Module (Join-Path $PSScriptRoot '..\devbench-control\DevBenchControl.psm1') -Force
+
+$script:CocCanonicalEndpoint = 'http://127.0.0.1:8921/mcp'
+
+function Assert-CocCanonicalEndpoint {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Endpoint)
+
+    $uri = $null
+    if (-not [Uri]::TryCreate($Endpoint, [UriKind]::Absolute, [ref]$uri) -or
+        $uri.AbsoluteUri -cne $script:CocCanonicalEndpoint) {
+        throw "The COC stability lane only accepts the registered DevBench endpoint $script:CocCanonicalEndpoint."
+    }
+    return $uri
+}
+
+function Get-CocListenerProcessId {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][int]$Port)
+
+    if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) {
+        throw 'Get-NetTCPConnection is required to prove the DevBench listener owner.'
+    }
+    $owners = @(Get-NetTCPConnection -State Listen -LocalPort $Port `
+            -ErrorAction Stop | Where-Object {
+                $_.LocalAddress -in @('127.0.0.1', '::1')
+            } | Select-Object -ExpandProperty OwningProcess -Unique)
+    if ($owners.Count -ne 1 -or [int]$owners[0] -le 0) {
+        throw "Could not prove exactly one loopback listener owner for port $Port."
+    }
+    return [int]$owners[0]
+}
+
+function Assert-CocEndpointBinding {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Endpoint,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$ExpectedProcessId,
+        [Parameter(Mandatory)][string]$ExpectedProcessStartTimeUtc
+    )
+
+    $uri = Assert-CocCanonicalEndpoint -Endpoint $Endpoint
+    $listenerPid = Get-CocListenerProcessId -Port $uri.Port
+    if ($listenerPid -ne $ExpectedProcessId) {
+        throw "DevBench listener PID $listenerPid differs from expected Skyrim PID $ExpectedProcessId."
+    }
+    Assert-CocProcessLifetime -ProcessId $ExpectedProcessId `
+        -ExpectedStartTimeUtc $ExpectedProcessStartTimeUtc
+}
+
+function Invoke-CocMcpRequest {
+    param(
+        [Parameter(Mandatory)][string]$Endpoint,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [Parameter(Mandatory)]$Payload,
+        [ValidateRange(1, 180)][int]$TimeoutSeconds = 20
+    )
+
+    $response = Invoke-WebRequest -UseBasicParsing -Method Post -Uri $Endpoint `
+        -Headers $Headers -Body ($Payload | ConvertTo-Json -Depth 50 -Compress) `
+        -TimeoutSec $TimeoutSeconds
+    return [pscustomobject]@{
+        response = $response
+        json = $response.Content | ConvertFrom-Json -Depth 80
+    }
+}
+
+function Open-CocMcpSession {
+    param(
+        [Parameter(Mandatory)][string]$Endpoint,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$ExpectedProcessId,
+        [Parameter(Mandatory)][string]$ExpectedProcessStartTimeUtc,
+        [ValidateRange(1, 180)][int]$TimeoutSeconds = 20
+    )
+
+    Assert-CocEndpointBinding -Endpoint $Endpoint `
+        -ExpectedProcessId $ExpectedProcessId `
+        -ExpectedProcessStartTimeUtc $ExpectedProcessStartTimeUtc
+    $baseHeaders = @{
+        Accept = 'application/json, text/event-stream'
+        'Content-Type' = 'application/json'
+    }
+    $initialize = Invoke-CocMcpRequest -Endpoint $Endpoint `
+        -Headers $baseHeaders -TimeoutSeconds $TimeoutSeconds -Payload @{
+            jsonrpc = '2.0'
+            id = [DateTime]::UtcNow.Ticks
+            method = 'initialize'
+            params = @{
+                protocolVersion = '2025-03-26'
+                capabilities = @{}
+                clientInfo = @{ name = 'CocStabilityControl'; version = '1.0' }
+            }
+        }
+    $sessionHeader = $initialize.response.Headers['Mcp-Session-Id']
+    $sessionId = if ($sessionHeader -is [array]) {
+        [string]$sessionHeader[0]
+    } else {
+        [string]$sessionHeader
+    }
+    if ([string]::IsNullOrWhiteSpace($sessionId)) {
+        throw 'DevBench did not return an MCP session ID.'
+    }
+
+    $headers = @{
+        Accept = 'application/json, text/event-stream'
+        'Content-Type' = 'application/json'
+        'Mcp-Session-Id' = $sessionId
+    }
+    Invoke-WebRequest -UseBasicParsing -Method Post -Uri $Endpoint `
+        -Headers $headers -TimeoutSec $TimeoutSeconds `
+        -Body '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' |
+        Out-Null
+    Assert-CocEndpointBinding -Endpoint $Endpoint `
+        -ExpectedProcessId $ExpectedProcessId `
+        -ExpectedProcessStartTimeUtc $ExpectedProcessStartTimeUtc
+    return [pscustomobject]@{
+        id = $sessionId
+        headers = $headers
+        endpoint = $Endpoint
+        processId = $ExpectedProcessId
+        processStartTimeUtc = $ExpectedProcessStartTimeUtc
+    }
+}
+
+function Assert-CocProcessLifetime {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$ProcessId,
+        [Parameter(Mandatory)][string]$ExpectedStartTimeUtc
+    )
+
+    try {
+        $expectedStart = [DateTimeOffset]::Parse(
+            $ExpectedStartTimeUtc,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind
+        ).UtcDateTime
+        $process = Get-Process -Id $ProcessId -ErrorAction Stop
+        $actualStart = $process.StartTime.ToUniversalTime()
+    }
+    catch {
+        throw "Expected process identity is inaccessible: $($_.Exception.Message)"
+    }
+    if ($actualStart.ToFileTimeUtc() -ne $expectedStart.ToFileTimeUtc()) {
+        throw "PID $ProcessId no longer denotes the admitted process."
+    }
+}
+
+function Get-CocMcpResultContent {
+    [CmdletBinding()]
+    param(
+        $Call,
+        [Parameter(Mandatory)][string]$Context
+    )
+
+    if ($null -eq $Call -or -not $Call.PSObject.Properties['json'] -or
+        $null -eq $Call.json) {
+        throw "$Context returned no JSON response."
+    }
+    $json = $Call.json
+    if ($json.PSObject.Properties['error']) {
+        throw "$Context failed: $($json.error | ConvertTo-Json -Compress)"
+    }
+    if (-not $json.PSObject.Properties['result'] -or $null -eq $json.result) {
+        throw "$Context returned no result."
+    }
+    $result = $json.result
+    if (-not $result.PSObject.Properties['content'] -or $null -eq $result.content) {
+        throw "$Context returned no content."
+    }
+    $rawContent = $result.content
+    if ($rawContent -is [string] -or $rawContent -is [Collections.IDictionary] -or
+        $rawContent -isnot [Collections.IList]) {
+        throw "$Context returned content that is not an array of content blocks."
+    }
+    $content = @($rawContent)
+    foreach ($block in $content) {
+        if ($null -eq $block -or -not $block.PSObject.Properties['type'] -or
+            [string]::IsNullOrWhiteSpace([string]$block.type)) {
+            throw "$Context returned a malformed content block."
+        }
+    }
+    if ($result.PSObject.Properties['isError'] -and [bool]$result.isError) {
+        $messages = @(
+            $content | ForEach-Object {
+                    if ($null -ne $_ -and $_.PSObject.Properties['text']) {
+                        [string]$_.text
+                    }
+                }
+        )
+        $detail = if ($messages.Count -gt 0) {
+            $messages -join "`n"
+        } else { 'unspecified error' }
+        throw "$Context reported an error result: $detail"
+    }
+    return $content
+}
+
+function Get-CocHealthValue {
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][object[]]$Content = @())
+
+    $healthText = @($Content | ForEach-Object {
+            if ($null -ne $_ -and $_.PSObject.Properties['type'] -and
+                [string]$_.type -eq 'text' -and $_.PSObject.Properties['text']) {
+                [string]$_.text
+            }
+        } | Select-Object -First 1)
+    if ($healthText.Count -eq 0 -or
+        [string]::IsNullOrWhiteSpace([string]$healthText[0])) {
+        throw 'DevBench health call returned no JSON text payload.'
+    }
+    try {
+        $value = [string]$healthText[0] | ConvertFrom-Json -Depth 30
+    }
+    catch {
+        throw 'DevBench health call returned an invalid JSON text payload.'
+    }
+    if ($null -eq $value) {
+        throw 'DevBench health call returned an invalid JSON text payload.'
+    }
+    return $value
+}
+
+function Invoke-CocMcpTool {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Endpoint,
+        [Parameter(Mandatory)][string]$Tool,
+        [Parameter(Mandatory)][Collections.IDictionary]$Arguments,
+        [pscustomobject]$Session,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$ExpectedProcessId,
+        [Parameter(Mandatory)][string]$ExpectedProcessStartTimeUtc,
+        [string]$ExpectedBuildId,
+        [ValidateRange(1, 180)][int]$TimeoutSeconds = 20
+    )
+
+    Assert-CocEndpointBinding -Endpoint $Endpoint `
+        -ExpectedProcessId $ExpectedProcessId `
+        -ExpectedProcessStartTimeUtc $ExpectedProcessStartTimeUtc
+
+    if ($null -eq $Session) {
+        $Session = Open-CocMcpSession -Endpoint $Endpoint `
+            -ExpectedProcessId $ExpectedProcessId `
+            -ExpectedProcessStartTimeUtc $ExpectedProcessStartTimeUtc `
+            -TimeoutSeconds $TimeoutSeconds
+    } elseif ([string]$Session.endpoint -cne $Endpoint -or
+        [int]$Session.processId -ne $ExpectedProcessId -or
+        [string]$Session.processStartTimeUtc -cne $ExpectedProcessStartTimeUtc) {
+        throw 'The supplied MCP session is not bound to the admitted endpoint and process lifetime.'
+    }
+
+    $healthCall = Invoke-CocMcpRequest -Endpoint $Endpoint `
+        -Headers $Session.headers -TimeoutSeconds $TimeoutSeconds -Payload @{
+            jsonrpc = '2.0'
+            id = [DateTime]::UtcNow.Ticks
+            method = 'tools/call'
+            params = @{ name = 'inspect'; arguments = @{ kind = 'health' } }
+        }
+    $healthContent = @(Get-CocMcpResultContent -Call $healthCall `
+            -Context 'DevBench health call')
+    $healthValue = Get-CocHealthValue -Content $healthContent
+    $healthPid = Get-CocPropertyValue -Value $healthValue -Name 'pid'
+    if ($null -eq $healthPid -or [int]$healthPid -ne $ExpectedProcessId) {
+        throw "DevBench endpoint process identity changed; expected PID $ExpectedProcessId."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedBuildId) -and
+        $null -ne (Get-CocPropertyValue -Value $healthValue -Name 'buildId')) {
+        $healthBuildId = Get-CocPropertyValue -Value $healthValue -Name 'buildId'
+        if ([string]$healthBuildId -cne $ExpectedBuildId) {
+            throw "DevBench health Build ID '$healthBuildId' differs from expected Build ID '$ExpectedBuildId'."
+        }
+    }
+    Assert-CocEndpointBinding -Endpoint $Endpoint `
+        -ExpectedProcessId $ExpectedProcessId `
+        -ExpectedProcessStartTimeUtc $ExpectedProcessStartTimeUtc
+
+    $call = Invoke-CocMcpRequest -Endpoint $Endpoint `
+        -Headers $Session.headers -TimeoutSeconds $TimeoutSeconds -Payload @{
+            jsonrpc = '2.0'
+            id = [DateTime]::UtcNow.Ticks
+            method = 'tools/call'
+            params = @{ name = $Tool; arguments = $Arguments }
+        }
+    Assert-CocEndpointBinding -Endpoint $Endpoint `
+        -ExpectedProcessId $ExpectedProcessId `
+        -ExpectedProcessStartTimeUtc $ExpectedProcessStartTimeUtc
+    $callContent = @(Get-CocMcpResultContent -Call $call `
+            -Context "DevBench tool '$Tool'")
+
+    $content = [Collections.Generic.List[object]]::new()
+    foreach ($item in $callContent) {
+        if ($null -ne $item -and $item.PSObject.Properties['type'] -and
+            [string]$item.type -eq 'text' -and $item.PSObject.Properties['text']) {
+            try { $content.Add(($item.text | ConvertFrom-Json -Depth 80)) }
+            catch { $content.Add([string]$item.text) }
+        } else {
+            $content.Add($item)
+        }
+    }
+    $firstContent = if ($content.Count -gt 0) { $content[0] } else { $null }
+    return [pscustomobject][ordered]@{
+        tool = $Tool
+        sessionId = $Session.id
+        content = @($content)
+        value = $firstContent
+        rawResult = $call.json.result
+    }
+}
+
+function Assert-CocProtocolConfig {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$ProtocolConfig)
+
+    if ([string]$ProtocolConfig.schema -cne 'csx-coc-stability-protocol-v1') {
+        throw 'The COC stability protocol config schema is unsupported.'
+    }
+    $requiredReceiptFields = @(
+        'presentationStable', 'presentationFailureMask',
+        'presentationFailureReasons', 'presentationElapsedMs',
+        'presentationElapsedFrames', 'cleanupDrained', 'cleanupFailureMask',
+        'cleanupFailureReasons', 'cleanupElapsedMs', 'cleanupElapsedFrames',
+        'strictSatisfied', 'strictFailureMask', 'strictFailureReasons',
+        'strictElapsedMs', 'strictElapsedFrames', 'outstandingCleanupDebt',
+        'timing', 'frames', 'observation', 'producer'
+    )
+    $actualReceiptFields = @($ProtocolConfig.qualification.receiptFields)
+    if ($actualReceiptFields.Count -ne $requiredReceiptFields.Count -or
+        @($requiredReceiptFields | Where-Object {
+                $_ -notin $actualReceiptFields
+            }).Count -ne 0 -or
+        @($actualReceiptFields | Select-Object -Unique).Count -ne
+            $actualReceiptFields.Count) {
+        throw 'The protocol must declare every unique mandatory qualification receipt field.'
+    }
+    if (@($ProtocolConfig.telemetry.preparation.fields).Count -eq 0 -or
+        @($ProtocolConfig.telemetry.preparation.eventFields).Count -eq 0) {
+        throw 'The protocol must declare complete preparation and event field contracts.'
+    }
+}
+
+function New-CocProtocolSnapshot {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ProtocolJson)
+
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($ProtocolJson)
+    $config = $ProtocolJson | ConvertFrom-Json -Depth 50
+    Assert-CocProtocolConfig -ProtocolConfig $config
+    return [pscustomobject][ordered]@{
+        encoding = 'utf8-base64'
+        sha256 = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($bytes)
+        ).ToLowerInvariant()
+        bytes = [Convert]::ToBase64String($bytes)
+        config = $config
+    }
+}
+
+function Get-CocProtocolFromSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Encoding,
+        [Parameter(Mandatory)][string]$Sha256,
+        [Parameter(Mandatory)][string]$Bytes
+    )
+
+    if ($Encoding -cne 'utf8-base64' -or $Sha256 -notmatch '^[a-f0-9]{64}$') {
+        throw 'The persisted protocol snapshot metadata is invalid.'
+    }
+    try { $raw = [Convert]::FromBase64String($Bytes) }
+    catch { throw 'The persisted protocol snapshot bytes are invalid Base64.' }
+    $actualHash = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData($raw)
+    ).ToLowerInvariant()
+    if ($actualHash -cne $Sha256) {
+        throw 'The persisted protocol snapshot digest does not match its bytes.'
+    }
+    $config = [Text.UTF8Encoding]::new($false, $true).GetString($raw) |
+        ConvertFrom-Json -Depth 50
+    Assert-CocProtocolConfig -ProtocolConfig $config
+    return $config
+}
+
+function New-CocMeasuredScenario {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$ProtocolConfig,
+        [Parameter(Mandatory)][string]$ExpectedBuildId,
+        [Parameter(Mandatory)][string]$OwnerId
+    )
+
+    $startCell = [string]$ProtocolConfig.startCellEditorId
+    $interiorCell = [string]$ProtocolConfig.interiorCellEditorId
+    if ($startCell -ne 'WindhelmExterior01' -or
+        $interiorCell -ne 'WhiterunDragonsreach') {
+        throw 'The protocol config does not describe the fixed COC route.'
+    }
+    $transitionCount = [int]$ProtocolConfig.transitionCount
+    if ($transitionCount -ne 20) { throw 'The measured COC run must contain 20 transitions.' }
+
+    $qualification = $ProtocolConfig.qualification
+    if ($null -eq $qualification -or
+        [string]$qualification.milestone -ne 'strict' -or
+        [int]$qualification.timeoutMs -ne 30000) {
+        throw 'The measured COC run requires strict qualification with a 30-second maximum deadline.'
+    }
+    $requiredPreparationEvents = @(
+        'request_queued', 'admission_check', 'early_exit',
+        'shader_cache_busy_wait', 'sss_raymarch_prewarm', 'ssgi_prewarm',
+        'dlss_preparation', 'fsr_preparation', 'fsr4_preparation',
+        'd3d_object_creation', 'total_preparation', 'request_to_prepared',
+        'prepared_to_creator'
+    )
+    $telemetryContract = Get-CocPropertyValue -Value $ProtocolConfig `
+        -Name 'telemetry'
+    $preparationContract = if ($null -ne $telemetryContract) {
+        Get-CocPropertyValue -Value $telemetryContract -Name 'preparation'
+    } else { $null }
+    $requiredPublicationFields = @(
+        'current', 'currentGeneration', 'completedGeneration',
+        'publishedGeneration', 'expectedWidth', 'expectedHeight',
+        'publishedWidth', 'publishedHeight', 'complete',
+        'deferredSetupAcknowledged', 'deviceMatches', 'contextMatches'
+    )
+    $publicationFields = if ($null -ne $telemetryContract) {
+        @(Get-CocPropertyValue -Value $telemetryContract `
+                -Name 'resourcePublicationFields')
+    } else { @() }
+    if ($null -eq $preparationContract -or
+        [string]$preparationContract.source -ne 'status.preparation' -or
+        [string]$preparationContract.capturePoint -ne 'post_wait_status' -or
+        @($preparationContract.eventNames).Count -ne
+            $requiredPreparationEvents.Count -or
+        @($requiredPreparationEvents | Where-Object {
+                $_ -notin @($preparationContract.eventNames)
+            }).Count -ne 0 -or
+        $publicationFields.Count -ne $requiredPublicationFields.Count -or
+        @($requiredPublicationFields | Where-Object {
+                $_ -notin $publicationFields
+            }).Count -ne 0) {
+        throw 'The measured COC run requires the complete publication and post-wait preparation telemetry contract.'
+    }
+
+    $foveation = [ordered]@{
+        foveatedVendorDispatch = [bool]$ProtocolConfig.foveation.foveatedVendorDispatch
+        foveatedCenterArea = [double]$ProtocolConfig.foveation.foveatedCenterArea
+        peripheryTAAEnable = [bool]$ProtocolConfig.foveation.peripheryTAAEnable
+        peripheryTAACenterArea = [double]$ProtocolConfig.foveation.peripheryTAACenterArea
+        peripheryTAAOuterScale = [double]$ProtocolConfig.foveation.peripheryTAAOuterScale
+    }
+    $steps = [Collections.Generic.List[object]]::new()
+    $steps.Add([ordered]@{
+        tool = 'communityshaders.renderscale'
+        label = 'coc-01-qualification-status'
+        args = [ordered]@{
+            action = 'qualification_status'
+            expectedBuildId = $ExpectedBuildId
+        }
+    })
+    $steps.Add([ordered]@{
+        tool = 'communityshaders.renderscale'
+        label = 'coc-01-begin'
+        args = [ordered]@{
+            action = 'qualification_begin'
+            transitionId = [uint64]1
+            ownerId = $OwnerId
+            expectedBuildId = $ExpectedBuildId
+        }
+    })
+    $steps.Add([ordered]@{
+        tool = 'communityshaders.renderscale'
+        label = 'stress-reset'
+        args = @{
+            action = 'reset'
+            ownerId = $OwnerId
+            expectedBuildId = $ExpectedBuildId
+        }
+    })
+    $steps.Add([ordered]@{
+        tool = 'communityshaders.renderscale'
+        label = 'stress-start'
+        args = @{
+            action = 'start'
+            ownerId = $OwnerId
+            expectedBuildId = $ExpectedBuildId
+        }
+    })
+
+    for ($ordinal = 1; $ordinal -le $transitionCount; $ordinal++) {
+        $cell = if (($ordinal % 2) -eq 1) { $interiorCell } else { $startCell }
+        $transitionId = [uint64]$ordinal
+        $dispatch = [ordered]@{
+            action = 'qualification_dispatch'
+            transitionId = $transitionId
+            ownerId = $OwnerId
+            expectedBuildId = $ExpectedBuildId
+            cocCellEditorId = $cell
+        }
+        if ($ordinal -eq 1) { $dispatch.startPerformanceTelemetry = $true }
+
+        if ($ordinal -gt 1) {
+            $steps.Add([ordered]@{
+                tool = 'communityshaders.renderscale'
+                label = "coc-$($ordinal.ToString('D2'))-qualification-status"
+                args = [ordered]@{
+                    action = 'qualification_status'
+                    expectedBuildId = $ExpectedBuildId
+                }
+            })
+
+            $steps.Add([ordered]@{
+                tool = 'communityshaders.renderscale'
+                label = "coc-$($ordinal.ToString('D2'))-begin"
+                args = [ordered]@{
+                    action = 'qualification_begin'
+                    transitionId = $transitionId
+                    ownerId = $OwnerId
+                    expectedBuildId = $ExpectedBuildId
+                }
+            })
+        }
+        $steps.Add([ordered]@{
+            tool = 'communityshaders.renderscale'
+            label = "coc-$($ordinal.ToString('D2'))-dispatch"
+            args = $dispatch
+        })
+        $steps.Add([ordered]@{
+            tool = 'communityshaders.renderscale'
+            label = "coc-$($ordinal.ToString('D2'))-wait"
+            args = [ordered]@{
+                action = 'qualification_wait'
+                transitionId = $transitionId
+                ownerId = $OwnerId
+                expectedBuildId = $ExpectedBuildId
+                expectedCellEditorId = $cell
+                foveation = $foveation
+                milestone = 'strict'
+                timeoutMs = [int]$qualification.timeoutMs
+            }
+        })
+        $steps.Add([ordered]@{
+            tool = 'communityshaders.renderscale'
+            label = "coc-$($ordinal.ToString('D2'))-status"
+            args = [ordered]@{
+                action = 'status'
+                expectedBuildId = $ExpectedBuildId
+            }
+        })
+    }
+    return [ordered]@{
+        action = 'run'
+        async = $true
+        continueOnError = $false
+        steps = @($steps)
+    }
+}
+
+function Test-CocBaseline {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Results,
+        [Parameter(Mandatory)][string]$ExpectedCell
+    )
+
+    $reasons = [Collections.Generic.List[string]]::new()
+    $ownershipConflicts = [Collections.Generic.List[string]]::new()
+    foreach ($name in @('state', 'scene', 'upscaling', 'renderscale', 'image')) {
+        if (-not $Results.ContainsKey($name) -or $null -eq $Results[$name]) {
+            $reasons.Add("baseline '$name' is incomplete")
+            continue
+        }
+        $receipt = $Results[$name]
+        $valueProperty = if ($receipt -is [Collections.IDictionary]) {
+            if ($receipt.Contains('value')) { $receipt['value'] } else { $null }
+        } else {
+            $property = $receipt.PSObject.Properties['value']
+            if ($property) { $property.Value } else { $null }
+        }
+        if ($null -eq $valueProperty) {
+            $reasons.Add("baseline '$name' application value is missing or null")
+        }
+    }
+    if ($reasons.Count -gt 0) {
+        return [pscustomobject]@{
+            acceptable = $false
+            ownershipConflict = $false
+            ownershipConflicts = @()
+            reasons = @($reasons)
+        }
+    }
+
+    $state = $Results.state.value
+    $scene = $Results.scene.value
+    $upscaling = $Results.upscaling.value
+    $renderScale = $Results.renderscale.value
+    $cell = Get-CocPropertyValue -Value $scene -Name 'cell'
+    $actualCell = if ($cell -is [string]) {
+        [string]$cell
+    } elseif ($null -ne $cell) {
+        [string](Get-CocPropertyValue -Value $cell -Name 'editorId')
+    } else {
+        ''
+    }
+    $playerLoaded = ConvertTo-CocBoolean (
+        Get-CocPropertyValue -Value $state -Name 'playerLoaded'
+    )
+    if ($true -ne $playerLoaded) { $reasons.Add('the player is not loaded') }
+    if (-not [string]::Equals(
+        $actualCell, $ExpectedCell, [StringComparison]::OrdinalIgnoreCase
+    )) { $reasons.Add("the exact cell is '$actualCell'") }
+
+    $stability = Test-DevBenchUpscalingStable `
+        -UpscalingSnapshot $upscaling -RenderScaleStatus $renderScale
+    foreach ($reason in @($stability.reasons)) { $reasons.Add([string]$reason) }
+    $status = if ($renderScale.PSObject.Properties['status']) {
+        $renderScale.status
+    } else {
+        $renderScale
+    }
+    $diagnostics = @(
+        @{ name = 'stress'; property = 'session' },
+        @{ name = 'CPU telemetry'; property = 'cpuPerformance' },
+        @{ name = 'GPU telemetry'; property = 'gpuPerformance' }
+    )
+    foreach ($diagnostic in $diagnostics) {
+        $property = $status.PSObject.Properties[$diagnostic.property]
+        $activeProperty = if ($property -and $property.Value) {
+            $property.Value.PSObject.Properties['active']
+        } else {
+            $null
+        }
+        if (-not $activeProperty) {
+            $reasons.Add("$($diagnostic.name) ownership status is unavailable")
+            continue
+        }
+        $diagnostic.active = [bool]$activeProperty.Value
+        if ($diagnostic.active) {
+            $conflict = "an unowned $($diagnostic.name) session is already active"
+            $reasons.Add($conflict)
+            $ownershipConflicts.Add($conflict)
+        }
+    }
+    return [pscustomobject][ordered]@{
+        acceptable = $reasons.Count -eq 0
+        ownershipConflict = $ownershipConflicts.Count -gt 0
+        ownershipConflicts = @($ownershipConflicts)
+        reasons = @($reasons | Select-Object -Unique)
+        actualCell = $actualCell
+        stability = $stability
+        resourcePublication = Get-DevBenchResourcePublicationTelemetry -Response $renderScale
+        preparation = Get-DevBenchRenderScalePreparationTelemetry -Response $renderScale
+    }
+}
+
+function Get-CocPropertyValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Value,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($Value -is [Collections.IDictionary]) {
+        if ($Value.Contains($Name)) { return $Value[$Name] }
+        return $null
+    }
+    $property = $Value.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $null
+}
+
+function Get-CocPathValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Value,
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $current = $Value
+    foreach ($segment in $Path.Split('.')) {
+        if ($null -eq $current) { return $null }
+        $current = Get-CocPropertyValue -Value $current -Name $segment
+    }
+    return $current
+}
+
+function ConvertTo-CocNumber {
+    [CmdletBinding()]
+    param($Value)
+
+    if ($null -eq $Value) { return $null }
+    try {
+        $number = [double]$Value
+        if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) {
+            return $null
+        }
+        return $number
+    }
+    catch {
+        return $null
+    }
+}
+
+function ConvertTo-CocBoolean {
+    [CmdletBinding()]
+    param($Value)
+
+    if ($Value -is [bool]) { return $Value }
+    if ($Value -is [string]) {
+        $parsed = $false
+        if ([bool]::TryParse($Value, [ref]$parsed)) { return $parsed }
+    }
+    return $null
+}
+
+function Get-CocFirstNumber {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Value,
+        [Parameter(Mandatory)][string[]]$Paths
+    )
+
+    foreach ($path in $Paths) {
+        $number = ConvertTo-CocNumber (Get-CocPathValue -Value $Value -Path $path)
+        if ($null -ne $number) { return $number }
+    }
+    return $null
+}
+
+function Get-CocTimingSummary {
+    [CmdletBinding()]
+    param([object[]]$Values)
+
+    $numbers = @($Values | ForEach-Object { ConvertTo-CocNumber $_ } |
+        Where-Object { $null -ne $_ } | Sort-Object)
+    if ($numbers.Count -eq 0) {
+        return [pscustomobject]@{ count = 0; median = $null; p95 = $null; max = $null }
+    }
+    $middle = [int][Math]::Floor(($numbers.Count - 1) / 2)
+    $median = if (($numbers.Count % 2) -eq 1) {
+        $numbers[$middle]
+    } else {
+        ($numbers[$middle] + $numbers[$middle + 1]) / 2.0
+    }
+    $p95 = $numbers[[int][Math]::Ceiling($numbers.Count * 0.95) - 1]
+    return [pscustomobject]@{
+        count = $numbers.Count
+        median = [Math]::Round($median, 3)
+        p95 = [Math]::Round($p95, 3)
+        max = [Math]::Round($numbers[-1], 3)
+    }
+}
+
+function Get-CocNumberTotal {
+    [CmdletBinding()]
+    param([object[]]$Values)
+
+    $numbers = @($Values | ForEach-Object { ConvertTo-CocNumber $_ } |
+        Where-Object { $null -ne $_ })
+    if ($numbers.Count -eq 0) { return $null }
+    return [Math]::Round((($numbers | Measure-Object -Sum).Sum), 3)
+}
+
+function Get-CocScenarioRecordPayload {
+    param(
+        [Parameter(Mandatory)][object[]]$Records,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    $matches = @($Records | Where-Object {
+            [string](Get-CocPropertyValue -Value $_ -Name 'label') -ceq $Label
+        } | Select-Object -First 1)
+    if ($matches.Count -eq 0) { return $null }
+    $record = $matches[0]
+    $payload = Get-CocPropertyValue -Value $record -Name 'result'
+    if ($null -eq $payload) {
+        $payload = Get-CocPropertyValue -Value $record -Name 'value'
+    }
+    return $payload
+}
+
+function Test-CocReceiptFieldValue {
+    param([Parameter(Mandatory)][string]$Name, $Value)
+
+    if ($null -eq $Value) { return $false }
+    if ($Name -in @('presentationStable', 'cleanupDrained', 'strictSatisfied')) {
+        return $Value -is [bool]
+    }
+    if ($Name -in @(
+            'presentationFailureMask', 'presentationElapsedMs',
+            'presentationElapsedFrames', 'cleanupFailureMask',
+            'cleanupElapsedMs', 'cleanupElapsedFrames', 'strictFailureMask',
+            'strictElapsedMs', 'strictElapsedFrames'
+        )) {
+        $number = ConvertTo-CocNumber $Value
+        return $null -ne $number -and $number -ge 0
+    }
+    if ($Name -in @(
+            'presentationFailureReasons', 'cleanupFailureReasons',
+            'strictFailureReasons', 'outstandingCleanupDebt'
+        )) {
+        return $Value -is [array]
+    }
+    if ($Name -in @('timing', 'frames', 'observation', 'producer')) {
+        return $Value -is [Collections.IDictionary] -or
+            $Value -is [pscustomobject]
+    }
+    return $true
+}
+
+function Get-CocQualificationAnalysis {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Scenario,
+        [Parameter(Mandatory)]$ProtocolConfig,
+        [string]$ExpectedOwnerId,
+        [string]$ExpectedBuildId
+    )
+
+    Assert-CocProtocolConfig -ProtocolConfig $ProtocolConfig
+    $records = @(Get-CocPropertyValue -Value $Scenario -Name 'results')
+    if ($records.Count -eq 0) {
+        return [pscustomobject]@{
+            available = $false
+            reason = 'The scenario transcript has no result records.'
+        }
+    }
+
+    $missingEvidence = [Collections.Generic.List[string]]::new()
+    foreach ($group in @($records | Group-Object {
+                [string](Get-CocPropertyValue -Value $_ -Name 'label')
+            })) {
+        if ([string]::IsNullOrWhiteSpace([string]$group.Name)) {
+            $missingEvidence.Add('scenario-record.label')
+        } elseif ($group.Count -ne 1) {
+            $missingEvidence.Add("$($group.Name).duplicate")
+        }
+    }
+    $transitions = [Collections.Generic.List[object]]::new()
+    for ($ordinal = 1; $ordinal -le [int]$ProtocolConfig.transitionCount; $ordinal++) {
+        $prefix = "coc-$($ordinal.ToString('D2'))"
+        $receipt = Get-CocScenarioRecordPayload -Records $records `
+            -Label "$prefix-wait"
+        $statusReceipt = Get-CocScenarioRecordPayload -Records $records `
+            -Label "$prefix-status"
+        $cell = if (($ordinal % 2) -eq 1) {
+            [string]$ProtocolConfig.interiorCellEditorId
+        } else {
+            [string]$ProtocolConfig.startCellEditorId
+        }
+        if ($null -eq $receipt) {
+            $missingEvidence.Add("$prefix-wait")
+            if ($null -eq $statusReceipt) { $missingEvidence.Add("$prefix-status") }
+            $transitions.Add([pscustomobject][ordered]@{
+                ordinal = $ordinal; destination = $cell; receiptPresent = $false
+                statusReceiptPresent = $null -ne $statusReceipt
+                presentationElapsedMs = $null; presentationElapsedFrames = $null
+                cleanupElapsedMs = $null; cleanupElapsedFrames = $null
+                strictElapsedMs = $null; strictElapsedFrames = $null
+                cleanupTailMs = $null; cleanupTailFrames = $null
+                presentationStable = $null; cleanupDrained = $null
+                strictSatisfied = $null; retryCount = $null
+                sessionStretchObservations = $null
+                vendorFailures = $null; boundsMismatchFallbacks = $null
+                ooms = $null; deviceLosses = $null
+                fidelityMismatches = $null
+                resourcePublication = Get-DevBenchResourcePublicationTelemetry -Response $null
+                preparation = Get-DevBenchRenderScalePreparationTelemetry -Response $statusReceipt
+            })
+            continue
+        }
+
+        if ($null -eq $statusReceipt) { $missingEvidence.Add("$prefix-status") }
+
+        $presentationMs = Get-CocFirstNumber $receipt @('presentationElapsedMs')
+        $presentationFrames = Get-CocFirstNumber $receipt @('presentationElapsedFrames')
+        $cleanupMs = Get-CocFirstNumber $receipt @('cleanupElapsedMs')
+        $cleanupFrames = Get-CocFirstNumber $receipt @('cleanupElapsedFrames')
+        $strictMs = Get-CocFirstNumber $receipt @('strictElapsedMs')
+        $strictFrames = Get-CocFirstNumber $receipt @('strictElapsedFrames')
+        $tailMs = if ($null -ne $strictMs -and $null -ne $presentationMs) {
+            [Math]::Round($strictMs - $presentationMs, 3)
+        } else { $null }
+        $tailFrames = if ($null -ne $strictFrames -and $null -ne $presentationFrames) {
+            [Math]::Round($strictFrames - $presentationFrames, 3)
+        } else { $null }
+        $observation = Get-CocPropertyValue -Value $receipt -Name 'observation'
+        $transitionEpoch = $null
+        if ($null -ne $observation) {
+            $transitionEpoch = Get-CocPathValue -Value $observation `
+                -Path 'physical.stable.transitionEpoch'
+            if ($null -eq $transitionEpoch) {
+                $transitionEpoch = Get-CocPathValue -Value $observation `
+                    -Path 'upscalingSnapshot.stable.transitionEpoch'
+            }
+        }
+        $preparation = if ($null -ne $transitionEpoch) {
+            Get-DevBenchRenderScalePreparationTelemetry -Response $statusReceipt `
+                -TransitionEpoch $transitionEpoch
+        } else {
+            Get-DevBenchRenderScalePreparationTelemetry -Response $statusReceipt
+        }
+        $resourcePublication = Get-DevBenchResourcePublicationTelemetry `
+            -Response $observation
+        if (-not [bool]$resourcePublication.available) {
+            $missingEvidence.Add("$prefix-wait.resourcePublication")
+        }
+        if ($null -ne $statusReceipt -and -not [bool]$preparation.available) {
+            $missingEvidence.Add("$prefix-status.preparation")
+        }
+        $transitionId = Get-CocPropertyValue -Value $receipt -Name 'transitionId'
+        $receiptOwnerId = Get-CocPropertyValue -Value $receipt -Name 'ownerId'
+        foreach ($field in @($ProtocolConfig.qualification.receiptFields)) {
+            $property = if ($receipt -is [Collections.IDictionary]) {
+                if ($receipt.Contains([string]$field)) {
+                    [pscustomobject]@{ Value = $receipt[[string]$field] }
+                } else { $null }
+            } else { $receipt.PSObject.Properties[[string]$field] }
+            if (-not $property -or
+                -not (Test-CocReceiptFieldValue -Name ([string]$field) `
+                    -Value $property.Value)) {
+                $missingEvidence.Add("$prefix-wait.$field")
+            }
+        }
+        $producer = Get-CocPropertyValue -Value $receipt -Name 'producer'
+        $producerBuildId = if ($null -ne $producer) {
+            Get-CocPropertyValue -Value $producer -Name 'buildId'
+        } else { $null }
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedBuildId) -and
+            [string]$producerBuildId -cne $ExpectedBuildId) {
+            $missingEvidence.Add("$prefix-wait.producer.buildId")
+        }
+        $presentationStable = ConvertTo-CocBoolean (Get-CocPropertyValue -Value $receipt -Name 'presentationStable')
+        $cleanupDrained = ConvertTo-CocBoolean (Get-CocPropertyValue -Value $receipt -Name 'cleanupDrained')
+        $strictSatisfied = ConvertTo-CocBoolean (Get-CocPropertyValue -Value $receipt -Name 'strictSatisfied')
+        $transitionIdNumber = ConvertTo-CocNumber $transitionId
+        if ($null -eq $transitionIdNumber -or $transitionIdNumber -lt 0 -or
+            $transitionIdNumber -ne [double]$ordinal) {
+            $missingEvidence.Add("$prefix-wait.transitionId")
+        }
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedOwnerId) -and
+            [string]$receiptOwnerId -cne $ExpectedOwnerId) {
+            $missingEvidence.Add("$prefix-wait.ownerId")
+        }
+        foreach ($required in @(
+                @{ name = 'presentationStable'; value = $presentationStable },
+                @{ name = 'cleanupDrained'; value = $cleanupDrained },
+                @{ name = 'strictSatisfied'; value = $strictSatisfied },
+                @{ name = 'presentationElapsedMs'; value = $presentationMs },
+                @{ name = 'cleanupElapsedMs'; value = $cleanupMs },
+                @{ name = 'strictElapsedMs'; value = $strictMs }
+            )) {
+            if ($null -eq $required.value) {
+                $missingEvidence.Add("$prefix-wait.$($required.name)")
+            }
+        }
+        $transitions.Add([pscustomobject][ordered]@{
+            ordinal = $ordinal
+            destination = $cell
+            receiptPresent = $true
+            statusReceiptPresent = $null -ne $statusReceipt
+            transitionId = $transitionId
+            ownerId = $receiptOwnerId
+            timedOutMilestone = Get-CocPropertyValue -Value $receipt -Name 'timedOutMilestone'
+            presentationStable = $presentationStable
+            presentationFailureMask = Get-CocPropertyValue -Value $receipt -Name 'presentationFailureMask'
+            presentationFailureReasons = @(Get-CocPropertyValue -Value $receipt -Name 'presentationFailureReasons')
+            presentationElapsedMs = $presentationMs
+            presentationElapsedFrames = $presentationFrames
+            cleanupDrained = $cleanupDrained
+            cleanupFailureMask = Get-CocPropertyValue -Value $receipt -Name 'cleanupFailureMask'
+            cleanupFailureReasons = @(Get-CocPropertyValue -Value $receipt -Name 'cleanupFailureReasons')
+            cleanupElapsedMs = $cleanupMs
+            cleanupElapsedFrames = $cleanupFrames
+            strictSatisfied = $strictSatisfied
+            strictFailureMask = Get-CocPropertyValue -Value $receipt -Name 'strictFailureMask'
+            strictFailureReasons = @(Get-CocPropertyValue -Value $receipt -Name 'strictFailureReasons')
+            strictElapsedMs = $strictMs
+            strictElapsedFrames = $strictFrames
+            cleanupTailMs = $tailMs
+            cleanupTailFrames = $tailFrames
+            outstandingCleanupDebt = Get-CocPropertyValue -Value $receipt -Name 'outstandingCleanupDebt'
+            timing = Get-CocPropertyValue -Value $receipt -Name 'timing'
+            frames = Get-CocPropertyValue -Value $receipt -Name 'frames'
+            observation = $observation
+            resourcePublication = $resourcePublication
+            preparation = $preparation
+            producer = $producer
+            retryCount = Get-CocFirstNumber $receipt @('retryCount', 'retries', 'observation.retryCount', 'observation.retries')
+            sessionStretchObservations = Get-CocFirstNumber $receipt @('observation.stretch.sessionObservations', 'sessionStretchObservations')
+            consecutiveStretchFrames = Get-CocFirstNumber $receipt @('observation.stretch.consecutiveFrames', 'consecutiveStretchFrames')
+            vendorFailures = Get-CocFirstNumber $receipt @('observation.diagnostics.delta.vendorFailures', 'vendorFailures')
+            boundsMismatchFallbacks = Get-CocFirstNumber $receipt @('observation.diagnostics.delta.boundsMismatchFallbacks', 'boundsMismatchFallbacks')
+            ooms = Get-CocFirstNumber $receipt @('observation.diagnostics.delta.ooms', 'ooms')
+            deviceLosses = Get-CocFirstNumber $receipt @('observation.diagnostics.delta.deviceLosses', 'deviceLosses')
+            fidelityMismatches = Get-CocFirstNumber $receipt @('observation.diagnostics.delta.fidelityMismatches', 'fidelityMismatches')
+        })
+    }
+
+    $strictFrames = @($transitions | ForEach-Object { $_.strictElapsedFrames })
+    $presentationFrames = @($transitions | ForEach-Object { $_.presentationElapsedFrames })
+    $cleanupFrames = @($transitions | ForEach-Object { $_.cleanupElapsedFrames })
+    $tailFrames = @($transitions | ForEach-Object { $_.cleanupTailFrames })
+    $strictByDestination = [ordered]@{}
+    foreach ($cell in @(
+            [string]$ProtocolConfig.interiorCellEditorId,
+            [string]$ProtocolConfig.startCellEditorId
+        )) {
+        $strictByDestination[$cell] = Get-CocTimingSummary @(
+            $transitions | Where-Object destination -ceq $cell |
+                ForEach-Object { $_.strictElapsedFrames }
+        )
+    }
+    $strictTargets = Get-CocPropertyValue -Value $ProtocolConfig.qualification -Name 'strictFrameTargets'
+    $cleanupDebtRanked = @(
+        $transitions | Sort-Object -Property @(
+            @{ Expression = { if ($null -eq $_.cleanupTailFrames) { -1 } else { $_.cleanupTailFrames } }; Descending = $true },
+            @{ Expression = { if ($null -eq $_.cleanupTailMs) { -1 } else { $_.cleanupTailMs } }; Descending = $true }
+        )
+    )
+    $publicationSamples = @($transitions | ForEach-Object { $_.resourcePublication })
+    $availablePublications = @($publicationSamples | Where-Object { [bool]$_.available })
+    $currentPublications = @($availablePublications | Where-Object { [bool]$_.current })
+    $preparationSamples = @($transitions | ForEach-Object { $_.preparation })
+    $availablePreparation = @($preparationSamples | Where-Object { [bool]$_.available })
+    $exactPreparation = @($availablePreparation | Where-Object { [bool]$_.filterApplied })
+    $unknownPresentation = @($transitions | Where-Object { $null -eq $_.presentationStable }).Count
+    $unknownCleanup = @($transitions | Where-Object { $null -eq $_.cleanupDrained }).Count
+    $unknownStrict = @($transitions | Where-Object { $null -eq $_.strictSatisfied }).Count
+    return [pscustomobject][ordered]@{
+        available = $true
+        complete = $missingEvidence.Count -eq 0
+        missingEvidence = @($missingEvidence | Select-Object -Unique)
+        canonicalMilestone = 'strict'
+        strictFrameTargets = $strictTargets
+        transitions = @($transitions)
+        timings = [pscustomobject][ordered]@{
+            presentationFrames = Get-CocTimingSummary $presentationFrames
+            cleanupFrames = Get-CocTimingSummary $cleanupFrames
+            strictFrames = Get-CocTimingSummary $strictFrames
+            cleanupTailFrames = Get-CocTimingSummary $tailFrames
+            presentationMs = Get-CocTimingSummary @($transitions | ForEach-Object { $_.presentationElapsedMs })
+            cleanupMs = Get-CocTimingSummary @($transitions | ForEach-Object { $_.cleanupElapsedMs })
+            strictMs = Get-CocTimingSummary @($transitions | ForEach-Object { $_.strictElapsedMs })
+            cleanupTailMs = Get-CocTimingSummary @($transitions | ForEach-Object { $_.cleanupTailMs })
+            strictFramesByDestination = [pscustomobject]$strictByDestination
+        }
+        totals = [pscustomobject][ordered]@{
+            retries = Get-CocNumberTotal @($transitions | ForEach-Object { $_.retryCount })
+            sessionStretchObservations = Get-CocNumberTotal @($transitions | ForEach-Object { $_.sessionStretchObservations })
+            vendorFailures = Get-CocNumberTotal @($transitions | ForEach-Object { $_.vendorFailures })
+            boundsMismatchFallbacks = Get-CocNumberTotal @($transitions | ForEach-Object { $_.boundsMismatchFallbacks })
+            ooms = Get-CocNumberTotal @($transitions | ForEach-Object { $_.ooms })
+            deviceLosses = Get-CocNumberTotal @($transitions | ForEach-Object { $_.deviceLosses })
+            fidelityMismatches = Get-CocNumberTotal @($transitions | ForEach-Object { $_.fidelityMismatches })
+            presentationFailures = @($transitions | Where-Object { $_.presentationStable -eq $false }).Count
+            cleanupFailures = @($transitions | Where-Object { $_.cleanupDrained -eq $false }).Count
+            strictFailures = @($transitions | Where-Object { $_.strictSatisfied -eq $false }).Count
+            unknownPresentation = $unknownPresentation
+            unknownCleanup = $unknownCleanup
+            unknownStrict = $unknownStrict
+        }
+        cleanupDebtRanked = $cleanupDebtRanked
+        resourcePublication = [pscustomobject][ordered]@{
+            samples = $publicationSamples
+            availableSamples = $availablePublications.Count
+            currentSamples = $currentPublications.Count
+            latest = $(if ($publicationSamples.Count -gt 0) { $publicationSamples[-1] } else { Get-DevBenchResourcePublicationTelemetry -Response $null })
+        }
+        preparation = [pscustomobject][ordered]@{
+            samples = $preparationSamples
+            availableSamples = $availablePreparation.Count
+            exactTransitionSamples = $exactPreparation.Count
+            eventCount = Get-CocNumberTotal @(
+                $preparationSamples | ForEach-Object { $_.eventCount }
+            )
+            overwrittenEventsMaximum = $(
+                $overwritten = @($availablePreparation | ForEach-Object {
+                        ConvertTo-CocNumber $_.overwrittenEvents
+                    } | Where-Object { $null -ne $_ })
+                if ($overwritten.Count -gt 0) {
+                    ($overwritten | Measure-Object -Maximum).Maximum
+                } else { $null }
+            )
+            latest = $(if ($preparationSamples.Count -gt 0) {
+                    $preparationSamples[-1]
+                } else {
+                    Get-DevBenchRenderScalePreparationTelemetry -Response $null
+                })
+        }
+    }
+}
+
+function New-CocDispatchClaim {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Source
+    )
+
+    $claim = $null
+    try {
+        $claim = [IO.File]::Open(
+            $Path, [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write, [IO.FileShare]::Read
+        )
+    }
+    catch {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            return [pscustomobject]@{
+                ok = $true
+                state = 'dispatch-already-claimed'
+                source = $Source
+                error = $null
+            }
+        }
+        return [pscustomobject]@{
+            ok = $false
+            state = 'dispatch-claim-failed'
+            source = $Source
+            error = $_.Exception.Message
+        }
+    }
+
+    try {
+        $writer = [IO.StreamWriter]::new($claim)
+        $writer.Write($Source)
+        $writer.Flush()
+        $writer.Dispose()
+        $claim = $null
+        return [pscustomobject]@{
+            ok = $true
+            state = 'dispatch-claimed'
+            source = $Source
+            error = $null
+        }
+    }
+    catch {
+        if ($claim) { $claim.Dispose() }
+        return [pscustomobject]@{
+            ok = $false
+            state = 'dispatch-claim-failed'
+            source = $Source
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function Get-CocScenarioDisposition {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Scenario,
+        [Parameter(Mandatory)]$Analysis
+    )
+
+    $doneValue = Get-CocPropertyValue -Value $Scenario -Name 'done'
+    if ($doneValue -isnot [bool]) {
+        return [pscustomobject][ordered]@{
+            ok = $false
+            state = 'evidence-partial'
+            executionComplete = $null
+            executionOk = $false
+            evidenceComplete = $false
+            errors = @('Scenario status omitted a Boolean done field.')
+        }
+    }
+    $done = [bool]$doneValue
+    $okValue = Get-CocPropertyValue -Value $Scenario -Name 'ok'
+    if ($done -and $okValue -isnot [bool]) {
+        return [pscustomobject][ordered]@{
+            ok = $false
+            state = 'evidence-partial'
+            executionComplete = $true
+            executionOk = $false
+            evidenceComplete = $false
+            errors = @('Completed scenario status omitted a Boolean ok field.')
+        }
+    }
+    $executionOk = -not $done -or [bool]$okValue
+    $evidenceComplete = -not $done -or
+        ($Analysis.PSObject.Properties['complete'] -and [bool]$Analysis.complete)
+    $ok = $executionOk -and $evidenceComplete
+    $state = if (-not $done) {
+        'running'
+    } elseif (-not $executionOk) {
+        'failed'
+    } elseif (-not $evidenceComplete) {
+        'evidence-partial'
+    } else { 'complete' }
+    $errors = if (-not $executionOk) {
+        $executionError = [string](Get-CocPropertyValue -Value $Scenario -Name 'error')
+        if ([string]::IsNullOrWhiteSpace($executionError)) {
+            $executionError = 'Scenario execution failed without an error detail.'
+        }
+        @($executionError)
+    } elseif (-not $evidenceComplete) {
+        $missingEvidence = if ($Analysis.PSObject.Properties['missingEvidence']) {
+            @($Analysis.missingEvidence)
+        } elseif ($Analysis.PSObject.Properties['reason'] -and
+            -not [string]::IsNullOrWhiteSpace([string]$Analysis.reason)) {
+            @([string]$Analysis.reason)
+        } else {
+            @('qualification analysis is unavailable')
+        }
+        @("Scenario execution completed but mandatory evidence is incomplete: $($missingEvidence -join ', ')")
+    } else { @() }
+    return [pscustomobject][ordered]@{
+        ok = $ok
+        state = $state
+        executionComplete = $done
+        executionOk = $executionOk
+        evidenceComplete = $evidenceComplete
+        errors = $errors
+    }
+}
+
+Export-ModuleMember -Function Invoke-CocMcpTool, New-CocDispatchClaim, New-CocMeasuredScenario, Test-CocBaseline, Get-CocQualificationAnalysis, Get-CocScenarioDisposition, Assert-CocCanonicalEndpoint, Assert-CocEndpointBinding, Assert-CocProcessLifetime, Assert-CocProtocolConfig, New-CocProtocolSnapshot, Get-CocProtocolFromSnapshot

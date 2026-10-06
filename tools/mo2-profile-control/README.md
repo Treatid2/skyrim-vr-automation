@@ -38,6 +38,26 @@ path, retain an exact modlist backup, and record all displaced providers plus a
 postcondition. MO2 overwrite, unmanaged files, and archives are outside this
 proof; use VFS evidence when those sources matter.
 
+`add-enable` is the high-level interface for an already deployed mod directory.
+The caller supplies `ProfilePath`, `ModsDirectory`, `ModName`, and the exact
+`ModDirectory`; the controller discovers every DLL in that mod, registers or
+enables its marker, and places it before every enabled loose-file provider of a
+matching relative DLL path. Callers do not calculate priority or winning paths.
+
+Its default `DisableExactDllOnly` retirement policy disables a previous provider
+only when all of that provider's functional files are matching DLLs supplied by
+the target. `meta.ini`, documentation, symbols, FOMOD metadata, and `.mohidden`
+files do not prevent that narrow classification. Any INI, script, asset,
+different DLL, or other functional payload keeps the provider enabled below the
+new winner. Use `-RetirementPolicy KeepProviders` when even exact DLL-only
+providers must remain enabled. The whole target registration/reposition and
+provider retirement occurs in one `modlist.txt` transaction and one restore
+receipt.
+
+Automatic directory inventory is reparse-, file-, directory-, and depth-bounded.
+The interface does not copy or extract an archive: deploy the exact mod directory
+first, then pass it to `add-enable`.
+
 For more than one winning path in a direct `pwsh -File` invocation, use
 `-WinningPathsFile`. It accepts either a JSON string array or one relative path
 per line (blank lines and `#` comments are ignored), then combines and
@@ -68,4 +88,32 @@ refresh cannot be proven, it returns `ok=false`, state
 `committed-refresh-required`, and retains the exact transaction receipt; it
 does not pretend the committed bytes were rolled back.
 
-Run `tests/Test-MO2ProfileControl.ps1` after changing the contract.
+## Disabled installed inventory (workspace-owned orchestration)
+
+`normalize-installed` appends only installed direct-child mods absent from the
+profile, as disabled markers. It preserves all original bytes and enabled order.
+`recover-disabled-append` removes at most 64 new disabled trailing markers only
+when the exact remaining bytes match `-PinnedProfileSha256`. MO2 may instead
+insert new disabled entries near the start. For this case only, supply
+`-DisabledModNamesFile`: an explicit JSON array of 1..64 unique installed names,
+at most 32 KiB, not a reparse path. Recovery removes exactly one disabled record
+per named mod, wherever inserted, preserving every other byte; the result must
+still equal the trusted pinned SHA exactly. It performs no candidate search and
+does not accept enabled/order/comment/newline drift. The names-file SHA is
+recorded in the transaction proof. Without this parameter only suffix recovery
+is attempted. It refuses enabled,
+reordered, duplicate, unknown, unsafe, reparse, or non-suffix drift. Strict UTF-8,
+16 MiB profile and 30-second planning budgets apply; inventory is bounded to
+20,000 direct directories, with no recursive shared-mod scan.
+
+Both commands require `-ExpectedCurrentSha256`, `-ModsDirectory`, closed MO2/game,
+and normal evidence/backup/journal/CAS/rollback. `ModName` remains required as an
+audit label, not a selected marker. They do not accept a human live-mutation
+capability. Operational callers use the workspace entry point, which derives
+the trusted pinned hash from existing ownership and plans; never manufacture
+a pinned hash or mutate active bindings through this lower-level primitive.
+An already exact/normalized profile is a mutation-free no-op, not a new receipt.
+
+Run `tests/Test-MO2ProfileControl.ps1` after changing the contract, and run
+`tests/Test-DisabledModlistReconciliation.ps1 -FixtureRoot <managed-fixture-root>`
+for the disabled inventory matrix.

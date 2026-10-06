@@ -1,9 +1,104 @@
 # Changelog
 
+- Fix config discovery under strict mode when zero or one named modlist exists;
+  the controller now falls through to stable configuration or returns the
+  explicit `named-selection-required` precondition instead of a scalar `.Count`
+  error.
+
 All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Atomically replace a bounded-process receipt when its final persistence
+  crosses the absolute deadline, so reopened durable evidence cannot retain a
+  success projection after the returned result has failed.
+- Validate every completed runtime-output layer and restored live baseline
+  before discovery or resume can rearm it, rearm completed output even under
+  the same access ID, and report malformed or otherwise unavailable task-owned
+  workspace state without offering fresh-create guidance.
+- Rebind an exact retained active MO2 Overwrite transaction to the task's new
+  closed-state access lease instead of dead-ending between obsolete-lease
+  completion and fresh-transaction rearm. Workspace discovery now distinguishes
+  exact active rebind, completed-output rearm, foreign ownership, malformed
+  markers, and incomplete completion evidence.
+- Reauthorize the last cooperative-close `Preparing vfs` Cancel control against
+  the exact retained MO2 process and current session generation immediately
+  before mutation; every MO2/game UI, close, and termination action now has an
+  immediate complete-identity boundary.
+- Scope doctor fixture failures to an explicit `VerifiedFixture` requirement;
+  missing or stale fixture state remains advisory for `MainMenuOnly` and
+  `FreshGame`.
+- Add a high-level MO2 `add-enable` transaction that discovers target DLLs,
+  registers or enables the deployed mod at sufficient winning priority, and by
+  default disables only fully superseded exact DLL-only providers while
+  retaining every mixed-content provider.
+- Add deterministic MO2 ZIP packaging from an explicit Skyrim Data root plus
+  safe archive inspection that distinguishes direct layouts, flatten-dependent
+  wrappers, the quick-installer `Data`-plus-docs special case, and wrapper
+  layouts blocked by sibling files.
+- Keep the synchronous-completion public-call fixtures composable with the
+  integrated workspace-isolation gate by supplying the real access identity
+  and session-lock evidence, and replacing that unrelated dependency inside
+  the bounded fixture.
+- Preserve each synchronous launch/open generation through its completion,
+  refuse stale terminal writes after a concurrent lifecycle wins, and recognize
+  success only when the newer record proves the same exact attempt completed.
+- Launch bounded child processes suspended, assign their complete process tree
+  to the kill-on-close job before first execution, and require verified root
+  exit, job quiescence, stream drain, receipt persistence, and absolute-deadline
+  completion before reporting success.
+- Keep qualification acceptance validators and publication fault-injection
+  callbacks module-private, and report cleanup-only warnings without rejecting
+  an already validated public result.
+- Attempt every qualification publication rollback and temporary-file cleanup
+  step even when one filesystem operation fails, compose cleanup failures with
+  the original error, and retain unrestored backups for manual recovery.
+- Stage qualification reports and summaries until their completion receipt is
+  validated and privately committed, then publish the sealed result with
+  rollback so a later failure cannot leave a new unsealed PASS projection.
+- Keep unsealed qualification projection internal to the atomic receipt
+  committer, initialize every strict-mode terminal path, and return later
+  revalidation/status disagreements in memory without rewriting sealed bytes.
+- Keep render-scale terminal acceptance atomic through the runner result: reuse
+  the receipt hash proven before public commit, and preserve an existing sealed
+  report and summary when any later revalidation becomes unavailable.
+- Recheck the exact MO2 owner beside the serialized game-close inventory, guard
+  every retained failed-to-run dialog action with the initiating generation and
+  retained owner handle, and keep recovery-close completion on that same
+  generation so stale results cannot overwrite a newer lifecycle.
+- Derive graceful game-close authority from the current session's recorded
+  identities and veto all close requests when another configured but unowned
+  game or loader process is present.
+- Bind graceful `stop-game` and `stop` targets to retained live process handles,
+  revalidate exact PID/name/path/start identity and current session generation,
+  and never reopen a previously observed PID for `CloseMainWindow`.
+- Qualify every cooperative-close UI mutation against the current lease
+  generation, refuse stale session release after a competing lifecycle change,
+  and recheck game/loader and RootBuilder vetoes inside forced MO2 termination.
+- Project initial and recovery session binding plus in-session access renewal
+  into `session.json` at the authoritative lock generation, including
+  attributable projection failure and renewal-based reconciliation.
+- Revalidate the exact live MO2 owner inside the serialized game-identity commit
+  and immediately before exact game termination, so owner exit or replacement
+  cannot publish `running` state or strand RootBuilder restoration.
+- Capture serialized lifecycle callbacks under a distinct closed-over binding so
+  the lock wrapper cannot recursively resolve its own `Action` parameter.
+- Serialize launch, open, game termination, MO2 termination, and RootBuilder
+  `Unlock` authorization against the current session generation before their
+  external process/UI action; bind Unlock to one retained exact-owner handle at
+  every control boundary; preserve synchronous-open ownership unless the full
+  detached transition proves a replacement; capture direct-child identity while
+  the dispatched parent handle prevents PID reuse; and update `session.json`
+  inside the same ordered transition as its authoritative ownership-lock state.
+- Reject stale lease generations at the serialized MO2 session commit boundary,
+  bind detached handoff ancestry to the dispatched helper's exact lifetime, and
+  make session-lock liveness consume the modern owner path/start-time schema.
+- Revalidate and retain the exact MO2 owner process lifetime across every
+  cooperative-close UI action, including the stop path after game shutdown.
+- Treat every named outcome-map member as required unless it is explicitly
+  typed metadata, make rejected outcomes a global semantic veto, qualify menu
+  and current-state wait probes before barrier evaluation, reject present-null
+  registry statuses, and retain positive subsecond request budget.
 - Normalize the evidence-directory boundary before validating snapshot
   containment so an equivalent trailing-separator spelling cannot block task
   completion or receipt-only recovery.
@@ -16,8 +111,50 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - Complete failed or unverified shader-cache tasks without a physical restore
   when the live tree still exactly matches the prepared baseline, recording a
   committed no-op restore proof bound to the original snapshot.
+- Revalidate the exact recorded MO2 owner before every RootBuilder `Unlock` UI
+  action and before reporting successful recovery, so PID reuse cannot redirect
+  recovery after game termination.
+- Keep loader-first StartOnly observations pending until the configured primary
+  game arrives, require exact dispatch and direct process-lineage evidence for
+  one helper-to-runtime owner handoff, and co-write synchronous game identity
+  with its durable running transition.
+- Bind every `terminate-game` target to a retained live process handle, recheck
+  its complete recorded and configured identity immediately before mutation,
+  and eliminate PID reopening from game force termination.
+- Bind StartOnly adoption and retained relaunch to configured full executable
+  paths, a pre-dispatch process snapshot and timestamp, a freshly observed exact
+  MO2 owner, and a per-launch active identity set while retaining prior game
+  identities as history; normalize process timestamps across persistence and
+  exact termination comparisons.
+- Bind recorded MO2 ownership to exact PID, executable path, and start time
+  before `status` can adopt game identities after a StartOnly launch or
+  `terminate` can force-stop the recorded MO2 owner, and retain the verified
+  process handle so PID reuse cannot retarget the final termination call.
+- Let `status` durably adopt exact game and loader identities observed after a
+  `launch -StartOnly` request, so the owning session can safely terminate a
+  crashed game and complete RootBuilder recovery.
 - Raise the bounded MO2 workspace profile traversal default to 100,000 files
   so the maintained MGO profile no longer requires a per-call override.
+- Preserve terminal `serviceReady` failure semantics instead of rewriting them
+  as deadline timeouts; reject negative screenshot limits without unsigned
+  conversion faults, keep
+  retryable identity-probe propagation exclusive to bounded waits, and emit one
+  structured timeout shape for both ordinary and mid-iteration wait expiry.
+- Keep DevBench discovery, identity verification, and qualified readiness probes
+  inside one bounded session-rebind loop; reject contradictory success/error,
+  readiness, restoration, recording, screenshot, and render-map receipts; and
+  preserve capture-start identity and cleanup evidence when rollback is
+  incomplete.
+- Qualify every screenshot read action explicitly, preserve retryable identity
+  probe failures for rebind, reject malformed outcome types and retryable
+  negative readiness, enforce the post-response wait deadline, and retain
+  indeterminate recording/screenshot start ownership without unscoped cleanup.
+- Recognize the structured render-scale status read contract before profiler
+  sampling, and reject screenshot sequences that exceed runtime-advertised
+  frame or duration limits before session creation or recording mutation.
+- Make DevBench game-load dispatch and render-map planning fail closed on
+  inexact receipts, failed or unbound registries, malformed numeric bounds,
+  missing scope estimates, and post-publication receipt-finalization faults.
 - Enforce MO2 `SteamVRNull` admission inside null-HMD `apply` and `start`, bind
   the exact lease, profile, and provider inventory into the transaction
   receipt, and route-shape fresh SteamVR task clones so inherited OCU providers
@@ -141,8 +278,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   task identity, preserve saves and profile-local state across lease yields,
   and enforce additive shared-mod update guidance.
 - Copy and hash-verify the maintained source profile's complete save tree into
-  every task profile while retaining `SavePolicy` as an authorization marker
-  and verified fixtures as the only deterministic baseline contract.
+  every task profile while retaining `SavePolicy` as an authorization marker;
+  only `VerifiedFixture` requires a declared deterministic baseline contract.
 - Exclude local `.fixture-refresh-*` evidence from generated marketplace
   packages.
 - Treat physical-headset and Valve null-HMD SteamVR shader caches as one

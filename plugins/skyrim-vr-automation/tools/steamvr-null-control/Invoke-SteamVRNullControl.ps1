@@ -41,11 +41,16 @@ param(
 
     [switch]$WhatIf,
 
+    [switch]$PreserveDesktopUIWindowState,
+
+    [ValidatePattern('^[A-Fa-f0-9]{64}$')]
+    [string]$ExpectedCurrentSettingsSha256,
+
     [switch]$Force,
 
     [switch]$AllowExternalDisplayRedirector,
 
-    [ValidateSet('', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'head-pose-access-denied', 'head-pose-access-denied-after-start', 'runtime-ready', 'runtime-early-post-launch-failure', 'runtime-early-post-launch-cleanup-crosses-deadline', 'runtime-early-post-launch-cleanup-crosses-deadline-failure', 'runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-confirmation-timeout-input-contract-failure', 'runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-final-admission-timeout-input-contract-failure', 'runtime-post-receipt-timeout', 'runtime-final-boundary-timeout-cleanup-unverified', 'runtime-final-boundary-timeout-cleanup-failure', 'runtime-input-contract-failure', 'runtime-accepted-receipt-stage-failure', 'runtime-accepted-receipt-publish-failure', 'runtime-accepted-receipt-publish-and-stage-cleanup-failure')]
+    [ValidateSet('', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'restore-source-drift-after-stage', 'head-pose-access-denied', 'head-pose-access-denied-after-start', 'runtime-ready', 'runtime-early-post-launch-failure', 'runtime-early-post-launch-cleanup-crosses-deadline', 'runtime-early-post-launch-cleanup-crosses-deadline-failure', 'runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-confirmation-timeout-input-contract-failure', 'runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-final-admission-timeout-input-contract-failure', 'runtime-post-receipt-timeout', 'runtime-final-boundary-timeout-cleanup-unverified', 'runtime-final-boundary-timeout-cleanup-failure', 'runtime-input-contract-failure', 'runtime-accepted-receipt-stage-failure', 'runtime-accepted-receipt-publish-failure', 'runtime-accepted-receipt-publish-and-stage-cleanup-failure')]
     [string]$InternalTestFailurePoint = '',
 
     [switch]$IsolateExternalDisplayRedirectors,
@@ -80,6 +85,8 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..\steamvr-head-pose-control\DriverPackageAuthority.ps1')
+. (Join-Path $PSScriptRoot 'StartupLogProof.ps1')
+. (Join-Path $PSScriptRoot 'DesktopUIRestore.ps1')
 
 if (-not ('SkyrimVRAutomation.Native.SharedPoseAtomics' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -478,6 +485,22 @@ function Test-JsonDictionaryContains($Dictionary, [string]$Key) {
     return $Dictionary -is [Collections.IDictionary] -and $Dictionary.Contains($Key)
 }
 
+function Get-JsonNumberIdentity($Value) {
+    # Compare JSON numeric values exactly as decimal coefficient/exponent,
+    # without coercing an integer/decimal through a rounded Double. This also
+    # accepts SteamVR's harmless 90.0 -> 90 and 0.0 -> 0 reserialization.
+    $json = $Value | ConvertTo-Json -Compress
+    $match = [regex]::Match($json, '\A(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?\z')
+    if (-not $match.Success) { return $null } # NaN/Infinity serialize as strings.
+    $digits = ($match.Groups[2].Value + $match.Groups[3].Value).TrimStart('0')
+    if ($digits.Length -eq 0) { return '0@0' }
+    $exponent = if ($match.Groups[4].Success) { [long]::Parse($match.Groups[4].Value, [Globalization.CultureInfo]::InvariantCulture) } else { [long]0 }
+    $exponent -= $match.Groups[3].Value.Length
+    $coefficient = $digits.TrimEnd('0')
+    $exponent += $digits.Length - $coefficient.Length
+    return $match.Groups[1].Value + $coefficient + '@' + $exponent.ToString([Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Test-JsonValueEquivalent([AllowNull()]$Expected, [AllowNull()]$Actual) {
     if ($null -eq $Expected -or $null -eq $Actual) { return $null -eq $Expected -and $null -eq $Actual }
     if ($Expected -is [Collections.IDictionary] -or $Actual -is [Collections.IDictionary]) {
@@ -498,7 +521,14 @@ function Test-JsonValueEquivalent([AllowNull()]$Expected, [AllowNull()]$Actual) 
         return $true
     }
     if ($Expected -is [string] -or $Actual -is [string]) { return $Expected -is [string] -and $Actual -is [string] -and [string]$Expected -ceq [string]$Actual }
-    return $Expected -eq $Actual
+    if ($Expected -is [bool] -or $Actual -is [bool]) { return $Expected -is [bool] -and $Actual -is [bool] -and $Expected.Equals($Actual) }
+    # Only numeric JSON kinds reach normalization. Booleans/strings never
+    # borrow numeric equality; exact decimal normalization avoids precision loss.
+    $numericTypes = @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64], [single], [double], [decimal], [bigint])
+    if ($Expected.GetType() -notin $numericTypes -or $Actual.GetType() -notin $numericTypes) { return $false }
+    $expectedIdentity = Get-JsonNumberIdentity $Expected
+    $actualIdentity = Get-JsonNumberIdentity $Actual
+    return $null -ne $expectedIdentity -and $null -ne $actualIdentity -and $expectedIdentity -ceq $actualIdentity
 }
 
 function Get-JsonDifferencePaths([AllowNull()]$Expected, [AllowNull()]$Actual, [string]$Path = '') {
@@ -552,7 +582,7 @@ function Get-NullSettingsExpectation([Collections.IDictionary]$Receipt, [string]
             $controlled.Add("$section.$key")
         }
     }
-    return [pscustomobject][ordered]@{ value = $expected; profile = $profile; controlledPaths = @($controlled); semanticSha256 = Get-JsonSemanticSha256 -Value $expected }
+    return [pscustomobject][ordered]@{ value = $expected; profile = $profile; profilePath = $profilePath; controlledPaths = @($controlled); semanticSha256 = Get-JsonSemanticSha256 -Value $expected }
 }
 
 function Get-SettingsRestoreValidation([Collections.IDictionary]$Receipt, [string]$BackupPath, [string]$CurrentPath) {
@@ -573,18 +603,53 @@ function Get-SettingsRestoreValidation([Collections.IDictionary]$Receipt, [strin
     }
     $allDifferences = @(Get-JsonDifferencePaths $expectation.value $current)
     $runtimeManagedPrefixes = @('GpuSpeed', 'LastKnown')
+    $historyKey = 'lastAccessedExternalOverlayKey'
+    $historyPath = "dashboard.$historyKey"
+    $historyTyped = $true
+    foreach ($document in @($expectation.value, $current)) {
+        if (Test-JsonDictionaryContains $document 'dashboard') {
+            $dashboard = $document['dashboard']
+            if ($dashboard -isnot [Collections.IDictionary] -or
+                ((Test-JsonDictionaryContains $dashboard $historyKey) -and $dashboard[$historyKey] -isnot [string])) { $historyTyped = $false }
+        }
+    }
+    # Display paths are diagnostics, not structural authority: a literal root
+    # key can contain dots and collide with dashboard history's display path.
+    # Compare copies with only the actual allowed JSON subtrees removed.
+    $qualifiedDocuments = @(
+        foreach ($document in @($expectation.value, $current)) {
+            $qualified = [ordered]@{}
+            foreach ($key in $document.Keys) {
+                if ([string]$key -cin $runtimeManagedPrefixes) { continue }
+                if ([string]$key -ceq 'dashboard' -and $historyTyped -and $document[$key] -is [Collections.IDictionary]) {
+                    $dashboardCopy = [ordered]@{}
+                    foreach ($dashboardKey in $document[$key].Keys) {
+                        if ([string]$dashboardKey -cne $historyKey) { $dashboardCopy[$dashboardKey] = $document[$key][$dashboardKey] }
+                    }
+                    $qualified[$key] = $dashboardCopy
+                }
+                else { $qualified[$key] = $document[$key] }
+            }
+            $qualified
+        }
+    )
+    $structuralDriftAllowed = Test-JsonValueEquivalent $qualifiedDocuments[0] $qualifiedDocuments[1]
     $unclassified = @($allDifferences | Where-Object {
         $candidate = [string]$_
-        @($runtimeManagedPrefixes | Where-Object { $candidate -eq $_ -or $candidate.StartsWith("$_`.", [StringComparison]::Ordinal) }).Count -eq 0
+        -not ($candidate -ceq $historyPath -and $historyTyped) -and
+            @($runtimeManagedPrefixes | Where-Object { $candidate -eq $_ -or $candidate.StartsWith("$_`.", [StringComparison]::Ordinal) }).Count -eq 0
     })
     $controlledMatch = $controlledDifferences.Count -eq 0
+    if (-not $structuralDriftAllowed -and $unclassified.Count -eq 0) { $unclassified = @($allDifferences) }
     $formattingOnly = -not $exactMatch -and $controlledMatch -and $allDifferences.Count -eq 0
-    $runtimeManagedOnly = -not $exactMatch -and $controlledMatch -and $allDifferences.Count -gt 0 -and $unclassified.Count -eq 0
+    $runtimeManagedOnly = -not $exactMatch -and $controlledMatch -and $allDifferences.Count -gt 0 -and $unclassified.Count -eq 0 -and $structuralDriftAllowed
     return [pscustomobject][ordered]@{
         exactMatch = $exactMatch; controlledContractMatch = $controlledMatch; formattingOnlyDriftAccepted = $formattingOnly; runtimeManagedOnlyDriftAccepted = $runtimeManagedOnly
         authorized = $exactMatch -or $formattingOnly -or $runtimeManagedOnly; authorizationRoute = if ($exactMatch) { 'exact-applied-bytes' } elseif ($formattingOnly) { 'semantic-formatting-only' } elseif ($runtimeManagedOnly) { 'controlled-contract-plus-runtime-managed-fields' } else { 'none' }
         currentSha256 = $currentHash; expectedSha256 = [string]$Receipt['settingsSha256Null']; expectedSemanticSha256 = $expectation.semanticSha256
         currentSemanticSha256 = Get-JsonSemanticSha256 -Value $current; controlledDifferences = @($controlledDifferences)
+        dashboardHistoryDriftAccepted = $runtimeManagedOnly -and $historyPath -cin $allDifferences
+        runtimeManagedStructuralMatch = $structuralDriftAllowed
         runtimeManagedDifferencePaths = @($allDifferences | Where-Object { $_ -notin $unclassified }); unclassifiedDifferencePaths = @($unclassified)
     }
 }
@@ -996,35 +1061,35 @@ function Get-EffectiveState {
         $checks["steamvr.$key"] = [ordered]@{
             actual = if ($steamvr.ContainsKey($key)) { $steamvr[$key] } else { $null }
             expected = $expectedSteamVR[$key]
-            matches = $steamvr.ContainsKey($key) -and $steamvr[$key] -eq $expectedSteamVR[$key]
+            matches = $steamvr.ContainsKey($key) -and (Test-JsonValueEquivalent $expectedSteamVR[$key] $steamvr[$key])
         }
     }
     foreach ($key in $expectedDashboard.Keys) {
         $checks["dashboard.$key"] = [ordered]@{
             actual = if ($dashboard.ContainsKey($key)) { $dashboard[$key] } else { $null }
             expected = $expectedDashboard[$key]
-            matches = $dashboard.ContainsKey($key) -and $dashboard[$key] -eq $expectedDashboard[$key]
+            matches = $dashboard.ContainsKey($key) -and (Test-JsonValueEquivalent $expectedDashboard[$key] $dashboard[$key])
         }
     }
     foreach ($key in @('enable', 'serialNumber', 'modelNumber', 'windowWidth', 'windowHeight', 'renderWidth', 'renderHeight', 'displayFrequency')) {
         $checks["driver_null.$key"] = [ordered]@{
             actual = if ($driver.ContainsKey($key)) { $driver[$key] } else { $null }
             expected = $expectedDriver[$key]
-            matches = $driver.ContainsKey($key) -and $driver[$key] -eq $expectedDriver[$key]
+            matches = $driver.ContainsKey($key) -and (Test-JsonValueEquivalent $expectedDriver[$key] $driver[$key])
         }
     }
     foreach ($key in $expectedHeadPoseDriver.Keys) {
         $checks["driver_codex_head_pose.$key"] = [ordered]@{
             actual = if ($headPoseDriver.ContainsKey($key)) { $headPoseDriver[$key] } else { $null }
             expected = $expectedHeadPoseDriver[$key]
-            matches = $headPoseDriver.ContainsKey($key) -and $headPoseDriver[$key] -eq $expectedHeadPoseDriver[$key]
+            matches = $headPoseDriver.ContainsKey($key) -and (Test-JsonValueEquivalent $expectedHeadPoseDriver[$key] $headPoseDriver[$key])
         }
     }
     foreach ($key in $expectedTrackingOverrides.Keys) {
         $checks["TrackingOverrides.$key"] = [ordered]@{
             actual = if ($trackingOverrides.ContainsKey($key)) { $trackingOverrides[$key] } else { $null }
             expected = $expectedTrackingOverrides[$key]
-            matches = $trackingOverrides.ContainsKey($key) -and $trackingOverrides[$key] -eq $expectedTrackingOverrides[$key]
+            matches = $trackingOverrides.ContainsKey($key) -and (Test-JsonValueEquivalent $expectedTrackingOverrides[$key] $trackingOverrides[$key])
         }
     }
     $controllerInactivitySuppressed = $false
@@ -1267,27 +1332,21 @@ function Get-NullRuntimeEvidence {
     $headPoseRegistered = $null
     $tail = @()
     $tailState = $null
-    if ($serverStartUtc -and (Test-Path -LiteralPath $ServerLogPath -PathType Leaf)) {
-        $tail = @(Get-SharedTextTail -Path $ServerLogPath -Count 2000 -MaxBytes $LogTailMaxBytes -DeadlineUtc $DeadlineUtc)
-        $tailState = @($script:SharedTextTailState.Values | Select-Object -First 1)[0]
-        $minimumUtc = $serverStartUtc.AddSeconds(-3)
-        foreach ($line in $tail) {
-            $timestampUtc = Get-LogTimestampUtc -Line $line
-            if (-not $timestampUtc -or $timestampUtc -lt $minimumUtc) { continue }
-            if ($line -match 'Loaded server driver null .*driver_null\.dll') {
-                $loaded = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line }
-            }
-            if ($line -match "Active HMD set to null\.$([regex]::Escape([string]$Profile['driver_null']['serialNumber']))") {
-                $active = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line }
-            }
-            if ($line -match 'Loaded server driver codex_head_pose .*driver_codex_head_pose\.dll') {
-                $headPoseLoaded = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line }
-            }
-            if ($line -match 'codex_head_pose: registered synthetic head-pose device at configured standing pose') {
-                $headPoseRegistered = [pscustomobject]@{ timestampUtc = $timestampUtc.ToString('o'); line = $line }
-            }
+    $startupLogProof = $null
+    if ($serverStartUtc) {
+        if (Test-Path -LiteralPath $ServerLogPath -PathType Leaf) {
+            $tail = @(Get-SharedTextTail -Path $ServerLogPath -Count 2000 -MaxBytes $LogTailMaxBytes -DeadlineUtc $DeadlineUtc)
+            $tailState = @($script:SharedTextTailState.Values | Select-Object -First 1)[0]
+        }
+        $startupLogProof = Get-NullStartupLogProof -Path $ServerLogPath -Server $server[0] -SerialNumber ([string]$Profile['driver_null']['serialNumber']) -MaxBytes $LogTailMaxBytes -DeadlineUtc $DeadlineUtc
+        if ($tailState -and $tailState.stable -and $tailState.usable -and $startupLogProof.stable -and $startupLogProof.complete) {
+            $loaded = $startupLogProof.driverLoaded
+            $active = $startupLogProof.activeHmd
+            $headPoseLoaded = $startupLogProof.headPoseDriverLoaded
+            $headPoseRegistered = $startupLogProof.headPoseDeviceRegistered
         }
     }
+    else { $script:NullStartupLogProofState.Clear() }
     $headPoseAuthorizationError = $null
     try {
         $denyAfterStart = $InternalTestFailurePoint -eq 'head-pose-access-denied-after-start' -and
@@ -1348,6 +1407,7 @@ function Get-NullRuntimeEvidence {
             error = if ($tailState -and $tailState.PSObject.Properties['error']) { [string]$tailState.error } else { $null }
         }
         driverLoaded = $loaded
+        startupLogProof = $startupLogProof
         activeHmd = $active
         headPoseDriverLoaded = $headPoseLoaded
         headPoseDeviceRegistered = $headPoseRegistered
@@ -1405,6 +1465,32 @@ function New-Result {
     }
 }
 
+function Get-MO2ProviderInventoryEvidence($Inventory) {
+    # Preserve full provenance. Only absolute provider line numbers are excluded
+    # from canonical semantic admission; array order remains significant.
+    $retained = $Inventory | ConvertTo-Json -Depth 64 -Compress | ConvertFrom-Json -AsHashtable -Depth 64
+    if ($retained -isnot [Collections.IDictionary] -or
+        -not (Test-JsonDictionaryContains $retained 'profile') -or $retained['profile'] -isnot [string] -or [string]::IsNullOrWhiteSpace($retained['profile']) -or
+        -not (Test-JsonDictionaryContains $retained 'modListPath') -or $retained['modListPath'] -isnot [string] -or [string]::IsNullOrWhiteSpace($retained['modListPath']) -or
+        -not (Test-JsonDictionaryContains $retained 'providers') -or $retained['providers'] -isnot [array] -or
+        -not (Test-JsonDictionaryContains $retained 'errors') -or $retained['errors'] -isnot [array] -or @($retained['errors']).Count -ne 0) { throw 'Malformed runtime-provider inventory.' }
+    $semantic = $retained | ConvertTo-Json -Depth 64 -Compress | ConvertFrom-Json -AsHashtable -Depth 64
+    foreach ($provider in @($semantic['providers'])) {
+        if ($provider -isnot [Collections.IDictionary]) { throw 'Malformed runtime-provider record.' }
+        foreach ($field in @('classification','modName','modPath','marker')) {
+            if (-not (Test-JsonDictionaryContains $provider $field) -or $provider[$field] -isnot [string] -or [string]::IsNullOrWhiteSpace($provider[$field])) { throw "Malformed runtime-provider $field." }
+        }
+        if ($provider['marker'] -cnotin @('+','-') -or -not (Test-JsonDictionaryContains $provider 'enabled') -or $provider['enabled'] -isnot [bool] -or $provider['enabled'] -ne ($provider['marker'] -ceq '+')) { throw 'Contradictory runtime-provider marker/enabled state.' }
+        if (-not (Test-JsonDictionaryContains $provider 'markers') -or $provider['markers'] -isnot [Collections.IDictionary]) { throw 'Malformed runtime-provider markers.' }
+        foreach ($field in @('rootOpenVrApi','rootOpenCompositeIni','openCompositeInput')) {
+            if (-not (Test-JsonDictionaryContains $provider['markers'] $field) -or $provider['markers'][$field] -isnot [bool]) { throw "Malformed runtime-provider marker $field." }
+        }
+        if ($provider['enabled'] -and $provider['markers']['rootOpenVrApi']) { throw 'Enabled root OpenVR replacement cannot enter null-HMD admission.' }
+        if (Test-JsonDictionaryContains $provider 'lineNumber') { $provider.Remove('lineNumber') }
+    }
+    return [pscustomobject][ordered]@{ contractVersion = 1; inventory = $retained; semanticSha256 = Get-JsonSemanticSha256 -Value $semantic }
+}
+
 function Get-MO2NullAdmission {
     $fixtureMode = -not $InternalTestRequireMO2Admission -and -not [string]::IsNullOrWhiteSpace($env:CSX_STEAMVR_TRANSACTION_ROOT) -and
         [IO.Path]::GetFullPath($SettingsPath).StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()), [StringComparison]::OrdinalIgnoreCase)
@@ -1455,10 +1541,14 @@ function Get-MO2NullAdmission {
     if ($enabledReplacements.Count -ne 0) { throw 'MO2 null-HMD admission returned pass while an enabled profile-local OpenVR replacement remained.' }
     $inventoryJson = $validation.data.runtimeProviders | ConvertTo-Json -Depth 8 -Compress
     $inventoryHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($inventoryJson)))
+    $inventoryEvidence = Get-MO2ProviderInventoryEvidence -Inventory $validation.data.runtimeProviders
     return [pscustomobject][ordered]@{
         mode = 'mo2'; runtimeRoute = $routeId; profile = [string]$validation.data.requested.profile
         leaseId = [string]$validation.data.sessionLock.leaseId; validatedUtc = [DateTime]::UtcNow.ToString('o')
         providerInventorySha256 = $inventoryHash; enabledOpenVrReplacementCount = 0
+        providerInventoryContractVersion = $inventoryEvidence.contractVersion
+        providerInventorySemanticSha256 = $inventoryEvidence.semanticSha256
+        providerInventory = $inventoryEvidence.inventory
         validationContractVersion = [string]$validation.contractVersion
     }
 }
@@ -1471,8 +1561,19 @@ function Assert-MO2NullAdmissionMatchesReceipt($Admission, $Receipt) {
             throw "Current MO2/null-HMD admission differs from the apply receipt at '$field'."
         }
     }
-    if ([string]$Admission.mode -eq 'mo2' -and [string]$recorded['providerInventorySha256'] -cne [string]$Admission.providerInventorySha256) {
-        throw 'The exact MO2 runtime-provider inventory changed after null-HMD apply; revalidate and create a new transaction.'
+    if ([string]$Admission.mode -eq 'mo2') {
+        if (Test-JsonDictionaryContains $recorded 'providerInventoryContractVersion') {
+            if (($recorded['providerInventoryContractVersion'] -isnot [int] -and $recorded['providerInventoryContractVersion'] -isnot [long]) -or $recorded['providerInventoryContractVersion'] -ne 1 -or $Admission.providerInventoryContractVersion -ne 1 -or
+                -not (Test-JsonDictionaryContains $recorded 'providerInventory') -or -not (Test-JsonDictionaryContains $recorded 'providerInventorySemanticSha256')) { throw 'Unsupported or incomplete runtime-provider inventory receipt contract.' }
+            $expected = Get-MO2ProviderInventoryEvidence -Inventory $recorded['providerInventory']
+            $actual = Get-MO2ProviderInventoryEvidence -Inventory $Admission.providerInventory
+            if ([string]$expected.inventory['profile'] -cne [string]$recorded['profile'] -or [string]$actual.inventory['profile'] -cne [string]$Admission.profile -or
+                $expected.semanticSha256 -cne [string]$recorded['providerInventorySemanticSha256'] -or $actual.semanticSha256 -cne [string]$Admission.providerInventorySemanticSha256) { throw 'Runtime-provider retained inventory disagrees with its receipt-bound semantic fingerprint.' }
+            if ($expected.semanticSha256 -cne $actual.semanticSha256) { throw 'The semantic MO2 runtime-provider inventory changed after null-HMD apply; restore and create a new admitted transaction.' }
+        }
+        elseif ([string]$recorded['providerInventorySha256'] -cne [string]$Admission.providerInventorySha256) {
+            throw 'The legacy exact MO2 runtime-provider inventory changed after null-HMD apply; restore and create a new admitted transaction. Legacy receipts are not migrated.'
+        }
     }
 }
 
@@ -1604,6 +1705,7 @@ $startupDeadlineUtc = $null
 $failureObservedUtc = $null
 $startupCleanupCompletedUtc = $null
 try {
+    if (($PreserveDesktopUIWindowState -or $ExpectedCurrentSettingsSha256) -and $Command -ne 'restore') { throw 'DesktopUI preservation options are restore-only.' }
     if ([string]::IsNullOrWhiteSpace($OpenVRPathsPath)) { throw 'OpenVRPathsPath is required to identify the complete live transaction target.' }
     $localApplicationData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
     if ([string]::IsNullOrWhiteSpace($localApplicationData)) { throw 'The Windows LocalApplicationData folder could not be resolved for target-owned transaction control.' }
@@ -2090,7 +2192,7 @@ try {
             throw 'EvidenceDirectory is required for apply and restore.'
         }
         if (-not (Test-Path -LiteralPath $EvidenceDirectory -PathType Container)) {
-            throw "Evidence directory does not exist: $EvidenceDirectory"
+            throw "Evidence directory does not exist: $EvidenceDirectory. Create this exact task-scoped directory before preview/apply and reuse it for start and restore; -WhatIf never creates it."
         }
         if ($ownedProcesses.Count -gt 0) {
             throw "SteamVR must be stopped before $Command. Running from configured root: $($ownedProcesses.name -join ', ')"
@@ -2270,7 +2372,9 @@ try {
             $pendingRestore = $recoveredTransaction
             if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) { throw "Exact backup is missing: $backupPath" }
             if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) { throw "Apply receipt is missing: $receiptPath" }
+            $applyReceiptHash = Get-HashOrNull $receiptPath
             $receipt = Read-JsonHashtable -Path $receiptPath
+            if ((Get-HashOrNull $receiptPath) -cne $applyReceiptHash) { throw 'Apply receipt changed during restore admission.' }
             $backupHash = Get-HashOrNull $backupPath
             if ($backupHash -ne $receipt['settingsSha256Before']) { throw 'The exact backup hash does not match the apply receipt.' }
             if (-not $receipt.ContainsKey('settingsPath') -or [string]::IsNullOrWhiteSpace([string]$receipt['settingsPath'])) { throw 'The apply receipt does not identify its SteamVR settings path.' }
@@ -2279,10 +2383,39 @@ try {
             }
             if (-not $receipt.ContainsKey('settingsSha256Null') -or [string]::IsNullOrWhiteSpace([string]$receipt['settingsSha256Null'])) { throw 'The apply receipt does not identify the applied SteamVR settings hash.' }
             $settingsLiveHash = Get-HashOrNull $SettingsPath
-            $restoreAlreadyCommitted = $null -ne $pendingRestore -and [string]$pendingRestore['phase'] -eq 'committed' -and $settingsLiveHash -eq $backupHash
+            $restoreSelection = $null
+            $expectedRestoredHash = $backupHash
+            if ($null -ne $pendingRestore -and [string]$pendingRestore['operation'] -eq 'restore' -and [string]$pendingRestore['phase'] -eq 'committed') {
+                if ([string]$pendingRestore['applyTransactionId'] -cne [string]$receipt['transactionId']) { throw 'Committed restore does not belong to this apply receipt.' }
+                if (Test-JsonDictionaryContains $pendingRestore 'settingsRestoreSelection') {
+                    $restoreSelection = $pendingRestore['settingsRestoreSelection']
+                    if ($restoreSelection['policy'] -ceq 'baseline-plus-exact-desktopui-strings') {
+                        $settingsTarget = @($pendingRestore['rollbackTargets'] | Where-Object { $_['name'] -ceq 'steamvr-settings' })
+                        if ($settingsTarget.Count -ne 1) { throw 'Committed DesktopUI restore has no exact settings preimage.' }
+                        Assert-CommittedDesktopUIRestoreSelection $restoreSelection $receipt $backupPath ([string]$settingsTarget[0]['backupPath'])
+                        if ([string]$restoreSelection['applyReceiptSha256'] -cne (Get-HashOrNull $receiptPath)) { throw 'Committed DesktopUI restore apply receipt changed.' }
+                        $expectedRestoredHash = [string]$restoreSelection['resultSha256']
+                    }
+                    elseif ($restoreSelection['policy'] -cne 'exact-backup') { throw 'Unknown committed settings restore policy.' }
+                }
+            }
+            $restoreAlreadyCommitted = $null -ne $pendingRestore -and [string]$pendingRestore['operation'] -eq 'restore' -and [string]$pendingRestore['phase'] -eq 'committed' -and $settingsLiveHash -eq $expectedRestoredHash
+            $preservationPlan = $null
             $settingsValidation = $null
             if (-not $restoreAlreadyCommitted) {
-                $settingsValidation = Get-SettingsRestoreValidation -Receipt $receipt -BackupPath $backupPath -CurrentPath $SettingsPath
+                if ($PreserveDesktopUIWindowState) {
+                    $preservationPlan = Get-DesktopUISettingsRestorePlan $receipt $backupPath $SettingsPath
+                    $settingsValidation = $preservationPlan.validation
+                    $restoreSelection = $preservationPlan.selection
+                    $expectedRestoredHash = [string]$restoreSelection['resultSha256']
+                    if (-not $WhatIf -and [string]::IsNullOrWhiteSpace($ExpectedCurrentSettingsSha256)) { throw 'DesktopUI preservation commit requires -ExpectedCurrentSettingsSha256 from the admitted preview.' }
+                }
+                else {
+                    $settingsValidation = Get-SettingsRestoreValidation -Receipt $receipt -BackupPath $backupPath -CurrentPath $SettingsPath
+                    $restoreSelection = [ordered]@{ schemaVersion = 1; policy = 'exact-backup'; baselineSha256 = $backupHash; preimageSha256 = $settingsLiveHash; resultSha256 = $backupHash; resultPath = $backupPath; applyTransactionId = [string]$receipt['transactionId'] }
+                }
+                if ($settingsValidation.currentSha256 -cne $settingsLiveHash -or
+                    ($ExpectedCurrentSettingsSha256 -and $ExpectedCurrentSettingsSha256 -ine $settingsLiveHash)) { throw 'SteamVR settings current hash changed or differs from the admitted preview; refusing restore.' }
                 if (-not [bool]$settingsValidation.authorized) {
                     $details = @($settingsValidation.controlledDifferences + $settingsValidation.unclassifiedDifferencePaths | Select-Object -Unique)
                     throw "SteamVR settings changed after apply outside the authorized runtime-managed contract; refusing to overwrite drift: $($details -join ', ')"
@@ -2314,16 +2447,17 @@ try {
             }
             if ($restoreAlreadyCommitted) {
                 $result = New-Result -Ok $true -State 'already-restored' -Data @{
-                    settingsPath = $SettingsPath; restoredSha256 = $settingsLiveHash; backupPath = $backupPath; backupRetained = $true
+                    settingsPath = $SettingsPath; restoredSha256 = $settingsLiveHash; backupPath = $backupPath; backupRetained = $true; settingsRestoreSelection = $restoreSelection
                     externalDriverIsolation = $isolation; openVRPathsRestoredSha256 = if ($restoreExternalDrivers) { Get-HashOrNull $OpenVRPathsPath } else { $null }
                     settingsRestoreValidation = $settingsValidation; externalDriverIsolationValidation = $isolationValidation; restoreJournalPath = $authoritativeJournalPath; evidenceJournalPath = $restoreJournalPath; targetControl = $targetControl
                 }
             }
             if ($WhatIf) {
                 $result = New-Result -Ok $true -State 'dry-run' -Data @{
-                    wouldRestore = $backupPath
+                    wouldRestore = if ($restoreSelection -and $restoreSelection['policy'] -ceq 'baseline-plus-exact-desktopui-strings') { 'receipt-bound-baseline-plus-exact-desktopui-strings' } else { $backupPath }
                     settingsPath = $SettingsPath
-                    expectedSha256 = $backupHash
+                    expectedSha256 = $expectedRestoredHash
+                    settingsRestoreSelection = $restoreSelection
                     backupRetained = $true
                     settingsRestoreValidation = $settingsValidation
                     externalDriverIsolation = $isolation
@@ -2335,6 +2469,22 @@ try {
                 $transactionId = [guid]::NewGuid().ToString('N')
                 $settingsRollbackPath = Join-Path $EvidenceDirectory ("steamvr.vrsettings.applied.$transactionId")
                 Copy-Item -LiteralPath $SettingsPath -Destination $settingsRollbackPath
+                if ((Get-HashOrNull $settingsRollbackPath) -cne $settingsLiveHash) { throw 'Settings rollback preimage changed during capture; refusing restore.' }
+                if ($PreserveDesktopUIWindowState) {
+                    $verifiedPlan = Get-DesktopUISettingsRestorePlan $receipt $backupPath $settingsRollbackPath
+                    if ($verifiedPlan.selection.resultSha256 -cne $expectedRestoredHash) { throw 'DesktopUI selected result changed during preimage capture.' }
+                    $selectedResultPath = Join-Path $EvidenceDirectory ("steamvr.vrsettings.restore-result.$transactionId")
+                    [IO.File]::WriteAllBytes($selectedResultPath, $verifiedPlan.bytes)
+                    $restoreSelection['resultPath'] = [IO.Path]::GetFullPath($selectedResultPath)
+                }
+                $restoreSelection['applyReceiptSha256'] = $applyReceiptHash
+                if ($InternalTestFailurePoint -eq 'restore-source-drift-after-stage') {
+                    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+                    if ([string]::IsNullOrWhiteSpace($env:CSX_STEAMVR_TRANSACTION_ROOT) -or -not [IO.Path]::GetFullPath($SettingsPath).StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Restore drift injection is temporary-fixture-only.' }
+                    [IO.File]::AppendAllText($SettingsPath, ' ')
+                }
+                if ((Get-HashOrNull $SettingsPath) -cne $settingsLiveHash -or (Get-HashOrNull $backupPath) -cne $backupHash -or (Get-HashOrNull $receiptPath) -cne $applyReceiptHash -or
+                    (Get-HashOrNull ([string]$restoreSelection['resultPath'])) -cne $expectedRestoredHash) { throw 'Restore source/current hash changed after staging; refusing dispatch.' }
                 $rollbackTargets = @([ordered]@{ name = 'steamvr-settings'; path = [IO.Path]::GetFullPath($SettingsPath); backupPath = $settingsRollbackPath; expectedHash = $settingsLiveHash })
                 if ($restoreExternalDrivers) {
                     $openVRRollbackPath = Join-Path $EvidenceDirectory ("openvrpaths.vrpath.isolated.$transactionId")
@@ -2346,23 +2496,27 @@ try {
                     applyTransactionId = [string]$receipt['transactionId']; settingsPath = [IO.Path]::GetFullPath($SettingsPath)
                     openVRPathsPath = if ($restoreExternalDrivers) { [IO.Path]::GetFullPath($OpenVRPathsPath) } else { $null }
                     evidenceDirectory = [IO.Path]::GetFullPath($EvidenceDirectory); evidenceJournalPath = [IO.Path]::GetFullPath($restoreJournalPath)
-                    rollbackTargets = $rollbackTargets; preparedUtc = [DateTime]::UtcNow.ToString('o'); rollback = $null
+                    rollbackTargets = $rollbackTargets; settingsRestoreSelection = $restoreSelection; preparedUtc = [DateTime]::UtcNow.ToString('o'); rollback = $null
                 }
                 Write-SteamVRTransactionJournal -AuthoritativePath $authoritativeJournalPath -Journal $journal
                 try {
-                    Copy-FileAtomic -Source $backupPath -Destination $SettingsPath
+                    if ($PreserveDesktopUIWindowState) {
+                        Copy-FileAtomicVerified -Source ([string]$restoreSelection['resultPath']) -Destination $SettingsPath -ExpectedSha256 $expectedRestoredHash
+                    }
+                    else { Copy-FileAtomic -Source $backupPath -Destination $SettingsPath }
                     $journal['phase'] = 'settings-restored-uncommitted'; Write-SteamVRTransactionJournal -AuthoritativePath $authoritativeJournalPath -Journal $journal
                     if ($InternalTestFailurePoint -eq 'restore-after-settings') { throw 'Injected restore failure after settings restoration.' }
                     if ($restoreExternalDrivers) { Copy-FileAtomic -Source $openVRPathsBackupPath -Destination $OpenVRPathsPath }
                     $journal['phase'] = 'all-targets-restored-uncommitted'; Write-SteamVRTransactionJournal -AuthoritativePath $authoritativeJournalPath -Journal $journal
                     $restoredHash = Get-HashOrNull $SettingsPath
-                    if ($restoredHash -ne $backupHash) { throw 'Restored SteamVR settings hash does not match the exact backup.' }
+                    if ($restoredHash -cne $expectedRestoredHash) { throw 'Restored SteamVR settings hash does not match the selected restore result.' }
                     if ($restoreExternalDrivers -and (Get-HashOrNull $OpenVRPathsPath) -ne [string]$isolation['sha256Before']) { throw 'Restored OpenVR registration hash does not match the exact backup.' }
                     $restoreReceiptPath = Join-Path $EvidenceDirectory ("steamvr-null-restore.$transactionId.receipt.json")
                     Write-JsonAtomic -Path $restoreReceiptPath -Value ([ordered]@{
                         schemaVersion = 1; operation = 'restore'; transactionId = $transactionId; applyTransactionId = [string]$receipt['transactionId']
                         settingsPath = [IO.Path]::GetFullPath($SettingsPath); settingsSha256Restored = $restoredHash
                         settingsRestoreValidation = $settingsValidation
+                        settingsRestoreSelection = $restoreSelection
                         openVRPathsPath = if ($restoreExternalDrivers) { [IO.Path]::GetFullPath($OpenVRPathsPath) } else { $null }
                         openVRPathsSha256Restored = if ($restoreExternalDrivers) { Get-HashOrNull $OpenVRPathsPath } else { $null }; restoredUtc = [DateTime]::UtcNow.ToString('o')
                     })
@@ -2375,7 +2529,7 @@ try {
                     throw "Null-HMD restore failed; the exact applied state was restored and verified. $failure"
                 }
                 $result = New-Result -Ok $true -State 'restored' -Data @{
-                    settingsPath = $SettingsPath; restoredSha256 = $restoredHash; backupPath = $backupPath; backupRetained = $true
+                    settingsPath = $SettingsPath; restoredSha256 = $restoredHash; backupPath = $backupPath; backupRetained = $true; settingsRestoreSelection = $restoreSelection
                     externalDriverIsolation = $isolation; openVRPathsRestoredSha256 = if ($restoreExternalDrivers) { Get-HashOrNull $OpenVRPathsPath } else { $null }
                     settingsRestoreValidation = $settingsValidation; externalDriverIsolationValidation = $isolationValidation; restoreJournalPath = $authoritativeJournalPath; evidenceJournalPath = $restoreJournalPath; restoreReceiptPath = $restoreReceiptPath; targetControl = $targetControl
                 }

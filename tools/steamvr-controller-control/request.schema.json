@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SteamVR controller request (command selected by CLI)",
+  "oneOf": [
+    {"type":"object","additionalProperties":false,"properties":{"cursor":{"$ref":"#/$defs/cursor"}}},
+    {"type":"object","additionalProperties":false,"required":["binding","ownerNonce"],"properties":{"binding":{"$ref":"#/$defs/binding"},"ownerNonce":{"$ref":"#/$defs/nonce"}}},
+    {"type":"object","additionalProperties":false,"required":["binding","ownerNonce","pair","leaseMilliseconds"],"properties":{"binding":{"$ref":"#/$defs/binding"},"ownerNonce":{"$ref":"#/$defs/nonce"},"pair":{"$ref":"#/$defs/pair"},"leaseMilliseconds":{"type":"integer","minimum":100,"maximum":60000}}},
+    {"type":"object","additionalProperties":false,"required":["binding","ownerNonce","hand","button","holdMilliseconds"],"properties":{"binding":{"$ref":"#/$defs/binding"},"ownerNonce":{"$ref":"#/$defs/nonce"},"hand":{"enum":["left","right"]},"button":{"enum":["system","application_menu","grip","trackpad","trigger","thumbstick"]},"holdMilliseconds":{"type":"integer","minimum":1,"maximum":10000}}},
+    {"type":"object","additionalProperties":false,"required":["binding","ownerNonce","frames"],"properties":{"binding":{"$ref":"#/$defs/binding"},"ownerNonce":{"$ref":"#/$defs/nonce"},"frames":{"type":"array","minItems":1,"maxItems":128,"items":{"type":"object","additionalProperties":false,"required":["pair","holdMilliseconds"],"properties":{"pair":{"$ref":"#/$defs/pair"},"holdMilliseconds":{"type":"integer","minimum":0,"maximum":10000}}}}}}
+  ],
+  "$defs": {
+    "u64":{"type":"string","pattern":"^(0|[1-9][0-9]{0,19})$","description":"Runtime additionally checks UInt64 upper bound."},
+    "nonce":{"type":"string","pattern":"^[1-9][0-9]{0,19}$","description":"Nonzero UInt64; runtime enforces upper bound."},
+    "binding":{"type":"object","additionalProperties":false,"required":["creatorPid","creatorFileTime","driverNonce"],"properties":{"creatorPid":{"type":"integer","minimum":1,"maximum":4294967295},"creatorFileTime":{"$ref":"#/$defs/nonce"},"driverNonce":{"$ref":"#/$defs/nonce"}}},
+    "cursor":{"type":"object","additionalProperties":false,"required":["driverNonce","sequence"],"properties":{"driverNonce":{"$ref":"#/$defs/nonce"},"sequence":{"$ref":"#/$defs/u64"}}},
+    "pair":{"type":"object","additionalProperties":false,"required":["left","right"],"properties":{"left":{"$ref":"#/$defs/hand"},"right":{"$ref":"#/$defs/hand"}}},
+    "xy":{"type":"array","minItems":2,"maxItems":2,"items":{"type":"number","minimum":-1,"maximum":1}},
+    "hand":{"type":"object","additionalProperties":false,"required":["position","quaternion","pressed","touched","trackpad","trigger","grip","stick"],"properties":{
+      "position":{"type":"array","minItems":3,"maxItems":3,"items":{"type":"number","minimum":-1000,"maximum":1000}},
+      "quaternion":{"type":"array","minItems":4,"maxItems":4,"items":{"type":"number","exclusiveMinimum":-2,"exclusiveMaximum":2},"description":"Squared norm strictly >.25 and <4; native normalizes."},
+      "pressed":{"$ref":"#/$defs/u64"},"touched":{"$ref":"#/$defs/u64"},"trackpad":{"$ref":"#/$defs/xy"},"trigger":{"type":"number","minimum":0,"maximum":1},"grip":{"type":"number","minimum":0,"maximum":1},"stick":{"$ref":"#/$defs/xy"}
+    }}
+  }
+}

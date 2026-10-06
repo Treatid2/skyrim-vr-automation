@@ -1,5 +1,74 @@
 # MO2 Control
 
+## Explicit exact-owner Run-button launch
+
+`launch -LaunchMethod RunButton` is an opt-in alternative to the unchanged CLI
+default. First `open` the freshly prepared session through its durable controller
+and require `mo2-open` (or verify that state using `status` after `open -StartOnly`).
+RunButton requires the logged-on interactive desktop and that already-owned
+MO2 lifetime. It never opens/adopts another process, changes a combo selection,
+replays a failed attempt, dispatches a CLI helper or launches SKSE directly.
+
+  One visible, enabled `MainWindow` must expose unique exact accessibility IDs
+  for `profileBox`, `executablesListBox`, and `startButton`. Qt 6.7.1 builds IDs
+  from named parents, so the controller accepts the exact MO2 v2.5.2 paths
+  rooted at `MainWindow.centralWidget.categoriesSplitter.splitter` as well as
+  the bare-ID form; it never uses arbitrary prefixes, suffixes or names to
+  select a control. Both forms appearing is ambiguity, not a fallback choice.
+  A discovery refusal includes `data.runControlDiscovery`: exact owner/window,
+  at most six selector queries, one attempt per query, and match counts. No
+  extra whole-tree diagnostic inventory or selection/Run action is performed.
+  These bound query count/output, not synchronous native RPC duration; use a
+  bounded interactive execution host for native qualification. Selected values must equal
+the exact session profile and registered executable; the unique button must be
+enabled, onscreen and named `Run`. Unknown/extra windows, inaccessible values,
+selection mismatch, changed registered entry, game/loader presence or active
+RootBuilder deployment fail closed. No coordinate/keyboard fallback exists.
+All ordinary route, SKSE and task-output admission remains in place.
+
+The controller records the original owner PID/path/start, exact registered
+entry, window/control identity and launch method. It commits `launching` before
+the protected UI action, rechecks selections and exact owner under the lease
+transition lock while holding a process handle, and uses the normal bounded
+game ownership/status path afterward. `-StartOnly` returns after dispatch, not
+before invoking Run. A UI exception yields `launch-dispatch-uncertain` with the
+pending attempt retained; inspect `status` and use normal cleanup, never replay.
+Accessibility-provider calls themselves depend on the Windows provider; the
+outer host must retain its bounded execution/cancellation policy. This route is
+fixture-tested but not a live-qualified fix for a Windows spawn denial.
+
+MO2 2.5.2 source shows both routes use ProcessRunner with a registered executable;
+Run uses selected-entry/TriggerRefresh whereas CLI uses name lookup and
+ForCommandLine/PreventExit. Neither source comparison nor Error5 proves the
+denying mechanism. User-reported Run success was in a programmatically opened
+MO2; do not assume a manual-process-origin difference or attach it to an unproven
+PID. Reference: upstream v2.5.2 `src/mainwindow.cpp` on_startButton_clicked and
+`src/commandline.cpp` RunCommand::runPostOrganizer.
+
+## Bounded launch-error evidence
+
+Launch retains an optional exact registered-binary log baseline before dispatch.
+Both synchronous `launch` and `status` after `launch -StartOnly` can classify a
+new MO2 loader spawn error before the game-observation timeout. This requires
+one exact owned MO2 lifetime, no loader/game, matching attempt/profile/binary,
+and stable bounded evidence from `logs/mo_interface.log`. A retained owner uses
+only appended bytes after a prefix-and-tail verified baseline. A fresh log also
+requires the exact requested command header near the proven process start.
+The adapter supports the observed MO2 2.5.2 UTC timestamp/error-block format;
+unknown formats, rotation under a retained owner, incomplete/mismatched errors,
+inaccessible files and over-budget windows keep the existing timeout fallback.
+Each probe reads at most 256KiB of candidate bytes plus bounded anchors; a
+matched window is reread within that same bound to verify stability.
+
+An attributable error returns `launch-failed`, retains `launchFailure` and an
+attempt-specific `launchFailureReceiptPath`, and preserves the numeric Win32
+error/message with `cause=unassigned`. Error5 is not proof of antivirus,
+permissions, a lock, or another denying mechanism. Neither classification nor
+status retries launch, dismisses a dialog, closes MO2 or changes the lease.
+Use the ordinary exact-session stop/Unlock cleanup after classifying the
+attempt. A later status retains the failure; active stranded RootBuilder state
+still takes precedence as `rootbuilder-recovery-required`.
+
 MO2 Control is the shared, machine-readable entry point for Codex tasks that
 inspect or validate the Skyrim VR Mod Organizer 2 installation.
 
@@ -36,11 +105,50 @@ visible MO2-owned modal windows. It never closes Tullius,
 Notepad++, or another editor and never force-terminates. Existing retained-MO2
 game cycling and explicit safe-gated termination remain available.
 
+`inspect` classifies MO2's "waiting on an application" exit dialog as an
+external USVFS participant, not an application dependency. Its
+`data.usvfsWait` record reports the exact executable/PID, process age and command
+line when readable, matching USVFS modules from this MO2 installation, and
+`executable_blacklist` coverage. External editors and crash viewers are never
+automation close targets: exit an already injected process under user control;
+blacklisting only prevents future MO2-launched instances from joining USVFS.
+
 `open` and `launch` accept `-StartOnly`: they write their exact session receipt,
-start only the intended process, return immediately with the session/evidence
-path, and direct the caller to poll `status`. When `status` proves the one exact
+start only the intended process, and commit the resulting process identity while
+holding the same generation transition that authorized dispatch. A stale renewal
+or competing lifecycle transition therefore refuses before process creation,
+not after it. They then return with the session/evidence path and direct the
+caller to poll `status`. When `status` proves the one exact
 adopted MO2 process and its visible `MainWindow`, it advances an `opening`
-session to durable `mo2-open` so a later game launch is valid. A missing session
+session to durable `mo2-open` so a later game launch is valid. After a
+`launch -StartOnly`, `status` also adopts only configured game/loader identities
+whose PID, process name, executable path, and start time bind them to the
+recorded launch and a freshly revalidated exact MO2 owner. The launch records a
+pre-dispatch process set and dispatch boundary, so a recent pre-existing process
+cannot enter through a timing allowance. A loader-only observation remains
+pending until the configured primary game appears, so polling cannot finalize
+an incomplete launch set. Helper-to-runtime owner adoption is allowed only once,
+while the session is still opening or launching, and requires the candidate to
+be the exact requested process or its direct child whose parent PID and start
+time match the dispatched helper under a matching durable dispatch receipt.
+Launch/open capture an eligible direct child's exact identity while retaining
+the original helper handle, so the lifetime proof survives a later helper exit
+without treating a recycled parent PID as authority. A merely configured later
+process cannot become session
+authority. Synchronous compatibility callers keep the generation produced by
+their own handoff through terminal completion. If `status` or another lifecycle
+writer wins that race, the older caller preserves the newer state and recognizes
+success only when that durable record proves the same exact attempt completed.
+Later `terminate-game` rebinds every
+recorded game identity to a retained live process handle, revalidates its full
+identity, configured path, and current serialized session generation immediately
+before mutation, and never reopens a PID for termination. This makes exact
+termination and RootBuilder recovery
+available without reissuing the launch. RootBuilder `Unlock` revalidates that
+same recorded MO2 PID, executable path, and start time through one retained
+process handle before window selection, before every UI action, and again before
+reporting recovery success. Each action also checks current session-generation
+authority. A missing session
 ID is a structured `missing-session-id` precondition instead of a PowerShell
 binding failure. Launch classifies the exact `Failed to write settings` dialog
 and cooperative close acknowledges only its exact `OK` button.
@@ -51,6 +159,13 @@ grace it identifies a closed or headless owner with active RootBuilder
 performs one recorded exact-profile launch; the caller then uses normal `stop`
 so RootBuilder can restore its deployment through the exact Unlock path. It
 never deletes deployment data.
+
+Cooperative `close`, `recover-close`, and `stop` also recognize a structurally
+matched `Preparing vfs` window with exactly one `Cancel` control. They invoke
+only that exact control, retain the action in the session receipt, and still
+require both owned-process shutdown and removal of active `BuildData.json`
+before reporting success or allowing release. A stranded transaction remains
+`rootbuilder-recovery-required`; the controller never deletes it directly.
 
 Validation also resolves a registered executable stored under MO2's `mods`
 directory back to its owning mod. Launch is blocked when that exact mod is
@@ -176,8 +291,31 @@ overrides the profile's actual runtime files.
 never expires, steals, or transfers a lease because its estimate elapsed.
 `renew-access` refreshes the recorded activity time and can replace the
 estimate. `access-status` reports availability and exact ownership.
-Session owner liveness is bound to both process ID and process start time, so a
-reused PID cannot make an abandoned session appear live.
+Every lifecycle commit writes the ownership lock as the authoritative state and
+projects that same generation into `session.json` before releasing the transition
+lock. An older writer cannot overtake a newer manifest. If projection itself
+fails, the error identifies the already committed lock generation; the next
+serialized commit reconciles the manifest from that authoritative state.
+Initial preparation, recovery-session binding, and in-session `renew-access`
+use the same projection rule; access-only renewal has no session manifest to
+update.
+Game-identity persistence also resolves one exact live MO2 owner inside that
+same serialized transition before it may publish `running`. Exact game
+termination repeats that owner proof inside its serialized transition before
+requesting any game-process termination, preserving the owner required for
+RootBuilder restoration.
+Modern session owner liveness is bound to process ID, executable path, and
+process start time, so a reused PID cannot make an abandoned session appear
+live. Readable legacy PID/start-time records are labelled separately from the
+modern path-bound identity contract; PID presence alone is never reported as an
+identity match.
+The same complete lifetime proof gates cooperative close, stop, dialog cleanup,
+and RootBuilder recovery; a matching PID alone never authorizes UI control.
+
+Cooperative close re-resolves that exact owner after game shutdown and retains
+an open kernel process handle across each `Unlock`, `Exit`, or window-close UI
+action. If the owner exits or its PID, path, or start time changes, close stops
+without acting on the replacement process.
 
 The human code word `Lease` maps to `request-access -AccessKind human`. It has
 no runtime route and binds to MO2's exact selected existing profile, including
@@ -238,6 +376,50 @@ session or call `release-access`.
 
 ## Session lifecycle
 
+### Recovering an interrupted fresh dispatch
+
+If launch created MO2 and wrote `mo2-launch-started.json` but the session is
+still `prepared`, do not relaunch, force-edit the lock, use `recover-close`, or
+release another task's lease. `recover-dispatch` is a narrow source-upgrade
+exception to the usual durable-controller rule: invoke the repaired entry point
+with **that session's captured `config/machine.local.json`**, the owner's private
+`AccessId`, exact `SessionId`, recorded `TaskId`, receipt `AttemptId`, and current
+`ExpectedGeneration`. Preview first with `-WhatIf`.
+
+It accepts only a fresh originally closed dispatch with no game/loader, exactly
+one live MO2, and the receipt's exact PID, executable path, and start instant.
+It checks profile/executable arguments, chronology, lock/manifest generation,
+the original controller file hashes, and identical captured configuration.
+Prepare binds the controller receipt's exact size, digest, version and physical
+identity plus the complete producer inventory into the authoritative lease;
+the session manifest projects that same binding. Recovery refuses a rewritten
+receipt, missing/duplicate/aliased member, physical replacement, reparse path,
+or lock/manifest controller path drift before ownership transfer. An old prepared
+session without that independent binding fails closed; recovery must not invent
+an external proof from the self-declared historical receipt.
+Existing owner transitions/tuples, helper-only handoffs, foreign credentials,
+extra processes, and stale generations fail closed. Legacy launch receipts have
+both generation and leaseId absent; modern receipts have both present, typed and
+exact. One-sided metadata is invalid. Legacy launch-receipt compatibility still
+requires the independently bound controller inventory and all prepared-session
+proofs; it is not permission to upgrade an unbound historical controller.
+
+Recovery retains the original controller and receipt, snapshots pre-recovery
+lock/manifest/receipt into a new session-local evidence directory, creates a
+new durable controller, and commits one `launch-failed` generation with the
+exact owner tuple. It does not launch, dismiss a dialog, close MO2, restore
+RootBuilder, change the profile, or release access. Use its returned literal
+`controllerPath` for `status`, `close`/`stop`, and subsequent lifecycle commands.
+Cooperative close recognizes `Cannot launch program` only with a matching
+`Cannot start ...exe` message; unknown dialogs remain unattended. Inspect and
+retain modal details/logs before closing: generic antivirus advice does not
+establish an antivirus cause.
+
+Fresh launch now normalizes prior game history before process creation and
+records the dispatched lifetime before optional child inventory. Empty and
+singleton histories remain arrays, and a child-probe failure cannot strand an
+otherwise recorded owner. Recovery never enables a repeat launch implicitly.
+
 `prepare` requires a closed game/MO2 state, validates one exact profile and
 registered executable, and creates a durable evidence manifest on staging
 storage. It binds the caller's exact route-qualified access lease. It also
@@ -257,25 +439,45 @@ Immediately after process creation it writes `mo2-open-started.json` and marks
 the owned session `opening`. If the caller's outer timeout expires before UIA
 readiness, a later `status`, `close`, or `recover-close` still has durable PID,
 path, argument, and timestamp evidence for exact-process adoption.
-`status` is bounded and mutates only the durable `opening` to `mo2-open`
-transition after exact process and visible-main-window proof. `stop-game`
-requests normal closure of the owned game/loader while preserving the exact
-owner MO2 PID, allowing controlled relaunches. After the game exits it first
+`status` is bounded and mutates only proven lifecycle transitions: `opening` to
+`mo2-open`, or `launching` to `running` with exact post-launch process identities.
+Each retained relaunch archives the preceding active game identities with their
+launch-attempt provenance before opening a new active identity set; it does not
+discard the earlier evidence or reuse it as authority for the new game.
+`stop-game` derives its complete graceful-close target set from the game
+identities recorded in the current serialized session, vetoes the action when
+the live inventory contains any additional configured game or loader process,
+binds every owned target to a retained live process handle, and revalidates its
+PID, name, executable path, start instant, and current session generation before
+requesting normal closure; the same serialized boundary must still contain the
+exact recorded MO2 owner. `stop` uses the same helper and never reopens an
+earlier PID. After the game exits `stop-game` first
 observes the exact session-owned MO2 PID for a bounded stability window,
 allowing a delayed post-stop dialog to arrive. It then acknowledges only a
 structurally classified retained `Failed to run` dialog; an unknown modal returns
-`game-stopped-needs-attention` without touching it. If MO2 exits immediately
+`game-stopped-needs-attention` without touching it. Each retained-dialog action
+rechecks the initiating generation and exact retained owner handle. If MO2 exits immediately
 after the game, `stop-game` returns `mo2-exited-after-game-stop`, sets
-`releaseRequired`, and refuses to represent the session as relaunchable. `close`
+`releaseRequired`, and records that MO2 must be reopened or the lease released
+before another task receives it. `close`
 refuses while a game/loader exists and cooperatively resolves
 MO2's structured `File` → `Exit` path and visible modal chain, including the VFS
 `Unlock` prompt. `stop` first closes the game and then uses the same MO2
-resolver. `release` ends only the exactly owned session after proving MO2 and
-the game are closed, while retaining the evidence directory. It returns the
-explicit lease to access-only state. All mutation commands have `-WhatIf`.
+resolver. Every cooperative UI action rechecks the caller's current lease
+generation while retaining the exact owner handle. Recovery close also carries
+one initiating generation through its close result and completion write rather
+than reacquiring newer authority for an older result. `release` repeats current
+generation and live-process checks inside its serialized transition, then ends
+only the exactly owned session while retaining the evidence directory. It
+returns the explicit lease to access-only state. All mutation commands have
+`-WhatIf`.
 Evidence
 collection, archive verification, profile mutation, cache management, and
 recovery remain deferred until separately bounded.
+
+If the retained MO2 owner exits after the stability window, a later `launch`
+reopens the same owned session, exact profile, and executable when no MO2 or
+game process exists. It still refuses an unrelated or ambiguous MO2 owner.
 
 Use `-NoExit` when embedding the entry script in a larger PowerShell host; a
 failed command then returns structured JSON without terminating that host.
@@ -287,12 +489,20 @@ The retained cycle is:
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <literal-controllerPath> launch -SessionId <literal-session-id> -Compact
 ```
 
-Resume is accepted only from a bounded stopped/failure state, with no game
-process and exactly one MO2 process matching the session's original owner PID.
+Resume is accepted only from a bounded stopped/failure state with no game
+process. It either reuses exactly one MO2 process whose PID, start time, and
+executable path match the retained owner record, or—when no MO2 process
+exists—reopens the same owned session, profile, and executable. An unrelated,
+reused-PID, legacy PID-only, or ambiguous MO2 process blocks the launch without
+being adopted. A retained owner is checked again by PID, configured executable
+path, and process start instant before dry-run authorization and immediately
+before live dispatch.
 
 `terminate` is intentionally distinct from `stop`: it force-terminates only
 MO2 processes owned by the active session, and only after proving that no game
-or loader process is running and no RootBuilder `BuildData.json` remains.
+or loader process is running and no RootBuilder `BuildData.json` remains. Those
+vetoes are reobserved inside the same serialized boundary that revalidates the
+exact owner and requests termination.
 
 Visible `open`, `close`, `recover-close`, `stop-game`, and `stop` operations must
 run as the logged-on user on the interactive Windows desktop. In Codex this

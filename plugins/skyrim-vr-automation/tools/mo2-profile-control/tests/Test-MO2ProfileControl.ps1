@@ -47,6 +47,65 @@ try {
     if (-not $ensuredWinner.enabled -or $ensuredLines[1] -ne '+Enable Test Mod') { throw 'Ensure-winner did not enable and move the existing target before providers.' }
     $ensureWinnerRestored = & $script restore -ProfilePath $profile -ModName 'Enable Test Mod' -EvidenceDirectory $ensureWinnerEvidence -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
     if ($ensureWinnerRestored.enabled -or $ensureWinnerRestored.sha256 -ne $originalHash) { throw 'Ensure-winner restore was not byte-identical.' }
+    $profileControlDirectory = @(Get-ChildItem -LiteralPath $env:CSX_MO2_PROFILE_CONTROL_ROOT -Directory)[0].FullName
+
+    $automaticProfileDirectory = Join-Path $fixture 'automatic-profile'
+    New-Item -ItemType Directory -Path $automaticProfileDirectory -Force | Out-Null
+    $automaticProfile = Join-Path $automaticProfileDirectory 'modlist.txt'
+    $automaticOriginal = [Text.Encoding]::UTF8.GetBytes("#automatic`r`n+DLL Only Old`r`n+Mixed Old`r`n-Other Mod`r`n")
+    [IO.File]::WriteAllBytes($automaticProfile, $automaticOriginal)
+    $automaticOriginalHash = (Get-FileHash -LiteralPath $automaticProfile -Algorithm SHA256).Hash
+    $automaticTarget = Join-Path $mods 'Automatic Target'
+    $dllOnlyOld = Join-Path $mods 'DLL Only Old'
+    $mixedOld = Join-Path $mods 'Mixed Old'
+    foreach ($mod in @($automaticTarget, $dllOnlyOld, $mixedOld)) {
+        New-Item -ItemType Directory -Path (Join-Path $mod 'SKSE\Plugins') -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $mod 'SKSE\Plugins\Shared.dll'), $mod)
+    }
+    [IO.File]::WriteAllText((Join-Path $dllOnlyOld 'README.md'), 'documentation')
+    [IO.File]::WriteAllText((Join-Path $dllOnlyOld 'SKSE\Plugins\Shared.pdb'), 'symbols')
+    [IO.File]::WriteAllText((Join-Path $mixedOld 'SKSE\Plugins\Shared.ini'), 'functional configuration')
+
+    $automaticEvidence = Join-Path $fixture 'automatic-evidence'
+    $automaticPreviewEvidence = Join-Path $fixture 'automatic-preview-evidence'
+    $automaticPreview = & $script add-enable -ProfilePath $automaticProfile -ModName 'Automatic Target' -ModDirectory $automaticTarget -ModsDirectory $mods -EvidenceDirectory $automaticPreviewEvidence -BlockingProcessNames $fixtureProcessNames -WhatIf | ConvertFrom-Json
+    $previewPlan = $automaticPreview.operationResult.automaticDllPlan
+    if (@($previewPlan.targetDllPaths).Count -ne 1 -or $previewPlan.targetDllPaths[0] -ne 'SKSE\Plugins\Shared.dll') { throw 'WhatIf lost target DLL discovery.' }
+    if ($automaticPreview.operationResult.relativeToMod -ne 'Mixed Old' -or @($previewPlan.providers).Count -ne 2 -or @($previewPlan.disableMods).Count -ne 1 -or $previewPlan.disableMods[0] -ne 'DLL Only Old' -or @($previewPlan.providers | Where-Object { $_.modName -eq 'Mixed Old' -and $_.retainedFunctionalPaths -contains 'SKSE\Plugins\Shared.ini' }).Count -ne 1) { throw 'WhatIf changed winner placement or provider-retirement classification.' }
+    if ((Get-FileHash -LiteralPath $automaticProfile -Algorithm SHA256).Hash -ne $automaticOriginalHash -or (Test-Path -LiteralPath $automaticPreviewEvidence)) { throw 'Add-enable WhatIf changed profile or created evidence.' }
+    $automatic = & $script add-enable -ProfilePath $automaticProfile -ModName 'Automatic Target' -ModDirectory $automaticTarget -ModsDirectory $mods -EvidenceDirectory $automaticEvidence -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
+    if (($previewPlan | ConvertTo-Json -Depth 15 -Compress) -cne ($automatic.operationResult.automaticDllPlan | ConvertTo-Json -Depth 15 -Compress)) { throw 'Preview and actual add-enable plan differ for identical preimage and providers.' }
+    $automaticLines = Get-Content -LiteralPath $automaticProfile
+    if (-not $automatic.enabled -or -not $automatic.operationResult.registered -or @($automatic.operationResult.automaticDllPlan.targetDllPaths).Count -ne 1) { throw 'Add-enable did not register the target and discover its DLL path.' }
+    if ($automaticLines[1] -ne '-DLL Only Old' -or $automaticLines[2] -ne '+Automatic Target' -or $automaticLines[3] -ne '+Mixed Old') { throw 'Add-enable did not disable only the exact DLL-only provider and place the target above the retained mixed provider.' }
+    if (@($automatic.operationResult.automaticDllPlan.disableMods) -notcontains 'DLL Only Old' -or @($automatic.operationResult.automaticDllPlan.disableMods) -contains 'Mixed Old') { throw 'Add-enable retirement plan was not conservative.' }
+    $automaticReceipt = Get-Content -LiteralPath (Join-Path $automaticEvidence 'modlist-control.receipt.json') -Raw | ConvertFrom-Json
+    if (-not $automaticReceipt.postcondition.verified -or @($automaticReceipt.postcondition.disabledMods) -notcontains 'DLL Only Old') { throw 'Add-enable receipt did not retain its verified retirement postcondition.' }
+
+    $automaticNoOpEvidence = Join-Path $fixture 'automatic-noop-evidence'
+    $automaticNoOp = & $script add-enable -ProfilePath $automaticProfile -ModName 'Automatic Target' -ModDirectory $automaticTarget -ModsDirectory $mods -EvidenceDirectory $automaticNoOpEvidence -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
+    if ($automaticNoOp.operationResult.changed -or (Test-Path -LiteralPath $automaticNoOpEvidence)) { throw 'Repeated add-enable was not a side-effect-free no-op.' }
+
+    $automaticRestored = & $script restore -ProfilePath $automaticProfile -ModName 'Automatic Target' -EvidenceDirectory $automaticEvidence -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
+    if ($null -ne $automaticRestored.marker -or $automaticRestored.sha256 -ne $automaticOriginalHash) { throw 'Add-enable restore did not restore the target absence and prior provider states byte-identically.' }
+
+    $keepProfileDirectory = Join-Path $fixture 'keep-profile'
+    New-Item -ItemType Directory -Path $keepProfileDirectory -Force | Out-Null
+    $keepProfile = Join-Path $keepProfileDirectory 'modlist.txt'
+    [IO.File]::WriteAllText($keepProfile, "+DLL Only Old`r`n-Mixed Old`r`n")
+    $kept = & $script add-enable -ProfilePath $keepProfile -ModName 'Automatic Target' -ModDirectory $automaticTarget -ModsDirectory $mods -RetirementPolicy KeepProviders -EvidenceDirectory (Join-Path $fixture 'keep-evidence') -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
+    $keepLines = Get-Content -LiteralPath $keepProfile
+    if ($keepLines[0] -ne '+Automatic Target' -or $keepLines[1] -ne '+DLL Only Old' -or @($kept.operationResult.automaticDllPlan.disableMods).Count -ne 0) { throw 'KeepProviders did not retain the older DLL provider below the winning target.' }
+
+    $noDllTarget = Join-Path $mods 'No DLL Target'
+    New-Item -ItemType Directory -Path (Join-Path $noDllTarget 'textures') -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $noDllTarget 'textures\example.dds'), 'texture')
+    $noDllProfileDirectory = Join-Path $fixture 'no-dll-profile'
+    New-Item -ItemType Directory -Path $noDllProfileDirectory -Force | Out-Null
+    $noDllProfile = Join-Path $noDllProfileDirectory 'modlist.txt'
+    [IO.File]::WriteAllText($noDllProfile, "-No DLL Target`r`n+Other Mod`r`n")
+    $noDll = & $script add-enable -ProfilePath $noDllProfile -ModName 'No DLL Target' -ModDirectory $noDllTarget -ModsDirectory $mods -EvidenceDirectory (Join-Path $fixture 'no-dll-evidence') -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
+    if (-not $noDll.enabled -or $noDll.operationResult.placement -ne 'Unchanged' -or @($noDll.operationResult.automaticDllPlan.targetDllPaths).Count -ne 0) { throw 'Add-enable did not enable a non-DLL mod without inventing a winner plan.' }
 
     $inspect = & $script inspect -ProfilePath $profile -ModName 'Exact Test Mod' -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
     if (-not $inspect.enabled) { throw 'Inspect did not report the enabled marker.' }
@@ -59,7 +118,6 @@ try {
     $enableInspect = & $script inspect -ProfilePath $profile -ModName 'Enable Test Mod' -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
     if ($enableInspect.enabled) { throw 'Inspect did not report the disabled marker.' }
 
-    $profileControlDirectory = @(Get-ChildItem -LiteralPath $env:CSX_MO2_PROFILE_CONTROL_ROOT -Directory)[0].FullName
     $heldLock = [IO.File]::Open((Join-Path $profileControlDirectory 'target.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     $contentionRejected = $false
     try {
@@ -161,6 +219,12 @@ try {
     $humanConfig = Read-MO2ControlConfig -ConfigPath $humanConfigPath
     $humanAccess = Invoke-MO2RequestAccess -Config $humanConfig -AccessKind human -Profile Codex -TaskId 'profile-control-fixture-task' -Label 'profile-control fixture'
     try {
+        $humanAddTarget = Join-Path $humanModsRoot 'Human Add Enable Target'
+        New-Item -ItemType Directory -Path (Join-Path $humanAddTarget 'SKSE\Plugins') -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $humanAddTarget 'SKSE\Plugins\HumanTarget.dll'), 'fixture')
+        $humanAddEvidence = Join-Path $humanRoot 'add-enable-evidence'
+        $humanAdded = & $script add-enable -ProfilePath $humanProfileRoot -ModName 'Human Add Enable Target' -ModDirectory $humanAddTarget -ModsDirectory $humanModsRoot -EvidenceDirectory $humanAddEvidence -ConfigPath $humanConfigPath -HumanMutationId $humanAccess.data.access.humanMutationId -TaskId 'profile-control-fixture-task' -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
+        if (-not $humanAdded.ok -or $humanAdded.state -ne 'committed' -or -not $humanAdded.operationResult.changed -or -not $humanAdded.enabled -or $null -ne $humanAdded.refresh -or -not (Test-Path -LiteralPath (Join-Path $humanAddEvidence 'modlist-control.receipt.json') -PathType Leaf)) { throw 'Closed-MO2 human add-enable did not use authorized mutation and report its real commit.' }
         $humanEvidence = Join-Path $humanRoot 'evidence'
         $humanDisabled = & $script disable -ProfilePath $humanProfileRoot -ModName 'Human Lease Test Mod' -EvidenceDirectory $humanEvidence -ConfigPath $humanConfigPath -HumanMutationId $humanAccess.data.access.humanMutationId -TaskId 'profile-control-fixture-task' -BlockingProcessNames $fixtureProcessNames | ConvertFrom-Json
         if ($humanDisabled.ok -ne $true -or $humanDisabled.state -ne 'committed' -or $humanDisabled.enabled -or $humanDisabled.humanLeaseId -ne $humanAccess.data.access.leaseId -or $null -ne $humanDisabled.refresh) { throw 'Closed-MO2 human lease mutation did not commit without requesting a refresh.' }
@@ -171,7 +235,7 @@ try {
         $null = Invoke-MO2ReleaseAccess -Config $humanConfig -AccessId $humanAccess.data.access.accessId
     }
 
-    [pscustomobject]@{ ok = $true; assertions = 32; restoredSha256 = $enableRestored.sha256 } | ConvertTo-Json
+    [pscustomobject]@{ ok = $true; assertions = 45; restoredSha256 = $enableRestored.sha256 } | ConvertTo-Json
 }
 finally {
     $env:CSX_MO2_PROFILE_CONTROL_ROOT = $priorControlRoot

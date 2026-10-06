@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('inspect', 'validate', 'validate-closed', 'validate-human-mutation', 'request-access', 'access-status', 'renew-access', 'release-access', 'recover-access', 'prepare', 'open', 'launch', 'status', 'refresh', 'stop-game', 'terminate-game', 'close', 'recover-close', 'recover-rootbuilder', 'stop', 'terminate', 'release', 'help')]
+    [ValidateSet('inspect', 'validate', 'validate-closed', 'validate-human-mutation', 'request-access', 'access-status', 'renew-access', 'release-access', 'recover-access', 'prepare', 'open', 'launch', 'status', 'refresh', 'stop-game', 'terminate-game', 'close', 'recover-close', 'recover-dispatch', 'recover-rootbuilder', 'stop', 'terminate', 'release', 'help')]
     [string]$Command = 'help',
 
     [string]$ConfigPath,
@@ -17,6 +17,10 @@ param(
     [string]$AccessId,
 
     [string]$HumanMutationId,
+
+    [string]$AttemptId,
+
+    [Nullable[long]]$ExpectedGeneration,
 
     [Alias('ReporterTaskId')]
     [string]$TaskId,
@@ -45,6 +49,9 @@ param(
 
     [switch]$StartOnly,
 
+    [ValidateSet('CLI','RunButton')]
+    [string]$LaunchMethod = 'CLI',
+
     [switch]$NoExit,
 
     [switch]$ConfirmAbandoned,
@@ -63,7 +70,7 @@ function New-MO2ApprovalMetadata {
         $hostExecutable = [string](Get-Process -Id $PID -ErrorAction Stop).Path
     }
     $entryPoint = [IO.Path]::GetFullPath($PSCommandPath)
-    $oneShotCommands = @('recover-access', 'terminate-game', 'terminate')
+    $oneShotCommands = @('recover-access', 'recover-dispatch', 'terminate-game', 'terminate')
     $readOnlyCommands = @('inspect', 'validate', 'validate-closed', 'validate-human-mutation', 'access-status', 'status', 'help')
     return [pscustomobject][ordered]@{
         hostExecutable = $hostExecutable
@@ -115,7 +122,7 @@ try {
     }
     $config = Read-MO2ControlConfig -ConfigPath $configuration.path
 
-    $sessionCommands = @('open', 'launch', 'stop-game', 'terminate-game', 'close', 'recover-rootbuilder', 'stop', 'terminate', 'release')
+    $sessionCommands = @('open', 'launch', 'stop-game', 'terminate-game', 'close', 'recover-dispatch', 'recover-rootbuilder', 'stop', 'terminate', 'release')
     if ($Command -in $sessionCommands -and [string]::IsNullOrWhiteSpace($SessionId)) {
         $result = [pscustomobject][ordered]@{
             contractVersion = '1.1.0'
@@ -216,7 +223,7 @@ try {
             Invoke-MO2Open -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -StartOnly:$StartOnly -WhatIf:$WhatIf
         }
         'launch' {
-            Invoke-MO2Launch -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -StartOnly:$StartOnly -WhatIf:$WhatIf
+            Invoke-MO2Launch -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -StartOnly:$StartOnly -LaunchMethod $LaunchMethod -WhatIf:$WhatIf
         }
         'status' {
             Invoke-MO2Status -Config $config -SessionId $SessionId
@@ -235,6 +242,10 @@ try {
         }
         'recover-close' {
             Invoke-MO2RecoverClose -Config $config -AccessId $AccessId -Label $Label -TimeoutSeconds $TimeoutSeconds -WhatIf:$WhatIf
+        }
+        'recover-dispatch' {
+            if ([string]::IsNullOrWhiteSpace($AccessId) -or [string]::IsNullOrWhiteSpace($TaskId) -or [string]::IsNullOrWhiteSpace($AttemptId) -or $null -eq $ExpectedGeneration) { throw 'recover-dispatch requires AccessId, TaskId, AttemptId and ExpectedGeneration.' }
+            Invoke-MO2RecoverDispatch -Config $config -SessionId $SessionId -AccessId $AccessId -TaskId $TaskId -AttemptId $AttemptId -ExpectedGeneration $ExpectedGeneration -WhatIf:$WhatIf
         }
         'recover-rootbuilder' {
             Invoke-MO2RecoverRootBuilder -Config $config -SessionId $SessionId -TimeoutSeconds $TimeoutSeconds -StartOnly:$StartOnly -WhatIf:$WhatIf
@@ -257,6 +268,7 @@ try {
     Set-MO2ResultDataValue -Result $result -Name approval -Value (New-MO2ApprovalMetadata -Subcommand $Command)
 }
 catch {
+    $runControlDiscovery = if ($_.Exception.Data.Contains('MO2RunControlDiscovery')) { $_.Exception.Data['MO2RunControlDiscovery'] } else { $null }
     $result = [pscustomobject][ordered]@{
         contractVersion = '1.1.0'
         command = $Command
@@ -268,6 +280,7 @@ catch {
         errors = @($_.Exception.Message)
         data = [pscustomobject]@{
             exceptionType = $_.Exception.GetType().FullName
+            runControlDiscovery = $runControlDiscovery
             configuration = $configuration
             requestedConfigPath = $ConfigPath
             approval = New-MO2ApprovalMetadata -Subcommand $Command

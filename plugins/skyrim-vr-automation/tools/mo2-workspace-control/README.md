@@ -4,10 +4,12 @@ This tool gives each automation task a unique MO2 profile cloned from an
 explicitly configured, known-good `defaults.testProfileSource`. It never uses
 the ordinary session default as an implicit template. The complete `saves`
 tree from that maintained source profile is copied and verified into every new
-task profile so ordinary access requests remain usable. Fresh creation is
-fail-closed unless that source also has one valid default world-entry fixture.
-The fixture is the maintained route into the loaded game world; alternate
-locations may then be reached with guarded `coc`/`cow` commands.
+task profile so ordinary access requests remain usable. A valid default
+world-entry fixture is required only when creation requests
+`-SavePolicy VerifiedFixture`; `MainMenuOnly` and `FreshGame` remain available
+without one. The fixture is the maintained deterministic route into the loaded
+game world; alternate locations may then be reached with guarded `coc`/`cow`
+commands.
 
 Profile discovery, hashing, fixture verification, copying, and post-copy
 verification share one command-wide tree-operation deadline. The controller
@@ -53,10 +55,32 @@ Workspaces are durably owned by `-TaskId` (or `CODEX_THREAD_ID` /
 `CODEX_TASK_ID`), not by one access lease. `create` makes and selects a fresh
 profile. `list-task` reports retained profiles. `resume` rebinds one exact
 retained workspace to a newly owned lease and selects it without refreshing it
-from the primary profile. If the prior lease completed its output transaction,
-resume also publishes a fresh owner marker, snapshots, evidence paths, and
-completion paths before returning ready. See
+from the primary profile. If the exact retained owner marker still exists,
+resume validates its bytes, task, workspace, immutable ownership ID, and
+Overwrite path, then rebinds that unchanged active transaction to the new
+closed-state lease. All output paths must match the configured exact Overwrite
+mapping. Interrupted active rebind recovery requires the original task and
+workspace plus a current closed-state lease, and restores the exact manifest
+before another resume. If the prior lease completed its output transaction, every
+resume—including one under the same access ID—first verifies the exact cache
+and backup plans, completions, snapshot and restore lineage, preserved working
+trees, and restored live Overwrite state. It then publishes a fresh owner
+marker, snapshots, evidence paths, and completion paths before returning ready.
+See
 `../../docs/MO2-TASK-WORKSPACES.md`.
+
+`list-task` advertises a workspace as resumable only when its profile exists,
+its retained manifest contains the complete supported runtime-output contract,
+and it has one machine-checked transition: `rebind-active-output` for its exact
+live owner marker or `rearm-completed-output` for exact terminal completion
+evidence. Foreign owners, changed markers, incomplete evidence, and legacy
+contracts remain preserved under `unavailableWorkspaces` with a precise
+`resumeBlockReason`; `resume` fails before profile selection or manifest/profile
+mutation. Malformed task-owned manifests are reported there instead of being
+silently skipped. If a task has retained records but none is resumable,
+`list-task` returns `retained-workspaces-unavailable` and explicitly forbids a
+replacement without reviewed migration or retirement authority. Do not
+silently recreate such an environment.
 
 Creation binds the task to MO2 Overwrite with an exact owner marker. It removes
 both the selected game executable and `Synthesis` entries from the cloned
@@ -68,6 +92,70 @@ materializes every enabled provider path there. New-area files then use MO2's
 ordinary Overwrite route, while paths that already existed in a mod also have
 an Overwrite winner. First launch requires exact prepared hashes; retained game
 cycles may grow both trees while preserving complete provider coverage.
+
+## Task CSX configuration custody
+
+An enabled settings mod cannot outrank existing files in shared MO2 Overwrite.
+Use `stage-config`, edit the returned task working copy, then `bind-config`.
+The controller owns shared-state restoration; the experiment owner owns the
+requested settings and runtime qualification. It does not synthesize calibration
+or alter unrelated feature values.
+
+This lane is bounded to the exact `SKSE\Plugins\CommunityShaders` subtree:
+256 files, 16 MiB, depth 8, 128 directories, 30 seconds per tree inventory,
+with the existing command-wide workspace deadline and a 90-second launch-proof
+deadline. It preserves the whole subtree, including root settings, override
+providers/user layers, tracking JSON/backups and empty directories. It never
+touches other Overwrite paths or edits lower shared mod providers. Reparse
+points, profile drift, missing shadows and changed shared providers fail closed.
+
+All three commands require exact task/workspace/access ownership, closed
+MO2/game/loader/RootBuilder state, and no bound evidence session. Stage does
+not change shared Overwrite. Pass the exact game
+`Data\SKSE\Plugins\CommunityShaders` path as `-UnmanagedConfigPath` even when
+absent; nonempty unmanaged settings are refused. `-ConfigScopeNote` is required
+and must explicitly state archive coverage and remaining VFS limitations. That
+note records the caller's scope disposition; it is not independent archive
+inspection or runtime VFS proof. Archive-only configuration is not qualified
+by this physical loose-file lane. The task must independently qualify actual
+post-load config and effective settings before accepting experimental results.
+
+Stage captures every enabled mod's exact config root, including absent roots,
+the profile hash and shared baseline hashes. It materializes the effective
+loose-provider union in a retained task working directory, with existing
+Overwrite files taking precedence. Edit only that returned copy. Bind checks
+unchanged baseline/providers/profile, snapshots the original shared tree through
+the existing transaction primitive, and seeds the exact working copy into
+Overwrite. First launch requires the bound prepared hash; retained relaunches
+may grow settings/tracking output but still require complete provider shadows
+and unchanged shared providers. A staged or interrupted binding is not launch
+authority.
+
+`complete-config` preserves task-generated settings and restores exact shared
+bytes and prior configuration-root directory-existence semantics. Ancestors
+created by binding are removed only when empty; unrelated generated content
+is retained and any resulting ancestor-existence difference is reported under
+`retainedNonemptyParents`, not erased or labelled a whole-Overwrite reset.
+It requires the underlying
+snapshot, committed restore journal/receipt and preserved/live tree proofs.
+Interrupted bind/completion keeps its owner marker; invoke the same exact
+closed-state `complete-config` to finish recovery, never delete markers or
+rewrite receipts. Completing an unbound stage retains its task working copy
+without claiming shared restoration. Configuration completion is also included
+in ordinary `complete-output`, before backup/output ownership is released.
+Automation `release-access` refuses while a CSX config owner remains.
+
+After normal workspace `resume`, run `stage-config` again: it snapshots the
+current shared baseline while picking up that task's last retained settings,
+not another task's configuration. Bind after any intentional edits. Neither
+completion nor staging resets the retained profile, saves or task mods. All
+three transitions remain one-shot approvals where escalation applies.
+
+```text
+<pwsh.exe> -NoProfile -NonInteractive -File <Invoke-MO2WorkspaceControl.ps1> stage-config -AccessId <owned-access> -TaskId <owner-task> -WorkspaceId <exact-workspace> -UnmanagedConfigPath <game-Data\SKSE\Plugins\CommunityShaders> -ConfigScopeNote <explicit-archive-and-VFS-disposition> -Confirm:$false -Compact
+<pwsh.exe> -NoProfile -NonInteractive -File <same-source-controller> bind-config -AccessId <same-access> -TaskId <same-task> -WorkspaceId <same-workspace> -Confirm:$false -Compact
+<pwsh.exe> -NoProfile -NonInteractive -File <same-source-controller> complete-config -AccessId <same-access> -TaskId <same-task> -WorkspaceId <same-workspace> -Confirm:$false -Compact
+```
 
 ## Modlist and local-work choices
 
@@ -101,10 +189,71 @@ replace shared metadata, restore snapshotted Overwrite state, or recursively
 remove exact owned paths. `prepare-source` is also one-shot because it moves
 legacy shader-cache trees out of shared Overwrite state.
 
-`adopt` is also one-shot: it transfers one ready workspace from the exact
-released `-PreviousAccessId` to a distinct active lease only after closed-state,
-stable-source, and task-profile fingerprint proofs. It is the recovery route
-when an otherwise valid workspace outlives its transient access lease.
+`resume` is the supported retained-workspace recovery route. It rebinds one
+exact ready workspace to the caller's new active lease only after closed-state,
+stable-source, task identity, and task-profile fingerprint proofs. It is
+one-shot because it replaces the workspace's retained ownership metadata.
+
+### Explicit candidate output requalification
+
+Every forward baseline restore publishes its receipt, committed journal,
+unique inventory and physically displaced working tree under this attempt's
+audit directory. The original prepared plan and snapshot namespace remain
+unchanged. Failed-attempt rollback therefore leaves ordinary catalog and
+workspace completion free to prove and finish the original generation,
+including recovery from a genuine `completing` state. Attempt evidence is
+retained, never deleted or relabelled as normal completion authority. Existing
+legacy receipt conflicts still fail closed; this does not erase older audit.
+
+`requalify-output -ConfirmCandidateChanges` is the separate closed-state
+transition after intentional candidate registration changes the task profile
+or winning CSX DLL/manifest/ABI. Ordinary `resume` never performs this refresh.
+First reacquire access and `resume` the exact workspace; then preview and invoke
+this command with that same access ID, task ID, and workspace ID. It requires
+the exact active owner marker, both original **prepared** cache/backup plans
+and their intact physical snapshot baselines, no completion in progress, no
+MO2/game/loader, no evidence session, and a qualified runtime route. Missing,
+corrupt, foreign, legacy, or partially completed contracts fail before mutation.
+
+The controller snapshots both current working trees for exact rollback, then
+uses the existing transaction primitive to restore both original baselines
+while physically preserving the displaced output. This output is classified
+`superseded-unverified`, never promoted or called known-working. Original
+plans, snapshots, manifest bytes, and ownership-marker bytes are retained;
+`runtimeOutputHistory` links the supersession journal and restore receipts.
+Only after validating both committed restores does it release the old marker
+and derive a new generation from the actual current winning DLL and verified
+build manifest. No expected build ID or old OFF/ON variant is hardcoded. Profile
+markers, task mods, saves, settings, source profiles, and unrelated Overwrite
+content are not edited. Original pre-task directory-existence semantics remain
+binding, including when both `ShaderCache` and `backup` were absent.
+
+Success is `output-requalified-cache-prepare-required`, **not launch-ready**.
+Use the returned fresh `runtimeOutput.cachePrepareArguments` for ordinary
+catalog `prepare` with the actual shader-source/runtime compatibility metadata.
+Then require normal MO2 preparation/first-launch isolation checks and
+`-RequireSKSE`. Old cache-plan arguments are no longer valid. The new backup
+provider shadow is materialized by requalification; the cache shadow is
+materialized by subsequent catalog prepare. Completion of the new generation
+restores the original pre-task baselines through the normal strict gates.
+
+```text
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <source-Invoke-MO2WorkspaceControl.ps1> requalify-output -AccessId <owned-access-id> -TaskId <original-owner-task-id> -WorkspaceId <exact-workspace-id> -ConfirmCandidateChanges -WhatIf -Compact
+<absolute-pwsh.exe> -NoProfile -NonInteractive -File <same-source-Invoke-MO2WorkspaceControl.ps1> requalify-output -AccessId <same-owned-access-id> -TaskId <same-owner-task-id> -WorkspaceId <same-workspace-id> -ConfirmCandidateChanges -Compact
+```
+
+A failure restores the exact prior working trees, marker, and manifest, retaining
+all displaced evidence. If rollback cannot be verified, it reports
+`recovery-required` and leaves a nonterminal journal; it never declares a
+successful rollback or launches. Recovery is integrated into the next
+controller command, but this transaction requires the caller's exact active
+closed-state access lease. If access was released, reacquire it and pass the
+new `-AccessId` to exact `resume`; its recovery hook restores the preimage before
+it rebinds the retained workspace. A foreign
+owner or active process fails closed. No plugin rotation is needed when a task
+explicitly invokes this source controller; installation remains deferred while
+any live protocol is active. This is a one-shot mutation, not a reusable broad
+approval or permission to rewrite evidence manually.
 
 ```text
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2WorkspaceControl.ps1> prepare-source -AccessId <literal-access-id> -Confirm:$false -Compact
@@ -145,18 +294,16 @@ this release does not synthesize that action, and `coc APStartCell` is
 explicitly not equivalent. See `../../docs/BREEZEHOME-SAVE.md` for the current
 maintained fallback starting point.
 
-One default fixture is mandatory for every fresh clone, regardless of
-`SavePolicy`. The installer or list maintainer must first load that save in the
-maintained source profile, record it in `defaults.newGameFixtureManifest`, and
-obtain `fixture-valid`. Creation records static integrity as
-`data.sourceIntegrity`, reports the declaration as `data.worldEntryFixture`,
-verifies it again in the copied tree, and sets `data.copiedWorldEntrySave`.
-`integrityVerified` proves exact profile/save bytes; it does not imply
-`runtimeQualified`. This is a clone-time integrity guarantee only: `resume`
-preserves a task's prior profile exactly and does not claim its save still works
-after task-local edits.
+Every fresh clone receives and hashes the complete stable source save tree.
+`MainMenuOnly` and `FreshGame` do not require, select, or authorize a declared
+world-entry fixture: their result reports `worldEntryFixture: null` and
+`copiedWorldEntrySave: false`. Creation still records static source/copy
+integrity as `data.sourceIntegrity`. `integrityVerified` proves exact
+profile/save bytes; it does not imply `runtimeQualified`. This is a clone-time
+integrity guarantee only: `resume` preserves a task's prior profile exactly and
+does not claim its save still works after task-local edits.
 
-`VerifiedFixture` additionally authorizes that exact fixture as the
+`VerifiedFixture` requires and authorizes one exact fixture as the
 deterministic automation form of “new game”. It uses
 `-FixtureManifestPath`, or `defaults.newGameFixtureManifest`, and selects
 `-FixtureId` or the manifest's `defaultFixtureId`. The manifest fingerprint must
@@ -172,9 +319,11 @@ changing anything. When no manifest is configured, or the configured file is
 missing, `fixture-status` returns `fixture-not-configured` or
 `fixture-manifest-missing` with the exact configuration property, portable
 example path, current stable-profile fingerprint, and creation guidance; this
-discovery state is not a tool error for inspection, but it blocks fresh
-`create`. The doctor treats anything other than `fixture-valid` as a failed
-setup prerequisite. `refresh-fixture` is the separately authorized repair path:
+discovery state is not a tool error for inspection. It blocks only
+`VerifiedFixture` creation; `MainMenuOnly` and `FreshGame` remain available.
+The doctor reports fixture readiness separately rather than treating it as a
+prerequisite for every save policy. `refresh-fixture` is the separately
+authorized repair path:
 it requires the exact access lease and closed-state proof, preserves the prior
 manifest and a receipt, refreshes only the selected declared fixture, and
 verifies the postcondition. It never invents a replacement save path.
@@ -205,6 +354,18 @@ restore's immutable transaction identity, committed journal, and snapshot lineag
 baseline, and the physical preserved task output before publishing completion
 or releasing ownership. Conflicting or malformed restore evidence remains
 nonterminal and retains the task's recovery authority.
+Zero generated shader-cache files are accepted only as non-promoted
+`failed`/`unverified` cleanup, never as known-working output. The workspace
+independently verifies the exact prepared provider-shadow hash, original
+physical snapshot, preserved physical working tree, canonical restore receipt,
+and committed journal bound to the same snapshot and output generation.
+`restore-noop` additionally requires the exact snapshot `cache.before` path and
+matching original/prepared hashes; an identical tree at another path is not
+equivalent proof. `complete-output`, completed-generation `resume`, and
+retirement use this same validation. Missing or changed evidence fails closed
+without releasing the owner or changing the retained profile. A successful
+cleanup allows later resume into a fresh output generation; it does not promote
+the failed cache or certify it as working.
 Restoring shared runtime state is independent and must not rewrite or retire
 the retained workspace. Virtual Desktop and `VirtualDesktop.Streamer` never
 block profile mutation or SteamVR null-HMD; an enabled profile-local
@@ -218,7 +379,9 @@ mod already proven task-owned by that workspace. Winner proof intentionally
 covers enabled loose-file providers in the exact profile. Overwrite, unmanaged
 game files, and archives still require separate VFS evidence.
 
-Use `-WinningPathsFile` for multiple paths in a direct approval-compatible
+Use inline `-WinningPaths` for one path only. Native `pwsh -File` argument
+binding can collapse comma-separated quoted values into one string, so use
+`-WinningPathsFile` for every multi-path direct or approval-compatible
 invocation; the format matches the profile controller. Every result also
 reports `data.configuration` with the exact selected config path, source, and
 candidate precedence.
