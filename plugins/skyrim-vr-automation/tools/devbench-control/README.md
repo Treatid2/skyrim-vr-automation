@@ -8,6 +8,11 @@ It pins actual admitted AE/HDR, never writes the colour contract, requires actua
 submitted reset/jitter/delta telemetry, and reuses finite same-session calendar,
 probe custody, compiler/identity, burn-in and spacing guards. The total20..180s
 budget includes service-owned cleanup; partial coverage is not scientific PASS.
+The baseline-only Boolean `captureReadBrackets` opt-in adds sequential camera,
+scene/time and bounded scene-light observations before arm/after completion on
+that same session. It retains native generation association and ordered read
+bounds, NOT atomic rendered-frame equivalence or simulation freeze. See the
+baseline contract for unavailable/truncated coverage and immutable receipts.
 
 ## Typed finite colour measurement
 

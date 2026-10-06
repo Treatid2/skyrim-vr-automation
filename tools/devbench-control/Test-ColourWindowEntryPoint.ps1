@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-[CmdletBinding()]param([Parameter(Mandatory)][string]$FixtureRoot,[switch]$FixedAutoExposure,[string[]]$FixtureModes)
+[CmdletBinding()]param([Parameter(Mandatory)][string]$FixtureRoot,[switch]$FixedAutoExposure,[switch]$CaptureReadBrackets,[string[]]$FixtureModes)
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 $checks=0
@@ -7,15 +7,19 @@ function Check([bool]$Value,[string]$Message){if(-not $Value){throw $Message};$s
 $root=Join-Path $FixtureRoot ('colour-entry-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root|Out-Null
 $modes=if($FixedAutoExposure){@('healthy','healthy-false','ae-mismatch','hdr-mismatch','foreign-revision','telemetry-unavailable','telemetry-malformed','page-telemetry-unavailable','partial-page','compiler','schema-missing','lost-arm','lost-reset','burnin-incomplete','budget-incomplete','foreign-cell','session-retired')}else{@('healthy','partial-page','compiler','schema-missing','lost-arm','lost-reset','string-page-generation','native-failure','burnin-incomplete','session-retired')}
+if($CaptureReadBrackets){
+    if(-not $FixedAutoExposure){throw 'Read bracket public fixture requires fixed baseline'}
+    $modes=@('healthy','lights-unavailable','camera-malformed','scene-foreign','lights-malformed','lost-before','lost-after','bracket-schema-missing','bracket-schema-lights')
+}
 if($FixtureModes){if(@($FixtureModes|Where-Object {$_ -cnotin $modes}).Count){throw 'Unknown public fixture case'};$modes=@($FixtureModes)}
 foreach($mode in $modes){
     $dir=Join-Path $root $mode;New-Item -ItemType Directory -Path $dir|Out-Null
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0);$listener.Start();$port=$listener.LocalEndpoint.Port
     $events=[Collections.Concurrent.ConcurrentQueue[object]]::new()
-    $server=Start-ThreadJob -ArgumentList $listener,$mode,$PSScriptRoot,$events,$PID,$port,([bool]$FixedAutoExposure) -ScriptBlock {
-        param($Listener,$Mode,$Source,$Events,$OwnerPid,$Port,$Baseline)
+    $server=Start-ThreadJob -ArgumentList $listener,$mode,$PSScriptRoot,$events,$PID,$port,([bool]$FixedAutoExposure),([bool]$CaptureReadBrackets) -ScriptBlock {
+        param($Listener,$Mode,$Source,$Events,$OwnerPid,$Port,$Baseline,$Brackets)
         $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
-        $fixture=. (Join-Path $Source $(if($Baseline){'Test-FixedAEColourBaseline.ps1'}else{'Test-ColourMeasurementWindow.ps1'})) -FixtureOnly -FixtureMode $Mode
+        $fixture=. (Join-Path $Source $(if($Brackets){'Test-CaptureReadBrackets.ps1'}elseif($Baseline){'Test-FixedAEColourBaseline.ps1'}else{'Test-ColourMeasurementWindow.ps1'})) -FixtureOnly -FixtureMode $Mode
         $binding=[pscustomobject]@{processSession='colour-calendar-fixture';pid=$OwnerPid;loadGeneration=1;cellFormId=7;globalFormIds=@(1,2,3,4,5,6)}
         $values=[pscustomobject]@{year=201;month=1;day=1;gameHour=12;daysPassed=1;calendarRate=20;engineMultiplier=1}
         $lease=$null;$restored=$false
@@ -53,11 +57,15 @@ foreach($mode in $modes){
                         'notifications/initialized'{$status='204 No Content';$body=''}
                         'tools/list'{
                             $available=if($Mode -ceq 'schema-missing'){@($schemas|Where-Object name -CNE 'communityshaders.colour_pipeline_probe')}else{@($schemas)}
-                            $result=@{tools=@($calendarSchema)+$available+@(@{name='inspect';inputSchema=@{}},@{name='communityshaders.shader_api';inputSchema=@{required=@('contractMajor','clientId','commandId','action');properties=@{contractMajor=@{type='integer';const=1};clientId=@{type='string'};commandId=@{type='string'};action=@{type='string';enum=@('registry','snapshot')}}}})}
+                            $inspectTool=@{name='inspect';inputSchema=@{properties=@{kind=@{type='string';enum=@('health','scene','lights')};scope=@{type='string';enum=@('ref','scene')};limit=@{type='integer'}}}}
+                            $cameraTool=@{name='camera';inputSchema=@{properties=@{action=@{type='string';enum=@('get','drive')}}}}
+                            if($Mode -ceq 'bracket-schema-missing'){$cameraTool.inputSchema.properties.action.enum=@('drive')}
+                            if($Mode -ceq 'bracket-schema-lights'){$inspectTool.inputSchema.properties.kind.enum=@('health','scene')}
+                            $result=@{tools=@($calendarSchema)+$available+@($inspectTool,$cameraTool,@{name='communityshaders.shader_api';inputSchema=@{required=@('contractMajor','clientId','commandId','action');properties=@{contractMajor=@{type='integer';const=1};clientId=@{type='string'};commandId=@{type='string'};action=@{type='string';enum=@('registry','snapshot')}}}})}
                         }
                         'tools/call'{
                             if($headers['Mcp-Session-Id'] -cne 'colour-fixture'){throw 'fixture wrong session'}
-                            if($name -ceq 'inspect'){$payload=@{pid=$OwnerPid;exe='pwsh.exe';port=$Port;frame=1;lastTaskFrame=-1;pendingTasks=0;vr=$true}}
+                            if($name -ceq 'inspect' -and $query.kind -ceq 'health'){$payload=@{pid=$OwnerPid;exe='pwsh.exe';port=$Port;frame=1;lastTaskFrame=-1;pendingTasks=0;vr=$true}}
                             elseif($name -ceq 'calendar'){
                                 if($Mode -ceq 'foreign-cell' -and $armCount -gt 0){$binding.cellFormId=8}
                                 if($query.action -ceq 'hold'){$lease=[pscustomobject]@{id='owned-colour-lease';owner=$query.owner;commandId=$query.commandId;binding=($binding|ConvertTo-Json|ConvertFrom-Json);captured=$values;applied=$true}}
@@ -100,7 +108,7 @@ foreach($mode in $modes){
         }}catch{if($Listener.Server.IsBound){throw}}finally{$Listener.Stop()}
     }
     try{
-        $fixture=& (Join-Path $PSScriptRoot $(if($FixedAutoExposure){'Test-FixedAEColourBaseline.ps1'}else{'Test-ColourMeasurementWindow.ps1'})) -FixtureOnly -FixtureMode $mode
+        $fixture=& (Join-Path $PSScriptRoot $(if($CaptureReadBrackets){'Test-CaptureReadBrackets.ps1'}elseif($FixedAutoExposure){'Test-FixedAEColourBaseline.ps1'}else{'Test-ColourMeasurementWindow.ps1'})) -FixtureOnly -FixtureMode $mode
         $plan=$fixture.Plan;$plan.capturesPerCondition=1
         if($FixedAutoExposure -and $mode -cin @('healthy','healthy-false','session-retired')){$plan.capturesPerCondition=16}
         if($FixedAutoExposure){$plan.burnIn.maximumElapsedMilliseconds=4000}
@@ -115,18 +123,36 @@ foreach($mode in $modes){
         $seconds=if($FixedAutoExposure -and $mode -cin @('healthy','healthy-false','session-retired')){180}else{30}
         $reply=& (Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1') $command -RuntimePath $runtime -ColourPlanJson ($plan|ConvertTo-Json -Depth 20 -Compress) -CalendarOwner fixture-owner -CalendarHoldMilliseconds ($seconds*1000) -TimeoutSeconds $seconds -MaxTransientRetries 0 -EvidenceDirectory $dir -NoExit -Compact|ConvertFrom-Json -Depth 80
         $reply|ConvertTo-Json -Depth 80|Set-Content -LiteralPath (Join-Path $dir 'result.json')
-        Check ($reply.ok -eq ($mode -cin @('healthy','healthy-false'))) "$mode public outcome: $($reply.errors -join ';')"
+        Check ($reply.ok -eq ($mode -cin @('healthy','healthy-false','lights-unavailable'))) "$mode public outcome: $($reply.errors -join ';')"
         $all=@($events.ToArray())
         Check (@($all|Where-Object method -CEQ 'initialize').Count -eq 1) "$mode no session rebind"
         Check (@($all|Where-Object {$_.method -ceq 'tools/call' -and $_.session -cne 'colour-fixture'}).Count -eq 0) "$mode uses one actual session"
         Check ($all[-1].method -ceq 'DELETE' -and $reply.sessionCleanup.ok) "$mode session finalized separately"
         if($FixedAutoExposure){Check (@($all|Where-Object {$_.name -ceq 'communityshaders.fsr_color_contract' -and $_.arguments.action -cne 'status'}).Count -eq 0) "$mode ZERO public colour writes"}
-        if($mode -cin @('schema-missing','budget-incomplete')){Check (@($all|Where-Object {$_.name -ceq 'calendar' -and $_.arguments.action -ceq 'hold'}).Count -eq 0) 'schema/budget refusal before hold'}else{
+        if($mode -cin @('schema-missing','budget-incomplete','bracket-schema-missing','bracket-schema-lights')){Check (@($all|Where-Object {$_.name -ceq 'calendar' -and $_.arguments.action -ceq 'hold'}).Count -eq 0) 'schema/budget refusal before hold'}else{
             Check ($reply.data.restorationVerified -eq ($mode -cne 'session-retired')) "$mode calendar restoration independently reported"
             Check (@($all|Where-Object {$_.name -ceq 'calendar' -and $_.arguments.action -ceq 'hold'}).Count -eq 1 -and @($all|Where-Object {$_.name -ceq 'calendar' -and $_.arguments.action -ceq 'release'}).Count -eq 1) "$mode exact hold/release once"
             Check (@(Get-ChildItem -LiteralPath $dir -Filter 'colour-rpc.*.json' -File).Count -gt 0) "$mode immutable raw replies retained"
         }
         if($mode -cin @('healthy','healthy-false')){ $count=if($FixedAutoExposure){16}else{3};Check ($reply.data.measurement.captures.Count -eq $count -and @($reply.data.measurement.captures|ForEach-Object {$_.pages}).Count -eq 10*$count) 'public full capture/page inventory complete'}
+        if($CaptureReadBrackets -and $mode -cnotin @('bracket-schema-missing','bracket-schema-lights')){
+            $m=$reply.data.measurement
+            $brackets=@($m.captures|ForEach-Object {$_.readBrackets})
+            Check (@(Get-ChildItem -LiteralPath $dir -Filter 'colour-read-bracket.*.json' -File).Count -eq $brackets.Count) 'public immutable bracket receipts including partials'
+            foreach($bracket in $brackets){
+                Check (-not $bracket.atomicRenderFrameEquivalent -and (Test-Path -LiteralPath $bracket.immutableReceiptPath)) 'non-atomic immutable association'
+                foreach($read in $bracket.reads){if($null -ne $read.reply){Check (Test-Path -LiteralPath $read.reply.immutableReceiptPath) 'immutable native read receipt retained'}}
+            }
+            $observationCalls=@($all|Where-Object {$_.name -ceq 'camera' -or ($_.name -ceq 'inspect' -and $_.arguments.kind -cin @('scene','lights'))})
+            if($mode -cin @('healthy','lights-unavailable')){
+                $n=if($mode -ceq 'healthy'){16}else{1}
+                Check ($brackets.Count -eq 2*$n -and $observationCalls.Count -eq 6*$n -and @($brackets|Where-Object {-not $_.complete}).Count -eq 0) 'exact public bracket reads'
+                foreach($capture in $m.captures){Check ($capture.readBrackets[0].captureId -ceq $capture.captureId -and $capture.readBrackets[0].generation -eq $capture.generation -and -not $capture.readBrackets[0].generationKnownAtRead -and $capture.readBrackets[1].generationKnownAtRead) 'native generation binding not guessed before arm'}
+            }else{
+                Check ($m.captures.Count -eq 1 -and -not $m.captures[0].complete) 'failed bracket has no successor'
+                Check ($m.probeCleanup.verified) 'failed read retains independent probe cleanup'
+            }
+        }
         if($mode -ceq 'session-retired'){
             $m=$reply.data.measurement;$captures=@($m.captures);$last=$captures[-1]
             Check ($reply.indeterminate -and $m.indeterminate) 'session loss retains indeterminate custody'

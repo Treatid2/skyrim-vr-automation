@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'NativeReadContracts.ps1')
+. (Join-Path $PSScriptRoot 'ColourCaptureReadBrackets.ps1')
 
 function Assert-ColourMeasurementPlan([Collections.IDictionary]$Plan,[switch]$FixedAutoExposure) {
     $keys=@('expectedBuildId','expectedRevision','expectedCellFormId','highDynamicRangeInput','capturesPerCondition','metadata')
     $optional=@('burnIn','minimumElapsedMillisecondsBetweenCaptureArms')
-    if($FixedAutoExposure){$keys+=@('autoExposure')+$optional;$optional=@()}
+    if($FixedAutoExposure){$keys+=@('autoExposure')+$optional;$optional=@('captureReadBrackets')}
     if ($null -eq $Plan -or @($keys | Where-Object {-not $Plan.Contains($_)}).Count -or @($Plan.Keys | Where-Object {$_ -cnotin ($keys+$optional)}).Count) { throw 'Colour plan requires six documented fields and only supported optional timing fields.' }
     if ($Plan.expectedBuildId -isnot [string] -or $Plan.expectedBuildId -cnotmatch '^[0-9a-f]{64}$' -or $Plan.highDynamicRangeInput -isnot [bool]) { throw 'Colour plan requires exact build and fixed Boolean HDR input.' }
     foreach($name in @('expectedRevision','expectedCellFormId','capturesPerCondition')) {
@@ -14,6 +15,7 @@ function Assert-ColourMeasurementPlan([Collections.IDictionary]$Plan,[switch]$Fi
     $maximumCaptures=if($FixedAutoExposure){16}else{4}
     if ($Plan.capturesPerCondition -gt $maximumCaptures -or $Plan.expectedCellFormId -gt [uint32]::MaxValue) { throw 'Colour plan exceeds finite capture/cell bounds.' }
     if($FixedAutoExposure -and $Plan.autoExposure -isnot [bool]){throw 'Fixed-AE baseline requires an explicit actual Boolean autoExposure.'}
+    if($Plan.Contains('captureReadBrackets') -and $Plan.captureReadBrackets -isnot [bool]){throw 'captureReadBrackets requires an actual Boolean; baseline-only opt-in.'}
     if ($Plan.metadata -isnot [Collections.IDictionary] -or -not $Plan.metadata.Contains('calibratedScene') -or $Plan.metadata.calibratedScene -isnot [string] -or [string]::IsNullOrWhiteSpace($Plan.metadata.calibratedScene) -or [Text.Encoding]::UTF8.GetByteCount(($Plan.metadata|ConvertTo-Json -Depth 20 -Compress)) -gt 15000) { throw 'Explicit experiment-owner calibratedScene metadata (at most15000 UTF8 bytes) is required.' }
     if($Plan.Contains('burnIn')){
         $burn=$Plan.burnIn
@@ -43,6 +45,7 @@ function Invoke-DevBenchColourMeasurement {
     $revision=$Plan.expectedRevision; $owned=$null; $uncertain=$false; $resetVerified=$true; $mutationPending=$false
     $probeCleanup=[ordered]@{attempted=$false;verified=$true;errors=[Collections.Generic.List[string]]::new()}
     $clock=[Diagnostics.Stopwatch]::StartNew()
+    $readBrackets=$FixedAutoExposure -and $Plan.Contains('captureReadBrackets') -and $Plan.captureReadBrackets
     $timed=$Plan.Contains('burnIn') -or $Plan.Contains('minimumElapsedMillisecondsBetweenCaptureArms')
     $burnPolicy=if($Plan.Contains('burnIn')){$Plan.burnIn}else{$null}
     $spacing=if($Plan.Contains('minimumElapsedMillisecondsBetweenCaptureArms')){$Plan.minimumElapsedMillisecondsBetweenCaptureArms}else{0}
@@ -77,6 +80,26 @@ function Invoke-DevBenchColourMeasurement {
             throw 'Compiler boundary refused colour measurement.'
         }
         return $g
+    }
+    function ReadBracket($Record,[string]$Phase,[datetime]$Bound) {
+        $bracket=[ordered]@{schema='auto-tools.colour-capture-read-bracket.1';phase=$Phase;captureId=$Record.captureId;generation=$Record.generation;generationKnownAtRead=($null -ne $Record.generation);generationBindingBasis=if($null -ne $Record.generation){'native-arm-acceptance'}else{'pending-native-arm-acceptance'};capturedCpuFrame=if($null -ne $Record.status){$Record.status.cpuFrame}else{$null};cpuFrameKnownAtRead=($null -ne $Record.status);startedUtc=[datetime]::UtcNow.ToString('o');finishedUtc=$null;startedElapsedMilliseconds=$clock.Elapsed.TotalMilliseconds;finishedElapsedMilliseconds=$null;reads=[Collections.Generic.List[object]]::new();complete=$false;atomicRenderFrameEquivalent=$false;error=$null}
+        $Record.readBrackets.Add($bracket)
+        try {
+            foreach($item in @(@{tool='camera';arguments=@{action='get'}},@{tool='inspect';arguments=@{kind='scene'}},@{tool='inspect';arguments=@{kind='lights';scope='scene';limit=64}})) {
+                $read=[ordered]@{tool=$item.tool;arguments=$item.arguments;mutation=$false;intendedUtc=[datetime]::UtcNow.ToString('o');receivedUtc=$null;intendedElapsedMilliseconds=$clock.Elapsed.TotalMilliseconds;receivedElapsedMilliseconds=$null;reply=$null;availability=$null;qualified=$false;error=$null}
+                $bracket.reads.Add($read)
+                try {
+                    if([datetime]::UtcNow -ge $Bound){throw 'Read bracket original work/capture deadline expired before dispatch.'}
+                    $read.reply=& $Call $item.tool $item.arguments $false $Bound
+                    $read.receivedUtc=[datetime]::UtcNow.ToString('o');$read.receivedElapsedMilliseconds=$clock.Elapsed.TotalMilliseconds
+                    if([datetime]::UtcNow -ge $Bound){throw 'Read bracket response arrived at or after original deadline.'}
+                    $projection=Get-ColourReadBracketPayload -Reply $read.reply -Tool $item.tool -Arguments $item.arguments -Cell $Plan.expectedCellFormId
+                    $read.availability=$projection.availability;$read.qualified=$true
+                } catch {$read.error=$_.Exception.Message;throw}
+            }
+            $bracket.complete=$true
+        } catch {$bracket.error=$_.Exception.Message;throw}
+        finally {$bracket.finishedUtc=[datetime]::UtcNow.ToString('o');$bracket.finishedElapsedMilliseconds=$clock.Elapsed.TotalMilliseconds}
     }
     function Status([string]$Name,[datetime]$Bound,$Observations=$null) {
         $argsMap=@{action='status';expectedBuildId=$Plan.expectedBuildId}
@@ -215,6 +238,7 @@ function Invoke-DevBenchColourMeasurement {
             for($iteration=0;$iteration -lt $Plan.capturesPerCondition;$iteration++) {
                 $record=[ordered]@{autoExposure=$auto;iteration=$iteration;revision=$revision;captureId=[guid]::NewGuid().ToString('N');generation=$null;armReply=$null;status=$null;pages=[Collections.Generic.List[object]]::new();complete=$false;resetVerified=$false;resetAttempted=$false;spacing=[ordered]@{minimumMilliseconds=$spacing;priorArmAcknowledgedElapsedMilliseconds=$lastArmAcknowledged;observations=[Collections.Generic.List[object]]::new();armIntentElapsedMilliseconds=$null;verified=$false}}
                 $captures.Add($record)
+                if($readBrackets){$record.readBrackets=[Collections.Generic.List[object]]::new()}
                 while($null -ne $lastArmAcknowledged -and ($clock.Elapsed.TotalMilliseconds-$lastArmAcknowledged) -lt $spacing){
                     $g=Guard $DeadlineUtc
                     if(-not (Test-DevBenchShaderCompilerWindow -Before $post.health -After $g.health).valid){throw 'Compiler changed during inter-arm spacing.'}
@@ -227,6 +251,7 @@ function Invoke-DevBenchColourMeasurement {
                 $current=Status $colour $DeadlineUtc
                 if(-not (Settled $current $revision $auto) -or $current.runtimeContext.generation -ne $s.runtimeContext.generation){throw 'Settled context changed before arm.'}
                 if($null -ne $burnPolicy){StableSignature $current $s}
+                if($readBrackets){ReadBracket $record 'before-arm' $DeadlineUtc}
                 $captureBound=[datetime]::UtcNow.AddSeconds(15)
                 if($captureBound -gt $DeadlineUtc){$captureBound=$DeadlineUtc}
                 $mutationPending=$true
@@ -237,6 +262,7 @@ function Invoke-DevBenchColourMeasurement {
                 $arm=One $record.armReply
                 if($arm.action -isnot [string] -or $arm.action -cne 'arm' -or $arm.accepted -isnot [bool] -or -not $arm.accepted -or $arm.captureId -isnot [string] -or $arm.captureId -cne $record.captureId -or -not (UInt $arm.generation 1)){throw 'Probe arm acceptance/identity unproven; no replay or foreign reset.'}
                 $record.generation=$arm.generation; $owned=$record; $resetVerified=$false
+                if($readBrackets){$record.readBrackets[0].generation=$arm.generation;$record.readBrackets[0].generationBindingBasis='native-arm-acceptance-after-read'}
                 $lastArmAcknowledged=$clock.Elapsed.TotalMilliseconds
                 $mutationPending=$false
                 do {
@@ -250,6 +276,10 @@ function Invoke-DevBenchColourMeasurement {
                 } while($p.state -cne 'complete' -and [datetime]::UtcNow -lt $captureBound)
                 if($p.state -cne 'complete' -or [datetime]::UtcNow -ge $captureBound){throw 'Native fifteen-second capture/readback deadline expired; partial capture retained.'}
                 if($null -ne $burnPolicy -and $p.cpuFrame -le $lastFresh.lastSuccessfulEyeDispatches[0].frame){throw 'Capture CPU frame did not advance beyond final burn-in observation.'}
+                if($readBrackets){
+                    $record.readBrackets[0].capturedCpuFrame=$p.cpuFrame
+                    ReadBracket $record 'after-native-completion' $captureBound
+                }
                 $context=$null; $eyeDispatch=@{}
                 foreach($stage in $stages){foreach($eye in 0,1){
                     $page=One (& $Call $probe @{action='read';expectedBuildId=$Plan.expectedBuildId;captureId=$owned.captureId;generation=$owned.generation;stage=$stage;eye=$eye} $false $captureBound)
@@ -363,4 +393,4 @@ function Invoke-DevBenchColourMeasurement {
     }
     return [pscustomobject]@{ok=($errors.Count -eq 0 -and $colourCleanup.verified);conditions=@($conditions);captures=@($captures);compilerBoundaries=@($guards);errors=@($errors);indeterminate=($uncertain -or -not $probeCleanup.verified -or -not $colourCleanup.verified);probeResetVerified=$resetVerified;probeCleanup=$probeCleanup;colourCleanup=$colourCleanup;retainedProbe=$owned;finalRevision=$revision;completionBasis='native-stereo-dispatch-and-ten-owned-pages-not-scientific-colour';burnInRequested=($null -ne $burnPolicy);vendorExposureConvergenceKnown=$false;nativeCaptureDeadlineSeconds=15;nativeReadbackFrameLimit=120;calibrationOwnedByCaller=$true;qualityAndRenderScaleAdmissionOwnedByCaller=$true;fixedAutoExposureBaseline=[bool]$FixedAutoExposure}
 }
-Export-ModuleMember -Function Assert-ColourMeasurementPlan,Invoke-DevBenchColourMeasurement
+Export-ModuleMember -Function Assert-ColourMeasurementPlan,Invoke-DevBenchColourMeasurement,Assert-ColourReadBracketCatalog

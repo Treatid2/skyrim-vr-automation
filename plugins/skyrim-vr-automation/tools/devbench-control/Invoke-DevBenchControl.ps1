@@ -1254,6 +1254,7 @@ try {
                     if($matches.Count -ne 1 -or $matches[0].inputSchema.additionalProperties -isnot [bool] -or $matches[0].inputSchema.additionalProperties -or @($matches[0].inputSchema.properties.action.enum).Count -ne $pair[1].Count -or @($pair[1]|Where-Object {$_ -cnotin @($matches[0].inputSchema.properties.action.enum)}).Count){throw 'toolSchemaUnresolved: exact finite colour action catalog required.'}
                 }
                 $probeSchema=($tools|Where-Object name -CEQ 'communityshaders.colour_pipeline_probe').inputSchema
+                if($colourPlan.Contains('captureReadBrackets') -and $colourPlan.captureReadBrackets){Assert-ColourReadBracketCatalog $tools}
                 if(@($probeSchema.properties.stage.enum).Count -ne 5 -or @('fsr_input','fsr_output','combined_main','imagespace_input','imagespace_output'|Where-Object {$_ -cnotin @($probeSchema.properties.stage.enum)}).Count -or @($probeSchema.properties.eye.enum).Count -ne 2 -or 0 -notin @($probeSchema.properties.eye.enum) -or 1 -notin @($probeSchema.properties.eye.enum)){throw 'toolSchemaUnresolved: exact five-stage/two-eye pages required.'}
             }
         }
@@ -1311,6 +1312,22 @@ try {
                 }
                 return $reply
             } finally { $script:operationDeadlineUtc=$calendarDeadline }
+        }
+        if($colourPlan -and $colourPlan.Contains('captureReadBrackets') -and $colourPlan.captureReadBrackets -and $null -ne $data.measurement){
+            foreach($capture in $data.measurement.captures){
+                if(-not $capture.Contains('readBrackets')){continue}
+                foreach($bracket in $capture.readBrackets){
+                    $bracketPath=Join-Path $EvidenceDirectory ('colour-read-bracket.'+[guid]::NewGuid().ToString('N')+'.json')
+                    try {
+                        Write-JsonAtomic -Path $bracketPath -Value $bracket
+                        $bracket.immutableReceiptPath=$bracketPath
+                    } catch {
+                        # Preserve already-completed operation and raw RPC receipts;
+                        # evidence publication failure is not permission to replay.
+                        $bracket.publicationError=$_.Exception.Message
+                    }
+                }
+            }
         }
         $semantic=[pscustomobject]@{known=$true;ok=$data.ok;outcome='calendar-window';guarded=$false;transient=$false;codes=@();states=@();reasons=@($data.errors);completionBasis=$data.completionBasis}
     }
