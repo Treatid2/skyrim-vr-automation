@@ -254,10 +254,13 @@ numbers. Drift comparison uses exact decimal coefficient/exponent identities
 from the current raw JSON, so changes hidden by floating-point parsing refuse.
 For receipt-profile-owned floating-point leaves only, the exact declared decimal
 or the finite binary64 value's canonical invariant `G17` runtime spelling is
-accepted, with identical binary64 bits and floating-point type required. For
+accepted, with identical binary64 bits required. JSON numbers with exactly equal
+normalized decimal identities admit integer/decimal formatting such as `90.0`
+to `90` and `0.0` to `0`; their PowerShell CLR types need not match. The explicitly
+integer-schema power timeout still refuses floating-point representations. For
 example, profile `1.68` and runtime `1.6799999999999999` are the same controlled
 eye height. This is not a tolerance: changed bits (including signed zero), type
-changes and arbitrary extra precision still refuse. The whole-document check
+changes to a non-number kind and arbitrary extra precision still refuse. The whole-document check
 uses that same admitted owned-leaf result; unowned values and additional keys
 retain strict raw-decimal, type, case and structure comparison. Numeric settings
 are restored from the baseline, not preserved as additional selected UI leaves.

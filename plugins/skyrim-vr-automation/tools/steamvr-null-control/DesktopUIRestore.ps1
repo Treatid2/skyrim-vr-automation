@@ -99,6 +99,17 @@ function Read-DesktopUIRestoreInput([string]$Path) {
 }
 
 function Test-DesktopUIRestoreControlledValueEquivalent($Expected, $Actual, $ExpectedExact, $ActualExact) {
+    # JSON has one number kind: 90.0 -> 90 and 0.0 -> 0 are formatting,
+    # not a CLR-type schema change. Establish exact decimal equality first;
+    # integer-only schemas (power timeout) are checked by the caller separately.
+    if (Test-DesktopUIRestoreValueEquivalent $ExpectedExact $ActualExact) {
+        if ($Expected -is [double] -or $Actual -is [double]) {
+            $expectedBitsValue = [double]$Expected; $actualBitsValue = [double]$Actual
+            return [double]::IsFinite($expectedBitsValue) -and [double]::IsFinite($actualBitsValue) -and
+                [BitConverter]::DoubleToInt64Bits($expectedBitsValue) -eq [BitConverter]::DoubleToInt64Bits($actualBitsValue)
+        }
+        return Test-DesktopUIRestoreValueEquivalent $Expected $Actual
+    }
     # Only a profile-owned floating leaf may use a runtime's canonical G17
     # binary64 spelling. This is not a tolerance or generic decimal coercion:
     # arbitrary extra precision (even hidden by Double parsing) still refuses.
@@ -106,7 +117,6 @@ function Test-DesktopUIRestoreControlledValueEquivalent($Expected, $Actual, $Exp
         if ($Expected -isnot [double] -or $Actual -isnot [double] -or
             -not [double]::IsFinite($Expected) -or -not [double]::IsFinite($Actual) -or
             [BitConverter]::DoubleToInt64Bits($Expected) -ne [BitConverter]::DoubleToInt64Bits($Actual)) { return $false }
-        if (Test-DesktopUIRestoreValueEquivalent $ExpectedExact $ActualExact) { return $true }
         $canonical = [Text.Json.JsonDocument]::Parse($Expected.ToString('G17', [Globalization.CultureInfo]::InvariantCulture))
         try { return Test-DesktopUIRestoreValueEquivalent (Get-DesktopUIRestoreExactValue $canonical.RootElement) $ActualExact }
         finally { $canonical.Dispose() }

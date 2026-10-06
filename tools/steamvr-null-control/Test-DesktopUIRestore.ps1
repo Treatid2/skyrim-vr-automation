@@ -69,6 +69,22 @@ try {
     $applied.dashboard.lastAccessedExternalOverlayKey='history'
     Write-Settings $applied
     $runtimeJson = Set-NumericLiteral ([IO.File]::ReadAllText($settings)) 'eyeHeightMeters' '1.6799999999999999'
+    # Exercise the complete real profile at once, not just the first refusal:
+    # SteamVR writes six integral-valued floating leaves as integer spellings.
+    foreach ($leaf in @('displayFrequency','positionX','positionZ','yawDegrees','pitchDegrees','rollDegrees')) {
+        $literal = if ($leaf -eq 'displayFrequency') { '90' } else { '0' }
+        $runtimeJson = Set-NumericLiteral $runtimeJson $leaf $literal
+    }
+    $controlledCount = 0
+    foreach ($section in @('steamvr','dashboard','driver_null','driver_codex_head_pose','TrackingOverrides','power')) {
+        $controlledCount += $profileValue[$section].Count
+    }
+    $runtimeValues = $runtimeJson | ConvertFrom-Json -AsHashtable
+    Assert-Test ($controlledCount -eq 29 -and $profileValue.driver_null.displayFrequency -is [double] -and
+        $runtimeValues.driver_null.displayFrequency -is [long] -and
+        @('positionX','positionZ','yawDegrees','pitchDegrees','rollDegrees').Where({
+            $profileValue.driver_codex_head_pose[$_] -is [double] -and $runtimeValues.driver_codex_head_pose[$_] -is [long]
+        }).Count -eq 5) 'full29 owned-leaf fixture includes all six realistic integral-number runtime spellings together'
     [IO.File]::WriteAllText($settings, $runtimeJson, [Text.UTF8Encoding]::new($false))
     $profileEye = $profileValue.driver_codex_head_pose.eyeHeightMeters
     $runtimeEye = ($runtimeJson | ConvertFrom-Json -AsHashtable).driver_codex_head_pose.eyeHeightMeters
@@ -120,7 +136,9 @@ try {
         @{key='eyeHeightMeters';literal='1.68000000000000001';name='noncanonical controlled decimal hidden by Double parsing'}
         @{key='positionX';literal='-0.0';name='controlled signed-zero bit change'}
         @{key='unownedFloat';literal='1.6799999999999999';name='unowned canonical binary64 reserialization'}
-        @{key='displayFrequency';literal='90';name='controlled floating leaf changed to integer type'}
+        @{key='displayFrequency';literal='"90"';name='controlled JSON number replaced by string'}
+        @{key='displayFrequency';literal='false';name='controlled JSON number replaced by Boolean'}
+        @{key='displayFrequency';literal='null';name='controlled JSON number replaced by null'}
     )) {
         [IO.File]::WriteAllText($settings, (Set-NumericLiteral $raw $numericCase.key $numericCase.literal))
         Assert-Refusal ('refuses ' + $numericCase.name)
