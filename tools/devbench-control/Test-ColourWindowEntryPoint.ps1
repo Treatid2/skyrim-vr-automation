@@ -87,7 +87,7 @@ foreach($mode in $modes){
                             }else{
                                 try{
                                     $map=$query|ConvertTo-Json -Depth 30|ConvertFrom-Json -AsHashtable -Depth 30
-                                    $reply=& $fixture.Call $name $map ($query.action -cin @('set','arm','reset')) ([datetime]::UtcNow.AddSeconds(30));$payload=$reply.content[0]
+                                    $reply=& $fixture.Call $name $map ($map.ContainsKey('action') -and $map.action -cin @('set','arm','reset')) ([datetime]::UtcNow.AddSeconds(30));$payload=$reply.content[0]
                                     if($Mode -ceq 'foreign-cell' -and $name -ceq 'communityshaders.colour_pipeline_probe' -and $query.action -ceq 'arm'){$armCount++}
                                     if($Mode -ceq 'session-retired'){
                                         if($name -ceq 'communityshaders.colour_pipeline_probe' -and $query.action -ceq 'arm'){$armCount++}
