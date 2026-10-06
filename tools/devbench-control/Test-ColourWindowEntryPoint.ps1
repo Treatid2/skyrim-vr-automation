@@ -12,7 +12,7 @@ foreach($mode in $modes){
     $dir=Join-Path $root $mode;New-Item -ItemType Directory -Path $dir|Out-Null
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0);$listener.Start();$port=$listener.LocalEndpoint.Port
     $events=[Collections.Concurrent.ConcurrentQueue[object]]::new()
-    $server=Start-ThreadJob -ArgumentList $listener,$mode,$PSScriptRoot,$events,$PID,$port,[bool]$FixedAutoExposure -ScriptBlock {
+    $server=Start-ThreadJob -ArgumentList $listener,$mode,$PSScriptRoot,$events,$PID,$port,([bool]$FixedAutoExposure) -ScriptBlock {
         param($Listener,$Mode,$Source,$Events,$OwnerPid,$Port,$Baseline)
         $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
         $fixture=. (Join-Path $Source $(if($Baseline){'Test-FixedAEColourBaseline.ps1'}else{'Test-ColourMeasurementWindow.ps1'})) -FixtureOnly -FixtureMode $Mode
