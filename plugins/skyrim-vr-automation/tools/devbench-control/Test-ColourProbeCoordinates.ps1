@@ -13,6 +13,26 @@ $example=& ([scriptblock]::Create($matchesFound[0].Groups[1].Value))
 Check ($example.stagingByteOffset -eq 0) 'Right-eye first local pixel addresses staging origin'
 Check ($example.absoluteSourcePixel[0] -eq 1512 -and $example.absoluteSourcePixel[1] -eq 0) 'Absolute report adds source origin'
 Check ($example.sourcePixel[0] -eq 0 -and $example.sourcePixel[1] -eq 0) 'Original local coordinates preserved'
+Check (@($example.page.stages).Count -eq 1) 'Marked example selects exactly one native-shaped stage'
+Check ($example.page.PSObject.Properties.Name -notcontains 'source') 'Native page has no synthetic source wrapper'
+$nativePage = @'
+{"stages":[{"activeRectangle":{"x":1512,"y":64,"width":1512,"height":1680},"readback":{"sampling":{"samples":[{"sourcePixel":[16,3]}]}}}]}
+'@ | ConvertFrom-Json
+$before = $nativePage | ConvertTo-Json -Depth 10 -Compress
+Check (@($nativePage.stages).Count -eq 1) 'Native-shaped fixture has one selected stage'
+$stage = $nativePage.stages[0]
+Check ($stage.PSObject.Properties.Name -contains 'activeRectangle') 'Rectangle belongs directly to selected stage'
+Check ($nativePage.PSObject.Properties.Name -notcontains 'source' -and $stage.PSObject.Properties.Name -notcontains 'source') 'Neither page nor stage requires source.activeRectangle'
+$rectangle = $stage.activeRectangle
+$sample = $stage.readback.sampling.samples[0]
+$localX = [uint64]$sample.sourcePixel[0]; $localY = [uint64]$sample.sourcePixel[1]
+Check ($localX -lt $rectangle.width -and $localY -lt $rectangle.height) 'Same-stage sample is within local crop'
+$offset = $localY * [uint64]12288 + $localX * [uint64]8
+$absolute = @(($rectangle.x + $localX), ($rectangle.y + $localY))
+Check ($offset -eq 36992) 'Native-shaped sample uses padded staging offset, not origin'
+Check ($absolute[0] -eq 1528 -and $absolute[1] -eq 67) 'Native-shaped absolute report adds both stage origins'
+Check (($nativePage | ConvertTo-Json -Depth 10 -Compress) -ceq $before) 'Native-shaped evidence is unchanged by reporting'
+Check ($guide -match 'stages\[0\]\.activeRectangle' -and $guide -match 'readback\.sampling\.samples\[\]\.sourcePixel') 'Guide names exact same-stage native paths'
 $cases=@(
     @{origin=@(0,0);local=@(0,0);pitch=128;bpp=4;expectedOffset=0;absolute=@(0,0);width=32;height=8},
     @{origin=@(1512,0);local=@(0,0);pitch=12288;bpp=8;expectedOffset=0;absolute=@(1512,0);width=1512;height=1680},
