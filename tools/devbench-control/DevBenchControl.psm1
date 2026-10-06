@@ -546,6 +546,7 @@ function Test-DevBenchReadOnlyRequest {
         [Parameter(Mandatory)][Collections.IDictionary]$Arguments
     )
 
+    if ($ToolName -ceq 'console') { return @(Get-DevBenchConsoleReadRequestReasons $Arguments).Count -eq 0 }
     if ($ToolName -ceq 'communityshaders.shader_api') { return Test-DevBenchShaderSnapshotRequest -Arguments $Arguments }
     $action = if ($Arguments.Contains('action')) { [string]$Arguments['action'] } else { '' }
     $kind = if ($Arguments.Contains('kind')) { [string]$Arguments['kind'] } else { '' }
@@ -633,6 +634,9 @@ function Get-DevBenchCallSemanticStatus {
 
     if ($ToolName -ceq 'console' -and $Arguments.Contains('action') -and $Arguments.action -is [string] -and $Arguments.action -ceq 'exec' -and $Arguments.Contains('capture') -and ($Arguments.capture -isnot [bool] -or $Arguments.capture)) {
         return Get-DevBenchConsoleExecutionStatus -Arguments $Arguments -Content $Content
+    }
+    if ($ToolName -ceq 'console' -and $Arguments.Contains('action') -and $Arguments.action -is [string] -and $Arguments.action -ceq 'read') {
+        return Get-DevBenchConsoleReadStatus -Arguments $Arguments -Content $Content
     }
     if ($ToolName -ceq 'communityshaders.shader_api' -and $Arguments.Contains('action') -and $Arguments.action -ceq 'snapshot') {
         $health=Get-DevBenchShaderCompilerHealth -Arguments $Arguments -Content $Content

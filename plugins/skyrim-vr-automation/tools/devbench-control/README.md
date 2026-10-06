@@ -1,5 +1,9 @@
 # DevBench Control
 
+For captured-exec window IDs, immutable guarded reads and loss/truncation
+admission, see [CONSOLE-WINDOWS.md](CONSOLE-WINDOWS.md). This qualifies evidence,
+not the command's desired game effect; never replay an uncertain capture.
+
 ## Fixed-AE temporal baseline
 
 Use `colour-baseline-window` for the narrowly typed, single-condition 1..16
