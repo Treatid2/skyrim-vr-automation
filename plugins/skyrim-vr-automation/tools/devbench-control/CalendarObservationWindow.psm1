@@ -62,6 +62,7 @@ function Invoke-DevBenchCalendarWindow {
           [Parameter(Mandatory)][string]$Owner,
           [AllowEmptyCollection()][array]$Observations=@(),
           [Collections.IDictionary]$ColourPlan,
+          [switch]$FixedAutoExposure,
           [scriptblock]$CompilerGuard,
           [ValidateRange(1,300000)][int]$HoldMilliseconds=60000,
           [Parameter(Mandatory)][datetime]$DeadlineUtc,
@@ -93,10 +94,16 @@ function Invoke-DevBenchCalendarWindow {
         return $Data.content[0]
     }
     try {
+        if($FixedAutoExposure -and $null -eq $ColourPlan){throw 'Fixed-AE baseline requires its exact typed colour plan.'}
         if ([string]::IsNullOrWhiteSpace($Owner) -or $Owner.Length -gt 128) { throw 'Calendar owner is required.' }
         if ($null -ne $ColourPlan) {
-            Assert-ColourMeasurementPlan $ColourPlan
+            Assert-ColourMeasurementPlan $ColourPlan -FixedAutoExposure:$FixedAutoExposure
             if($Observations.Count -ne 0 -or $null -eq $CompilerGuard){throw 'Typed colour workflow cannot mix generic observations or omit compiler admission.'}
+            if($FixedAutoExposure){
+                if(($DeadlineUtc-[datetime]::UtcNow).TotalSeconds -gt 180){throw 'Fixed-AE baseline total budget cannot exceed180 seconds.'}
+                $minimum=$ColourPlan.burnIn.minimumElapsedMilliseconds+([decimal]$ColourPlan.capturesPerCondition-1)*$ColourPlan.minimumElapsedMillisecondsBetweenCaptureArms
+                if($HoldMilliseconds -lt ($DeadlineUtc-[datetime]::UtcNow).TotalMilliseconds -or $minimum+1000 -ge ($workDeadline-[datetime]::UtcNow).TotalMilliseconds){throw 'Fixed-AE baseline declared minimum coverage cannot fit original hold/work/cleanup budget; no hold dispatched.'}
+            }
         } elseif($Observations.Count -lt 1 -or $Observations.Count -gt 16){throw 'Calendar finite1..16 observations are required.'}
         foreach($item in $Observations) {
             if($item -isnot [Collections.IDictionary] -or -not $item.Contains('tool') -or -not $item.Contains('arguments') -or $item.tool -isnot [string] -or $item.arguments -isnot [Collections.IDictionary] -or $item.tool -ceq 'calendar' -or -not (Test-DevBenchReadOnlyRequest -ToolName $item.tool -Arguments $item.arguments)) { throw 'Calendar composition rejects intrusive or unsupported observations.' }
@@ -114,10 +121,11 @@ function Invoke-DevBenchCalendarWindow {
         Assert-CalendarReadback $held
         if (-not (Test-CalendarBindingEqual $held.binding $binding) -or $held.status -cne 'held' -or -not $held.holdValid -or -not $held.outstanding -or -not $held.leaseActive -or $held.expiryDue -or $held.cleanupPending -or $held.values.calendarRate -ne 0) { throw 'Calendar hold was not currently valid.' }
         if($null -ne $ColourPlan){
-            $measurement=Invoke-DevBenchColourMeasurement -Plan $ColourPlan -DeadlineUtc $workDeadline -CompilerGuard $CompilerGuard -CleanupDeadlineUtc $DeadlineUtc.AddSeconds(-5) -CleanupCall {
+            $measurement=Invoke-DevBenchColourMeasurement -Plan $ColourPlan -FixedAutoExposure:$FixedAutoExposure -DeadlineUtc $workDeadline -CompilerGuard $CompilerGuard -CleanupDeadlineUtc $DeadlineUtc.AddSeconds(-5) -CleanupCall {
                 param($name,$argsMap,$mutation,$bound)
                 $probeCleanup=$name -ceq 'communityshaders.colour_pipeline_probe' -and $argsMap.action -cin @('status','reset')
                 $colourCleanup=$name -ceq 'communityshaders.fsr_color_contract' -and $argsMap.action -cin @('status','set') -and ($ColourPlan.Contains('burnIn') -or $ColourPlan.Contains('minimumElapsedMillisecondsBetweenCaptureArms'))
+                if($FixedAutoExposure -and $name -ceq 'communityshaders.fsr_color_contract' -and $argsMap.action -cne 'status'){throw 'Fixed-AE baseline cleanup forbids all colour writes.'}
                 if(-not $probeCleanup -and -not $colourCleanup){throw 'Cleanup accepts only owned probe status/reset or explicitly timed-workflow AE restoration.'}
                 if($colourCleanup){
                     # Restore only within the original held scene/session; cell or
@@ -137,6 +145,7 @@ function Invoke-DevBenchCalendarWindow {
                 return $cleanupReply
             } -Call {
                 param($name,$argsMap,$mutation,$bound)
+                if($FixedAutoExposure -and $name -ceq 'communityshaders.fsr_color_contract' -and ($argsMap.action -cne 'status' -or $mutation)){throw 'Fixed-AE baseline permits only non-mutating colour status.'}
                 foreach($side in @('before','after')){
                     if($side -ceq 'after'){$response=Invoke-WindowCall $name $argsMap $mutation $bound}
                     $current=Get-CalendarPayload (Invoke-WindowCall calendar @{action='status'} $false $bound)
