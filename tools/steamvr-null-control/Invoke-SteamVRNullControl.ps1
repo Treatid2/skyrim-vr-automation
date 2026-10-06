@@ -41,11 +41,16 @@ param(
 
     [switch]$WhatIf,
 
+    [switch]$PreserveDesktopUIWindowState,
+
+    [ValidatePattern('^[A-Fa-f0-9]{64}$')]
+    [string]$ExpectedCurrentSettingsSha256,
+
     [switch]$Force,
 
     [switch]$AllowExternalDisplayRedirector,
 
-    [ValidateSet('', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'head-pose-access-denied', 'head-pose-access-denied-after-start', 'runtime-ready', 'runtime-early-post-launch-failure', 'runtime-early-post-launch-cleanup-crosses-deadline', 'runtime-early-post-launch-cleanup-crosses-deadline-failure', 'runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-confirmation-timeout-input-contract-failure', 'runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-final-admission-timeout-input-contract-failure', 'runtime-post-receipt-timeout', 'runtime-final-boundary-timeout-cleanup-unverified', 'runtime-final-boundary-timeout-cleanup-failure', 'runtime-input-contract-failure', 'runtime-accepted-receipt-stage-failure', 'runtime-accepted-receipt-publish-failure', 'runtime-accepted-receipt-publish-and-stage-cleanup-failure')]
+    [ValidateSet('', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'restore-source-drift-after-stage', 'head-pose-access-denied', 'head-pose-access-denied-after-start', 'runtime-ready', 'runtime-early-post-launch-failure', 'runtime-early-post-launch-cleanup-crosses-deadline', 'runtime-early-post-launch-cleanup-crosses-deadline-failure', 'runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-confirmation-timeout-input-contract-failure', 'runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-final-admission-timeout-input-contract-failure', 'runtime-post-receipt-timeout', 'runtime-final-boundary-timeout-cleanup-unverified', 'runtime-final-boundary-timeout-cleanup-failure', 'runtime-input-contract-failure', 'runtime-accepted-receipt-stage-failure', 'runtime-accepted-receipt-publish-failure', 'runtime-accepted-receipt-publish-and-stage-cleanup-failure')]
     [string]$InternalTestFailurePoint = '',
 
     [switch]$IsolateExternalDisplayRedirectors,
@@ -80,6 +85,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..\steamvr-head-pose-control\DriverPackageAuthority.ps1')
+. (Join-Path $PSScriptRoot 'DesktopUIRestore.ps1')
 
 if (-not ('SkyrimVRAutomation.Native.SharedPoseAtomics' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -1604,6 +1610,7 @@ $startupDeadlineUtc = $null
 $failureObservedUtc = $null
 $startupCleanupCompletedUtc = $null
 try {
+    if (($PreserveDesktopUIWindowState -or $ExpectedCurrentSettingsSha256) -and $Command -ne 'restore') { throw 'DesktopUI preservation options are restore-only.' }
     if ([string]::IsNullOrWhiteSpace($OpenVRPathsPath)) { throw 'OpenVRPathsPath is required to identify the complete live transaction target.' }
     $localApplicationData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
     if ([string]::IsNullOrWhiteSpace($localApplicationData)) { throw 'The Windows LocalApplicationData folder could not be resolved for target-owned transaction control.' }
@@ -2270,7 +2277,9 @@ try {
             $pendingRestore = $recoveredTransaction
             if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) { throw "Exact backup is missing: $backupPath" }
             if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) { throw "Apply receipt is missing: $receiptPath" }
+            $applyReceiptHash = Get-HashOrNull $receiptPath
             $receipt = Read-JsonHashtable -Path $receiptPath
+            if ((Get-HashOrNull $receiptPath) -cne $applyReceiptHash) { throw 'Apply receipt changed during restore admission.' }
             $backupHash = Get-HashOrNull $backupPath
             if ($backupHash -ne $receipt['settingsSha256Before']) { throw 'The exact backup hash does not match the apply receipt.' }
             if (-not $receipt.ContainsKey('settingsPath') -or [string]::IsNullOrWhiteSpace([string]$receipt['settingsPath'])) { throw 'The apply receipt does not identify its SteamVR settings path.' }
@@ -2279,10 +2288,39 @@ try {
             }
             if (-not $receipt.ContainsKey('settingsSha256Null') -or [string]::IsNullOrWhiteSpace([string]$receipt['settingsSha256Null'])) { throw 'The apply receipt does not identify the applied SteamVR settings hash.' }
             $settingsLiveHash = Get-HashOrNull $SettingsPath
-            $restoreAlreadyCommitted = $null -ne $pendingRestore -and [string]$pendingRestore['phase'] -eq 'committed' -and $settingsLiveHash -eq $backupHash
+            $restoreSelection = $null
+            $expectedRestoredHash = $backupHash
+            if ($null -ne $pendingRestore -and [string]$pendingRestore['operation'] -eq 'restore' -and [string]$pendingRestore['phase'] -eq 'committed') {
+                if ([string]$pendingRestore['applyTransactionId'] -cne [string]$receipt['transactionId']) { throw 'Committed restore does not belong to this apply receipt.' }
+                if (Test-JsonDictionaryContains $pendingRestore 'settingsRestoreSelection') {
+                    $restoreSelection = $pendingRestore['settingsRestoreSelection']
+                    if ($restoreSelection['policy'] -ceq 'baseline-plus-exact-desktopui-strings') {
+                        $settingsTarget = @($pendingRestore['rollbackTargets'] | Where-Object { $_['name'] -ceq 'steamvr-settings' })
+                        if ($settingsTarget.Count -ne 1) { throw 'Committed DesktopUI restore has no exact settings preimage.' }
+                        Assert-CommittedDesktopUIRestoreSelection $restoreSelection $receipt $backupPath ([string]$settingsTarget[0]['backupPath'])
+                        if ([string]$restoreSelection['applyReceiptSha256'] -cne (Get-HashOrNull $receiptPath)) { throw 'Committed DesktopUI restore apply receipt changed.' }
+                        $expectedRestoredHash = [string]$restoreSelection['resultSha256']
+                    }
+                    elseif ($restoreSelection['policy'] -cne 'exact-backup') { throw 'Unknown committed settings restore policy.' }
+                }
+            }
+            $restoreAlreadyCommitted = $null -ne $pendingRestore -and [string]$pendingRestore['operation'] -eq 'restore' -and [string]$pendingRestore['phase'] -eq 'committed' -and $settingsLiveHash -eq $expectedRestoredHash
+            $preservationPlan = $null
             $settingsValidation = $null
             if (-not $restoreAlreadyCommitted) {
-                $settingsValidation = Get-SettingsRestoreValidation -Receipt $receipt -BackupPath $backupPath -CurrentPath $SettingsPath
+                if ($PreserveDesktopUIWindowState) {
+                    $preservationPlan = Get-DesktopUISettingsRestorePlan $receipt $backupPath $SettingsPath
+                    $settingsValidation = $preservationPlan.validation
+                    $restoreSelection = $preservationPlan.selection
+                    $expectedRestoredHash = [string]$restoreSelection['resultSha256']
+                    if (-not $WhatIf -and [string]::IsNullOrWhiteSpace($ExpectedCurrentSettingsSha256)) { throw 'DesktopUI preservation commit requires -ExpectedCurrentSettingsSha256 from the admitted preview.' }
+                }
+                else {
+                    $settingsValidation = Get-SettingsRestoreValidation -Receipt $receipt -BackupPath $backupPath -CurrentPath $SettingsPath
+                    $restoreSelection = [ordered]@{ schemaVersion = 1; policy = 'exact-backup'; baselineSha256 = $backupHash; preimageSha256 = $settingsLiveHash; resultSha256 = $backupHash; resultPath = $backupPath; applyTransactionId = [string]$receipt['transactionId'] }
+                }
+                if ($settingsValidation.currentSha256 -cne $settingsLiveHash -or
+                    ($ExpectedCurrentSettingsSha256 -and $ExpectedCurrentSettingsSha256 -ine $settingsLiveHash)) { throw 'SteamVR settings current hash changed or differs from the admitted preview; refusing restore.' }
                 if (-not [bool]$settingsValidation.authorized) {
                     $details = @($settingsValidation.controlledDifferences + $settingsValidation.unclassifiedDifferencePaths | Select-Object -Unique)
                     throw "SteamVR settings changed after apply outside the authorized runtime-managed contract; refusing to overwrite drift: $($details -join ', ')"
@@ -2314,16 +2352,17 @@ try {
             }
             if ($restoreAlreadyCommitted) {
                 $result = New-Result -Ok $true -State 'already-restored' -Data @{
-                    settingsPath = $SettingsPath; restoredSha256 = $settingsLiveHash; backupPath = $backupPath; backupRetained = $true
+                    settingsPath = $SettingsPath; restoredSha256 = $settingsLiveHash; backupPath = $backupPath; backupRetained = $true; settingsRestoreSelection = $restoreSelection
                     externalDriverIsolation = $isolation; openVRPathsRestoredSha256 = if ($restoreExternalDrivers) { Get-HashOrNull $OpenVRPathsPath } else { $null }
                     settingsRestoreValidation = $settingsValidation; externalDriverIsolationValidation = $isolationValidation; restoreJournalPath = $authoritativeJournalPath; evidenceJournalPath = $restoreJournalPath; targetControl = $targetControl
                 }
             }
             if ($WhatIf) {
                 $result = New-Result -Ok $true -State 'dry-run' -Data @{
-                    wouldRestore = $backupPath
+                    wouldRestore = if ($restoreSelection -and $restoreSelection['policy'] -ceq 'baseline-plus-exact-desktopui-strings') { 'receipt-bound-baseline-plus-exact-desktopui-strings' } else { $backupPath }
                     settingsPath = $SettingsPath
-                    expectedSha256 = $backupHash
+                    expectedSha256 = $expectedRestoredHash
+                    settingsRestoreSelection = $restoreSelection
                     backupRetained = $true
                     settingsRestoreValidation = $settingsValidation
                     externalDriverIsolation = $isolation
@@ -2335,6 +2374,22 @@ try {
                 $transactionId = [guid]::NewGuid().ToString('N')
                 $settingsRollbackPath = Join-Path $EvidenceDirectory ("steamvr.vrsettings.applied.$transactionId")
                 Copy-Item -LiteralPath $SettingsPath -Destination $settingsRollbackPath
+                if ((Get-HashOrNull $settingsRollbackPath) -cne $settingsLiveHash) { throw 'Settings rollback preimage changed during capture; refusing restore.' }
+                if ($PreserveDesktopUIWindowState) {
+                    $verifiedPlan = Get-DesktopUISettingsRestorePlan $receipt $backupPath $settingsRollbackPath
+                    if ($verifiedPlan.selection.resultSha256 -cne $expectedRestoredHash) { throw 'DesktopUI selected result changed during preimage capture.' }
+                    $selectedResultPath = Join-Path $EvidenceDirectory ("steamvr.vrsettings.restore-result.$transactionId")
+                    [IO.File]::WriteAllBytes($selectedResultPath, $verifiedPlan.bytes)
+                    $restoreSelection['resultPath'] = [IO.Path]::GetFullPath($selectedResultPath)
+                }
+                $restoreSelection['applyReceiptSha256'] = $applyReceiptHash
+                if ($InternalTestFailurePoint -eq 'restore-source-drift-after-stage') {
+                    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+                    if ([string]::IsNullOrWhiteSpace($env:CSX_STEAMVR_TRANSACTION_ROOT) -or -not [IO.Path]::GetFullPath($SettingsPath).StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Restore drift injection is temporary-fixture-only.' }
+                    [IO.File]::AppendAllText($SettingsPath, ' ')
+                }
+                if ((Get-HashOrNull $SettingsPath) -cne $settingsLiveHash -or (Get-HashOrNull $backupPath) -cne $backupHash -or (Get-HashOrNull $receiptPath) -cne $applyReceiptHash -or
+                    (Get-HashOrNull ([string]$restoreSelection['resultPath'])) -cne $expectedRestoredHash) { throw 'Restore source/current hash changed after staging; refusing dispatch.' }
                 $rollbackTargets = @([ordered]@{ name = 'steamvr-settings'; path = [IO.Path]::GetFullPath($SettingsPath); backupPath = $settingsRollbackPath; expectedHash = $settingsLiveHash })
                 if ($restoreExternalDrivers) {
                     $openVRRollbackPath = Join-Path $EvidenceDirectory ("openvrpaths.vrpath.isolated.$transactionId")
@@ -2346,23 +2401,27 @@ try {
                     applyTransactionId = [string]$receipt['transactionId']; settingsPath = [IO.Path]::GetFullPath($SettingsPath)
                     openVRPathsPath = if ($restoreExternalDrivers) { [IO.Path]::GetFullPath($OpenVRPathsPath) } else { $null }
                     evidenceDirectory = [IO.Path]::GetFullPath($EvidenceDirectory); evidenceJournalPath = [IO.Path]::GetFullPath($restoreJournalPath)
-                    rollbackTargets = $rollbackTargets; preparedUtc = [DateTime]::UtcNow.ToString('o'); rollback = $null
+                    rollbackTargets = $rollbackTargets; settingsRestoreSelection = $restoreSelection; preparedUtc = [DateTime]::UtcNow.ToString('o'); rollback = $null
                 }
                 Write-SteamVRTransactionJournal -AuthoritativePath $authoritativeJournalPath -Journal $journal
                 try {
-                    Copy-FileAtomic -Source $backupPath -Destination $SettingsPath
+                    if ($PreserveDesktopUIWindowState) {
+                        Copy-FileAtomicVerified -Source ([string]$restoreSelection['resultPath']) -Destination $SettingsPath -ExpectedSha256 $expectedRestoredHash
+                    }
+                    else { Copy-FileAtomic -Source $backupPath -Destination $SettingsPath }
                     $journal['phase'] = 'settings-restored-uncommitted'; Write-SteamVRTransactionJournal -AuthoritativePath $authoritativeJournalPath -Journal $journal
                     if ($InternalTestFailurePoint -eq 'restore-after-settings') { throw 'Injected restore failure after settings restoration.' }
                     if ($restoreExternalDrivers) { Copy-FileAtomic -Source $openVRPathsBackupPath -Destination $OpenVRPathsPath }
                     $journal['phase'] = 'all-targets-restored-uncommitted'; Write-SteamVRTransactionJournal -AuthoritativePath $authoritativeJournalPath -Journal $journal
                     $restoredHash = Get-HashOrNull $SettingsPath
-                    if ($restoredHash -ne $backupHash) { throw 'Restored SteamVR settings hash does not match the exact backup.' }
+                    if ($restoredHash -cne $expectedRestoredHash) { throw 'Restored SteamVR settings hash does not match the selected restore result.' }
                     if ($restoreExternalDrivers -and (Get-HashOrNull $OpenVRPathsPath) -ne [string]$isolation['sha256Before']) { throw 'Restored OpenVR registration hash does not match the exact backup.' }
                     $restoreReceiptPath = Join-Path $EvidenceDirectory ("steamvr-null-restore.$transactionId.receipt.json")
                     Write-JsonAtomic -Path $restoreReceiptPath -Value ([ordered]@{
                         schemaVersion = 1; operation = 'restore'; transactionId = $transactionId; applyTransactionId = [string]$receipt['transactionId']
                         settingsPath = [IO.Path]::GetFullPath($SettingsPath); settingsSha256Restored = $restoredHash
                         settingsRestoreValidation = $settingsValidation
+                        settingsRestoreSelection = $restoreSelection
                         openVRPathsPath = if ($restoreExternalDrivers) { [IO.Path]::GetFullPath($OpenVRPathsPath) } else { $null }
                         openVRPathsSha256Restored = if ($restoreExternalDrivers) { Get-HashOrNull $OpenVRPathsPath } else { $null }; restoredUtc = [DateTime]::UtcNow.ToString('o')
                     })
@@ -2375,7 +2434,7 @@ try {
                     throw "Null-HMD restore failed; the exact applied state was restored and verified. $failure"
                 }
                 $result = New-Result -Ok $true -State 'restored' -Data @{
-                    settingsPath = $SettingsPath; restoredSha256 = $restoredHash; backupPath = $backupPath; backupRetained = $true
+                    settingsPath = $SettingsPath; restoredSha256 = $restoredHash; backupPath = $backupPath; backupRetained = $true; settingsRestoreSelection = $restoreSelection
                     externalDriverIsolation = $isolation; openVRPathsRestoredSha256 = if ($restoreExternalDrivers) { Get-HashOrNull $OpenVRPathsPath } else { $null }
                     settingsRestoreValidation = $settingsValidation; externalDriverIsolationValidation = $isolationValidation; restoreJournalPath = $authoritativeJournalPath; evidenceJournalPath = $restoreJournalPath; restoreReceiptPath = $restoreReceiptPath; targetControl = $targetControl
                 }

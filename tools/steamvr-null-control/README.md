@@ -216,6 +216,59 @@ prove an application bypassing SteamVR is attached to it.
 
 Run `Test-SteamVRNullControl.ps1` after changing the control contract.
 
+## Explicit preservation of two DesktopUI strings
+
+Ordinary restore still restores the exact original backup and refuses unrelated
+drift. Only when the human has selected narrow preservation, use
+`restore -PreserveDesktopUIWindowState`. This preserves exactly the present,
+actual, exact-case, string-valued `DesktopUI.pairing` and
+`DesktopUI.settings_desktop` leaves; it does not interpret their contents or
+whitelist the whole DesktopUI section. Both leaves must also be present strings
+in the receipt-bound baseline. Missing/malformed sections/leaves, dotted-key
+aliases, case changes, controlled-key changes and any other unclassified drift
+are refused. Existing runtime-managed GpuSpeed/LastKnown and typed dashboard
+history differences are admitted but restored from the baseline, not preserved.
+
+Preview first with the original apply evidence directory, while SteamVR is
+closed. Require `ok=true`, `state=dry-run`, and the expected preservation policy.
+Commit requires the exact SHA-256 returned by this preview; do not automatically
+accept a changed hash by recomputing it after refusal.
+
+```powershell
+# All existing exact path, closed-runtime and evidence-ownership gates remain.
+.\Invoke-SteamVRNullControl.ps1 restore -EvidenceDirectory <original-apply-evidence> -PreserveDesktopUIWindowState -WhatIf -Compact
+.\Invoke-SteamVRNullControl.ps1 restore -EvidenceDirectory <same-original-apply-evidence> -PreserveDesktopUIWindowState -ExpectedCurrentSettingsSha256 <preview-data.settingsRestoreSelection.preimageSha256> -Compact
+```
+
+`settingsRestoreSelection` schema 1 has policy
+`baseline-plus-exact-desktopui-strings`, apply transaction identity, exact
+baseline/preimage/result hashes and the two `preservedStrings`. A committed
+selection additionally retains its distinct `resultPath` and immutable apply
+receipt digest. `expectedSha256` in preview and `restoredSha256` on success
+identify this selected result, **not** the original whole-file backup.
+The new restore receipt and target-owned journal retain this selection; the old
+apply receipt/profile/backup are never rewritten. All settings input parsing
+for this option is bounded to 1 MiB with duplicate keys refused.
+Untouched baseline values are copied as raw JSON, including full-precision
+numbers. Drift comparison uses exact decimal coefficient/exponent identities
+from the current raw JSON, so changes hidden by floating-point parsing refuse.
+
+Staging verifies the accepted preimage and selected result hashes again before
+dispatch. Failure after mutation rolls back to the exact accepted live bytes,
+including those UI strings. Interrupted operations use the existing target-owned
+journal recovery. A repeat after a committed preservation restore recognizes
+only the exact recorded result after reconstructing the selection from the
+retained baseline and validated preimage; it never adopts new live UI drift.
+Omitting the option on that repeat does not silently revert a completed selection.
+A changed result/preimage/receipt/profile or selection refuses. This is a bounded
+cooperative-controller transaction, not protection against a hostile same-user
+writer racing the final filesystem replacement.
+
+Run `Test-DesktopUIRestore.ps1` as well as `Test-SteamVRNullControl.ps1` after
+changing this contract. Both use temporary fixtures; passing them is source
+qualification, not live SteamVR or in-game qualification. Auto-Tools owns shared
+recovery/known-state handoff; caller experiment environments remain retained.
+
 Runtime startup and every application-facing probe also require the exact
 owned `HeadPoseDriverRoot` and committed schema-3 installation custody described
 in the head-pose README. Exactly one canonical registration and one same-name

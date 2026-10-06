@@ -58,6 +58,12 @@ particular drive letter for the plugin itself.
    requested, also require a conflict-free inventory and a receipt containing
    the exact registration and manifest hashes. After `restore`, require both
    the settings and OpenVR registration hashes to match their exact backups.
+   Exception only for an explicitly human-selected two-leaf preservation:
+   follow the README's `-PreserveDesktopUIWindowState` preview/commit contract,
+   pass its exact preimage `-ExpectedCurrentSettingsSha256`, and require the
+   settings hash to match the recorded selected result rather than claiming
+   whole-file backup restoration. OpenVR still restores its exact backup.
+   Never use this as a general drift bypass or repeat caller cleanup.
 7. Require `headPoseProvider.state` to be `ready` and independently run the
    head-pose controller's `qualify -RequireControllers` command. Qualification requires both the
    driver's shared-memory acknowledgement and a valid standing HMD pose seen
