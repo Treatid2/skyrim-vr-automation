@@ -19,7 +19,9 @@ foreach($mode in $modes){
     $server=Start-ThreadJob -ArgumentList $listener,$mode,$PSScriptRoot,$events,$PID,$port,([bool]$FixedAutoExposure),([bool]$CaptureReadBrackets) -ScriptBlock {
         param($Listener,$Mode,$Source,$Events,$OwnerPid,$Port,$Baseline,$Brackets)
         $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
+        $requestedPublicFixtureMode=$Mode
         $fixture=. (Join-Path $Source $(if($Brackets){'Test-CaptureReadBrackets.ps1'}elseif($Baseline){'Test-FixedAEColourBaseline.ps1'}else{'Test-ColourMeasurementWindow.ps1'})) -FixtureOnly -FixtureMode $Mode
+        $Mode=$requestedPublicFixtureMode
         $binding=[pscustomobject]@{processSession='colour-calendar-fixture';pid=$OwnerPid;loadGeneration=1;cellFormId=7;globalFormIds=@(1,2,3,4,5,6)}
         $values=[pscustomobject]@{year=201;month=1;day=1;gameHour=12;daysPassed=1;calendarRate=20;engineMultiplier=1}
         $lease=$null;$restored=$false
