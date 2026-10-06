@@ -10,9 +10,12 @@ capture runner or calibration service. It applies to CSX source
 
 Each stage/eye copies its source rectangle into a staging texture whose size is
 the crop width/height. The destination copy starts at staging coordinate (0,0).
-The native `samples[].sourcePixel` pair is local to this mapped staging crop,
-despite the field name. `source.activeRectangle` separately retains the original
-source texture's x/y origin and crop dimensions.
+Each current page contains one selected stage in `stages[0]`. That stage's
+`readback.sampling.samples[].sourcePixel` pair is local to this mapped staging
+crop, despite the field name. The same stage's `activeRectangle`
+(`stages[0].activeRectangle`) separately retains the original source texture's
+x/y origin and crop dimensions. There is no native `source` wrapper; do not
+introduce one into retained evidence.
 
 For a retained sample with local coordinates (localX, localY):
 
@@ -47,8 +50,20 @@ size, not a claim about the live right-eye format or its RowPitch:
 
 <!-- coordinate-example -->
 ```powershell
-$rectangle = @{ x = 1512; y = 0; width = 1512; height = 1680 }
-$sample = @{ sourcePixel = @(0, 0) }
+$page = [pscustomobject]@{
+    stages = @([pscustomobject]@{
+        activeRectangle = [pscustomobject]@{ x = 1512; y = 0; width = 1512; height = 1680 }
+        readback = [pscustomobject]@{
+            sampling = [pscustomobject]@{
+                samples = @([pscustomobject]@{ sourcePixel = @(0, 0) })
+            }
+        }
+    })
+}
+if (@($page.stages).Count -ne 1) { throw 'Expected one selected stage.' }
+$stage = $page.stages[0]
+$rectangle = $stage.activeRectangle
+$sample = $stage.readback.sampling.samples[0]
 $bytesPerPixel = [uint64]8
 $rowPitch = [uint64]12288 # synthetic: 12096 payload bytes plus padding
 $localX = [uint64]$sample.sourcePixel[0]
@@ -65,11 +80,13 @@ if ($stagingByteOffset -ne 0 -or $absoluteSourcePixel[0] -ne 1512) {
     stagingByteOffset = $stagingByteOffset
     absoluteSourcePixel = $absoluteSourcePixel
     sourcePixel = $sample.sourcePixel # original retained pair, unchanged
+    page = $page # minimal native-shaped fixture, not a live capture receipt
 }
 ```
 
 `Test-ColourProbeCoordinates.ps1` executes this repository-owned example and
-checks additional synthetic nonzero-row, padded-stride and nonzero-origin cases.
+checks the native page hierarchy and additional synthetic nonzero-row,
+padded-stride and nonzero-origin cases.
 It does not call DevBench, reopen capture scratch or rerun a native capture.
 
 ## Source and qualification limits
