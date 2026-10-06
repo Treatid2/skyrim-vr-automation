@@ -1,0 +1,198 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$FixtureRoot)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$passes = [Collections.Generic.List[string]]::new()
+function Assert-Semantic([bool]$Condition,[string]$Name) { if (-not $Condition) { throw "FAIL: $Name" }; $passes.Add($Name) }
+$entry = Join-Path $PSScriptRoot 'Invoke-SteamVRNullControl.ps1'
+$parseErrors = $null; $tokens = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($entry,[ref]$tokens,[ref]$parseErrors)
+Assert-Semantic (@($parseErrors).Count -eq 0) 'entry point parses without errors'
+foreach ($name in @('ConvertTo-CanonicalJsonValue','Get-JsonSemanticSha256','Test-JsonDictionaryContains','Get-JsonNumberIdentity','Test-JsonValueEquivalent','Get-JsonDifferencePaths','Get-SettingsRestoreValidation','Get-MO2ProviderInventoryEvidence','Assert-MO2NullAdmissionMatchesReceipt','Get-EffectiveState')) {
+    $node = @($ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true))[0]
+    Invoke-Expression $node.Extent.Text
+}
+function Clone-Value($Value) { return $Value | ConvertTo-Json -Depth 64 -Compress | ConvertFrom-Json -AsHashtable -Depth 64 }
+foreach ($pair in @(@($false,0),@($true,1),@(0,$false),@(1,$true),@('0',0),@(0,'0'),@($null,0),@(0,$null),@($false,'False'),@('False',$false))) {
+    Assert-Semantic (-not (Test-JsonValueEquivalent $pair[0] $pair[1])) 'different JSON scalar kinds never compare equal'
+}
+Assert-Semantic (Test-JsonValueEquivalent $false $false) 'identical Boolean values compare equal'
+Assert-Semantic (Test-JsonValueEquivalent ([int32]1) ([int64]1)) 'integer width alone is not JSON drift'
+foreach ($pair in @(@(1,1.0),@(90.0,90),@(0.0,0),@([decimal]0.100,[double]0.1),@([double]1e3,1000),@([double]1e-10,[decimal]0.0000000001),@(-90,-90.0),@([double]::NegativeZero,0))) {
+    Assert-Semantic (Test-JsonValueEquivalent $pair[0] $pair[1]) 'equal JSON numeric values qualify across exact representations'
+    Assert-Semantic (Test-JsonValueEquivalent $pair[1] $pair[0]) 'numeric equivalence is symmetric'
+}
+foreach ($pair in @(@(90.0,91),@(0.0,0.0001),@([double]1e-10,[double]1e-11),@(-90,90),@([decimal]9007199254740993,[double]9007199254740992),@([double]::NaN,[double]::NaN),@([double]::PositiveInfinity,[double]::PositiveInfinity),@(90.0,'90'),@(0.0,$false))) {
+    Assert-Semantic (-not (Test-JsonValueEquivalent $pair[0] $pair[1])) 'different values or nonnumeric/nonfinite kinds never qualify'
+}
+Assert-Semantic (-not (Test-JsonValueEquivalent ([long]9007199254740993) ([double]9007199254740992))) 'numeric comparison cannot round a large integer into equality'
+$effectiveProfile = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../../profiles/steamvr-null.profile.json') -Raw | ConvertFrom-Json -AsHashtable
+Assert-Semantic (Get-EffectiveState (Clone-Value $effectiveProfile) $effectiveProfile).active 'production effective-state function admits its exact typed profile'
+$trackingKey = @($effectiveProfile.TrackingOverrides.Keys)[0]
+foreach ($case in @(
+    @{section='dashboard';key='enableDashboard';value=0},
+    @{section='steamvr';key='requireHmd';value='False'},
+    @{section='driver_null';key='enable';value=1},
+    @{section='driver_codex_head_pose';key='enable';value=1},
+    @{section='driver_null';key='displayFrequency';value='90'},
+    @{section='driver_codex_head_pose';key='positionX';value=$false},
+    @{section='steamvr';key='forcedDriver';value='NULL'},
+    @{section='TrackingOverrides';key=$trackingKey;value='/USER/HEAD'},
+    @{section='dashboard';key='enableDashboard';value=$null}
+)) {
+    $changed = Clone-Value $effectiveProfile
+    $changed[$case.section][$case.key] = $case.value
+    $effective = Get-EffectiveState $changed $effectiveProfile
+    Assert-Semantic (-not $effective.active -and -not $effective.checks["$($case.section).$($case.key)"].matches) "production effective-state rejects typed/ordinal drift: $($case.section).$($case.key)"
+}
+$missing = Clone-Value $effectiveProfile; $missing.dashboard.Remove('enableDashboard')
+Assert-Semantic (-not (Get-EffectiveState $missing $effectiveProfile).active) 'production effective-state rejects missing Boolean leaf'
+$numeric = Clone-Value $effectiveProfile; $numeric.driver_null.displayFrequency = 90
+foreach ($key in @('positionX','positionZ','yawDegrees','pitchDegrees','rollDegrees')) { $numeric.driver_codex_head_pose[$key] = 0 }
+Assert-Semantic (Get-EffectiveState $numeric $effectiveProfile).active 'production effective-state admits equivalent JSON numeric spellings'
+$inventory = [ordered]@{profile='task';modListPath='C:\fixture\profiles\task\modlist.txt';providers=@([ordered]@{classification='OCU';modName='OCU';modPath='C:\fixture\mods\OCU';lineNumber=85;marker='-';enabled=$false;markers=[ordered]@{rootOpenVrApi=$true;rootOpenCompositeIni=$true;openCompositeInput=$false}});errors=@()}
+function New-Admission($Inventory) {
+    $proof = Get-MO2ProviderInventoryEvidence $Inventory
+    [pscustomobject]@{mode='mo2';runtimeRoute='SteamVRNull';profile='task';leaseId='fixture-lease';providerInventoryContractVersion=1;providerInventory=$proof.inventory;providerInventorySemanticSha256=$proof.semanticSha256;providerInventorySha256='legacy-raw'}
+}
+$admission = New-Admission $inventory
+$receipt = @{mo2Admission=Clone-Value $admission}
+$moved = Clone-Value $inventory; $moved.providers[0].lineNumber = 87
+$movedAdmission = New-Admission $moved
+Assert-MO2NullAdmissionMatchesReceipt $movedAdmission $receipt
+Assert-Semantic ($admission.providerInventorySemanticSha256 -ceq $movedAdmission.providerInventorySemanticSha256 -and $movedAdmission.providerInventory.providers[0].lineNumber -eq 87) 'line85 to87 changes only retained provenance, not semantic admission'
+$reordered = [ordered]@{errors=@();providers=@([ordered]@{markers=[ordered]@{openCompositeInput=$false;rootOpenCompositeIni=$true;rootOpenVrApi=$true};enabled=$false;marker='-';lineNumber=87;modPath='C:\fixture\mods\OCU';modName='OCU';classification='OCU'});modListPath=$inventory.modListPath;profile='task'}
+Assert-MO2NullAdmissionMatchesReceipt (New-Admission $reordered) $receipt
+Assert-Semantic ((New-Admission $reordered).providerInventorySemanticSha256 -ceq $admission.providerInventorySemanticSha256) 'object and nested marker property order is canonical'
+foreach ($case in @('enabled','path','name','marker','classification','profile','modlist','rootMarker','iniMarker','inputMarker','errors','missingMarkers','unknownField')) {
+    $changed = Clone-Value $inventory
+    switch ($case) {
+        enabled {$changed.providers[0].enabled=$true;$changed.providers[0].marker='+'}
+        path {$changed.providers[0].modPath='C:\fixture\mods\other'}
+        name {$changed.providers[0].modName='other'}
+        marker {$changed.providers[0].marker='+'}
+        classification {$changed.providers[0].classification='unclassified-openvr-provider'}
+        profile {$changed.profile='other'}
+        modlist {$changed.modListPath='C:\fixture\other.txt'}
+        rootMarker {$changed.providers[0].markers.rootOpenVrApi=$false}
+        iniMarker {$changed.providers[0].markers.rootOpenCompositeIni=$false}
+        inputMarker {$changed.providers[0].markers.openCompositeInput=$true}
+        errors {$changed.errors=@('read failure')}
+        missingMarkers {$changed.providers[0].Remove('markers')}
+        unknownField {$changed.providers[0]['newContractField']='different'}
+    }
+    $rejected=$false
+    try { Assert-MO2NullAdmissionMatchesReceipt (New-Admission $changed) $receipt } catch {$rejected=$true}
+    Assert-Semantic $rejected "reject actual provider contract change: $case"
+}
+foreach ($case in @('lease','mode','route','profile','snapshot','digest','version')) {
+    $altered = Clone-Value $receipt
+    switch ($case) {
+        lease {$altered.mo2Admission.leaseId='new-lease'}
+        mode {$altered.mo2Admission.mode='standalone'}
+        route {$altered.mo2Admission.runtimeRoute='SteamVR'}
+        profile {$altered.mo2Admission.profile='other'}
+        snapshot {$altered.mo2Admission.providerInventory.providers[0].modPath='C:\tampered'}
+        digest {$altered.mo2Admission.providerInventorySemanticSha256='tampered'}
+        version {$altered.mo2Admission.providerInventoryContractVersion=$true}
+    }
+    $rejected=$false;try {Assert-MO2NullAdmissionMatchesReceipt $admission $altered} catch {$rejected=$true}
+    Assert-Semantic $rejected "reject inconsistent receipt authority: $case"
+}
+$legacy=@{mo2Admission=@{mode='mo2';runtimeRoute='SteamVRNull';profile='task';leaseId='fixture-lease';providerInventorySha256='legacy-raw'}}
+Assert-MO2NullAdmissionMatchesReceipt $admission $legacy
+$legacy.mo2Admission.providerInventorySha256='old-different'
+$rejected=$false;try {Assert-MO2NullAdmissionMatchesReceipt $admission $legacy} catch {$rejected=$_.Exception.Message -match 'Legacy receipts are not migrated'}
+Assert-Semantic $rejected 'legacy receipts remain exact-hash-bound and are not migrated'
+
+# Pure restore qualification uses fixture files only, never the live controller.
+$fixture=Join-Path $FixtureRoot ('null-semantic-'+[guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $fixture | Out-Null
+$currentPath=Join-Path $fixture 'current.json'
+$expected=[ordered]@{dashboard=[ordered]@{enableDashboard=$false};steamvr=[ordered]@{forcedDriver='null'}}
+function Read-JsonHashtable([string]$Path) {Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable}
+function Get-HashOrNull([string]$Path) {(Get-FileHash -LiteralPath $Path).Hash}
+function Get-NullSettingsExpectation($Receipt,$BackupPath) { [pscustomobject]@{value=$expected;profile=$expected;controlledPaths=@('dashboard.enableDashboard','steamvr.forcedDriver');semanticSha256=Get-JsonSemanticSha256 -Value $expected} }
+function Assess-History($Document) {
+    $Document | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $currentPath -Encoding utf8NoBOM
+    Get-SettingsRestoreValidation -Receipt @{settingsSha256Null='different'} -BackupPath 'fixture-only' -CurrentPath $currentPath
+}
+# Reproduce all six protected values reported by the stopped live transaction.
+$savedNumericExpected = Clone-Value $expected
+$expected['driver_null'] = [ordered]@{displayFrequency=90.0}
+$expected['driver_codex_head_pose'] = [ordered]@{positionX=0.0;positionZ=0.0;yawDegrees=0.0;pitchDegrees=0.0;rollDegrees=0.0}
+function Get-NullSettingsExpectation($Receipt,$BackupPath) {
+    $controlled=@('dashboard.enableDashboard','steamvr.forcedDriver')
+    if ($expected.Contains('driver_null')) { $controlled+=@('driver_null.displayFrequency','driver_codex_head_pose.positionX','driver_codex_head_pose.positionZ','driver_codex_head_pose.yawDegrees','driver_codex_head_pose.pitchDegrees','driver_codex_head_pose.rollDegrees') }
+    [pscustomobject]@{value=$expected;profile=$expected;controlledPaths=$controlled;semanticSha256=Get-JsonSemanticSha256 -Value $expected}
+}
+$numericCandidate = Clone-Value $expected
+$numericCandidate.driver_null.displayFrequency = 90
+foreach ($key in @('positionX','positionZ','yawDegrees','pitchDegrees','rollDegrees')) { $numericCandidate.driver_codex_head_pose[$key] = 0 }
+$numericAssessment = Assess-History $numericCandidate
+Assert-Semantic ($numericAssessment.authorized -and $numericAssessment.controlledContractMatch -and $numericAssessment.controlledDifferences.Count -eq 0 -and $numericAssessment.formattingOnlyDriftAccepted) 'all six protected Double-to-integer rewrites are formatting-only, not value drift'
+foreach ($case in @(@('driver_null','displayFrequency'),@('driver_codex_head_pose','positionX'),@('driver_codex_head_pose','positionZ'),@('driver_codex_head_pose','yawDegrees'),@('driver_codex_head_pose','pitchDegrees'),@('driver_codex_head_pose','rollDegrees'))) {
+    foreach ($change in @('actual-value','string','boolean')) {
+        $candidate = Clone-Value $numericCandidate
+        $candidate[$case[0]][$case[1]] = switch ($change) { 'actual-value' { 17 }; 'string' { [string]$candidate[$case[0]][$case[1]] }; 'boolean' { $false } }
+        $assessment = Assess-History $candidate
+        Assert-Semantic (-not $assessment.authorized -and -not $assessment.controlledContractMatch -and $assessment.controlledDifferences -contains ($case[0]+'.'+$case[1])) "protected numeric key rejects $change at $($case[0]).$($case[1])"
+    }
+}
+$expected = $savedNumericExpected
+foreach ($pair in @(@($false,0),@($true,1),@(0,$false),@(1,$true))) {
+    foreach ($controlled in @($true,$false)) {
+        $savedExpected = Clone-Value $expected
+        $section = if ($controlled) { 'dashboard' } else { 'protected' }
+        $key = if ($controlled) { 'enableDashboard' } else { 'value' }
+        if (-not $expected.Contains($section)) { $expected[$section] = [ordered]@{} }
+        $expected[$section][$key] = $pair[0]
+        $candidate = Clone-Value $expected; $candidate[$section][$key] = $pair[1]
+        $assessment = Assess-History $candidate
+        Assert-Semantic (-not $assessment.authorized -and -not $assessment.formattingOnlyDriftAccepted -and -not $assessment.runtimeManagedStructuralMatch -and
+            ($controlled -eq $false -or -not $assessment.controlledContractMatch)) "restore rejects Boolean/numeric type drift (controlled=$controlled, expected=$($pair[0]), actual=$($pair[1]))"
+        $expected = $savedExpected
+    }
+}
+$added=Clone-Value $expected;$added.dashboard['lastAccessedExternalOverlayKey']='overlay.one'
+Assert-Semantic (Assess-History $added).dashboardHistoryDriftAccepted 'string history addition qualifies'
+$expected.dashboard['lastAccessedExternalOverlayKey']='overlay.old'
+Assert-Semantic (Assess-History $added).dashboardHistoryDriftAccepted 'string history change qualifies'
+$removed=Clone-Value $expected;$removed.dashboard.Remove('lastAccessedExternalOverlayKey')
+Assert-Semantic (Assess-History $removed).dashboardHistoryDriftAccepted 'string history removal qualifies'
+$added.dashboard.enableDashboard=$true
+Assert-Semantic (-not (Assess-History $added).authorized) 'history allowance cannot override enableDashboard change'
+$added.dashboard.enableDashboard=$false;$added.dashboard['other']='unclassified'
+Assert-Semantic (-not (Assess-History $added).authorized) 'history allowance cannot override other dashboard changes'
+$added.dashboard.Remove('other');$added.steamvr.forcedDriver='other'
+Assert-Semantic (-not (Assess-History $added).authorized) 'history allowance cannot override other controlled settings'
+# Preserve real nested history while attacking the ambiguous display spelling.
+$historyKey = 'lastAccessedExternalOverlayKey'
+foreach ($case in @('add','remove','change','object','null','boolean','number')) {
+    $originalExpected = Clone-Value $expected
+    $candidate = Clone-Value $expected
+    $literalKey = 'dashboard.lastAccessedExternalOverlayKey'
+    switch ($case) {
+        add { $candidate[$literalKey] = 'unrelated' }
+        remove { $expected[$literalKey] = 'unrelated' }
+        change { $expected[$literalKey] = 'old'; $candidate[$literalKey] = 'new' }
+        object { $candidate[$literalKey] = [ordered]@{ value = 'unrelated' } }
+        null { $candidate[$literalKey] = $null }
+        boolean { $candidate[$literalKey] = $true }
+        number { $candidate[$literalKey] = 42 }
+    }
+    $candidate.dashboard[$historyKey] = 'overlay.new'
+    $assessment = Assess-History $candidate
+    Assert-Semantic (-not $assessment.authorized -and -not $assessment.dashboardHistoryDriftAccepted -and -not $assessment.runtimeManagedStructuralMatch) "literal dotted root-key drift is never history authority: $case"
+    $expected = $originalExpected
+}
+foreach ($value in @($null,$false,42,[ordered]@{ value = 'not-string' })) {
+    $candidate = Clone-Value $expected; $candidate.dashboard[$historyKey] = $value
+    Assert-Semantic (-not (Assess-History $candidate).authorized) 'non-string actual history leaf remains refused'
+}
+$candidate = Clone-Value $expected; $candidate['GpuSpeed'] = [ordered]@{ nested = 42 }; $candidate.dashboard[$historyKey] = 'overlay.new'
+Assert-Semantic (Assess-History $candidate).authorized 'actual runtime-managed root subtree and actual string history qualify together'
+$candidate = Clone-Value $expected; $candidate['GpuSpeed.nested'] = 42
+Assert-Semantic (-not (Assess-History $candidate).authorized) 'literal runtime-managed dotted root key does not borrow subtree authority'
+[pscustomobject]@{ok=$true;passed=$passes.Count;passes=@($passes);fixture=$fixture;liveMutation=$false} | ConvertTo-Json -Depth 6

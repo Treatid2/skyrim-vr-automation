@@ -5,14 +5,26 @@ description: "Inspect and call the MCP tools exposed by a running CSX DevBench s
 
 # DevBench Control
 
+Before healthy image/performance evidence, independently admit the exact current
+CSX shader snapshot through the existing selected transport. Read the compiler
+admission section of the controller README: API/readiness PASS is not compiler
+health. On the controller lane use call -RequireCompilerHealthy with exact
+runtime/build/artifact identity; on the direct lane qualify the native snapshots
+with the exported offline classifier without opening a second live lane.
+Retain current log and stereo evidence. Failure/pending/unproven compilation
+allows explicit diagnostic evidence only, never healthy promotion. This gate
+does not repair or clear caches, change profiles, relaunch, or assign cleanup.
+
 Choose exactly one live transport before the first live call. When the
 plugin-provided direct MCP tools are callable, they are the mandatory and
 exclusive lane for live discovery, calls, waits, screenshots, and performance
 capture. Treat their exposed tool descriptions as the live callable action and
-input-schema inventory, not as an output schema. Validate result fields in the
+input-schema inventory for that runtime connection, not as an output schema.
+Validate result fields in the
 structured action response that owns them;
 do not run the bundled controller's `list`, open another loopback MCP session,
-or switch transport lanes during that run. A generic scenario dispatcher does
+or switch transport lanes during that run except for the exact stale-catalog
+rejection below. A generic scenario dispatcher does
 not prove that an ownership-bearing or intrusive custom action is callable. If
 the exact typed action is
 absent, report that protocol action unavailable; do not send it through the
@@ -24,9 +36,39 @@ Do not infer absence from an abbreviated initial tool list. A protocol may
 require this plugin lane and prohibit the bundled client; that stricter rule
 always wins.
 
+Establish catalog currency at connection initialization and after concrete
+staleness evidence, not before every healthy call. Known runtime replacement
+or concrete schema drift invalidates retained action/input schemas even when
+the tool name is unchanged. Preserve historical metadata and mismatch evidence;
+do not delete task context or treat it as current authority. Use a supported
+direct host refresh/rebind only if that facility is actually available and can
+bind the fresh catalog to the expected answering runtime. If no supported
+refresh exists, discovery is unavailable/malformed, the expected action/schema
+is absent, or current identity cannot be established, report
+`toolSchemaUnresolved` and perform no further stateful dispatch using that
+schema. Do not restart MO2, Skyrim, SteamVR, or Virtual Desktop to refresh a
+catalog. Same-name replacement and argument/schema mismatch do not themselves
+authorize a lane switch or replay of an earlier call.
+
 Use the bundled client as the sole live lane only when direct MCP is unavailable
 before the first live call. It also remains available for offline validation or
-a required durable receipt that direct MCP cannot expose. Never choose the
+a required durable receipt that direct MCP cannot expose. A direct invocation
+that returns exact MCP error `-32602 Tool not found: <requested-name>` is
+staleness evidence, but its text alone does not prove zero handler entry.
+Preserve the trusted structured error envelope, requested tool/request identity,
+and answering runtime identity; make no direct retry. Require version-bound
+server/connector evidence proving pre-dispatch rejection for that correlated
+request before using the exception. If that proof is unavailable, report
+`executionStateUnresolved`; do not switch lanes or replay the uncertain call.
+With proven pre-dispatch rejection, treat the direct lane as invalidated.
+The bundled client may then become the sole lane for the rest of the run: bind
+it to the explicit runtime path, call `list`, verify runtime/build identity, and
+continue only if that fresh list contains the exact action and current input
+schema. If discovery is missing/malformed or identity/action/schema cannot be
+proved, return `toolSchemaUnresolved` without dispatch. This is the only
+post-call lane-switch exception. Invalid arguments, semantic failures,
+timeouts, lost responses, or any error other than that exact pre-dispatch name
+rejection do not authorize switching. Never choose the
 loopback HTTP path merely for convenience, mix it with a healthy direct lane,
 or construct HTTP or MCP requests ad hoc.
 
@@ -42,7 +84,10 @@ or construct HTTP or MCP requests ad hoc.
    direct lane, use its bound tools and do not create or resolve a controller
    runtime file.
 4. On the direct lane, use the exposed direct tool definitions as authoritative
-   action and input-schema inventory. They do not prove output-field presence.
+   action and input-schema inventory for the connected runtime. They do not
+   prove output-field presence. Known runtime replacement or concrete schema
+   drift invalidates retained definitions regardless of tool-name continuity;
+   apply the supported refresh or explicit refusal boundary above.
    On the selected controller lane, call `list` before using a tool whose
    current name or input schema has not been established.
 5. On the direct lane, call the exact exposed tool with structured arguments.
@@ -63,8 +108,14 @@ or construct HTTP or MCP requests ad hoc.
    only the unresolved read-only health or action call within its explicit
    bounded deadline and return on its first success. On the controller fallback
    lane, use `wait -Condition toolAvailable -Tool <exact-name>` or
-   `serviceReady` with a read-only `-ArgumentsJson` action and an explicit
-   bounded timeout. Never cross transports to perform a readiness wait.
+   `wait -Condition serviceReady -Tool <exact-name>` with an explicit bounded
+   timeout. Do not pass `-ArgumentsJson` to `serviceReady`: the controller
+   derives its qualified read-only probe from the authoritative input schema
+   and rejects caller-supplied probe actions.
+   Never cross transports to perform a readiness wait. A retryable failure
+   remains unsatisfied, and a positive
+   response received at or after the absolute deadline remains timeout evidence,
+   never readiness success.
 9. On the selected controller lane, use `-ExpectedErrorCode` for deliberate
    guard tests such as `producer_mismatch`; do not reinterpret an unrequested
    API failure as a pass on either lane.
@@ -101,6 +152,23 @@ or construct HTTP or MCP requests ad hoc.
     the exact managed `-WorkspaceManifestPath`. Do not use
     `-AllowUnprovenGameMutation` unless the user explicitly authorized bypassing
     workspace save policy.
+17. Treat a successful `game load` response with `queued: true` as the only
+    mutation dispatch. Do not wait for a lifecycle event or for an observed
+    unloaded-to-loaded edge; either can be missed between polls. On the bundled
+    lane, follow it with `wait -Condition playerLoaded -ExpectedCell <exact>`.
+    That barrier polls current player and scene state and never replays the load.
+    The wrapper reports the accepted mutation as `game-load-dispatch-queued`
+    with `completionBasis=dispatch-only`; only the later state barrier proves
+    load completion.
+18. Before `communityshaders.render_map start`, call the bundled
+    `New-CSXRenderMapCapturePlan.ps1` with the retained live registry response
+    and an explicit positive-integer workload estimate. Require a successful
+    registry envelope bound to the exact service, contract major, producer
+    build, and retained snapshot hash. Use only a successful planner result's
+    headroom-sized arguments and retain its immutable plan receipt. Do not use
+    conservative defaults for a broad evidence run. Treat any limit hit as
+    incomplete evidence unless the experiment is specifically measuring
+    saturation.
 
 The bundled fallback entry point is:
 

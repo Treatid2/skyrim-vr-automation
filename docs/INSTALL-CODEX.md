@@ -46,13 +46,22 @@ Verify the contract before installation is considered ready:
 
 The first command must return `fixture-valid`; the doctor check
 `prime-profile-world-entry-integrity` must pass. A missing, stale, or mismatched fixture
-blocks fresh workspace creation. Only one save is required because guarded
+blocks fresh workspace creation only when `-SavePolicy VerifiedFixture` is selected.
+`MainMenuOnly` and `FreshGame` workspaces still copy the source save tree but do not
+select or claim authority from this fixture. Only one verified fixture is required
+because guarded
 `coc`/`cow` transitions can reach other locations after world entry.
+The doctor check `prime-profile-launch-readiness` must also pass. It validates
+the exact profile named by `defaults.testProfileSource` and its registered
+executable provider, and reports discovered profile candidates when that
+configuration is stale.
 
-Every fresh task profile receives the complete prime-profile save tree and a
-verified copy of that baseline. This is exact static integrity, not proof of a
-successful runtime load. A resumed task profile is intentionally left untouched
-and is not reverified after the task changes its own mod or save state.
+Every fresh task profile receives a hash-checked copy of the complete prime-profile
+save tree. A `VerifiedFixture` workspace additionally selects the configured,
+integrity-verified baseline; the other save policies make no fixture claim. Static
+integrity is not proof of a successful runtime load. A resumed task profile is
+intentionally left untouched and is not reverified after the task changes its own
+mod or save state.
 
 ## Declare optional local work
 
@@ -80,6 +89,30 @@ either `-WorkspaceContent Modlist` or
 `-WorkspaceContent ModlistPlusLocalWorkMods` with exact candidate IDs.
 
 ## Upgrade
+
+### Maintained live development plugin
+
+The maintained local live plugin is published from an exact committed
+`codex/auto-tools-all-integrated` head, including incorporated PR work that is
+still in review. `main` remains curated and receives individual PRs only after
+review passes. Publishing the integrated plugin does not promote those PRs to
+main or certify their native/runtime behavior. Never merge the aggregate wholesale.
+
+At an authorized publication boundary, finish every active automation protocol
+in every chat first. Rotate both source/package plugin manifest version identities
+once, build with `scripts/Build-CodexMarketplacePlugin.ps1` into managed staging,
+and promote the verified package to the configured local marketplace plugin path.
+Keep the previous installed package as a verified rollback artifact. Install with
+`scripts/Install-CodexMarketplacePlugin.ps1 -MarketplaceRoot <registered-root>
+-MarketplaceName <registered-name> -ConfirmSafeCacheRotation`; do not replace cache
+files directly or change unrelated marketplace entries. Verify exact source,
+marketplace and installed file sets/hashes, registered version and integrated head.
+Retain a publication receipt with review/runtime qualification limits.
+
+Fully restart the Codex host after installation; a new chat alone is not a safe
+pickup boundary. Existing protocols keep their pinned controller/profile bytes
+until terminal. The public Git marketplace commands below track curated main,
+not this maintained local development lane.
 
 ```text
 codex plugin marketplace upgrade skyrim-vr-tools

@@ -46,8 +46,10 @@ particular drive letter for the plugin itself.
 5. Create or select one attributable evidence directory for the test. The
    target-owned transaction journal, rather than this caller-selected folder,
    is authoritative. Preview
-   `apply` or `restore` with `-WhatIf`, then perform the authorized operation
-   using the same `-EvidenceDirectory`. For an MO2-backed `apply` or `start`,
+   Create the exact task-scoped evidence directory before preview; `-WhatIf`
+   deliberately never creates it. Preview `apply` or `restore` with `-WhatIf`,
+   then perform the authorized operation using the same `-EvidenceDirectory`.
+   For an MO2-backed `apply` or `start`,
    pass the exact admitted `-MO2AccessId <literal-access-id>` and
    `-MO2Profile <literal-profile-name>` on every call. The controller repeats
    the closed-state `SteamVRNull` provider admission and binds its public proof
@@ -58,6 +60,12 @@ particular drive letter for the plugin itself.
    requested, also require a conflict-free inventory and a receipt containing
    the exact registration and manifest hashes. After `restore`, require both
    the settings and OpenVR registration hashes to match their exact backups.
+   Exception only for an explicitly human-selected two-leaf preservation:
+   follow the README's `-PreserveDesktopUIWindowState` preview/commit contract,
+   pass its exact preimage `-ExpectedCurrentSettingsSha256`, and require the
+   settings hash to match the recorded selected result rather than claiming
+   whole-file backup restoration. OpenVR still restores its exact backup.
+   Never use this as a general drift bypass or repeat caller cleanup.
 7. Require `headPoseProvider.state` to be `ready` and independently run the
    head-pose controller's `qualify -RequireControllers` command. Qualification requires both the
    driver's shared-memory acknowledgement and a valid standing HMD pose seen
@@ -74,6 +82,21 @@ particular drive letter for the plugin itself.
    substitute an OCU-qualified workspace after the null-HMD transition.
 9. Run `inspect -Compact` again and preserve the before/after results, exact
    backup, receipt, hashes, and evidence-directory identity.
+
+## Controller and Skyrim keyboard input
+
+For controller pose/button/touch/axis commands, additionally read
+`../../tools/steamvr-controller-control/README.md` and its entry-point parameter
+block. Use its inspect binding and stable task owner; never manufacture a new
+mapping, borrow another active owner, or replay an indeterminate command. The
+full-input native provider is required: the limited passive-only live DLL does
+not expose this protocol. Passive neutral qualification remains a presence test,
+not active-input/game acceptance. Keep head v2 control unchanged.
+
+Keyboard uses the existing DevBench `input` tool, capability/status negotiation
+and a stable task owner, as described in that README. It is Skyrim-only, not
+dashboard or OS injection. Preserve keyboard releaseAll and native controller
+release/reset receipts separately; neither implies atomic cross-provider reset.
 
 ## Safety and recovery
 

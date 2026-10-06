@@ -29,8 +29,12 @@ automatic orchestration endpoint exists.
   executable, entry point, or subcommand behind a variable or `-Command`.
 - For enabling, disabling, or restoring one exact mod marker, read
   `../../tools/mo2-profile-control/README.md` and inspect the entry point's
-  parameter block before acting. For a DLL deployment, prefer the workspace
-  controller's `-WinningPaths` transaction; do not guess MO2 priority order.
+  parameter block before acting. For a deployed mod, prefer `add-enable`: pass
+  its exact directory and let the controller discover matching DLL paths,
+  choose sufficient priority, and conservatively retire only exact DLL-only
+  providers. Do not calculate priority from names or disable a mixed-content
+  provider manually. Select `KeepProviders` when an older DLL-only provider
+  must remain enabled.
 - For every independent test task, read
   `../../tools/mo2-workspace-control/README.md` and use the stable task ID to
   discover, resume, or create its task profile before preparing a session.
@@ -55,12 +59,16 @@ are:
    `request-access`, retain its exact `accessId`, and respect `access-busy`.
    An estimated duration is advisory only and never permits lease stealing.
    Use workspace `list-task -TaskId` to discover retained state. On the first
-   request, require `fixture-status` to report
-   `fixture-valid`, and then run `create -TaskId`; the primary profile, its
-   complete save tree, and the mandatory default world-entry save are cloned,
-   verified, and selected. On later requests, require an explicit
+   request, run `prepare-source`, then run `create -TaskId`; the primary profile
+   and its complete save tree are cloned and verified. Require `fixture-status`
+   to report `fixture-valid` only when creating with `VerifiedFixture`. On later
+   requests, require an explicit
    `resume -TaskId -WorkspaceId` or fresh `create -TaskId`. Never silently
    replace, refresh, or requalify a retained profile after task-local edits.
+   If `list-task` returns a retained workspace under `unavailableWorkspaces`,
+   report its exact `resumeBlockReason`; do not try to resume or recreate it.
+   Legacy contract migration requires separate review while the profile and
+   task-owned mods remain retained.
    Before fresh creation, run `list-local-work-mods`; pass
    `-WorkspaceContent Modlist` for no local build, or
    `ModlistPlusLocalWorkMods` plus exact available candidate IDs. Resume
@@ -108,10 +116,9 @@ are:
    Pass the exact profile returned by the task workspace rather than accepting
    the ordinary configured session default.
    Every fresh task profile receives a verified copy of the stable source
-   profile's complete saves tree and mandatory default world-entry fixture.
-   This makes saves available but does not authorize their use: respect
-   `SavePolicy`, and use only a declared `VerifiedFixture` as a deterministic
-   automation baseline. A resumed task profile is preserved as-is; never claim
+   profile's complete saves tree. This makes saves available but does not
+   authorize their use: respect `SavePolicy`, and require/select a declared
+   fixture only for `VerifiedFixture`. A resumed task profile is preserved as-is; never claim
    its save remains working after the task has changed its profile.
    When the test requires a deterministic new-game baseline, create the
    workspace with `-SavePolicy VerifiedFixture`. Use the returned fixture ID
@@ -134,7 +141,9 @@ are:
 5. For repeated measurements, retain the owning MO2 process and cycle Skyrim
    with `stop-game` followed by `launch`.
    If `stop-game` returns `mo2-exited-after-game-stop` or `releaseRequired`, do
-   not relaunch from that session; release it and request access normally.
+   not adopt another MO2 process. When no MO2 or game process exists, `launch`
+   may reopen that same owned session's exact profile and executable; otherwise
+   release it before another task receives MO2.
 6. Use `-StartOnly` when the outer host cannot safely wait for UI/game
    readiness; retain the immediate receipt and poll the exact session with
    `status`.
@@ -196,9 +205,14 @@ are:
 - Dump Management has standing user authority to install, update, configure,
   and enable Tullius. It still obeys closed-Skyrim and lease/known-state gates;
   when a human lease is active it targets only that lease's exact profile.
-- Register a task DLL with its exact relative path in `-WinningPaths`. Treat
-  the returned loose-file provider proof as scoped: overwrite, unmanaged game
-  files, and archives still require separate VFS evidence.
+- Prefer `add-enable` for a deployed task mod so exact DLL paths and priority
+  are controller-derived. Treat the returned loose-file provider proof as
+  scoped: overwrite, unmanaged game files, and archives still require separate
+  VFS evidence.
+- If explicitly using `register-mod` rather than `add-enable`, use
+  `-WinningPathsFile` for multiple paths in a native `pwsh -File` invocation;
+  comma-separated quoted arguments can bind as one path. A single exact path
+  can use inline `-WinningPaths`.
 - Never treat `coc APStartCell` as a genuine New Game. Copied ordinary saves
   are conveniences, not deterministic baselines; use only an exact
   hash-verified fixture when baseline provenance matters.

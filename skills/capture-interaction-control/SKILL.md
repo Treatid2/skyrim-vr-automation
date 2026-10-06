@@ -15,7 +15,15 @@ only session orchestrator. Read its `README.md` before the first mutation.
    `on-demand` or `sequence` mode.
 3. Choose `none` for state/input capture only, `on-demand` for a frame at each
    `observe`, or `sequence` for continuous stereo evidence. Do not emulate a
-   sequence with repeated still requests.
+   sequence with repeated still requests. `start` preflights sequence frame and
+   duration bounds against the live screenshot capabilities before it creates
+   session state or starts recording; reduce `-MaximumFrames` to the reported
+   compatible bound when that preflight rejects a request.
+   If either start returns an indeterminate or accepted-but-unqualified result,
+   retain the command/correlation identity and controller journal reference and
+   reconcile that exact owner. Do not report full rollback merely because the
+   other service stopped, and do not issue an unscoped recording stop for an
+   ambiguous recording start.
 4. Call `observe` and inspect `data.observation`. When a frame is present, use
    the image-viewing tool on `frameSubmission.path`; do not infer the current
    screen from an earlier frame or an uncommitted artifact.
@@ -26,11 +34,16 @@ only session orchestrator. Read its `README.md` before the first mutation.
    are already understood. Never approximate an unsupported input silently.
 6. Use `-ObserveAfterAction` when closed-loop feedback matters. The action
    receipt and subsequent observation have distinct IDs and timestamps.
-7. Use `stop` for normal completion. Use `abort` only for explicit partial
+7. For a direct `game load`, send it once and require the response to report
+   `queued: true`. Do not wait on the transient load lifecycle event. Use the
+   DevBench state barrier with the exact expected cell, or repeat read-only
+   `observe` calls until both `game.value.playerLoaded` and the target scene
+   cell are proven; never replay the load to recover a missed observation.
+8. Use `stop` for normal completion. Use `abort` only for explicit partial
    finalization. Both preserve receipts; neither deletes evidence.
-8. Use `wait-save` for a requested save boundary. Keep its bounded UTC receipt,
+9. Use `wait-save` for a requested save boundary. Keep its bounded UTC receipt,
    then call `stop` separately after the expected save is stable.
-9. Promote unique retained evidence to the configured authoritative permanent
+10. Promote unique retained evidence to the configured authoritative permanent
    store and verify it before releasing capture scratch as promoted. Do not keep
    using a released allocation.
 

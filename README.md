@@ -16,7 +16,12 @@ optional integration rather than the identity or boundary of the toolkit.
   automation and human leases, supported live-instance refresh, and a bounded
   single-owner launch lifecycle.
 - `tools/mo2-profile-control` — transactional toggling of an exact MO2
-  `modlist.txt` marker and guarded registration of a newly deployed mod.
+  `modlist.txt` marker, guarded registration of a newly deployed mod, and a
+  high-level add/enable operation that discovers matching DLL providers,
+  selects winning priority, and conservatively retires exact DLL-only predecessors.
+- `tools/mo2-mod-package-control` — safe ZIP inspection and deterministic MO2
+  install-package creation from an explicit Skyrim Data root, without relying
+  on installer flattening heuristics.
 - `tools/mo2-workspace-control` — stable-source ShaderCache evacuation plus
   unique task profiles cloned from that explicit source, with a verified copy
   of its complete saves tree, a mandatory integrity-verified world-entry save, and
@@ -29,11 +34,20 @@ optional integration rather than the identity or boundary of the toolkit.
   OpenVR display redirectors.
 - `tools/steamvr-head-pose-control` — install, inspect, update, and independently
   qualify the bundled SteamVR head-pose provider used by null-HMD sessions.
+- `tools/steamvr-controller-control` — exact-instance, leased native controller
+  pose/input commands, bounded tap/sequence, neutral release and haptic readback.
+  Full-input provider required; passive qualification is not game acceptance.
 - `tools/devbench-control` — a small MCP client for the DevBench endpoint
   exposed by a running CSX build, with listener/process/build/artifact binding
   and normalized semantic results.
 - `tools/profiler-control` — repeatable DevBench profiler capture and
   multi-state comparison reports.
+- `tools/render-scale-qualification` — one bounded, evidence-preserving
+  render-scale qualification that combines transition stability, performance,
+  stereo capture, and blinded visual assessment.
+- `tools/renderscale-tuning-live` and `tools/renderscale-tuning-finalizer` —
+  identity-bound NVIDIA or AMD render-scale assay execution and restartable,
+  lossless evidence finalization.
 - `tools/shader-cache-control` — provider discovery, physical cache
   snapshot/restore transactions, compatibility-ranked known-working cache
   catalogs, task seeding/restoration/promotion, and comparison reports.
@@ -52,17 +66,24 @@ versioned shared-memory pose contract, but it is not the bootstrap provider.
 
 ## Codex plugin
 
-The repository publishes a Codex marketplace plugin. Its seven skills connect a
+The repository publishes a Codex marketplace plugin. Its skills connect a
 new task to the bundled implementations and their operational contracts:
 
 - `$feedback-control` records unexpected automation behaviour and concrete
   enhancement requests in a durable local queue; it never publishes them.
 - `$mo2-control` routes MO2 inspection, exact-profile lifecycle management,
   and transactional profile edits.
+- `$mo2-mod-packaging` packages and diagnoses MO2 archives without guessed
+  wrapper flattening.
 - `$steamvr-null-hmd` routes backed-up SteamVR null-HMD apply/restore and
   bounded runtime shutdown.
 - `$devbench-control` discovers and calls the exact loopback DevBench MCP API.
 - `$profiler-control` captures bounded GPU/CPU timer evidence and compares runs.
+- `$render-scale-qualification` runs the complete unattended CSX render-scale
+  qualification against one already-running, identity-bound DevBench session.
+- `$renderscale-tuning-nvidia` runs the NVIDIA-only 33-transition tuning assay.
+- `$renderscale-tuning-amd` runs three AMD-only 31-transition FSR lanes and
+  preserves their results for cross-machine comparison.
 - `$shader-cache-control` prepares tasks from compatible known-working compiled
   caches, restores prior state, promotes verified results, and compares trees
   by SHA-256.
@@ -78,7 +99,10 @@ codex plugin add skyrim-vr-automation@skyrim-vr-tools
 
 The reproducible marketplace package lives under
 `plugins/skyrim-vr-automation`; canonical sources remain at repository root.
-See `docs/INSTALL-CODEX.md` for upgrades, removal, and release pinning. Restart
+The maintained local live plugin instead follows an exact committed
+`codex/auto-tools-all-integrated` head, including incorporated pending PRs;
+reviewed `main` remains the curated public lane. See `docs/INSTALL-CODEX.md`
+for the guarded live-publication workflow, upgrades, removal, and release pinning. Restart
 Codex after installing or updating.
 
 ## Local setup
@@ -150,6 +174,13 @@ Run the isolated suite with:
 ```powershell
 .\tests\Test-Toolset.ps1
 ```
+
+The aggregate prints suite start/completion progress to stderr and supervises
+each child in a Windows job with a 600-second wall-clock limit by default.
+Override that bounded per-suite budget with `-PerSuiteTimeoutSeconds`; pass
+`-EvidenceDirectory` to retain each child's stdout, stderr, and custody receipt.
+A timed-out suite is terminated with its owned process tree and reported as a
+bounded failure instead of leaving the aggregate silent indefinitely.
 
 Support, privacy, terms, compatibility, clean-install, and release contracts
 are documented in the repository root and `docs/`.

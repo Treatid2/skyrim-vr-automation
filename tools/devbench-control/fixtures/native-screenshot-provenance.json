@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "sourceCommit": "f3623871660d0d5073957458daeb8055dddc40ce",
+  "sourceContract": "csx.screenshot 1.0 schemaRevision 1; ScreenshotApi::MakeReceipt/IsTerminal",
+  "captureTimeUtc": "2026-10-04T02:49:28Z",
+  "accessMode": "read-only parsing of retained completed invocation journals; no runtime calls",
+  "boundaries": "one still request, encoding and completed observations; not sequences or rendered-science admission",
+  "sanitization": "Only absolute machine paths replaced with C:\\fixture\\frames\\basename. IDs, types, states, UTCs, dimensions, progress and hashes retained.",
+  "originals": [
+    {"name": "devbench-invocation.call-communityshaders.screenshot.20261004T024928283Z.14108.json", "sha256": "4bc0fe04a7c73bbf3597eadd5f39369da6561acbda52ce8ea84804672f4732c2", "fixture": "native-screenshot-encoding.json"},
+    {"name": "mapping-rsoff-still-reconcile-20261004-0312-001/stdout.log", "sha256": "9a3a044791b6365f9f57b0cd3bf511b823f523ea0bf34125cbc3624cb673625f", "fixture": "native-screenshot-completed.json"}
+  ]
+}

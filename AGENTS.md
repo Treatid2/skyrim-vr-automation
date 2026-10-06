@@ -1,7 +1,10 @@
 # Automation repository rules
 
-- Treat `main` as the sole integration line and keep local `main` aligned with
-  the latest merged `origin/main`. Develop in scoped feature branches; a
+- Treat `main` as the reviewed, curated line and keep local `main` aligned with
+  the latest merged `origin/main`. `codex/auto-tools-all-integrated` is the live
+  development and plugin-publication source, including pending reviewed PR
+  corrections; publication does not require those PRs to have merged to main.
+  Never merge the aggregate wholesale into main. Develop in scoped feature branches; a
   temporary worktree is not complete until its commits are pushed to its named
   branch and represented by a pull request targeting `main`. Never push
   directly to `main`. Open or merge that pull request only when the user
@@ -34,6 +37,11 @@
   change the coordination-only meaning of human `Release`.
 - A task may delete or replace only uniquely named mods that its workspace
   proves did not predate the task and explicitly records as task-owned.
+- When a deployed mod must be added or enabled, use the profile controller's
+  `add-enable` transaction instead of manually calculating mod priority. Its
+  default may disable only enabled providers proven to contain no functional
+  content beyond exact matching DLL paths; mixed-content providers remain
+  enabled below the selected winner.
 - Do not inherit unknown-provenance saves, and do not treat COC as New Game.
 - Require Skyrim and its loader to be closed before profile or package
   mutation. The normal autonomous task flow also closes MO2 to establish a
@@ -60,24 +68,33 @@
   classified. Never delete unclassified MO2 overwrite or shader-cache content.
 - Keep automated waits bounded and report the observed postcondition. A CTD is
   useful evidence, not permission for unbounded retries.
+- Treat the render-scale tuning fixture, immediate positioning, and startup
+  admission sequence as frozen. Change that prefix only on explicit user
+  instruction or preserved evidence proving the prefix itself is defective;
+  post-position runner, telemetry, and reporting fixes must not alter it.
 - Tests must use temporary fixtures by default. Live checks must be explicitly
   selected and read-only unless the user has placed a state change in scope.
 - Machine-specific paths belong only in ignored `machine.local.json` files,
   explicit parameters, or documented environment variables.
 - Never rotate an installed Codex plugin cache while any automation protocol
   is active in any chat. Feature branches validate source/package parity but do
-  not rotate the installed cache. After an authorized merge to `main` that
-  affects installed plugin behavior, skills, tools, MCP configuration,
-  manifests, or packaged AI guidance, rotate both plugin manifest cache
-  identities once from the final integrated tree, rebuild the managed
+  not rotate the installed cache independently. For an authorized live publication,
+  use one exact committed `codex/auto-tools-all-integrated` tree, rotate both
+  plugin manifest cache identities once, and rebuild the managed
   marketplace package, and reinstall it with the guarded repository installer
   instead of direct `codex plugin add`. Verify the registered version plus
   source, marketplace, and installed-cache hashes, then fully reload the Codex
   host; a new chat alone is not a safe pickup boundary. If a protocol is
-  active, defer installation until every run is terminal.
+  active, defer installation until every run is terminal. Preserve the previous
+  installed package and a hash-complete publication receipt for rollback. Record
+  the exact integrated commit and pending-review boundary; live publication is
+  not review PASS or permission to merge into curated main.
 - When an automation command behaves unexpectedly, its contract is ambiguous,
   or a concrete safety issue or enhancement is discovered, submit it through
   `tools/feedback-control/Invoke-AutomationFeedback.ps1`. Claim that feedback
   was recorded only when the controller returns a durable `AUTO-...` receipt.
+  When an in-scope safe fix is available, implement and validate it before
+  resolving or amending feedback; record feedback first only when evidence
+  would otherwise be lost or the implementation is blocked.
   Tasks report desires; they do not publish issues or edit automation source
   unless that work is explicitly in scope.

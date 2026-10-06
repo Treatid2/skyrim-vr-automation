@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "sourceCommit": "e03bd1fd4790795f9dd205d9458f34ce96092ca8",
+  "sourceContract": "csx.screenshot exact 1.1/schemaRevision2; ScreenshotApi::MakeReceipt still shape unchanged from f3623871660d0d5073957458daeb8055dddc40ce",
+  "captureTimeUtc": "2026-10-05T12:27:25.0208524Z",
+  "accessMode": "offline parsing of retained native raw request_get invocation; no runtime calls",
+  "boundaries": "one completed still request, not sequence admission or rendered-science acceptance",
+  "sanitization": "Only destination/artifact machine paths replaced with C:\\fixture\\frames. IDs, types, states, UTCs, dimensions, progress, acquisition and hashes preserved.",
+  "original": {
+    "name": "devbench-invocation.call-communityshaders.screenshot.20261005T122724325Z.37640.json",
+    "sha256": "4b148432640241e59d9a996c869d9a6a4097869cbfd7b7ab5693131c205e8310",
+    "fixture": "native-screenshot-schema2-completed.json"
+  }
+}

@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 [CmdletBinding()]
-param([switch]$DiscoveryOnly)
+param([switch]$DiscoveryOnly, [switch]$RequalificationOnly, [switch]$UnchangedCompletionOnly, [switch]$ConfigCustodyOnly, [string]$FixtureRoot)
 
 $ErrorActionPreference = 'Stop'
 $entry = Join-Path (Split-Path -Parent $PSScriptRoot) 'Invoke-MO2WorkspaceControl.ps1'
 $powerShell = (Get-Process -Id $PID).Path
-$fixture = Join-Path ([IO.Path]::GetTempPath()) ('mo2-workspace-control-' + [guid]::NewGuid().ToString('N'))
+$fixture = Join-Path $(if ($FixtureRoot) { [IO.Path]::GetFullPath($FixtureRoot) } else { [IO.Path]::GetTempPath() }) ('mo2-workspace-control-' + [guid]::NewGuid().ToString('N'))
 $taskId = 'codex-test-task-001'
 $priorProfileControlRoot = $env:CSX_MO2_PROFILE_CONTROL_ROOT
 $priorShaderCacheControlRoot = $env:CSX_SHADER_CACHE_CONTROL_ROOT
+$priorFixtureTemp = $env:TEMP
+$priorFixtureTmp = $env:TMP
+# Only this isolated test process and its children use the caller's managed
+# fixture directory as temporary scope; no machine/user setting is changed.
+if ($FixtureRoot) { $env:TEMP = [IO.Path]::GetFullPath($FixtureRoot); $env:TMP = $env:TEMP }
 $env:CSX_MO2_PROFILE_CONTROL_ROOT = Join-Path $fixture 'profile-transactions'
 $env:CSX_SHADER_CACHE_CONTROL_ROOT = Join-Path $fixture 'shader-cache-transactions'
 function Get-TestProfileFingerprint([string]$Path) {
@@ -100,6 +105,61 @@ try {
     Import-Module (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'mo2-control\MO2Control.psm1') -Force
     $config = Read-MO2ControlConfig -ConfigPath $configPath
     $access = Invoke-MO2RequestAccess -Config $config -Label fixture -RuntimeRoute SteamVRNull; $accessId = [string]$access.data.access.accessId
+    $discoveryRoot = Join-Path $sessions 'workspaces'
+    $emptyList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact -NoExit | ConvertFrom-Json
+    if (-not $emptyList.ok -or $emptyList.data.count -ne 0) { throw 'Normal empty-root discovery did not succeed.' }
+    foreach ($emptyCase in @('empty-root', 'empty-evidence-directory')) {
+        if ($emptyCase -eq 'empty-evidence-directory') {
+            New-Item -ItemType Directory -Path (Join-Path $discoveryRoot 'empty-create-select') -Force | Out-Null
+        }
+        $expiredList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -InternalTestFailurePoint tree-operation-deadline -Compact -NoExit | ConvertFrom-Json
+        if ($expiredList.ok -or $expiredList.errors[0] -notmatch 'shared .*tree-operation deadline') { throw "Expired $emptyCase discovery silently succeeded." }
+    }
+    $discoveryIniHash = (Get-FileHash -LiteralPath $ini -Algorithm SHA256).Hash
+    $externalJournalDirectory = Join-Path $fixture 'external-journal-evidence'
+    New-Item -ItemType Directory -Path $externalJournalDirectory -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $externalJournalDirectory 'outside.selected-profile.journal.json'), '{"phase":"selection-applied-uncommitted"}')
+    $externalDiscoveryHash = (Get-FileHash -LiteralPath (Join-Path $externalJournalDirectory 'outside.selected-profile.journal.json') -Algorithm SHA256).Hash
+    foreach ($hiddenDirectory in @($false, $true)) {
+        $evidenceLink = Join-Path $discoveryRoot 'unsafe-create-select'
+        try {
+            New-Item -ItemType Junction -Path $evidenceLink -Target $externalJournalDirectory -ErrorAction Stop | Out-Null
+            if ($hiddenDirectory) { [IO.File]::SetAttributes($evidenceLink, ([IO.File]::GetAttributes($evidenceLink) -bor [IO.FileAttributes]::Hidden)) }
+            $unsafeList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact -NoExit | ConvertFrom-Json
+            if ($unsafeList.ok -or $unsafeList.errors[0] -notmatch 'reparse point' -or
+                (Get-FileHash -LiteralPath $ini -Algorithm SHA256).Hash -cne $discoveryIniHash -or
+                (Get-FileHash -LiteralPath (Join-Path $externalJournalDirectory 'outside.selected-profile.journal.json') -Algorithm SHA256).Hash -cne $externalDiscoveryHash) {
+                throw "Visible/hidden reparse evidence directory was not refused without recovery changes ($hiddenDirectory)."
+            }
+        }
+        finally { if (Test-Path -LiteralPath $evidenceLink) { Remove-Item -LiteralPath $evidenceLink -Force } }
+    }
+    foreach ($rootCase in @('root', 'ancestor')) {
+        $alternateBase = Join-Path $fixture ("unsafe-$rootCase")
+        $alternateTarget = Join-Path $fixture ("unsafe-$rootCase-target")
+        New-Item -ItemType Directory -Path $alternateTarget -Force | Out-Null
+        $alternateConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+        if ($rootCase -eq 'root') {
+            New-Item -ItemType Directory -Path $alternateBase -Force | Out-Null
+            $rootLink = Join-Path $alternateBase 'workspaces'
+            $alternateConfig.storage.sessionStaging = $alternateBase
+        }
+        else {
+            New-Item -ItemType Directory -Path (Join-Path $alternateTarget 'sessions\workspaces') -Force | Out-Null
+            $rootLink = $alternateBase
+            $alternateConfig.storage.sessionStaging = Join-Path $alternateBase 'sessions'
+        }
+        $alternateConfig.session.lockFile = Join-Path $alternateConfig.storage.sessionStaging 'lock.json'
+        $alternateConfigPath = Join-Path $fixture ("unsafe-$rootCase-config.json")
+        $alternateConfig | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $alternateConfigPath -Encoding utf8
+        try {
+            New-Item -ItemType Junction -Path $rootLink -Target $alternateTarget -ErrorAction Stop | Out-Null
+            $unsafeList = & $entry list-task -ConfigPath $alternateConfigPath -TaskId $taskId -Compact -NoExit | ConvertFrom-Json
+            if ($unsafeList.ok -or $unsafeList.errors[0] -notmatch 'reparse point' -or
+                (Get-FileHash -LiteralPath $ini -Algorithm SHA256).Hash -cne $discoveryIniHash) { throw "Reparse control $rootCase was not refused before recovery." }
+        }
+        finally { if (Test-Path -LiteralPath $rootLink) { Remove-Item -LiteralPath $rootLink -Force } }
+    }
     $escapedSource = Join-Path $mo2 'outside'
     New-Item -ItemType Directory -Path $escapedSource -Force | Out-Null
     '+Loader' | Set-Content -LiteralPath (Join-Path $escapedSource 'modlist.txt') -Encoding utf8
@@ -191,13 +251,19 @@ try {
     if (@(Get-ChildItem -LiteralPath (Join-Path $mo2 'overwrite') -Directory -Recurse -Force | Where-Object Name -Match '^(?i:ShaderCache)(?:[.]|$)').Count -ne 0) { throw 'ShaderCache directories remained in overwrite after preparation.' }
     if ((Get-Content -LiteralPath (Join-Path $source 'modlist.txt') -Raw) -notmatch ('(?m)^\+' + [regex]::Escape([string]$prepared.data.modName) + '\r?$')) { throw 'Migrated shader-cache mod was not enabled in the stable source.' }
     foreach ($move in @($prepared.data.movedDirectories)) { if (-not (Test-Path -LiteralPath ([string]$move.destinationPath) -PathType Container)) { throw "Migrated ShaderCache destination is missing: $($move.destinationPath)" } }
-    $unqualifiedCreate = & $entry create -ConfigPath $unconfiguredPath -AccessId $accessId -TaskId $taskId -Label unqualified -SavePolicy MainMenuOnly -WorkspaceContent Modlist -Confirm:$false -NoExit | ConvertFrom-Json
-    if ($unqualifiedCreate.ok -or $unqualifiedCreate.errors[0] -notmatch 'valid default world-entry save') { throw 'Fresh creation did not reject an unqualified maintained source profile.' }
-    $missingFixtureCreate = & $entry create -ConfigPath $missingPath -AccessId $accessId -TaskId $taskId -Label missing-fixture -SavePolicy FreshGame -WorkspaceContent Modlist -Confirm:$false -NoExit | ConvertFrom-Json
-    if ($missingFixtureCreate.ok -or $missingFixtureCreate.errors[0] -notmatch 'valid default world-entry save') { throw 'Fresh creation did not reject a missing maintained world-entry fixture.' }
+    $unqualifiedCreate = & $entry create -ConfigPath $unconfiguredPath -AccessId $accessId -TaskId $taskId -Label unqualified -SavePolicy MainMenuOnly -WorkspaceContent Modlist -WhatIf -Confirm:$false -NoExit | ConvertFrom-Json
+    if (-not $unqualifiedCreate.ok -or $unqualifiedCreate.state -ne 'dry-run' -or $null -ne $unqualifiedCreate.data.worldEntryFixture -or -not [string]::IsNullOrWhiteSpace([string]$unqualifiedCreate.data.fixtureManifestPath)) { throw 'MainMenuOnly creation remained coupled to an unconfigured world-entry fixture.' }
+    $missingFixtureCreate = & $entry create -ConfigPath $missingPath -AccessId $accessId -TaskId $taskId -Label missing-fixture -SavePolicy FreshGame -WorkspaceContent Modlist -WhatIf -Confirm:$false -NoExit | ConvertFrom-Json
+    if (-not $missingFixtureCreate.ok -or $missingFixtureCreate.state -ne 'dry-run' -or $null -ne $missingFixtureCreate.data.worldEntryFixture) { throw 'FreshGame creation remained coupled to a missing world-entry fixture.' }
+    $missingVerifiedCreate = & $entry create -ConfigPath $missingPath -AccessId $accessId -TaskId $taskId -Label missing-verified-fixture -SavePolicy VerifiedFixture -WorkspaceContent Modlist -WhatIf -Confirm:$false -NoExit | ConvertFrom-Json
+    if ($missingVerifiedCreate.ok -or $missingVerifiedCreate.errors[0] -notmatch 'VerifiedFixture workspace creation requires a valid declared save') { throw 'VerifiedFixture creation did not reject a missing declared fixture.' }
     'stable-profile-drift' | Set-Content -LiteralPath (Join-Path $source 'fixture-drift.txt') -Encoding utf8
     $staleStatus = & $entry fixture-status -ConfigPath $configPath -Compact | ConvertFrom-Json
     if ($staleStatus.state -ne 'fixture-stale' -or $staleStatus.data.expectedProfileFingerprintSha256 -eq $staleStatus.data.actualProfileFingerprintSha256) { throw 'Fixture drift did not report expected and actual fingerprints.' }
+    $staleMainMenuPreview = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label stale-main-menu -SavePolicy MainMenuOnly -WorkspaceContent Modlist -WhatIf -Confirm:$false -NoExit | ConvertFrom-Json
+    if (-not $staleMainMenuPreview.ok -or $staleMainMenuPreview.state -ne 'dry-run' -or $null -ne $staleMainMenuPreview.data.worldEntryFixture) { throw 'MainMenuOnly creation was blocked by an unrelated stale fixture.' }
+    $staleVerifiedPreview = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label stale-verified -SavePolicy VerifiedFixture -WorkspaceContent Modlist -WhatIf -Confirm:$false -NoExit | ConvertFrom-Json
+    if ($staleVerifiedPreview.ok -or $staleVerifiedPreview.errors[0] -notmatch 'VerifiedFixture workspace creation requires a valid declared save') { throw 'VerifiedFixture creation did not remain fail-closed on fixture drift.' }
     $refreshedFixture = & $entry refresh-fixture -ConfigPath $configPath -AccessId $accessId -Confirm:$false -Compact | ConvertFrom-Json
     if (-not $refreshedFixture.ok -or -not $refreshedFixture.data.valid -or -not (Test-Path -LiteralPath $refreshedFixture.data.backupPath -PathType Leaf)) { throw 'Guarded fixture refresh did not preserve and verify the manifest.' }
     if ($refreshedFixture.data.approval.reusableApprovalEligible -or [string]::IsNullOrWhiteSpace([string]$refreshedFixture.data.approval.oneShotReason)) { throw 'Shared fixture replacement was not explicitly classified as a one-shot approval.' }
@@ -326,7 +392,19 @@ try {
     $preparedCache = & $catalogEntry prepare -CatalogRoot $catalogRoot -CachePath $created.data.runtimeOutput.cachePath -ProfilePath $created.data.modListPath -ModsPath $mods -BindToOverwrite -EvidenceDirectory $created.data.runtimeOutput.cacheEvidenceDirectory -BuildId $created.data.runtimeOutput.cachePrepareArguments.BuildId -ShaderCacheAbi $created.data.runtimeOutput.cachePrepareArguments.ShaderCacheAbi -WorkspaceId $created.data.workspaceId -OwnershipId $created.data.ownershipId -OwnerMarkerPath $created.data.runtimeOutput.ownerMarkerPath -OwnerMarkerSha256 $created.data.runtimeOutput.ownerMarkerSha256 -ShaderSourceSha256 $shaderSourceSha256 -RequireMaterializedOutput -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json
     $preparedIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
     if (-not $preparedCache.ok -or -not $preparedIsolation.ok -or -not $preparedIsolation.cachePlan.verification.ok -or [int]$preparedIsolation.cachePlan.verification.requiredProviderFiles -ne 2) { throw "Prepared Overwrite provider-shadow verification failed. Prepare: $($preparedCache | ConvertTo-Json -Depth 20 -Compress) Isolation: $($preparedIsolation | ConvertTo-Json -Depth 20 -Compress)" }
+    if ($RequalificationOnly) {
+        . (Join-Path $PSScriptRoot 'Test-OutputRequalification.inc.ps1')
+        return
+    }
     $cachePlanPath = [string]$created.data.runtimeOutput.cachePlanPath
+    if ($ConfigCustodyOnly) {
+        . (Join-Path $PSScriptRoot 'Test-ConfigCustody.inc.ps1')
+        return
+    }
+    if ($UnchangedCompletionOnly) {
+        . (Join-Path $PSScriptRoot 'Test-UnchangedCacheCompletion.inc.ps1')
+        return
+    }
     $cachePlanBytes = [IO.File]::ReadAllBytes($cachePlanPath)
     $malformedCachePlan = Get-Content -LiteralPath $cachePlanPath -Raw | ConvertFrom-Json -Depth 40
     $malformedCachePlan.PSObject.Properties.Remove('preparedTreeSha256')
@@ -416,12 +494,65 @@ try {
         (Get-FileHash -LiteralPath (Join-Path $runtimeBackupRoot 'hashes') -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath (Join-Path $synthesisMod 'backup\hashes') -Algorithm SHA256).Hash -or
         (Get-FileHash -LiteralPath (Join-Path $runtimeBackupRoot 'previous\shader.bin') -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath (Join-Path $synthesisMod 'backup\previous\shader.bin') -Algorithm SHA256).Hash) { throw 'Backup completion did not restore the exact pre-task MO2 Overwrite tree.' }
     if (Test-Path -LiteralPath $created.data.runtimeOutput.cachePath -PathType Container) { throw 'Cache completion did not restore the migrated ShaderCache tree to an absent Overwrite state.' }
+    $completedManifestPath = Join-Path (Join-Path $sessions 'workspaces') ($created.data.workspaceId + '.json')
+    $completedBackupPlan = Get-Content -LiteralPath ([string]$created.data.runtimeOutput.backupPlanPath) -Raw | ConvertFrom-Json -Depth 40
+    $completedCacheReceipt = Get-Content -LiteralPath ([string]$created.data.runtimeOutput.cacheCompletionPath) -Raw | ConvertFrom-Json -Depth 40
+    $completedBackupReceipt = Get-Content -LiteralPath ([string]$created.data.runtimeOutput.backupCompletionPath) -Raw | ConvertFrom-Json -Depth 40
+    $completionTamperCases = @(
+        [pscustomobject]@{ label='cache-completion-plan'; kind='json'; path=[string]$created.data.runtimeOutput.cacheCompletionPath },
+        [pscustomobject]@{ label='backup-completion-plan'; kind='json'; path=[string]$created.data.runtimeOutput.backupCompletionPath },
+        [pscustomobject]@{ label='backup-completion-cache-transaction'; kind='json'; path=[string]$created.data.runtimeOutput.backupCompletionPath },
+        [pscustomobject]@{ label='backup-plan-restored-baseline'; kind='json'; path=[string]$created.data.runtimeOutput.backupPlanPath },
+        [pscustomobject]@{ label='backup-snapshot-lineage'; kind='json'; path=[string]$completedBackupPlan.transactionReceiptPath },
+        [pscustomobject]@{ label='backup-restore-lineage'; kind='json'; path=[string]$completedBackupPlan.restoreReceiptPath },
+        [pscustomobject]@{ label='cache-preserved-tree'; kind='tree'; path=[string]$completedCacheReceipt.workingTree.preservedPath },
+        [pscustomobject]@{ label='backup-preserved-tree'; kind='tree'; path=[string]$completedBackupReceipt.preservedPath },
+        [pscustomobject]@{ label='live-backup-tree'; kind='tree'; path=$runtimeBackupRoot }
+    )
+    foreach ($tamperCase in $completionTamperCases) {
+        $tamperTarget = [string]$tamperCase.path
+        $tamperBytes = if ([string]$tamperCase.kind -eq 'json') { [IO.File]::ReadAllBytes($tamperTarget) } else { $null }
+        $tamperFile = if ([string]$tamperCase.kind -eq 'tree') { Join-Path $tamperTarget ('.completion-tamper-' + [string]$tamperCase.label) } else { $null }
+        $manifestBeforeTamper = (Get-FileHash -LiteralPath $completedManifestPath -Algorithm SHA256).Hash
+        $profileBeforeTamper = (Get-FileHash -LiteralPath ([string]$created.data.modListPath) -Algorithm SHA256).Hash
+        $iniBeforeTamper = (Get-FileHash -LiteralPath $ini -Algorithm SHA256).Hash
+        try {
+            if ([string]$tamperCase.kind -eq 'tree') {
+                'tamper' | Set-Content -LiteralPath $tamperFile -Encoding utf8
+            }
+            else {
+                $tampered = Get-Content -LiteralPath $tamperTarget -Raw | ConvertFrom-Json -Depth 40
+                switch ([string]$tamperCase.label) {
+                    'cache-completion-plan' { $tampered.planPath = [string]$tampered.planPath + '.wrong' }
+                    'backup-completion-plan' { $tampered.backupPlanPath = [string]$tampered.backupPlanPath + '.wrong' }
+                    'backup-completion-cache-transaction' { $tampered.cachePlanTransactionId = 'tampered-cache-transaction' }
+                    'backup-plan-restored-baseline' { $tampered.restoredTreeSha256 = ('0' * 64) }
+                    'backup-snapshot-lineage' { $tampered.transactionId = 'tampered-snapshot-transaction' }
+                    'backup-restore-lineage' { $tampered.snapshotTransactionId = 'tampered-snapshot-transaction' }
+                }
+                $tampered | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $tamperTarget -Encoding utf8
+            }
+            $tamperedList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
+            $tamperedWorkspace = @($tamperedList.data.unavailableWorkspaces | Where-Object workspaceId -eq $created.data.workspaceId)[0]
+            if ($null -eq $tamperedWorkspace -or $tamperedWorkspace.resumable -or [string]$tamperedWorkspace.resumeBlockReason -notmatch '^runtime-output-completion-invalid:' -or
+                ((Get-FileHash -LiteralPath $completedManifestPath -Algorithm SHA256).Hash -cne $manifestBeforeTamper) -or
+                ((Get-FileHash -LiteralPath ([string]$created.data.modListPath) -Algorithm SHA256).Hash -cne $profileBeforeTamper) -or
+                ((Get-FileHash -LiteralPath $ini -Algorithm SHA256).Hash -cne $iniBeforeTamper) -or
+                (Test-Path -LiteralPath ([string]$created.data.runtimeOutput.ownerMarkerPath))) {
+                throw "Completion tamper '$($tamperCase.label)' was not classified unavailable before mutation."
+            }
+        }
+        finally {
+            if ($null -ne $tamperBytes) { [IO.File]::WriteAllBytes($tamperTarget, $tamperBytes) }
+            elseif (Test-Path -LiteralPath $tamperFile) { Remove-Item -LiteralPath $tamperFile -Force }
+        }
+    }
     $createdModList = Get-Content -LiteralPath $created.data.modListPath -Raw
     if ($created.data.runtimeRoute.id -ne 'SteamVRNull' -or $created.data.runtimeRouteApplication.state -ne 'incompatible-providers-disabled' -or $created.data.runtimeRouteAdmission.state -ne 'qualified' -or $createdModList -notmatch '(?m)^-OpenComposite Runtime Provider\r?$') { throw 'Fresh SteamVRNull workspace did not disable and qualify the inherited OCU provider.' }
     $ordinaryCopied = Join-Path $created.data.profilePath 'saves\ordinary.ess'
     if (-not (Test-Path -LiteralPath $ordinaryCopied -PathType Leaf) -or (Get-FileHash -LiteralPath $ordinaryCopied -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath (Join-Path $source 'saves\ordinary.ess') -Algorithm SHA256).Hash) { throw 'Workspace did not copy the complete stable-source saves tree.' }
     if (-not $created.data.inheritedSaves -or $created.data.sourceSaveSnapshot.sha256 -ne $created.data.profileSaveSnapshot.sha256 -or $created.data.sourceSaveSnapshot.fileCount -ne 3) { throw 'Workspace did not report a verified inherited-save snapshot.' }
-    if (-not $created.data.copiedWorldEntrySave -or -not $created.data.sourceIntegrity.integrityVerified -or $created.data.sourceIntegrity.runtimeQualified -or [string]::IsNullOrWhiteSpace([string]$created.data.sourceIntegrity.cloneVerifiedUtc) -or $null -ne $created.data.sourceIntegrity.runtimeQualificationEvidence -or $created.data.worldEntryFixture.id -ne 'interior' -or $null -ne $created.data.saveFixture) { throw 'Ordinary fresh creation did not preserve the integrity-verified world-entry baseline independently of SavePolicy.' }
+    if ($created.data.copiedWorldEntrySave -or -not $created.data.sourceIntegrity.integrityVerified -or $created.data.sourceIntegrity.runtimeQualified -or [string]::IsNullOrWhiteSpace([string]$created.data.sourceIntegrity.cloneVerifiedUtc) -or $null -ne $created.data.sourceIntegrity.runtimeQualificationEvidence -or $null -ne $created.data.sourceIntegrity.fixtureId -or $null -ne $created.data.worldEntryFixture -or $null -ne $created.data.saveFixture) { throw 'FreshGame creation did not retain source-tree integrity while remaining independent of world-entry fixture authorization.' }
     $createdModList = Get-Content -LiteralPath $created.data.modListPath -Raw
     if ($created.data.localWorkMods.workspaceContent -ne 'Modlist' -or @($created.data.localWorkMods.requestedIds).Count -ne 0 -or $createdModList -notmatch '(?m)^-\[NoDelete\] CSX AIO Local Release\r?$' -or $createdModList -notmatch '(?m)^-\[NoDelete\] CSX AIO Local DevBench\r?$') { throw 'Modlist workspace did not disable every optional CSX AIO candidate.' }
     $workspaceControlRoot = Join-Path $sessions 'workspaces'
@@ -559,15 +690,145 @@ try {
     $partialManifest = Join-Path $workspaceControlRoot 'interrupted-create.workspace.json'
     $partialJournal = Join-Path $workspaceControlRoot 'interrupted-create.creation.journal.json'
     [ordered]@{contractVersion='2.0.0';operation='create';phase='profile-copy-uncommitted';workspaceId='interrupted-create';ownershipId='interrupted-owner';profilePath=$partialProfile;manifestPath=$partialManifest} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $partialJournal -Encoding utf8
+    $externalOperationJournal = Join-Path $fixture 'external-operation-journal.json'
+    Move-Item -LiteralPath $partialJournal -Destination $externalOperationJournal
+    $externalOperationHash = (Get-FileHash -LiteralPath $externalOperationJournal -Algorithm SHA256).Hash
+    $journalFileLinkTestsAvailable = $true
+    try {
+        try { New-Item -ItemType SymbolicLink -Path $partialJournal -Target $externalOperationJournal -ErrorAction Stop | Out-Null }
+        catch {
+            if ($_.Exception.Message -notmatch 'Administrator privilege required') { throw }
+            $journalFileLinkTestsAvailable = $false
+        }
+        if ($journalFileLinkTestsAvailable) {
+            $linkedList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact -NoExit | ConvertFrom-Json
+            if ($linkedList.ok -or $linkedList.errors[0] -notmatch 'reparse point' -or
+                -not (Test-Path -LiteralPath $partialProfile) -or
+                (Get-FileHash -LiteralPath $externalOperationJournal -Algorithm SHA256).Hash -cne $externalOperationHash) { throw 'Operation journal file link drove recovery or altered external evidence.' }
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $partialJournal) { Remove-Item -LiteralPath $partialJournal -Force }
+        Move-Item -LiteralPath $externalOperationJournal -Destination $partialJournal
+    }
+    # Execute the production resolver definitions in an isolated metadata fixture.
+    # This always runs, including hosts unable to create actual file symlinks.
+    $workspaceAst = [Management.Automation.Language.Parser]::ParseFile($entry, [ref]$null, [ref]$null)
+    $guardNames = @('Assert-NoWorkspaceReparsePoint', 'Resolve-SelectedProfileJournal', 'Resolve-PendingWorkspaceJournal')
+    $guardText = @($workspaceAst.FindAll({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $guardNames
+    }, $true) | ForEach-Object { $_.Extent.Text }) -join "`n"
+    $guardModule = New-Module -ArgumentList $guardText -ScriptBlock {
+        param($SourceFunctions)
+        $script:journalReads = 0
+        function Get-Item { param($LiteralPath, [switch]$Force, $ErrorAction)
+            [pscustomobject]@{ Attributes = [IO.FileAttributes]::ReparsePoint; FullName = $LiteralPath }
+        }
+        function Get-Content { $script:journalReads++; throw 'Journal content must not be read.' }
+        . ([scriptblock]::Create($SourceFunctions))
+        Export-ModuleMember -Function @()
+    }
+    $leafGuardResult = & $guardModule {
+        $rejected = 0
+        foreach ($resolver in @('Resolve-SelectedProfileJournal', 'Resolve-PendingWorkspaceJournal')) {
+            try { & $resolver -Config @{} -JournalPath 'fixture-reparse-journal.json' }
+            catch { if ($_.Exception.Message -match 'reparse point') { $rejected++ } else { throw } }
+        }
+        [pscustomobject]@{ rejected = $rejected; reads = $script:journalReads }
+    }
+    if ($leafGuardResult.rejected -ne 2 -or $leafGuardResult.reads -ne 0) { throw 'Production recovery resolvers consumed reparse journal authority before qualification.' }
+    Remove-Module -ModuleInfo $guardModule -Force
+    [IO.File]::SetAttributes($partialJournal, ([IO.File]::GetAttributes($partialJournal) -bor [IO.FileAttributes]::Hidden))
+    $expiredJournalList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -InternalTestFailurePoint tree-operation-deadline -Compact -NoExit | ConvertFrom-Json
+    if ($expiredJournalList.ok -or $expiredJournalList.errors[0] -notmatch 'shared .*tree-operation deadline' -or -not (Test-Path -LiteralPath $partialProfile)) { throw "Expired nonempty discovery changed pending recovery state: $($expiredJournalList | ConvertTo-Json -Depth 8 -Compress); profileExists=$(Test-Path -LiteralPath $partialProfile)" }
     $recoveryList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
     $partialJournalResult = Get-Content -LiteralPath $partialJournal -Raw | ConvertFrom-Json
     if (-not $recoveryList.ok -or (Test-Path -LiteralPath $partialProfile) -or (Test-Path -LiteralPath $partialManifest) -or $partialJournalResult.phase -ne 'rolled-back') { throw 'Startup recovery did not remove and terminally record an interrupted workspace creation.' }
+    # Earlier recovery fixtures intentionally reuse and remove the shared backup
+    # path. Re-establish the completed workspace's exact restored baseline before
+    # testing that unrelated deep payloads do not consume discovery budgets.
+    if (Test-Path -LiteralPath $runtimeBackupRoot) { Remove-Item -LiteralPath $runtimeBackupRoot -Recurse -Force }
+    New-Item -ItemType Directory -Path (Join-Path $runtimeBackupRoot 'previous') -Force | Out-Null
+    'pre-task-overwrite-backup' | Set-Content -LiteralPath (Join-Path $runtimeBackupRoot 'preexisting.bin') -Encoding utf8
+    Copy-Item -LiteralPath (Join-Path $synthesisMod 'backup\hashes') -Destination (Join-Path $runtimeBackupRoot 'hashes') -Force
+    Copy-Item -LiteralPath (Join-Path $synthesisMod 'backup\previous\shader.bin') -Destination (Join-Path $runtimeBackupRoot 'previous\shader.bin') -Force
+    $unrelatedPayload = Join-Path $workspaceControlRoot 'unrelated-output-evidence\preserved-cache'
+    New-Item -ItemType Directory -Path $unrelatedPayload -Force | Out-Null
+    foreach ($index in 1..101) { [IO.File]::WriteAllBytes((Join-Path $unrelatedPayload ("payload-$index.bin")), [byte[]]$index) }
+    $boundedList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -MaxProfileFiles 100 -Compact | ConvertFrom-Json
+    if (-not $boundedList.ok -or $boundedList.data.count -ne 1 -or $boundedList.data.workspaces[0].workspaceId -ne $created.data.workspaceId) { throw "Exact list-task was gated by unrelated workspace payload volume: $($boundedList | ConvertTo-Json -Depth 12 -Compress)" }
+    $legacyWorkspaceId = 'workspace-legacy-runtime-output-fixture'
+    $legacyProfileName = 'Codex Task - ' + $legacyWorkspaceId
+    $legacyProfilePath = Join-Path $profiles $legacyProfileName
+    New-Item -ItemType Directory -Path $legacyProfilePath -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $legacyProfilePath 'modlist.txt'), "+Legacy Owned Mod`r`n")
+    $legacyManifestPath = Join-Path $workspaceControlRoot ($legacyWorkspaceId + '.json')
+    $legacyManifest = $created.data | ConvertTo-Json -Depth 80 | ConvertFrom-Json -Depth 80
+    $legacyManifest.workspaceId = $legacyWorkspaceId
+    $legacyManifest.profile = $legacyProfileName
+    $legacyManifest.profileName = $legacyProfileName
+    $legacyManifest.profilePath = $legacyProfilePath
+    $legacyManifest.status = 'retained'
+    $legacyManifest.PSObject.Properties.Remove('runtimeOutput')
+    $legacyManifest | ConvertTo-Json -Depth 80 | Set-Content -LiteralPath $legacyManifestPath -Encoding utf8
+    $legacyJournalPath = Join-Path $workspaceControlRoot ($legacyWorkspaceId + '.creation.journal.json')
+    [ordered]@{ contractVersion='2.0.0'; operation='create'; phase='committed'; workspaceId=$legacyWorkspaceId; ownershipId=[string]$legacyManifest.ownershipId; profilePath=$legacyProfilePath; manifestPath=$legacyManifestPath } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $legacyJournalPath -Encoding utf8
+    $legacyList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
+    $legacyUnavailable = @($legacyList.data.unavailableWorkspaces | Where-Object workspaceId -eq $legacyWorkspaceId)
+    if ($legacyList.data.count -ne 1 -or $legacyUnavailable.Count -ne 1 -or $legacyUnavailable[0].resumable -or $legacyUnavailable[0].runtimeOutputCompatible -or $legacyUnavailable[0].resumeBlockReason -ne 'legacy-runtime-output-contract-missing') { throw 'Legacy workspace without runtimeOutput was advertised as resumable or lacked its explicit compatibility reason.' }
+    $legacyIniBefore = [IO.File]::ReadAllBytes($ini)
+    $legacyProfileBefore = (Get-FileHash -LiteralPath (Join-Path $legacyProfilePath 'modlist.txt') -Algorithm SHA256).Hash
+    $legacyManifestBefore = (Get-FileHash -LiteralPath $legacyManifestPath -Algorithm SHA256).Hash
+    $legacyResume = & $entry resume -ConfigPath $configPath -AccessId 'fixture-unused-access' -TaskId $taskId -WorkspaceId $legacyWorkspaceId -Confirm:$false -Compact -NoExit | ConvertFrom-Json
+    if ($legacyResume.ok -or $legacyResume.errors[0] -notmatch 'legacy-runtime-output-contract-missing' -or
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($ini)) -cne [Convert]::ToBase64String($legacyIniBefore) -or
+        (Get-FileHash -LiteralPath (Join-Path $legacyProfilePath 'modlist.txt') -Algorithm SHA256).Hash -cne $legacyProfileBefore -or
+        (Get-FileHash -LiteralPath $legacyManifestPath -Algorithm SHA256).Hash -cne $legacyManifestBefore) {
+        throw 'Legacy workspace resume did not fail before mutation with its profile, manifest, and MO2 selection retained.'
+    }
+    $unavailableOnlyTaskId = 'codex-unavailable-only-task'
+    $malformedOwnedManifestPath = Join-Path $workspaceControlRoot 'malformed-owned-workspace.json'
+    [IO.File]::WriteAllText($malformedOwnedManifestPath, '{"ownerTaskId":"' + $unavailableOnlyTaskId + '","workspaceId":"malformed-owned-workspace",', [Text.UTF8Encoding]::new($false))
+    $malformedOwnedHash = (Get-FileHash -LiteralPath $malformedOwnedManifestPath -Algorithm SHA256).Hash
+    $unavailableOnlyIniHash = (Get-FileHash -LiteralPath $ini -Algorithm SHA256).Hash
+    $unavailableOnlyList = & $entry list-task -ConfigPath $configPath -TaskId $unavailableOnlyTaskId -Compact | ConvertFrom-Json
+    if (-not $unavailableOnlyList.ok -or $unavailableOnlyList.state -ne 'retained-workspaces-unavailable' -or
+        [int]$unavailableOnlyList.data.count -ne 0 -or @($unavailableOnlyList.data.unavailableWorkspaces).Count -ne 1 -or
+        [string]$unavailableOnlyList.data.unavailableWorkspaces[0].resumeBlockReason -notmatch '^manifest-invalid:' -or
+        [string]$unavailableOnlyList.data.guidance -notmatch 'do not create a replacement' -or
+        (Get-FileHash -LiteralPath $malformedOwnedManifestPath -Algorithm SHA256).Hash -cne $malformedOwnedHash -or
+        (Get-FileHash -LiteralPath $ini -Algorithm SHA256).Hash -cne $unavailableOnlyIniHash) {
+        throw "Malformed task-owned state was hidden behind fresh-create guidance: $($unavailableOnlyList | ConvertTo-Json -Depth 12 -Compress)"
+    }
+    Remove-Item -LiteralPath $malformedOwnedManifestPath -Force
     $selectionJournalPath = [string]$created.data.selectedProfileTransaction.journalPath
     $selectionReceiptPath = [string]$created.data.selectedProfileTransaction.receiptPath
     $interruptedSelection = Get-Content -LiteralPath $selectionJournalPath -Raw | ConvertFrom-Json
     $interruptedSelection.phase = 'selection-applied-uncommitted'
     $interruptedSelection | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $selectionJournalPath -Encoding utf8
     Remove-Item -LiteralPath $selectionReceiptPath -Force
+    $externalSelectionJournal = Join-Path $fixture 'external-selection-journal.json'
+    Move-Item -LiteralPath $selectionJournalPath -Destination $externalSelectionJournal
+    $externalSelectionHash = (Get-FileHash -LiteralPath $externalSelectionJournal -Algorithm SHA256).Hash
+    $selectionIniHash = (Get-FileHash -LiteralPath $ini -Algorithm SHA256).Hash
+    try {
+        if ($journalFileLinkTestsAvailable) {
+            New-Item -ItemType SymbolicLink -Path $selectionJournalPath -Target $externalSelectionJournal -ErrorAction Stop | Out-Null
+            $linkedList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact -NoExit | ConvertFrom-Json
+            if ($linkedList.ok -or $linkedList.errors[0] -notmatch 'reparse point' -or
+                (Test-Path -LiteralPath $selectionReceiptPath) -or
+                (Get-FileHash -LiteralPath $ini -Algorithm SHA256).Hash -cne $selectionIniHash -or
+                (Get-FileHash -LiteralPath $externalSelectionJournal -Algorithm SHA256).Hash -cne $externalSelectionHash) { throw 'Selected-profile journal file link drove recovery or altered external/pre-state evidence.' }
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $selectionJournalPath) { Remove-Item -LiteralPath $selectionJournalPath -Force }
+        Move-Item -LiteralPath $externalSelectionJournal -Destination $selectionJournalPath
+    }
+    [IO.File]::SetAttributes($selectionJournalPath, ([IO.File]::GetAttributes($selectionJournalPath) -bor [IO.FileAttributes]::Hidden))
+    $selectionEvidenceDirectory = Split-Path -Parent $selectionJournalPath
+    [IO.File]::SetAttributes($selectionEvidenceDirectory, ([IO.File]::GetAttributes($selectionEvidenceDirectory) -bor [IO.FileAttributes]::Hidden))
+    Remove-Item -LiteralPath $runtimeBackupRoot -Recurse -Force
     $localWorkIdsPath = Join-Path $fixture 'requested-local-work-mods.json'
     '["csx-aio-local-devbench"]' | Set-Content -LiteralPath $localWorkIdsPath -Encoding utf8
     $verified = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label verified -SavePolicy VerifiedFixture -WorkspaceContent ModlistPlusLocalWorkMods -LocalWorkModIdsFile $localWorkIdsPath -Confirm:$false | ConvertFrom-Json
@@ -587,7 +848,7 @@ try {
     'verified-generated-cache' | Set-Content -LiteralPath (Join-Path $verified.data.runtimeOutput.cachePath 'verified-generated.pso') -Encoding utf8
     $verifiedCompletedCache = & $catalogEntry complete -CatalogRoot $catalogRoot -CachePath $verified.data.runtimeOutput.cachePath -EvidenceDirectory $verified.data.runtimeOutput.cacheEvidenceDirectory -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json
     $verifiedCompletedOutput = & $entry complete-output -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $verified.data.workspaceId -Confirm:$false | ConvertFrom-Json
-    if (-not $verifiedPreparedCache.ok -or -not $verifiedCompletedCache.ok -or -not $verifiedCompletedOutput.ok) { throw 'Verified fixture workspace output transactions did not complete.' }
+    if (-not $verifiedPreparedCache.ok -or -not $verifiedCompletedCache.ok -or -not $verifiedCompletedOutput.ok) { throw "Verified fixture workspace output transactions did not complete. Prepare=$($verifiedPreparedCache | ConvertTo-Json -Depth 12 -Compress) Cache=$($verifiedCompletedCache | ConvertTo-Json -Depth 12 -Compress) Output=$($verifiedCompletedOutput | ConvertTo-Json -Depth 12 -Compress)" }
     if ((Test-Path -LiteralPath $verified.data.runtimeOutput.cachePath) -or (Test-Path -LiteralPath $verified.data.runtimeOutput.backupPath)) { throw 'Completion did not restore both originally absent Overwrite trees to absence.' }
     foreach ($mixedCase in @(
         [pscustomobject]@{ label = 'backup-present'; cachePresent = $false; backupPresent = $true; invalidRestore = $false; hiddenConflict = $false },
@@ -693,22 +954,81 @@ try {
     $preexisting = & $entry register-mod -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -ModName Loader -ModDirectory $loaderMod -NoExit -Confirm:$false | ConvertFrom-Json
     if ($preexisting.ok) { throw 'Workspace claimed a pre-existing mod.' }
     'retained-profile-state' | Set-Content -LiteralPath (Join-Path $created.data.profilePath 'task-state.txt') -Encoding utf8
+    $activeFixtureCache = Join-Path $mo2 'overwrite\ShaderCache'
+    if (Test-Path -LiteralPath $activeFixtureCache) { Remove-Item -LiteralPath $activeFixtureCache -Recurse -Force }
+    $activeRetained = & $entry create -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -Label active-retained -SavePolicy FreshGame -WorkspaceContent Modlist -Confirm:$false | ConvertFrom-Json
+    if (-not $activeRetained.ok -or -not (Test-Path -LiteralPath ([string]$activeRetained.data.runtimeOutput.ownerMarkerPath) -PathType Leaf)) { throw "Active-output retained workspace fixture was not created with its exact owner marker: $($activeRetained | ConvertTo-Json -Depth 20 -Compress)" }
     $unsafeRelease = & $entry release -ConfigPath $configPath -AccessId $accessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -NoExit -Confirm:$false | ConvertFrom-Json
     if ($unsafeRelease.ok -or $unsafeRelease.errors[0] -notmatch 'explicit retire only after direction to discard or replace' -or $unsafeRelease.errors[0] -match 'finished workspace' -or -not (Test-Path -LiteralPath $created.data.profilePath) -or -not (Test-Path -LiteralPath (Join-Path $created.data.profilePath 'task-state.txt'))) { throw 'Deprecated workspace release did not fail closed with explicit-discard guidance while preserving retained task state.' }
     $listed = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
-    if (-not $listed.ok -or $listed.data.count -ne 2) { throw 'Task workspace discovery did not list both retained profiles.' }
-    $listedModlist = @($listed.data.workspaces | Where-Object workspaceId -eq $created.data.workspaceId)[0]
-    $listedDevBench = @($listed.data.workspaces | Where-Object workspaceId -eq $verified.data.workspaceId)[0]
+    if (-not $listed.ok -or $listed.data.count -ne 1) { throw "Task workspace discovery did not isolate the one currently resumable active-output profile: $($listed | ConvertTo-Json -Depth 20 -Compress)" }
+    $allListed = @($listed.data.workspaces) + @($listed.data.unavailableWorkspaces)
+    $listedModlist = @($allListed | Where-Object workspaceId -eq $created.data.workspaceId)[0]
+    $listedDevBench = @($allListed | Where-Object workspaceId -eq $verified.data.workspaceId)[0]
+    $listedActive = @($listed.data.workspaces | Where-Object workspaceId -eq $activeRetained.data.workspaceId)[0]
     if ($listedModlist.workspaceContent -ne 'Modlist' -or @($listedModlist.selectedLocalWorkModIds).Count -ne 0 -or $listedDevBench.workspaceContent -ne 'ModlistPlusLocalWorkMods' -or @($listedDevBench.selectedLocalWorkModIds)[0] -ne 'csx-aio-local-devbench') { throw 'Retained workspace discovery did not expose each original local-work selection.' }
+    if ($listedModlist.resumeBlockReason -ne 'runtime-output-owned-by-other-workspace' -or $listedDevBench.resumeBlockReason -ne 'runtime-output-owned-by-other-workspace') { throw 'Completed workspaces were not explicitly blocked behind the exact active Overwrite owner.' }
+    if (-not $listedActive.resumable -or $listedActive.resumeDisposition -ne 'rebind-active-output' -or -not $listedActive.activeOutputRecoveryRequired) { throw 'Exact retained active-output ownership was not advertised with its bounded rebind transition.' }
+    $activeMarkerPath = [string]$activeRetained.data.runtimeOutput.ownerMarkerPath
+    $activeMarkerBytes = [IO.File]::ReadAllBytes($activeMarkerPath)
+    Add-Content -LiteralPath $activeMarkerPath -Value 'foreign-marker-drift' -Encoding utf8
+    $invalidMarkerList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
+    $invalidActive = @($invalidMarkerList.data.unavailableWorkspaces | Where-Object workspaceId -eq $activeRetained.data.workspaceId)[0]
+    if ($null -eq $invalidActive -or $invalidActive.resumable -or $invalidActive.resumeBlockReason -ne 'runtime-output-owner-marker-invalid') { throw 'Changed retained owner-marker bytes were still advertised as resumable.' }
+    [IO.File]::WriteAllBytes($activeMarkerPath, $activeMarkerBytes)
     $releasedAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $accessId
     if (-not $releasedAccess.ok -or -not (Test-Path -LiteralPath $created.data.profilePath)) { throw 'Yielding MO2 access did not preserve the retained task profile.' }
     $laterSharedMod = Join-Path $mods 'Later Shared Mod'; New-Item -ItemType Directory -Path $laterSharedMod -Force | Out-Null
     $nextAccess = Invoke-MO2RequestAccess -Config $config -Label fixture-resume -RuntimeRoute SteamVRNull; $nextAccessId = [string]$nextAccess.data.access.accessId
     $wrongOwner = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId 'different-task' -WorkspaceId $created.data.workspaceId -NoExit -Confirm:$false | ConvertFrom-Json
     if ($wrongOwner.ok -or $wrongOwner.errors[0] -notmatch 'different task') { throw 'A different task identity was allowed to resume the retained workspace.' }
+    $activeBackupPlanHashBefore = (Get-FileHash -LiteralPath ([string]$activeRetained.data.runtimeOutput.backupPlanPath) -Algorithm SHA256).Hash
+    $reboundActive = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $activeRetained.data.workspaceId -Confirm:$false | ConvertFrom-Json
+    $activeRebindChecks = [ordered]@{
+        ok = [bool]$reboundActive.ok
+        access = [string]$reboundActive.data.accessId -ceq $nextAccessId
+        disposition = [string]$reboundActive.data.lastResumeDisposition -ceq 'rebind-active-output'
+        markerPath = [string]$reboundActive.data.runtimeOutput.ownerMarkerPath -ceq [string]$activeRetained.data.runtimeOutput.ownerMarkerPath
+        markerIdentity = [string]$reboundActive.data.runtimeOutput.ownerMarkerSha256 -ceq [string]$activeRetained.data.runtimeOutput.ownerMarkerSha256
+        cacheEvidence = [string]$reboundActive.data.runtimeOutput.cacheEvidenceDirectory -ceq [string]$activeRetained.data.runtimeOutput.cacheEvidenceDirectory
+        backupEvidence = [string]$reboundActive.data.runtimeOutput.backupEvidenceDirectory -ceq [string]$activeRetained.data.runtimeOutput.backupEvidenceDirectory
+        backupPlan = (Get-FileHash -LiteralPath ([string]$reboundActive.data.runtimeOutput.backupPlanPath) -Algorithm SHA256).Hash -ceq $activeBackupPlanHashBefore
+        history = (-not $reboundActive.data.PSObject.Properties['runtimeOutputHistory'] -or @($reboundActive.data.runtimeOutputHistory).Count -eq 0)
+        liveMarker = (Get-FileHash -LiteralPath $activeMarkerPath -Algorithm SHA256).Hash -ceq [string]$activeRetained.data.runtimeOutput.ownerMarkerSha256
+    }
+    $failedActiveRebindChecks = @($activeRebindChecks.Keys | Where-Object { -not $activeRebindChecks[$_] })
+    if ($failedActiveRebindChecks.Count -gt 0) { throw "Active runtime-output transaction failed unchanged-rebind checks: $($failedActiveRebindChecks -join ', ')." }
+    $activeResumeJournal = Get-ChildItem -LiteralPath $workspaceControlRoot -Filter ($activeRetained.data.workspaceId + '.resume.*.journal.json') -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1 | Get-Content -Raw | ConvertFrom-Json
+    if ($activeResumeJournal.phase -ne 'committed' -or $activeResumeJournal.runtimeOutputRebind.state -ne 'validated' -or
+        [string]$activeResumeJournal.runtimeOutputRebind.transactionIdentity -cne [string]$activeRetained.data.runtimeOutput.ownerMarkerSha256 -or
+        [string]$activeResumeJournal.runtimeOutputRebind.priorAccessId -cne $accessId -or [string]$activeResumeJournal.runtimeOutputRebind.targetAccessId -cne $nextAccessId) {
+        throw 'Committed active-output resume did not retain exact transaction-lineage and access-rebind evidence.'
+    }
+    Complete-RearmedTestOutput -Workspace $reboundActive -OwnedAccessId $nextAccessId
+    $completedActiveManifest = Get-Content -LiteralPath (Join-Path $workspaceControlRoot ($activeRetained.data.workspaceId + '.json')) -Raw | ConvertFrom-Json -Depth 40
+    $cacheCompletionPath = [string]$completedActiveManifest.runtimeOutput.cacheCompletionPath
+    $hiddenCacheCompletionPath = $cacheCompletionPath + '.missing-fixture'
+    Move-Item -LiteralPath $cacheCompletionPath -Destination $hiddenCacheCompletionPath
+    try {
+        $missingCompletionList = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
+        $missingCompletionWorkspace = @($missingCompletionList.data.unavailableWorkspaces | Where-Object workspaceId -eq $activeRetained.data.workspaceId)[0]
+        if ($null -eq $missingCompletionWorkspace -or $missingCompletionWorkspace.resumable -or [string]$missingCompletionWorkspace.resumeBlockReason -notmatch 'runtime-output-completion-missing: cacheCompletionPath') {
+            throw 'A completed workspace with one missing completion receipt was still advertised as resumable.'
+        }
+    }
+    finally {
+        Move-Item -LiteralPath $hiddenCacheCompletionPath -Destination $cacheCompletionPath
+    }
+    $retiredActive = & $entry retire -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $activeRetained.data.workspaceId -Confirm:$false | ConvertFrom-Json
+    if (-not $retiredActive.ok -or (Test-Path -LiteralPath ([string]$activeRetained.data.profilePath))) { throw 'Completed active-output recovery fixture did not retire cleanly.' }
+    if (Test-Path -LiteralPath $runtimeBackupRoot) { Remove-Item -LiteralPath $runtimeBackupRoot -Recurse -Force }
+    New-Item -ItemType Directory -Path (Join-Path $runtimeBackupRoot 'previous') -Force | Out-Null
+    'pre-task-overwrite-backup' | Set-Content -LiteralPath (Join-Path $runtimeBackupRoot 'preexisting.bin') -Encoding utf8
+    Copy-Item -LiteralPath (Join-Path $synthesisMod 'backup\hashes') -Destination (Join-Path $runtimeBackupRoot 'hashes') -Force
+    Copy-Item -LiteralPath (Join-Path $synthesisMod 'backup\previous\shader.bin') -Destination (Join-Path $runtimeBackupRoot 'previous\shader.bin') -Force
     $overwriteBeforeInterruptedResume = Get-TestProfileFingerprint (Join-Path $mo2 'overwrite')
-    & $powerShell -NoProfile -NonInteractive -File $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -InternalTestFailurePoint resume-interrupt-after-output-rearm -Confirm:$false -NoExit | Out-Null
-    if ($LASTEXITCODE -ne 91) { throw 'Interrupted resume fixture did not terminate after publishing recoverable output-rearm evidence.' }
+    $interruptedResumeOutput = (& $powerShell -NoProfile -NonInteractive -File $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -InternalTestFailurePoint resume-interrupt-after-output-rearm -Confirm:$false -NoExit | Out-String)
+    if ($LASTEXITCODE -ne 91) { throw "Interrupted resume fixture did not terminate after publishing recoverable output-rearm evidence. Exit=$LASTEXITCODE Output=$interruptedResumeOutput" }
     & $powerShell -NoProfile -NonInteractive -File $entry list-task -ConfigPath $configPath -TaskId $taskId -InternalTestFailurePoint resume-recovery-interrupt-after-owner-release -Compact -NoExit | Out-Null
     if ($LASTEXITCODE -ne 92) { throw 'Recovery interruption fixture did not terminate immediately after attributable owner release.' }
     $global:LASTEXITCODE = 0
@@ -752,9 +1072,19 @@ try {
     $selectedWithBom = [Text.UTF8Encoding]::new($true).GetPreamble() + [Text.UTF8Encoding]::new($false).GetBytes($selectedText)
     [IO.File]::WriteAllBytes($ini, $selectedWithBom)
     $alreadySelectedBefore = [IO.File]::ReadAllBytes($ini)
+    $sameAccessPriorEvidence = [string]$resumed.data.runtimeOutput.cacheEvidenceDirectory
+    $sameAccessPriorHistoryCount = @($resumed.data.runtimeOutputHistory).Count
     $alreadySelectedResume = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -Confirm:$false | ConvertFrom-Json
     $alreadySelectedAfter = [IO.File]::ReadAllBytes($ini)
-    if (-not $alreadySelectedResume.ok -or [Convert]::ToBase64String($alreadySelectedAfter) -cne [Convert]::ToBase64String($alreadySelectedBefore)) { throw 'Resuming an already-selected profile did not preserve exact MO2 INI bytes.' }
+    if (-not $alreadySelectedResume.ok -or
+        [Convert]::ToBase64String($alreadySelectedAfter) -cne [Convert]::ToBase64String($alreadySelectedBefore) -or
+        [string]$alreadySelectedResume.data.lastResumeDisposition -cne 'rearm-completed-output' -or
+        [string]$alreadySelectedResume.data.runtimeOutput.cacheEvidenceDirectory -ceq $sameAccessPriorEvidence -or
+        @($alreadySelectedResume.data.runtimeOutputHistory).Count -ne ($sameAccessPriorHistoryCount + 1) -or
+        -not (Test-Path -LiteralPath ([string]$alreadySelectedResume.data.runtimeOutput.ownerMarkerPath) -PathType Leaf)) {
+        throw 'Same-access resume did not preserve exact MO2 INI bytes while opening one new runtime-output transaction.'
+    }
+    Complete-RearmedTestOutput -Workspace $alreadySelectedResume -OwnedAccessId $nextAccessId
     $resumeJournal = Get-ChildItem -LiteralPath $workspaceControlRoot -Filter ($created.data.workspaceId + '.resume.*.journal.json') -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     $resumeJournalData = Get-Content -LiteralPath $resumeJournal.FullName -Raw | ConvertFrom-Json
     if ($resumeJournalData.phase -ne 'committed' -or -not (Test-Path -LiteralPath $resumeJournalData.manifestPreimagePath -PathType Leaf) -or [string]::IsNullOrWhiteSpace([string]$resumeJournalData.selectedProfileJournalPath)) { throw 'Committed resume did not retain a durable manifest preimage and selected-profile journal link.' }
@@ -769,18 +1099,25 @@ try {
     $resumeDrift | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $resumeManifestPath -Encoding utf8
     $resumeRecoveryJournal = Join-Path $workspaceControlRoot ($created.data.workspaceId + '.resume.' + $resumeRecoveryId + '.journal.json')
     [ordered]@{contractVersion='2.0.0';operation='resume';phase='manifest-write-uncommitted';operationId=$resumeRecoveryId;workspaceId=$created.data.workspaceId;ownershipId=$created.data.ownershipId;manifestPath=$resumeManifestPath;manifestPreimagePath=$resumeRecoveryPreimage;manifestPreimageSha256=$resumePreimageHash;profilePath=$created.data.profilePath} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $resumeRecoveryJournal -Encoding utf8
+    [IO.File]::SetAttributes($resumeRecoveryJournal, ([IO.File]::GetAttributes($resumeRecoveryJournal) -bor [IO.FileAttributes]::Hidden))
     $null = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
     $resumeRecoveredJournal = Get-Content -LiteralPath $resumeRecoveryJournal -Raw | ConvertFrom-Json
     if ((Get-FileHash -LiteralPath $resumeManifestPath -Algorithm SHA256).Hash -cne $resumePreimageHash -or $resumeRecoveredJournal.phase -ne 'rolled-back') { throw 'Startup recovery did not restore the exact persisted resume manifest preimage.' }
     $lateClaim = & $entry register-mod -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -ModName 'Later Shared Mod' -ModDirectory $laterSharedMod -NoExit -Confirm:$false | ConvertFrom-Json
     if ($lateClaim.ok -or $lateClaim.errors[0] -notmatch 'protected shared mod') { throw 'Resume did not protect a shared mod added after workspace creation.' }
+    if (Test-Path -LiteralPath $runtimeBackupRoot) { Remove-Item -LiteralPath $runtimeBackupRoot -Recurse -Force }
     $resumedVerified = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $verified.data.workspaceId -Confirm:$false | ConvertFrom-Json
     if (-not $resumedVerified.ok) { throw "Second retained workspace could not be explicitly resumed: $($resumedVerified | ConvertTo-Json -Depth 12 -Compress)" }
     Complete-RearmedTestOutput -Workspace $resumedVerified -OwnedAccessId $nextAccessId
     $releasedVerified = & $entry retire -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $verified.data.workspaceId -Confirm:$false | ConvertFrom-Json
     if (-not $releasedVerified.ok -or (Test-Path -LiteralPath $verified.data.profilePath)) { throw "Verified fixture workspace retirement failed: $($releasedVerified | ConvertTo-Json -Depth 12 -Compress)" }
+    New-Item -ItemType Directory -Path (Join-Path $runtimeBackupRoot 'previous') -Force | Out-Null
+    'pre-task-overwrite-backup' | Set-Content -LiteralPath (Join-Path $runtimeBackupRoot 'preexisting.bin') -Encoding utf8
+    Copy-Item -LiteralPath (Join-Path $synthesisMod 'backup\hashes') -Destination (Join-Path $runtimeBackupRoot 'hashes') -Force
+    Copy-Item -LiteralPath (Join-Path $synthesisMod 'backup\previous\shader.bin') -Destination (Join-Path $runtimeBackupRoot 'previous\shader.bin') -Force
     $resumedAgain = & $entry resume -ConfigPath $configPath -AccessId $nextAccessId -TaskId $taskId -WorkspaceId $created.data.workspaceId -Confirm:$false | ConvertFrom-Json
     if (-not $resumedAgain.ok) { throw 'Original retained workspace could not be reselected after another workspace.' }
+    Complete-RearmedTestOutput -Workspace $resumedAgain -OwnedAccessId $nextAccessId
     $retireManifestPath = Join-Path $workspaceControlRoot ($created.data.workspaceId + '.json')
     $retirePreimageBytes = [IO.File]::ReadAllBytes($retireManifestPath)
     $retirePreimageHash = (Get-FileHash -LiteralPath $retireManifestPath -Algorithm SHA256).Hash
@@ -793,6 +1130,7 @@ try {
     Move-Item -LiteralPath $newMod -Destination $modQuarantine
     $retireRecoveryJournal = Join-Path $workspaceControlRoot ($created.data.workspaceId + '.retire.' + $retireRecoveryId + '.journal.json')
     [ordered]@{contractVersion='2.0.0';operation='retire';phase='profile-move-uncommitted';operationId=$retireRecoveryId;workspaceId=$created.data.workspaceId;ownershipId=$created.data.ownershipId;manifestPath=$retireManifestPath;manifestPreimagePath=$retirePreimagePath;manifestPreimageSha256=$retirePreimageHash;profilePath=$created.data.profilePath;profileQuarantine=$profileQuarantine;modMoves=@([ordered]@{source=$newMod;quarantine=$modQuarantine;moved=$true})} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $retireRecoveryJournal -Encoding utf8
+    [IO.File]::SetAttributes($retireRecoveryJournal, ([IO.File]::GetAttributes($retireRecoveryJournal) -bor [IO.FileAttributes]::Hidden))
     $null = & $entry list-task -ConfigPath $configPath -TaskId $taskId -Compact | ConvertFrom-Json
     $retireRecoveredJournal = Get-Content -LiteralPath $retireRecoveryJournal -Raw | ConvertFrom-Json
     if (-not (Test-Path -LiteralPath $created.data.profilePath -PathType Container) -or -not (Test-Path -LiteralPath $newMod -PathType Container) -or $retireRecoveredJournal.phase -ne 'rolled-back' -or (Get-FileHash -LiteralPath $retireManifestPath -Algorithm SHA256).Hash -cne $retirePreimageHash) { throw 'Startup recovery did not restore an interrupted retirement profile, mod, and exact manifest preimage.' }
@@ -808,9 +1146,15 @@ try {
     if (-not (Test-Path -LiteralPath $source) -or -not (Test-Path -LiteralPath $loaderMod)) { throw 'Workspace cleanup damaged stable state.' }
     $releasedAccess = Invoke-MO2ReleaseAccess -Config $config -AccessId $nextAccessId
     if (-not $releasedAccess.ok) { throw 'Resumed access release failed.' }
-    [pscustomobject]@{ok=$true; assertions=100; workspaceId=$created.data.workspaceId} | ConvertTo-Json
+    [pscustomobject]@{ok=$true; assertions=112; workspaceId=$created.data.workspaceId; recoveryDiscovery=[ordered]@{
+        junctionCases=4; hiddenControlEvidence=$true; emptyDeadlineCases=2
+        productionLeafGuards=$leafGuardResult; actualJournalFileLinksAvailable=$journalFileLinkTestsAvailable
+        fileLinkLimitation=$(if (-not $journalFileLinkTestsAvailable) { 'Windows requires administrator privilege for file symlink creation.' } else { $null })
+    }} | ConvertTo-Json -Depth 5
 }
 finally {
+    $env:TEMP = $priorFixtureTemp
+    $env:TMP = $priorFixtureTmp
     $env:CSX_MO2_PROFILE_CONTROL_ROOT = $priorProfileControlRoot
     $env:CSX_SHADER_CACHE_CONTROL_ROOT = $priorShaderCacheControlRoot
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }

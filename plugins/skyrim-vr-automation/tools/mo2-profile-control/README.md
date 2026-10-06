@@ -38,6 +38,26 @@ path, retain an exact modlist backup, and record all displaced providers plus a
 postcondition. MO2 overwrite, unmanaged files, and archives are outside this
 proof; use VFS evidence when those sources matter.
 
+`add-enable` is the high-level interface for an already deployed mod directory.
+The caller supplies `ProfilePath`, `ModsDirectory`, `ModName`, and the exact
+`ModDirectory`; the controller discovers every DLL in that mod, registers or
+enables its marker, and places it before every enabled loose-file provider of a
+matching relative DLL path. Callers do not calculate priority or winning paths.
+
+Its default `DisableExactDllOnly` retirement policy disables a previous provider
+only when all of that provider's functional files are matching DLLs supplied by
+the target. `meta.ini`, documentation, symbols, FOMOD metadata, and `.mohidden`
+files do not prevent that narrow classification. Any INI, script, asset,
+different DLL, or other functional payload keeps the provider enabled below the
+new winner. Use `-RetirementPolicy KeepProviders` when even exact DLL-only
+providers must remain enabled. The whole target registration/reposition and
+provider retirement occurs in one `modlist.txt` transaction and one restore
+receipt.
+
+Automatic directory inventory is reparse-, file-, directory-, and depth-bounded.
+The interface does not copy or extract an archive: deploy the exact mod directory
+first, then pass it to `add-enable`.
+
 For more than one winning path in a direct `pwsh -File` invocation, use
 `-WinningPathsFile`. It accepts either a JSON string array or one relative path
 per line (blank lines and `#` comments are ignored), then combines and

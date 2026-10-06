@@ -43,7 +43,7 @@ try {
     $manifest = Get-Content -LiteralPath (Join-Path $rebuilt '.codex-plugin\plugin.json') -Raw | ConvertFrom-Json
     $sourceManifest = Get-Content -LiteralPath (Join-Path $repositoryRoot '.codex-plugin\plugin.json') -Raw | ConvertFrom-Json
     if ($manifest.name -ne 'skyrim-vr-automation' -or $manifest.version -ne $sourceManifest.version) { throw 'Rebuilt plugin identity/version is incorrect.' }
-    foreach ($skill in @('feedback-control', 'mo2-control', 'steamvr-null-hmd', 'devbench-control', 'profiler-control', 'shader-cache-control')) {
+    foreach ($skill in @('feedback-control', 'mo2-control', 'mo2-mod-packaging', 'steamvr-null-hmd', 'devbench-control', 'profiler-control', 'shader-cache-control')) {
         if (-not (Test-Path -LiteralPath (Join-Path $rebuilt "skills\$skill\SKILL.md") -PathType Leaf)) { throw "Missing installed skill: $skill" }
     }
     if (@(Get-ChildItem -LiteralPath $rebuilt -Recurse -File -Filter '*.local.json').Count -ne 0) { throw 'Distribution contains machine-local JSON.' }
@@ -56,6 +56,7 @@ try {
         'tools\doctor\Invoke-SkyrimVRAutomationDoctor.ps1',
         'tools\feedback-control\Invoke-AutomationFeedback.ps1',
         'tools\mo2-control\Invoke-MO2Control.ps1',
+        'tools\mo2-mod-package-control\Invoke-MO2ModPackageControl.ps1',
         'tools\steamvr-null-control\Invoke-SteamVRNullControl.ps1',
         'tools\steamvr-head-pose-control\Invoke-SteamVRHeadPoseControl.ps1',
         'drivers\codex_head_pose\bin\win64\driver_codex_head_pose.dll',

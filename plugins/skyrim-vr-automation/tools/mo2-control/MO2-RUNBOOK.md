@@ -1,5 +1,32 @@
 # MO2 automation runbook
 
+## Attributable loader errors and current blocking dialogs
+
+The launch classifier binds exact MO2 lifetime and current-attempt stable log
+bytes. For an enabled registered mod's exact `root` binary, fresh launch also
+captures the root-relative path, registered working directory and pre-dispatch
+source digest. A different logged deployment path qualifies only when it is
+that exact derived destination and its bounded physical bytes match the source.
+Both registered and actual paths and digest binding remain in the receipt;
+matching a filename alone is never sufficient. Legacy attempts cannot acquire
+this mapping retrospectively. Unavailable, oversized (over16MiB), aliased or
+differing files leave detailed error attribution unavailable.
+
+Independently, `status` returns `ok:false, launch-blocked-dialog` for one exact
+owned MO2 with a visible known launch-error modal and no game/loader. Its
+`controller.launchBlocker` is current UI evidence, not an invented Win32 code,
+deployment history or denying mechanism, and outranks startup grace. Preserve
+numeric errors when proved; Error5 and generic antivirus advice do not identify
+the cause. No retry, security/ACL/elevation change or cleanup is dispatched by
+classification. Auto owns shared-state cleanup; caller environments are retained.
+
+After the failed attempt is already terminal, the supported alternative is a
+fresh durable controller/session with the exact retained profile and registered
+executable. `open` must prove `mo2-open`; preview `launch -LaunchMethod RunButton
+-WhatIf` before one authorised `launch -LaunchMethod RunButton -StartOnly`.
+This route never changes selections or security policy and is not a guarantee
+that access denial disappears. Never reopen/replay the failed session to try it.
+
 ## Purpose and authority
 
 This runbook is the operational source of truth for Codex-assisted MO2 work on

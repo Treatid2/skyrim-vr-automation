@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([string]$FixtureDriverPackagePath)
 
 Set-StrictMode -Version Latest
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -96,6 +96,10 @@ try {
     [IO.File]::WriteAllText((Join-Path $headPoseDriverRoot '.csx-vr-automation-driver.json'), '{"schemaVersion":1,"driverName":"codex_head_pose"}')
     $headEntry = Join-Path $PSScriptRoot '..\steamvr-head-pose-control\Invoke-SteamVRHeadPoseControl.ps1'
     $fixtureBundle = Join-Path $PSScriptRoot '..\..\drivers\codex_head_pose'
+    if ($FixtureDriverPackagePath) {
+        $fixtureBundle = [IO.Path]::GetFullPath($FixtureDriverPackagePath)
+        $PSDefaultParameterValues['Invoke-SteamVRNullControl.ps1:HeadPoseExpectedProvenanceSha256'] = (Get-FileHash -LiteralPath (Join-Path $fixtureBundle 'build-provenance.json') -Algorithm SHA256).Hash
+    }
     # Actual install transaction; no vrpathreg execution because this exact
     # temporary root is already registered. Mask only named SteamVR queries.
     function Get-Process {
@@ -112,7 +116,7 @@ try {
     New-Item -ItemType Directory -Path $failureEvidence | Out-Null
     New-Item -ItemType Directory -Path (Split-Path -Parent $startupPath) -Force | Out-Null
     [IO.File]::WriteAllBytes($startupPath, [byte[]]@(0))
-    $originalText = "{`r`n  `"steamvr`": { `"enableHomeApp`": true },`r`n  `"power`": { `"turnOffControllersTimeout`": 600, `"turnOffScreensTimeout`": 30, `"powerOffOnExit`": false },`r`n  `"unrelated`": { `"value`": 7 }`r`n}`r`n"
+    $originalText = "{`r`n  `"steamvr`": { `"enableHomeApp`": true },`r`n  `"power`": { `"turnOffControllersTimeout`": 600, `"turnOffScreensTimeout`": 30, `"powerOffOnExit`": false },`r`n  `"unrelated`": { `"value`": 7, `"boolFalse`": false, `"boolTrue`": true, `"numberZero`": 0, `"numberOne`": 1 }`r`n}`r`n"
     [IO.File]::WriteAllText($settingsPath, $originalText, [Text.UTF8Encoding]::new($false))
     $headPoseMapName = "Local\CSXVRHeadPose-fixture-$([guid]::NewGuid().ToString('N'))"
     [ordered]@{
@@ -156,6 +160,10 @@ try {
     $poseView.Write(104, [uint64]73)
     $poseView.Write(112, [uint32]$PID)
     $poseView.Write(120, [uint64][DateTime]::UtcNow.ToFileTimeUtc())
+
+    $absentEvidence = Join-Path $fixture 'absent-evidence'
+    $absentEvidencePreview = & $entry apply -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $absentEvidence -Standalone -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $absentEvidencePreview.ok -and $absentEvidencePreview.errors[0] -match 'Create this exact task-scoped directory before preview/apply' -and -not (Test-Path -LiteralPath $absentEvidence)) 'apply preview explains the evidence-directory precondition without mutating the requested path'
 
     $inspectBefore = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact | ConvertFrom-Json
     Assert-Test ($inspectBefore.ok -and $inspectBefore.state -eq 'null-inactive') 'inspect identifies inactive null profile'
@@ -587,6 +595,7 @@ try {
 
     Copy-Item -LiteralPath $env:ComSpec -Destination $startupPath -Force
     $authorizationDeniedStart = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint head-pose-access-denied-after-start -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    if (-not (Test-Path -LiteralPath (Join-Path $evidence 'steamvr-null-runtime.receipt.json'))) { throw "Authorization-denial fixture produced no receipt: $($authorizationDeniedStart | ConvertTo-Json -Depth 12 -Compress)" }
     $authorizationDeniedReceipt = Get-Content -LiteralPath (Join-Path $evidence 'steamvr-null-runtime.receipt.json') -Raw | ConvertFrom-Json
     if (-not $authorizationDeniedStart.data.PSObject.Properties['startupCleanup']) { throw "Fixture authorization-denied start did not reach cleanup: $($authorizationDeniedStart | ConvertTo-Json -Depth 12 -Compress)" }
     Assert-Test (-not $authorizationDeniedStart.ok -and $authorizationDeniedStart.state -eq 'head-pose-provider-authorization-failed' -and $authorizationDeniedStart.data.startupCleanup -and @($authorizationDeniedStart.data.startupCleanup.remaining).Count -eq 0) 'startup authorization denial stops every exact SteamVR process started by the attempt'
@@ -761,12 +770,83 @@ try {
     $formattingRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
     Assert-Test ($formattingRestore.ok -and $formattingRestore.data.settingsRestoreValidation.formattingOnlyDriftAccepted -and $formattingRestore.data.settingsRestoreValidation.authorizationRoute -eq 'semantic-formatting-only') 'restore accepts formatting-only SteamVR settings drift'
 
+    $numericDrift = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
+    $numericDrift.driver_null.displayFrequency = 90
+    foreach ($key in @('positionX','positionZ','yawDegrees','pitchDegrees','rollDegrees')) { $numericDrift.driver_codex_head_pose[$key] = 0 }
+    $numericDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+    $numericAuthority = @($settingsPath,$openVrPathsPath,(Join-Path $evidence 'steamvr-null-receipt.json'),[string]$inspectBefore.data.targetControl.journalPath,(Join-Path $evidence 'steamvr-null-apply.journal.json'))
+    $numericBefore = @($numericAuthority | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash })
+    $numericRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+    $numericAfter = @($numericAuthority | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash })
+    Assert-Test ($numericRestore.ok -and $numericRestore.data.settingsRestoreValidation.authorized -and $numericRestore.data.settingsRestoreValidation.controlledDifferences.Count -eq 0 -and $numericRestore.data.settingsRestoreValidation.formattingOnlyDriftAccepted -and ($numericBefore -join ',') -ceq ($numericAfter -join ',')) 'public preview accepts all six equal Double-to-integer protected values without mutation'
+    foreach ($case in @(@('driver_null','displayFrequency'),@('driver_codex_head_pose','positionX'),@('driver_codex_head_pose','positionZ'),@('driver_codex_head_pose','yawDegrees'),@('driver_codex_head_pose','pitchDegrees'),@('driver_codex_head_pose','rollDegrees'))) {
+        foreach ($change in @('actual-value','string','boolean')) {
+            $candidate = $numericDrift | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable
+            $candidate[$case[0]][$case[1]] = switch ($change) { 'actual-value' { 17 }; 'string' { [string]$candidate[$case[0]][$case[1]] }; 'boolean' { $false } }
+            $candidate | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+            $before = @($numericAuthority | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash })
+            $refused = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -Compact -NoExit | ConvertFrom-Json
+            $after = @($numericAuthority | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash })
+            Assert-Test (-not $refused.ok -and $refused.state -eq 'blocked' -and ($refused.errors -join ' ') -match [regex]::Escape($case[0]+'.'+$case[1]) -and ($before -join ',') -ceq ($after -join ',')) "public committed restore rejects $change at $($case[0]).$($case[1]) without altering any target/authority"
+        }
+    }
+    $numericDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+
     $runtimeDrift = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
     $runtimeDrift['GpuSpeed'] = [ordered]@{ gpuSpeed0 = 1234; gpuSpeedCount = 1 }
     $runtimeDrift['LastKnown'] = [ordered]@{ HMDManufacturer = 'Null'; HMDModel = 'Null Model' }
     $runtimeDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
     $runtimeRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
     Assert-Test ($runtimeRestore.ok -and $runtimeRestore.data.settingsRestoreValidation.runtimeManagedOnlyDriftAccepted -and $runtimeRestore.data.settingsRestoreValidation.authorizationRoute -eq 'controlled-contract-plus-runtime-managed-fields') 'restore accepts SteamVR-managed GpuSpeed and LastKnown drift while controlled settings still match'
+
+    $runtimeDrift['dashboard']['lastAccessedExternalOverlayKey'] = 'runtime.overlay.history'
+    foreach ($case in @(
+        @('dashboard','enableDashboard',0), @('steamvr','requireHmd',0),
+        @('steamvr','activateMultipleDrivers',1), @('steamvr','enableHomeApp',0), @('driver_null','enable',1),
+        @('unrelated','boolFalse',0), @('unrelated','boolTrue',1),
+        @('unrelated','numberZero',$false), @('unrelated','numberOne',$true)
+    )) {
+        $typeDrift = $runtimeDrift | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable
+        $typeDrift[$case[0]][$case[1]] = $case[2]
+        $typeDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+        $authorityPaths = @($settingsPath,$openVrPathsPath,(Join-Path $evidence 'steamvr-null-receipt.json'),[string]$inspectBefore.data.targetControl.journalPath,(Join-Path $evidence 'steamvr-null-apply.journal.json'))
+        $beforeHashes = @($authorityPaths | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash })
+        $typeDriftRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -Compact -NoExit | ConvertFrom-Json
+        $afterHashes = @($authorityPaths | ForEach-Object { (Get-FileHash -LiteralPath $_).Hash })
+        Assert-Test (-not $typeDriftRestore.ok -and $typeDriftRestore.state -eq 'blocked' -and
+            ($typeDriftRestore.errors -join ' ') -match ([regex]::Escape("$($case[0]).$($case[1])")) -and
+            ($beforeHashes -join ',') -ceq ($afterHashes -join ',')) "public committed restore refuses scalar type drift at $($case[0]).$($case[1]) with settings, registration, receipt and ownership journals byte-identical"
+    }
+    $runtimeDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+    $historyRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($historyRestore.ok -and $historyRestore.data.settingsRestoreValidation.dashboardHistoryDriftAccepted -and $historyRestore.data.settingsRestoreValidation.runtimeManagedDifferencePaths -contains 'dashboard.lastAccessedExternalOverlayKey') 'public restore accepts only the typed dashboard history leaf and retains its exact difference path'
+    foreach ($literalValue in @('unrelated', $null, $true, 42, [ordered]@{ value = 'unrelated' })) {
+        $runtimeDrift['dashboard.lastAccessedExternalOverlayKey'] = $literalValue
+        $runtimeDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+        $settingsBeforeCollision = (Get-FileHash -LiteralPath $settingsPath).Hash
+        $registrationBeforeCollision = (Get-FileHash -LiteralPath $openVrPathsPath).Hash
+        $receiptBeforeCollision = (Get-FileHash -LiteralPath (Join-Path $evidence 'steamvr-null-receipt.json')).Hash
+        # Commit requested, not WhatIf: admission must reject before mutation.
+        $collisionRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -Compact -NoExit | ConvertFrom-Json
+        Assert-Test (-not $collisionRestore.ok -and $collisionRestore.state -eq 'blocked' -and $collisionRestore.errors[0] -match 'dashboard.lastAccessedExternalOverlayKey' -and
+            (Get-FileHash -LiteralPath $settingsPath).Hash -ceq $settingsBeforeCollision -and
+            (Get-FileHash -LiteralPath $openVrPathsPath).Hash -ceq $registrationBeforeCollision -and
+            (Get-FileHash -LiteralPath (Join-Path $evidence 'steamvr-null-receipt.json')).Hash -ceq $receiptBeforeCollision) 'public committed restore refuses literal dotted root-key drift without changing settings, registrations or apply receipt'
+    }
+    $runtimeDrift.Remove('dashboard.lastAccessedExternalOverlayKey')
+    foreach ($badHistory in @($true, 12, [ordered]@{ child = 'overlay' }, $null)) {
+        $runtimeDrift['dashboard']['lastAccessedExternalOverlayKey'] = $badHistory
+        $runtimeDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+        $badHistoryRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+        Assert-Test (-not $badHistoryRestore.ok -and $badHistoryRestore.errors[0] -match 'dashboard.lastAccessedExternalOverlayKey') 'public restore rejects malformed dashboard history instead of whitelisting its subtree'
+    }
+    $runtimeDrift['dashboard']['lastAccessedExternalOverlayKey'] = 'runtime.overlay.history'
+    $runtimeDrift['dashboard']['otherHistorySetting'] = 'unclassified'
+    $runtimeDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
+    $otherDashboardRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test (-not $otherDashboardRestore.ok -and $otherDashboardRestore.errors[0] -match 'dashboard.otherHistorySetting') 'public restore protects every other dashboard leaf'
+    $runtimeDrift['dashboard'].Remove('otherHistorySetting')
+    $runtimeDrift | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
 
     $controlledDrift = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
     $controlledDrift['dashboard']['enableDashboard'] = $true
@@ -809,6 +889,59 @@ try {
 
     $startDry = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact | ConvertFrom-Json
     Assert-Test ($startDry.ok -and $startDry.state -eq 'dry-run' -and $startDry.data.startupPath -eq $startupPath) 'start dry-run validates the configured transaction and exact startup path'
+
+    # Exercise the public startup boundary with an actual fixture apply receipt.
+    # Every path/binary/provider is fixture-owned; an invalid value must refuse
+    # before any startup attempt, stage, launch or authoritative state change.
+    function Get-StartupFixtureEvidenceIdentity {
+        $members = @(Get-ChildItem -LiteralPath $evidence -File -Recurse |
+            Sort-Object FullName | ForEach-Object {
+                [ordered]@{ path = $_.FullName; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
+            })
+        return ConvertTo-Json -InputObject $members -Depth 6 -Compress
+    }
+    $trackingKey = @((Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json -AsHashtable).TrackingOverrides.Keys)[0]
+    $startupDriftCases = @(
+        @{ section = 'dashboard'; key = 'enableDashboard'; value = 0; label = 'false Boolean to zero' },
+        @{ section = 'steamvr'; key = 'requireHmd'; value = 'False'; label = 'false Boolean to string' },
+        @{ section = 'driver_null'; key = 'enable'; value = 1; label = 'true Boolean to one' },
+        @{ section = 'driver_codex_head_pose'; key = 'enable'; value = 1; label = 'head provider Boolean to one' },
+        @{ section = 'driver_null'; key = 'displayFrequency'; value = '90'; label = 'numeric frequency to string' },
+        @{ section = 'driver_codex_head_pose'; key = 'positionX'; value = $false; label = 'numeric zero to Boolean' },
+        @{ section = 'steamvr'; key = 'forcedDriver'; value = 'NULL'; label = 'forced driver string case drift' },
+        @{ section = 'driver_null'; key = 'serialNumber'; value = 'fixture'; label = 'driver identity string case drift' },
+        @{ section = 'TrackingOverrides'; key = $trackingKey; value = '/USER/HEAD'; label = 'tracking override string case drift' },
+        @{ section = 'dashboard'; key = 'enableDashboard'; value = $null; label = 'Boolean to null' },
+        @{ section = 'dashboard'; key = 'enableDashboard'; remove = $true; label = 'missing controlled leaf' }
+    )
+    foreach ($case in $startupDriftCases) {
+        $drift = $appliedText | ConvertFrom-Json -AsHashtable
+        if ($case.ContainsKey('remove')) { $drift[$case.section].Remove($case.key) }
+        else { $drift[$case.section][$case.key] = $case.value }
+        [IO.File]::WriteAllText($settingsPath, ($drift | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+        $settingsIdentity = (Get-FileHash -LiteralPath $settingsPath).Hash
+        $registrationIdentity = (Get-FileHash -LiteralPath $openVrPathsPath).Hash
+        $journalIdentity = (Get-FileHash -LiteralPath $inspectConfigured.data.targetControl.journalPath).Hash
+        $evidenceIdentity = Get-StartupFixtureEvidenceIdentity
+        $typedInspect = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact -NoExit | ConvertFrom-Json
+        Assert-Test ($typedInspect.ok -and $typedInspect.state -eq 'null-inactive' -and -not $typedInspect.data.effective.active -and -not $typedInspect.data.runtime.active) "public inspect refuses active configuration for $($case.label)"
+        foreach ($preview in @($true, $false)) {
+            $typedStart = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf:$preview -Compact -NoExit | ConvertFrom-Json
+            Assert-Test (-not $typedStart.ok -and $typedStart.state -eq 'null-not-configured' -and -not $typedStart.data.effective.active -and -not $typedStart.data.runtime.active -and 'runtimeAttemptId' -notin @($typedStart.data.PSObject.Properties.Name)) "public start preview=$preview refuses $($case.label) before an attempt or launch"
+        }
+        Assert-Test ((Get-FileHash -LiteralPath $settingsPath).Hash -ceq $settingsIdentity -and
+            (Get-FileHash -LiteralPath $openVrPathsPath).Hash -ceq $registrationIdentity -and
+            (Get-FileHash -LiteralPath $inspectConfigured.data.targetControl.journalPath).Hash -ceq $journalIdentity -and
+            (Get-StartupFixtureEvidenceIdentity) -ceq $evidenceIdentity) "startup refusal preserves settings, registrations, journal, receipt and all attempt/stage evidence for $($case.label)"
+    }
+    $numericEquivalent = $appliedText | ConvertFrom-Json -AsHashtable
+    $numericEquivalent.driver_null.displayFrequency = 90
+    foreach ($key in @('positionX', 'positionZ', 'yawDegrees', 'pitchDegrees', 'rollDegrees')) { $numericEquivalent.driver_codex_head_pose[$key] = 0 }
+    [IO.File]::WriteAllText($settingsPath, ($numericEquivalent | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+    $numericInspect = & $entry inspect -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -Compact -NoExit | ConvertFrom-Json
+    $numericStart = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -WhatIf -Compact -NoExit | ConvertFrom-Json
+    Assert-Test ($numericInspect.ok -and $numericInspect.data.effective.active -and $numericStart.ok -and $numericStart.state -eq 'dry-run') 'public inspect/start accept equal JSON numeric spellings without a runtime launch'
+    [IO.File]::WriteAllText($settingsPath, $appliedText, [Text.UTF8Encoding]::new($false))
 
     [ordered]@{ name = 'VirtualDesktop'; alwaysActivate = $true; redirectsDisplay = $true } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $externalDriverRoot 'driver.vrdrivermanifest') -Encoding utf8
     [ordered]@{ version = 1; external_drivers = @($headPoseDriverRoot, $externalDriverRoot) } | ConvertTo-Json | Set-Content -LiteralPath $openVrPathsPath -Encoding utf8
@@ -932,10 +1065,16 @@ try {
     Assert-Test (-not $driftRestore.ok -and $driftRestore.state -eq 'blocked' -and $driftRestore.errors[0] -match 'registration file changed') 'restore refuses to overwrite unclassified OpenVR registration drift'
 
     [IO.File]::WriteAllText($openVrPathsPath, $isolatedText, [Text.UTF8Encoding]::new($false))
+    $commitHistory = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
+    $commitHistory['dashboard']['lastAccessedExternalOverlayKey'] = 'runtime.history.before-restore'
+    $commitHistory.driver_null.displayFrequency = 90
+    foreach ($key in @('positionX','positionZ','yawDegrees','pitchDegrees','rollDegrees')) { $commitHistory.driver_codex_head_pose[$key] = 0 }
+    $commitHistory | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $settingsPath -Encoding utf8
     $isolatedRestoreDry = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -WhatIf -Compact | ConvertFrom-Json
     Assert-Test ($isolatedRestoreDry.ok -and $isolatedRestoreDry.data.externalDriverIsolation.enabled -and $isolatedRestoreDry.data.wouldRestoreOpenVRPaths) 'restore dry-run reports exact external-driver restoration'
     $isolatedRestore = & $entry restore -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $isolationEvidence -Compact | ConvertFrom-Json
     Assert-Test ($isolatedRestore.ok -and $isolatedRestore.state -eq 'restored' -and $isolatedRestore.data.openVRPathsRestoredSha256 -and $isolatedRestore.data.externalDriverIsolationValidation.formattingOnlyDriftAccepted) 'restore reinstates the exact external-driver registration transaction after formatting-only drift'
+    Assert-Test ($isolatedRestore.data.settingsRestoreValidation.dashboardHistoryDriftAccepted -and $isolatedRestore.data.settingsRestoreValidation.controlledDifferences.Count -eq 0) 'public committed restore accepts typed dashboard history while retaining all controlled-key proofs'
     Assert-Test ([IO.File]::ReadAllText($settingsPath) -ceq $originalText) 'isolation restore keeps SteamVR settings exact-byte identical'
     Assert-Test ([IO.File]::ReadAllText($openVrPathsPath) -ceq $openVrTextBeforeIsolation) 'isolation restore keeps OpenVR registrations exact-byte identical'
 

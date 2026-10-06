@@ -117,8 +117,24 @@ in the receipt, so plugin-cache replacement cannot strand a later restore. A
 legacy receipt may use a caller-supplied profile only when its SHA-256 matches
 the receipt. Restore accepts byte-only
 formatting changes and runtime-managed changes confined to the top-level
-`GpuSpeed` and `LastKnown` sections only when every controller-owned null-HMD
-setting still matches. Changes to a controller-owned key or any other section
+`GpuSpeed` and `LastKnown` sections, plus the exact string-valued
+`dashboard.lastAccessedExternalOverlayKey` history leaf (addition/removal included)
+only when every controller-owned null-HMD setting still matches. Authorization
+uses actual JSON structure, not dotted diagnostic spelling: literal root keys
+containing dots cannot borrow history or runtime-managed authority.
+Scalar comparison preserves JSON kinds: Booleans never equal numbers or
+strings, and null equals only null. Numbers compare exact normalized decimal
+coefficient/exponent identities from their JSON representations, without
+coercing integers or decimals through a rounded floating-point type. Numerically
+identical spellings (`90.0`/`90`, `0.0`/`0`, and equivalent exponent forms) are
+formatting-only changes; actual value differences and non-finite values fail
+closed, including large integers that would become equal after lossy rounding.
+Inspection and startup use this same JSON-aware comparator for every controlled
+profile leaf. A Boolean rewritten as a number/string, a numeric leaf rewritten
+as a string, or a case-changed string does not constitute an effective profile.
+Both startup preview and commit refuse before runtime-attempt publication or
+process launch; equal numeric reserializations remain admissible.
+Changes to a controller-owned key or any other section
 remain unclassified drift and fail closed. The validation route and exact
 difference paths are returned as `settingsRestoreValidation`; rollback retains
 the exact accepted live bytes rather than assuming they equal the originally
@@ -162,6 +178,26 @@ in-place mutation before lines are published. Runtime evidence reports payload
 and proof byte counts plus cache usability, reuse, and resynchronization state.
 Decoding, hashing, and publication are charged to the startup deadline, so a
 large historical log cannot turn one poll into an unbounded whole-file read.
+Startup proof is separate from this moving diagnostic tail. The controller
+reads a prefix from byte zero, bounded by `LogTailMaxBytes` and 10,000 lines,
+and accepts only fully newline-framed proof lines of at most 4,096 bytes with
+the current server timestamp and exact configured HMD serial. Once all four
+startup lines are found, their complete prefix is pinned rather than forgotten
+when noise scrolls past the tail. Each later observation revalidates the prefix
+hash, Windows file identity and nondecreasing observed length against the
+currently selected path. `runtime.startupLogProof` retains the server identity,
+file identity, prefix offset/length/hash, physical line byte spans and bounded
+I/O counts. Replacement, rotation, truncation or proof-prefix drift invalidates
+that server's cache; the same invocation never silently reacquires rejected
+proof. A new server identity cannot inherit it. Missing proof beyond the byte
+or line budget fails explicitly instead of scanning historical logs without
+bound. This proves the retained prefix and current diagnostic tail, not every
+intervening log byte or future runtime health. Package/creator, shared-memory,
+independent application/controller and absolute-deadline checks remain required.
+Run `Test-StartupLogProof.ps1 -FixtureRoot <owned-fixture-directory>` for the
+production runtime-function fixtures, including delayed first observation,
+tail rollover and selected-path drift. These tests never launch SteamVR.
+
 The polling loop reserves a final bounded log-read window and records its
 deadlines, attempt count, and confirmation outcome in the runtime receipt. A
 timed-out confirmation invalidates readiness and performs exact-attempt cleanup
@@ -188,6 +224,9 @@ possible.
 Operator diagnostics never describe unverified cleanup as successfully stopped.
 
 ```powershell
+# Create one exact task-scoped directory first; -WhatIf deliberately does not
+# create it. Reuse the same path for apply, start, and restore.
+New-Item -ItemType Directory -Path <session-evidence>
 .\Invoke-SteamVRNullControl.ps1 apply -MO2AccessId <access-id> -MO2Profile <task-profile> -EvidenceDirectory <session-evidence> -Compact
 .\Invoke-SteamVRNullControl.ps1 apply -MO2AccessId <access-id> -MO2Profile <task-profile> -EvidenceDirectory <session-evidence> -IsolateExternalDisplayRedirectors -Compact
 .\Invoke-SteamVRNullControl.ps1 start -MO2AccessId <access-id> -MO2Profile <task-profile> -EvidenceDirectory <session-evidence> -Compact
@@ -209,12 +248,83 @@ before applying or starting null-HMD. Pass that exact lease's bearer
 `-MO2AccessId` and selected `-MO2Profile` to both `apply` and `start`. The
 controller independently repeats the `runtime-route-provider` check, requires
 the `SteamVRNull` route, and binds the public admission proof into the apply
-receipt. `start` rejects lease, profile, or provider-inventory drift. The
+receipt. `start` rejects lease, profile, or semantic provider-inventory drift.
+New receipts retain the complete inventory and a versioned canonical fingerprint.
+Only provider `lineNumber` is excluded; object property order is canonicalized.
+Array order, profile/modlist path, names, paths, enable/marker state, classification,
+marker inventory and all other fields remain significant. Legacy hash-only receipts
+keep exact-hash matching and are not migrated: restore, then apply a new transaction
+under the admitted current lease. The
 explicit `-Standalone` escape is for non-MO2 SteamVR diagnostics only and must
 not be used for Skyrim through MO2. A running null SteamVR instance does not
 prove an application bypassing SteamVR is attached to it.
 
 Run `Test-SteamVRNullControl.ps1` after changing the control contract.
+
+## Explicit preservation of two DesktopUI strings
+
+Ordinary restore still restores the exact original backup and refuses unrelated
+drift. Only when the human has selected narrow preservation, use
+`restore -PreserveDesktopUIWindowState`. This preserves exactly the present,
+actual, exact-case, string-valued `DesktopUI.pairing` and
+`DesktopUI.settings_desktop` leaves; it does not interpret their contents or
+whitelist the whole DesktopUI section. Both leaves must also be present strings
+in the receipt-bound baseline. Missing/malformed sections/leaves, dotted-key
+aliases, case changes, controlled-key changes and any other unclassified drift
+are refused. Existing runtime-managed GpuSpeed/LastKnown and typed dashboard
+history differences are admitted but restored from the baseline, not preserved.
+
+Preview first with the original apply evidence directory, while SteamVR is
+closed. Require `ok=true`, `state=dry-run`, and the expected preservation policy.
+Commit requires the exact SHA-256 returned by this preview; do not automatically
+accept a changed hash by recomputing it after refusal.
+
+```powershell
+# All existing exact path, closed-runtime and evidence-ownership gates remain.
+.\Invoke-SteamVRNullControl.ps1 restore -EvidenceDirectory <original-apply-evidence> -PreserveDesktopUIWindowState -WhatIf -Compact
+.\Invoke-SteamVRNullControl.ps1 restore -EvidenceDirectory <same-original-apply-evidence> -PreserveDesktopUIWindowState -ExpectedCurrentSettingsSha256 <preview-data.settingsRestoreSelection.preimageSha256> -Compact
+```
+
+`settingsRestoreSelection` schema 1 has policy
+`baseline-plus-exact-desktopui-strings`, apply transaction identity, exact
+baseline/preimage/result hashes and the two `preservedStrings`. A committed
+selection additionally retains its distinct `resultPath` and immutable apply
+receipt digest. `expectedSha256` in preview and `restoredSha256` on success
+identify this selected result, **not** the original whole-file backup.
+The new restore receipt and target-owned journal retain this selection; the old
+apply receipt/profile/backup are never rewritten. All settings input parsing
+for this option is bounded to 1 MiB with duplicate keys refused.
+Untouched baseline values are copied as raw JSON, including full-precision
+numbers. Drift comparison uses exact decimal coefficient/exponent identities
+from the current raw JSON, so changes hidden by floating-point parsing refuse.
+For receipt-profile-owned floating-point leaves only, the exact declared decimal
+or the finite binary64 value's canonical invariant `G17` runtime spelling is
+accepted, with identical binary64 bits required. JSON numbers with exactly equal
+normalized decimal identities admit integer/decimal formatting such as `90.0`
+to `90` and `0.0` to `0`; their PowerShell CLR types need not match. The explicitly
+integer-schema power timeout still refuses floating-point representations. For
+example, profile `1.68` and runtime `1.6799999999999999` are the same controlled
+eye height. This is not a tolerance: changed bits (including signed zero), type
+changes to a non-number kind and arbitrary extra precision still refuse. The whole-document check
+uses that same admitted owned-leaf result; unowned values and additional keys
+retain strict raw-decimal, type, case and structure comparison. Numeric settings
+are restored from the baseline, not preserved as additional selected UI leaves.
+
+Staging verifies the accepted preimage and selected result hashes again before
+dispatch. Failure after mutation rolls back to the exact accepted live bytes,
+including those UI strings. Interrupted operations use the existing target-owned
+journal recovery. A repeat after a committed preservation restore recognizes
+only the exact recorded result after reconstructing the selection from the
+retained baseline and validated preimage; it never adopts new live UI drift.
+Omitting the option on that repeat does not silently revert a completed selection.
+A changed result/preimage/receipt/profile or selection refuses. This is a bounded
+cooperative-controller transaction, not protection against a hostile same-user
+writer racing the final filesystem replacement.
+
+Run `Test-DesktopUIRestore.ps1` as well as `Test-SteamVRNullControl.ps1` after
+changing this contract. Both use temporary fixtures; passing them is source
+qualification, not live SteamVR or in-game qualification. Auto-Tools owns shared
+recovery/known-state handoff; caller experiment environments remain retained.
 
 Runtime startup and every application-facing probe also require the exact
 owned `HeadPoseDriverRoot` and committed schema-3 installation custody described
