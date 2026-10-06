@@ -1,0 +1,90 @@
+[
+  {
+    "name": "communityshaders.colour_pipeline_probe",
+    "description": "Bounded developer-only VR FSR five-seam raw sample capture. arm and reset require exact build identity; arm binds the expected FSR colour request revision. Read one stage and eye per page with the arm receipt's captureId/generation. Storage values are retained without gamma conversion; ambiguous typeless numeric decoding is withheld. Captures require the main-pass stereo FSR path, expire after 15 seconds or 120 readback frames, and never imply render-scale, headset or visual qualification. Limits: 8192 per staging dimension, 256 MiB per slot, 1 GiB total staging payload (driver overhead unmeasured), 16 KiB serialized metadata, 64 KiB request and 128 KiB response. FSR colour mutations use communityshaders.fsr_color_contract separately.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "default": "status",
+          "enum": [
+            "status",
+            "arm",
+            "read",
+            "reset"
+          ],
+          "type": "string"
+        },
+        "captureId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "expectedBuildId": {
+          "type": "string"
+        },
+        "expectedRevision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "eye": {
+          "enum": [
+            0,
+            1
+          ],
+          "type": "integer"
+        },
+        "generation": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "metadata": {
+          "type": "object"
+        },
+        "stage": {
+          "enum": [
+            "fsr_input",
+            "fsr_output",
+            "combined_main",
+            "imagespace_input",
+            "imagespace_output"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "communityshaders.fsr_color_contract",
+    "description": "Inspect or set DevBench-only FSR processing flags without changing the compositor source-colour contract. The production default remains HDR-input plus auto-exposure. set uses expectedRevision compare-and-set, invalidates prior dispatch evidence, and causes host/runtime FSR contexts to be recreated at their existing render-thread safe points. status reports requested flags, effective context flags and generations, plus synchronized successful per-eye dispatch identity, dimensions, configured sharpness at dispatch, effective sharpening value/enabled state and QPC timing. Invalid dispatch sharpness/timing evidence is null; no sharpness setter is added. This tool does not alter DLSS/DLAA, source transfer, provider selection, persistence, or resolution.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "default": "status",
+          "enum": [
+            "status",
+            "set"
+          ],
+          "type": "string"
+        },
+        "autoExposure": {
+          "type": "boolean"
+        },
+        "expectedBuildId": {
+          "type": "string"
+        },
+        "expectedRevision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "highDynamicRangeInput": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    }
+  }
+]
+

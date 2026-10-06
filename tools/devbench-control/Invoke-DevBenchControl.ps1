@@ -3,15 +3,20 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('list', 'call', 'wait')]
+    [ValidateSet('list', 'call', 'wait', 'calendar-window', 'colour-window')]
     [string]$Command = 'list',
     [string]$Tool,
     [string]$ArgumentsJson = '{}',
+    [string]$CalendarOwner,
+    [ValidateRange(1,300000)][int]$CalendarHoldMilliseconds = 60000,
+    [string]$CalendarObservationsJson,
+    [string]$ColourPlanJson,
     [string]$RuntimePath = $env:CSX_DEVBENCH_RUNTIME_PATH,
     [string]$ToolFilter,
     [switch]$NamesOnly,
     [switch]$RequireSuccess,
     [switch]$RequirePerformanceNeutral,
+    [switch]$RequireCompilerHealthy,
     [switch]$SkipRuntimeIdentityVerification,
     [string]$EvidenceDirectory,
     [string]$EvidenceLabel,
@@ -20,7 +25,7 @@ param(
     [string]$ExpectedBuildId,
     [string]$ExpectedArtifactSha256,
     [string]$ExpectedRuntimeIdentityJson,
-    [ValidateSet('noBlockingMenu', 'mainMenuReady', 'playerLoaded', 'upscalingStable', 'toolAvailable', 'serviceReady')]
+    [ValidateSet('noBlockingMenu', 'mainMenuReady', 'playerLoaded', 'compilerHealthy', 'upscalingStable', 'toolAvailable', 'serviceReady')]
     [string]$Condition = 'noBlockingMenu',
     [ValidateRange(1, 600)]
     [int]$TimeoutSeconds = 30,
@@ -75,7 +80,37 @@ $effectiveOperationTimeoutSeconds = $TimeoutSeconds
 $serverTimeoutMilliseconds = $null
 $serverTimeoutDispatchRemainingSeconds = $null
 Import-Module (Join-Path $PSScriptRoot 'DevBenchControl.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'CalendarObservationWindow.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'ColourMeasurementWindow.psm1') -Force
 $script:requestTimeoutSecondsForRpc = $RequestTimeoutSeconds
+
+function Get-ShaderCompilerGuard {
+    param([object[]]$Tools,[hashtable]$Headers,$Identity)
+    $guard=[pscustomobject][ordered]@{admissible=$false; state='READ_UNAVAILABLE'; health=$null; reply=$null; arguments=$null; reasons=@()}
+    try {
+        if ($null -eq $Identity -or -not $Identity.complete -or -not $Identity.verified) { throw 'Compiler admission requires complete verified current runtime/artifact identity.' }
+        $matches=@($Tools | Where-Object name -CEQ 'communityshaders.shader_api')
+        if ($matches.Count -ne 1) { throw 'toolSchemaUnresolved: exact shader_api is not registered.' }
+        $schema=$matches[0].inputSchema
+        if ($schema.properties.contractMajor.const -ne 1 -or $schema.properties.contractMajor.type -cne 'integer' -or $schema.properties.action.type -cne 'string' -or 'snapshot' -cnotin @($schema.properties.action.enum) -or @($schema.required).Count -ne 4 -or @($schema.required | Where-Object { $_ -cnotin @('contractMajor','clientId','commandId','action') }).Count -gt 0 -or $schema.properties.clientId.type -cne 'string' -or $schema.properties.commandId.type -cne 'string') { throw 'toolSchemaUnresolved: current shader snapshot input schema is unsupported.' }
+        $argsMap=@{contractMajor=1;clientId='auto-tools-compiler-admission';commandId=[guid]::NewGuid().ToString('N');action='snapshot';expectedBuildId=[string]$Identity.build.buildId}
+        $guard.arguments=$argsMap
+        $guard.reply=Invoke-ToolRpc -Name 'communityshaders.shader_api' -Arguments $argsMap -Headers $Headers -RetainShaderSnapshotToolError
+        if ($guard.reply.rawResult.PSObject.Properties['isError'] -and ($guard.reply.rawResult.isError -isnot [bool] -or $guard.reply.rawResult.isError)) { throw 'Decoded MCP compiler snapshot error retained; no native counters accepted.' }
+        $guard.health=Get-DevBenchShaderCompilerHealth -Arguments $argsMap -Content @($guard.reply.content)
+        $guard.state=$guard.health.state
+        $guard.reasons=@($guard.health.reasons)
+        if (-not $guard.health.readQualified) { return $guard }
+        $sources=@($Identity.build.sources | Where-Object tool -CEQ 'communityshaders.shader_api')
+        if ($sources.Count -ne 1 -or $sources[0].producer.serviceSessionId -cne $guard.health.serviceSessionId) { throw 'Shader service session differs from the accepting runtime registry.' }
+        $age=([DateTimeOffset]::UtcNow - [DateTimeOffset]$guard.health.timestampUtc).TotalSeconds
+        if ($age -lt -5 -or $age -gt 10) { throw 'Compiler snapshot is stale or future-dated; no current-health admission.' }
+        $guard.admissible=$guard.health.admissible
+    } catch {
+        $guard.admissible=$false; $guard.reasons=@($guard.reasons)+$_.Exception.Message
+    }
+    return $guard
+}
 
 function Get-RequestTimeoutSeconds {
     if ($null -eq $script:operationDeadlineUtc) { return $script:requestTimeoutSecondsForRpc }
@@ -450,18 +485,22 @@ function Invoke-McpRequest {
 }
 
 function Invoke-ToolRpc {
-    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation)
+    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation, [switch]$RetainShaderSnapshotToolError)
+    if ($RetainShaderSnapshotToolError -and ($Name -cne 'communityshaders.shader_api' -or $Mutation -or -not (Test-DevBenchShaderSnapshotRequest -Arguments $Arguments))) { throw 'Decoded compiler-error retention is restricted to the exact read-only shader snapshot.' }
     Set-ServerWaitBudgetAtDispatch -Arguments $Arguments
     $rpc = Invoke-McpRequest -Endpoint $endpoint -Headers $Headers -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/call'; params = @{ name = $Name; arguments = $Arguments } } -Mutation:$Mutation
     if ($rpc.json.PSObject.Properties['error']) { throw "DevBench tools/call failed: $($rpc.json.error | ConvertTo-Json -Compress)" }
-    if ($rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
+    if (-not $RetainShaderSnapshotToolError -and $rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
         $message = ($rpc.json.result.content | ForEach-Object { $_.text }) -join "`n"
         throw "DevBench tool '$Name' failed: $message"
     }
     $parsed = @()
     foreach ($item in @($rpc.json.result.content)) {
         if ($item.type -eq 'text') {
-            try { $parsed += ,($item.text | ConvertFrom-Json -Depth 50) } catch { $parsed += ,([string]$item.text) }
+            try {
+                if ($Name -ceq 'communityshaders.shader_api') { $parsed += ,($item.text | ConvertFrom-Json -Depth 50 -DateKind String) }
+                else { $parsed += ,($item.text | ConvertFrom-Json -Depth 50) }
+            } catch { $parsed += ,([string]$item.text) }
         }
         else { $parsed += ,$item }
     }
@@ -831,12 +870,34 @@ function Write-RuntimeEvidence($Binding) {
 
 try {
     Initialize-InvocationEvidence
+    if ($RequireCompilerHealthy -and ($Command -cne 'call' -or $SkipRuntimeIdentityVerification -or -not [string]::IsNullOrWhiteSpace($ExpectedErrorCode))) { throw '-RequireCompilerHealthy requires call, verified runtime identity and no expected-error override.' }
     if ([string]::IsNullOrWhiteSpace($RuntimePath)) { throw 'RuntimePath is required. Pass -RuntimePath or set CSX_DEVBENCH_RUNTIME_PATH.' }
     if (-not (Test-Path -LiteralPath $RuntimePath -PathType Leaf)) { throw "DevBench runtime metadata does not exist: $RuntimePath" }
     $runtime = Get-Content -LiteralPath $RuntimePath -Raw | ConvertFrom-Json
     if (-not $runtime.PSObject.Properties['port']) { throw 'DevBench runtime metadata has no port.' }
     $endpoint = "http://127.0.0.1:$([int]$runtime.port)/mcp"
     $arguments = $null
+    $calendarObservations = @()
+    $colourPlan=$null
+    if ($Command -in @('calendar-window','colour-window')) {
+        if ($SkipRuntimeIdentityVerification -or $MaxTransientRetries -ne 0 -or $TimeoutSeconds -lt 20 -or $RequirePerformanceNeutral) { throw 'calendar-window requires identity verification, -MaxTransientRetries 0, at least 20 seconds and no performance-neutrality claim.' }
+        if ([string]::IsNullOrWhiteSpace($CalendarOwner) -or $CalendarOwner.Length -gt 128) { throw 'calendar-window requires a bounded explicit CalendarOwner.' }
+        if($Command -ceq 'colour-window'){
+            if($TimeoutSeconds -gt 180 -or $CalendarHoldMilliseconds -lt ($TimeoutSeconds*1000) -or [string]::IsNullOrWhiteSpace($EvidenceDirectory) -or -not [string]::IsNullOrWhiteSpace($Tool) -or $argumentsJsonSupplied -or -not [string]::IsNullOrWhiteSpace($CalendarObservationsJson) -or -not [string]::IsNullOrWhiteSpace($ExpectedErrorCode)){throw 'colour-window requires20..180s, hold covering total budget, explicit evidence directory and no generic arguments/observations/error override.'}
+            $colourPlan=$ColourPlanJson|ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop
+            Assert-ColourMeasurementPlan $colourPlan
+        }else{
+            if(-not [string]::IsNullOrWhiteSpace($ColourPlanJson)){throw 'Read-only calendar-window does not accept ColourPlanJson.'}
+            $calendarObservations = @($CalendarObservationsJson | ConvertFrom-Json -AsHashtable -Depth 30 -ErrorAction Stop)
+            if ($calendarObservations.Count -lt 1 -or $calendarObservations.Count -gt 16) { throw 'calendar-window requires 1..16 observations.' }
+        }
+        foreach ($item in $calendarObservations) {
+            if ($item -isnot [Collections.IDictionary] -or $item.Count -ne 2 -or -not $item.Contains('tool') -or -not $item.Contains('arguments') -or $item.tool -isnot [string] -or $item.arguments -isnot [Collections.IDictionary] -or $item.tool -ceq 'calendar' -or -not (Test-DevBenchReadOnlyRequest -ToolName $item.tool -Arguments $item.arguments) -or $item.arguments.Contains('timeoutMs')) { throw 'calendar-window accepts only exact supported non-mutating observation requests; no calendar/save/time/quality/weather mutations.' }
+        }
+        $script:invocationRecord.requestMode = if($colourPlan){'typed-finite-colour-calendar-window'}else{'finite-calendar-hold-with-read-only-observations'}
+        $script:invocationRecord.requestedArguments = if($colourPlan){$ColourPlanJson}else{$CalendarObservationsJson}
+        Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord
+    }
     if ($Command -eq 'call') {
         if ([string]::IsNullOrWhiteSpace($Tool)) { throw 'Tool is required for call.' }
         try { $arguments = $ArgumentsJson | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { throw "ArgumentsJson is invalid: $($_.Exception.Message)" }
@@ -865,10 +926,28 @@ try {
     $tools = @()
     $evidencePath = $null
     if ($Command -ne 'wait') {
+        $script:transport='mcp'
         $session = Open-McpSession -Runtime $runtime
         $headers = $session.headers
         $tools = @($session.tools)
         $runtimeIdentity = $session.runtimeIdentity
+        if ($Command -in @('calendar-window','colour-window')) {
+            if (-not $runtimeIdentity.complete -or -not $runtimeIdentity.verified) { throw 'calendar-window requires complete verified runtime identity.' }
+            $calendarTools=@($tools | Where-Object name -CEQ 'calendar')
+            if ($calendarTools.Count -ne 1) { throw 'toolSchemaUnresolved: exact calendar is absent.' }
+            $schema=$calendarTools[0].inputSchema
+            if (@($schema.properties.action.enum).Count -ne 3 -or @($schema.properties.action.enum | Where-Object { $_ -cnotin @('status','hold','release') }).Count -gt 0 -or $schema.properties.holdMs.maximum -ne 300000 -or @($schema.properties.binding.required).Count -ne 5 -or @($schema.oneOf).Count -ne 3) { throw 'toolSchemaUnresolved: current calendar schema cannot establish the native finite ownership contract.' }
+            foreach ($item in $calendarObservations) { if (@($tools | Where-Object name -CEQ $item.tool).Count -ne 1) { throw "toolSchemaUnresolved: observation $($item.tool) is absent." } }
+            if($colourPlan){
+                if($runtimeIdentity.build.buildId -cne $colourPlan.expectedBuildId -or [string]::IsNullOrWhiteSpace($runtimeIdentity.process.startTimeUtc)){throw 'Colour plan requires exact verified build/process start identity.'}
+                foreach($pair in @(@('communityshaders.fsr_color_contract',@('status','set')),@('communityshaders.colour_pipeline_probe',@('status','arm','read','reset')))){
+                    $matches=@($tools|Where-Object name -CEQ $pair[0])
+                    if($matches.Count -ne 1 -or $matches[0].inputSchema.additionalProperties -isnot [bool] -or $matches[0].inputSchema.additionalProperties -or @($matches[0].inputSchema.properties.action.enum).Count -ne $pair[1].Count -or @($pair[1]|Where-Object {$_ -cnotin @($matches[0].inputSchema.properties.action.enum)}).Count){throw 'toolSchemaUnresolved: exact finite colour action catalog required.'}
+                }
+                $probeSchema=($tools|Where-Object name -CEQ 'communityshaders.colour_pipeline_probe').inputSchema
+                if(@($probeSchema.properties.stage.enum).Count -ne 5 -or @('fsr_input','fsr_output','combined_main','imagespace_input','imagespace_output'|Where-Object {$_ -cnotin @($probeSchema.properties.stage.enum)}).Count -or @($probeSchema.properties.eye.enum).Count -ne 2 -or 0 -notin @($probeSchema.properties.eye.enum) -or 1 -notin @($probeSchema.properties.eye.enum)){throw 'toolSchemaUnresolved: exact five-stage/two-eye pages required.'}
+            }
+        }
         if (-not $SkipRuntimeIdentityVerification) {
             if ($Command -eq 'call' -and -not $readOnlyCall -and -not $runtimeIdentity.complete) {
                 throw "Mutation-capable DevBench calls require complete runtime identity. Missing: $($runtimeIdentity.missing -join ', ')."
@@ -882,13 +961,57 @@ try {
         if (-not [string]::IsNullOrWhiteSpace($ToolFilter)) { $tools = @($tools | Where-Object { $_.name -like "*$ToolFilter*" }) }
         $data = if ($NamesOnly) { [pscustomobject][ordered]@{ names = @($tools | ForEach-Object name); count = $tools.Count } } else { [pscustomobject][ordered]@{ tools = $tools } }
     }
+    elseif ($Command -in @('calendar-window','colour-window')) {
+        $calendarSessionId=[string]$headers['Mcp-Session-Id']
+        $calendarDeadline=$operationDeadlineUtc
+        $colourGuard={
+            param($bound)
+            $script:operationDeadlineUtc=$bound
+            try{
+                $pidNow=Get-ListenerPid ([int]$runtimeIdentity.expectations.port)
+                $processNow=Get-Process -Id $runtimeIdentity.listenerPid -ErrorAction Stop
+                if($pidNow -ne $runtimeIdentity.listenerPid -or $processNow.Path -cne $runtimeIdentity.process.path -or $processNow.StartTime.ToUniversalTime().ToString('o') -cne $runtimeIdentity.process.startTimeUtc){throw 'Colour runtime process/listener changed.'}
+                $guard=Get-ShaderCompilerGuard -Tools $tools -Headers $headers -Identity $runtimeIdentity
+                $rawGuardPath=Join-Path $EvidenceDirectory ('colour-compiler.'+[guid]::NewGuid().ToString('N')+'.json')
+                Write-JsonAtomic -Path $rawGuardPath -Value ([pscustomobject]@{receivedUtc=[datetime]::UtcNow.ToString('o');sessionId=$calendarSessionId;runtimeIdentity=$runtimeIdentity;guard=$guard})
+                $guard|Add-Member -NotePropertyName immutableReceiptPath -NotePropertyValue $rawGuardPath
+                if((Get-ListenerPid ([int]$runtimeIdentity.expectations.port)) -ne $runtimeIdentity.listenerPid -or $processNow.HasExited){throw 'Colour runtime changed during compiler snapshot.'}
+                return $guard
+            }finally{$script:operationDeadlineUtc=$calendarDeadline}
+        }
+        $data=Invoke-DevBenchCalendarWindow -Owner $CalendarOwner -Observations $calendarObservations -ColourPlan $colourPlan -CompilerGuard $colourGuard -HoldMilliseconds $CalendarHoldMilliseconds -DeadlineUtc $calendarDeadline -ExpectedProcessId $runtimeIdentity.listenerPid -AssertSession {
+            if ($script:transport -cne 'mcp' -or [string]::IsNullOrWhiteSpace($calendarSessionId) -or [string]$headers['Mcp-Session-Id'] -cne $calendarSessionId) { throw 'Calendar MCP session changed; no rebind/release on a replacement.' }
+        } -Call {
+            param($name,$argsMap,$mutation,$bound)
+            $script:operationDeadlineUtc=$bound
+            try {
+                if ($mutation) {
+                    $script:invocationRecord.commandId=if($argsMap.Contains('commandId')){[string]$argsMap.commandId}else{[guid]::NewGuid().ToString('N')}
+                    $script:invocationRecord['calendarDispatchArguments']=$argsMap
+                    $reply=Invoke-DevBenchTargetDispatch -InvocationRecord $invocationRecord -PersistIntent { Update-InvocationEvidence -State 'dispatching' } -TargetAction { Invoke-ToolRpc -Name $name -Arguments $argsMap -Headers $headers -Mutation }
+                } else { $reply=Invoke-ToolRpc -Name $name -Arguments $argsMap -Headers $headers }
+                if($colourPlan){
+                    $rawPath=Join-Path $EvidenceDirectory ('colour-rpc.'+[guid]::NewGuid().ToString('N')+'.json')
+                    Write-JsonAtomic -Path $rawPath -Value ([pscustomobject]@{tool=$name;arguments=$argsMap;mutation=$mutation;receivedUtc=[datetime]::UtcNow.ToString('o');sessionId=$calendarSessionId;runtimeIdentity=$runtimeIdentity;reply=$reply})
+                    $reply|Add-Member -NotePropertyName immutableReceiptPath -NotePropertyValue $rawPath
+                }
+                return $reply
+            } finally { $script:operationDeadlineUtc=$calendarDeadline }
+        }
+        $semantic=[pscustomobject]@{known=$true;ok=$data.ok;outcome='calendar-window';guarded=$false;transient=$false;codes=@();states=@();reasons=@($data.errors);completionBasis=$data.completionBasis}
+    }
     elseif ($Command -eq 'call') {
         $toolAvailable = @($tools | Where-Object name -eq $Tool).Count -eq 1
-        $performanceGuard = if ($RequirePerformanceNeutral) {
+        $compilerGuard = if ($RequireCompilerHealthy) { Get-ShaderCompilerGuard -Tools $tools -Headers $headers -Identity $runtimeIdentity } else { $null }
+        $performanceGuard = if ($RequirePerformanceNeutral -and (-not $compilerGuard -or $compilerGuard.admissible)) {
             Get-PerformanceMeasurementGuard -Tools $tools -Headers $headers
         }
         else { $null }
-        if ($performanceGuard -and -not $performanceGuard.neutral) {
+        if ($compilerGuard -and -not $compilerGuard.admissible) {
+            $data=[pscustomobject]@{tool=$Tool;toolCallSkipped=$true;compilerGuard=$compilerGuard;healthyEvidenceAdmitted=$false}
+            $semantic=[pscustomobject]@{known=$true;ok=$false;outcome='compiler-admission-refused';guarded=$true;transient=$false;codes=@('compiler_health_unproven');states=@();reasons=@($compilerGuard.reasons)}
+        }
+        elseif ($performanceGuard -and -not $performanceGuard.neutral) {
             $data = [pscustomobject][ordered]@{
                 tool = $Tool
                 toolCallSkipped = $true
@@ -996,6 +1119,7 @@ try {
         }
     }
     else {
+        if ($Condition -ceq 'compilerHealthy' -and ($SkipRuntimeIdentityVerification -or -not [string]::IsNullOrWhiteSpace($Tool) -or $argumentsJsonSupplied)) { throw 'compilerHealthy requires verified runtime identity and accepts no target tool or target arguments.' }
         if ($Condition -in @('toolAvailable', 'serviceReady') -and [string]::IsNullOrWhiteSpace($Tool)) { throw "Condition '$Condition' requires -Tool." }
         if ($DismissBlockingMenus.Count -gt 0 -and $Condition -ne 'noBlockingMenu') { throw '-DismissBlockingMenus is valid only with -Condition noBlockingMenu.' }
         if ($MinimumMenuStableSeconds -gt 0 -and $Condition -ne 'noBlockingMenu') { throw '-MinimumMenuStableSeconds is valid only with -Condition noBlockingMenu.' }
@@ -1030,7 +1154,7 @@ try {
         if ($Condition -eq 'serviceReady') {
             try { $waitArguments = $ArgumentsJson | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { throw "ArgumentsJson is invalid: $($_.Exception.Message)" }
         }
-        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        $deadline = if ($Condition -ceq 'compilerHealthy') { $operationDeadlineUtc } else { [DateTime]::UtcNow.AddSeconds($TimeoutSeconds) }
         $script:operationDeadlineUtc = $deadline
         $waitStartedUtc = [DateTime]::UtcNow
         $attempts = 0
@@ -1040,6 +1164,7 @@ try {
         $lastProgressUtc = [DateTime]::MinValue
         $firstCpu = $null
         $lastCpu = $null
+        $compilerWaitIdentity = $null
         $playerTransitionObserved = $false
         $playerInitialState = $null
         $menuDismissals = [Collections.Generic.List[object]]::new()
@@ -1143,6 +1268,63 @@ try {
                 $observation | Add-Member -NotePropertyName baseSatisfied -NotePropertyValue $baseSatisfied -Force
                 $observation | Add-Member -NotePropertyName stableSeconds -NotePropertyValue $stableSeconds -Force
                 $observation | Add-Member -NotePropertyName requiredStableSeconds -NotePropertyValue $MinimumMenuStableSeconds -Force
+            }
+            elseif ($Condition -ceq 'compilerHealthy') {
+                # Read-only barrier; never retry a load/camera/target mutation.
+                if (($deadline - [DateTime]::UtcNow).TotalSeconds -lt 1 -and $null -ne $observation) {
+                    $observation | Add-Member -NotePropertyName waitStopReason -NotePropertyValue 'Insufficient remaining allowance for another bounded request.' -Force
+                    break
+                }
+                if ($null -eq $compilerWaitIdentity) { $compilerWaitIdentity = $runtimeIdentity }
+                if (-not $compilerWaitIdentity.complete -or -not $compilerWaitIdentity.verified -or
+                    [string]::IsNullOrWhiteSpace($compilerWaitIdentity.process.startTimeUtc)) { throw 'Compiler wait requires complete verified process/artifact/start identity.' }
+                $guard = $null
+                foreach ($boundary in @(0,1)) {
+                    $listenerPid = Get-ListenerPid ([int]$compilerWaitIdentity.expectations.port)
+                    $process = if ($listenerPid) { Get-Process -Id $listenerPid -ErrorAction Stop } else { $null }
+                    if ($listenerPid -ne $compilerWaitIdentity.listenerPid -or $null -eq $process -or
+                        $process.Path -cne $compilerWaitIdentity.process.path -or
+                        $process.StartTime.ToUniversalTime().ToString('o') -cne $compilerWaitIdentity.process.startTimeUtc) { throw 'Compiler wait runtime identity changed; no readiness or mutation replay.' }
+                    if ($boundary -eq 0) { $guard = Get-ShaderCompilerGuard -Tools $tools -Headers $headers -Identity $compilerWaitIdentity }
+                }
+                if ($null -eq $guard.health -and ($deadline - [DateTime]::UtcNow).TotalSeconds -lt 1 -and
+                    $null -ne $observation -and $observation.PSObject.Properties['compilerGuard']) {
+                    # Preserve last qualified diagnostics, not invented current counters.
+                    $observation | Add-Member -NotePropertyName deadlineReadFailure -NotePropertyValue $guard -Force
+                    $observation | Add-Member -NotePropertyName compilerSnapshotBasis -NotePropertyValue 'last-qualified-observation-before-deadline' -Force
+                    $observation.satisfied = $false
+                    break
+                }
+                $retryable = $null -ne $guard.health -and (
+                    ($guard.health.readQualified -and $guard.state -cin @('COMPILATION_UNPROVEN','COMPILATION_PENDING','UNAVAILABLE') -and
+                     @($guard.reasons).Count -eq @($guard.health.reasons).Count) -or
+                    ($guard.state -ceq 'READ_UNAVAILABLE' -and $guard.health.state -ceq 'READ_UNAVAILABLE'))
+                $observation = [pscustomobject][ordered]@{
+                    satisfied = $guard.admissible
+                    retryable = $retryable
+                    terminalFailure = -not $guard.admissible -and -not $retryable
+                    classification = $guard.state
+                    compilerGuard = $guard
+                    completionBasis = 'current-state-compiler-snapshot'
+                    semantic = [pscustomobject][ordered]@{
+                        known = $true; ok = [bool]$guard.admissible
+                        outcome = if ($guard.admissible) { 'compiler-ready' } else { 'compiler-readiness-refused' }
+                        guarded = $true; transient = [bool]$retryable
+                        codes = @(); states = @($guard.state); reasons = @($guard.reasons)
+                    }
+                    scope = 'Compiler readiness only; not loaded-cell, pixel, full-render-pipeline or future-health proof.'
+                }
+                if ($observation.satisfied -and [DateTime]::UtcNow -ge $deadline) {
+                    $observation.satisfied = $false
+                    $observation.retryable = $false
+                    $observation.terminalFailure = $true
+                    $observation.classification = 'late-positive-compiler-observation'
+                    $observation.semantic.ok = $false
+                    $observation.semantic.outcome = 'wait-timeout'
+                    $observation.semantic.codes = @('wait_timeout')
+                    $observation.semantic.reasons = @('Positive compiler observation completed after the fixed operation deadline.')
+                }
+                if ($observation.terminalFailure -or [DateTime]::UtcNow -ge $deadline) { break }
             }
             elseif ($Condition -eq 'playerLoaded') {
                 try {
@@ -1347,11 +1529,27 @@ try {
         $semantic = [pscustomobject][ordered]@{ known = $true; ok = [bool]$observation.satisfied; reasons = $(if ($observation.satisfied) { @() } else { @("Condition '$Condition' was not satisfied within $TimeoutSeconds seconds.") }) }
     }
 
-    if (($RequireSuccess -or $RequirePerformanceNeutral) -and -not $semantic.known) {
+    if ($RequireCompilerHealthy -and $null -ne $data -and $invocationRecord.dispatchedUtc) {
+        # Bracket only this invocation. An async capture's later completion needs
+        # its own guarded request_get/finalization; this is not whole-run health.
+        $data | Add-Member -NotePropertyName targetSemantic -NotePropertyValue $semantic -Force
+        $data | Add-Member -NotePropertyName compilerGuard -NotePropertyValue $compilerGuard -Force
+        $compilerGuardAfter=Get-ShaderCompilerGuard -Tools $tools -Headers $headers -Identity $runtimeIdentity
+        $compilerWindow=Test-DevBenchShaderCompilerWindow -Before $compilerGuard.health -After $compilerGuardAfter.health
+        $data | Add-Member -NotePropertyName compilerGuardAfter -NotePropertyValue $compilerGuardAfter -Force
+        $data | Add-Member -NotePropertyName compilerWindow -NotePropertyValue $compilerWindow -Force
+        $compilerAdmitted=$compilerGuard.admissible -and $compilerGuardAfter.admissible -and $compilerWindow.valid
+        if ($Tool -ceq 'communityshaders.shader_api' -and $arguments.action -ceq 'snapshot') { $compilerAdmitted=$compilerAdmitted -and $semantic.compilerHealth.admissible }
+        $data | Add-Member -NotePropertyName healthyEvidenceAdmitted -NotePropertyValue ([bool]($compilerAdmitted -and $semantic.known -and $semantic.ok)) -Force
+        if (-not $compilerAdmitted) {
+            $semantic=[pscustomobject]@{known=$true;ok=$false;outcome='compiler-admission-invalidated';guarded=$true;transient=$false;codes=@('compiler_health_invalidated');states=@();reasons=@($compilerGuardAfter.reasons)+@($compilerWindow.reasons);completionBasis='compiler-boundary-bracket-only'}
+        }
+    }
+    if (($RequireSuccess -or $RequirePerformanceNeutral -or $RequireCompilerHealthy) -and -not $semantic.known) {
         $semantic.outcome = 'unverified'
         $semantic.reasons = @($semantic.reasons) + 'A verified semantic outcome was required, but the response did not provide one.'
     }
-    $semanticFailure = if ($Command -eq 'call') {
+    $semanticFailure = if ($Command -in @('call','calendar-window','colour-window')) {
         -not $semantic.known -or -not $semantic.ok
     }
     elseif ($RequireSuccess -or $Command -eq 'wait') {
@@ -1363,7 +1561,7 @@ try {
         ok = -not $semanticFailure
         transportOk = $true
         state = $(if ($semanticFailure) { 'semantic-failed' } else { 'completed' })
-        indeterminate = $false
+        indeterminate = [bool]($Command -in @('calendar-window','colour-window') -and $data.indeterminate)
         dispatchReached = [bool]$dispatch.dispatchReached
         responseDataRetained = [bool]$dispatch.responseDataRetained
         acceptedDataRetained = [bool]$dispatch.acceptedDataRetained
