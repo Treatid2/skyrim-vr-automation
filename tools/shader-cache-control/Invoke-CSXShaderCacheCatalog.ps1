@@ -759,7 +759,7 @@ function New-CommittedNoOpRestoreProof(
     return Get-CommittedRestoreProof -ReceiptPath $receiptPath -EvidenceRoot $resolvedEvidence -CachePath $CachePath -BaselineTreeSha256 $BaselineTreeSha256 -WorkingTreeSha256 $WorkingTreeSha256 -SnapshotTransactionId $SnapshotTransactionId -ExpectedNoOpPreservedPath $baselinePath
 }
 
-function Assert-OverwriteOwnerBinding($Binding) {
+function Assert-OverwriteOwnerBinding($Binding, [switch]$RequireReconciledBaseline) {
     if ($null -eq $Binding -or [string]$Binding.mode -cne 'mo2-overwrite-output') { return }
     foreach ($required in @('workspaceId', 'ownershipId', 'ownerMarkerPath', 'ownerMarkerSha256', 'overwriteRoot')) {
         if (-not (Test-Property $Binding $required) -or [string]::IsNullOrWhiteSpace([string]$Binding.$required)) {
@@ -787,6 +787,12 @@ function Assert-OverwriteOwnerBinding($Binding) {
         [string]$marker.mode -cne 'mo2-overwrite-output' -or
         -not (Test-SamePath ([string]$marker.overwritePath) ([string]$Binding.overwriteRoot))) {
         throw 'The MO2 Overwrite owner marker belongs to a different workspace transaction.'
+    }
+    if ($RequireReconciledBaseline -and $marker.PSObject.Properties['reconciledCacheBaselineSha256']) {
+        $expected=[string]$marker.reconciledCacheBaselineSha256
+        if ($expected -cnotmatch '\A[0-9A-Fa-f]{64}\z') { throw 'Reconciled cache baseline identity is invalid.' }
+        $current=Invoke-Transaction 'inspect' @{CachePath=[string]$Binding.cachePath}
+        if ([string]$current.data.treeSha256 -ine $expected) { throw 'Shared ShaderCache changed after completed-output reconciliation and before catalog preparation.' }
     }
 }
 
@@ -1291,7 +1297,7 @@ function Prepare-TaskCache($Storage) {
         [pscustomobject]@{ data = [pscustomobject]@{ receiptPath = [string]$existingPlan.transactionReceiptPath; inventory = [pscustomobject]@{ treeSha256 = [string]$existingPlan.beforeTreeSha256 } } }
     }
     else {
-        Assert-OverwriteOwnerBinding $cacheResolution.binding
+        Assert-OverwriteOwnerBinding $cacheResolution.binding -RequireReconciledBaseline
         Invoke-Transaction 'snapshot' @{ CachePath = $resolvedCache; EvidenceDirectory = $evidence; BlockingProcessNames = $BlockingProcessNames; Confirm = $false }
     }
     $action = 'use-current-no-match'
