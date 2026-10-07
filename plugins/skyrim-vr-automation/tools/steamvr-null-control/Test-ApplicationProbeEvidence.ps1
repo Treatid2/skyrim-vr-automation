@@ -43,6 +43,15 @@ $LogTailMaxBytes=262144
 $InternalTestFailurePoint=''
 $script:SharedTextTailState=@{current=[pscustomobject]@{stable=$true;usable=$true;continuitySha256='new-partial-log';continuityOffset=0;continuityLength=12500;bytesRead=12500;hashBytesRead=12500;incremental=$false;resynchronized=$false}}
 $serverStart=[DateTime]::UtcNow.AddSeconds(-1)
+$script:NullStartupLogProofState=@{}
+# Integrated builds use a separate startup-prefix reader. Like the tail reader
+# below, isolate it with synthetic activation facts; this suite tests probe
+# evidence propagation, not the independently covered log identity protocol.
+function Get-NullStartupLogProof {param($Path,$Server,$SerialNumber,$MaxBytes,$DeadlineUtc)
+ $lines=@(Get-SharedTextTail -Path $Path -Count 2000 -MaxBytes $MaxBytes -DeadlineUtc $DeadlineUtc)
+ $facts=@($lines|ForEach-Object{[pscustomobject]@{timestampUtc=$serverStart.ToString('o');line=$_}})
+ [pscustomobject]@{stable=$true;complete=$true;driverLoaded=$facts[0];activeHmd=$facts[1];headPoseDriverLoaded=$facts[2];headPoseDeviceRegistered=$facts[3]}
+}
 function Get-NullProviderAuthority {param($DeadlineUtc) [pscustomobject]@{verified=$true;markerSha256='marker'}}
 function New-HeadPoseContinuityIdentity {param($Pose,$PackageAuthority) [pscustomobject]@{identity='same'}}
 function Assert-HeadPoseContinuity {param($Before,$After)}
