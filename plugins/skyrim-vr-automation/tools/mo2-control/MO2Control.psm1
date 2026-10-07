@@ -4635,7 +4635,9 @@ function Invoke-MO2UnlockOnly {
         [scriptblock]$UnlockControlAction
     )
     if (-not $InspectionFactory) {
-        $InspectionFactory = { Get-MO2InspectionData -Config $Config }.GetNewClosure()
+        # Keep the defining module session state. GetNewClosure creates a new
+        # dynamic module which cannot resolve private inspection functions.
+        $InspectionFactory = { Get-MO2InspectionData -Config $Config }
     }
     if (-not $BindingFactory) {
         $BindingFactory = {
@@ -6882,23 +6884,44 @@ function Invoke-MO2TerminateGame {
         return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $false -State 'blocked' -Data @{ gameTermination=$termination } -Errors @('A launch-recorded game identity changed before force termination; no PID-based fallback was attempted.')
     }
     $targets = @($termination.targets)
-    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    do {
-        Start-Sleep -Milliseconds 250
-        $afterTermination = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$owned.data.profile) -RequestedExecutable ([string]$owned.data.executable)
-        if (@($afterTermination.processes.game | Where-Object { @($targets.id) -contains [int]$_.id }).Count -eq 0) { break }
-    } while ([DateTime]::UtcNow -lt $deadline)
-    if ($afterTermination.processes.game.Count -gt 0) {
-        return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $false -State 'game-terminate-incomplete' -Data @{ targets=$targets; remaining=$afterTermination.processes.game } -Errors @('One or more exact recorded game processes remained after termination.')
+    $gameStopVerified = $false
+    $cleanupVerified = $false
+    $rootBuilder = $null
+    $receiptPublished = $false
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        do {
+            Start-Sleep -Milliseconds 250
+            $afterTermination = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$owned.data.profile) -RequestedExecutable ([string]$owned.data.executable)
+            if (@($afterTermination.processes.game | Where-Object { @($targets.id) -contains [int]$_.id }).Count -eq 0) { break }
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if ($afterTermination.processes.game.Count -gt 0) {
+            return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $false -State 'game-terminate-incomplete' -Data @{ targets=$targets; remaining=$afterTermination.processes.game } -Errors @('One or more exact recorded game processes remained after termination.')
+        }
+        $gameStopVerified = $true
+        $remainingSeconds = [math]::Max(1, [int][math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds))
+        $rootBuilder = Invoke-MO2UnlockOnly -Config $Config -Owned $owned -TimeoutSeconds $remainingSeconds
+        $success = $rootBuilder.restored -and @($rootBuilder.gameProcesses).Count -eq 0 -and @($rootBuilder.mo2Processes | Where-Object { [int]$_.id -eq [int]$resolution.ownerPid }).Count -eq 1
+        $cleanupVerified = [bool]$success
+        $state = if ($success) { 'game-terminated-rootbuilder-restored' } else { 'rootbuilder-recovery-pending' }
+        Set-MO2OwnedSessionStatus -Owned $owned -Status $state -TimestampProperty 'gameTerminatedUtc'
+        $receipt = [pscustomobject][ordered]@{ contractVersion=$script:MO2ControlContractVersion; sessionId=$SessionId; terminatedProcesses=$targets; rootBuilder=$rootBuilder; completedUtc=[DateTime]::UtcNow.ToString('o') }
+        Write-MO2JsonAtomic -Path (Join-Path ([string]$owned.data.sessionPath) 'mo2-terminate-game.json') -Value $receipt
+        $receiptPublished = $true
+        return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $success -State $state -Data @{ sessionId=$SessionId; terminatedProcesses=$targets; mo2Retained=$success; rootBuilder=$rootBuilder; receiptPath=(Join-Path ([string]$owned.data.sessionPath) 'mo2-terminate-game.json') } -Errors $(if ($success) { @() } else { @('The game ended, but MO2 ownership and RootBuilder BuildData cleanup were not both verified before the timeout.') })
     }
-    $remainingSeconds = [math]::Max(1, [int][math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds))
-    $rootBuilder = Invoke-MO2UnlockOnly -Config $Config -Owned $owned -TimeoutSeconds $remainingSeconds
-    $success = $rootBuilder.restored -and @($rootBuilder.gameProcesses).Count -eq 0 -and @($rootBuilder.mo2Processes | Where-Object { [int]$_.id -eq [int]$resolution.ownerPid }).Count -eq 1
-    $state = if ($success) { 'game-terminated-rootbuilder-restored' } else { 'rootbuilder-recovery-pending' }
-    Set-MO2OwnedSessionStatus -Owned $owned -Status $state -TimestampProperty 'gameTerminatedUtc'
-    $receipt = [pscustomobject][ordered]@{ contractVersion=$script:MO2ControlContractVersion; sessionId=$SessionId; terminatedProcesses=$targets; rootBuilder=$rootBuilder; completedUtc=[DateTime]::UtcNow.ToString('o') }
-    Write-MO2JsonAtomic -Path (Join-Path ([string]$owned.data.sessionPath) 'mo2-terminate-game.json') -Value $receipt
-    return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $success -State $state -Data @{ sessionId=$SessionId; terminatedProcesses=$targets; mo2Retained=$success; rootBuilder=$rootBuilder; receiptPath=(Join-Path ([string]$owned.data.sessionPath) 'mo2-terminate-game.json') } -Errors $(if ($success) { @() } else { @('The game ended, but MO2 ownership and RootBuilder BuildData cleanup were not both verified before the timeout.') })
+    catch {
+        # A successful exact termination request is not reversible or retryable.
+        # Retain it even when later inspection, status, or receipt publication
+        # fails. Do not convert missing cleanup evidence into restoration proof.
+        return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $false -State 'game-termination-reporting-failed' -Data @{
+            sessionId=$SessionId; gameTermination=$termination; terminatedProcesses=$targets
+            mutationDispatched=$true; gameStopVerified=$gameStopVerified
+            rootBuilder=$rootBuilder; cleanupVerified=$cleanupVerified
+            mo2Retained=$(if($cleanupVerified){$true}else{$null})
+            receiptPublished=$receiptPublished; recoveryRequired=$true; noAutomaticRetry=$true
+        } -Errors @($_.Exception.Message)
+    }
 }
 
 function Invoke-MO2Stop {
