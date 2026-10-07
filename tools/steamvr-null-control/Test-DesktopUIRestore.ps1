@@ -23,11 +23,27 @@ function Invoke-Control([string]$Command, [hashtable]$Options = @{}) {
     return ($lines -join [Environment]::NewLine) | ConvertFrom-Json -Depth 64
 }
 function Assert-Refusal([string]$Name, [hashtable]$Options = @{PreserveDesktopUIWindowState=$true;WhatIf=$true}) {
-    $before = Hash $settings; $beforeJournal = Hash $journal
+    $before = Hash $settings; $beforeJournal = Hash $journal; $beforeOpenVR = Hash $openvr
+    $beforeEvidence = @(Get-ChildItem -LiteralPath $evidence -File -Recurse | Sort-Object FullName | ForEach-Object { $_.FullName + '|' + (Hash $_.FullName) }) -join "`n"
     $result = Invoke-Control restore $Options
-    Assert-Test (-not $result.ok -and (Hash $settings) -ceq $before -and (Hash $journal) -ceq $beforeJournal) $Name
+    $afterEvidence = @(Get-ChildItem -LiteralPath $evidence -File -Recurse | Sort-Object FullName | ForEach-Object { $_.FullName + '|' + (Hash $_.FullName) }) -join "`n"
+    Assert-Test (-not $result.ok -and (Hash $settings) -ceq $before -and (Hash $journal) -ceq $beforeJournal -and (Hash $openvr) -ceq $beforeOpenVR -and $beforeEvidence -ceq $afterEvidence) $Name
 }
 try {
+    . (Join-Path $PSScriptRoot 'DesktopUIRestore.ps1')
+    $positiveZero=[Text.Json.JsonDocument]::Parse('0.0')
+    try {
+        $expectedExact=Get-DesktopUIRestoreExactValue $positiveZero.RootElement
+        foreach($literal in @('0','0.0','0e0','0.0000','0E+5','-0','-0.0','-0e0','-0.0000','-0E+5')){
+            $actualDoc=[Text.Json.JsonDocument]::Parse($literal)
+            try {
+                $actualExact=Get-DesktopUIRestoreExactValue $actualDoc.RootElement
+                $actual=$literal|ConvertFrom-Json
+                $equivalent=Test-DesktopUIRestoreControlledValueEquivalent ([double]0.0) $actual $expectedExact $actualExact
+                Assert-Test ($equivalent -eq (-not $literal.StartsWith('-'))) ("module controlled zero spelling: "+$literal)
+            } finally { $actualDoc.Dispose() }
+        }
+    } finally { $positiveZero.Dispose() }
     [IO.Directory]::CreateDirectory($fixture) | Out-Null
     $settings = Join-Path $fixture 'steamvr.vrsettings'
     $openvr = Join-Path $fixture 'openvrpaths.vrpath'
@@ -131,6 +147,17 @@ try {
         Assert-Refusal ("refuses "+$case.name)
     }
     $raw=[Text.Encoding]::UTF8.GetString($admittedBytes)
+    foreach($literal in @('0','0.0','0e0','0.0000','0E+5','-0','-0.0','-0e0','-0.0000','-0E+5')){
+        [IO.File]::WriteAllText($settings,(Set-NumericLiteral $raw 'positionX' $literal),[Text.UTF8Encoding]::new($false))
+        if($literal.StartsWith('-')){
+            Assert-Refusal ("preview refuses negative-zero "+$literal)
+            Assert-Refusal ("commit refuses negative-zero "+$literal) @{PreserveDesktopUIWindowState=$true;ExpectedCurrentSettingsSha256=(Hash $settings)}
+        } else {
+            $positiveHash=Hash $settings
+            $positivePreview=Invoke-Control restore @{PreserveDesktopUIWindowState=$true;WhatIf=$true}
+            Assert-Test ($positivePreview.ok -and $positivePreview.state -ceq 'dry-run' -and (Hash $settings) -ceq $positiveHash) ("preview accepts positive-zero "+$literal)
+        }
+    }
     foreach ($numericCase in @(
         @{key='eyeHeightMeters';literal='1.6800000000000002';name='changed controlled binary64 bits'}
         @{key='eyeHeightMeters';literal='1.68000000000000001';name='noncanonical controlled decimal hidden by Double parsing'}
