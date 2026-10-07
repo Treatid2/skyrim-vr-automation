@@ -17,6 +17,10 @@ scene/time and bounded scene-light observations before arm/after completion on
 that same session. It retains native generation association and ordered read
 bounds, NOT atomic rendered-frame equivalence or simulation freeze. See the
 baseline contract for unavailable/truncated coverage and immutable receipts.
+It reserves the final3s within that budget for fractional-deadline MCP session
+closure and terminal journal/in-memory output. Expired closure/journal admission
+is explicit and unverified, not a new timeout. See the baseline guide for the
+cooperative local-I/O boundary and separately retained restoration proofs.
 
 ## Typed finite colour measurement
 

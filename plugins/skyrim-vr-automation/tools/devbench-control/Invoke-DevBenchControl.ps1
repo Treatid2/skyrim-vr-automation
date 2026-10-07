@@ -84,6 +84,10 @@ $data = $null
 $semantic = $null
 $operationStartedUtc = [DateTime]::UtcNow
 $operationDeadlineUtc = $operationStartedUtc.AddSeconds($TimeoutSeconds)
+$totalInvocationDeadlineUtc = $operationDeadlineUtc
+# Ownership-bearing windows reserve 2s for session closure and 1s for local
+# journal/JSON finalization inside, never after, their original total budget.
+$finalizationReserveMilliseconds = if ($Command -in @('calendar-window','colour-window','colour-baseline-window')) { 3000 } else { 0 }
 $effectiveOperationTimeoutSeconds = $TimeoutSeconds
 $serverTimeoutMilliseconds = $null
 $serverTimeoutDispatchRemainingSeconds = $null
@@ -272,6 +276,9 @@ function Write-TerminalInvocationEvidence {
     )
 
     try {
+        if ($finalizationReserveMilliseconds -gt 0 -and [DateTime]::UtcNow -ge $totalInvocationDeadlineUtc) {
+            throw [TimeoutException]::new('Original total invocation deadline exhausted; no new terminal journal I/O was attempted. Retained in-memory evidence remains available in the result.')
+        }
         & $WriteAction | Out-Null
         return $true
     }
@@ -771,7 +778,7 @@ function Get-DevBenchWaitCompletion {
 }
 
 function Close-McpSession {
-    param([string]$Endpoint, [hashtable]$Headers)
+    param([string]$Endpoint, [hashtable]$Headers, [DateTime]$DeadlineUtc = [DateTime]::MaxValue)
     $sessionId = if ($null -ne $Headers -and $Headers.ContainsKey('Mcp-Session-Id')) {
         [string]$Headers['Mcp-Session-Id']
     }
@@ -782,26 +789,72 @@ function Close-McpSession {
             statusCode = $null; error = $null
         }
     }
+    $attempted = $false
+    $admittedUtc = $null
+    $timeoutMilliseconds = $null
+    $client = $null; $request = $null; $response = $null; $cancellation = $null; $handler = $null
     try {
-        $response = Invoke-WebRequest -UseBasicParsing -Method Delete -Uri $Endpoint -Headers $Headers -TimeoutSec 2
+        # TimeoutSec is an integer connection timeout in current PowerShell.
+        # HttpClient cancellation covers the entire DELETE through response
+        # headers, including connect, without rounding a sub-second allowance.
+        $handler = [Net.Http.HttpClientHandler]::new()
+        $handler.AllowAutoRedirect = $false
+        $handler.UseProxy = $false
+        $handler.UseCookies = $false
+        $client = [Net.Http.HttpClient]::new($handler)
+        $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
+        $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Delete,$Endpoint)
+        foreach ($key in $Headers.Keys) {
+            if ($key -ieq 'Content-Type') { continue }
+            if (-not $request.Headers.TryAddWithoutValidation([string]$key,[string]$Headers[$key])) { throw "Unsupported session-close header: $key" }
+        }
+        $remainingMilliseconds = ($DeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds
+        if ($remainingMilliseconds -le 0) {
+            return [pscustomobject][ordered]@{
+                attempted = $false; ok = $false; state = 'not_attempted_deadline_exhausted'; sessionId = $sessionId
+                indeterminate = $true; deadlineUtc = $DeadlineUtc.ToString('o'); admittedUtc = $null
+                timeoutMilliseconds = 0; statusCode = $null; error = 'No session DELETE admitted after its original invocation deadline allowance.'
+            }
+        }
+        $timeoutMilliseconds = [Math]::Min(2000.0,$remainingMilliseconds)
+        $cancellation = [Threading.CancellationTokenSource]::new([TimeSpan]::FromMilliseconds($timeoutMilliseconds))
+        $admittedUtc = [DateTime]::UtcNow
+        if ($admittedUtc -ge $DeadlineUtc) {
+            return [pscustomobject][ordered]@{
+                attempted = $false; ok = $false; state = 'not_attempted_deadline_exhausted'; sessionId = $sessionId
+                indeterminate = $true; deadlineUtc = $DeadlineUtc.ToString('o'); admittedUtc = $null
+                timeoutMilliseconds = 0; statusCode = $null; error = 'Deadline expired at session DELETE dispatch admission.'
+            }
+        }
+        $attempted = $true
+        $response = $client.SendAsync($request,[Net.Http.HttpCompletionOption]::ResponseHeadersRead,$cancellation.Token).GetAwaiter().GetResult()
+        $statusCode = [int]$response.StatusCode
+        $withinDeadline = [DateTime]::UtcNow -lt $DeadlineUtc
+        $ok = $withinDeadline -and (($statusCode -ge 200 -and $statusCode -lt 300) -or $statusCode -eq 404)
         return [pscustomobject][ordered]@{
-            attempted = $true; ok = $true; state = 'closed'; sessionId = $sessionId
-            statusCode = [int]$response.StatusCode; error = $null
+            attempted = $true; ok = $ok
+            state = if (-not $withinDeadline) { 'cleanup_timed_out' } elseif ($statusCode -eq 404) { 'already_absent' } elseif ($ok) { 'closed' } else { 'cleanup_failed' }
+            sessionId = $sessionId; indeterminate = -not $ok
+            deadlineUtc = $DeadlineUtc.ToString('o'); admittedUtc = $admittedUtc.ToString('o'); timeoutMilliseconds = $timeoutMilliseconds
+            statusCode = $statusCode; error = if ($ok) { $null } else { 'Session DELETE did not establish closure within its admitted deadline.' }
         }
     }
     catch {
         $statusCode = $null
         try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = $null }
-        if ($statusCode -eq 404) {
-            return [pscustomobject][ordered]@{
-                attempted = $true; ok = $true; state = 'already_absent'; sessionId = $sessionId
-                statusCode = $statusCode; error = $null
-            }
-        }
         return [pscustomobject][ordered]@{
-            attempted = $true; ok = $false; state = 'cleanup_failed'; sessionId = $sessionId
+            attempted = $attempted; ok = $false
+            state = if ($cancellation -and $cancellation.IsCancellationRequested) { 'cleanup_timed_out' } else { 'cleanup_failed' }; sessionId = $sessionId
+            indeterminate = $true; deadlineUtc = $DeadlineUtc.ToString('o')
+            admittedUtc = if ($admittedUtc) { $admittedUtc.ToString('o') } else { $null }; timeoutMilliseconds = $timeoutMilliseconds
             statusCode = $statusCode; error = $_.Exception.Message
         }
+    }
+    finally {
+        if ($response) { $response.Dispose() }
+        if ($request) { $request.Dispose() }
+        if ($cancellation) { $cancellation.Dispose() }
+        if ($client) { $client.Dispose() } elseif ($handler) { $handler.Dispose() }
     }
 }
 
@@ -812,24 +865,26 @@ function Close-OwnedMcpSession {
     } else { $null }
     $owned = @($ownedMcpSessions | Where-Object sessionId -eq $sessionId | Select-Object -Last 1)
     if ($owned.Count -eq 1 -and $null -ne $owned[0].cleanup) { return $owned[0].cleanup }
-    $cleanup = Close-McpSession -Endpoint $Endpoint -Headers $Headers
+    $cleanup = Close-McpSession -Endpoint $Endpoint -Headers $Headers -DeadlineUtc $script:operationDeadlineUtc
     if ($owned.Count -eq 1) { $owned[0].cleanup = $cleanup }
     return $cleanup
 }
 
 function Close-AllMcpSessions {
+    param([DateTime]$DeadlineUtc = [DateTime]::MaxValue)
     $cleanups = [Collections.Generic.List[object]]::new()
     foreach ($owned in @($ownedMcpSessions)) {
         if ($null -eq $owned.cleanup) {
-            $owned.cleanup = Close-McpSession -Endpoint $endpoint -Headers $owned.headers
+            $owned.cleanup = Close-McpSession -Endpoint $endpoint -Headers $owned.headers -DeadlineUtc $DeadlineUtc
         }
         $cleanups.Add($owned.cleanup)
     }
     return [pscustomobject][ordered]@{
-        attempted = $cleanups.Count -gt 0
+        attempted = @($cleanups | Where-Object attempted).Count -gt 0
         ok = @($cleanups | Where-Object { -not $_.ok }).Count -eq 0
         state = if ($cleanups.Count -eq 0) { 'not_opened' } elseif (@($cleanups | Where-Object { -not $_.ok }).Count -gt 0) { 'cleanup_failed' } else { 'all_closed' }
         sessions = @($cleanups)
+        indeterminate = @($cleanups | Where-Object { -not $_.ok }).Count -gt 0
     }
 }
 
@@ -1292,7 +1347,7 @@ try {
     }
     elseif ($Command -in @('calendar-window','colour-window','colour-baseline-window')) {
         $calendarSessionId=[string]$headers['Mcp-Session-Id']
-        $calendarDeadline=$operationDeadlineUtc
+        $calendarDeadline=$totalInvocationDeadlineUtc.AddMilliseconds(-$finalizationReserveMilliseconds)
         $colourGuard={
             param($bound)
             $script:operationDeadlineUtc=$bound
@@ -1308,6 +1363,7 @@ try {
                 return $guard
             }finally{$script:operationDeadlineUtc=$calendarDeadline}
         }
+        try {
         $data=Invoke-DevBenchCalendarWindow -Owner $CalendarOwner -Observations $calendarObservations -ColourPlan $colourPlan -FixedAutoExposure:($Command -ceq 'colour-baseline-window') -CompilerGuard $colourGuard -HoldMilliseconds $CalendarHoldMilliseconds -DeadlineUtc $calendarDeadline -ExpectedProcessId $runtimeIdentity.listenerPid -AssertSession {
             if ($script:transport -cne 'mcp' -or [string]::IsNullOrWhiteSpace($calendarSessionId) -or [string]$headers['Mcp-Session-Id'] -cne $calendarSessionId) { throw 'Calendar MCP session changed; no rebind/release on a replacement.' }
         } -Call {
@@ -1347,6 +1403,7 @@ try {
             }
         }
         $semantic=[pscustomobject]@{known=$true;ok=$data.ok;outcome='calendar-window';guarded=$false;transient=$false;codes=@();states=@();reasons=@($data.errors);completionBasis=$data.completionBasis}
+        } finally { $script:operationDeadlineUtc=$totalInvocationDeadlineUtc }
     }
     elseif ($Command -eq 'call') {
         $toolAvailable = @($tools | Where-Object name -eq $Tool).Count -eq 1
@@ -2094,7 +2151,10 @@ catch {
     else { $semantic }
     if ($waitDeadlineExpired) { $failureMessage = [string]$failureSemantic.reasons[0] }
     if ($invocationRecord -and $invocationRecord.state -ne 'guard-rejected') {
-        try { Update-InvocationEvidence -State $failureState -Semantic $failureSemantic -Data $failureData -Errors @($failureMessage) } catch { $failureMessage = "$failureMessage Evidence update also failed: $($_.Exception.Message)" }
+        try {
+            if ($finalizationReserveMilliseconds -gt 0 -and [DateTime]::UtcNow -ge $totalInvocationDeadlineUtc) { throw 'Original total deadline exhausted; failure journal I/O not attempted.' }
+            Update-InvocationEvidence -State $failureState -Semantic $failureSemantic -Data $failureData -Errors @($failureMessage)
+        } catch { $failureMessage = "$failureMessage Evidence update also failed: $($_.Exception.Message)" }
     }
     $result = [pscustomobject][ordered]@{
         ok = $false
@@ -2121,9 +2181,28 @@ catch {
     }
 }
 
-$sessionCleanup = Close-AllMcpSessions
+$sessionCloseDeadline = if ($finalizationReserveMilliseconds -gt 0) { $totalInvocationDeadlineUtc.AddMilliseconds(-1000) } else { $script:operationDeadlineUtc }
+$sessionCleanup = Close-AllMcpSessions -DeadlineUtc $sessionCloseDeadline
 $result | Add-Member -NotePropertyName sessionCleanup -NotePropertyValue $sessionCleanup
+if ($finalizationReserveMilliseconds -gt 0) {
+    $result | Add-Member -NotePropertyName finalization -NotePropertyValue ([pscustomobject][ordered]@{
+        originalDeadlineUtc = $totalInvocationDeadlineUtc.ToString('o')
+        reserveMilliseconds = $finalizationReserveMilliseconds
+        sessionCloseDeadlineUtc = $sessionCloseDeadline.ToString('o')
+        calendarDeadlineUtc = $totalInvocationDeadlineUtc.AddMilliseconds(-$finalizationReserveMilliseconds).ToString('o')
+        sessionClosureVerified = [bool]$sessionCleanup.ok
+        finalJournalAttempted = $false
+        serializationSource = 'retained-in-memory-result'
+        localIoDeadlineMode = 'cooperative-admission-and-postcondition'
+    })
+    if (-not $sessionCleanup.ok) {
+        $result.ok = $false
+        $result.indeterminate = $true
+        $result.errors = @($result.errors) + 'Original MCP session closure was not verified within its admitted allowance; Calendar/probe restoration proofs remain separate.'
+    }
+}
 if ($invocationRecord -and -not [string]::IsNullOrWhiteSpace($invocationEvidencePath)) {
+    if ($finalizationReserveMilliseconds -gt 0) { $result.finalization.finalJournalAttempted = [DateTime]::UtcNow -lt $totalInvocationDeadlineUtc }
     $finalEvidenceWritten = Write-TerminalInvocationEvidence -Result $result -FailurePrefix 'Session cleanup evidence could not be journaled' -WriteAction {
         $invocationRecord['sessionCleanup'] = $sessionCleanup
         Write-JsonAtomic -Path $invocationEvidencePath -Value $invocationRecord
@@ -2132,8 +2211,40 @@ if ($invocationRecord -and -not [string]::IsNullOrWhiteSpace($invocationEvidence
         $result | Add-Member -NotePropertyName evidenceJournalFinalized -NotePropertyValue $true -Force
     }
 }
+if ($finalizationReserveMilliseconds -gt 0) {
+    $result | Add-Member -NotePropertyName finalizationPreparedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o'))
+    $result | Add-Member -NotePropertyName originalDeadlineExceeded -NotePropertyValue ([DateTime]::UtcNow -ge $totalInvocationDeadlineUtc)
+    if ($result.originalDeadlineExceeded) {
+        $result.ok = $false
+        $result.indeterminate = $true
+        $result.errors = @($result.errors) + 'Original total invocation deadline exceeded before in-memory output serialization; no extended budget or finalization success claimed.'
+    }
+}
 
 $parameters = @{ InputObject = $result; Depth = 50 }
 if ($Compact) { $parameters['Compress'] = $true }
-ConvertTo-Json @parameters
+$serializedResult = ConvertTo-Json @parameters
+if ($finalizationReserveMilliseconds -gt 0) {
+    $serializationCompletedUtc = [DateTime]::UtcNow
+    $withinOriginalDeadline = $serializationCompletedUtc -lt $totalInvocationDeadlineUtc
+    if (-not $withinOriginalDeadline) {
+        $result.ok = $false
+        $result.indeterminate = $true
+        $result.originalDeadlineExceeded = $true
+        $result.errors = @($result.errors) + 'In-memory result serialization exceeded the original total deadline; retained output is failure evidence, not timely invocation qualification.'
+        # Finite fallback serialization of already retained memory only; no new
+        # network/journal operation or fresh allowance. Failure stays explicit.
+        $serializedResult = ConvertTo-Json @parameters
+    }
+    $serializationEvidence = @{ outputSerializationEvidence = @{
+        candidateCompletedUtc = $serializationCompletedUtc.ToString('o')
+        withinOriginalDeadline = $withinOriginalDeadline
+        failureFallbackUsed = -not $withinOriginalDeadline
+    }} | ConvertTo-Json -Depth 5 -Compress
+    # Append a small independently serialized metadata member to the complete
+    # JSON object; avoid a second whole-result serialization on the healthy path.
+    $end = $serializedResult.LastIndexOf('}')
+    $serializedResult = $serializedResult.Substring(0,$end) + ',' + $serializationEvidence.Substring(1,$serializationEvidence.Length-2) + '}'
+}
+$serializedResult
 if (-not $result.ok -and -not $NoExit) { exit $(if ($result.PSObject.Properties['indeterminate'] -and $result.indeterminate) { 3 } else { 2 }) }
