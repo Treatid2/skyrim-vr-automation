@@ -9,7 +9,7 @@ New-Item -ItemType Directory -Path $root|Out-Null
 $modes=if($FixedAutoExposure){@('healthy','healthy-false','ae-mismatch','hdr-mismatch','foreign-revision','telemetry-unavailable','telemetry-malformed','page-telemetry-unavailable','partial-page','compiler','schema-missing','lost-arm','lost-reset','burnin-incomplete','budget-incomplete','foreign-cell','session-retired')}else{@('healthy','partial-page','compiler','schema-missing','lost-arm','lost-reset','string-page-generation','native-failure','burnin-incomplete','session-retired')}
 if($CaptureReadBrackets){
     if(-not $FixedAutoExposure){throw 'Read bracket public fixture requires fixed baseline'}
-    $modes=@('healthy','lights-unavailable','camera-malformed','scene-foreign','lights-malformed','lost-before','lost-after','bracket-schema-missing','bracket-schema-lights')
+    $modes=@('healthy','lights-unavailable','camera-malformed','scene-foreign','lights-malformed','lost-before','lost-after','bracket-schema-missing','bracket-schema-lights','mcp-error-camera','mcp-error-scene','mcp-error-lights')
 }
 if($FixtureModes){if(@($FixtureModes|Where-Object {$_ -cnotin $modes}).Count){throw 'Unknown public fixture case'};$modes=@($FixtureModes)}
 foreach($mode in $modes){
@@ -99,7 +99,13 @@ foreach($mode in $modes){
                                 }
                                 catch{$payload=@{error=$_.Exception.Message}}
                             }
-                            $result=@{isError=$false;content=@(@{type='text';text=($payload|ConvertTo-Json -Depth 40 -Compress)})}
+                            $toolError=$Brackets -and (
+                                ($Mode -ceq 'mcp-error-camera' -and $name -ceq 'camera') -or
+                                ($Mode -ceq 'mcp-error-scene' -and $name -ceq 'inspect' -and $query.kind -ceq 'scene') -or
+                                ($Mode -ceq 'mcp-error-lights' -and $name -ceq 'inspect' -and $query.kind -ceq 'lights'))
+                            if($toolError){$payload=@{error='fixture native bracket rejection';code='fixture-bracket-tool-error';kind=$Mode}}
+                            $result=@{isError=[bool]$toolError;content=@(@{type='text';text=($payload|ConvertTo-Json -Depth 40 -Compress)})}
+                            if($toolError){$result.fixtureErrorIdentity=$Mode}
                         }
                     }}
                     if($status -ceq '200 OK'){$body=@{jsonrpc='2.0';id=$rpc.id;result=$result}|ConvertTo-Json -Depth 50 -Compress}
@@ -146,6 +152,20 @@ foreach($mode in $modes){
                 foreach($read in $bracket.reads){if($null -ne $read.reply){Check (Test-Path -LiteralPath $read.reply.immutableReceiptPath) 'immutable native read receipt retained'}}
             }
             $observationCalls=@($all|Where-Object {$_.name -ceq 'camera' -or ($_.name -ceq 'inspect' -and $_.arguments.kind -cin @('scene','lights'))})
+            if($mode -clike 'mcp-error-*'){
+                $expectedReadCount=if($mode -ceq 'mcp-error-camera'){1}elseif($mode -ceq 'mcp-error-scene'){2}else{3}
+                Check ($observationCalls.Count -eq $expectedReadCount) 'decoded error read never replayed; later reads stopped'
+                Check (@($all|Where-Object {$_.name -ceq 'communityshaders.colour_pipeline_probe' -and $_.arguments.action -ceq 'arm'}).Count -eq 0) 'no arm after decoded before-bracket error'
+                $failed=$brackets[0].reads[-1]
+                Check ($null -ne $failed.reply -and $failed.reply.rawResult.isError -is [bool] -and $failed.reply.rawResult.isError) 'failed read retains decoded MCP error rather than accepting content'
+                Check ($failed.reply.rawResult.fixtureErrorIdentity -ceq $mode) 'exact raw native error identity preserved'
+                $rawReceipt=Get-Content -LiteralPath $failed.reply.immutableReceiptPath -Raw|ConvertFrom-Json -Depth 80
+                Check (($rawReceipt.reply.rawResult|ConvertTo-Json -Depth 40 -Compress) -ceq ($failed.reply.rawResult|ConvertTo-Json -Depth 40 -Compress)) 'immutable raw receipt equals full failed MCP result'
+                $nativeError=$rawReceipt.reply.rawResult.content[0].text|ConvertFrom-Json
+                Check ($nativeError.error -ceq 'fixture native bracket rejection' -and $nativeError.code -ceq 'fixture-bracket-tool-error' -and $nativeError.kind -ceq $mode) 'returned native error text retained exactly'
+                $partial=Get-Content -LiteralPath $brackets[0].immutableReceiptPath -Raw|ConvertFrom-Json -Depth 80
+                Check (-not $partial.complete -and $partial.reads[-1].reply.immutableReceiptPath -ceq $failed.reply.immutableReceiptPath) 'immutable partial bracket links failed raw receipt'
+            }
             if($mode -cin @('healthy','lights-unavailable')){
                 $n=if($mode -ceq 'healthy'){16}else{1}
                 Check ($brackets.Count -eq 2*$n -and $observationCalls.Count -eq 6*$n -and @($brackets|Where-Object {-not $_.complete}).Count -eq 0) 'exact public bracket reads'
