@@ -55,7 +55,13 @@ function Get-MO2AutomationWindows {throw 'Live UI query forbidden in fixture'}
 '@
  $modulePath=Join-Path $directory 'MO2Control.psm1'
  [IO.File]::AppendAllText($modulePath,[char]10+$adapters,[Text.UTF8Encoding]::new($false))
- $result=& (Join-Path $directory 'Invoke-MO2Control.ps1') terminate-game -SessionId fixture-session -ConfigPath (Join-Path $directory 'fixture.json') -TimeoutSeconds 1 -Compact -NoExit|ConvertFrom-Json -Depth 50
+ try {
+  $result=& (Join-Path $directory 'Invoke-MO2Control.ps1') terminate-game -SessionId fixture-session -ConfigPath (Join-Path $directory 'fixture.json') -TimeoutSeconds 1 -Compact -NoExit|ConvertFrom-Json -Depth 50
+ }finally{
+  # Each copied production entry imports its own named modules. Unload only
+  # that exact fixture directory so a later broad suite gets one real module.
+  foreach($m in @(Get-Module|Where-Object {$_.ModuleBase -ceq $directory})){Remove-Module -ModuleInfo $m -Force}
+ }
  $requestPath=Join-Path $directory 'request-evidence.json'
  [IO.File]::WriteAllText((Join-Path $directory 'result.json'),($result|ConvertTo-Json -Depth 50))
  if($case -ceq 'owner-changed'){
