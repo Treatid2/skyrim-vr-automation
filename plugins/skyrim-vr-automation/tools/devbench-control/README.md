@@ -1,5 +1,25 @@
 # DevBench Control
 
+## Bounded scene-light reads
+
+Explicit `inspect {kind:lights,scope:scene,limit:<integer 1..64>}` admits only
+the typed native16dac scene schema. Other selectors/radius/extra arguments are
+not covered by this adapter. Read-only identity still requires the exact listener
+and answering process; it never grants mutation identity. Exact source/list/budget
+metadata, count/request/array consistency, finite light geometry and typed owner/
+lineage fields qualify the bounded read. Unknown fields, error objects, type or
+source drift refuse. Raw content remains unchanged.
+
+`completionBasis:bounded-read-only` proves a schema-qualified observation only.
+`observedSubsetComplete` follows the native truncation/budget/source evidence;
+partial reads remain typed partial evidence. `wholeSceneCoverageProven` and
+`visibleIlluminationProven` always remain false. Renderer membership, distance
+order and source completeness are not evidence of static/visible illumination.
+The pure exported classifier makes no calls or mutations; a later offline
+classification never rewrites old failed controller output or replaces answering
+runtime and non-error MCP provenance. Missing current schema refuses, not replay.
+
+
 For captured-exec window IDs, immutable guarded reads and loss/truncation
 admission, see [CONSOLE-WINDOWS.md](CONSOLE-WINDOWS.md). This qualifies evidence,
 not the command's desired game effect; never replay an uncertain capture.

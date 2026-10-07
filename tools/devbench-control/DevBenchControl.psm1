@@ -112,6 +112,7 @@ function Get-DevBenchHealthSemanticStatus {
         rejectedOutcomeEvidence = @($rejected | Select-Object -Unique)
     }
 }
+. (Join-Path $PSScriptRoot 'SceneLightReadEvidence.ps1')
 
 function Get-DevBenchSemanticStatus {
     [CmdletBinding()]
@@ -553,6 +554,7 @@ function Test-DevBenchReadOnlyRequest {
     if ($ToolName -ceq 'game' -and $action -ceq 'newGame') {
         return (-not $Arguments.Contains('phase') -or ($Arguments['phase'] -is [string] -and $Arguments['phase'] -ceq 'inspect'))
     }
+    if ($ToolName -ceq 'inspect' -and $kind -ceq 'lights') { return Test-DevBenchSceneLightRequest $Arguments }
     if ($ToolName -eq 'inspect') {
         return $kind -in @('state', 'health', 'vm', 'scene', 'mods', 'player', 'inventory', 'quests', 'effects', 'refs', 'registrants', 'screenshots', 'extensions')
     }
@@ -634,6 +636,8 @@ function Get-DevBenchCallSemanticStatus {
 
     if ($ToolName -ceq 'console' -and $Arguments.Contains('action') -and $Arguments.action -is [string] -and $Arguments.action -ceq 'exec' -and $Arguments.Contains('capture') -and $Arguments.capture -is [bool] -and -not $Arguments.capture) {
         return Get-DevBenchConsoleDispatchStatus -Arguments $Arguments -Content $Content
+    if ($ToolName -ceq 'inspect' -and $Arguments.Contains('kind') -and $Arguments.kind -is [string] -and $Arguments.kind -ceq 'lights') {
+        return Get-DevBenchSceneLightStatus -Arguments $Arguments -Content $Content
     }
     if ($ToolName -ceq 'console' -and $Arguments.Contains('action') -and $Arguments.action -is [string] -and $Arguments.action -ceq 'exec' -and $Arguments.Contains('capture') -and ($Arguments.capture -isnot [bool] -or $Arguments.capture)) {
         return Get-DevBenchConsoleExecutionStatus -Arguments $Arguments -Content $Content
