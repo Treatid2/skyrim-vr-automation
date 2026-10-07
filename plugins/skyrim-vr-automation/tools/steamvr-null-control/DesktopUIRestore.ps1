@@ -29,7 +29,7 @@ function Test-DesktopUIRestoreValueEquivalent($Expected, $Actual) {
         $match = [regex]::Match(($number | ConvertTo-Json -Compress), '\A(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?\z')
         if (-not $match.Success) { return $false }
         $digits = ($match.Groups[2].Value + $match.Groups[3].Value).TrimStart('0')
-        if ($digits.Length -eq 0) { '0@0'; continue }
+        if ($digits.Length -eq 0) { $match.Groups[1].Value + '0@0'; continue }
         $exponent = if ($match.Groups[4].Success) { [long]::Parse($match.Groups[4].Value, [Globalization.CultureInfo]::InvariantCulture) } else { [long]0 }
         $exponent -= $match.Groups[3].Value.Length
         $coefficient = $digits.TrimEnd('0'); $exponent += $digits.Length - $coefficient.Length
@@ -69,7 +69,9 @@ function Get-DesktopUIRestoreExactValue($Element) {
             $match = [regex]::Match($Element.GetRawText(), '\A(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?\z')
             if (-not $match.Success) { throw 'Malformed JSON number.' }
             $digits = ($match.Groups[2].Value + $match.Groups[3].Value).TrimStart('0')
-            if ($digits.Length -eq 0) { return [pscustomobject]@{numericIdentity='0@0'} }
+            # Integer -0 loses its sign in PowerShell's numeric projection.
+            # Preserve the raw sign before any CLR/binary64 comparison.
+            if ($digits.Length -eq 0) { return [pscustomobject]@{numericIdentity=($match.Groups[1].Value + '0@0')} }
             $exponent = if ($match.Groups[4].Success) { [long]::Parse($match.Groups[4].Value, [Globalization.CultureInfo]::InvariantCulture) } else { [long]0 }
             $exponent -= $match.Groups[3].Value.Length
             $coefficient = $digits.TrimEnd('0'); $exponent += $digits.Length - $coefficient.Length
