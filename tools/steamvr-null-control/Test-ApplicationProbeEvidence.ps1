@@ -33,7 +33,7 @@ Get-Content -LiteralPath (Join-Path $PSScriptRoot 'case.json') -Raw
 '@
     [IO.File]::WriteAllText((Join-Path $processRoot 'Invoke-BoundedProcess.ps1'),$boundedStub)
     $setup=@'
-param([string]$Fixture,[switch]$Expired)
+param([string]$Fixture,[switch]$Expired,[switch]$NotReady)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $HeadPoseDriverRoot=Join-Path $Fixture 'provider'
@@ -47,7 +47,7 @@ function Get-NullProviderAuthority {param($DeadlineUtc) [pscustomobject]@{verifi
 function New-HeadPoseContinuityIdentity {param($Pose,$PackageAuthority) [pscustomobject]@{identity='same'}}
 function Assert-HeadPoseContinuity {param($Before,$After)}
 function Get-HeadPoseCanonicalPath {param($Path) [IO.Path]::GetFullPath($Path)}
-function Get-HeadPoseSharedState {param($Contract) [pscustomobject]@{qualified=$true;driverCreatorPid=12345;creatorAuthority=[pscustomobject]@{processStartFileTimeUtc=$serverStart.ToFileTimeUtc()}}}
+function Get-HeadPoseSharedState {param($Contract) [pscustomobject]@{qualified=(-not $NotReady);driverCreatorPid=12345;creatorAuthority=[pscustomobject]@{processStartFileTimeUtc=$serverStart.ToFileTimeUtc()}}}
 function Get-SharedTextTail {param($Path,$Count,$MaxBytes,$DeadlineUtc)
  $prefix=$serverStart.ToLocalTime().ToString('ddd MMM d yyyy HH:mm:ss.fff',[Globalization.CultureInfo]::InvariantCulture)+' [Info] - '
  $prefix+'Loaded server driver null from driver_null.dll'
@@ -75,9 +75,19 @@ Get-NullRuntimeEvidence -Processes @($process) -Profile $profile -DeadlineUtc $d
         Assert-Evidence ($result.applicationHeadPose.boundedProcess.attempts[0].stdout -ceq $stdout -and $result.applicationHeadPose.boundedProcess.attempts[0].stderr -ceq 'retained native stderr') "$case preserves exact bounded stdout/stderr"
         Assert-Evidence ($result.applicationHeadPose.boundedProcess.attempts[0].exitVerified -and $result.applicationHeadPose.boundedProcess.attempts[0].jobQuiescent) "$case preserves child cleanup outcome"
         Assert-Evidence ($result.applicationHeadPose.timedOut -eq ($case -eq 'timeout') -and -not [string]::IsNullOrWhiteSpace($result.applicationHeadPose.error)) "$case has accurate timeout flag and error"
+        $kind=switch($case){timeout {'timeout'} malformed {'malformed-output'} empty {'empty-output'}}
+        Assert-Evidence ($result.applicationHeadPose.probeAttempted -and $result.applicationHeadPose.terminalFailure -and $result.applicationHeadPose.failureKind -ceq $kind) "$case is an explicitly terminal admitted failure"
     }
     $expired=& $harness -Fixture $fixture -Expired | ConvertFrom-Json -Depth 50
     Assert-Evidence ($expired.applicationHeadPose.timedOut -and $null -eq $expired.applicationHeadPose.boundedProcess -and -not $expired.headPoseReady) 'insufficient outer budget retains explicit unexecuted/unknown probe outcome'
+    Assert-Evidence (-not $expired.applicationHeadPose.probeAttempted -and $expired.applicationHeadPose.terminalFailure -and $expired.applicationHeadPose.failureKind -ceq 'insufficient-budget') 'budget refusal is terminal but does not claim an executed probe'
+    $notReady=& $harness -Fixture $fixture -NotReady | ConvertFrom-Json -Depth 50
+    Assert-Evidence (-not $notReady.applicationHeadPose.probeAttempted -and -not $notReady.applicationHeadPose.terminalFailure -and $null -eq $notReady.applicationHeadPose.failureKind) 'pre-admission provider state is not a terminal probe outcome'
+    Assert-Evidence (-not $notReady.headPoseReady -and -not $notReady.controllersReady) 'pre-admission observation remains unqualified'
+    Remove-Item -LiteralPath (Join-Path $providerRoot 'csx_openvr_pose_probe.exe')
+    $missing=& $harness -Fixture $fixture | ConvertFrom-Json -Depth 50
+    Assert-Evidence (-not $missing.applicationHeadPose.probeAttempted -and $missing.applicationHeadPose.terminalFailure -and $missing.applicationHeadPose.failureKind -ceq 'probe-unavailable') 'admitted missing probe is terminal without a native dispatch'
+    Assert-Evidence ($null -eq $missing.applicationHeadPose.boundedProcess -and -not $missing.headPoseReady) 'missing probe does not manufacture a bounded outcome'
     Assert-Evidence (@(Get-Content -LiteralPath (Join-Path $processRoot 'dispatch-count.txt')).Count -eq 3) 'one dispatch per tested outcome and no dispatch after deadline'
     @{ok=$true;passed=$passed;liveRuntimeUsed=$false}|ConvertTo-Json -Compress
 }

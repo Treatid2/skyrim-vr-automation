@@ -1170,52 +1170,77 @@ function Get-ApplicationHeadPose {
         [DateTime]$DeadlineUtc = [DateTime]::MaxValue
     )
     if ([string]::IsNullOrWhiteSpace($HeadPoseDriverRoot)) {
-        return [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The stable head-pose driver root could not be resolved.' }
+        return [pscustomobject][ordered]@{ available = $false; qualified = $false; probeAttempted = $false; terminalFailure = $true; failureKind = 'provider-package-unavailable'; timedOut = $false; boundedProcess = $null; error = 'The stable head-pose driver root could not be resolved.' }
     }
     $probePath = Join-Path $HeadPoseDriverRoot ([string]$Contract['poseProbeRelativePath'])
     if (-not (Test-Path -LiteralPath $probePath -PathType Leaf)) {
-        return [pscustomobject][ordered]@{ available = $false; qualified = $false; probePath = $probePath; error = 'The independent OpenVR pose probe is not installed.' }
+        return [pscustomobject][ordered]@{ available = $false; qualified = $false; probeAttempted = $false; terminalFailure = $true; failureKind = 'probe-unavailable'; timedOut = $false; boundedProcess = $null; probePath = $probePath; error = 'The independent OpenVR pose probe is not installed.' }
     }
     # Keep the bounded outcome even if timeout, parsing or continuity fails.
     # Returning unqualified evidence lets the caller publish its newer partial
     # runtime observation instead of retaining a preceding pre-probe snapshot.
     $bounded = $null
+    $probeAttempted = $false
+    $failureKind = 'provider-package-drift'
+    $payload = $null
+    $afterAuthority = $null
+    $afterPose = $null
+    $continuityAfter = $null
     try {
         $packageAuthority = Get-NullProviderAuthority -DeadlineUtc $DeadlineUtc
         if (-not $packageAuthority.verified) { throw "Provider package refused before probe execution: $($packageAuthority.errors -join '; ')" }
         $continuityBefore = New-HeadPoseContinuityIdentity -Pose $PreProbePose -PackageAuthority $PreProbePackageAuthority
         $continuityAtDispatch = New-HeadPoseContinuityIdentity -Pose $PreProbePose -PackageAuthority $packageAuthority
+        $failureKind = 'continuity-failed'
         Assert-HeadPoseContinuity -Before $continuityBefore -After $continuityAtDispatch
+        $failureKind = 'invalid-probe-path'
         if ((Get-HeadPoseCanonicalPath $probePath) -ne (Get-HeadPoseCanonicalPath (Join-Path $HeadPoseDriverRoot 'tools\csx_openvr_pose_probe.exe'))) { throw 'The profile cannot substitute a probe outside the exact owned package member.' }
         $boundedTool = Join-Path (Split-Path -Parent $PSScriptRoot) 'process-control\Invoke-BoundedProcess.ps1'
+        $failureKind = 'bounded-controller-unavailable'
         if (-not (Test-Path -LiteralPath $boundedTool -PathType Leaf)) { throw "Bounded process controller is missing: $boundedTool" }
         $probeTimeoutSeconds = 10
         if ($DeadlineUtc -ne [DateTime]::MaxValue) {
             $remainingMilliseconds = [long]($DeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds
             if ($remainingMilliseconds -lt 1450) {
+                $failureKind = 'insufficient-budget'
                 throw [TimeoutException]::new('SteamVR readiness deadline leaves insufficient time for the application-facing pose probe and bounded cleanup.')
             }
             $probeTimeoutSeconds = [Math]::Max(1, [Math]::Min(10, [Math]::Floor(($remainingMilliseconds - 450) / 1000)))
         }
+        $failureKind = 'bounded-process-failure'
+        $probeAttempted = $true
         $bounded = & $boundedTool -FilePath $probePath -ArgumentList @('--require-controllers') -WorkingDirectory (Split-Path -Parent $probePath) -MaxAttempts 1 -TimeoutSeconds $probeTimeoutSeconds -TerminationGraceMilliseconds 100 -StreamDrainGraceMilliseconds 100 -NoExit -Compact | ConvertFrom-Json -Depth 30
         $attempt = if (@($bounded.attempts).Count -gt 0) { $bounded.attempts[-1] } else { $null }
         if ($attempt -and [bool]$attempt.timedOut) {
+            $failureKind = 'timeout'
             throw [TimeoutException]::new("Independent OpenVR pose probe exceeded its $probeTimeoutSeconds-second share of the SteamVR readiness deadline.")
         }
+        $failureKind = 'empty-output'
         if ($null -eq $attempt -or [string]::IsNullOrWhiteSpace([string]$attempt.stdout)) { throw "Independent OpenVR pose probe produced no bounded output. $($bounded.errors -join '; ')" }
+        $failureKind = 'malformed-output'
         $payload = [string]$attempt.stdout | ConvertFrom-Json -ErrorAction Stop
+        $failureKind = 'bounded-process-failure'
+        if (-not $bounded.ok) { throw "Independent OpenVR pose probe bounded process failed (exit $($attempt.exitCode)). $($bounded.errors -join '; ')" }
+        $failureKind = 'provider-package-drift'
         $afterAuthority = Get-NullProviderAuthority -DeadlineUtc $DeadlineUtc
         if (-not $afterAuthority.verified -or $afterAuthority.markerSha256 -ne $packageAuthority.markerSha256) { throw 'Provider package changed during probe execution.' }
         $afterPose = Get-HeadPoseSharedState -Contract $Contract
         $continuityAfter = New-HeadPoseContinuityIdentity -Pose $afterPose -PackageAuthority $afterAuthority
+        $failureKind = 'continuity-failed'
         Assert-HeadPoseContinuity -Before $continuityBefore -After $continuityAfter
+        $failureKind = 'observation-unqualified'
         $controllersQualified = Test-PassiveControllerProbeObservation $payload
         $qualified = $bounded.ok -and $payload.ok -and $payload.standing.connected -and $payload.standing.valid -and
             [double]$payload.standing.position[1] -ge [double]$Contract['minimumQualifiedEyeHeightMeters'] -and
             [double]$payload.standing.position[1] -le [double]$Contract['maximumQualifiedEyeHeightMeters'] -and $controllersQualified
+        if (-not $qualified) { throw 'Independent OpenVR pose observation did not qualify the standing HMD and exact passive controller pair.' }
         return [pscustomobject][ordered]@{
             available = $true
             qualified = $qualified
+            probeAttempted = $probeAttempted
+            terminalFailure = $false
+            failureKind = $null
+            error = $null
             controllersRequired = $true
             controllersQualified = $controllersQualified
             timedOut = $false
@@ -1231,17 +1256,21 @@ function Get-ApplicationHeadPose {
     catch [TimeoutException] {
         return [pscustomobject][ordered]@{
             available = $false; qualified = $false
+            probeAttempted = $probeAttempted; terminalFailure = $true; failureKind = $failureKind
             controllersRequired = $true; controllersQualified = $false
             timedOut = $true; probePath = $probePath
-            boundedProcess = $bounded; error = $_.Exception.Message
+            boundedProcess = $bounded; observation = $payload; packageAuthority = $afterAuthority
+            providerContinuity = $continuityAfter; poseAfterProbe = $afterPose; error = $_.Exception.Message
         }
     }
     catch {
         return [pscustomobject][ordered]@{
             available = $false; qualified = $false
+            probeAttempted = $probeAttempted; terminalFailure = $true; failureKind = $failureKind
             controllersRequired = $true; controllersQualified = $false
             timedOut = $false; probePath = $probePath
-            boundedProcess = $bounded; error = $_.Exception.Message
+            boundedProcess = $bounded; observation = $payload; packageAuthority = $afterAuthority
+            providerContinuity = $continuityAfter; poseAfterProbe = $afterPose; error = $_.Exception.Message
         }
     }
 }
@@ -1322,7 +1351,7 @@ function Get-NullRuntimeEvidence {
         }
     }
     $providerLogReady = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active -and $null -ne $headPoseLoaded -and $null -ne $headPoseRegistered
-    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified -and $packageAuthority.verified -and $headPoseState.driverCreatorPid -eq $server[0].id -and [uint64][DateTime]::Parse($server[0].startTimeUtc).ToUniversalTime().ToFileTimeUtc() -eq $headPoseState.creatorAuthority.processStartFileTimeUtc) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -PreProbePose $headPoseState -PreProbePackageAuthority $packageAuthority -DeadlineUtc $DeadlineUtc } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; error = 'The provider creator/package is not ready for an application-facing pose probe.' } }
+    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified -and $packageAuthority.verified -and $headPoseState.driverCreatorPid -eq $server[0].id -and [uint64][DateTime]::Parse($server[0].startTimeUtc).ToUniversalTime().ToFileTimeUtc() -eq $headPoseState.creatorAuthority.processStartFileTimeUtc) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -PreProbePose $headPoseState -PreProbePackageAuthority $packageAuthority -DeadlineUtc $DeadlineUtc } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; probeAttempted = $false; terminalFailure = $false; failureKind = $null; timedOut = $false; error = 'The provider creator/package is not ready for an application-facing pose probe.' } }
     $preProbeServerProcess = if ($server.Count -eq 1) { $server[0] } else { $null }
     $serverProcess = $preProbeServerProcess
     if ($applicationHeadPose.qualified) {
@@ -1408,6 +1437,7 @@ function Get-NullRuntimeEvidence {
         $runtimeEvidence.active = $true
         $runtimeEvidence.applicationHeadPose = [pscustomobject]@{
             available = $false; qualified = $false; timedOut = $true
+            probeAttempted = $true; terminalFailure = $true; failureKind = 'timeout'
             controllersRequired = $true; controllersQualified = $false
             error = 'Injected independent application pose probe timeout.'
             boundedProcess = [pscustomobject]@{
@@ -1942,7 +1972,7 @@ try {
                         $lastRuntimeProbeError = [string]$runtime.headPoseAuthorizationError
                         break
                     }
-                    if ($runtime.applicationHeadPose.PSObject.Properties['timedOut'] -and $runtime.applicationHeadPose.timedOut) {
+                    if ($runtime.applicationHeadPose.terminalFailure) {
                         $lastRuntimeProbeError = [string]$runtime.applicationHeadPose.error
                         break
                     }
@@ -1957,9 +1987,9 @@ try {
                             throw [TimeoutException]::new('Injected runtime confirmation timeout.')
                         }
                         $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline
-                        if ($runtime.applicationHeadPose.PSObject.Properties['timedOut'] -and $runtime.applicationHeadPose.timedOut) {
+                        if ($runtime.applicationHeadPose.terminalFailure) {
                             $lastRuntimeProbeError = [string]$runtime.applicationHeadPose.error
-                            $runtimeConfirmationTimedOut = $true
+                            $runtimeConfirmationTimedOut = [bool]$runtime.applicationHeadPose.timedOut
                         }
                     }
                     catch [TimeoutException] {
@@ -1990,6 +2020,11 @@ try {
                     $failureState = 'application-pose-probe-timeout'
                     $failureErrors.Add([string]$lastRuntimeProbeError)
                     $failureErrors.Add('The independent application pose probe timed out; retained driver activation is not application-visible pose qualification.')
+                }
+                elseif ($runtime.applicationHeadPose.terminalFailure) {
+                    $failureState = 'application-pose-probe-failed'
+                    $failureErrors.Add([string]$lastRuntimeProbeError)
+                    $failureErrors.Add("The admitted independent application pose probe failed ($($runtime.applicationHeadPose.failureKind)); no retry or confirmation is authorised by that failure.")
                 }
                 elseif ($runtime.active -and -not $runtime.headPoseReady) {
                     $failureState = 'head-pose-provider-not-ready'
