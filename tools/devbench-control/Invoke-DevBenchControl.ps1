@@ -12,6 +12,7 @@ param(
     [switch]$NamesOnly,
     [switch]$RequireSuccess,
     [switch]$RequirePerformanceNeutral,
+    [switch]$RequireCompilerHealthy,
     [switch]$SkipRuntimeIdentityVerification,
     [string]$EvidenceDirectory,
     [string]$EvidenceLabel,
@@ -20,7 +21,7 @@ param(
     [string]$ExpectedBuildId,
     [string]$ExpectedArtifactSha256,
     [string]$ExpectedRuntimeIdentityJson,
-    [ValidateSet('noBlockingMenu', 'mainMenuReady', 'playerLoaded', 'upscalingStable', 'toolAvailable', 'serviceReady')]
+    [ValidateSet('noBlockingMenu', 'mainMenuReady', 'playerLoaded', 'compilerHealthy', 'upscalingStable', 'toolAvailable', 'serviceReady')]
     [string]$Condition = 'noBlockingMenu',
     [ValidateRange(1, 600)]
     [int]$TimeoutSeconds = 30,
@@ -76,6 +77,34 @@ $serverTimeoutMilliseconds = $null
 $serverTimeoutDispatchRemainingSeconds = $null
 Import-Module (Join-Path $PSScriptRoot 'DevBenchControl.psm1') -Force
 $script:requestTimeoutSecondsForRpc = $RequestTimeoutSeconds
+
+function Get-ShaderCompilerGuard {
+    param([object[]]$Tools,[hashtable]$Headers,$Identity)
+    $guard=[pscustomobject][ordered]@{admissible=$false; state='READ_UNAVAILABLE'; health=$null; reply=$null; arguments=$null; reasons=@()}
+    try {
+        if ($null -eq $Identity -or -not $Identity.complete -or -not $Identity.verified) { throw 'Compiler admission requires complete verified current runtime/artifact identity.' }
+        $matches=@($Tools | Where-Object name -CEQ 'communityshaders.shader_api')
+        if ($matches.Count -ne 1) { throw 'toolSchemaUnresolved: exact shader_api is not registered.' }
+        $schema=$matches[0].inputSchema
+        if ($schema.properties.contractMajor.const -ne 1 -or $schema.properties.contractMajor.type -cne 'integer' -or $schema.properties.action.type -cne 'string' -or 'snapshot' -cnotin @($schema.properties.action.enum) -or @($schema.required).Count -ne 4 -or @($schema.required | Where-Object { $_ -cnotin @('contractMajor','clientId','commandId','action') }).Count -gt 0 -or $schema.properties.clientId.type -cne 'string' -or $schema.properties.commandId.type -cne 'string') { throw 'toolSchemaUnresolved: current shader snapshot input schema is unsupported.' }
+        $argsMap=@{contractMajor=1;clientId='auto-tools-compiler-admission';commandId=[guid]::NewGuid().ToString('N');action='snapshot';expectedBuildId=[string]$Identity.build.buildId}
+        $guard.arguments=$argsMap
+        $guard.reply=Invoke-ToolRpc -Name 'communityshaders.shader_api' -Arguments $argsMap -Headers $Headers -RetainShaderSnapshotToolError
+        if ($guard.reply.rawResult.PSObject.Properties['isError'] -and ($guard.reply.rawResult.isError -isnot [bool] -or $guard.reply.rawResult.isError)) { throw 'Decoded MCP compiler snapshot error retained; no native counters accepted.' }
+        $guard.health=Get-DevBenchShaderCompilerHealth -Arguments $argsMap -Content @($guard.reply.content)
+        $guard.state=$guard.health.state
+        $guard.reasons=@($guard.health.reasons)
+        if (-not $guard.health.readQualified) { return $guard }
+        $sources=@($Identity.build.sources | Where-Object tool -CEQ 'communityshaders.shader_api')
+        if ($sources.Count -ne 1 -or $sources[0].producer.serviceSessionId -cne $guard.health.serviceSessionId) { throw 'Shader service session differs from the accepting runtime registry.' }
+        $age=([DateTimeOffset]::UtcNow - [DateTimeOffset]$guard.health.timestampUtc).TotalSeconds
+        if ($age -lt -5 -or $age -gt 10) { throw 'Compiler snapshot is stale or future-dated; no current-health admission.' }
+        $guard.admissible=$guard.health.admissible
+    } catch {
+        $guard.admissible=$false; $guard.reasons=@($guard.reasons)+$_.Exception.Message
+    }
+    return $guard
+}
 
 function Get-RequestTimeoutSeconds {
     if ($null -eq $script:operationDeadlineUtc) { return $script:requestTimeoutSecondsForRpc }
@@ -450,18 +479,22 @@ function Invoke-McpRequest {
 }
 
 function Invoke-ToolRpc {
-    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation)
+    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation, [switch]$RetainShaderSnapshotToolError)
+    if ($RetainShaderSnapshotToolError -and ($Name -cne 'communityshaders.shader_api' -or $Mutation -or -not (Test-DevBenchShaderSnapshotRequest -Arguments $Arguments))) { throw 'Decoded compiler-error retention is restricted to the exact read-only shader snapshot.' }
     Set-ServerWaitBudgetAtDispatch -Arguments $Arguments
     $rpc = Invoke-McpRequest -Endpoint $endpoint -Headers $Headers -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/call'; params = @{ name = $Name; arguments = $Arguments } } -Mutation:$Mutation
     if ($rpc.json.PSObject.Properties['error']) { throw "DevBench tools/call failed: $($rpc.json.error | ConvertTo-Json -Compress)" }
-    if ($rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
+    if (-not $RetainShaderSnapshotToolError -and $rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
         $message = ($rpc.json.result.content | ForEach-Object { $_.text }) -join "`n"
         throw "DevBench tool '$Name' failed: $message"
     }
     $parsed = @()
     foreach ($item in @($rpc.json.result.content)) {
         if ($item.type -eq 'text') {
-            try { $parsed += ,($item.text | ConvertFrom-Json -Depth 50) } catch { $parsed += ,([string]$item.text) }
+            try {
+                if ($Name -ceq 'communityshaders.shader_api') { $parsed += ,($item.text | ConvertFrom-Json -Depth 50 -DateKind String) }
+                else { $parsed += ,($item.text | ConvertFrom-Json -Depth 50) }
+            } catch { $parsed += ,([string]$item.text) }
         }
         else { $parsed += ,$item }
     }
@@ -831,6 +864,7 @@ function Write-RuntimeEvidence($Binding) {
 
 try {
     Initialize-InvocationEvidence
+    if ($RequireCompilerHealthy -and ($Command -cne 'call' -or $SkipRuntimeIdentityVerification -or -not [string]::IsNullOrWhiteSpace($ExpectedErrorCode))) { throw '-RequireCompilerHealthy requires call, verified runtime identity and no expected-error override.' }
     if ([string]::IsNullOrWhiteSpace($RuntimePath)) { throw 'RuntimePath is required. Pass -RuntimePath or set CSX_DEVBENCH_RUNTIME_PATH.' }
     if (-not (Test-Path -LiteralPath $RuntimePath -PathType Leaf)) { throw "DevBench runtime metadata does not exist: $RuntimePath" }
     $runtime = Get-Content -LiteralPath $RuntimePath -Raw | ConvertFrom-Json
@@ -884,11 +918,16 @@ try {
     }
     elseif ($Command -eq 'call') {
         $toolAvailable = @($tools | Where-Object name -eq $Tool).Count -eq 1
-        $performanceGuard = if ($RequirePerformanceNeutral) {
+        $compilerGuard = if ($RequireCompilerHealthy) { Get-ShaderCompilerGuard -Tools $tools -Headers $headers -Identity $runtimeIdentity } else { $null }
+        $performanceGuard = if ($RequirePerformanceNeutral -and (-not $compilerGuard -or $compilerGuard.admissible)) {
             Get-PerformanceMeasurementGuard -Tools $tools -Headers $headers
         }
         else { $null }
-        if ($performanceGuard -and -not $performanceGuard.neutral) {
+        if ($compilerGuard -and -not $compilerGuard.admissible) {
+            $data=[pscustomobject]@{tool=$Tool;toolCallSkipped=$true;compilerGuard=$compilerGuard;healthyEvidenceAdmitted=$false}
+            $semantic=[pscustomobject]@{known=$true;ok=$false;outcome='compiler-admission-refused';guarded=$true;transient=$false;codes=@('compiler_health_unproven');states=@();reasons=@($compilerGuard.reasons)}
+        }
+        elseif ($performanceGuard -and -not $performanceGuard.neutral) {
             $data = [pscustomobject][ordered]@{
                 tool = $Tool
                 toolCallSkipped = $true
@@ -996,6 +1035,7 @@ try {
         }
     }
     else {
+        if ($Condition -ceq 'compilerHealthy' -and ($SkipRuntimeIdentityVerification -or -not [string]::IsNullOrWhiteSpace($Tool) -or $argumentsJsonSupplied)) { throw 'compilerHealthy requires verified runtime identity and accepts no target tool or target arguments.' }
         if ($Condition -in @('toolAvailable', 'serviceReady') -and [string]::IsNullOrWhiteSpace($Tool)) { throw "Condition '$Condition' requires -Tool." }
         if ($DismissBlockingMenus.Count -gt 0 -and $Condition -ne 'noBlockingMenu') { throw '-DismissBlockingMenus is valid only with -Condition noBlockingMenu.' }
         if ($MinimumMenuStableSeconds -gt 0 -and $Condition -ne 'noBlockingMenu') { throw '-MinimumMenuStableSeconds is valid only with -Condition noBlockingMenu.' }
@@ -1030,7 +1070,7 @@ try {
         if ($Condition -eq 'serviceReady') {
             try { $waitArguments = $ArgumentsJson | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { throw "ArgumentsJson is invalid: $($_.Exception.Message)" }
         }
-        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        $deadline = if ($Condition -ceq 'compilerHealthy') { $operationDeadlineUtc } else { [DateTime]::UtcNow.AddSeconds($TimeoutSeconds) }
         $script:operationDeadlineUtc = $deadline
         $waitStartedUtc = [DateTime]::UtcNow
         $attempts = 0
@@ -1040,6 +1080,7 @@ try {
         $lastProgressUtc = [DateTime]::MinValue
         $firstCpu = $null
         $lastCpu = $null
+        $compilerWaitIdentity = $null
         $playerTransitionObserved = $false
         $playerInitialState = $null
         $menuDismissals = [Collections.Generic.List[object]]::new()
@@ -1143,6 +1184,63 @@ try {
                 $observation | Add-Member -NotePropertyName baseSatisfied -NotePropertyValue $baseSatisfied -Force
                 $observation | Add-Member -NotePropertyName stableSeconds -NotePropertyValue $stableSeconds -Force
                 $observation | Add-Member -NotePropertyName requiredStableSeconds -NotePropertyValue $MinimumMenuStableSeconds -Force
+            }
+            elseif ($Condition -ceq 'compilerHealthy') {
+                # Read-only barrier; never retry a load/camera/target mutation.
+                if (($deadline - [DateTime]::UtcNow).TotalSeconds -lt 1 -and $null -ne $observation) {
+                    $observation | Add-Member -NotePropertyName waitStopReason -NotePropertyValue 'Insufficient remaining allowance for another bounded request.' -Force
+                    break
+                }
+                if ($null -eq $compilerWaitIdentity) { $compilerWaitIdentity = $runtimeIdentity }
+                if (-not $compilerWaitIdentity.complete -or -not $compilerWaitIdentity.verified -or
+                    [string]::IsNullOrWhiteSpace($compilerWaitIdentity.process.startTimeUtc)) { throw 'Compiler wait requires complete verified process/artifact/start identity.' }
+                $guard = $null
+                foreach ($boundary in @(0,1)) {
+                    $listenerPid = Get-ListenerPid ([int]$compilerWaitIdentity.expectations.port)
+                    $process = if ($listenerPid) { Get-Process -Id $listenerPid -ErrorAction Stop } else { $null }
+                    if ($listenerPid -ne $compilerWaitIdentity.listenerPid -or $null -eq $process -or
+                        $process.Path -cne $compilerWaitIdentity.process.path -or
+                        $process.StartTime.ToUniversalTime().ToString('o') -cne $compilerWaitIdentity.process.startTimeUtc) { throw 'Compiler wait runtime identity changed; no readiness or mutation replay.' }
+                    if ($boundary -eq 0) { $guard = Get-ShaderCompilerGuard -Tools $tools -Headers $headers -Identity $compilerWaitIdentity }
+                }
+                if ($null -eq $guard.health -and ($deadline - [DateTime]::UtcNow).TotalSeconds -lt 1 -and
+                    $null -ne $observation -and $observation.PSObject.Properties['compilerGuard']) {
+                    # Preserve last qualified diagnostics, not invented current counters.
+                    $observation | Add-Member -NotePropertyName deadlineReadFailure -NotePropertyValue $guard -Force
+                    $observation | Add-Member -NotePropertyName compilerSnapshotBasis -NotePropertyValue 'last-qualified-observation-before-deadline' -Force
+                    $observation.satisfied = $false
+                    break
+                }
+                $retryable = $null -ne $guard.health -and (
+                    ($guard.health.readQualified -and $guard.state -cin @('COMPILATION_UNPROVEN','COMPILATION_PENDING','UNAVAILABLE') -and
+                     @($guard.reasons).Count -eq @($guard.health.reasons).Count) -or
+                    ($guard.state -ceq 'READ_UNAVAILABLE' -and $guard.health.state -ceq 'READ_UNAVAILABLE'))
+                $observation = [pscustomobject][ordered]@{
+                    satisfied = $guard.admissible
+                    retryable = $retryable
+                    terminalFailure = -not $guard.admissible -and -not $retryable
+                    classification = $guard.state
+                    compilerGuard = $guard
+                    completionBasis = 'current-state-compiler-snapshot'
+                    semantic = [pscustomobject][ordered]@{
+                        known = $true; ok = [bool]$guard.admissible
+                        outcome = if ($guard.admissible) { 'compiler-ready' } else { 'compiler-readiness-refused' }
+                        guarded = $true; transient = [bool]$retryable
+                        codes = @(); states = @($guard.state); reasons = @($guard.reasons)
+                    }
+                    scope = 'Compiler readiness only; not loaded-cell, pixel, full-render-pipeline or future-health proof.'
+                }
+                if ($observation.satisfied -and [DateTime]::UtcNow -ge $deadline) {
+                    $observation.satisfied = $false
+                    $observation.retryable = $false
+                    $observation.terminalFailure = $true
+                    $observation.classification = 'late-positive-compiler-observation'
+                    $observation.semantic.ok = $false
+                    $observation.semantic.outcome = 'wait-timeout'
+                    $observation.semantic.codes = @('wait_timeout')
+                    $observation.semantic.reasons = @('Positive compiler observation completed after the fixed operation deadline.')
+                }
+                if ($observation.terminalFailure -or [DateTime]::UtcNow -ge $deadline) { break }
             }
             elseif ($Condition -eq 'playerLoaded') {
                 try {
@@ -1347,7 +1445,23 @@ try {
         $semantic = [pscustomobject][ordered]@{ known = $true; ok = [bool]$observation.satisfied; reasons = $(if ($observation.satisfied) { @() } else { @("Condition '$Condition' was not satisfied within $TimeoutSeconds seconds.") }) }
     }
 
-    if (($RequireSuccess -or $RequirePerformanceNeutral) -and -not $semantic.known) {
+    if ($RequireCompilerHealthy -and $null -ne $data -and $invocationRecord.dispatchedUtc) {
+        # Bracket only this invocation. An async capture's later completion needs
+        # its own guarded request_get/finalization; this is not whole-run health.
+        $data | Add-Member -NotePropertyName targetSemantic -NotePropertyValue $semantic -Force
+        $data | Add-Member -NotePropertyName compilerGuard -NotePropertyValue $compilerGuard -Force
+        $compilerGuardAfter=Get-ShaderCompilerGuard -Tools $tools -Headers $headers -Identity $runtimeIdentity
+        $compilerWindow=Test-DevBenchShaderCompilerWindow -Before $compilerGuard.health -After $compilerGuardAfter.health
+        $data | Add-Member -NotePropertyName compilerGuardAfter -NotePropertyValue $compilerGuardAfter -Force
+        $data | Add-Member -NotePropertyName compilerWindow -NotePropertyValue $compilerWindow -Force
+        $compilerAdmitted=$compilerGuard.admissible -and $compilerGuardAfter.admissible -and $compilerWindow.valid
+        if ($Tool -ceq 'communityshaders.shader_api' -and $arguments.action -ceq 'snapshot') { $compilerAdmitted=$compilerAdmitted -and $semantic.compilerHealth.admissible }
+        $data | Add-Member -NotePropertyName healthyEvidenceAdmitted -NotePropertyValue ([bool]($compilerAdmitted -and $semantic.known -and $semantic.ok)) -Force
+        if (-not $compilerAdmitted) {
+            $semantic=[pscustomobject]@{known=$true;ok=$false;outcome='compiler-admission-invalidated';guarded=$true;transient=$false;codes=@('compiler_health_invalidated');states=@();reasons=@($compilerGuardAfter.reasons)+@($compilerWindow.reasons);completionBasis='compiler-boundary-bracket-only'}
+        }
+    }
+    if (($RequireSuccess -or $RequirePerformanceNeutral -or $RequireCompilerHealthy) -and -not $semantic.known) {
         $semantic.outcome = 'unverified'
         $semantic.reasons = @($semantic.reasons) + 'A verified semantic outcome was required, but the response did not provide one.'
     }
