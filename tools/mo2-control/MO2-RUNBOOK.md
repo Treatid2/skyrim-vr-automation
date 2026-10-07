@@ -393,6 +393,12 @@ For a proven current-attempt MO2 spawn error, `launch` or the exact session's
 `status` instead returns `launch-failed` with `launchFailure` and a retained
 attempt-specific receipt. The classifier binds exact MO2 lifetime and registered
 binary to a bounded stable log window; unknown or stale evidence is ignored.
+Only a fresh post-dispatch MO2 owner is eligible; retained-owner logs do not
+independently correlate a launch request and must use the bounded timeout path.
+The exact command header must precede the error in bytes and UTC time. Physical
+log identity and unchanged bounded window are required. An interrupted receipt
+commit may reuse only the exact revalidated receipt; mismatching retained
+custody is an explicit error, never permission to overwrite or delete evidence.
 Preserve the numeric Win32 code/message. Do not infer antivirus from error5 or
 generic dialog advice, and do not replay launch or change ACL/elevation/security
 policy speculatively. Finish the existing attempt through normal exact-session

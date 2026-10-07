@@ -3450,7 +3450,9 @@ function Read-MO2LaunchLogWindow {
             $read += $n
         }
         if ($read -ne $count -or $stream.Length -lt $length) { throw 'Log truncated during read.' }
-        return [pscustomobject]@{ length = $length; offset = $Offset; bytesRead = $read; bytes = $bytes; truncated = $length - $Offset -gt $MaximumBytes; sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)) }
+        # This open handle excludes deletion/replacement while identity is read.
+        $identity = [SkyrimVRAutomation.Native.DirectoryIdentity]::Get($Path)
+        return [pscustomobject]@{ length = $length; fileIdentity = $identity; offset = $Offset; bytesRead = $read; bytes = $bytes; truncated = $length - $Offset -gt $MaximumBytes; sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)) }
     }
     finally { $stream.Dispose() }
 }
@@ -3462,10 +3464,10 @@ function New-MO2LaunchLogBoundary {
         if ($entries.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$entries[0].binary)) { throw 'Exact registered binary unavailable.' }
         $path = Join-Path ([IO.Path]::GetFullPath([string]$Config.mo2.root)) 'logs\mo_interface.log'
         $boundary = [pscustomobject][ordered]@{
-            available = $true; contractVersion = 1; attemptId = $AttemptId; profile = $Profile; executable = $Executable
+            available = $true; contractVersion = 2; attemptId = $AttemptId; profile = $Profile; executable = $Executable
             mo2Path = [IO.Path]::GetFullPath([string]$Config.mo2.executable); binary = [IO.Path]::GetFullPath([string]$entries[0].binary)
             path = $path; retainedOwner = $RetainedOwner; expectedCommandLine = ('"' + [IO.Path]::GetFullPath([string]$Config.mo2.executable) + '" ' + $ArgumentLine)
-            existed = Test-Path -LiteralPath $path -PathType Leaf; length = 0L; anchorOffset = 0L; anchorLength = 0; anchorSha256 = $null; prefixLength = 0; prefixSha256 = $null
+            existed = Test-Path -LiteralPath $path -PathType Leaf; fileIdentity = $null; length = 0L; anchorOffset = 0L; anchorLength = 0; anchorSha256 = $null; prefixLength = 0; prefixSha256 = $null
         }
         if ($boundary.existed) {
             $length = (Get-Item -LiteralPath $path).Length
@@ -3473,8 +3475,9 @@ function New-MO2LaunchLogBoundary {
             $anchor = Read-MO2LaunchLogWindow -Path $path -Offset $anchorOffset -MaximumBytes 128
             if ($anchor.length -ne $length) { throw 'Log boundary changed before dispatch.' }
             $boundary.length = $length; $boundary.anchorOffset = $anchorOffset; $boundary.anchorLength = $anchor.bytesRead; $boundary.anchorSha256 = $anchor.sha256
+            $boundary.fileIdentity = $anchor.fileIdentity
             $prefix = Read-MO2LaunchLogWindow -Path $path -MaximumBytes ([int][math]::Max(1,[math]::Min(256,$length)))
-            if ($prefix.length -ne $length) { throw 'Log prefix changed before dispatch.' }
+            if ($prefix.length -ne $length -or $prefix.fileIdentity -cne $boundary.fileIdentity) { throw 'Log prefix changed before dispatch.' }
             $boundary.prefixLength = $prefix.bytesRead; $boundary.prefixSha256 = $prefix.sha256
         }
         return $boundary
@@ -3488,7 +3491,9 @@ function Get-MO2LaunchFailureEvidence {
         -not $Owned.data.PSObject.Properties['launchLogBoundary'] -or -not $Owned.data.launchLogBoundary.available) { return $null }
     try {
         $boundary = $Owned.data.launchLogBoundary
-        if ([int]$boundary.contractVersion -ne 1 -or [string]$boundary.attemptId -cne [string]$Owned.data.launchAttemptId -or
+        # A retained owner's log has no independently correlated request ID;
+        # even an exact same-command header can be delayed from an older action.
+        if ([int]$boundary.contractVersion -ne 2 -or $boundary.retainedOwner -or [string]$boundary.attemptId -cne [string]$Owned.data.launchAttemptId -or
             [string]$boundary.profile -cne [string]$Owned.data.profile -or [string]$boundary.executable -cne [string]$Owned.data.executable -or
             -not [string]::Equals([string]$boundary.mo2Path, [IO.Path]::GetFullPath([string]$Config.mo2.executable), [StringComparison]::OrdinalIgnoreCase) -or
             -not [string]::Equals([string]$boundary.path, (Join-Path ([IO.Path]::GetFullPath([string]$Config.mo2.root)) 'logs\mo_interface.log'), [StringComparison]::OrdinalIgnoreCase)) { return $null }
@@ -3499,12 +3504,14 @@ function Get-MO2LaunchFailureEvidence {
         $append = $false
         if ($boundary.existed -and (Get-Item -LiteralPath $boundary.path).Length -ge [long]$boundary.length) {
             $anchor = Read-MO2LaunchLogWindow -Path ([string]$boundary.path) -Offset ([long]$boundary.anchorOffset) -MaximumBytes ([int][math]::Max(1,$boundary.anchorLength))
+            if ($anchor.fileIdentity -cne [string]$boundary.fileIdentity) { return $null }
             if ($anchor.length -ge [long]$boundary.length -and $anchor.bytesRead -ge [int]$boundary.anchorLength) {
                 $anchorBytes = [byte[]]::new([int]$boundary.anchorLength)
                 [Array]::Copy($anchor.bytes, $anchorBytes, $anchorBytes.Length)
                 $append = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($anchorBytes)) -ceq [string]$boundary.anchorSha256
                 if ($append) {
                     $prefix = Read-MO2LaunchLogWindow -Path ([string]$boundary.path) -MaximumBytes ([int][math]::Max(1,$boundary.prefixLength))
+                    if ($prefix.fileIdentity -cne [string]$boundary.fileIdentity) { return $null }
                     $prefixBytes = [byte[]]::new([int]$boundary.prefixLength)
                     if ($prefix.bytesRead -lt $prefixBytes.Length) { return $null }
                     [Array]::Copy($prefix.bytes, $prefixBytes, $prefixBytes.Length)
@@ -3514,28 +3521,32 @@ function Get-MO2LaunchFailureEvidence {
         }
         $offset = if ($append) { [long]$boundary.length } else { 0L }
         $window = Read-MO2LaunchLogWindow -Path ([string]$boundary.path) -Offset $offset
+        if ($boundary.existed -and $window.fileIdentity -cne [string]$boundary.fileIdentity) { return $null }
         if ($window.truncated -or $window.bytesRead -eq 0) { return $null }
         $text = [Text.UTF8Encoding]::new($false,$true).GetString($window.bytes)
         $styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
-        if (-not $append) {
-            if ($boundary.retainedOwner) { return $null }
-            # The captured MO2 2.5.2 log uses UTC stamps; other formats fail closed.
-            $header = [regex]::Match($text, "(?m)^\[(?<stamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) D\] command line: '(?<command>[^\r\n]*)'\r?$")
-            if (-not $header.Success -or $header.Groups['command'].Value -cne [string]$boundary.expectedCommandLine) { return $null }
-            $headerUtc = [DateTime]::ParseExact($header.Groups['stamp'].Value, 'yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture, $styles)
-            $ownerUtc = [DateTimeOffset]::Parse([string]$owner.startTime).UtcDateTime
-            if ($headerUtc -lt $dispatchUtc -or $headerUtc -lt $ownerUtc -or ($headerUtc - $ownerUtc).TotalSeconds -gt 10) { return $null }
-        }
+        # This also applies to appended bytes. Exactly one header disambiguates
+        # the bounded current-owner window; errors must follow in bytes/time.
+        $headers = @([regex]::Matches($text, "(?m)^\[(?<stamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) D\] command line: '(?<command>[^\r\n]*)'\r?$"))
+        if ($headers.Count -ne 1) { return $null }
+        $header = $headers[0]
+        if ($header.Groups['command'].Value -cne [string]$boundary.expectedCommandLine) { return $null }
+        $headerUtc = [DateTime]::ParseExact($header.Groups['stamp'].Value, 'yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture, $styles)
+        $ownerUtc = [DateTimeOffset]::Parse([string]$owner.startTime).UtcDateTime
+        if ($headerUtc -lt $dispatchUtc -or $ownerUtc -lt $dispatchUtc -or $headerUtc -lt $ownerUtc -or
+            ($headerUtc - $ownerUtc).TotalSeconds -gt 10) { return $null }
         $pattern = "(?m)^\[(?<stamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) E\] Error (?<code>[1-9]\d{0,9}) (?<message>[^\r\n]+)\r?\n\[\k<stamp> E\]  \. binary: '(?<binary>[^'\r\n]+)'\r?$"
         foreach ($match in @([regex]::Matches($text, $pattern))) {
             $errorUtc = [DateTime]::ParseExact($match.Groups['stamp'].Value, 'yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture, $styles)
-            if ($errorUtc -lt $dispatchUtc -or $errorUtc -gt [DateTime]::UtcNow -or
+            if ($match.Index -lt $header.Index + $header.Length -or $errorUtc -lt $headerUtc -or $errorUtc -lt $dispatchUtc -or $errorUtc -gt [DateTime]::UtcNow -or
                 -not [string]::Equals([IO.Path]::GetFullPath($match.Groups['binary'].Value), [string]$boundary.binary, [StringComparison]::OrdinalIgnoreCase)) { continue }
             $verification = Read-MO2LaunchLogWindow -Path ([string]$boundary.path) -Offset $offset -MaximumBytes $window.bytesRead
-            if ($verification.sha256 -cne $window.sha256) { return $null }
+            if ($verification.sha256 -cne $window.sha256 -or $verification.fileIdentity -cne $window.fileIdentity -or
+                $verification.length -ne $window.length) { return $null }
             return [pscustomobject][ordered]@{
                 schemaVersion = 1; classification = 'loader-spawn-failed'; sessionId = $Owned.sessionId; attemptId = $boundary.attemptId
                 observedUtc = [DateTime]::UtcNow.ToString('o'); dispatchStartedUtc = $dispatchUtc.ToString('o'); owner = $owner
+                commandHeaderTimestampUtc = $headerUtc.ToString('o'); commandHeaderText = $header.Value; logFileIdentity = $window.fileIdentity
                 binary = $boundary.binary; win32ErrorCode = [uint32]$match.Groups['code'].Value; message = $match.Groups['message'].Value
                 cause = 'unassigned'; errorLogTimestampUtc = $errorUtc.ToString('o'); logPath = $boundary.path
                 byteOffset = $window.offset; byteLength = $window.bytesRead; bounds = '[offset,offset+length)'; windowSha256 = $window.sha256
@@ -3547,20 +3558,90 @@ function Get-MO2LaunchFailureEvidence {
     return $null
 }
 
+function ConvertTo-MO2LaunchEvidenceCanonicalValue {
+    param([AllowNull()]$Value)
+    if ($null -eq $Value) { return $null }
+    # PSObject-wrapped strings from JSON can satisfy `-is [pscustomobject]`.
+    # Canonicalize the actual CLR value type, not the incidental wrapper.
+    if ($Value -is [string] -or $Value.GetType().IsValueType) { return $Value }
+    if ($Value -is [System.Collections.IDictionary] -or $Value.GetType() -eq [System.Management.Automation.PSCustomObject]) {
+        $canonical = [ordered]@{}
+        $names = if ($Value -is [System.Collections.IDictionary]) { @($Value.Keys) } else { @($Value.PSObject.Properties | ForEach-Object { $_.Name }) }
+        foreach ($name in @($names | Sort-Object -CaseSensitive)) {
+            $item = if ($Value -is [System.Collections.IDictionary]) { $Value[$name] } else { $Value.$name }
+            $canonical[$name] = ConvertTo-MO2LaunchEvidenceCanonicalValue -Value $item
+        }
+        return $canonical
+    }
+    if ($Value -is [array]) {
+        $items = @($Value | ForEach-Object { ConvertTo-MO2LaunchEvidenceCanonicalValue -Value $_ })
+        return ,$items
+    }
+    return $Value
+}
+
+function Assert-MO2LaunchFailureReceiptMatches {
+    param($Expected, $Retained)
+    try {
+        $observed = [DateTimeOffset]::Parse([string]$Retained.observedUtc).UtcDateTime
+        $latest = [DateTimeOffset]::Parse([string]$Expected.observedUtc).UtcDateTime
+        $errorTime = [DateTimeOffset]::Parse([string]$Expected.errorLogTimestampUtc).UtcDateTime
+        if ($observed -lt $errorTime -or $observed -gt $latest) { throw 'Invalid retained observation time.' }
+        # Preserve the first verified capture time, not the parser's new time.
+        $comparison = ConvertFrom-MO2JsonText ($Expected | ConvertTo-Json -Depth 16 -Compress)
+        $comparison.observedUtc = $Retained.observedUtc
+        $a = ConvertTo-MO2LaunchEvidenceCanonicalValue $comparison | ConvertTo-Json -Depth 20 -Compress
+        $b = ConvertTo-MO2LaunchEvidenceCanonicalValue $Retained | ConvertTo-Json -Depth 20 -Compress
+        if ($a -cne $b) {
+            $different = @($comparison.PSObject.Properties | Where-Object {
+                $name = $_.Name
+                -not $Retained.PSObject.Properties[$name] -or
+                ((ConvertTo-MO2LaunchEvidenceCanonicalValue $_.Value | ConvertTo-Json -Depth 20 -Compress) -cne
+                 (ConvertTo-MO2LaunchEvidenceCanonicalValue $Retained.$name | ConvertTo-Json -Depth 20 -Compress))
+            } | ForEach-Object { $_.Name })
+            throw "Retained launch evidence differs (fields: $($different -join ','))."
+        }
+    }
+    catch { throw "Launch failure receipt custody conflict; retained evidence was not overwritten: $($_.Exception.Message)" }
+}
+
+function Read-MO2LaunchFailureReceipt {
+    param([string]$Path)
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -le 0 -or $stream.Length -gt 1048576) { throw 'Launch receipt outside bounded size.' }
+        $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false,$true), $false)
+        try { return ConvertFrom-MO2JsonText $reader.ReadToEnd() } finally { $reader.Dispose() }
+    }
+    finally { $stream.Dispose() }
+}
+
 function Set-MO2LaunchFailureEvidence {
     param($Config, $Owned, $Failure)
     return Invoke-MO2OwnedSessionMutation -Owned $Owned -Action {
         param($currentData)
-        if ([string]$currentData.status -cne 'launching' -or [string]$currentData.launchAttemptId -cne [string]$Failure.attemptId) { throw 'Launch failure superseded before commit.' }
+        if ([string]$currentData.status -cne 'launching' -or [string]$currentData.launchAttemptId -cne [string]$Failure.attemptId -or
+            [string]$Owned.sessionId -cne [string]$Failure.sessionId) { throw 'Launch failure superseded before commit.' }
         $currentOwned = [pscustomobject]@{ path = $Owned.path; sessionId = $Owned.sessionId; accessId = $Owned.accessId; data = $currentData }
-        $resolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $currentOwned -Processes @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
+        $owners = @(Get-MO2ProcessRecords -Names @($Config.mo2.processNames))
+        $games = @(Get-MO2ProcessRecords -Names @($Config.mo2.gameProcessNames))
+        $resolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $currentOwned -Processes $owners
         if (-not $resolution.ok -or @($resolution.targets).Count -ne 1 -or
             -not (Test-MO2ProcessRecordIdentity -Expected $Failure.owner -Actual $resolution.targets[0]).ok -or
-            @(Get-MO2ProcessRecords -Names @($Config.mo2.gameProcessNames)).Count -ne 0) { throw 'Launch failure owner or closed-game proof changed.' }
+            $games.Count -ne 0) { throw 'Launch failure owner or closed-game proof changed.' }
+        $verified = Get-MO2LaunchFailureEvidence -Config $Config -Owned $currentOwned -MO2Processes $owners -GameProcesses $games
+        if ($null -eq $verified) { throw 'Launch failure evidence no longer verifies before commit.' }
+        Assert-MO2LaunchFailureReceiptMatches -Expected $verified -Retained $Failure
         $receiptPath = Join-Path ([string]$currentData.sessionPath) ('mo2-launch-failure.' + [guid]::Parse([string]$Failure.attemptId).ToString('D') + '.json')
-        Write-MO2JsonAtomic -Path $receiptPath -Value $Failure -CreateNew
+        $retained = $Failure
+        if (Test-Path -LiteralPath $receiptPath) {
+            try { $retained = Read-MO2LaunchFailureReceipt -Path $receiptPath }
+            catch { throw "Launch failure receipt custody conflict; retained receipt is unreadable or malformed and was not overwritten: $($_.Exception.Message)" }
+            Assert-MO2LaunchFailureReceiptMatches -Expected $verified -Retained $retained
+        }
+        else { Write-MO2JsonAtomic -Path $receiptPath -Value $retained -CreateNew }
         $currentData.status = 'launch-failed'
-        $currentData | Add-Member -NotePropertyName launchFailure -NotePropertyValue $Failure -Force
+        $currentData | Add-Member -NotePropertyName launchFailure -NotePropertyValue $retained -Force
         $currentData | Add-Member -NotePropertyName launchFailureReceiptPath -NotePropertyValue $receiptPath -Force
         return [pscustomobject]@{ sessionData = $currentData; result = $receiptPath }
     }
