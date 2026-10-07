@@ -5385,7 +5385,7 @@ function Invoke-MO2Status {
     # A currently owned modal is a blocker, not detailed historical spawn proof.
     # Never call an owned failed-to-run UI healthy because its log is unqualified.
     $launchBlocker = $null
-    if ($owned -and [string]$owned.data.status -ceq 'launching' -and $data.processes.game.Count -eq 0 -and
+    if ($owned -and [string]$owned.data.status -cin @('launching','launch-blocked-dialog') -and $data.processes.game.Count -eq 0 -and
         $null -ne $ownershipResolution -and $ownershipResolution.ok -and @($ownershipResolution.targets).Count -eq 1 -and $data.processes.mo2.Count -eq 1) {
         $blockedWindows = @($windows | Where-Object {
             $_.PSObject.Properties['visible'] -and $_.visible -is [bool] -and $_.visible -and
@@ -5834,7 +5834,8 @@ function Invoke-MO2Launch {
         $dialogOwner = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @($status.processes.mo2) -AdoptDetachedOwner
         $blockingDialog = @()
         if ($dialogOwner.ok -and @($dialogOwner.targets).Count -eq 1 -and @($status.processes.mo2).Count -eq 1) {
-            $blockingDialog = @(Get-MO2WindowSnapshot -Processes @($status.processes.mo2) | Where-Object { $_.PSObject.Properties['processId'] -and [int]$_.processId -eq [int]$dialogOwner.targets[0].id -and $_.visible -and $_.dialogKind -cin @('failed-to-write-settings','failed-to-run') } | Select-Object -First 1)
+            $blockingDialog = @(Get-MO2WindowSnapshot -Processes @($status.processes.mo2) | Where-Object { $_.PSObject.Properties['processId'] -and [int]$_.processId -eq [int]$dialogOwner.targets[0].id -and $_.visible -is [bool] -and $_.visible -and $_.dialogKind -cin @('failed-to-write-settings','failed-to-run') })
+            if($blockingDialog.Count -ne 1){$blockingDialog=@()}
         }
         if ($blockingDialog.Count -gt 0) { break }
     } while ([DateTime]::UtcNow -lt $deadline)
@@ -5871,6 +5872,21 @@ function Invoke-MO2Launch {
             }
             return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'launch-failed' -Data @{ sessionId = $SessionId; launchFailure = $launchFailure; launchFailureReceiptPath = $failureReceiptPath; launchStartedReceiptPath = $launchStartedPath; processes = $status.processes; sessionPath = $lockData.sessionPath } -Errors @("MO2 failed to spawn '$($launchFailure.binary)': Win32 error $($launchFailure.win32ErrorCode) $($launchFailure.message). Cause is unassigned; no retry or cleanup was dispatched.")
         }
+        # Do not turn a stale/ambiguous modal snapshot into terminal cause evidence.
+        # Detailed current-attempt spawn proof above remains the higher-priority path.
+        if($blockingDialog.Count -eq 1){
+            $freshDialogs=@(if($ownerResolution.ok -and @($ownerResolution.targets).Count -eq 1){
+                @(Get-MO2WindowSnapshot -Processes @($status.processes.mo2) | Where-Object {
+                    $_.PSObject.Properties['processId'] -and [int]$_.processId -eq [int]$ownerResolution.targets[0].id -and
+                    $_.visible -is [bool] -and $_.visible -and $_.dialogKind -cin @('failed-to-write-settings','failed-to-run')
+                })
+            }else{@()})
+            if(@($freshDialogs).Count -ne 1 -or -not $blockingDialog[0].PSObject.Properties['handle'] -or
+                -not $freshDialogs[0].PSObject.Properties['handle'] -or [long]$blockingDialog[0].handle -le 0 -or
+                $freshDialogs[0].handle -ne $blockingDialog[0].handle -or $freshDialogs[0].dialogKind -cne $blockingDialog[0].dialogKind){
+                $blockingDialog=@()
+            }else{$blockingDialog=@($freshDialogs[0])}
+        }
         $lockData.status = if ($blockingDialog.Count -gt 0) { 'launch-blocked-dialog' } else { 'launch-failed' }
         try {
             $null = Write-MO2OwnedSessionAtomic -Owned $owned -Value $lockData
@@ -5888,14 +5904,14 @@ function Invoke-MO2Launch {
         $dialogReceipt = [pscustomobject][ordered]@{
             contractVersion = $script:MO2ControlContractVersion
             sessionId = $SessionId
-            classification = 'failed-to-write-settings'
+            classification = [string]$blockingDialog[0].dialogKind
             observedUtc = [DateTime]::UtcNow.ToString('o')
             dialog = $blockingDialog[0]
             processes = $status.processes
             safeCloseAction = 'close or stop will acknowledge only the exact OK button, then continue cooperative shutdown'
         }
         Write-MO2JsonAtomic -Path $dialogReceiptPath -Value $dialogReceipt
-        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'launch-blocked-dialog' -Data @{ sessionId = $SessionId; launcherPid = $process.Id; launchStartedReceiptPath = $launchStartedPath; dialogReceiptPath = $dialogReceiptPath; dialog = $blockingDialog[0]; processes = $status.processes; sessionPath = $lockData.sessionPath } -Errors @('MO2 reported Failed to write settings. The launch was classified immediately; use close/stop to acknowledge the exact dialog and shut down cooperatively.')
+        return New-MO2ActionResult -Config $Config -Command 'launch' -Ok $false -State 'launch-blocked-dialog' -Data @{ sessionId = $SessionId; launcherPid = $process.Id; launchStartedReceiptPath = $launchStartedPath; dialogReceiptPath = $dialogReceiptPath; dialog = $blockingDialog[0]; processes = $status.processes; sessionPath = $lockData.sessionPath } -Errors @("MO2 reported the exact owned '$($dialogReceipt.classification)' dialog. Cause is unassigned; no launch replay or cleanup was dispatched. Use normal close/stop for cooperative shutdown.")
     }
 
     if (-not $gameOwned) {
