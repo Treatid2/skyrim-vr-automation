@@ -154,6 +154,18 @@ If a start or qualification attempt fails, cleanup stops only
 SteamVR-root-owned processes whose creation time belongs to that attempt and
 reports the verified survivor inventory.
 
+An independent application probe can exhaust its maximum ten-second share while
+time remains in the outer startup budget. This is terminal for that attempt:
+`application-pose-probe-timeout` is distinct from `startup-deadline-exceeded`;
+a probe timeout during confirmation remains `runtime-confirmation-timeout`.
+The returned and nonaccepted persisted runtime observation retains the newest
+partial driver/log/shared-state evidence and the bounded process outcome,
+including available stdout/stderr, exit and process-tree cleanup facts. Unknown
+or undrained output remains unknown, not an empty successful observation. Failed
+output parsing or post-probe continuity checks also retain the bounded outcome.
+Driver activation is not application-visible pose qualification. No automatic
+probe retry, larger budget or qualification waiver follows from this diagnosis.
+
 Readiness polling keeps an incremental identity/offset cache and reads at most
 `LogTailMaxBytes` of new payload from the shared `vrserver` log. Its retained
 proof, including first-line framing, is capped to the same size. A final bounded
