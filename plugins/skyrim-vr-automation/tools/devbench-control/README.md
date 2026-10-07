@@ -8,6 +8,10 @@ It pins actual admitted AE/HDR, never writes the colour contract, requires actua
 submitted reset/jitter/delta telemetry, and reuses finite same-session calendar,
 probe custody, compiler/identity, burn-in and spacing guards. The total20..180s
 budget includes service-owned cleanup; partial coverage is not scientific PASS.
+It reserves the final3s within that budget for fractional-deadline MCP session
+closure and terminal journal/in-memory output. Expired closure/journal admission
+is explicit and unverified, not a new timeout. See the baseline guide for the
+cooperative local-I/O boundary and separately retained restoration proofs.
 
 ## Typed finite colour measurement
 

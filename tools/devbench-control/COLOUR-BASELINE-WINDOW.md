@@ -42,7 +42,10 @@ jitter offset and frame-time delta. Missing/unavailable/malformed telemetry
 refuses; it is never synthesised or labelled a controlled jitter phase.
 
 The total invocation budget remains20..180 seconds, including discovery and
-15 seconds reserved for cleanup (the final5 for calendar release/readback).
+15 seconds reserved for probe/colour/Calendar cleanup (the final5 of that
+workflow for calendar release/readback), plus a separate final3-second slice
+inside the same original deadline: up to2 seconds for the original MCP session
+DELETE and1 second for terminal journal/in-memory JSON finalization.
 Before hold, declared minimum burn-in plus inter-arm spacing must fit the
 remaining work budget with request headroom. This is a necessary lower-bound
 check, NOT a promise that16 captures finish: each capture's existing15-second
@@ -54,6 +57,24 @@ AE/HDR by reads, releases its original calendar lease and verifies prior-rate
 restoration, then separately reports MCP session close. It cannot compensate for
 foreign colour changes by writing the contract. Lost mutation acknowledgements,
 foreign custody and unavailable restoration remain explicit; never replay.
+
+Session closure is admitted only before its cutoff and uses cancellable HTTP
+with a millisecond timeout capped to the smaller of2 seconds or its remaining
+allowance. There is no integer-second rounding or fresh timeout after expiry.
+`not_attempted_deadline_exhausted`, `cleanup_timed_out` and other close failures
+are unverified/indeterminate, never Calendar restoration proof. Partial
+measurement and custody evidence remain in the result. A404 means only that the
+session is absent, not that Calendar or probe state was restored.
+
+The terminal journal is not started after the original deadline. If that
+allowance is exhausted, the controller returns already retained in-memory
+evidence with an explicit unfinalized-journal warning rather than starting new
+disk I/O. Local journal/JSON work uses the reserved slice with admission and
+postcondition checks; this is a cooperative application deadline, not a hard OS
+interrupt guarantee for an individual filesystem call or JSON serialization.
+Reported deadline overrun is failure/indeterminate, never a silently extended
+budget or total-time qualification. Public offline timing fixtures include final
+journal/output time; runtime qualification remains separate.
 These are Auto-Tools lifecycle responsibilities, not an instruction for callers
 to revert/rebuild retained environments or perform bespoke shared cleanup.
 
