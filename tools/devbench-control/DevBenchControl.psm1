@@ -636,6 +636,7 @@ function Get-DevBenchCallSemanticStatus {
 
     if ($ToolName -ceq 'console' -and $Arguments.Contains('action') -and $Arguments.action -is [string] -and $Arguments.action -ceq 'exec' -and $Arguments.Contains('capture') -and $Arguments.capture -is [bool] -and -not $Arguments.capture) {
         return Get-DevBenchConsoleDispatchStatus -Arguments $Arguments -Content $Content
+    }
     if ($ToolName -ceq 'inspect' -and $Arguments.Contains('kind') -and $Arguments.kind -is [string] -and $Arguments.kind -ceq 'lights') {
         return Get-DevBenchSceneLightStatus -Arguments $Arguments -Content $Content
     }
