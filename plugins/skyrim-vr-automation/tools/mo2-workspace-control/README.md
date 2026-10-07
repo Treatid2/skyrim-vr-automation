@@ -69,6 +69,45 @@ marker, snapshots, evidence paths, and completion paths before returning ready.
 See
 `../../docs/MO2-TASK-WORKSPACES.md`.
 
+### Explicit completed-output reconciliation
+
+Ordinary `resume` remains strict: a later human/shared cache change is not
+automatically output of the completed task and does not invalidate its old
+evidence. Use `reconcile-completed-output -TaskId <exact owner> -WorkspaceId
+<exact workspace> -AccessId <new owned lease> -ReconciliationNote <classification>`
+only when explicitly admitting that current shared baseline. Preview with
+`-WhatIf` first; its `reconciliation.baseline` reports each exact path, root
+existence, tree hash, file/byte counts and capture time. A note records the
+owner's classification and remaining producer/provenance uncertainty; it is not
+independent proof of who wrote those bytes.
+
+The same closed MO2/Skyrim/loader/RootBuilder and task/access/path gates apply.
+Any active or foreign output marker, unsupported legacy contract, reparse path,
+changed receipt/snapshot/preserved output, or unclassified concurrent drift
+refuses the transition. Old terminal plans, completions, physical baselines,
+working output and committed restore journals are independently verified without
+requiring today's shared trees to equal those historical baselines. They are
+never rewritten. The exact original runtime-output contract is retained in
+`runtimeOutputHistory`; the profile, task mods, settings and saves are preserved.
+
+Successful reconciliation selects/rebinds that retained profile through the
+existing journaled resume transaction and snapshots both current shared trees
+into a new generation. Its cache audit snapshot is separate from the ordinary
+catalog namespace. It does not select shaders, promote output or grant launch
+readiness: run normal catalog `prepare` using the new returned arguments before
+MO2 preparation. The new exact owner marker binds the admitted cache hash; fresh
+catalog preparation refuses a later changed cache instead of silently rebasing.
+Then complete the cache and `complete-output` normally; completion restores the
+new shared baseline, not the old task's historical baseline.
+
+Interruption uses the existing resume journal/preimage and bounded restart
+recovery. Both baselines and old task evidence survive verified rollback.
+Unclassified cache/backup drift keeps ownership and evidence and returns
+recovery-required; never delete a marker, retry a launch, recreate the profile,
+use active `requalify-output`, or invoke `prepare-source` to bypass it. This is a
+maintainer-source capability; an older installed/bundled controller that lacks
+the command must report unavailable, not reconstruct this transition ad hoc.
+
 `list-task` advertises a workspace as resumable only when its profile exists,
 its retained manifest contains the complete supported runtime-output contract,
 and it has one machine-checked transition: `rebind-active-output` for its exact
