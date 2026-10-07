@@ -1244,6 +1244,18 @@ function Get-SameTaskResume($Binding, [string]$CurrentEvidence) {
     }
 }
 
+function New-TaskCacheCompletionArguments($Storage, [string]$ResolvedCache, [string]$EvidenceRoot) {
+    # Fixed bounded parameter object for forwarding to another execution host.
+    # Paths come from this admitted plan, never a later host's ambient defaults.
+    # Status/promotion still require a caller's explicit classification/authority.
+    return [pscustomobject][ordered]@{
+        Command = 'complete'
+        CatalogRoot = [string]$Storage.path
+        CachePath = $ResolvedCache
+        EvidenceDirectory = $EvidenceRoot
+    }
+}
+
 function Prepare-TaskCache($Storage) {
     Assert-CompatibilityInput
     $cacheResolution = Resolve-TaskCacheBinding
@@ -1285,7 +1297,7 @@ function Prepare-TaskCache($Storage) {
         $current = Invoke-Transaction 'inspect' @{ CachePath = $resolvedCache }
         $expectedLiveHash = if (Test-Property $existingPlan 'preparedTreeSha256') { [string]$existingPlan.preparedTreeSha256 } elseif ([string]$existingPlan.action -eq 'seed-selected') { [string]$existingPlan.selection.selected.treeSha256 } else { [string]$existingPlan.beforeTreeSha256 }
         if ([string]$current.data.treeSha256 -ine $expectedLiveHash) { throw 'Prepared task cache plan no longer matches the exact live cache state.' }
-        return [pscustomobject][ordered]@{ state = 'already-prepared'; planPath = $planPath; action = [string]$existingPlan.action; selection = $existingPlan.selection; resume = $resume; providerShadow = $(if (Test-Property $existingPlan 'providerShadow') { $existingPlan.providerShadow } else { $null }); before = @{ treeSha256 = [string]$existingPlan.beforeTreeSha256 }; seed = $null }
+        return [pscustomobject][ordered]@{ state = 'already-prepared'; planPath = $planPath; completionArguments = New-TaskCacheCompletionArguments $Storage $resolvedCache $evidence; action = [string]$existingPlan.action; selection = $existingPlan.selection; resume = $resume; providerShadow = $(if (Test-Property $existingPlan 'providerShadow') { $existingPlan.providerShadow } else { $null }); before = @{ treeSha256 = [string]$existingPlan.beforeTreeSha256 }; seed = $null }
     }
     $snapshot = if ($null -ne $existingPlan) {
         [pscustomobject]@{ data = [pscustomobject]@{ receiptPath = [string]$existingPlan.transactionReceiptPath; inventory = [pscustomobject]@{ treeSha256 = [string]$existingPlan.beforeTreeSha256 } } }
@@ -1347,7 +1359,7 @@ function Prepare-TaskCache($Storage) {
     $plan | Add-Member -NotePropertyName preparedTreeSha256 -NotePropertyValue ([string]$preparedInventory.treeSha256) -Force
     Assert-OverwriteOwnerBinding $cacheResolution.binding
     Write-JsonAtomic $planPath $plan
-    return [pscustomobject][ordered]@{ state = 'prepared'; planPath = $planPath; action = $action; selection = $selection; resume = $resume; providerShadow = $providerShadow; cacheBinding = $cacheResolution.binding; requireMaterializedOutput = [bool]$RequireMaterializedOutput; before = $snapshot.data.inventory; seed = $seed }
+    return [pscustomobject][ordered]@{ state = 'prepared'; planPath = $planPath; completionArguments = New-TaskCacheCompletionArguments $Storage $resolvedCache $evidence; action = $action; selection = $selection; resume = $resume; providerShadow = $providerShadow; cacheBinding = $cacheResolution.binding; requireMaterializedOutput = [bool]$RequireMaterializedOutput; before = $snapshot.data.inventory; seed = $seed }
 }
 
 function Complete-TaskCache($Storage) {
