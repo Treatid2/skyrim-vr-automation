@@ -452,6 +452,41 @@ attended or unsupported step rather than substituting COC.
 
 ### MO2 command helper exits before the game appears
 
+For a proven current-attempt MO2 spawn error, `launch` or the exact session's
+`status` instead returns `launch-failed` with `launchFailure` and a retained
+attempt-specific receipt. The classifier binds exact MO2 lifetime and registered
+binary to a bounded stable log window; unknown or stale evidence is ignored.
+For an enabled registered mod's exact `root` binary, fresh launch captures the
+root-relative path, registered working directory and pre-dispatch source digest.
+A different logged deployment path qualifies only when it is that exact derived
+destination and its bounded physical file bytes match the captured source.
+Both registered and actual paths and the digest binding remain in the receipt;
+matching a filename alone is never sufficient. Legacy attempts without this
+pre-dispatch binding cannot acquire it retrospectively. Unavailable, oversized
+(over16MiB), aliased or differing bytes leave the detailed error unqualified.
+
+Independently, `status` reports `ok:false, launch-blocked-dialog` when one
+positively owned MO2 shows a visible known launch-error modal and no game/loader,
+even if detailed current-attempt log attribution is unavailable. Its
+`controller.launchBlocker` is current UI evidence, not a fabricated Win32 code,
+deployment history or denying mechanism; it outranks the launch grace period.
+Only a fresh post-dispatch MO2 owner is eligible; retained-owner logs do not
+independently correlate a launch request and must use the bounded timeout path.
+The exact command header must precede the error in bytes and UTC time. Physical
+log identity and unchanged bounded window are required. An interrupted receipt
+commit may reuse only the exact revalidated receipt; mismatching retained
+custody is an explicit error, never permission to overwrite or delete evidence.
+Preserve the numeric Win32 code/message. Do not infer antivirus from error5 or
+generic dialog advice, and do not replay launch or change ACL/elevation/security
+policy speculatively. Finish the existing attempt through normal exact-session
+stop/Unlock and preserve its RootBuilder cleanup proof before further work.
+
+After that attempt is already terminal, the supported alternative is a fresh
+durable controller/session and the existing exact-profile/executable Run-button
+route described above. Preview it before one authorised dispatch; it never
+changes selections or security policy and is not a guarantee that an access
+denial disappears. Never reopen or replay the failed session just to try it.
+
 Symptom: the process started for `ModOrganizer.exe --profile ... run ...` exits
 successfully while the retained MO2 UI remains open, and Skyrim appears a few
 seconds later.

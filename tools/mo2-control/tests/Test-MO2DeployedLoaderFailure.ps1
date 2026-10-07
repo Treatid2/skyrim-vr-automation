@@ -57,7 +57,7 @@ $result=& $module {
  $oversized=Join-Path $game 'large.exe';$stream=[IO.File]::Create($oversized);$stream.SetLength(16777217);$stream.Dispose()
  $refused=$false;try {Get-MO2LaunchBinaryDigest $oversized|Out-Null}catch{$refused=$true}
  Check $refused 'bounded digest refuses over16MiB without hashing whole file'
- # Real classifier, synthetic retained-owner append and current attempt.
+ # Real classifier: retained-owner append is uncorrelated (PR65 correction).
  [IO.Directory]::CreateDirectory((Join-Path $root 'logs'))|Out-Null
  $log=Join-Path $root 'logs\mo_interface.log';[IO.File]::WriteAllText($log,'baseline')
  $boundary=New-MO2LaunchLogBoundary -Config $cfg -Validation $validation -AttemptId $attempt -Profile 'Fixture Profile' -Executable 'Fixture SKSE' -ArgumentLine 'fixture' -RetainedOwner $true
@@ -71,6 +71,13 @@ $result=& $module {
   $script:deployedOwner=$owner;$script:deployedOwned=$owned;$script:deployedOwnerOK=$true;$script:deployedOwners=@($owner)
   $script:deployedWindows=@([pscustomobject]@{processId=111;visible=$true;dialogKind='failed-to-run';title='Cannot launch program';texts=@('Cannot start sksevr_loader.exe')})
   Set-Item Function:script:Resolve-MO2OwnedProcessTarget {[pscustomobject]@{ok=$script:deployedOwnerOK;targets=@($script:deployedOwner);adopted=$false;ownerPid=111}}
+  Check ($null -eq (Get-MO2LaunchFailureEvidence -Config $cfg -Owned $owned -MO2Processes @($owner) -GameProcesses @())) 'retained bare deployed error cannot prove current request'
+  [IO.File]::WriteAllText($log,'baseline')
+  $boundary=New-MO2LaunchLogBoundary -Config $cfg -Validation $validation -AttemptId $attempt -Profile 'Fixture Profile' -Executable 'Fixture SKSE' -ArgumentLine 'fixture' -RetainedOwner $false
+  $owned.data.launchLogBoundary=$boundary
+  $owner.startTime=$dispatch.AddMilliseconds(100).ToString('o')
+  $headerStamp=$dispatch.AddMilliseconds(200).ToString('yyyy-MM-dd HH:mm:ss.fff')
+  [IO.File]::AppendAllText($log,"`r`n[$headerStamp D] command line: '$($boundary.expectedCommandLine)'`r`n[$stamp E] Error 5 ERROR_ACCESS_DENIED: denied (0x5)`r`n[$stamp E]  . binary: '$deployed'`r`n")
   $failure=Get-MO2LaunchFailureEvidence -Config $cfg -Owned $owned -MO2Processes @($owner) -GameProcesses @()
   Check ($null -ne $failure -and $failure.win32ErrorCode -eq 5 -and $failure.cause -ceq 'unassigned') 'classify current-attempt deployed denial without assigning mechanism'
   Check ($failure.binary -ceq $deployed -and $failure.registeredBinary -ceq $binary -and $failure.windowStableAtVerification) 'failure retains source/deployed binding and stable log proof'
