@@ -307,6 +307,51 @@ session or call `release-access`.
 
 ## Session lifecycle
 
+### Opening transition versus current readiness
+
+The three opening/status fields answer different questions:
+
+| Field | Meaning |
+| --- | --- |
+| `data.controller.openingCompleted` | Transition **in this status call**: it changed the owned phase from `opening` to `mo2-open`. It is not a persistent ready flag. |
+| `data.controller.lockStatus` | The current durable phase of the exact owned session. |
+| Top-level `state` | Current process/recovery projection; `mo2-running` alone does not prove an owned, usable UI. |
+
+For example, a synchronous `open` can succeed with `ok=true` and
+`state=mo2-open`. A subsequent `status` for that same session can legitimately
+return this **partial illustration**, with no new opening transition:
+
+```json
+{
+  "ok": true,
+  "state": "mo2-running",
+  "data": {
+    "controller": {
+      "lockStatus": "mo2-open",
+      "openingCompleted": false
+    }
+  }
+}
+```
+
+The omitted ownership, process, window, lease and failure fields remain
+mandatory evidence; this fragment is not a complete readiness receipt. Retain
+the successful open receipt, then assess current readiness through the same
+literal session-scoped controller and exact `SessionId`. Require the current
+access lease/session/profile binding, successful ownership resolution to one
+process with the retained PID, executable path and start time, no game/loader,
+and one visible exact `MainWindow`. Refuse changed/foreign ownership, a modal
+or failure/recovery state, unexpected profile/executable selection, or an
+unresolved RootBuilder deployment. Do not accept a bare `mo2-running` state
+or a historical open receipt after the current identity or UI has changed.
+
+For a `-StartOnly` open, `status` can promote `opening` to `mo2-open`
+after those proofs. Later reads normally report `openingCompleted=false`
+while the durable phase remains `mo2-open`. Do not wait for that transient
+edge to recur, replay `open`, or create another session merely because it is
+false. A genuinely incomplete/blocked open still needs exact-session evidence
+classification and Auto-owned recovery; this distinction does not waive it.
+
 `prepare` requires a closed game/MO2 state, validates one exact profile and
 registered executable, and creates a durable evidence manifest on staging
 storage. It binds the caller's exact route-qualified access lease. It also
