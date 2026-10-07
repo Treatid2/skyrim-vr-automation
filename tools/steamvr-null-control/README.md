@@ -247,8 +247,8 @@ profile changes or reconstruct shared baseline state. For an authorised resume:
    identities only after apply succeeds; require current independent
    application-facing head/controller qualification before preparing MO2.
 
-Unclassified settings/registration drift is a refusal to investigate, not
-permission to replace journals, broaden restore ownership, select
+Unclassified settings/registration drift requires investigation after refusal;
+it is not permission to replace journals, broaden restore ownership, select
 `-Standalone` for Skyrim, or retry with a newly accepted hash.
 
 Some integrated controller versions expose the separately implemented
