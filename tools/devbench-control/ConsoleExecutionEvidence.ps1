@@ -78,6 +78,11 @@ function Get-DevBenchConsoleReadStatus {
             $reasons.Add('Console read has missing native fields or unknown/error/redirect extensions.')
         }
         $modern='windowId' -cin $names
+        if(-not $modern) {
+            # Fences and lossPossible do not expose ReadFenced's final maxLines
+            # tail trim. Retain the raw response, but never qualify its completeness.
+            $reasons.Add('Legacy windowless read lacks total-line completeness telemetry.')
+        }
         if($modern -and -not (Test-DevBenchConsoleInteger $p.windowId 1)) {$reasons.Add('Read windowId must be a positive native uint64 integer.')}
         if($Arguments.Contains('windowId')) {
             $windowMatched=$modern -and (Test-DevBenchConsoleInteger $p.windowId 1) -and

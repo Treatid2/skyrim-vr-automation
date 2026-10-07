@@ -90,7 +90,22 @@ Check (-not (Get-DevBenchConsoleReadStatus -Arguments $readArgs -Content @($read
 $p=Clone $read;$p.PSObject.Properties.Remove('windowId');$p.diag=[pscustomobject]@{timedOut=$false;printHooked=$true;printDropped=0;lastMessage='retained marker diagnostic'}
 Check (-not (ReadStatus $p).ok) 'legacy reply cannot satisfy modern guard'
 $s=ReadStatus $p @{action='read'}
-Check ($s.ok -and -not $s.windowMatched) 'legacy uncorrelated read preserved'
+Check ($s.known -and -not $s.ok -and -not $s.outputQualified -and -not $s.windowMatched -and -not $s.desiredEffectVerified) 'legacy uncorrelated evidence never proves complete output'
+Check ($s.reasons -ccontains 'Legacy windowless read lacks total-line completeness telemetry.') 'legacy completeness refusal is explicit'
+# Synthetic producer total201 with only its retained200-line tail: neither clean
+# fences nor zero printDropped proves the oldest payload survived maxLines trimming.
+foreach($legacySource in @('print','buffer')){
+    foreach($legacyArgs in @(@{action='read'},@{action='read';maxLines=200},@{action='read';maxLines=20000})){
+        $legacy=Clone $p;$legacy.source=$legacySource
+        $legacy.lines=@(2..201|ForEach-Object{"payload $_"});$legacy.count=200
+        $rawBefore=$legacy|ConvertTo-Json -Depth 30 -Compress
+        $legacyStatus=ReadStatus $legacy $legacyArgs
+        Check ($legacyStatus.known -and -not $legacyStatus.ok -and -not $legacyStatus.outputQualified) "legacy $legacySource tail remains unqualified"
+        Check (-not $legacyStatus.windowMatched -and -not $legacyStatus.desiredEffectVerified -and $null -eq $legacyStatus.qualifiedConsoleOutput) 'legacy refusal invents no correlation/effect/complete output'
+        Check ($legacyStatus.reasons -ccontains 'Legacy windowless read lacks total-line completeness telemetry.') 'legacy refusal retains exact completeness reason'
+        Check (($legacy|ConvertTo-Json -Depth 30 -Compress) -ceq $rawBefore) 'legacy refused raw payload retained unchanged without dispatch/replay'
+    }
+}
 $s=ReadStatus $read @{action='read'}
 Check ($s.ok -and -not $s.windowMatched) 'modern unguarded read makes no generation match claim'
 Check (Test-DevBenchReadOnlyRequest -ToolName console -Arguments $readArgs) 'exact read admitted as read-only'
