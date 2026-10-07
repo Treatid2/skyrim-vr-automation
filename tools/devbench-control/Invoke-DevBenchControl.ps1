@@ -136,10 +136,14 @@ function Get-DevBenchDispatchProvenance($InvocationRecord, $Data, $Semantic) {
     $responseDataRetained = [bool]($dispatchReached -and $null -ne $Data)
     $semanticKnown = [bool]($Semantic -and $Semantic.PSObject.Properties['known'] -and [bool]$Semantic.known)
     $semanticAccepted = [bool]($semanticKnown -and $Semantic.PSObject.Properties['ok'] -and [bool]$Semantic.ok)
+    $acceptedDispatchRetained = [bool]($Data -and $Data.PSObject.Properties['dispatchEvidence'] -and
+        $Data.dispatchEvidence -is [pscustomobject] -and $Data.dispatchEvidence.PSObject.Properties['accepted'] -and
+        $Data.dispatchEvidence.accepted -is [bool] -and $Data.dispatchEvidence.accepted -and
+        $Data.dispatchEvidence.completionBasis -ceq 'dispatch-only')
     return [pscustomobject][ordered]@{
         dispatchReached = $dispatchReached
         responseDataRetained = $responseDataRetained
-        acceptedDataRetained = [bool]($responseDataRetained -and $semanticAccepted)
+        acceptedDataRetained = [bool]($responseDataRetained -and ($semanticAccepted -or $acceptedDispatchRetained))
         semanticRejected = [bool]($responseDataRetained -and $semanticKnown -and -not $semanticAccepted)
     }
 }
@@ -2056,6 +2060,20 @@ try {
         # Bracket only this invocation. An async capture's later completion needs
         # its own guarded request_get/finalization; this is not whole-run health.
         $data | Add-Member -NotePropertyName targetSemantic -NotePropertyValue $semantic -Force
+        # Preserve queue admission BEFORE a later read can fail. It is not arrival,
+        # command completion, shader health or permission to replay the mutation.
+        if ($Tool -ceq 'console' -and $semantic.PSObject.Properties['dispatchAccepted'] -and
+            $semantic.dispatchAccepted -is [bool] -and $semantic.dispatchAccepted -and
+            $semantic.known -and $semantic.ok -and $semantic.completionBasis -ceq 'dispatch-only') {
+            $data | Add-Member -NotePropertyName dispatchEvidence -NotePropertyValue ([pscustomobject]@{
+                accepted=$true;completionBasis='dispatch-only';receipt=$semantic.qualifiedDispatch
+                executionCompleted=$false;arrivalProven=$false;desiredEffectVerified=$false;replayPermitted=$false
+            }) -Force
+        }
+        $data | Add-Member -NotePropertyName compilerQualification -NotePropertyValue ([pscustomobject]@{
+            required=$true;admitted=$false;state='post-boundary-unobserved';boundary='this-invocation-only'
+            beforeState=$compilerGuard.state;afterState=$null;windowValid=$false;arrivalProven=$false
+        }) -Force
         $data | Add-Member -NotePropertyName compilerGuard -NotePropertyValue $compilerGuard -Force
         $compilerGuardAfter=Get-ShaderCompilerGuard -Tools $tools -Headers $headers -Identity $runtimeIdentity
         $compilerWindow=Test-DevBenchShaderCompilerWindow -Before $compilerGuard.health -After $compilerGuardAfter.health
@@ -2064,6 +2082,12 @@ try {
         $compilerAdmitted=$compilerGuard.admissible -and $compilerGuardAfter.admissible -and $compilerWindow.valid
         if ($Tool -ceq 'communityshaders.shader_api' -and $arguments.action -ceq 'snapshot') { $compilerAdmitted=$compilerAdmitted -and $semantic.compilerHealth.admissible }
         $data | Add-Member -NotePropertyName healthyEvidenceAdmitted -NotePropertyValue ([bool]($compilerAdmitted -and $semantic.known -and $semantic.ok)) -Force
+        $data | Add-Member -NotePropertyName compilerQualification -NotePropertyValue ([pscustomobject]@{
+            required=$true;admitted=[bool]($compilerAdmitted -and $semantic.known -and $semantic.ok)
+            state=$(if($compilerAdmitted){'boundary-qualified'}else{'boundary-unqualified'})
+            boundary='this-invocation-only';beforeState=$compilerGuard.state;afterState=$compilerGuardAfter.state
+            windowValid=[bool]$compilerWindow.valid;arrivalProven=$false
+        }) -Force
         if (-not $compilerAdmitted) {
             $semantic=[pscustomobject]@{known=$true;ok=$false;outcome='compiler-admission-invalidated';guarded=$true;transient=$false;codes=@('compiler_health_invalidated');states=@();reasons=@($compilerGuardAfter.reasons)+@($compilerWindow.reasons);completionBasis='compiler-boundary-bracket-only'}
         }

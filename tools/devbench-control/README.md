@@ -53,6 +53,26 @@ remain distinct. This does not broaden the read-only `calendar-window` allowlist
 set quality or render scale, take ownership from the live experiment, or qualify
 scientific colour. No mutation replay or second transport lane is permitted.
 
+## Async dispatch and compiler qualification
+
+An uncaptured console queue receipt proves dispatch acceptance, not arrival,
+execution completion or shader health. With `-RequireCompilerHealthy`, the
+controller retains exact `data.targetSemantic` and `data.dispatchEvidence`
+before attempting the post-boundary read. `data.compilerQualification` describes
+that independent before/after bracket. A timeout/unavailable/failed post-read
+still fails the overall compiler-gated call; it never erases accepted dispatch
+or permits replay. Unavailable transport is not invented failed-shader counters.
+Even a healthy bracket proves only this invocation's boundary, not async arrival.
+
+For scene navigation, the requesting task owns destination correlation: retain
+one dispatch, then use the existing bounded current-state `playerLoaded` barrier
+with exact ExpectedCell on its selected lane, then separately qualify existing
+`compilerHealthy` readiness when its protocol requires destination health.
+Keep the original failed bracket and later reconciliation as separate evidence;
+do not retroactively change old results, change lanes, queue a second COC, or
+treat a late healthy read as proof that the original bracket passed. Auto does
+not add another navigation wrapper or calibrate the task's experiment.
+
 ## Bounded compiler readiness after an accepted load
 
 `playerLoaded` proves the current loaded cell, not compiler initialization.
