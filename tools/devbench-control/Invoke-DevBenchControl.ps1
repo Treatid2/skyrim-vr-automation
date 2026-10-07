@@ -609,8 +609,22 @@ function Invoke-RestRequest {
     }
 }
 
+function Test-CaptureBracketRpcRequest {
+    param([string]$Name,[hashtable]$Arguments)
+    $keys=@($Arguments.Keys)
+    if($Name -ceq 'camera'){
+        return $keys.Count -eq 1 -and 'action' -cin $keys -and $Arguments.action -is [string] -and $Arguments.action -ceq 'get'
+    }
+    if($Name -cne 'inspect' -or 'kind' -cnotin $keys -or $Arguments.kind -isnot [string]){return $false}
+    if($Arguments.kind -ceq 'scene'){return $keys.Count -eq 1}
+    return $Arguments.kind -ceq 'lights' -and $keys.Count -eq 3 -and 'scope' -cin $keys -and 'limit' -cin $keys -and
+        $Arguments.scope -is [string] -and $Arguments.scope -ceq 'scene' -and
+        ($Arguments.limit -is [int] -or $Arguments.limit -is [long]) -and $Arguments.limit -eq 64
+}
+
 function Invoke-ToolRpc {
-    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation, [switch]$RetainHealthToolError, [switch]$RetainShaderSnapshotToolError)
+    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation, [switch]$RetainHealthToolError, [switch]$RetainShaderSnapshotToolError, [switch]$RetainCaptureBracketToolError)
+    if($RetainCaptureBracketToolError -and ($Mutation -or -not (Test-CaptureBracketRpcRequest -Name $Name -Arguments $Arguments))){throw 'Decoded bracket-error retention is restricted to exact read-only camera/get, inspect/scene or scene lights limit64.'}
     if ($RetainShaderSnapshotToolError -and ($Name -cne 'communityshaders.shader_api' -or $Mutation -or -not (Test-DevBenchShaderSnapshotRequest -Arguments $Arguments))) { throw 'Decoded compiler-error retention is restricted to the exact read-only shader snapshot.' }
     if ($RetainHealthToolError -and ($Name -cne 'inspect' -or [string]$Arguments['kind'] -cne 'health' -or $Mutation)) { throw 'Decoded tool-error retention is restricted to the read-only identity health probe.' }
     Set-ServerWaitBudgetAtDispatch -Arguments $Arguments
@@ -621,7 +635,7 @@ function Invoke-ToolRpc {
     }
     $rpc = Invoke-McpRequest -Endpoint $endpoint -Headers $Headers -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/call'; params = @{ name = $Name; arguments = $Arguments } } -Mutation:$Mutation
     if ($rpc.json.PSObject.Properties['error']) { throw "DevBench tools/call failed: $($rpc.json.error | ConvertTo-Json -Compress)" }
-    if (-not $RetainShaderSnapshotToolError -and -not $RetainHealthToolError -and $rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
+    if (-not $RetainCaptureBracketToolError -and -not $RetainShaderSnapshotToolError -and -not $RetainHealthToolError -and $rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
         $message = ($rpc.json.result.content | ForEach-Object { $_.text }) -join "`n"
         throw "DevBench tool '$Name' failed: $message"
     }
@@ -1304,7 +1318,10 @@ try {
                     $script:invocationRecord.commandId=if($argsMap.Contains('commandId')){[string]$argsMap.commandId}else{[guid]::NewGuid().ToString('N')}
                     $script:invocationRecord['calendarDispatchArguments']=$argsMap
                     $reply=Invoke-DevBenchTargetDispatch -InvocationRecord $invocationRecord -PersistIntent { Update-InvocationEvidence -State 'dispatching' } -TargetAction { Invoke-ToolRpc -Name $name -Arguments $argsMap -Headers $headers -Mutation }
-                } else { $reply=Invoke-ToolRpc -Name $name -Arguments $argsMap -Headers $headers }
+                } else {
+                    $retainBracketError=$colourPlan -and $colourPlan.Contains('captureReadBrackets') -and $colourPlan.captureReadBrackets -and (Test-CaptureBracketRpcRequest -Name $name -Arguments $argsMap)
+                    $reply=Invoke-ToolRpc -Name $name -Arguments $argsMap -Headers $headers -RetainCaptureBracketToolError:$retainBracketError
+                }
                 if($colourPlan){
                     $rawPath=Join-Path $EvidenceDirectory ('colour-rpc.'+[guid]::NewGuid().ToString('N')+'.json')
                     Write-JsonAtomic -Path $rawPath -Value ([pscustomobject]@{tool=$name;arguments=$argsMap;mutation=$mutation;receivedUtc=[datetime]::UtcNow.ToString('o');sessionId=$calendarSessionId;runtimeIdentity=$runtimeIdentity;reply=$reply})
