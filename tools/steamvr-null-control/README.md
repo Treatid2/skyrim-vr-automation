@@ -216,6 +216,56 @@ prove an application bypassing SteamVR is attached to it.
 
 Run `Test-SteamVRNullControl.ps1` after changing the control contract.
 
+## Resuming a retained environment under a new access lease
+
+Releasing MO2 access preserves the task workspace; it does not transfer the
+shared null-HMD transaction. A committed apply is bound to its recorded lease,
+profile, provider inventory, exact receipt/profile backups and target journal.
+Reacquiring access for the same task/profile produces a new lease. That does
+not make the old apply eligible for `start`: lease drift is deliberately
+rejected, and `apply` reporting `already-applied` is not a rebind operation.
+There is no supported journal edit or blind restart shortcut.
+
+Auto-Tools owns the shared cleanup/restoration handoff. Calling tasks retain
+their intended environment and evidence; they are not required to undo their
+profile changes or reconstruct shared baseline state. For an authorised resume:
+
+1. Identify the exact retained task workspace and old transaction/evidence
+   directory. Acquire the new `SteamVRNull` lease and validate the exact task
+   profile with the closed-state `runtime-route-provider` gate. Keep Skyrim,
+   its loader and MO2 closed during the runtime transition; verify SteamVR-root
+   processes stopped through the supported controller. Do not stop another
+   owner's live experiment or steal its lease.
+2. Inspect the authoritative transaction and retained receipts. If the prior
+   restore is already committed, retain its verified result and do not replay
+   that restore. Otherwise preview `restore -EvidenceDirectory <old-evidence>
+   -WhatIf`, then restore that exact prior apply through its receipt-bound
+   backup/profile and verify the returned baseline/restoration proof.
+3. Apply into a fresh evidence directory with the new exact `-MO2AccessId`
+   and `-MO2Profile`, selecting the independently qualified provider package.
+   Retain the fresh transaction and public route proof. Start with those same
+   identities only after apply succeeds; require current independent
+   application-facing head/controller qualification before preparing MO2.
+
+Unclassified settings/registration drift is a refusal to investigate, not
+permission to replace journals, broaden restore ownership, select
+`-Standalone` for Skyrim, or retry with a newly accepted hash.
+
+Some integrated controller versions expose the separately implemented
+`-PreserveDesktopUIWindowState` restore option. Use it only when that exact
+controller advertises it and the human has explicitly selected preservation
+of the two string leaves `DesktopUI.pairing` and
+`DesktopUI.settings_desktop`. Take a fresh exact preview and preimage;
+commit with its `-ExpectedCurrentSettingsSha256` and retain the selected-result
+receipt. It is not general DesktopUI/drift tolerance. A controller without the
+option must fail closed on such drift; do not pass undocumented flags or edit
+settings by hand. A changed preimage or refused preview requires classification,
+not a silent new-hash retry.
+
+This lifecycle guidance authorises no runtime action by itself. Preserve
+completed restoration receipts, task-local profile/mod/cache state and the
+current runtime owner's authority when the workflow is held.
+
 Runtime startup and every application-facing probe also require the exact
 owned `HeadPoseDriverRoot` and committed schema-3 installation custody described
 in the head-pose README. Exactly one canonical registration and one same-name
