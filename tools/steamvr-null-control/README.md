@@ -182,6 +182,17 @@ output parsing or post-probe continuity checks also retain the bounded outcome.
 Driver activation is not application-visible pose qualification. No automatic
 probe retry, larger budget or qualification waiver follows from this diagnosis.
 
+Application observations explicitly report `probeAttempted`, `terminalFailure`,
+`failureKind` and `timedOut`. Provider/log/shared-state readiness before probe
+admission is not a terminal failure and may still be polled. Once admitted, a
+missing probe/controller, insufficient budget, timeout, empty or malformed
+output, bounded-process failure, package drift, continuity failure or unqualified
+observation ends that startup attempt. Non-timeout failures use
+`application-pose-probe-failed`; the exact first error and bounded streams are
+retained in both the returned observation and nonaccepted runtime receipt.
+No second probe or confirmation follows a failed first observation. A successful
+first observation can still receive the independent success confirmation.
+
 Readiness polling keeps an incremental identity/offset cache and reads at most
 `LogTailMaxBytes` of new payload from the shared `vrserver` log. Its retained
 proof, including first-line framing, is capped to the same size. A final bounded
