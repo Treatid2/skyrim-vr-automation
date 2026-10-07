@@ -479,6 +479,12 @@ positively owned MO2 shows a visible known launch-error modal and no game/loader
 even if detailed current-attempt log attribution is unavailable. Its
 `controller.launchBlocker` is current UI evidence, not a fabricated Win32 code,
 deployment history or denying mechanism; it outranks the launch grace period.
+Only a fresh post-dispatch MO2 owner is eligible; retained-owner logs do not
+independently correlate a launch request and must use the bounded timeout path.
+The exact command header must precede the error in bytes and UTC time. Physical
+log identity and unchanged bounded window are required. An interrupted receipt
+commit may reuse only the exact revalidated receipt; mismatching retained
+custody is an explicit error, never permission to overwrite or delete evidence.
 Preserve the numeric Win32 code/message. Do not infer antivirus from error5 or
 generic dialog advice, and do not replay launch or change ACL/elevation/security
 policy speculatively. Finish the existing attempt through normal exact-session

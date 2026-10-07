@@ -51,14 +51,28 @@ Launch retains an optional exact registered-binary log baseline before dispatch.
 Both synchronous `launch` and `status` after `launch -StartOnly` can classify a
 new MO2 loader spawn error before the game-observation timeout. This requires
 one exact owned MO2 lifetime, no loader/game, matching attempt/profile/binary,
-and stable bounded evidence from `logs/mo_interface.log`. A retained owner uses
-only appended bytes after a prefix-and-tail verified baseline. A fresh log also
-requires the exact requested command header near the proven process start.
+and stable bounded evidence from `logs/mo_interface.log`. Only a fresh owner
+is supported: retained-owner logs lack independent request correlation, so even
+a matching appended header/error keeps the bounded timeout fallback. Fresh-owner
+evidence (including append mode) requires exactly one exact requested command
+header near its proven post-dispatch process start, followed by the error in
+both byte order and UTC time. File identity, not sampled anchors alone, binds
+the baseline/window generation; replacement and changed verification are refused.
 The adapter supports the observed MO2 2.5.2 UTC timestamp/error-block format;
 unknown formats, rotation under a retained owner, incomplete/mismatched errors,
 inaccessible files and over-budget windows keep the existing timeout fallback.
 Each probe reads at most 256KiB of candidate bytes plus bounded anchors; a
-matched window is reread within that same bound to verify stability.
+matched window is reread within that same bound to verify stability. Old version1
+boundaries are not silently upgraded or reinterpreted.
+
+Receipt creation precedes the authoritative ownership-state commit. If that
+commit is interrupted, later status can reuse the existing attempt receipt only
+after serialized owner/game/attempt and exact current log-evidence revalidation.
+Canonical full content must match (including session, command, file identity,
+binary, error and byte window); the original valid observation time is retained.
+Malformed, over-1MiB, or mismatching receipts raise an explicit custody conflict
+and are never overwritten or deleted. Manifest-projection failure after a lock
+commit remains an explicit authoritative-generation reconciliation error.
 
 An attributable error returns `launch-failed`, retains `launchFailure` and an
 attempt-specific `launchFailureReceiptPath`, and preserves the numeric Win32
