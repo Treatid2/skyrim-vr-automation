@@ -632,6 +632,9 @@ function Get-DevBenchCallSemanticStatus {
         [AllowEmptyCollection()][object[]]$Content
     )
 
+    if ($ToolName -ceq 'console' -and $Arguments.Contains('action') -and $Arguments.action -is [string] -and $Arguments.action -ceq 'exec' -and $Arguments.Contains('capture') -and $Arguments.capture -is [bool] -and -not $Arguments.capture) {
+        return Get-DevBenchConsoleDispatchStatus -Arguments $Arguments -Content $Content
+    }
     if ($ToolName -ceq 'console' -and $Arguments.Contains('action') -and $Arguments.action -is [string] -and $Arguments.action -ceq 'exec' -and $Arguments.Contains('capture') -and ($Arguments.capture -isnot [bool] -or $Arguments.capture)) {
         return Get-DevBenchConsoleExecutionStatus -Arguments $Arguments -Content $Content
     }
