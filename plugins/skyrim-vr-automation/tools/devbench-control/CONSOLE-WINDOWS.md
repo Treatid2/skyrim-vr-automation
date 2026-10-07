@@ -28,8 +28,12 @@ has no retained total-line count and maxLines clips silently, its full-output
 qualification requires maxLines 20000. A refused smaller buffer read is retained
 evidence, not permission to replay the command.
 
-Legacy windowless reads retain their typed fenced-output contract but are
-uncorrelated. Unguarded modern reads also report windowMatched false. Successful
+Legacy windowless reads remain retained raw evidence, but report
+outputQualified false: their total-line completeness is unproved. Clean fences,
+count/array agreement, zero drops and lossPossible false do not exclude native
+tail trimming. Even a full-capacity request cannot invent missing producer
+telemetry. No legacy read refusal permits command replay.
+Unguarded modern reads also report windowMatched false. Successful
 read admission proves captured-output structure only: it does not parse an
 INISetting value, verify the command's desired effect, prove visible illumination,
 or establish asynchronous engine-wide quiescence.
