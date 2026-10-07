@@ -50,7 +50,7 @@ param(
 
     [switch]$AllowExternalDisplayRedirector,
 
-    [ValidateSet('', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'restore-source-drift-after-stage', 'head-pose-access-denied', 'head-pose-access-denied-after-start', 'runtime-ready', 'runtime-early-post-launch-failure', 'runtime-early-post-launch-cleanup-crosses-deadline', 'runtime-early-post-launch-cleanup-crosses-deadline-failure', 'runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-confirmation-timeout-input-contract-failure', 'runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-final-admission-timeout-input-contract-failure', 'runtime-post-receipt-timeout', 'runtime-final-boundary-timeout-cleanup-unverified', 'runtime-final-boundary-timeout-cleanup-failure', 'runtime-input-contract-failure', 'runtime-accepted-receipt-stage-failure', 'runtime-accepted-receipt-publish-failure', 'runtime-accepted-receipt-publish-and-stage-cleanup-failure')]
+    [ValidateSet('', 'runtime-application-probe-timeout', 'apply-after-openvr', 'apply-source-drift-after-stage', 'restore-after-settings', 'restore-source-drift-after-stage', 'head-pose-access-denied', 'head-pose-access-denied-after-start', 'runtime-ready', 'runtime-early-post-launch-failure', 'runtime-early-post-launch-cleanup-crosses-deadline', 'runtime-early-post-launch-cleanup-crosses-deadline-failure', 'runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-confirmation-timeout-input-contract-failure', 'runtime-final-admission-timeout', 'runtime-final-admission-timeout-no-confirmation', 'runtime-final-admission-timeout-input-contract-failure', 'runtime-post-receipt-timeout', 'runtime-final-boundary-timeout-cleanup-unverified', 'runtime-final-boundary-timeout-cleanup-failure', 'runtime-input-contract-failure', 'runtime-accepted-receipt-stage-failure', 'runtime-accepted-receipt-publish-failure', 'runtime-accepted-receipt-publish-and-stage-cleanup-failure')]
     [string]$InternalTestFailurePoint = '',
 
     [switch]$IsolateExternalDisplayRedirectors,
@@ -1241,6 +1241,10 @@ function Get-ApplicationHeadPose {
     if (-not (Test-Path -LiteralPath $probePath -PathType Leaf)) {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; probePath = $probePath; error = 'The independent OpenVR pose probe is not installed.' }
     }
+    # Keep the bounded outcome even if timeout, parsing or continuity fails.
+    # Returning unqualified evidence lets the caller publish its newer partial
+    # runtime observation instead of retaining a preceding pre-probe snapshot.
+    $bounded = $null
     try {
         $packageAuthority = Get-NullProviderAuthority -DeadlineUtc $DeadlineUtc
         if (-not $packageAuthority.verified) { throw "Provider package refused before probe execution: $($packageAuthority.errors -join '; ')" }
@@ -1279,6 +1283,7 @@ function Get-ApplicationHeadPose {
             qualified = $qualified
             controllersRequired = $true
             controllersQualified = $controllersQualified
+            timedOut = $false
             probePath = $probePath
             exitCode = $attempt.exitCode
             boundedProcess = $bounded
@@ -1289,10 +1294,20 @@ function Get-ApplicationHeadPose {
         }
     }
     catch [TimeoutException] {
-        throw
+        return [pscustomobject][ordered]@{
+            available = $false; qualified = $false
+            controllersRequired = $true; controllersQualified = $false
+            timedOut = $true; probePath = $probePath
+            boundedProcess = $bounded; error = $_.Exception.Message
+        }
     }
     catch {
-        return [pscustomobject][ordered]@{ available = $false; qualified = $false; probePath = $probePath; error = $_.Exception.Message }
+        return [pscustomobject][ordered]@{
+            available = $false; qualified = $false
+            controllersRequired = $true; controllersQualified = $false
+            timedOut = $false; probePath = $probePath
+            boundedProcess = $bounded; error = $_.Exception.Message
+        }
     }
 }
 
@@ -1448,6 +1463,22 @@ function Get-NullRuntimeEvidence {
         $runtimeEvidence.headPoseReady = $true
         $runtimeEvidence.controllersReady = $true
         $runtimeEvidence.headPoseAuthorizationError = $null
+    }
+    if ($fixtureMode -and $InternalTestFailurePoint -eq 'runtime-application-probe-timeout') {
+        $runtimeEvidence.active = $true
+        $runtimeEvidence.applicationHeadPose = [pscustomobject]@{
+            available = $false; qualified = $false; timedOut = $true
+            controllersRequired = $true; controllersQualified = $false
+            error = 'Injected independent application pose probe timeout.'
+            boundedProcess = [pscustomobject]@{
+                ok = $false; attempts = @([pscustomobject]@{
+                    timedOut = $true; stdout = 'partial probe stdout'; stderr = 'partial probe stderr'
+                    exitVerified = $true; jobQuiescent = $true
+                })
+            }
+        }
+        $runtimeEvidence.headPoseReady = $false
+        $runtimeEvidence.controllersReady = $false
     }
     return $runtimeEvidence
 }
@@ -2013,6 +2044,10 @@ try {
                         $lastRuntimeProbeError = [string]$runtime.headPoseAuthorizationError
                         break
                     }
+                    if ($runtime.applicationHeadPose.PSObject.Properties['timedOut'] -and $runtime.applicationHeadPose.timedOut) {
+                        $lastRuntimeProbeError = [string]$runtime.applicationHeadPose.error
+                        break
+                    }
                 } while (-not $runtime.active -or -not $runtime.headPoseReady)
                 if ($InternalTestFailurePoint -ne 'runtime-final-admission-timeout-no-confirmation' -and $runtime.active -and $runtime.headPoseReady -and [DateTime]::UtcNow.AddMilliseconds(2250) -lt $qualificationDeadline) {
                     $runtimeConfirmationAttempted = $true
@@ -2024,6 +2059,10 @@ try {
                             throw [TimeoutException]::new('Injected runtime confirmation timeout.')
                         }
                         $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline
+                        if ($runtime.applicationHeadPose.PSObject.Properties['timedOut'] -and $runtime.applicationHeadPose.timedOut) {
+                            $lastRuntimeProbeError = [string]$runtime.applicationHeadPose.error
+                            $runtimeConfirmationTimedOut = $true
+                        }
                     }
                     catch [TimeoutException] {
                         $lastRuntimeProbeError = $_.Exception.Message
@@ -2048,6 +2087,11 @@ try {
                 elseif ($runtime.headPoseAuthorizationError) {
                     $failureState = 'head-pose-provider-authorization-failed'
                     $failureErrors.Add([string]$runtime.headPoseAuthorizationError)
+                }
+                elseif ($runtime.applicationHeadPose.PSObject.Properties['timedOut'] -and $runtime.applicationHeadPose.timedOut) {
+                    $failureState = 'application-pose-probe-timeout'
+                    $failureErrors.Add([string]$lastRuntimeProbeError)
+                    $failureErrors.Add('The independent application pose probe timed out; retained driver activation is not application-visible pose qualification.')
                 }
                 elseif ($runtime.active -and -not $runtime.headPoseReady) {
                     $failureState = 'head-pose-provider-not-ready'

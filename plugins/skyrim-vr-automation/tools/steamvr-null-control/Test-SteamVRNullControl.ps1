@@ -602,6 +602,14 @@ try {
     Assert-Test (Test-RuntimeAdmissionReceiptTiming -Admission $authorizationDeniedStart.data.admission -Receipt $authorizationDeniedReceipt) 'authorization rejection returns and persists one complete failure timeline'
 
     $runtimeReceiptPath = Join-Path $evidence 'steamvr-null-runtime.receipt.json'
+    $probeTimeout = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-application-probe-timeout -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
+    $probeTimeoutReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
+    Assert-LaunchedFailureEnvelope $probeTimeout 'application-pose-probe-timeout' 'application probe timeout retains the public failed-admission envelope' $probeTimeoutReceipt
+    Assert-Test ($probeTimeout.data.runtime.active -and -not $probeTimeout.data.runtime.headPoseReady -and -not $probeTimeout.data.runtime.controllersReady) 'partial driver activation does not qualify application head/controller presence'
+    Assert-Test ($probeTimeout.data.admission.runtimeProbeAttempts -eq 1 -and -not $probeTimeout.data.admission.runtimeConfirmationAttempted) 'a timed-out application probe is terminal without implicit replay or confirmation'
+    Assert-Test ($probeTimeout.data.runtime.applicationHeadPose.boundedProcess.attempts[0].stdout -ceq 'partial probe stdout' -and $probeTimeoutReceipt.runtime.applicationHeadPose.boundedProcess.attempts[0].stderr -ceq 'partial probe stderr') 'timeout bounded stdout/stderr survives both returned and persisted runtime evidence'
+    Assert-Test ($probeTimeout.data.startupCleanup.verified -and -not $probeTimeoutReceipt.runtimeAccepted -and $null -eq $probeTimeoutReceipt.acceptedUtc) 'application probe timeout performs exact-attempt cleanup and cannot publish accepted authority'
+    Assert-Test (([DateTimeOffset]$probeTimeout.data.admission.failureObservedUtc) -lt ([DateTimeOffset]$probeTimeout.data.admission.startupDeadlineUtc)) 'early probe timeout is distinct from exhaustion of the outer startup budget'
     Remove-Item -LiteralPath $runtimeReceiptPath -Force -ErrorAction SilentlyContinue
     $confirmationTimeout = & $entry start -SettingsPath $settingsPath -NullProfilePath $profilePath -SteamVRRoot $steamVrRoot -ServerLogPath $serverLogPath -OpenVRPathsPath $openVrPathsPath -EvidenceDirectory $evidence -InternalTestFailurePoint runtime-confirmation-timeout -StartupTimeoutSeconds 5 -Compact -NoExit | ConvertFrom-Json
     $confirmationReceipt = Get-Content -LiteralPath $runtimeReceiptPath -Raw | ConvertFrom-Json
