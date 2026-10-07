@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$FixtureRoot,[string]$EntryCaseFilter,[switch]$ConsoleDispatch)
+param([Parameter(Mandatory)][string]$FixtureRoot,[string]$EntryCaseFilter,[switch]$ConsoleDispatch,[switch]$ExpectExpiredCleanupEvidence)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 Import-Module (Join-Path $PSScriptRoot 'DevBenchControl.psm1') -Force
@@ -234,7 +234,10 @@ foreach($case in @('healthy','failed','pending','main-thread-unavailable','after
             $ids=@($calls|Where-Object kind -eq 'snapshot'|ForEach-Object commandId)
             Check ($ids.Count -eq 2 -and $ids[0] -cne $ids[1]) 'guard uses fresh non-replayed snapshot command IDs'
         }
-        if($case -cnotin @('skip-refused','wait-skip-refused','wait-target-refused','wait-listener-lost')) {Check ($reply.sessionCleanup.ok -and @($calls|Where-Object kind -eq 'delete').Count -eq 1) "$case closes one owned fixture MCP session"}
+        if($case -ceq 'wait-late' -and $ExpectExpiredCleanupEvidence){
+            Check (-not $reply.ok -and $reply.semantic.outcome -ceq 'wait-timeout' -and -not $reply.sessionCleanup.ok -and -not $reply.sessionCleanup.attempted -and $reply.sessionCleanup.indeterminate) 'late read retains explicit unverified cleanup without deadline extension'
+            Check (@($calls|Where-Object kind -eq 'delete').Count -eq 0 -and $reply.sessionCleanup.sessions.Count -eq 1 -and $reply.sessionCleanup.sessions[0].sessionId -ceq 'compiler-fixture' -and $reply.sessionCleanup.sessions[0].state -ceq 'not_attempted_deadline_exhausted' -and $reply.sessionCleanup.sessions[0].timeoutMilliseconds -eq 0) 'late cleanup starts no DELETE and binds exact expired session evidence'
+        }elseif($case -cnotin @('skip-refused','wait-skip-refused','wait-target-refused','wait-listener-lost')) {Check ($reply.sessionCleanup.ok -and @($calls|Where-Object kind -eq 'delete').Count -eq 1) "$case closes one owned fixture MCP session"}
         $reply|ConvertTo-Json -Depth 60|Set-Content -LiteralPath (Join-Path $fixture 'result.json')
     } finally {$listener.Stop();Stop-Job $server;Remove-Job $server}
 }
