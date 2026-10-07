@@ -92,4 +92,3 @@ function Assert-WorkspaceReconciliationBaseline($Workspace, $Baseline, [switch]$
             [long]$expected.files -ne [long]$observed.files -or [long]$expected.bytes -ne [long]$observed.bytes) { throw "Shared $kind baseline drifted during completed-output reconciliation." }
     }
 }
-
