@@ -125,6 +125,43 @@ try {
     Check-Reconciliation (-not $p.ok -and -not (Test-Path -LiteralPath $new.cachePlanPath) -and
         (Test-Path -LiteralPath $latePath)) 'late cache drift refuses fresh catalog preparation without destructive rebasing'
 } finally { Remove-Item -LiteralPath $latePath -Force }
+# Restart admission must not attribute later shared writes to the published plan.
+$prepareParameters=@{CatalogRoot=$catalogRoot;CachePath=$new.cachePath;ProfilePath=$r.data.modListPath;ModsPath=$mods;BindToOverwrite=$true;EvidenceDirectory=$new.cacheEvidenceDirectory;BuildId=$new.cachePrepareArguments.BuildId;ShaderCacheAbi=$new.cachePrepareArguments.ShaderCacheAbi;WorkspaceId=$r.data.workspaceId;OwnershipId=$r.data.ownershipId;OwnerMarkerPath=$new.ownerMarkerPath;OwnerMarkerSha256=$new.ownerMarkerSha256;ShaderSourceSha256=$shaderSourceSha256;RequireMaterializedOutput=$true;BlockingProcessNames='MO2WorkspaceImpossibleFixtureProcess';NoExit=$true;Confirm=$false}
+$interruptArguments=@('-NoProfile','-NonInteractive','-File',$catalogEntry,'prepare')
+foreach($key in $prepareParameters.Keys){
+    if($key -in @('NoExit','Confirm','BindToOverwrite','RequireMaterializedOutput')){continue}
+    $interruptArguments+=@(('-'+$key),[string]$prepareParameters[$key])
+}
+$interruptArguments+=@('-BindToOverwrite','-RequireMaterializedOutput','-NoExit','-Confirm:$false','-InternalTestFailurePoint','prepare-interrupt-after-snapshot-plan')
+$null=& $powerShell @interruptArguments
+Check-Reconciliation ($LASTEXITCODE -eq 93) 'public catalog stops immediately after snapshot-preserved plan publication'
+$retryPlan=Get-Content -LiteralPath $new.cachePlanPath -Raw | ConvertFrom-Json -Depth 40
+$retrySnapshot=[string]$retryPlan.transactionReceiptPath
+$planHash=(Get-FileHash -LiteralPath $new.cachePlanPath).Hash
+$snapshotHash=(Get-FileHash -LiteralPath $retrySnapshot).Hash
+$markerHash=(Get-FileHash -LiteralPath $new.ownerMarkerPath).Hash
+$providerHash=Get-TestProfileFingerprint $mods
+$shadowPath=Join-Path $new.cacheEvidenceDirectory 'shader-cache-provider-shadow.receipt.json'
+Check-Reconciliation ($retryPlan.state -ceq 'snapshot-preserved' -and -not (Test-Path -LiteralPath $shadowPath)) 'interruption retained snapshot plan before any provider materialization'
+[IO.File]::WriteAllText($latePath,'foreign-after-plan')
+$driftHash=Get-TestProfileFingerprint $new.cachePath
+$retry=& $catalogEntry prepare @prepareParameters | ConvertFrom-Json
+Check-Reconciliation (-not $retry.ok -and @($retry.errors | Where-Object {$_ -match 'snapshot-preserved.*baseline|reconciled.*baseline|changed after completed-output reconciliation'}).Count -eq 1) 'snapshot-preserved retry refuses post-plan shared-cache drift'
+Check-Reconciliation ((Get-FileHash -LiteralPath $new.cachePlanPath).Hash -ceq $planHash -and (Get-FileHash -LiteralPath $retrySnapshot).Hash -ceq $snapshotHash -and (Get-FileHash -LiteralPath $new.ownerMarkerPath).Hash -ceq $markerHash -and (Get-TestProfileFingerprint $new.cachePath) -ceq $driftHash -and (Get-TestProfileFingerprint $mods) -ceq $providerHash -and -not (Test-Path -LiteralPath $shadowPath)) 'retry drift refusal preserves plan snapshot owner foreign bytes and providers without prepared state'
+Remove-Item -LiteralPath $latePath -Force
+$snapshotBytes=[IO.File]::ReadAllBytes($retrySnapshot)
+foreach($field in @('cachePath','beforeTreeSha256','operation','transactionId')){
+    $tampered=Get-Content -LiteralPath $retrySnapshot -Raw | ConvertFrom-Json -Depth 40
+    $tampered.$field=if($field -eq 'cachePath'){Join-Path $fixture 'foreign-cache'}elseif($field -eq 'operation'){'seed'}elseif($field -eq 'transactionId'){''}else{'0'*64}
+    [IO.File]::WriteAllText($retrySnapshot,($tampered|ConvertTo-Json -Depth 40))
+    try{
+        $tamperedHash=(Get-FileHash -LiteralPath $retrySnapshot).Hash
+        $retry=& $catalogEntry prepare @prepareParameters | ConvertFrom-Json
+        Check-Reconciliation (-not $retry.ok -and (Get-FileHash -LiteralPath $new.cachePlanPath).Hash -ceq $planHash -and (Get-FileHash -LiteralPath $retrySnapshot).Hash -ceq $tamperedHash -and (Get-FileHash -LiteralPath $new.ownerMarkerPath).Hash -ceq $markerHash -and -not (Test-Path -LiteralPath $shadowPath)) "snapshot-preserved retry refuses and preserves tampered $field receipt"
+    }finally{[IO.File]::WriteAllBytes($retrySnapshot,$snapshotBytes)}
+}
+$retry=& $catalogEntry prepare @prepareParameters | ConvertFrom-Json
+Check-Reconciliation ($retry.ok -and $retry.data.task.state -ceq 'prepared' -and (Get-FileHash -LiteralPath $retrySnapshot).Hash -ceq $snapshotHash -and (Get-FileHash -LiteralPath $new.ownerMarkerPath).Hash -ceq $markerHash -and (Test-Path -LiteralPath $shadowPath)) 'same retained snapshot-preserved plan resumes successfully when baseline has no drift'
 Complete-RearmedTestOutput $r $accessId
 Check-Reconciliation ((Get-TestProfileFingerprint (Join-Path $mo2 'overwrite')) -ceq $humanHash -and
     (Get-TestProfileFingerprint $created.data.profilePath) -ceq $profileBefore -and
