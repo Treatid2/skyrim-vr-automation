@@ -177,7 +177,13 @@ a probe timeout during confirmation remains `runtime-confirmation-timeout`.
 The returned and nonaccepted persisted runtime observation retains the newest
 partial driver/log/shared-state evidence and the bounded process outcome,
 including available stdout/stderr, exit and process-tree cleanup facts. Unknown
-or undrained output remains unknown, not an empty successful observation. Failed
+or undrained output remains unknown, not an empty successful observation.
+Exactly one bounded attempt is required. Only a Boolean true
+`streamDrainComplete` permits output interpretation: an unverified drain is
+`stream-drain-incomplete`, and absent/non-text stdout is `output-unavailable`.
+`empty-output` requires a verified complete drain and empty/whitespace text.
+These terminal failures preserve null streams, never retry, and never confirm.
+Failed
 output parsing or post-probe continuity checks also retain the bounded outcome.
 Driver activation is not application-visible pose qualification. No automatic
 probe retry, larger budget or qualification waiver follows from this diagnosis.
