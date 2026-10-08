@@ -1210,13 +1210,23 @@ function Get-ApplicationHeadPose {
         $failureKind = 'bounded-process-failure'
         $probeAttempted = $true
         $bounded = & $boundedTool -FilePath $probePath -ArgumentList @('--require-controllers') -WorkingDirectory (Split-Path -Parent $probePath) -MaxAttempts 1 -TimeoutSeconds $probeTimeoutSeconds -TerminationGraceMilliseconds 100 -StreamDrainGraceMilliseconds 100 -NoExit -Compact | ConvertFrom-Json -Depth 30
-        $attempt = if (@($bounded.attempts).Count -gt 0) { $bounded.attempts[-1] } else { $null }
+        $failureKind = 'bounded-attempt-invalid'
+        $attempts = @($bounded.attempts)
+        if ($attempts.Count -ne 1 -or $null -eq $attempts[0]) { throw 'Independent OpenVR pose probe did not retain exactly one bounded attempt.' }
+        $attempt = $attempts[0]
         if ($attempt -and [bool]$attempt.timedOut) {
             $failureKind = 'timeout'
             throw [TimeoutException]::new("Independent OpenVR pose probe exceeded its $probeTimeoutSeconds-second share of the SteamVR readiness deadline.")
         }
+        # Undrained output is unknown, not evidence of an empty producer. Keep
+        # the complete bounded result unchanged, including null stdout/stderr.
+        $failureKind = 'stream-drain-incomplete'
+        $drain = $attempt.PSObject.Properties['streamDrainComplete']
+        if ($null -eq $drain -or $drain.Value -isnot [bool] -or -not $drain.Value) { throw "Independent OpenVR pose probe output is unavailable because stream drain was not verified complete. $($bounded.errors -join '; ')" }
+        $failureKind = 'output-unavailable'
+        if ($attempt.stdout -isnot [string]) { throw 'Independent OpenVR pose probe did not retain a complete stdout text stream.' }
         $failureKind = 'empty-output'
-        if ($null -eq $attempt -or [string]::IsNullOrWhiteSpace([string]$attempt.stdout)) { throw "Independent OpenVR pose probe produced no bounded output. $($bounded.errors -join '; ')" }
+        if ([string]::IsNullOrWhiteSpace($attempt.stdout)) { throw "Independent OpenVR pose probe produced no bounded output. $($bounded.errors -join '; ')" }
         $failureKind = 'malformed-output'
         $payload = [string]$attempt.stdout | ConvertFrom-Json -ErrorAction Stop
         $failureKind = 'bounded-process-failure'

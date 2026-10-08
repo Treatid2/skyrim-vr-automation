@@ -121,12 +121,13 @@ $count=@(Get-Content -LiteralPath $countPath).Count
 $case=Get-Content -LiteralPath (Join-Path $root 'case.txt') -Raw
 $payload=@{ok=$true;standing=@{connected=$true;valid=$true;position=@(0,1.68,0)};controllers=@{required=$true;valid=$true;leftIndex=1;rightIndex=2;neutralSamples=100;inputEvents=0}}
 $stdout=$payload|ConvertTo-Json -Depth 8 -Compress
-$ok=$true;$code=0;$timedOut=$false;$errors=@()
+$ok=$true;$code=0;$timedOut=$false;$errors=@();$drained=$true;$stderr='first native stderr'
 # Every first-failure case would succeed on a second call. This is intentional:
 # a faulty outer retry must make the public test fail by accepting the attempt.
 if($count -eq 1){
     switch($case){
         'empty' {$stdout=''}
+        'undrained' {$ok=$false;$drained=$false;$stdout=$null;$stderr=$null;$errors=@('synthetic stream drain incomplete')}
         'malformed' {$stdout='{not-json'}
         'exit' {$ok=$false;$code=23;$errors=@('synthetic native exit failure')}
         'timeout' {$ok=$false;$timedOut=$true;$stdout='partial native stdout'}
@@ -134,7 +135,7 @@ if($count -eq 1){
     }
 }
 if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation-invalid'}
-@{ok=$ok;errors=$errors;attempts=@(@{timedOut=$timedOut;stdout=$stdout;stderr='first native stderr';exitCode=$code;exitVerified=$true;jobQuiescent=$true;streamDrainComplete=$true})}|ConvertTo-Json -Depth 10 -Compress
+@{ok=$ok;errors=$errors;attempts=@(@{timedOut=$timedOut;stdout=$stdout;stderr=$stderr;exitCode=$code;exitVerified=$true;jobQuiescent=$true;streamDrainComplete=$drained})}|ConvertTo-Json -Depth 10 -Compress
 '@
     [IO.File]::WriteAllText((Join-Path $processRoot 'Invoke-BoundedProcess.ps1'),$boundedStub,[Text.UTF8Encoding]::new($false))
     # Process effects are mocked at their native API boundary. Production exact
@@ -157,8 +158,8 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
         $s=Get-Content -LiteralPath (Join-Path $SteamVRRoot 'launch.json') -Raw|ConvertFrom-Json
         if($s.live){[pscustomobject]@{Id=12345}}
     }
-    $kinds=@{empty='empty-output';malformed='malformed-output';'package-drift'='provider-package-drift';continuity='continuity-failed';exit='bounded-process-failure';timeout='timeout';unqualified='observation-unqualified';'confirmation-malformed'='malformed-output'}
-    foreach ($case in @('empty','malformed','package-drift','continuity','exit','timeout','unqualified','confirmation-malformed','success','delayed-provider')) {
+    $kinds=@{empty='empty-output';undrained='stream-drain-incomplete';malformed='malformed-output';'package-drift'='provider-package-drift';continuity='continuity-failed';exit='bounded-process-failure';timeout='timeout';unqualified='observation-unqualified';'confirmation-malformed'='malformed-output'}
+    foreach ($case in @('empty','undrained','malformed','package-drift','continuity','exit','timeout','unqualified','confirmation-malformed','success','delayed-provider')) {
         $caseRoot=Join-Path $fixture $case
         $script:currentSteamRoot=Join-Path $caseRoot 'SteamVR'
         $provider=Join-Path $caseRoot 'provider'
@@ -200,9 +201,14 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
             Assert-Startup ($application.timedOut -eq ($case -ceq 'timeout')) "$case accurate timeout flag"
             Assert-Startup (-not $result.data.runtime.headPoseReady -and -not $result.data.runtime.controllersReady -and -not $result.data.inputContract.measurementReady) "$case no qualification from activation"
             Assert-Startup (($application.boundedProcess|ConvertTo-Json -Depth 40 -Compress) -ceq ($receipt.runtime.applicationHeadPose.boundedProcess|ConvertTo-Json -Depth 40 -Compress)) "$case full bounded outcome byte-equivalent returned/persisted"
-            Assert-Startup ($application.boundedProcess.attempts[0].stderr -ceq 'first native stderr' -and $application.boundedProcess.attempts[0].exitVerified -and $application.boundedProcess.attempts[0].jobQuiescent) "$case stderr and native child cleanup retained"
-            $expectedStdout=switch($case){empty {''} malformed {'{not-json'} timeout {'partial native stdout'} 'confirmation-malformed' {'{confirmation-invalid'} default {$application.observation|ConvertTo-Json -Depth 8 -Compress}}
+            $expectedStderr=if($case -ceq 'undrained'){$null}else{'first native stderr'}
+            Assert-Startup ($application.boundedProcess.attempts[0].stderr -ceq $expectedStderr -and $application.boundedProcess.attempts[0].exitVerified -and $application.boundedProcess.attempts[0].jobQuiescent) "$case stderr and native child cleanup retained"
+            $expectedStdout=switch($case){empty {''} undrained {$null} malformed {'{not-json'} timeout {'partial native stdout'} 'confirmation-malformed' {'{confirmation-invalid'} default {$application.observation|ConvertTo-Json -Depth 8 -Compress}}
             Assert-Startup ($application.boundedProcess.attempts[0].stdout -ceq $expectedStdout) "$case exact first stdout retained"
+            if($case -ceq 'undrained'){
+                Assert-Startup (-not $application.boundedProcess.attempts[0].streamDrainComplete -and $null -eq $application.boundedProcess.attempts[0].stdout -and $null -eq $application.boundedProcess.attempts[0].stderr -and $null -eq $application.observation) 'unknown output is not empty or a parsed observation'
+                Assert-Startup ($application.failureKind -cne 'empty-output' -and $receipt.runtime.applicationHeadPose.failureKind -ceq 'stream-drain-incomplete' -and -not $receipt.runtimeConfirmationAttempted) 'unavailable output disposition persists without confirmation'
+            }
             Assert-Startup (-not [string]::IsNullOrWhiteSpace($application.error) -and $receipt.lastRuntimeProbeError -ceq $application.error -and $result.data.admission.lastRuntimeProbeError -ceq $application.error) "$case exact error retained in admission and receipt"
             Assert-Startup (-not $receipt.runtimeAccepted -and $null -eq $receipt.acceptedUtc -and $receipt.attemptId -ceq $result.data.runtimeAttemptId -and $result.data.runtimeReceiptPersisted) "$case failed attempt cannot publish accepted authority"
             Assert-Startup ($result.data.startupCleanup.verified -and @($result.data.startupCleanup.requested).Count -eq 1 -and $result.data.startupCleanup.requested[0].id -eq 12345 -and @($result.data.startupCleanup.remaining).Count -eq 0 -and @(Get-Content -LiteralPath (Join-Path $script:currentSteamRoot 'stopped.txt')).Count -eq 1) "$case actual exact-attempt cleanup dispatch/verification: $($result.data.startupCleanup|ConvertTo-Json -Depth 8 -Compress)"

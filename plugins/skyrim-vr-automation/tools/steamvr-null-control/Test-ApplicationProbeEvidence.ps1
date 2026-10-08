@@ -65,18 +65,39 @@ Get-NullRuntimeEvidence -Processes @($process) -Profile $profile -DeadlineUtc $d
     $harness=Join-Path $nullRoot 'harness.ps1'
     [IO.File]::WriteAllText($harness,($setup+"`n"+$definitions+"`n"+$run))
     [IO.File]::WriteAllText((Join-Path $fixture 'vrserver.txt'),'Synthetic log fixture, no live runtime.')
-    foreach($case in @('timeout','malformed','empty')){
-        $stdout=switch($case){timeout {'partial native progress'} malformed {'{not-json'} empty {''}}
-        $bounded=@{ok=$false;errors=@('test diagnostic');attempts=@(@{timedOut=($case -eq 'timeout');stdout=$stdout;stderr='retained native stderr';exitCode=99;exitVerified=$true;jobQuiescent=$true;streamDrainComplete=$true})}
+    foreach($case in @('timeout','malformed','empty','undrained')){
+        $stdout=switch($case){timeout {'partial native progress'} malformed {'{not-json'} empty {''} undrained {$null}}
+        $stderr=if($case -eq 'undrained'){$null}else{'retained native stderr'}
+        $bounded=@{ok=$false;errors=@('test diagnostic');attempts=@(@{timedOut=($case -eq 'timeout');stdout=$stdout;stderr=$stderr;exitCode=99;exitVerified=$true;jobQuiescent=$true;streamDrainComplete=($case -ne 'undrained')})}
         [IO.File]::WriteAllText((Join-Path $processRoot 'case.json'),($bounded|ConvertTo-Json -Depth 10 -Compress))
         $result=& $harness -Fixture $fixture | ConvertFrom-Json -Depth 50
         Assert-Evidence ($result.active -and $result.serverLogHashLength -eq 12500 -and $null -ne $result.driverLoaded -and $null -ne $result.activeHmd) "$case returns newest partial runtime/log observation"
         Assert-Evidence (-not $result.headPoseReady -and -not $result.controllersReady -and -not $result.applicationHeadPose.qualified) "$case cannot qualify head/controllers"
-        Assert-Evidence ($result.applicationHeadPose.boundedProcess.attempts[0].stdout -ceq $stdout -and $result.applicationHeadPose.boundedProcess.attempts[0].stderr -ceq 'retained native stderr') "$case preserves exact bounded stdout/stderr"
+        Assert-Evidence ($result.applicationHeadPose.boundedProcess.attempts[0].stdout -ceq $stdout -and $result.applicationHeadPose.boundedProcess.attempts[0].stderr -ceq $stderr) "$case preserves exact bounded stdout/stderr"
         Assert-Evidence ($result.applicationHeadPose.boundedProcess.attempts[0].exitVerified -and $result.applicationHeadPose.boundedProcess.attempts[0].jobQuiescent) "$case preserves child cleanup outcome"
         Assert-Evidence ($result.applicationHeadPose.timedOut -eq ($case -eq 'timeout') -and -not [string]::IsNullOrWhiteSpace($result.applicationHeadPose.error)) "$case has accurate timeout flag and error"
-        $kind=switch($case){timeout {'timeout'} malformed {'malformed-output'} empty {'empty-output'}}
+        $kind=switch($case){timeout {'timeout'} malformed {'malformed-output'} empty {'empty-output'} undrained {'stream-drain-incomplete'}}
         Assert-Evidence ($result.applicationHeadPose.probeAttempted -and $result.applicationHeadPose.terminalFailure -and $result.applicationHeadPose.failureKind -ceq $kind) "$case is an explicitly terminal admitted failure"
+        if($case -eq 'undrained'){
+            Assert-Evidence (-not $result.applicationHeadPose.boundedProcess.attempts[0].streamDrainComplete -and $null -eq $result.applicationHeadPose.boundedProcess.attempts[0].stdout -and $null -eq $result.applicationHeadPose.boundedProcess.attempts[0].stderr) 'undrained output remains unknown, not empty'
+            Assert-Evidence (($result.applicationHeadPose.boundedProcess|ConvertTo-Json -Depth 10 -Compress) -ceq (($bounded|ConvertTo-Json -Depth 10 -Compress|ConvertFrom-Json)|ConvertTo-Json -Depth 10 -Compress)) 'undrained complete bounded evidence is unchanged'
+        }
+    }
+    foreach($shape in @('missing-drain','string-drain','no-attempt','multiple-attempts','null-drained-stdout')){
+        $attempt=@{timedOut=$false;stdout='';stderr='shape diagnostic';exitCode=0;streamDrainComplete=$true}
+        $bounded=@{ok=$false;errors=@('shape diagnostic');attempts=@($attempt)}
+        $expectedKind='stream-drain-incomplete'
+        switch($shape){
+            'missing-drain' {$attempt.Remove('streamDrainComplete')}
+            'string-drain' {$attempt.streamDrainComplete='true'}
+            'no-attempt' {$bounded.attempts=@();$expectedKind='bounded-attempt-invalid'}
+            'multiple-attempts' {$bounded.attempts=@($attempt,$attempt);$expectedKind='bounded-attempt-invalid'}
+            'null-drained-stdout' {$attempt.stdout=$null;$expectedKind='output-unavailable'}
+        }
+        [IO.File]::WriteAllText((Join-Path $processRoot 'case.json'),($bounded|ConvertTo-Json -Depth 10 -Compress))
+        $result=& $harness -Fixture $fixture|ConvertFrom-Json -Depth 50
+        Assert-Evidence ($result.applicationHeadPose.terminalFailure -and $result.applicationHeadPose.failureKind -ceq $expectedKind -and -not $result.headPoseReady) "$shape cannot manufacture known empty output or qualification"
+        Assert-Evidence (($result.applicationHeadPose.boundedProcess|ConvertTo-Json -Depth 10 -Compress) -ceq (($bounded|ConvertTo-Json -Depth 10 -Compress|ConvertFrom-Json)|ConvertTo-Json -Depth 10 -Compress)) "$shape retains exact bounded evidence"
     }
     $expired=& $harness -Fixture $fixture -Expired | ConvertFrom-Json -Depth 50
     Assert-Evidence ($expired.applicationHeadPose.timedOut -and $null -eq $expired.applicationHeadPose.boundedProcess -and -not $expired.headPoseReady) 'insufficient outer budget retains explicit unexecuted/unknown probe outcome'
@@ -88,7 +109,7 @@ Get-NullRuntimeEvidence -Processes @($process) -Profile $profile -DeadlineUtc $d
     $missing=& $harness -Fixture $fixture | ConvertFrom-Json -Depth 50
     Assert-Evidence (-not $missing.applicationHeadPose.probeAttempted -and $missing.applicationHeadPose.terminalFailure -and $missing.applicationHeadPose.failureKind -ceq 'probe-unavailable') 'admitted missing probe is terminal without a native dispatch'
     Assert-Evidence ($null -eq $missing.applicationHeadPose.boundedProcess -and -not $missing.headPoseReady) 'missing probe does not manufacture a bounded outcome'
-    Assert-Evidence (@(Get-Content -LiteralPath (Join-Path $processRoot 'dispatch-count.txt')).Count -eq 3) 'one dispatch per tested outcome and no dispatch after deadline'
+    Assert-Evidence (@(Get-Content -LiteralPath (Join-Path $processRoot 'dispatch-count.txt')).Count -eq 9) 'one dispatch per tested outcome and no dispatch after deadline'
     @{ok=$true;passed=$passed;liveRuntimeUsed=$false}|ConvertTo-Json -Compress
 }
 finally {
