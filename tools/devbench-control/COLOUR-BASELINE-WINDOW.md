@@ -67,6 +67,15 @@ are unverified/indeterminate, never Calendar restoration proof. Partial
 measurement and custody evidence remain in the result. A404 means only that the
 session is absent, not that Calendar or probe state was restored.
 
+On both success and exception paths, the operation outcome is first retained
+in memory. The original MCP sessions are closed before any terminal journal
+I/O; then exactly one terminal journal combines outcome and session cleanup.
+Pre-dispatch intent journals remain unchanged. `finalJournalAttempted` is set
+only at actual write-action admission, not by a preceding timestamp sample;
+`finalJournalDisposition` distinguishes skipped, failed, timely and late writes.
+A write that starts before the deadline but finishes after it is retained as
+late evidence with `evidenceJournalFinalized=false`, without replay.
+
 The terminal journal is not started after the original deadline. If that
 allowance is exhausted, the controller returns already retained in-memory
 evidence with an explicit unfinalized-journal warning rather than starting new
