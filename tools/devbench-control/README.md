@@ -11,6 +11,9 @@ budget includes service-owned cleanup; partial coverage is not scientific PASS.
 It reserves the final3s within that budget for fractional-deadline MCP session
 closure and terminal journal/in-memory output. Expired closure/journal admission
 is explicit and unverified, not a new timeout. See the baseline guide for the
+close-first ordering: outcome retained in memory, original sessions closed,
+then one terminal journal containing outcome and cleanup, including exceptions.
+The attempt flag records actual write admission; late writes remain unfinalized.
 cooperative local-I/O boundary and separately retained restoration proofs.
 
 ## Typed finite colour measurement

@@ -240,7 +240,7 @@ function Initialize-InvocationEvidence {
 }
 
 function Update-InvocationEvidence {
-    param([Parameter(Mandatory)][string]$State, $Semantic = $null, $Data = $null, [string[]]$Errors = @())
+    param([Parameter(Mandatory)][string]$State, $Semantic = $null, $Data = $null, [string[]]$Errors = @(), [switch]$InMemoryOnly)
     if ($null -eq $script:invocationRecord -or [string]::IsNullOrWhiteSpace($script:invocationEvidencePath)) { return }
     $script:invocationRecord.state = $State
     $script:invocationRecord.endpoint = $endpoint
@@ -255,7 +255,7 @@ function Update-InvocationEvidence {
     $script:invocationRecord.errors = @($Errors)
     if ($State -eq 'dispatching') { $script:invocationRecord.dispatchIntentUtc = [DateTime]::UtcNow.ToString('o') }
     if ($State -in @('completed', 'failed', 'guard-rejected', 'indeterminate')) { $script:invocationRecord.completedUtc = [DateTime]::UtcNow.ToString('o') }
-    Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord
+    if (-not $InMemoryOnly) { Write-JsonAtomic -Path $script:invocationEvidencePath -Value $script:invocationRecord }
 }
 
 function Write-TerminalInvocationEvidence {
@@ -267,12 +267,23 @@ function Write-TerminalInvocationEvidence {
 
     try {
         if ($finalizationReserveMilliseconds -gt 0 -and [DateTime]::UtcNow -ge $totalInvocationDeadlineUtc) {
+            if ($Result.PSObject.Properties['finalization']) { $Result.finalization.finalJournalDisposition = 'not-attempted-deadline-exhausted' }
             throw [TimeoutException]::new('Original total invocation deadline exhausted; no new terminal journal I/O was attempted. Retained in-memory evidence remains available in the result.')
         }
+        if ($Result.PSObject.Properties['finalization']) {
+            $Result.finalization.finalJournalAttempted = $true
+            $Result.finalization.finalJournalDisposition = 'attempted'
+        }
         & $WriteAction | Out-Null
+        if ($finalizationReserveMilliseconds -gt 0 -and [DateTime]::UtcNow -ge $totalInvocationDeadlineUtc) {
+            $Result.finalization.finalJournalDisposition = 'written-after-deadline'
+            throw [TimeoutException]::new('Admitted terminal journal completed after the original total deadline; its retained bytes are late evidence, not timely finalization. No replay or new allowance is admitted.')
+        }
+        if ($Result.PSObject.Properties['finalization']) { $Result.finalization.finalJournalDisposition = 'written-within-deadline' }
         return $true
     }
     catch {
+        if ($Result.PSObject.Properties['finalization'] -and $Result.finalization.finalJournalDisposition -ceq 'attempted') { $Result.finalization.finalJournalDisposition = 'write-failed' }
         $journalError = "$FailurePrefix`: $($_.Exception.Message)"
         $existingWarnings = if ($Result.PSObject.Properties['evidenceWarnings']) { @($Result.evidenceWarnings) } else { @() }
         $Result | Add-Member -NotePropertyName evidenceWarnings -NotePropertyValue @($existingWarnings + $journalError) -Force
@@ -1638,8 +1649,15 @@ try {
     }
     $guardedProperty = $semantic.PSObject.Properties['guarded']
     $completionState = if ($guardedProperty -and [bool]$guardedProperty.Value -and -not $semantic.ok) { 'guard-rejected' } else { 'completed' }
-    $null = Write-TerminalInvocationEvidence -Result $result -FailurePrefix 'Completed invocation evidence could not be journaled' -WriteAction {
-        Update-InvocationEvidence -State $completionState -Semantic $semantic -Data $data -Errors @($result.errors)
+    if ($finalizationReserveMilliseconds -gt 0) {
+        # Preserve outcome in memory; terminal I/O must not consume the original
+        # MCP session's reserved close interval. Dispatch-intent I/O is unchanged.
+        Update-InvocationEvidence -State $completionState -Semantic $semantic -Data $data -Errors @($result.errors) -InMemoryOnly
+    }
+    else {
+        $null = Write-TerminalInvocationEvidence -Result $result -FailurePrefix 'Completed invocation evidence could not be journaled' -WriteAction {
+            Update-InvocationEvidence -State $completionState -Semantic $semantic -Data $data -Errors @($result.errors)
+        }
     }
 }
 catch {
@@ -1649,8 +1667,7 @@ catch {
     $outcomeIndeterminate = [bool]($indeterminateMutation -or ((-not $readOnlyCall) -and $dispatch.dispatchReached -and -not $dispatch.acceptedDataRetained -and -not $dispatch.semanticRejected))
     if ($invocationRecord -and $invocationRecord.state -ne 'guard-rejected') {
         try {
-            if ($finalizationReserveMilliseconds -gt 0 -and [DateTime]::UtcNow -ge $totalInvocationDeadlineUtc) { throw 'Original total deadline exhausted; failure journal I/O not attempted.' }
-            Update-InvocationEvidence -State $(if ($outcomeIndeterminate) { 'indeterminate' } else { 'failed' }) -Semantic $semantic -Data $data -Errors @($failureMessage)
+            Update-InvocationEvidence -State $(if ($outcomeIndeterminate) { 'indeterminate' } else { 'failed' }) -Semantic $semantic -Data $data -Errors @($failureMessage) -InMemoryOnly:($finalizationReserveMilliseconds -gt 0)
         } catch { $failureMessage = "$failureMessage Evidence update also failed: $($_.Exception.Message)" }
     }
     $result = [pscustomobject][ordered]@{
@@ -1688,6 +1705,7 @@ if ($finalizationReserveMilliseconds -gt 0) {
         calendarDeadlineUtc = $totalInvocationDeadlineUtc.AddMilliseconds(-$finalizationReserveMilliseconds).ToString('o')
         sessionClosureVerified = [bool]$sessionCleanup.ok
         finalJournalAttempted = $false
+        finalJournalDisposition = 'not-attempted-no-journal'
         serializationSource = 'retained-in-memory-result'
         localIoDeadlineMode = 'cooperative-admission-and-postcondition'
     })
@@ -1698,9 +1716,14 @@ if ($finalizationReserveMilliseconds -gt 0) {
     }
 }
 if ($invocationRecord -and -not [string]::IsNullOrWhiteSpace($invocationEvidencePath)) {
-    if ($finalizationReserveMilliseconds -gt 0) { $result.finalization.finalJournalAttempted = [DateTime]::UtcNow -lt $totalInvocationDeadlineUtc }
+    # Ownership windows perform their one terminal write only after close.
+    # Attempt evidence is set inside the helper after its deadline admission.
     $finalEvidenceWritten = Write-TerminalInvocationEvidence -Result $result -FailurePrefix 'Session cleanup evidence could not be journaled' -WriteAction {
         $invocationRecord['sessionCleanup'] = $sessionCleanup
+        if ($finalizationReserveMilliseconds -gt 0) {
+            $invocationRecord.errors = @($result.errors)
+            $invocationRecord['finalization'] = $result.finalization
+        }
         Write-JsonAtomic -Path $invocationEvidencePath -Value $invocationRecord
     }
     if ($finalEvidenceWritten) {
