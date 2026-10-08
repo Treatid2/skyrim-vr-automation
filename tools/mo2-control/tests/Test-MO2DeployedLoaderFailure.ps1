@@ -47,6 +47,15 @@ $result=& $module {
  Check ($null -eq (Get-MO2LaunchRootBinaryMapping -Config $cfg -Entry $entry -Profile 'Fixture Profile')) 'relative destination refused'
  $entry.workingDirectory=$sourceRoot
  Check ($null -eq (Get-MO2LaunchRootBinaryMapping -Config $cfg -Entry $entry -Profile 'Fixture Profile')) 'mod source directory is not a deployed destination'
+ $modsRootLoader=Join-Path $mods 'sksevr_loader.exe'
+ [IO.File]::WriteAllBytes($modsRootLoader,[byte[]](1,2,3,4))
+ foreach($destination in @($mods,($mods+'\'),$mods.ToUpperInvariant())){
+  $entry.workingDirectory=$destination
+  Check ($null -eq (Get-MO2LaunchRootBinaryMapping -Config $cfg -Entry $entry -Profile 'Fixture Profile')) 'exact mods root, including trailing separator and case variants, is not an outside-mods deployment'
+  $refusedBoundary=New-MO2LaunchLogBoundary -Config $cfg -Validation $validation -AttemptId $attempt -Profile 'Fixture Profile' -Executable 'Fixture SKSE' -ArgumentLine 'fixture' -RetainedOwner $true
+  Check ($null -eq $refusedBoundary.rootBinaryMapping) 'pre-dispatch boundary retains unavailable mods-root deployment mapping'
+  Check ($null -eq (Get-MO2LaunchBinaryBinding -Boundary $refusedBoundary -ObservedBinary $modsRootLoader)) 'equal bytes at exact mods root cannot acquire detailed deployed-loader qualification'
+ }
  $entry.workingDirectory=$game
  $originalSource=$entry.binary;$entry.binary=$deployed
  Check ($null -eq (Get-MO2LaunchRootBinaryMapping -Config $cfg -Entry $entry -Profile 'Fixture Profile')) 'unmanaged binary not upgraded to root mapping'
@@ -81,6 +90,16 @@ $result=& $module {
   $failure=Get-MO2LaunchFailureEvidence -Config $cfg -Owned $owned -MO2Processes @($owner) -GameProcesses @()
   Check ($null -ne $failure -and $failure.win32ErrorCode -eq 5 -and $failure.cause -ceq 'unassigned') 'classify current-attempt deployed denial without assigning mechanism'
   Check ($failure.binary -ceq $deployed -and $failure.registeredBinary -ceq $binary -and $failure.windowStableAtVerification) 'failure retains source/deployed binding and stable log proof'
+  $retainedLog=[IO.File]::ReadAllBytes($log);$retainedBoundary=$owned.data.launchLogBoundary
+  try{
+   foreach($destination in @($mods,($mods+'\'),$mods.ToUpperInvariant())){
+    $entry.workingDirectory=$destination
+    [IO.File]::WriteAllText($log,'baseline')
+    $owned.data.launchLogBoundary=New-MO2LaunchLogBoundary -Config $cfg -Validation $validation -AttemptId $attempt -Profile 'Fixture Profile' -Executable 'Fixture SKSE' -ArgumentLine 'fixture' -RetainedOwner $true
+    [IO.File]::AppendAllText($log,"`r`n[$stamp E] Error 5 ERROR_ACCESS_DENIED: denied (0x5)`r`n[$stamp E]  . binary: '$modsRootLoader'`r`n")
+    Check ($null -eq (Get-MO2LaunchFailureEvidence -Config $cfg -Owned $owned -MO2Processes @($owner) -GameProcesses @())) 'real detailed classifier refuses exact mods-root equal-byte deployment'
+   }
+  }finally{$entry.workingDirectory=$game;$owned.data.launchLogBoundary=$retainedBoundary;[IO.File]::WriteAllBytes($log,$retainedLog)}
   [IO.File]::WriteAllBytes($deployed,[byte[]](4,3,2,1))
   Check ($null -eq (Get-MO2LaunchFailureEvidence -Config $cfg -Owned $owned -MO2Processes @($owner) -GameProcesses @())) 'real classifier refuses wrong deployed content'
   Set-Item Function:script:Get-MO2OwnedSession {$script:deployedOwned}
