@@ -29,7 +29,7 @@ function Test-DesktopUIRestoreValueEquivalent($Expected, $Actual) {
         $match = [regex]::Match(($number | ConvertTo-Json -Compress), '\A(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?\z')
         if (-not $match.Success) { return $false }
         $digits = ($match.Groups[2].Value + $match.Groups[3].Value).TrimStart('0')
-        if ($digits.Length -eq 0) { '0@0'; continue }
+        if ($digits.Length -eq 0) { $match.Groups[1].Value + '0@0'; continue }
         $exponent = if ($match.Groups[4].Success) { [long]::Parse($match.Groups[4].Value, [Globalization.CultureInfo]::InvariantCulture) } else { [long]0 }
         $exponent -= $match.Groups[3].Value.Length
         $coefficient = $digits.TrimEnd('0'); $exponent += $digits.Length - $coefficient.Length
@@ -40,7 +40,9 @@ function Test-DesktopUIRestoreValueEquivalent($Expected, $Actual) {
 
 function Assert-DesktopUIRestoreJsonElement($Element) {
     if ($Element.ValueKind -eq [Text.Json.JsonValueKind]::Object) {
-        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        # PowerShell ordered dictionaries can collapse case aliases. Reject
+        # them before projection instead of silently losing an additional key.
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($property in $Element.EnumerateObject()) {
             if (-not $seen.Add($property.Name)) { throw "Duplicate JSON key in DesktopUI restore input: $($property.Name)" }
             Assert-DesktopUIRestoreJsonElement $property.Value
@@ -67,7 +69,9 @@ function Get-DesktopUIRestoreExactValue($Element) {
             $match = [regex]::Match($Element.GetRawText(), '\A(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?\z')
             if (-not $match.Success) { throw 'Malformed JSON number.' }
             $digits = ($match.Groups[2].Value + $match.Groups[3].Value).TrimStart('0')
-            if ($digits.Length -eq 0) { return [pscustomobject]@{numericIdentity='0@0'} }
+            # Integer -0 loses its sign in PowerShell's numeric projection.
+            # Preserve the raw sign before any CLR/binary64 comparison.
+            if ($digits.Length -eq 0) { return [pscustomobject]@{numericIdentity=($match.Groups[1].Value + '0@0')} }
             $exponent = if ($match.Groups[4].Success) { [long]::Parse($match.Groups[4].Value, [Globalization.CultureInfo]::InvariantCulture) } else { [long]0 }
             $exponent -= $match.Groups[3].Value.Length
             $coefficient = $digits.TrimEnd('0'); $exponent += $digits.Length - $coefficient.Length
@@ -94,6 +98,33 @@ function Read-DesktopUIRestoreInput([string]$Path) {
         jsonText = $text; exactValue = $exactValue
         sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
     }
+}
+
+function Test-DesktopUIRestoreControlledValueEquivalent($Expected, $Actual, $ExpectedExact, $ActualExact) {
+    # JSON has one number kind: 90.0 -> 90 and 0.0 -> 0 are formatting,
+    # not a CLR-type schema change. Establish exact decimal equality first;
+    # integer-only schemas (power timeout) are checked by the caller separately.
+    if (Test-DesktopUIRestoreValueEquivalent $ExpectedExact $ActualExact) {
+        if ($Expected -is [double] -or $Actual -is [double]) {
+            $expectedBitsValue = [double]$Expected; $actualBitsValue = [double]$Actual
+            return [double]::IsFinite($expectedBitsValue) -and [double]::IsFinite($actualBitsValue) -and
+                [BitConverter]::DoubleToInt64Bits($expectedBitsValue) -eq [BitConverter]::DoubleToInt64Bits($actualBitsValue)
+        }
+        return Test-DesktopUIRestoreValueEquivalent $Expected $Actual
+    }
+    # Only a profile-owned floating leaf may use a runtime's canonical G17
+    # binary64 spelling. This is not a tolerance or generic decimal coercion:
+    # arbitrary extra precision (even hidden by Double parsing) still refuses.
+    if ($Expected -is [double] -or $Actual -is [double]) {
+        if ($Expected -isnot [double] -or $Actual -isnot [double] -or
+            -not [double]::IsFinite($Expected) -or -not [double]::IsFinite($Actual) -or
+            [BitConverter]::DoubleToInt64Bits($Expected) -ne [BitConverter]::DoubleToInt64Bits($Actual)) { return $false }
+        $canonical = [Text.Json.JsonDocument]::Parse($Expected.ToString('G17', [Globalization.CultureInfo]::InvariantCulture))
+        try { return Test-DesktopUIRestoreValueEquivalent (Get-DesktopUIRestoreExactValue $canonical.RootElement) $ActualExact }
+        finally { $canonical.Dispose() }
+    }
+    return (Test-DesktopUIRestoreValueEquivalent $Expected $Actual) -and
+        (Test-DesktopUIRestoreValueEquivalent $ExpectedExact $ActualExact)
 }
 
 function Get-DesktopUIRestoreStrings($Document) {
@@ -166,6 +197,8 @@ function Get-DesktopUISettingsRestorePlan($Receipt, [string]$BackupPath, [string
     $baseline = Read-DesktopUIRestoreInput $BackupPath
     if ($baseline.sha256 -cne [string]$Receipt['settingsSha256Before']) { throw 'DesktopUI restore baseline hash differs from apply receipt.' }
     $nullExpectation = Get-NullSettingsExpectation -Receipt $Receipt -BackupPath $BackupPath
+    $profileInput = Read-DesktopUIRestoreInput $nullExpectation.profilePath
+    if ($profileInput.sha256 -cne [string]$Receipt['profileSha256']) { throw 'DesktopUI restore profile hash differs from apply receipt.' }
     $current = Read-DesktopUIRestoreInput $CurrentPath
     $nullStrings = Get-DesktopUIRestoreStrings $nullExpectation.value
     $baselineStrings = Get-DesktopUIRestoreStrings $baseline.value
@@ -175,7 +208,7 @@ function Get-DesktopUISettingsRestorePlan($Receipt, [string]$BackupPath, [string
         $section, $key = $path -split '[.]', 2
         if ($section -cnotin @($current.value.Keys) -or $current.value[$section] -isnot [Collections.IDictionary] -or
             $key -cnotin @($current.value[$section].Keys) -or
-            -not (Test-DesktopUIRestoreValueEquivalent $nullExpectation.profile[$section][$key] $current.value[$section][$key])) {
+            -not (Test-DesktopUIRestoreControlledValueEquivalent $profileInput.value[$section][$key] $current.value[$section][$key] $profileInput.exactValue[$section][$key] $current.exactValue[$section][$key])) {
             throw "DesktopUI restore refuses controlled-key drift: $path"
         }
         if ($path -ceq 'power.turnOffControllersTimeout' -and
@@ -186,6 +219,13 @@ function Get-DesktopUISettingsRestorePlan($Receipt, [string]$BackupPath, [string
     $expectedDocument = [Text.Json.JsonDocument]::Parse(($nullExpectation.value | ConvertTo-Json -Depth 64 -Compress))
     try { $expectedExactValue = Get-DesktopUIRestoreExactValue $expectedDocument.RootElement }
     finally { $expectedDocument.Dispose() }
+    # Reconcile only already-admitted exact owned leaves with the whole-document
+    # projection. Never discard the containing section: its aliases/extra keys
+    # and every unowned raw numeric identity remain part of the strict check.
+    foreach ($path in @($nullExpectation.controlledPaths)) {
+        $section, $key = $path -split '[.]', 2
+        $current.exactValue[$section][$key] = $expectedExactValue[$section][$key]
+    }
     if (-not (Test-DesktopUIRestoreValueEquivalent (Get-DesktopUIRestoreProjection $expectedExactValue) (Get-DesktopUIRestoreProjection $current.exactValue))) {
         throw 'DesktopUI restore refuses other unclassified drift (including dotted-key or case aliases).'
     }
