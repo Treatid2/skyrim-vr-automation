@@ -52,7 +52,15 @@
   changes. Any profile drift, active RootBuilder deployment, extra MO2 process,
   modal/Unlock state, or other ambiguity returns to close/recover-close.
 - The human code word `Lease` means acquire human access bound to MO2's exact
-  selected profile and return its public lease identity. `Release` means remove
+  selected profile and restore the receipt-bound normal physical-headset route
+  before reporting the environment ready for human use. Null-HMD is shared
+  SteamVR state, not a profile mod to disable. Use existing bounded stop/restore
+  controls; require game/loader and SteamVR closed for the transition, preserve
+  the profile/workspaces and matching human lease, and refuse unknown baseline,
+  drift or foreign ownership. Do not force-close the game, stop Virtual Desktop,
+  hand-edit settings or infer headset readiness from lease acquisition alone.
+  Follow the human headset handoff section in `tools/mo2-control/MO2-RUNBOOK.md`.
+  Return the public lease identity. `Release` means remove
   only that human coordination lease; do not close MO2, Skyrim, or another
   application as part of Release.
 - Dump Management has standing content authority to install, update, configure,
