@@ -5463,6 +5463,9 @@ function Invoke-MO2Status {
     if ($launchFailure) {
         $null = Set-MO2LaunchFailureEvidence -Config $Config -Owned $owned -Failure $launchFailure
         $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
+        # The immutable receipt may predate this recovery parse. Return the
+        # committed evidence, including its original observation time.
+        $launchFailure = $owned.data.launchFailure
     }
     elseif ($owned -and [string]$owned.data.status -ceq 'launch-failed' -and $owned.data.PSObject.Properties['launchFailure'] -and
         [string]$owned.data.launchFailure.attemptId -ceq [string]$owned.data.launchAttemptId) { $launchFailure = $owned.data.launchFailure }

@@ -1,8 +1,8 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$FixtureRoot)
+param([Parameter(Mandatory)][string]$FixtureRoot,[string]$ModulePath=(Join-Path $PSScriptRoot '../MO2Control.psm1'))
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
-Import-Module (Join-Path $PSScriptRoot '../MO2Control.psm1') -Force
+Import-Module $ModulePath -Force
 $module=Get-Module MO2Control
 $root=Join-Path $FixtureRoot ('launch-receipt-recovery-'+[guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory((Join-Path $root 'logs'))|Out-Null
@@ -64,8 +64,15 @@ $results=& $module {
   $manifest=ConvertFrom-MO2JsonText (Get-Content -LiteralPath (Join-Path $durable.data.sessionPath 'session.json') -Raw)
   $out.recovered=-not $status.ok -and $status.state -ceq 'launch-failed' -and $durable.data.generation -eq 4 -and $manifest.generation -eq 4
   $out.immutableReuse=(Get-FileHash -LiteralPath $receiptPath).Hash -ceq $receiptHash -and $durable.data.launchFailure.observedUtc -ceq $first.observedUtc
-  $null=Status 'interrupted'
+  $canonicalReceipt=ConvertTo-MO2LaunchEvidenceCanonicalValue $first | ConvertTo-Json -Depth 20 -Compress
+  $canonicalPublic=ConvertTo-MO2LaunchEvidenceCanonicalValue $status.data.controller.launchFailure | ConvertTo-Json -Depth 20 -Compress
+  $canonicalDurable=ConvertTo-MO2LaunchEvidenceCanonicalValue $durable.data.launchFailure | ConvertTo-Json -Depth 20 -Compress
+  $out.firstPublicEvidenceIdentity=$canonicalPublic -ceq $canonicalReceipt -and $canonicalPublic -ceq $canonicalDurable
+  $out.firstPublicOriginalTime=$status.data.controller.launchFailure.observedUtc -ceq $first.observedUtc
+  $out.firstPublicReceiptIdentity=$status.data.controller.launchFailureReceiptPath -ceq $receiptPath -and (Get-FileHash -LiteralPath $receiptPath).Hash -ceq $receiptHash
+  $repeat=Status 'interrupted'
   $out.repeatNoCommit=(Get-MO2OwnedSession -Config $cfg -SessionId 'interrupted').data.generation -eq 4
+  $out.repeatPublicEvidenceIdentity=(ConvertTo-MO2LaunchEvidenceCanonicalValue $repeat.data.controller.launchFailure | ConvertTo-Json -Depth 20 -Compress) -ceq $canonicalPublic -and (Get-FileHash -LiteralPath $receiptPath).Hash -ceq $receiptHash
   foreach($field in @('sessionId','attemptId','binary','win32ErrorCode','message','windowSha256','byteOffset','byteLength','logFileIdentity','commandHeaderText','observedUtc','owner','logBoundary','extra')){
    $owned=New-Fixture ('conflict-'+$field);$failure=Capture $owned
    $path=Join-Path $owned.data.sessionPath ('mo2-launch-failure.'+$owned.data.launchAttemptId+'.json')
