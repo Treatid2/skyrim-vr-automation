@@ -1,9 +1,17 @@
 # DevBench Control
 
+For captured-exec window IDs, immutable guarded reads and loss/truncation
+admission, see [CONSOLE-WINDOWS.md](CONSOLE-WINDOWS.md). This qualifies evidence,
+not the command's desired game effect; never replay an uncertain capture.
+
 `Invoke-DevBenchControl.ps1` lists and calls the MCP tools exposed by a running
 CSX DevBench server. Supply runtime metadata with `-RuntimePath` or set
 `CSX_DEVBENCH_RUNTIME_PATH`; no machine-specific path is compiled into the
 client.
+
+For source-bound native colour-probe sample addressing, see
+[COLOUR-PROBE-COORDINATES.md](COLOUR-PROBE-COORDINATES.md). Sample pixels are
+crop-local; source texture origins do not belong in staging byte offsets.
 
 ```powershell
 .\Invoke-DevBenchControl.ps1 list -RuntimePath 'C:\Path\To\runtime.json'

@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([string]$FixtureDriverPackagePath)
 
 Set-StrictMode -Version Latest
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -96,6 +96,10 @@ try {
     [IO.File]::WriteAllText((Join-Path $headPoseDriverRoot '.csx-vr-automation-driver.json'), '{"schemaVersion":1,"driverName":"codex_head_pose"}')
     $headEntry = Join-Path $PSScriptRoot '..\steamvr-head-pose-control\Invoke-SteamVRHeadPoseControl.ps1'
     $fixtureBundle = Join-Path $PSScriptRoot '..\..\drivers\codex_head_pose'
+    if ($FixtureDriverPackagePath) {
+        $fixtureBundle = [IO.Path]::GetFullPath($FixtureDriverPackagePath)
+        $PSDefaultParameterValues['Invoke-SteamVRNullControl.ps1:HeadPoseExpectedProvenanceSha256'] = (Get-FileHash -LiteralPath (Join-Path $fixtureBundle 'build-provenance.json') -Algorithm SHA256).Hash
+    }
     # Actual install transaction; no vrpathreg execution because this exact
     # temporary root is already registered. Mask only named SteamVR queries.
     function Get-Process {
