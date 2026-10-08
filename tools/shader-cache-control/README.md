@@ -144,6 +144,34 @@ different. With no match it safely leaves the current tree in use; add
 Repeating `prepare` with the same immutable cache, evidence, and catalog
 identities reconciles and returns the existing prepared plan.
 
+Fresh `prepared` and `already-prepared` responses provide the bounded four-field
+`data.task.completionArguments` parameter object: `Command=complete`, exact
+`CatalogRoot`, `CachePath` and `EvidenceDirectory`. Retain and forward that object
+across execution hosts instead of re-resolving environment/configuration defaults.
+Its paths come from the admitted plan; catalogue provenance remains in
+`data.storage` and the durable plan's `catalog`. Dry-run and failed preparation
+do not provide completion authority. The object does not select a working-set
+status, grant promotion, replace a lease, or waive closed-state/owner/restore
+checks. An explicitly wrong root continues to fail before cache restoration.
+
+For a parsed JSON receipt, convert the parameter object to a PowerShell hashtable
+before splatting; do not interpolate it into a shell command:
+
+```powershell
+$completionParameters = @{}
+foreach ($property in $prepareReceipt.data.task.completionArguments.PSObject.Properties) {
+    $completionParameters[$property.Name] = $property.Value
+}
+$completionParameters.WorkingSetStatus = 'unverified' # classify this exact run
+$completionParameters.Confirm = $false
+& $catalogController @completionParameters
+```
+
+Here `$catalogController` is the exact supported controller path selected for
+that workflow. Native `-File` wrappers must forward the same explicit three
+paths plus the `complete` command as separate arguments. Ambient defaults are
+conveniences for initial selection, not cross-host completion identities.
+
 ### Opt-in same-task preserved working-cache resume
 
 To resume a completed **unverified** working cache from the same retained MO2
