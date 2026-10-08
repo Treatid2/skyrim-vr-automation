@@ -2,6 +2,7 @@
 
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'ConsoleExecutionEvidence.ps1')
+. (Join-Path $PSScriptRoot 'SceneLightReadEvidence.ps1')
 
 function Get-DevBenchSemanticStatus {
     [CmdletBinding()]
@@ -160,6 +161,7 @@ function Test-DevBenchReadOnlyRequest {
     if ($ToolName -ceq 'console') { return @(Get-DevBenchConsoleReadRequestReasons $Arguments).Count -eq 0 }
     $action = if ($Arguments.Contains('action')) { [string]$Arguments['action'] } else { '' }
     $kind = if ($Arguments.Contains('kind')) { [string]$Arguments['kind'] } else { '' }
+    if ($ToolName -ceq 'inspect' -and $kind -ceq 'lights') { return Test-DevBenchSceneLightRequest $Arguments }
     if ($ToolName -eq 'inspect') {
         return $kind -in @('state', 'health', 'vm', 'scene', 'mods', 'player', 'inventory', 'quests', 'effects', 'refs', 'registrants', 'screenshots', 'extensions')
     }
@@ -177,6 +179,9 @@ function Get-DevBenchCallSemanticStatus {
         [AllowEmptyCollection()][object[]]$Content
     )
 
+    if ($ToolName -ceq 'inspect' -and $Arguments.Contains('kind') -and $Arguments.kind -is [string] -and $Arguments.kind -ceq 'lights') {
+        return Get-DevBenchSceneLightStatus -Arguments $Arguments -Content $Content
+    }
     if ($ToolName -ceq 'console' -and $Arguments.Contains('action') -and $Arguments.action -is [string] -and $Arguments.action -ceq 'exec' -and $Arguments.Contains('capture') -and ($Arguments.capture -isnot [bool] -or $Arguments.capture)) {
         return Get-DevBenchConsoleExecutionStatus -Arguments $Arguments -Content $Content
     }
