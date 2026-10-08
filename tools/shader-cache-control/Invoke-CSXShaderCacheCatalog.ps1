@@ -65,6 +65,8 @@ param(
     [int]$MaxInventoryDepth = 24,
     [ValidateRange(1, 3600)]
     [int]$InventoryTimeoutSeconds = 120,
+    [ValidateSet('', 'prepare-interrupt-after-snapshot-plan')]
+    [string]$InternalTestFailurePoint = '',
     [switch]$NoExit,
     [switch]$IncludeInventoryEntries,
     [switch]$Compact
@@ -1277,6 +1279,27 @@ function Prepare-TaskCache($Storage) {
              [string]$cacheResolution.binding.ownerMarkerSha256 -cne [string]$existingBinding.ownerMarkerSha256)) {
             throw 'Existing task cache plan belongs to a different workspace owner.'
         }
+        if ([string]$existingPlan.state -ceq 'snapshot-preserved') {
+            # Snapshot releases its target lock before the durable plan is published.
+            # Re-admit the original baseline on restart, never later shared writes.
+            $baselineHash = Assert-Hash ([string]$existingPlan.beforeTreeSha256) 'Snapshot-preserved baseline'
+            $snapshotPath = Join-Path $evidence 'shader-cache-transaction.receipt.json'
+            if (-not (Test-SamePath ([string]$existingPlan.transactionReceiptPath) $snapshotPath) -or
+                -not (Test-Path -LiteralPath $snapshotPath -PathType Leaf)) {
+                throw 'Snapshot-preserved plan lacks its exact canonical snapshot receipt.'
+            }
+            Assert-CSXNoCacheReparsePoint -Path $snapshotPath -Purpose 'Snapshot-preserved receipt'
+            $snapshotReceipt = Get-Content -LiteralPath $snapshotPath -Raw | ConvertFrom-Json -Depth 30
+            if ($null -eq $snapshotReceipt -or -not (Test-Property $snapshotReceipt 'beforeTreeSha256') -or
+                [string]$snapshotReceipt.beforeTreeSha256 -ine $baselineHash) {
+                throw 'Snapshot-preserved receipt no longer binds the exact plan baseline.'
+            }
+            # Existing verify validates snapshot operation/transaction/path/parent/
+            # leaf and preserved bytes, then checks the current live tree. No writes.
+            try { $null = Invoke-Transaction 'verify' @{ CachePath = $resolvedCache; EvidenceDirectory = $evidence } }
+            catch { throw "Snapshot-preserved cache baseline readmission failed: $($_.Exception.Message)" }
+            Assert-OverwriteOwnerBinding $existingBinding -RequireReconciledBaseline
+        }
     }
     $selection = if ($null -ne $existingPlan) { $existingPlan.selection } else { Select-CatalogSnapshot $Storage }
     if ($RequireMatch -and $null -eq $selection.selected) { throw 'No compatible known-working shader-cache snapshot matched the task request.' }
@@ -1323,6 +1346,7 @@ function Prepare-TaskCache($Storage) {
     if ($null -eq $existingPlan) {
         Assert-OverwriteOwnerBinding $cacheResolution.binding
         Write-JsonAtomic $planPath $plan -RefuseExisting
+        if ($InternalTestFailurePoint -ceq 'prepare-interrupt-after-snapshot-plan') { [Environment]::Exit(93) }
     }
     if ($null -ne $seedSource) {
         if ([string]$seedSource.treeSha256 -ieq [string]$snapshot.data.inventory.treeSha256) {

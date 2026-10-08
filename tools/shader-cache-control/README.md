@@ -144,6 +144,14 @@ different. With no match it safely leaves the current tree in use; add
 Repeating `prepare` with the same immutable cache, evidence, and catalog
 identities reconciles and returns the existing prepared plan.
 
+A retry from the earlier `snapshot-preserved` boundary must first revalidate
+the canonical snapshot receipt, its preserved physical baseline and the current
+cache against the plan's `beforeTreeSha256`. A reconciled Overwrite owner also
+requires that same live tree to match its retained reconciled baseline. Any
+drift refuses before seeding, provider shadowing or plan advancement, preserving
+the plan, receipt, owner and changed cache for recovery; retry does not rebase
+the generation. A no-drift retry continues the original preparation.
+
 ### Opt-in same-task preserved working-cache resume
 
 To resume a completed **unverified** working cache from the same retained MO2
