@@ -216,6 +216,56 @@ prove an application bypassing SteamVR is attached to it.
 
 Run `Test-SteamVRNullControl.ps1` after changing the control contract.
 
+## Resuming a retained environment under a new access lease
+
+Releasing MO2 access preserves the task workspace; it does not transfer the
+shared null-HMD transaction. A committed apply is bound to its recorded lease,
+profile, provider inventory, exact receipt/profile backups and target journal.
+Reacquiring access for the same task/profile produces a new lease. That does
+not make the old apply eligible for `start`: lease drift is deliberately
+rejected, and `apply` reporting `already-applied` is not a rebind operation.
+There is no supported journal edit or blind restart shortcut.
+
+Auto-Tools owns the shared cleanup/restoration handoff. Calling tasks retain
+their intended environment and evidence; they are not required to undo their
+profile changes or reconstruct shared baseline state. For an authorised resume:
+
+1. Identify the exact retained task workspace and old transaction/evidence
+   directory. Acquire the new `SteamVRNull` lease and validate the exact task
+   profile with the closed-state `runtime-route-provider` gate. Keep Skyrim,
+   its loader and MO2 closed during the runtime transition; verify SteamVR-root
+   processes stopped through the supported controller. Do not stop another
+   owner's live experiment or steal its lease.
+2. Inspect the authoritative transaction and retained receipts. If the prior
+   restore is already committed, retain its verified result and do not replay
+   that restore. Otherwise preview `restore -EvidenceDirectory <old-evidence>
+   -WhatIf`, then restore that exact prior apply through its receipt-bound
+   backup/profile and verify the returned baseline/restoration proof.
+3. Apply into a fresh evidence directory with the new exact `-MO2AccessId`
+   and `-MO2Profile`, selecting the independently qualified provider package.
+   Retain the fresh transaction and public route proof. Start with those same
+   identities only after apply succeeds; require current independent
+   application-facing head/controller qualification before preparing MO2.
+
+Unclassified settings/registration drift requires investigation after refusal;
+it is not permission to replace journals, broaden restore ownership, select
+`-Standalone` for Skyrim, or retry with a newly accepted hash.
+
+Some integrated controller versions expose the separately implemented
+`-PreserveDesktopUIWindowState` restore option. Use it only when that exact
+controller advertises it and the human has explicitly selected preservation
+of the two string leaves `DesktopUI.pairing` and
+`DesktopUI.settings_desktop`. Take a fresh exact preview and preimage;
+commit with its `-ExpectedCurrentSettingsSha256` and retain the selected-result
+receipt. It is not general DesktopUI/drift tolerance. A controller without the
+option must fail closed on such drift; do not pass undocumented flags or edit
+settings by hand. A changed preimage or refused preview requires classification,
+not a silent new-hash retry.
+
+This lifecycle guidance authorises no runtime action by itself. Preserve
+completed restoration receipts, task-local profile/mod/cache state and the
+current runtime owner's authority when the workflow is held.
+
 ## Explicit preservation of two DesktopUI strings
 
 Ordinary restore still restores the exact original backup and refuses unrelated
@@ -252,6 +302,18 @@ for this option is bounded to 1 MiB with duplicate keys refused.
 Untouched baseline values are copied as raw JSON, including full-precision
 numbers. Drift comparison uses exact decimal coefficient/exponent identities
 from the current raw JSON, so changes hidden by floating-point parsing refuse.
+For receipt-profile-owned floating-point leaves only, the exact declared decimal
+or the finite binary64 value's canonical invariant `G17` runtime spelling is
+accepted, with identical binary64 bits required. JSON numbers with exactly equal
+normalized decimal identities admit integer/decimal formatting such as `90.0`
+to `90` and `0.0` to `0`; their PowerShell CLR types need not match. The explicitly
+integer-schema power timeout still refuses floating-point representations. For
+example, profile `1.68` and runtime `1.6799999999999999` are the same controlled
+eye height. This is not a tolerance: changed bits (including signed zero), type
+changes to a non-number kind and arbitrary extra precision still refuse. The whole-document check
+uses that same admitted owned-leaf result; unowned values and additional keys
+retain strict raw-decimal, type, case and structure comparison. Numeric settings
+are restored from the baseline, not preserved as additional selected UI leaves.
 
 Staging verifies the accepted preimage and selected result hashes again before
 dispatch. Failure after mutation rolls back to the exact accepted live bytes,

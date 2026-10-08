@@ -13,16 +13,37 @@ function Assert-Test([bool]$Condition, [string]$Name) {
 }
 function Hash([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
 function Write-Settings($Value) { [IO.File]::WriteAllText($settings, ($Value | ConvertTo-Json -Depth 64), [Text.UTF8Encoding]::new($false)) }
+function Set-NumericLiteral([string]$Json, [string]$Key, [string]$Literal) {
+    $pattern = '("' + [regex]::Escape($Key) + '"\s*:\s*)-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?'
+    if ([regex]::Matches($Json, $pattern).Count -ne 1) { throw "Numeric fixture must select exactly one leaf: $Key" }
+    return [regex]::Replace($Json, $pattern, { param($m) $m.Groups[1].Value + $Literal }.GetNewClosure())
+}
 function Invoke-Control([string]$Command, [hashtable]$Options = @{}) {
     $lines = & $entry $Command @common @Options -Compact -NoExit
     return ($lines -join [Environment]::NewLine) | ConvertFrom-Json -Depth 64
 }
 function Assert-Refusal([string]$Name, [hashtable]$Options = @{PreserveDesktopUIWindowState=$true;WhatIf=$true}) {
-    $before = Hash $settings; $beforeJournal = Hash $journal
+    $before = Hash $settings; $beforeJournal = Hash $journal; $beforeOpenVR = Hash $openvr
+    $beforeEvidence = @(Get-ChildItem -LiteralPath $evidence -File -Recurse | Sort-Object FullName | ForEach-Object { $_.FullName + '|' + (Hash $_.FullName) }) -join "`n"
     $result = Invoke-Control restore $Options
-    Assert-Test (-not $result.ok -and (Hash $settings) -ceq $before -and (Hash $journal) -ceq $beforeJournal) $Name
+    $afterEvidence = @(Get-ChildItem -LiteralPath $evidence -File -Recurse | Sort-Object FullName | ForEach-Object { $_.FullName + '|' + (Hash $_.FullName) }) -join "`n"
+    Assert-Test (-not $result.ok -and (Hash $settings) -ceq $before -and (Hash $journal) -ceq $beforeJournal -and (Hash $openvr) -ceq $beforeOpenVR -and $beforeEvidence -ceq $afterEvidence) $Name
 }
 try {
+    . (Join-Path $PSScriptRoot 'DesktopUIRestore.ps1')
+    $positiveZero=[Text.Json.JsonDocument]::Parse('0.0')
+    try {
+        $expectedExact=Get-DesktopUIRestoreExactValue $positiveZero.RootElement
+        foreach($literal in @('0','0.0','0e0','0.0000','0E+5','-0','-0.0','-0e0','-0.0000','-0E+5')){
+            $actualDoc=[Text.Json.JsonDocument]::Parse($literal)
+            try {
+                $actualExact=Get-DesktopUIRestoreExactValue $actualDoc.RootElement
+                $actual=$literal|ConvertFrom-Json
+                $equivalent=Test-DesktopUIRestoreControlledValueEquivalent ([double]0.0) $actual $expectedExact $actualExact
+                Assert-Test ($equivalent -eq (-not $literal.StartsWith('-'))) ("module controlled zero spelling: "+$literal)
+            } finally { $actualDoc.Dispose() }
+        }
+    } finally { $positiveZero.Dispose() }
     [IO.Directory]::CreateDirectory($fixture) | Out-Null
     $settings = Join-Path $fixture 'steamvr.vrsettings'
     $openvr = Join-Path $fixture 'openvrpaths.vrpath'
@@ -45,7 +66,7 @@ try {
     Write-Settings ([ordered]@{
         steamvr=[ordered]@{enableHomeApp=$true}
         DesktopUI=[ordered]@{pairing='891,465,800,600,0';settings_desktop='1349,529,800,600,1';other='retained'}
-        unrelated=[ordered]@{flag=$false;large=9007199254740992L;value=7}
+        unrelated=[ordered]@{flag=$false;large=9007199254740992L;value=7;unownedFloat=1.68}
     })
     $baselineText=[IO.File]::ReadAllText($settings).Replace('"value": 7','"value": 7, "precise": 1.123456789012345678901234567890')
     [IO.File]::WriteAllText($settings,$baselineText,[Text.UTF8Encoding]::new($false))
@@ -63,6 +84,29 @@ try {
     $applied.LastKnown=@{runtime='updated'}
     $applied.dashboard.lastAccessedExternalOverlayKey='history'
     Write-Settings $applied
+    $runtimeJson = Set-NumericLiteral ([IO.File]::ReadAllText($settings)) 'eyeHeightMeters' '1.6799999999999999'
+    # Exercise the complete real profile at once, not just the first refusal:
+    # SteamVR writes six integral-valued floating leaves as integer spellings.
+    foreach ($leaf in @('displayFrequency','positionX','positionZ','yawDegrees','pitchDegrees','rollDegrees')) {
+        $literal = if ($leaf -eq 'displayFrequency') { '90' } else { '0' }
+        $runtimeJson = Set-NumericLiteral $runtimeJson $leaf $literal
+    }
+    $controlledCount = 0
+    foreach ($section in @('steamvr','dashboard','driver_null','driver_codex_head_pose','TrackingOverrides','power')) {
+        $controlledCount += $profileValue[$section].Count
+    }
+    $runtimeValues = $runtimeJson | ConvertFrom-Json -AsHashtable
+    Assert-Test ($controlledCount -eq 29 -and $profileValue.driver_null.displayFrequency -is [double] -and
+        $runtimeValues.driver_null.displayFrequency -is [long] -and
+        @('positionX','positionZ','yawDegrees','pitchDegrees','rollDegrees').Where({
+            $profileValue.driver_codex_head_pose[$_] -is [double] -and $runtimeValues.driver_codex_head_pose[$_] -is [long]
+        }).Count -eq 5) 'full29 owned-leaf fixture includes all six realistic integral-number runtime spellings together'
+    [IO.File]::WriteAllText($settings, $runtimeJson, [Text.UTF8Encoding]::new($false))
+    $profileEye = $profileValue.driver_codex_head_pose.eyeHeightMeters
+    $runtimeEye = ($runtimeJson | ConvertFrom-Json -AsHashtable).driver_codex_head_pose.eyeHeightMeters
+    Assert-Test ($profileEye -is [double] -and $runtimeEye -is [double] -and
+        [BitConverter]::DoubleToInt64Bits($profileEye) -eq [BitConverter]::DoubleToInt64Bits($runtimeEye) -and
+        $runtimeJson -match '1\.6799999999999999') 'realistic runtime eye-height serialization retains exact profile binary64 bits'
     $admittedBytes=[IO.File]::ReadAllBytes($settings)
     $admittedHash=Hash $settings
     Assert-Refusal 'default restore continues refusing DesktopUI drift' @{WhatIf=$true}
@@ -89,6 +133,8 @@ try {
         @{name='literal dotted child';edit={param($d) $d.DesktopUI['pairing.extra']='forged'}}
         @{name='controlled Boolean numeric alias';edit={param($d) $d.steamvr.requireHmd=0}}
         @{name='controlled value drift';edit={param($d) $d.driver_null.renderWidth=100}}
+        @{name='controlled case alias alongside owned leaf';edit={param($d) $d.driver_codex_head_pose['EyeHeightMeters']=$d.driver_codex_head_pose.eyeHeightMeters}}
+        @{name='controlled dotted alias alongside owned leaf';edit={param($d) $d.driver_codex_head_pose['eyeHeightMeters.extra']=1.68}}
         @{name='other Boolean numeric alias';edit={param($d) $d.unrelated.flag=0}}
         @{name='large integer drift';edit={param($d) $d.unrelated.large=9007199254740993L}}
         @{name='power numeric kind';edit={param($d) $d.power.turnOffControllersTimeout=0.0}}
@@ -101,6 +147,29 @@ try {
         Assert-Refusal ("refuses "+$case.name)
     }
     $raw=[Text.Encoding]::UTF8.GetString($admittedBytes)
+    foreach($literal in @('0','0.0','0e0','0.0000','0E+5','-0','-0.0','-0e0','-0.0000','-0E+5')){
+        [IO.File]::WriteAllText($settings,(Set-NumericLiteral $raw 'positionX' $literal),[Text.UTF8Encoding]::new($false))
+        if($literal.StartsWith('-')){
+            Assert-Refusal ("preview refuses negative-zero "+$literal)
+            Assert-Refusal ("commit refuses negative-zero "+$literal) @{PreserveDesktopUIWindowState=$true;ExpectedCurrentSettingsSha256=(Hash $settings)}
+        } else {
+            $positiveHash=Hash $settings
+            $positivePreview=Invoke-Control restore @{PreserveDesktopUIWindowState=$true;WhatIf=$true}
+            Assert-Test ($positivePreview.ok -and $positivePreview.state -ceq 'dry-run' -and (Hash $settings) -ceq $positiveHash) ("preview accepts positive-zero "+$literal)
+        }
+    }
+    foreach ($numericCase in @(
+        @{key='eyeHeightMeters';literal='1.6800000000000002';name='changed controlled binary64 bits'}
+        @{key='eyeHeightMeters';literal='1.68000000000000001';name='noncanonical controlled decimal hidden by Double parsing'}
+        @{key='positionX';literal='-0.0';name='controlled signed-zero bit change'}
+        @{key='unownedFloat';literal='1.6799999999999999';name='unowned canonical binary64 reserialization'}
+        @{key='displayFrequency';literal='"90"';name='controlled JSON number replaced by string'}
+        @{key='displayFrequency';literal='false';name='controlled JSON number replaced by Boolean'}
+        @{key='displayFrequency';literal='null';name='controlled JSON number replaced by null'}
+    )) {
+        [IO.File]::WriteAllText($settings, (Set-NumericLiteral $raw $numericCase.key $numericCase.literal))
+        Assert-Refusal ('refuses ' + $numericCase.name)
+    }
     [IO.File]::WriteAllText($settings,$raw.Replace('"value": 7','"value": 7.00000000000000000001'))
     Assert-Refusal 'refuses decimal drift hidden by PowerShell floating-point parsing'
     $controlledRaw=$raw.Replace('"displayFrequency": 90.0','"displayFrequency": 90.00000000000000000001')
