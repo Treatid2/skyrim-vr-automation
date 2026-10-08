@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 [CmdletBinding()]
-param([switch]$DiscoveryOnly, [switch]$RequalificationOnly, [switch]$UnchangedCompletionOnly, [string]$FixtureRoot)
+param([switch]$DiscoveryOnly, [switch]$RequalificationOnly, [switch]$UnchangedCompletionOnly, [switch]$CompletedReconciliationOnly, [string]$FixtureRoot)
 
 $ErrorActionPreference = 'Stop'
 $entry = Join-Path (Split-Path -Parent $PSScriptRoot) 'Invoke-MO2WorkspaceControl.ps1'
@@ -336,6 +336,10 @@ try {
         return
     }
     $cachePlanPath = [string]$created.data.runtimeOutput.cachePlanPath
+    if ($CompletedReconciliationOnly) {
+        . (Join-Path $PSScriptRoot 'Test-CompletedReconciliation.inc.ps1')
+        return
+    }
     if ($UnchangedCompletionOnly) {
         . (Join-Path $PSScriptRoot 'Test-UnchangedCacheCompletion.inc.ps1')
         return

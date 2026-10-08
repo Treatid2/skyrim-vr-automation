@@ -10,7 +10,7 @@ function Read-WorkspaceCacheProofJson([string]$Path, [string[]]$Fields) {
     return $value
 }
 
-function Assert-WorkspaceUnchangedFailedCacheCompletion($Workspace, $Plan, $Completion) {
+function Assert-WorkspaceUnchangedFailedCacheCompletion($Workspace, $Plan, $Completion, [switch]$HistoricalOnly) {
     # Cleanup evidence is not generated/known-working output. Reconstruct its
     # proof from the exact physical snapshot, committed restore and journal;
     # never trust the additive receipt flag alone or repair missing evidence.
@@ -91,6 +91,7 @@ function Assert-WorkspaceUnchangedFailedCacheCompletion($Workspace, $Plan, $Comp
     }
     # Before marker release the restored tree must exist. After complete-output
     # the existing caller additionally enforces absent task-created paths.
+    if ($HistoricalOnly) { return }
     if (Test-Path -LiteralPath ([string]$output.cachePath) -PathType Container) {
         $live = Get-WorkspaceOutputInventory -Path ([string]$output.cachePath) -Purpose 'Unchanged failed shader-cache restored baseline proof'
         if (-not (Test-WorkspaceSha256Equal ([string]$live.treeSha256) $beforeHash)) { throw 'Shader-cache restored original baseline changed.' }
