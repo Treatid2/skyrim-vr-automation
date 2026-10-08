@@ -5183,7 +5183,9 @@ function Get-MO2LaunchRootBinaryMapping {
         if (-not $registered.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { return $null }
         if (-not $Entry.PSObject.Properties['workingDirectory'] -or -not [IO.Path]::IsPathFullyQualified([string]$Entry.workingDirectory)) { return $null }
         $destinationRoot = [IO.Path]::GetFullPath([string]$Entry.workingDirectory).TrimEnd('\')
-        if ($destinationRoot.StartsWith([string]$owner.modsRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { return $null }
+        $modsRoot = [IO.Path]::GetFullPath([string]$owner.modsRoot).TrimEnd('\')
+        if ([string]::Equals($destinationRoot, $modsRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            $destinationRoot.StartsWith($modsRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { return $null }
         Assert-MO2ControllerPhysicalPath -Path $destinationRoot
         $relative = [IO.Path]::GetRelativePath($root, $registered)
         $deployed = [IO.Path]::GetFullPath((Join-Path $destinationRoot $relative))
