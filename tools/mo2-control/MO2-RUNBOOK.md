@@ -455,6 +455,26 @@ If `stop-game` cannot close a launch-recorded game process, preview and run
 identities recorded by that launch, retains MO2, invokes only exact `Unlock`,
 and withholds success until RootBuilder removes `BuildData.json`.
 
+Acceptance is not closure or cleanup proof. The session retains the original
+accepted result, exact targets and unresolved reconciliation before inspecting
+post-request state. Structured `game-terminate-incomplete` and
+`rootbuilder-recovery-pending`, as well as reporting failures, retain independent
+`gameStopVerified`, `cleanupVerified`, `receiptPublished` and
+`reconciliationPersisted` facts with `recoveryRequired` and `noAutomaticRetry`.
+An absent/unavailable stream of evidence must not become a clean-state claim.
+
+A subsequent `terminate-game` on that unresolved session returns
+`game-termination-recovery-required` with the retained original outcome and
+`newTerminationDispatched:false`, even if the game has since disappeared. It
+does not terminate again, invoke Unlock again, claim `game-already-stopped`, or
+rewrite the original outcome. Use the separately authorised normal exact-session
+closure/recovery route and verify its postconditions. Older accepted requests
+without detailed reconciliation are also held rather than silently upgraded.
+Only verified game closure, exact retained MO2/RootBuilder restoration and
+successful terminal receipt plus reconciliation publication resolve this
+termination transaction. A publication failure never erases independently
+verified cleanup, but still withholds complete success.
+
 `coc APStartCell` is not a New Game action. A `FreshGame` baseline requires a
 genuine Skyrim initialization route; until one is automated, classify it as an
 attended or unsupported step rather than substituting COC.
