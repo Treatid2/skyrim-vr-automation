@@ -80,7 +80,7 @@ $script:requestTimeoutSecondsForRpc = $RequestTimeoutSeconds
 
 function Get-ShaderCompilerGuard {
     param([object[]]$Tools,[hashtable]$Headers,$Identity)
-    $guard=[pscustomobject][ordered]@{admissible=$false; state='READ_UNAVAILABLE'; health=$null; reply=$null; arguments=$null; reasons=@()}
+    $guard=[pscustomobject][ordered]@{admissible=$false; state='READ_UNAVAILABLE'; health=$null; reply=$null; arguments=$null; transportFailure=$null; reasons=@()}
     try {
         if ($null -eq $Identity -or -not $Identity.complete -or -not $Identity.verified) { throw 'Compiler admission requires complete verified current runtime/artifact identity.' }
         $matches=@($Tools | Where-Object name -CEQ 'communityshaders.shader_api')
@@ -89,7 +89,9 @@ function Get-ShaderCompilerGuard {
         if ($schema.properties.contractMajor.const -ne 1 -or $schema.properties.contractMajor.type -cne 'integer' -or $schema.properties.action.type -cne 'string' -or 'snapshot' -cnotin @($schema.properties.action.enum) -or @($schema.required).Count -ne 4 -or @($schema.required | Where-Object { $_ -cnotin @('contractMajor','clientId','commandId','action') }).Count -gt 0 -or $schema.properties.clientId.type -cne 'string' -or $schema.properties.commandId.type -cne 'string') { throw 'toolSchemaUnresolved: current shader snapshot input schema is unsupported.' }
         $argsMap=@{contractMajor=1;clientId='auto-tools-compiler-admission';commandId=[guid]::NewGuid().ToString('N');action='snapshot';expectedBuildId=[string]$Identity.build.buildId}
         $guard.arguments=$argsMap
-        $guard.reply=Invoke-ToolRpc -Name 'communityshaders.shader_api' -Arguments $argsMap -Headers $Headers -RetainShaderSnapshotToolError
+        # A bracket qualifies the first observation, never a recovered transport read.
+        # Readiness waits may make separately identified fresh observations afterwards.
+        $guard.reply=Invoke-ToolRpc -Name 'communityshaders.shader_api' -Arguments $argsMap -Headers $Headers -RetainShaderSnapshotToolError -SingleAttempt
         if ($guard.reply.rawResult.PSObject.Properties['isError'] -and ($guard.reply.rawResult.isError -isnot [bool] -or $guard.reply.rawResult.isError)) { throw 'Decoded MCP compiler snapshot error retained; no native counters accepted.' }
         $guard.health=Get-DevBenchShaderCompilerHealth -Arguments $argsMap -Content @($guard.reply.content)
         $guard.state=$guard.health.state
@@ -101,6 +103,7 @@ function Get-ShaderCompilerGuard {
         if ($age -lt -5 -or $age -gt 10) { throw 'Compiler snapshot is stale or future-dated; no current-health admission.' }
         $guard.admissible=$guard.health.admissible
     } catch {
+        if ($_.Exception.Data.Contains('DevBenchBoundaryReadFailure')) { $guard.transportFailure=$_.Exception.Data['DevBenchBoundaryReadFailure'] }
         $guard.admissible=$false; $guard.reasons=@($guard.reasons)+$_.Exception.Message
     }
     return $guard
@@ -118,10 +121,14 @@ function Get-DevBenchDispatchProvenance($InvocationRecord, $Data, $Semantic) {
     $responseDataRetained = [bool]($dispatchReached -and $null -ne $Data)
     $semanticKnown = [bool]($Semantic -and $Semantic.PSObject.Properties['known'] -and [bool]$Semantic.known)
     $semanticAccepted = [bool]($semanticKnown -and $Semantic.PSObject.Properties['ok'] -and [bool]$Semantic.ok)
+    $acceptedDispatchRetained = [bool]($Data -and $Data.PSObject.Properties['dispatchEvidence'] -and
+        $Data.dispatchEvidence -is [pscustomobject] -and $Data.dispatchEvidence.PSObject.Properties['accepted'] -and
+        $Data.dispatchEvidence.accepted -is [bool] -and $Data.dispatchEvidence.accepted -and
+        $Data.dispatchEvidence.completionBasis -ceq 'dispatch-only')
     return [pscustomobject][ordered]@{
         dispatchReached = $dispatchReached
         responseDataRetained = $responseDataRetained
-        acceptedDataRetained = [bool]($responseDataRetained -and $semanticAccepted)
+        acceptedDataRetained = [bool]($responseDataRetained -and ($semanticAccepted -or $acceptedDispatchRetained))
         semanticRejected = [bool]($responseDataRetained -and $semanticKnown -and -not $semanticAccepted)
     }
 }
@@ -418,7 +425,7 @@ function Get-McpSessionHeaderValue {
 }
 
 function Invoke-McpRequest {
-    param([string]$Endpoint, [hashtable]$Headers, $Payload, [switch]$Mutation)
+    param([string]$Endpoint, [hashtable]$Headers, $Payload, [switch]$Mutation, [switch]$SingleAttempt)
     $body = $Payload | ConvertTo-Json -Depth 30 -Compress
     $attempt = 0
     $delay = [Math]::Max(50, $PollMilliseconds)
@@ -457,6 +464,16 @@ function Invoke-McpRequest {
                 $indeterminate.Data['DevBenchIndeterminateMutation'] = $true
                 throw $indeterminate
             }
+            if ($SingleAttempt) {
+                $failure=[pscustomobject][ordered]@{
+                    attempt=$attempt; statusCode=$statusCode; delayMilliseconds=0
+                    recovery='not-retried-boundary-read'; transport='mcp'
+                    message=$_.Exception.Message; timestampUtc=[DateTime]::UtcNow.ToString('o')
+                }
+                $transportRetries.Add($failure)
+                $_.Exception.Data['DevBenchBoundaryReadFailure']=$failure
+                throw
+            }
             if ($Command -eq 'wait' -and $statusCode -eq 404 -and $Headers.ContainsKey('Mcp-Session-Id')) {
                 $transportRetries.Add([pscustomobject][ordered]@{
                     attempt = $attempt; statusCode = $statusCode; delayMilliseconds = 0
@@ -479,10 +496,10 @@ function Invoke-McpRequest {
 }
 
 function Invoke-ToolRpc {
-    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation, [switch]$RetainShaderSnapshotToolError)
+    param([string]$Name, [hashtable]$Arguments, [hashtable]$Headers, [switch]$Mutation, [switch]$RetainShaderSnapshotToolError, [switch]$SingleAttempt)
     if ($RetainShaderSnapshotToolError -and ($Name -cne 'communityshaders.shader_api' -or $Mutation -or -not (Test-DevBenchShaderSnapshotRequest -Arguments $Arguments))) { throw 'Decoded compiler-error retention is restricted to the exact read-only shader snapshot.' }
     Set-ServerWaitBudgetAtDispatch -Arguments $Arguments
-    $rpc = Invoke-McpRequest -Endpoint $endpoint -Headers $Headers -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/call'; params = @{ name = $Name; arguments = $Arguments } } -Mutation:$Mutation
+    $rpc = Invoke-McpRequest -Endpoint $endpoint -Headers $Headers -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/call'; params = @{ name = $Name; arguments = $Arguments } } -Mutation:$Mutation -SingleAttempt:$SingleAttempt
     if ($rpc.json.PSObject.Properties['error']) { throw "DevBench tools/call failed: $($rpc.json.error | ConvertTo-Json -Compress)" }
     if (-not $RetainShaderSnapshotToolError -and $rpc.json.result.PSObject.Properties['isError'] -and $rpc.json.result.isError) {
         $message = ($rpc.json.result.content | ForEach-Object { $_.text }) -join "`n"
@@ -1449,6 +1466,20 @@ try {
         # Bracket only this invocation. An async capture's later completion needs
         # its own guarded request_get/finalization; this is not whole-run health.
         $data | Add-Member -NotePropertyName targetSemantic -NotePropertyValue $semantic -Force
+        # Preserve queue admission BEFORE a later read can fail. It is not arrival,
+        # command completion, shader health or permission to replay the mutation.
+        if ($Tool -ceq 'console' -and $semantic.PSObject.Properties['dispatchAccepted'] -and
+            $semantic.dispatchAccepted -is [bool] -and $semantic.dispatchAccepted -and
+            $semantic.known -and $semantic.ok -and $semantic.completionBasis -ceq 'dispatch-only') {
+            $data | Add-Member -NotePropertyName dispatchEvidence -NotePropertyValue ([pscustomobject]@{
+                accepted=$true;completionBasis='dispatch-only';receipt=$semantic.qualifiedDispatch
+                executionCompleted=$false;arrivalProven=$false;desiredEffectVerified=$false;replayPermitted=$false
+            }) -Force
+        }
+        $data | Add-Member -NotePropertyName compilerQualification -NotePropertyValue ([pscustomobject]@{
+            required=$true;admitted=$false;state='post-boundary-unobserved';boundary='this-invocation-only'
+            beforeState=$compilerGuard.state;afterState=$null;windowValid=$false;arrivalProven=$false
+        }) -Force
         $data | Add-Member -NotePropertyName compilerGuard -NotePropertyValue $compilerGuard -Force
         $compilerGuardAfter=Get-ShaderCompilerGuard -Tools $tools -Headers $headers -Identity $runtimeIdentity
         $compilerWindow=Test-DevBenchShaderCompilerWindow -Before $compilerGuard.health -After $compilerGuardAfter.health
@@ -1457,6 +1488,12 @@ try {
         $compilerAdmitted=$compilerGuard.admissible -and $compilerGuardAfter.admissible -and $compilerWindow.valid
         if ($Tool -ceq 'communityshaders.shader_api' -and $arguments.action -ceq 'snapshot') { $compilerAdmitted=$compilerAdmitted -and $semantic.compilerHealth.admissible }
         $data | Add-Member -NotePropertyName healthyEvidenceAdmitted -NotePropertyValue ([bool]($compilerAdmitted -and $semantic.known -and $semantic.ok)) -Force
+        $data | Add-Member -NotePropertyName compilerQualification -NotePropertyValue ([pscustomobject]@{
+            required=$true;admitted=[bool]($compilerAdmitted -and $semantic.known -and $semantic.ok)
+            state=$(if($compilerAdmitted){'boundary-qualified'}else{'boundary-unqualified'})
+            boundary='this-invocation-only';beforeState=$compilerGuard.state;afterState=$compilerGuardAfter.state
+            windowValid=[bool]$compilerWindow.valid;arrivalProven=$false
+        }) -Force
         if (-not $compilerAdmitted) {
             $semantic=[pscustomobject]@{known=$true;ok=$false;outcome='compiler-admission-invalidated';guarded=$true;transient=$false;codes=@('compiler_health_invalidated');states=@();reasons=@($compilerGuardAfter.reasons)+@($compilerWindow.reasons);completionBasis='compiler-boundary-bracket-only'}
         }

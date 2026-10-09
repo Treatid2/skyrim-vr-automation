@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$FixtureRoot,[string]$EntryCaseFilter)
+param([Parameter(Mandatory)][string]$FixtureRoot,[string]$EntryCaseFilter,[switch]$ConsoleDispatch,[switch]$ExpectExpiredCleanupEvidence,[switch]$ProductionRetryDefaults)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 Import-Module (Join-Path $PSScriptRoot 'DevBenchControl.psm1') -Force
@@ -89,14 +89,16 @@ foreach($case in @('session','build','revision','newTask','newCompile','cacheHit
 }
 $root=Join-Path ([IO.Path]::GetFullPath($FixtureRoot)) ('compiler-health-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
-foreach($case in @('healthy','failed','pending','main-thread-unavailable','after-failed','after-session','after-task','mcp-error','schema-missing','no-guard','skip-refused','wait-initializing','wait-zero-timeout','wait-unavailable-timeout','wait-failed','wait-foreign-session','wait-malformed','wait-stale','wait-replay','wait-schema-missing','wait-skip-refused','wait-target-refused','wait-late','wait-listener-lost')) {
+foreach($case in @('healthy','failed','pending','main-thread-unavailable','after-failed','after-unavailable','after-timeout','after-http503','after-session','after-task','mcp-error','schema-missing','no-guard','skip-refused','wait-initializing','wait-zero-timeout','wait-unavailable-timeout','wait-failed','wait-foreign-session','wait-malformed','wait-stale','wait-replay','wait-schema-missing','wait-skip-refused','wait-target-refused','wait-late','wait-listener-lost')) {
+    if($ConsoleDispatch -and $case -cnotin @('healthy','after-failed','after-unavailable','after-timeout','after-http503')){continue}
+    if(-not $ConsoleDispatch -and $case -cin @('after-unavailable','after-timeout','after-http503')){continue}
     if($EntryCaseFilter -and $case -cne $EntryCaseFilter){continue}
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0);$listener.Start()
     $port=$listener.LocalEndpoint.Port
     $events=[Collections.Concurrent.ConcurrentQueue[object]]::new()
     $seedJson=$seed | ConvertTo-Json -Depth 30 -Compress
-    $server=Start-ThreadJob -ArgumentList $listener,$case,$seedJson,$events,$PID,$port -ScriptBlock {
-        param($Listener,$Case,$SeedJson,$Events,$OwnerPid,$Port)
+    $server=Start-ThreadJob -ArgumentList $listener,$case,$seedJson,$events,$PID,$port,$ConsoleDispatch.IsPresent -ScriptBlock {
+        param($Listener,$Case,$SeedJson,$Events,$OwnerPid,$Port,$ConsoleDispatch)
         $ErrorActionPreference='Stop';$snapshots=0
         try {
             while($true) {
@@ -122,12 +124,13 @@ foreach($case in @('healthy','failed','pending','main-thread-unavailable','after
                             'notifications/initialized' {$status='204 No Content';$body=''}
                             'tools/list' {
                                 $enum=if($Case -cin @('schema-missing','wait-schema-missing')){@('registry')}else{@('registry','snapshot')}
-                                $result=@{tools=@(@{name='inspect';inputSchema=@{}},@{name='fixture.target';inputSchema=@{}},@{name='communityshaders.shader_api';inputSchema=@{type='object';required=@('contractMajor','clientId','commandId','action');properties=@{contractMajor=@{type='integer';const=1};clientId=@{type='string'};commandId=@{type='string'};action=@{type='string';enum=$enum}}}})}
+                                $result=@{tools=@(@{name='inspect';inputSchema=@{}},@{name='console';inputSchema=@{}},@{name='fixture.target';inputSchema=@{}},@{name='communityshaders.shader_api';inputSchema=@{type='object';required=@('contractMajor','clientId','commandId','action');properties=@{contractMajor=@{type='integer';const=1};clientId=@{type='string'};commandId=@{type='string'};action=@{type='string';enum=$enum}}}})}
                             }
                             'tools/call' {
                                 $payload=$SeedJson | ConvertFrom-Json -Depth 30
                                 if($rpc.params.name -ceq 'inspect') {$payload=@{pid=$OwnerPid;exe='pwsh.exe';port=$Port;frame=100;lastTaskFrame=-1;pendingTasks=0;vr=$true}}
                                 elseif($rpc.params.name -ceq 'fixture.target') {$Events.Enqueue([pscustomobject]@{kind='target'});$payload=@{ok=$true}}
+                                elseif($rpc.params.name -ceq 'console') {$Events.Enqueue([pscustomobject]@{kind='target'});$payload=@{command=$rpc.params.arguments.command;queued=$true;capturing=$false}}
                                 elseif($rpc.params.arguments.action -ceq 'registry') {$payload=@{ok=$true;server=$payload.server;result=@{service='csx.shader'}}}
                                 else {
                                     $snapshots++;$Events.Enqueue([pscustomobject]@{kind='snapshot';commandId=$rpc.params.arguments.commandId})
@@ -136,6 +139,9 @@ foreach($case in @('healthy','failed','pending','main-thread-unavailable','after
                                     if($Case -ceq 'failed' -or ($Case -ceq 'after-failed' -and $snapshots -eq 2)) {$payload.result.snapshot.compilation.failedTasks=1;$payload.result.snapshot.compilation.currentFailedShaders=1}
                                     if($Case -ceq 'pending') {$payload.result.snapshot.compilation.active=$true}
                                     if($Case -ceq 'main-thread-unavailable') {$payload.ok=$false;$payload.PSObject.Properties.Remove('result');$payload | Add-Member error ([pscustomobject]@{code='main_thread_dispatch_failed';message='main thread did not run within 5000ms';retryable=$true;phase='execution'})}
+                                    if($Case -ceq 'after-unavailable' -and $snapshots -eq 2){$payload.ok=$false;$payload.PSObject.Properties.Remove('result');$payload|Add-Member error ([pscustomobject]@{code='main_thread_dispatch_failed';message='bounded post-dispatch read unavailable';retryable=$true;phase='execution'})}
+                                    if($Case -ceq 'after-timeout' -and $snapshots -eq 2){Start-Sleep -Milliseconds 1500}
+                                    if($Case -ceq 'after-http503' -and $snapshots -eq 2){$status='503 Service Unavailable'}
                                     if($Case -ceq 'after-session' -and $snapshots -eq 2) {$payload.server.serviceSessionId='replaced';$payload.server.sessionId='replaced'}
                                     if($Case -ceq 'after-task' -and $snapshots -eq 2) {$payload.result.snapshot.compilation.totalTasks++;$payload.result.snapshot.compilation.completedTasks++}
                                     if($Case -ceq 'wait-zero-timeout' -or ($Case -ceq 'wait-initializing' -and $snapshots -eq 1)) {$payload.result.snapshot.compilation.totalTasks=0;$payload.result.snapshot.compilation.completedTasks=0}
@@ -156,7 +162,7 @@ foreach($case in @('healthy','failed','pending','main-thread-unavailable','after
                     $bytes=[Text.Encoding]::UTF8.GetBytes($body)
                     $crlf=[string][char]13+[char]10
                     $header=[Text.Encoding]::ASCII.GetBytes("HTTP/1.1 $status"+$crlf+"Content-Type: application/json"+$crlf+"Content-Length: $($bytes.Length)"+$crlf+$replyHeaders+"Connection: close"+$crlf+$crlf)
-                    $stream.Write($header,0,$header.Length);$stream.Write($bytes,0,$bytes.Length);$stream.Flush()
+                    try{$stream.Write($header,0,$header.Length);$stream.Write($bytes,0,$bytes.Length);$stream.Flush()}catch{if($Case -cne 'after-timeout'){throw}}
                     if($Case -ceq 'wait-listener-lost' -and $snapshots -gt 0) {$Listener.Stop();break}
                 } finally {$client.Close()}
             }
@@ -176,11 +182,13 @@ foreach($case in @('healthy','failed','pending','main-thread-unavailable','after
             if($case -ceq 'wait-target-refused'){$flags.Tool='fixture.target';$flags.ArgumentsJson='{}'}
         } else {
             $flags.Command='call';$flags.Tool='fixture.target';$flags.ArgumentsJson='{}';$flags.TimeoutSeconds=15
+            if($ConsoleDispatch){$flags.Tool='console';$flags.ArgumentsJson='{"action":"exec","command":"coc QASmoke","capture":false}';$flags.TimeoutSeconds=20;if($case -ceq 'after-timeout'){$flags.RequestTimeoutSeconds=1}}
             if($case -cne 'no-guard'){$flags.RequireCompilerHealthy=$true}
             if($case -ceq 'skip-refused'){$flags.SkipRuntimeIdentityVerification=$true}
         }
         $clock=[Diagnostics.Stopwatch]::StartNew()
-        $reply=& (Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1') -RuntimePath $runtime -EvidenceDirectory $fixture -MaxTransientRetries 0 -Compact -NoExit @flags | ConvertFrom-Json -Depth 60
+        if(-not $ProductionRetryDefaults){$flags.MaxTransientRetries=0}
+        $reply=& (Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps1') -RuntimePath $runtime -EvidenceDirectory $fixture -Compact -NoExit @flags | ConvertFrom-Json -Depth 60
         $clock.Stop()
         $reply|ConvertTo-Json -Depth 60|Set-Content -LiteralPath (Join-Path $fixture 'result.json')
         $calls=@($events.ToArray());$targets=@($calls|Where-Object kind -eq 'target').Count
@@ -215,12 +223,28 @@ foreach($case in @('healthy','failed','pending','main-thread-unavailable','after
         if($case -ceq 'main-thread-unavailable') {Check ($reply.data.compilerGuard.state -ceq 'READ_UNAVAILABLE' -and $reply.data.compilerGuard.reply.content[0].error.code -ceq 'main_thread_dispatch_failed' -and $null -eq $reply.data.compilerGuard.health.compilation) 'production entry retains native unavailable read without accepting counters or touching compile'}
         if($case -ceq 'mcp-error') {Check ($reply.data.compilerGuard.reply.rawResult.isError -and $null -eq $reply.data.compilerGuard.health) 'MCP error raw reply is retained without positive schema/counters'}
         if($case.StartsWith('after-')) {Check ($targets -eq 1 -and $reply.dispatchReached -and $reply.data.targetSemantic.ok -and -not $reply.data.healthyEvidenceAdmitted) "$case preserves completed target receipt without healthy promotion or replay"}
+        if($ConsoleDispatch){
+            Check ($reply.acceptedDataRetained -and $reply.responseDataRetained -and $targets -eq 1) "$case accepted dispatch remains retained despite later qualification"
+            Check ($reply.data.dispatchEvidence.accepted -and -not $reply.data.dispatchEvidence.executionCompleted -and -not $reply.data.dispatchEvidence.arrivalProven -and -not $reply.data.dispatchEvidence.replayPermitted) "$case retained queue admission is not arrival/replay"
+            Check ($reply.data.dispatchEvidence.receipt.command -ceq 'coc QASmoke' -and $reply.data.dispatchEvidence.receipt.queued -eq $true -and $reply.data.dispatchEvidence.receipt.capturing -eq $false) "$case exact native queue receipt retained"
+            Check ($reply.data.compilerQualification.admitted -eq ($case -ceq 'healthy') -and -not $reply.data.compilerQualification.arrivalProven) "$case compiler qualification is separate"
+            if($case -cin @('after-unavailable','after-timeout','after-http503')){Check (($null -eq $reply.data.compilerGuardAfter.health -or $null -eq $reply.data.compilerGuardAfter.health.compilation) -and $reply.data.compilerQualification.afterState -ceq 'READ_UNAVAILABLE') "$case no invented shader-failure counters"}
+            if($ProductionRetryDefaults -and $case -cin @('after-timeout','after-http503')){
+                Check (@($calls|Where-Object kind -ceq 'snapshot').Count -eq 2) "$case production retry defaults cannot replace first post-boundary read with later healthy data"
+                Check ($reply.data.compilerGuardAfter.transportFailure.attempt -eq 1 -and $reply.data.compilerGuardAfter.transportFailure.recovery -ceq 'not-retried-boundary-read') "$case first boundary transport failure retained separately from accepted dispatch"
+                Check (@($reply.transportRetries|Where-Object recovery -ceq 'not-retried-boundary-read').Count -eq 1) "$case terminal first-failure transport record retained"
+            }
+            if($case -cne 'healthy'){Check ($reply.semantic.outcome -ceq 'compiler-admission-invalidated' -and -not $reply.ok) "$case overall compiler gate remains failed"}
+        }
         if($case -ceq 'healthy') {
             Check ($reply.runtimeIdentity.complete -and $reply.runtimeIdentity.verified -and $reply.data.healthyEvidenceAdmitted -and $reply.data.compilerWindow.valid) 'healthy entry binds real fixture listener/process/artifact with two compiler boundaries'
             $ids=@($calls|Where-Object kind -eq 'snapshot'|ForEach-Object commandId)
             Check ($ids.Count -eq 2 -and $ids[0] -cne $ids[1]) 'guard uses fresh non-replayed snapshot command IDs'
         }
-        if($case -cnotin @('skip-refused','wait-skip-refused','wait-target-refused','wait-listener-lost')) {Check ($reply.sessionCleanup.ok -and @($calls|Where-Object kind -eq 'delete').Count -eq 1) "$case closes one owned fixture MCP session"}
+        if($case -ceq 'wait-late' -and $ExpectExpiredCleanupEvidence){
+            Check (-not $reply.ok -and $reply.semantic.outcome -ceq 'wait-timeout' -and -not $reply.sessionCleanup.ok -and -not $reply.sessionCleanup.attempted -and $reply.sessionCleanup.indeterminate) 'late read retains explicit unverified cleanup without deadline extension'
+            Check (@($calls|Where-Object kind -eq 'delete').Count -eq 0 -and $reply.sessionCleanup.sessions.Count -eq 1 -and $reply.sessionCleanup.sessions[0].sessionId -ceq 'compiler-fixture' -and $reply.sessionCleanup.sessions[0].state -ceq 'not_attempted_deadline_exhausted' -and $reply.sessionCleanup.sessions[0].timeoutMilliseconds -eq 0) 'late cleanup starts no DELETE and binds exact expired session evidence'
+        }elseif($case -cnotin @('skip-refused','wait-skip-refused','wait-target-refused','wait-listener-lost')) {Check ($reply.sessionCleanup.ok -and @($calls|Where-Object kind -eq 'delete').Count -eq 1) "$case closes one owned fixture MCP session"}
         $reply|ConvertTo-Json -Depth 60|Set-Content -LiteralPath (Join-Path $fixture 'result.json')
     } finally {$listener.Stop();Stop-Job $server;Remove-Job $server}
 }
