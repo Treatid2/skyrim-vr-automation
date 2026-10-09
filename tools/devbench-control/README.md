@@ -132,6 +132,15 @@ positive admission, failure/pending refusal with zero target dispatch, changed
 post-boundaries with preserved target receipt, no replay and exact session
 cleanup. They are offline validation, not a live ca3/ad8 health qualification.
 
+Compiler admission snapshots are single-attempt boundary reads even with the
+default `MaxTransientRetries=4`. A timeout or transport failure is retained as
+`compilerGuard.transportFailure` and `not-retried-boundary-read` transport
+evidence; a later healthy response cannot qualify the original bracket. Other
+read requests retain their normal retry policy. A readiness wait may still take
+new observations with fresh command IDs, not replay the failed snapshot. Run
+the console `after-timeout` and `after-http503` fixture cases with
+`-ProductionRetryDefaults` to exercise the public entry without a retry override.
+
 `Invoke-DevBenchControl.ps1` lists and calls the MCP tools exposed by a running
 CSX DevBench server. Supply runtime metadata with `-RuntimePath` or set
 `CSX_DEVBENCH_RUNTIME_PATH`; no machine-specific path is compiled into the
