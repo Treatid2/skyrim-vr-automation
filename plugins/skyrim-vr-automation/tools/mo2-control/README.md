@@ -1,5 +1,15 @@
 # MO2 Control
 
+After an exact `terminate-game` request is dispatched, a later inspection,
+status or receipt-publication failure reports `game-termination-reporting-failed`.
+Its data retains the exact request and targets, independently verified game
+closure and RootBuilder cleanup (if available), and `receiptPublished`.
+`recoveryRequired` and `noAutomaticRetry` are explicit: retain this result and
+reconcile the existing session; never repeat termination from a reporting error.
+Absent cleanup evidence is unknown, not proof that MO2 exited or restored.
+The default Unlock inspection callback retains its defining module scope so it
+can resolve private controller functions without a caller-supplied wrapper.
+
 ## Bounded launch-error evidence
 
 Launch retains an optional exact registered-binary log baseline before dispatch.
