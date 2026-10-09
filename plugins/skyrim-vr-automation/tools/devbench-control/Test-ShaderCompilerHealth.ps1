@@ -79,9 +79,35 @@ foreach ($case in @('stringCounter','fractional','boolCounter','negative','overf
 }
 Check ((Test-DevBenchShaderCompilerWindow -Before $health -After $health).valid) 'unchanged admitted boundaries qualify bracket only'
 $unavailable=Clone-Seed;$unavailable.ok=$false;$unavailable.PSObject.Properties.Remove('result')
-$unavailable | Add-Member error ([pscustomobject]@{code='main_thread_dispatch_failed';message='main thread did not run within 5000ms';phase='execution';retryable=$true})
+$unavailable | Add-Member error ([pscustomobject]@{code='main_thread_dispatch_failed';message='main thread did not run within 5000ms';phase='admission';retryable=$true;field=$null;requestId=$null;details=[pscustomobject]@{}})
 $unavailableHealth=Get-DevBenchShaderCompilerHealth -Arguments $argsMap -Content @($unavailable)
 Check (-not $unavailableHealth.readQualified -and -not $unavailableHealth.admissible -and $unavailableHealth.state -ceq 'READ_UNAVAILABLE' -and $null -eq $unavailableHealth.compilation) 'main-thread read unavailable is not an invented compiler failure/counter snapshot'
+Check ($unavailableHealth.unavailableEnvelopeQualified -and $unavailableHealth.nativeRetryable) 'strict native admission unavailable envelope qualifies without successful snapshot fields'
+foreach($case in @('wrongClient','wrongAction','stringMajor','futureMinor','contractExtra','commandExtra','producerExtra','producerArray','sessionMismatch','boolProducer','missingErrorField','unknownCode','emptyMessage','arrayError','arrayDetails','populatedDetails','mutationField','mutationReceipt','stringReplay','contradictoryStatus')) {
+    $bad=$unavailable|ConvertTo-Json -Depth 30|ConvertFrom-Json -Depth 30 -DateKind String
+    switch($case) {
+        wrongClient {$bad.command.clientId='wrong'};wrongAction {$bad.command.action='execute'}
+        stringMajor {$bad.contract.major='1'};futureMinor {$bad.contract.minor=1}
+        contractExtra {$bad.contract|Add-Member success $true}
+        commandExtra {$bad.command|Add-Member contractMajor 1}
+        producerExtra {$bad.server|Add-Member error 'contradiction'}
+        producerArray {$bad.server=@($bad.server)}
+        sessionMismatch {$bad.server.sessionId='different'}
+        boolProducer {$bad.server.manifestVerified='false'}
+        missingErrorField {$bad.error.PSObject.Properties.Remove('field')}
+        unknownCode {$bad.error.code='unknown'};emptyMessage {$bad.error.message=''}
+        arrayError {$bad.error=@($bad.error)}
+        arrayDetails {$bad.error.details=@()}
+        populatedDetails {$bad.error.details|Add-Member success $true}
+        mutationField {$bad.error.field='mutation'};mutationReceipt {$bad.error.requestId='foreign-receipt'}
+        stringReplay {$bad|Add-Member idempotentReplay 'false'}
+        contradictoryStatus {$bad|Add-Member result ([pscustomobject]@{status='success'})}
+    }
+    $raw=$bad|ConvertTo-Json -Depth 30 -Compress
+    $h=Get-DevBenchShaderCompilerHealth -Arguments $argsMap -Content @($bad)
+    Check (-not $h.unavailableEnvelopeQualified -and -not $h.nativeRetryable -and -not $h.admissible -and $h.state -ceq 'INDETERMINATE') "$case terminal unavailable schema cannot gain retry classification"
+    Check (($bad|ConvertTo-Json -Depth 30 -Compress) -ceq $raw -and $null -eq $h.compilation) "$case retains unavailable native bytes without successful counters"
+}
 foreach($case in @('session','build','revision','newTask','newCompile','cacheHit')) {
     $after=$health | ConvertTo-Json -Depth 30 | ConvertFrom-Json -Depth 30 -DateKind String
     switch($case) {session {$after.serviceSessionId='foreign'};build {$after.buildId='foreign'};revision {$after.stateRevision++};newTask {$after.compilation.totalTasks++};newCompile {$after.compilation.sourceCompiles++};cacheHit {$after.compilation.diskCacheHits++}}
@@ -89,7 +115,8 @@ foreach($case in @('session','build','revision','newTask','newCompile','cacheHit
 }
 $root=Join-Path ([IO.Path]::GetFullPath($FixtureRoot)) ('compiler-health-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
-foreach($case in @('healthy','failed','pending','main-thread-unavailable','after-failed','after-unavailable','after-timeout','after-session','after-task','mcp-error','schema-missing','no-guard','skip-refused','wait-initializing','wait-zero-timeout','wait-unavailable-timeout','wait-failed','wait-foreign-session','wait-malformed','wait-stale','wait-replay','wait-schema-missing','wait-skip-refused','wait-target-refused','wait-late','wait-listener-lost')) {
+$mixedUnavailableCases=@('wait-unavailable-command','wait-unavailable-build','wait-unavailable-session','wait-unavailable-schema','wait-unavailable-stale','wait-unavailable-future','wait-unavailable-extra','wait-unavailable-result','wait-unavailable-error-shape','wait-unavailable-replay','wait-unavailable-nonretryable')
+foreach($case in (@('healthy','failed','pending','main-thread-unavailable','after-failed','after-unavailable','after-timeout','after-session','after-task','mcp-error','schema-missing','no-guard','skip-refused','wait-initializing','wait-zero-timeout','wait-unavailable-timeout','wait-failed','wait-foreign-session','wait-malformed','wait-stale','wait-replay','wait-schema-missing','wait-skip-refused','wait-target-refused','wait-late','wait-listener-lost','wait-unavailable-healthy')+$mixedUnavailableCases)) {
     if($ConsoleDispatch -and $case -cnotin @('healthy','after-failed','after-unavailable','after-timeout')){continue}
     if(-not $ConsoleDispatch -and $case -cin @('after-unavailable','after-timeout')){continue}
     if($EntryCaseFilter -and $case -cne $EntryCaseFilter){continue}
@@ -134,12 +161,12 @@ foreach($case in @('healthy','failed','pending','main-thread-unavailable','after
                                 elseif($rpc.params.arguments.action -ceq 'registry') {$payload=@{ok=$true;server=$payload.server;result=@{service='csx.shader'}}}
                                 else {
                                     $snapshots++;$Events.Enqueue([pscustomobject]@{kind='snapshot';commandId=$rpc.params.arguments.commandId})
-                                    $payload.command=$rpc.params.arguments
+                                    $payload.command=[pscustomobject]@{action=$rpc.params.arguments.action;clientId=$rpc.params.arguments.clientId;commandId=$rpc.params.arguments.commandId}
                                     $payload.timestampUtc=[DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
                                     if($Case -ceq 'failed' -or ($Case -ceq 'after-failed' -and $snapshots -eq 2)) {$payload.result.snapshot.compilation.failedTasks=1;$payload.result.snapshot.compilation.currentFailedShaders=1}
                                     if($Case -ceq 'pending') {$payload.result.snapshot.compilation.active=$true}
-                                    if($Case -ceq 'main-thread-unavailable') {$payload.ok=$false;$payload.PSObject.Properties.Remove('result');$payload | Add-Member error ([pscustomobject]@{code='main_thread_dispatch_failed';message='main thread did not run within 5000ms';retryable=$true;phase='execution'})}
-                                    if($Case -ceq 'after-unavailable' -and $snapshots -eq 2){$payload.ok=$false;$payload.PSObject.Properties.Remove('result');$payload|Add-Member error ([pscustomobject]@{code='main_thread_dispatch_failed';message='bounded post-dispatch read unavailable';retryable=$true;phase='execution'})}
+                                    if($Case -ceq 'main-thread-unavailable') {$payload.ok=$false;$payload.PSObject.Properties.Remove('result');$payload | Add-Member error ([pscustomobject]@{code='main_thread_dispatch_failed';message='main thread did not run within 5000ms';retryable=$true;phase='admission';field=$null;requestId=$null;details=[pscustomobject]@{}})}
+                                    if($Case -ceq 'after-unavailable' -and $snapshots -eq 2){$payload.ok=$false;$payload.PSObject.Properties.Remove('result');$payload|Add-Member error ([pscustomobject]@{code='main_thread_dispatch_failed';message='bounded post-dispatch read unavailable';retryable=$true;phase='admission';field=$null;requestId=$null;details=[pscustomobject]@{}})}
                                     if($Case -ceq 'after-timeout' -and $snapshots -eq 2){Start-Sleep -Milliseconds 1500}
                                     if($Case -ceq 'after-session' -and $snapshots -eq 2) {$payload.server.serviceSessionId='replaced';$payload.server.sessionId='replaced'}
                                     if($Case -ceq 'after-task' -and $snapshots -eq 2) {$payload.result.snapshot.compilation.totalTasks++;$payload.result.snapshot.compilation.completedTasks++}
@@ -150,7 +177,26 @@ foreach($case in @('healthy','failed','pending','main-thread-unavailable','after
                                     if($Case -ceq 'wait-malformed') {$payload.result.snapshot.compilation.totalTasks='100'}
                                     if($Case -ceq 'wait-stale') {$payload.timestampUtc=[DateTimeOffset]::UtcNow.AddSeconds(-60).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')}
                                     if($Case -ceq 'wait-replay') {$payload.result|Add-Member idempotentReplay $true}
-                                    if($Case -ceq 'wait-unavailable-timeout') {$payload.ok=$false;$payload.PSObject.Properties.Remove('result');$payload|Add-Member error ([pscustomobject]@{code='main_thread_dispatch_failed';message='bounded fixture read unavailable';retryable=$true;phase='execution'})}
+                                    if($Case -ceq 'wait-unavailable-timeout') {$payload.ok=$false;$payload.PSObject.Properties.Remove('result');$payload|Add-Member error ([pscustomobject]@{code='main_thread_dispatch_failed';message='bounded fixture read unavailable';retryable=$true;phase='admission';field=$null;requestId=$null;details=[pscustomobject]@{}})}
+                                    if($Case.StartsWith('wait-unavailable-') -and $Case -cne 'wait-unavailable-timeout' -and $snapshots -eq 1) {
+                                        $payload.command=[pscustomobject]@{action='snapshot';clientId=$rpc.params.arguments.clientId;commandId=$rpc.params.arguments.commandId}
+                                        $payload.ok=$false;$payload.PSObject.Properties.Remove('result')
+                                        $payload|Add-Member error ([pscustomobject]@{code='main_thread_dispatch_failed';message='bounded native admission unavailable';phase='admission';retryable=$true;field=$null;requestId=$null;details=[pscustomobject]@{}})
+                                        switch($Case) {
+                                            'wait-unavailable-command' {$payload.command.commandId='wrong-first-command'}
+                                            'wait-unavailable-build' {$payload.server.buildId='wrong-first-build'}
+                                            'wait-unavailable-session' {$payload.server.sessionId='foreign-first-session';$payload.server.serviceSessionId='foreign-first-session'}
+                                            'wait-unavailable-schema' {$payload.contract.schemaRevision=2}
+                                            'wait-unavailable-stale' {$payload.timestampUtc=[DateTimeOffset]::UtcNow.AddSeconds(-60).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')}
+                                            'wait-unavailable-future' {$payload.timestampUtc=[DateTimeOffset]::UtcNow.AddSeconds(60).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')}
+                                            'wait-unavailable-extra' {$payload|Add-Member success $true}
+                                            'wait-unavailable-result' {$payload|Add-Member result ([pscustomobject]@{status='success'})}
+                                            'wait-unavailable-error-shape' {$payload.error.retryable='true'}
+                                            'wait-unavailable-replay' {$payload|Add-Member idempotentReplay $true}
+                                            'wait-unavailable-nonretryable' {$payload.error.retryable=$false;$payload.error.phase='execution'}
+                                        }
+                                        $Events.Enqueue([pscustomobject]@{kind='firstUnavailable';payloadJson=($payload|ConvertTo-Json -Depth 30 -Compress)})
+                                    }
                                     if($Case -ceq 'wait-late') {$remaining=($lateReplyUtc-[DateTime]::UtcNow).TotalMilliseconds;if($remaining -gt 0){Start-Sleep -Milliseconds ([int][Math]::Ceiling($remaining))}}
                                 }
                                 $result=@{isError=$Case -ceq 'mcp-error' -and $rpc.params.name -ceq 'communityshaders.shader_api' -and $rpc.params.arguments.action -ceq 'snapshot';content=@(@{type='text';text=($payload|ConvertTo-Json -Depth 30 -Compress)})}
@@ -193,7 +239,15 @@ foreach($case in @('healthy','failed','pending','main-thread-unavailable','after
         if($isWait) {
             Check ($targets -eq 0 -and @($calls|Where-Object {$_.kind -ceq 'tools/call' -and $_.tool -cnotin @('inspect','communityshaders.shader_api')}).Count -eq 0) "$case wait issues no load/camera/target mutation"
             $snapshots=@($calls|Where-Object kind -eq 'snapshot')
-            if($case -ceq 'wait-initializing') {
+            if($case -cin $mixedUnavailableCases) {
+                Check (-not $reply.ok -and -not $reply.data.satisfied -and $reply.data.observation.terminalFailure -and $snapshots.Count -eq 1) "$case terminal first response cannot be replaced by hypothetical healthy second read"
+                $firstUnavailable=@($calls|Where-Object kind -CEQ 'firstUnavailable')
+                $retained=$reply.data.observation.compilerGuard.reply.rawResult.content[0].text
+                Check ($firstUnavailable.Count -eq 1 -and $retained -ceq $firstUnavailable[0].payloadJson -and @($reply.data.observation.compilerGuard.reasons).Count -gt 0) "$case preserves exact first unavailable payload and refusal reasons"
+            } elseif($case -ceq 'wait-unavailable-healthy') {
+                Check ($reply.ok -and $reply.data.satisfied -and $snapshots.Count -eq 2) 'strict canonical unavailable may observe a fresh healthy snapshot within original deadline'
+                Check (@($snapshots.commandId|Sort-Object -Unique).Count -eq 2 -and @($calls|Where-Object kind -CEQ 'initialize').Count -eq 1) 'canonical unavailable continuation uses fresh IDs in the original owned MCP session'
+            } elseif($case -ceq 'wait-initializing') {
                 Check ($reply.ok -and $reply.data.satisfied -and $snapshots.Count -eq 3 -and $reply.data.observation.compilerGuard.health.compilation.totalTasks -gt 0) 'wait admits zero-to-pending-to-healthy only after fresh positive tasks'
                 Check (@($snapshots.commandId|Sort-Object -Unique).Count -eq 3) 'wait snapshot IDs never replay accepted reads or mutations'
                 Check (@($calls|Where-Object kind -eq 'initialize').Count -eq 1) 'normal readiness wait retains one selected MCP session'

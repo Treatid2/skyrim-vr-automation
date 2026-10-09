@@ -13,6 +13,79 @@ function Test-DevBenchShaderSnapshotRequest {
     return -not $Arguments.Contains('expectedBuildId') -or ($Arguments.expectedBuildId -is [string] -and -not [string]::IsNullOrWhiteSpace($Arguments.expectedBuildId))
 }
 
+
+function Get-DevBenchShaderUnavailableHealth {
+    param([Collections.IDictionary]$Arguments,$Payload)
+    $reasons=[Collections.Generic.List[string]]::new()
+    function U-Member($Object,[string]$Name) {
+        if ($Object -isnot [pscustomobject]) { return $null }
+        $property=$Object.PSObject.Properties[$Name]
+        if ($property) { return ,$property.Value }; return $null
+    }
+    function U-Shape($Object,[string[]]$Required,[string[]]$Optional,[string]$Name) {
+        if ($Object -isnot [pscustomobject]) { $reasons.Add("$Name must be an object."); return }
+        if (@($Required|Where-Object {-not $Object.PSObject.Properties[$_]}).Count -or
+            @($Object.PSObject.Properties.Name|Where-Object {$_ -cnotin ($Required+$Optional)}).Count) { $reasons.Add("$Name contains missing/unsupported fields."); }
+    }
+    function U-String($Value) { return $Value -is [string] -and -not [string]::IsNullOrWhiteSpace($Value) }
+    if (-not (Test-DevBenchShaderSnapshotRequest $Arguments)) { $reasons.Add('Only the exact versioned snapshot request qualifies unavailability.') }
+    U-Shape $Payload @('ok','contract','command','timestampUtc','server','error') @('idempotentReplay') 'Unavailable envelope'
+    $contract=U-Member $Payload 'contract';$command=U-Member $Payload 'command'
+    $server=U-Member $Payload 'server';$nativeError=U-Member $Payload 'error'
+    U-Shape $contract @('name','major','minor','schemaRevision') @() 'Unavailable contract'
+    U-Shape $command @('action','clientId','commandId') @() 'Unavailable command'
+    # Native MakeEnvelope echoes these three strings only. The issued
+    # contractMajor is bound by contract.major, not an invented command field.
+    if ((U-Member $Payload 'ok') -isnot [bool] -or (U-Member $Payload 'ok') -ne $false) { $reasons.Add('Unavailable ok must be Boolean false.') }
+    if ((U-Member $contract 'name') -cne 'csx.shader') { $reasons.Add('Foreign unavailable contract.') }
+    foreach($pair in @(@('major',1),@('minor',0),@('schemaRevision',1))) {
+        $v=U-Member $contract $pair[0]
+        if ($null -eq $v -or $v.GetType() -notin @([byte],[sbyte],[int16],[uint16],[int32],[uint32],[int64],[uint64]) -or $v -ne $pair[1]) { $reasons.Add("Unsupported unavailable contract $($pair[0]).") }
+    }
+    foreach($key in @('action','clientId','commandId')) {
+        $v=U-Member $command $key
+        if (-not (U-String $v) -or -not $Arguments.Contains($key) -or $v -cne $Arguments[$key]) { $reasons.Add("Unavailable command $key differs from issued request.") }
+    }
+    $requiredProducer=@('component','buildId','shaderCacheAbiId','shaderCompilerIdentity','sessionId','serviceSessionId')
+    $optionalProducer=@('buildIdShort','sourceCommit','sourceDescribe','configuration','sourceDirty','artifactSha256','manifestVerified','manifestError')
+    U-Shape $server $requiredProducer $optionalProducer 'Unavailable producer'
+    foreach($key in $requiredProducer) { if (-not (U-String (U-Member $server $key))) { $reasons.Add("Unavailable producer $key must retain native text.") } }
+    if ((U-Member $server 'component') -cne 'CommunityShaders' -or (U-Member $server 'sessionId') -cne (U-Member $server 'serviceSessionId')) { $reasons.Add('Unavailable shader service-session identity is inconsistent.') }
+    if (-not $Arguments.Contains('expectedBuildId') -or -not (U-String $Arguments.expectedBuildId) -or $Arguments.expectedBuildId -cne (U-Member $server 'buildId')) { $reasons.Add('Unavailable producer differs from expected build.') }
+    foreach($key in @('buildIdShort','sourceCommit','sourceDescribe','configuration','artifactSha256')) {
+        if ($server -is [pscustomobject] -and $server.PSObject.Properties[$key] -and (U-Member $server $key) -isnot [string]) { $reasons.Add("Unavailable producer $key must be string when present.") }
+    }
+    foreach($key in @('sourceDirty','manifestVerified')) {
+        if ($server -is [pscustomobject] -and $server.PSObject.Properties[$key] -and (U-Member $server $key) -isnot [bool]) { $reasons.Add("Unavailable producer $key must be Boolean when present.") }
+    }
+    $manifestError=U-Member $server 'manifestError'
+    if ($null -ne $manifestError -and $manifestError -isnot [string]) { $reasons.Add('Unavailable producer manifestError must be nullable text.') }
+    $timestamp=U-Member $Payload 'timestampUtc';$parsed=[DateTimeOffset]::MinValue
+    if ($timestamp -isnot [string] -or $timestamp -cnotmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,7})?Z$' -or -not [DateTimeOffset]::TryParse($timestamp,[ref]$parsed)) { $reasons.Add('Unavailable UTC timestamp missing/malformed.') }
+    U-Shape $nativeError @('code','message','phase','retryable','field','requestId','details') @() 'Unavailable error'
+    $code=U-Member $nativeError 'code';$phase=U-Member $nativeError 'phase';$retryable=U-Member $nativeError 'retryable'
+    if ($code -isnot [string] -or $code -cnotin @('main_thread_dispatch_failed','service_unavailable','main_thread_busy') -or -not (U-String (U-Member $nativeError 'message'))) { $reasons.Add('Unsupported/untyped native unavailable error.') }
+    if ($retryable -isnot [bool] -or $phase -isnot [string] -or
+        ($code -ceq 'main_thread_dispatch_failed' -and ($phase -cnotin @('admission','execution') -or ($phase -ceq 'execution' -and $retryable -ne $false))) -or
+        ($code -ceq 'service_unavailable' -and $phase -cne 'dispatch') -or
+        ($code -ceq 'main_thread_busy' -and $phase -cne 'admission')) { $reasons.Add('Unsupported native unavailable phase/retryable contract.') }
+    if ($null -ne (U-Member $nativeError 'field') -or $null -ne (U-Member $nativeError 'requestId')) { $reasons.Add('Snapshot unavailability may not carry a mutation field/request receipt.') }
+    $details=U-Member $nativeError 'details'
+    if ($details -isnot [pscustomobject] -or @($details.PSObject.Properties).Count -ne 0) { $reasons.Add('Unavailable native details must be the empty object.') }
+    if ($Payload -is [pscustomobject] -and $Payload.PSObject.Properties['idempotentReplay'] -and
+        ($Payload.idempotentReplay -isnot [bool] -or $Payload.idempotentReplay -ne $false)) { $reasons.Add('Replayed unavailable envelope is terminal.') }
+    $qualified=$reasons.Count -eq 0
+    if ($qualified) { $reasons.Add('Native compiler read unavailable; no compiler failure or counters inferred.') }
+    return [pscustomobject][ordered]@{
+        schema='auto-tools.shader-compiler-health.1';readQualified=$false;admissible=$false
+        state=if($qualified){'READ_UNAVAILABLE'}else{'INDETERMINATE'}
+        unavailableEnvelopeQualified=$qualified;nativeRetryable=$qualified -and $retryable -eq $true
+        buildId=U-Member $server 'buildId';serviceSessionId=U-Member $server 'serviceSessionId'
+        stateRevision=$null;timestampUtc=$timestamp;compilation=$null;producer=$server
+        reasons=@($reasons);scope='Unavailable error envelope only; registry/freshness qualification still required'
+    }
+}
+
 function Get-DevBenchShaderCompilerHealth {
     [CmdletBinding()]
     param([Parameter(Mandatory)][Collections.IDictionary]$Arguments,
@@ -30,6 +103,9 @@ function Get-DevBenchShaderCompilerHealth {
     $p=if ($payloads.Count -eq 1 -and $payloads[0] -is [pscustomobject]) { $payloads[0] } else { $null }
     if (-not (Test-DevBenchShaderSnapshotRequest $Arguments)) { $reasons.Add('Only the exact versioned shader snapshot request qualifies.') }
     if ($null -eq $p) { $reasons.Add('Shader snapshot requires exactly one structured native receipt.') }
+    if ($p -is [pscustomobject] -and $p.PSObject.Properties['error']) {
+        return Get-DevBenchShaderUnavailableHealth -Arguments $Arguments -Payload $p
+    }
     $contract=Shader-Member $p 'contract'; $command=Shader-Member $p 'command'
     $server=Shader-Member $p 'server'; $result=Shader-Member $p 'result'
     $snapshot=Shader-Member $result 'snapshot'; $compile=Shader-Member $snapshot 'compilation'
@@ -99,11 +175,6 @@ function Get-DevBenchShaderCompilerHealth {
         if ($object -is [pscustomobject] -and $object.PSObject.Properties['idempotentReplay'] -and $object.idempotentReplay -isnot [bool]) { $reasons.Add('idempotentReplay must be Boolean when present.'); $readQualified=$false }
     }
     $state='INDETERMINATE'
-    $nativeError=Shader-Member $p 'error'
-    if (-not $readQualified -and $ok -is [bool] -and -not $ok -and (Shader-Member $contract 'name') -ceq 'csx.shader' -and $nativeError -is [pscustomobject] -and (Shader-Member $nativeError 'code') -is [string] -and (Shader-Member $nativeError 'code') -cin @('main_thread_dispatch_failed','service_unavailable','main_thread_busy')) {
-        $state='READ_UNAVAILABLE'
-        $reasons.Add('Native compiler read unavailable; no compiler failure or counter values inferred.')
-    }
     if ($readQualified) {
         if (-not $available) { $state='UNAVAILABLE'; $reasons.Add('Shader snapshot is unavailable.') }
         elseif ($compile.failedTasks -gt 0 -or $compile.currentFailedShaders -gt 0) { $state='FAILED_COMPILATION'; $reasons.Add('Native shader task/current-entry failures prohibit healthy evidence.') }
@@ -117,6 +188,7 @@ function Get-DevBenchShaderCompilerHealth {
     }
     return [pscustomobject][ordered]@{
         schema='auto-tools.shader-compiler-health.1'; readQualified=$readQualified
+        unavailableEnvelopeQualified=$false;nativeRetryable=$false
         admissible=$state -ceq 'COMPILER_HEALTHY_AT_SNAPSHOT'; state=$state
         buildId=Shader-Member $server 'buildId'; serviceSessionId=Shader-Member $server 'serviceSessionId'
         stateRevision=Shader-Member $snapshot 'stateRevision'; timestampUtc=$timestamp
