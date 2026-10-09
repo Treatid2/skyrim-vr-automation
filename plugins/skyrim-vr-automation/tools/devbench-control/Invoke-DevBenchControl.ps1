@@ -80,7 +80,7 @@ $script:requestTimeoutSecondsForRpc = $RequestTimeoutSeconds
 
 function Get-ShaderCompilerGuard {
     param([object[]]$Tools,[hashtable]$Headers,$Identity)
-    $guard=[pscustomobject][ordered]@{admissible=$false; state='READ_UNAVAILABLE'; health=$null; reply=$null; arguments=$null; reasons=@()}
+    $guard=[pscustomobject][ordered]@{admissible=$false; retryableUnavailableQualified=$false; state='INDETERMINATE'; health=$null; reply=$null; arguments=$null; reasons=@()}
     try {
         if ($null -eq $Identity -or -not $Identity.complete -or -not $Identity.verified) { throw 'Compiler admission requires complete verified current runtime/artifact identity.' }
         $matches=@($Tools | Where-Object name -CEQ 'communityshaders.shader_api')
@@ -94,14 +94,15 @@ function Get-ShaderCompilerGuard {
         $guard.health=Get-DevBenchShaderCompilerHealth -Arguments $argsMap -Content @($guard.reply.content)
         $guard.state=$guard.health.state
         $guard.reasons=@($guard.health.reasons)
-        if (-not $guard.health.readQualified) { return $guard }
+        if (-not $guard.health.readQualified -and -not $guard.health.unavailableEnvelopeQualified) { return $guard }
         $sources=@($Identity.build.sources | Where-Object tool -CEQ 'communityshaders.shader_api')
         if ($sources.Count -ne 1 -or $sources[0].producer.serviceSessionId -cne $guard.health.serviceSessionId) { throw 'Shader service session differs from the accepting runtime registry.' }
         $age=([DateTimeOffset]::UtcNow - [DateTimeOffset]$guard.health.timestampUtc).TotalSeconds
         if ($age -lt -5 -or $age -gt 10) { throw 'Compiler snapshot is stale or future-dated; no current-health admission.' }
+        $guard.retryableUnavailableQualified=$guard.health.unavailableEnvelopeQualified -and $guard.health.nativeRetryable
         $guard.admissible=$guard.health.admissible
     } catch {
-        $guard.admissible=$false; $guard.reasons=@($guard.reasons)+$_.Exception.Message
+        $guard.admissible=$false; $guard.retryableUnavailableQualified=$false; $guard.reasons=@($guard.reasons)+$_.Exception.Message
     }
     return $guard
 }
@@ -1214,7 +1215,7 @@ try {
                 $retryable = $null -ne $guard.health -and (
                     ($guard.health.readQualified -and $guard.state -cin @('COMPILATION_UNPROVEN','COMPILATION_PENDING','UNAVAILABLE') -and
                      @($guard.reasons).Count -eq @($guard.health.reasons).Count) -or
-                    ($guard.state -ceq 'READ_UNAVAILABLE' -and $guard.health.state -ceq 'READ_UNAVAILABLE'))
+                    $guard.retryableUnavailableQualified)
                 $observation = [pscustomobject][ordered]@{
                     satisfied = $guard.admissible
                     retryable = $retryable

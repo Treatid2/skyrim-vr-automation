@@ -13,8 +13,14 @@ is accepted for this condition.
 
 Only `COMPILER_HEALTHY_AT_SNAPSHOT` completes the barrier. Zero tasks remain
 `COMPILATION_UNPROVEN`, not a compile failure; pending initialization/compilation
-and recognized native read-unavailable states may be observed again within
-the original absolute deadline. Actual failures/history, disabled custom shaders,
+and strictly qualified retryable native read-unavailable replies may be observed
+again within the original absolute deadline. Qualification requires the exact
+typed native error envelope, issued command/build identity, accepting registry
+service-session identity and fresh UTC timestamp. An unavailable error code alone
+never permits another read: malformed, foreign, stale, replayed or nonretryable
+first replies are terminal and retain their raw evidence. Native admission-time
+unavailability is distinct from nonretryable execution failure; neither invents
+successful snapshot counters. Actual failures/history, disabled custom shaders,
 malformed, replayed, stale, foreign or changed-process/service evidence refuse
 readiness. The receipt retains the last guard, exact process/build identity,
 attempts and elapsed time; a timeout retains the unproven diagnosis without
