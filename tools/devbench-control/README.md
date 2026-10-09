@@ -38,7 +38,13 @@ that same session. It retains native generation association and ordered read
 bounds, NOT atomic rendered-frame equivalence or simulation freeze. See the
 baseline contract for unavailable/truncated coverage and immutable receipts.
 It reserves the final3s within that budget for fractional-deadline MCP session
-closure and terminal journal/in-memory output. Expired closure/journal admission
+closure and terminal journal/in-memory output. Session
+establishment, initialized notification, tools/list and runtime qualification
+use the original-minus3s workflow cutoff from invocation start. Partial
+initialization cleanup uses the original-minus1s close cutoff and is cached,
+never repeated on finalization. Late discovery retains phase/error/response
+evidence without retry, replacement session or extended budget.
+Expired closure/journal admission
 is explicit and unverified, not a new timeout. See the baseline guide for the
 close-first ordering: outcome retained in memory, original sessions closed,
 then one terminal journal containing outcome and cleanup, including exceptions.

@@ -88,6 +88,9 @@ $totalInvocationDeadlineUtc = $operationDeadlineUtc
 # Ownership-bearing windows reserve 2s for session closure and 1s for local
 # journal/JSON finalization inside, never after, their original total budget.
 $finalizationReserveMilliseconds = if ($Command -in @('calendar-window','colour-window','colour-baseline-window')) { 3000 } else { 0 }
+$ownershipWorkflowDeadlineUtc = $totalInvocationDeadlineUtc.AddMilliseconds(-$finalizationReserveMilliseconds)
+$ownershipSessionCloseDeadlineUtc = if ($finalizationReserveMilliseconds -gt 0) { $totalInvocationDeadlineUtc.AddMilliseconds(-1000) } else { $null }
+if ($finalizationReserveMilliseconds -gt 0) { $operationDeadlineUtc = $ownershipWorkflowDeadlineUtc }
 $effectiveOperationTimeoutSeconds = $TimeoutSeconds
 $serverTimeoutMilliseconds = $null
 $serverTimeoutDispatchRemainingSeconds = $null
@@ -130,6 +133,12 @@ function Get-RequestTimeoutSeconds {
     $remainingSeconds = ($script:operationDeadlineUtc - [DateTime]::UtcNow).TotalSeconds
     if ($remainingSeconds -le 0) { throw [TimeoutException]::new('The DevBench operation deadline expired before another request could start.') }
     return [int][Math]::Max(1, [Math]::Min($script:requestTimeoutSecondsForRpc, [Math]::Ceiling($remainingSeconds)))
+}
+
+function Assert-OwnershipDiscoveryDeadline {
+    if ($finalizationReserveMilliseconds -gt 0 -and [DateTime]::UtcNow -ge $ownershipWorkflowDeadlineUtc) {
+        throw [TimeoutException]::new('Ownership session discovery exceeded its original workflow cutoff; cleanup and terminal output reserves are not workflow time.')
+    }
 }
 
 function Get-DevBenchDispatchProvenance($InvocationRecord, $Data, $Semantic) {
@@ -518,6 +527,12 @@ function Invoke-McpRequest {
                 }
                 throw $parseFailure
             }
+            if ($finalizationReserveMilliseconds -gt 0 -and [DateTime]::UtcNow -ge $script:operationDeadlineUtc) {
+                $late = [TimeoutException]::new('Ownership MCP response completed after its original admitted operation cutoff.')
+                $late.Data['DevBenchMcpSessionId'] = if ($Headers.ContainsKey('Mcp-Session-Id')) { [string]$Headers['Mcp-Session-Id'] } else { Get-McpSessionHeaderValue -Response $response }
+                $late.Data['DevBenchMcpPartialResponse'] = $json
+                throw $late
+            }
             return [pscustomobject]@{ response = $response; json = $json; attempts = $attempt }
         }
         catch {
@@ -556,7 +571,7 @@ function Invoke-McpRequest {
                 }
                 throw
             }
-            if (-not $transient -or $attempt -gt $MaxTransientRetries) { throw }
+            if ($finalizationReserveMilliseconds -gt 0 -or -not $transient -or $attempt -gt $MaxTransientRetries) { throw }
             $transportRetries.Add([pscustomobject][ordered]@{
                 attempt = $attempt
                 statusCode = $statusCode
@@ -881,7 +896,8 @@ function Close-OwnedMcpSession {
     } else { $null }
     $owned = @($ownedMcpSessions | Where-Object sessionId -eq $sessionId | Select-Object -Last 1)
     if ($owned.Count -eq 1 -and $null -ne $owned[0].cleanup) { return $owned[0].cleanup }
-    $cleanup = Close-McpSession -Endpoint $Endpoint -Headers $Headers -DeadlineUtc $script:operationDeadlineUtc
+    $closeDeadline = if ($finalizationReserveMilliseconds -gt 0) { $ownershipSessionCloseDeadlineUtc } else { $script:operationDeadlineUtc }
+    $cleanup = Close-McpSession -Endpoint $Endpoint -Headers $Headers -DeadlineUtc $closeDeadline
     if ($owned.Count -eq 1) { $owned[0].cleanup = $cleanup }
     return $cleanup
 }
@@ -917,7 +933,12 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity, [switch]
     $baseHeaders = @{ Accept = 'application/json, text/event-stream'; 'Content-Type' = 'application/json' }
     $sessionHeaders = $null
     $initializeCompleted = $false
+    $initialize = $null
+    $listRpc = $null
+    $identity = $null
+    $discoveryPhase = 'initialize'
     try {
+        Assert-OwnershipDiscoveryDeadline
         $initialize = Invoke-McpRequest -Endpoint $endpoint -Headers $baseHeaders -Payload @{
             jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'initialize'; params = @{
                 protocolVersion = '2025-03-26'; capabilities = @{}; clientInfo = @{ name = 'DevBenchControl'; version = '1.5' }
@@ -933,19 +954,27 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity, [switch]
             openedUtc = [DateTime]::UtcNow.ToString('o')
             cleanup = $null
         })
+        $discoveryPhase = 'initialized'
+        Assert-OwnershipDiscoveryDeadline
         Invoke-WebRequest -UseBasicParsing -Method Post -Uri $endpoint -Headers $sessionHeaders -Body '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' -TimeoutSec (Get-RequestTimeoutSeconds) | Out-Null
+        Assert-OwnershipDiscoveryDeadline
+        $discoveryPhase = 'tools-list'
         $listRpc = Invoke-McpRequest -Endpoint $endpoint -Headers $sessionHeaders -Payload @{ jsonrpc = '2.0'; id = [DateTime]::UtcNow.Ticks; method = 'tools/list'; params = @{} }
         if ($listRpc.json.PSObject.Properties['error']) { throw "DevBench tools/list failed: $($listRpc.json.error | ConvertTo-Json -Compress)" }
         $sessionTools = @($listRpc.json.result.tools)
         $script:mcpCapabilityPreviouslyProven = $true
         $identity = $null
         if (-not $SkipRuntimeIdentityVerification) {
+            $discoveryPhase = 'runtime-identity'
+            Assert-OwnershipDiscoveryDeadline
             $identity = Get-RuntimeIdentity -Runtime $Runtime -Headers $sessionHeaders -Tools $sessionTools -AllowDeferredBuildIdentity:$AllowDeferredBuildIdentity -PropagateRetryable:$PropagateRetryable
+            Assert-OwnershipDiscoveryDeadline
             if ($identity.errors.Count -gt 0) { throw "DevBench runtime identity verification failed: $($identity.errors -join ' ')" }
         }
         return [pscustomobject][ordered]@{ headers = $sessionHeaders; tools = $sessionTools; runtimeIdentity = $identity; sessionId = $sessionId }
     }
     catch {
+        $discoveryFailure = $_
         $statusCode = $null
         try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = $null }
         $returnedSessionId = [string]$_.Exception.Data['DevBenchMcpSessionId']
@@ -969,6 +998,18 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity, [switch]
         }
         if ($null -ne $sessionHeaders) {
             $partialCleanup = Close-OwnedMcpSession -Endpoint $endpoint -Headers $sessionHeaders
+            $partialCleanup | Add-Member -NotePropertyName partialInitialization -NotePropertyValue ([pscustomobject][ordered]@{
+                phase = $discoveryPhase
+                error = $discoveryFailure.Exception.Message
+                workflowDeadlineUtc = $ownershipWorkflowDeadlineUtc.ToString('o')
+                closeDeadlineUtc = if ($ownershipSessionCloseDeadlineUtc) { $ownershipSessionCloseDeadlineUtc.ToString('o') } else { $script:operationDeadlineUtc.ToString('o') }
+                retainedResponse = $discoveryFailure.Exception.Data['DevBenchMcpPartialResponse']
+                initializeResponse = if ($initialize) { $initialize.json } else { $null }
+                toolListResponse = if ($listRpc) { $listRpc.json } else { $null }
+                runtimeIdentity = $identity
+                replacementSessionOpened = $false
+                retryDispatched = $false
+            }) -Force
             if (-not $partialCleanup.ok) {
                 $cleanupFailure = [InvalidOperationException]::new(
                     "DevBench MCP initialization failed and session '$($partialCleanup.sessionId)' cleanup is uncertain; refusing automatic rebind. $($partialCleanup.error)",
