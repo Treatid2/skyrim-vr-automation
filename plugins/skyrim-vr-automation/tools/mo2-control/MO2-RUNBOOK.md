@@ -128,6 +128,49 @@ The human code word `Lease` uses this separate flow:
 <absolute-pwsh.exe> -NoProfile -NonInteractive -File <absolute-Invoke-MO2Control.ps1> validate-human-mutation -HumanMutationId <private-mutation-capability> -TaskId <matching-routing-id> -Profile <exact-selected-profile> -Compact
 ```
 
+## Human headset handoff on Lease
+
+The human code word `Lease` includes restoring the normal physical-headset
+route before reporting that the environment is ready for human use. This is an
+Auto-Tools handoff responsibility, not caller cleanup, and uses the existing
+null-HMD controller rather than a new runtime wrapper.
+
+1. Inspect MO2 and acquire or reconcile the human lease for the exact selected
+   profile. Respect a foreign lease or unfinished owner; never steal access.
+   Retain an already-held matching human lease and its private capability.
+2. Inspect the shared SteamVR null state and authoritative transaction. Null-HMD
+   is global SteamVR configuration, not a mod marker in the selected profile.
+   If the normal route is already configured, leave the physical runtime and
+   applications alone. Do not treat effective.active=false alone as proof:
+   a forced null driver, enabled null/synthetic provider or retained tracking
+   override still requires classification against the receipt-bound baseline.
+3. If null-HMD is configured, require Skyrim and its loader closed before
+   changing its runtime. If they are running, ask the human to close them;
+   retain the coordination lease and report the handoff as blocked. Do not
+   force-close the game or claim headset-ready merely because a lease exists.
+4. Use the null controller's bounded graceful `stop` only if needed, and prove
+   SteamVR closed. A failed stop requires its exact owned-process evidence and
+   explicit recovery decision, not an automatic force-by-name kill. Virtual
+   Desktop/Streamer are neither targets nor blockers.
+5. Preview and restore the original authoritative apply transaction through
+   `restore -EvidenceDirectory <original-apply-evidence>`. Require its exact
+   retained profile/backups/receipt and drift validation. Missing provenance,
+   an unknown baseline, a foreign active owner or unclassified drift blocks the
+   handoff; never patch steamvr.vrsettings, invent a backup or reset settings.
+6. Inspect again and verify the restored baseline does not force null or retain
+   its controlled synthetic-head tracking override. Retain the restore receipt
+   and backup-hash proof before reporting human headset readiness. A baseline
+   that is itself null is not a successful physical-headset handoff.
+
+Preserve the selected MO2 profile, modlist, saves, task workspaces and unrelated
+runtime registrations. Do not close MO2 solely to restore stopped SteamVR, launch
+Skyrim, start the physical headset runtime, disable OCU, or release/transfer the
+human lease as part of this handoff. `Release` remains coordination-only.
+
+This is the operator workflow for the human code word, not an implicit side
+effect of every generic `request-access` call. Lease acquisition and successful
+runtime handoff are separate facts; report a pending/failed restore truthfully.
+
 The public lease identity is coordination metadata only. The private
 `humanMutationId` delegates exact selected-profile or separately authorized
 mod-content changes to its capability holder and must not appear in status,
