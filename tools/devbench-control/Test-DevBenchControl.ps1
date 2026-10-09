@@ -62,11 +62,23 @@ Assert-Test ($queryOutcome.ok -and $queryOutcome.completionBasis -eq 'execution-
 $queryReceipt.command='setini "fVrScale:VR" 1'
 Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName console -Arguments $queryArgs -Content @($queryReceipt)).ok) 'world-scale query requires exact command identity'
 $fenced = [pscustomobject]@{count=1;lines=@('INISetting fVrScale:VR >> 79.06');source='print';lossPossible=$false;markersFound=$true;sawBegin=$true;sawEnd=$true;diag=[pscustomobject]@{timedOut=$false;printHooked=$true;printDropped=0;lastMessage='Script command "DVBCAPENDx9F3" not found.'}}
-Assert-Test ((Get-DevBenchCallSemanticStatus -ToolName console -Arguments @{action='read'} -Content @($fenced)).ok) 'fenced console output preserves marker diagnostic text without treating it as an execution error'
+Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName console -Arguments @{action='read'} -Content @($fenced)).ok) 'legacy fenced output without generation/completeness telemetry remains unqualified'
+$fenced = [pscustomobject]@{
+    windowId=31;count=1;lines=@('INISetting fVrScale:VR >> 79.06');source='print';lossPossible=$false;markersFound=$true;sawBegin=$true;sawEnd=$true
+    diag=[pscustomobject]@{
+        consoleLogNull=$false;bufferEmpty=$false;bufferHasBegin=$true;lastMessageHasBegin=$false
+        consoleMenuExists=$true;consoleMenuOpen=$true;consoleMode=$true;printHooked=$true;timedOut=$false
+        bufferLen=3;printLines=3;printDropped=0;printPayloadLines=1;printPayloadBytes=34;ringLines=3;samples=1;ticks=1;engineFrames=1
+        lastMessage='Script command "DVBCAPENDx9F3" not found.'
+        printLoss=[pscustomobject]@{lineLimit=0;byteLimit=0;format=0;allocation=0;oversize=0}
+    }
+}
+$fencedArguments=@{action='read';windowId=31}
+Assert-Test ((Get-DevBenchCallSemanticStatus -ToolName console -Arguments $fencedArguments -Content @($fenced)).ok) 'fenced console output preserves marker diagnostic text without treating it as an execution error'
 foreach ($defect in @('lost','missingEnd','drop','timeout','count','stringLine','error')) {
     $bad = $fenced | ConvertTo-Json -Depth 6 | ConvertFrom-Json
     switch ($defect) { lost {$bad.lossPossible=$true}; missingEnd {$bad.sawEnd=$false}; drop {$bad.diag.printDropped=1}; timeout {$bad.diag.timedOut=$true}; count {$bad.count=2}; stringLine {$bad.lines='not-array'}; error {$bad | Add-Member error 'bad'} }
-    Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName console -Arguments @{action='read'} -Content @($bad)).ok) "console fenced $defect cannot qualify output"
+    Assert-Test (-not (Get-DevBenchCallSemanticStatus -ToolName console -Arguments $fencedArguments -Content @($bad)).ok) "console fenced $defect cannot qualify output"
 }
 
 $success = Get-DevBenchSemanticStatus -Content @([pscustomobject]@{ status = [pscustomobject]@{ name = 'success'; value = 0 } })
@@ -1221,7 +1233,18 @@ $missingHeader = Get-McpSessionHeaderValue -Response ([pscustomobject]@{ Headers
 $arrayHeader = Get-McpSessionHeaderValue -Response ([pscustomobject]@{ Headers = @{ 'Mcp-Session-Id' = @('owned-session', 'ignored') } })
 Assert-Test ([string]::IsNullOrWhiteSpace($missingHeader) -and $arrayHeader -eq 'owned-session') 'session header lookup preserves missing-header parse failures and normalizes present array values'
 $completedFixture = [pscustomobject][ordered]@{ ok = $true; transportOk = $true; semantic = [pscustomobject]@{ known = $true; ok = $true }; data = [pscustomobject]@{ value = 42 }; errors = @() }
-$completionWriteSucceeded = Write-TerminalInvocationEvidence -Result $completedFixture -FailurePrefix 'fixture completion write failed' -WriteAction { throw 'fixture persistence fault' }
+$script:terminalWriteFixtureInvoked=$false
+$completionWriteSucceeded = & {
+    # This case isolates admitted I/O failure. Deadline refusal/overrun have
+    # their own public-path tests; missing caller variables is not an I/O fault.
+    $finalizationReserveMilliseconds=0
+    $totalInvocationDeadlineUtc=[DateTime]::UtcNow.AddSeconds(5)
+    Write-TerminalInvocationEvidence -Result $completedFixture -FailurePrefix 'fixture completion write failed' -WriteAction {
+        $script:terminalWriteFixtureInvoked=$true
+        throw 'fixture persistence fault'
+    }
+}
+Assert-Test $script:terminalWriteFixtureInvoked 'terminal evidence fixture reaches the intended admitted failing writer'
 Assert-Test (-not $completionWriteSucceeded -and $completedFixture.ok -and $completedFixture.transportOk -and $completedFixture.data.value -eq 42 -and $completedFixture.evidenceWarnings[0] -match 'fixture persistence fault' -and -not $completedFixture.evidenceJournalFinalized) 'post-completion journal failure preserves the exact completed response and reports evidence loss'
 Assert-Test ($entryPointText -notmatch '(?im)^\s*\$pid\s*=') 'entry point never assigns PowerShell reserved PID variable'
 Assert-Test ($entryPointText -match '\$expectations\.buildId\s+-and\s+\$actualBuildId\s+-and') 'deferred build identity never compares a missing runtime build ID'
@@ -1232,7 +1255,24 @@ Assert-Test ($entryPointText -match '\$waitCompletion = Get-DevBenchWaitCompleti
 Assert-Test ($entryPointText -match '-not \$runtimeIdentity\.complete -or -not \$runtimeIdentity\.verified') 'mutation-capable calls require complete and positively verified runtime identity'
 Assert-Test ($entryPointText -match '\[string\]\$ExpectedRuntimeIdentityJson') 'controller accepts an exact prior runtime identity for pre-dispatch continuity'
 Assert-Test ($entryPointText.IndexOf('Expected runtime identity is invalid:') -lt $entryPointText.IndexOf("Update-InvocationEvidence -State 'dispatching'")) 'runtime identity continuity is verified before mutation dispatch'
-Assert-Test ($entryPointText -match 'if \(\$Command -in @\(''call'',''calendar-window'',''colour-window''\)\) \{[\s\S]{0,100}-not \$semantic\.known -or -not \$semantic\.ok') 'ordinary and composed mutation-capable calls fail closed on unknown semantic outcomes'
+$semanticFailureAssignments=@($entryPointAst.FindAll({param($node)
+    $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+    $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and $node.Left.VariablePath.UserPath -ceq 'semanticFailure'
+},$true))
+Assert-Test ($semanticFailureAssignments.Count -eq 1) 'production semantic-failure assignment is unambiguous'
+if($semanticFailureAssignments.Count -eq 1){
+    foreach($mutationCommand in @('call','calendar-window','colour-window','colour-baseline-window')){
+        foreach($semanticCase in @(@{known=$false;ok=$true;refuse=$true},@{known=$true;ok=$false;refuse=$true},@{known=$true;ok=$true;refuse=$false})){
+            $guardResult=& {
+                $Command=$mutationCommand;$RequireSuccess=$false
+                $semantic=[pscustomobject]@{known=$semanticCase.known;ok=$semanticCase.ok}
+                Invoke-Expression $semanticFailureAssignments[0].Extent.Text
+                $semanticFailure
+            }
+            Assert-Test ($guardResult -eq $semanticCase.refuse) "production $mutationCommand semantic guard known=$($semanticCase.known) ok=$($semanticCase.ok)"
+        }
+    }
+}
 Assert-Test ($entryPointText -match '\$Tool -eq ''communityshaders\.profiler''') 'profiler calls have an explicit semantic contract adapter'
 Assert-Test ($entryPointText -match '\$requestedAction -eq ''status''[\s\S]{0,180}\.status\.PSObject\.Properties\[''frame_count''\]') 'profiler status requires a frame-bearing status payload'
 Assert-Test ($entryPointText -match '\$requestedAction -eq ''enable''[\s\S]{0,160}\[bool\]\$profilerPayload\[0\]\.enabled') 'profiler enable requires observed enabled state'
@@ -1258,8 +1298,9 @@ Assert-Test ($entryPointText -match 'state = \$\(if \(\$Command -eq ''wait''\) \
 Assert-Test ($entryPointText -match "persistentSessionInvalidation\) \{ 'persistent-session-invalidated'" -and $entryPointText -match 'lastSuccessfulObservation = \$lastSuccessfulWaitObservation' -and $entryPointText -match 'Update-InvocationEvidence -State \$failureState .* -Data \$failureData') 'persistent session invalidation returns and journals a distinct state with the last successfully decoded observation'
 Assert-Test ($entryPointText -match '\(\$RequireSuccess -or \$Command -eq ''wait''\)') 'unsatisfied waits fail even without RequireSuccess'
 Assert-Test ($entryPointText -match 'function Close-McpSession') 'entry point defines deterministic MCP session cleanup'
-Assert-Test ($entryPointText -match '-Method Delete') 'owned MCP sessions are closed through the server lifecycle endpoint'
-Assert-Test ($entryPointText -match "state = 'already_absent'") 'an already-retired MCP session is a successful cleanup'
+$lifecycleFixture=& (Join-Path $PSScriptRoot 'Test-McpSessionLifecycle.ps1') | ConvertFrom-Json
+Assert-Test ($lifecycleFixture.ok -and $lifecycleFixture.realHttpUsed -and $lifecycleFixture.closed204) 'owned MCP sessions are closed through the server lifecycle endpoint'
+Assert-Test ($lifecycleFixture.alreadyAbsent404 -and $lifecycleFixture.failed500 -and $lifecycleFixture.expiredRefused) 'an already-retired MCP session is a successful cleanup, unlike HTTP failure or expired admission'
 Assert-Test ($entryPointText -match 'Close-OwnedMcpSession -Endpoint \$endpoint -Headers \$sessionHeaders') 'partially opened MCP sessions are cleaned before rethrowing'
 Assert-Test ($entryPointText -match 'Add-Member -NotePropertyName sessionCleanup') 'controller results preserve a structured session cleanup receipt'
 Assert-Test ($entryPointText -match "clientInfo = @\{ name = 'DevBenchControl'; version = '1\.5' \}") 'MCP client identity records the timeout-envelope revision'
