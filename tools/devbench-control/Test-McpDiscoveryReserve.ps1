@@ -14,6 +14,17 @@ foreach($name in @('Get-RequestTimeoutSeconds','Assert-OwnershipDiscoveryDeadlin
  if($nodes.Count-ne 1){throw "Ambiguous source boundary: $name"}
  . ([scriptblock]::Create($nodes[0].Extent.Text))
 }
+# Integrated contexts may use additional pure module predicates. Retain their
+# exact definitions rather than dropping their guards or inventing fixtures.
+$moduleText=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'DevBenchControl.psm1'))
+$moduleAst=[Management.Automation.Language.Parser]::ParseInput($moduleText,[ref]$tokens,[ref]$errors)
+if(@($errors).Count){throw 'Module source parse failed'}
+foreach($name in @('Test-DevBenchInitialMcpCapabilityMiss','Get-DevBenchMutationFailureDisposition')){
+ if(-not $text.Contains($name)){continue}
+ $nodes=@($moduleAst.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name},$true))
+ if($nodes.Count-ne 1){throw "Ambiguous integrated module boundary: $name"}
+ . ([scriptblock]::Create($nodes[0].Extent.Text))
+}
 $start=$text.IndexOf('$operationDeadlineUtc = $operationStartedUtc.AddSeconds($TimeoutSeconds)')
 $end=$text.IndexOf('$effectiveOperationTimeoutSeconds = $TimeoutSeconds',$start)
 if($start-lt 0 -or $end-lt 0){throw 'Exact invocation deadline binding missing'}
@@ -49,7 +60,7 @@ function Invoke-WebRequest {
  throw 'Unexpected target dispatch/replay'
 }
 function Get-RuntimeIdentity {
- param($Runtime,$Headers,$Tools,[switch]$AllowDeferredBuildIdentity)
+ param($Runtime,$Headers,$Tools,[switch]$AllowDeferredBuildIdentity,[switch]$PropagateRetryable)
  Invoke-FixturePhase 'runtime-identity'
  return [pscustomobject]@{errors=@();complete=$true;verified=$true}
 }
