@@ -1255,6 +1255,7 @@ function Get-ApplicationHeadPose {
     $afterAuthority = $null
     $afterPose = $null
     $continuityAfter = $null
+    $probeBudget = $null
     try {
         $packageAuthority = Get-NullProviderAuthority -DeadlineUtc $DeadlineUtc
         if (-not $packageAuthority.verified) { throw "Provider package refused before probe execution: $($packageAuthority.errors -join '; ')" }
@@ -1270,11 +1271,21 @@ function Get-ApplicationHeadPose {
         $probeTimeoutSeconds = 10
         if ($DeadlineUtc -ne [DateTime]::MaxValue) {
             $remainingMilliseconds = [long]($DeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds
-            if ($remainingMilliseconds -lt 1450) {
-                $failureKind = 'insufficient-budget'
-                throw [TimeoutException]::new('SteamVR readiness deadline leaves insufficient time for the application-facing pose probe and bounded cleanup.')
+            # Never truncate the independent experiment to fit late readiness.
+            # This deadline already excludes the startup's final log reserve.
+            $probeBudget = [pscustomobject][ordered]@{
+                deadlineUtc = $DeadlineUtc.ToString('o')
+                remainingMilliseconds = $remainingMilliseconds
+                probeTimeoutMilliseconds = 10000
+                processCleanupReserveMilliseconds = 450
+                postProbeVerificationReserveMilliseconds = 1000
+                requiredMilliseconds = 11450
+                admitted = $remainingMilliseconds -ge 11450
             }
-            $probeTimeoutSeconds = [Math]::Max(1, [Math]::Min(10, [Math]::Floor(($remainingMilliseconds - 450) / 1000)))
+            if (-not $probeBudget.admitted) {
+                $failureKind = 'insufficient-probe-budget'
+                throw [TimeoutException]::new("Application probe refused before dispatch: $remainingMilliseconds ms remain before the qualification deadline; 11450 ms are required for the full 10-second probe, bounded process cleanup and post-probe verification.")
+            }
         }
         $failureKind = 'bounded-process-failure'
         $probeAttempted = $true
@@ -1328,6 +1339,7 @@ function Get-ApplicationHeadPose {
             probePath = $probePath
             exitCode = $attempt.exitCode
             boundedProcess = $bounded
+            probeBudget = $probeBudget
             observation = $payload
             packageAuthority = $afterAuthority
             providerContinuity = $continuityAfter
@@ -1339,7 +1351,8 @@ function Get-ApplicationHeadPose {
             available = $false; qualified = $false
             probeAttempted = $probeAttempted; terminalFailure = $true; failureKind = $failureKind
             controllersRequired = $true; controllersQualified = $false
-            timedOut = $true; probePath = $probePath
+            timedOut = $probeAttempted; probePath = $probePath
+            probeBudget = $probeBudget
             boundedProcess = $bounded; observation = $payload; packageAuthority = $afterAuthority
             providerContinuity = $continuityAfter; poseAfterProbe = $afterPose; error = $_.Exception.Message
         }
@@ -1350,6 +1363,7 @@ function Get-ApplicationHeadPose {
             probeAttempted = $probeAttempted; terminalFailure = $true; failureKind = $failureKind
             controllersRequired = $true; controllersQualified = $false
             timedOut = $false; probePath = $probePath
+            probeBudget = $probeBudget
             boundedProcess = $bounded; observation = $payload; packageAuthority = $afterAuthority
             providerContinuity = $continuityAfter; poseAfterProbe = $afterPose; error = $_.Exception.Message
         }
@@ -2081,7 +2095,7 @@ try {
                     $processes = @(Get-SteamVRProcesses)
                     try {
                         $runtimeProbeAttempts++
-                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline -DiagnosticPhases:$ProbeDiagnosticPhases
+                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $qualificationDeadline -DiagnosticPhases:$ProbeDiagnosticPhases
                     }
                     catch [TimeoutException] {
                         $lastRuntimeProbeError = $_.Exception.Message
@@ -2105,7 +2119,7 @@ try {
                         if ($InternalTestFailurePoint -in @('runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-confirmation-timeout-input-contract-failure')) {
                             throw [TimeoutException]::new('Injected runtime confirmation timeout.')
                         }
-                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline -DiagnosticPhases:$ProbeDiagnosticPhases
+                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $qualificationDeadline -DiagnosticPhases:$ProbeDiagnosticPhases
                         if ($runtime.applicationHeadPose.terminalFailure) {
                             $lastRuntimeProbeError = [string]$runtime.applicationHeadPose.error
                             $runtimeConfirmationTimedOut = [bool]$runtime.applicationHeadPose.timedOut
@@ -2134,6 +2148,11 @@ try {
                 elseif ($runtime.headPoseAuthorizationError) {
                     $failureState = 'head-pose-provider-authorization-failed'
                     $failureErrors.Add([string]$runtime.headPoseAuthorizationError)
+                }
+                elseif ($runtime.applicationHeadPose.failureKind -eq 'insufficient-probe-budget') {
+                    $failureState = 'application-pose-probe-insufficient-budget'
+                    $failureErrors.Add([string]$lastRuntimeProbeError)
+                    $failureErrors.Add('No independent probe was launched; the full probe and verification budget was unavailable.')
                 }
                 elseif ($runtime.applicationHeadPose.PSObject.Properties['timedOut'] -and $runtime.applicationHeadPose.timedOut) {
                     $failureState = 'application-pose-probe-timeout'

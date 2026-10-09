@@ -177,6 +177,16 @@ central bounded-process controller. The probe and its process-tree cleanup are
 charged to the outer readiness deadline. Shared-memory protocol versions are
 admitted before size selection, and access-denied state is surfaced distinctly
 from a provider that is simply not running. A probe cannot outlive its timeout.
+Startup never shortens the independent probe's 10-second timeout to fit late
+provider readiness. After package/creator checks, admission requires 11450 ms
+before the qualification deadline: 10000 ms for the probe, 450 ms process-cleanup
+allowance and 1000 ms post-probe verification allowance. That deadline separately
+excludes the final log/receipt reserve from the unchanged outer startup cap.
+Insufficient budget returns `application-pose-probe-insufficient-budget` before
+dispatch, retaining the required/remaining budget and exact-attempt cleanup.
+It is not a native timeout or evidence of a hung OpenVR call. The existing
+successful-start confirmation also refuses its probe if the full budget is
+unavailable after its two-second wait; failures never trigger replay.
 If a start or qualification attempt fails, cleanup stops only
 SteamVR-root-owned processes whose creation time belongs to that attempt and
 reports the verified survivor inventory.
