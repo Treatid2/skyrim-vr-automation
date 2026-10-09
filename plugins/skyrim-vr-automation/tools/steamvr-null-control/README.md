@@ -4,6 +4,17 @@
 restores the Valve null-HMD route. Apply always takes an exact settings backup,
 and restore requires its hash receipt.
 
+For an explicitly authorised diagnosis with a matching new exact native package,
+opt in with `-ProbeDiagnosticPhases`. The existing admitted independent probe
+then receives `--diagnostic-phases`: flushed fixed-domain stderr records identify
+entered/completed/aborted native call boundaries. The original stdout JSON,
+ten-second probe share, one attempt and package/creator/continuity/readiness gates
+are unchanged. Raw partial stderr stays in the bounded result even on timeout;
+it is diagnostic coverage, never pose readiness or historical root-cause proof.
+Older probes reject the flag, so new source alone does not enable live use.
+See `native/steamvr-head-pose/PROBE-PHASE-DIAGNOSTICS.md` for the output bound,
+truncation limits and source/build/live distinctions. Default behavior is unchanged.
+
 Applying settings is not runtime proof. `start` launches SteamVR and succeeds
 only after the current `vrserver` session logs both the Valve null driver load
 and `Active HMD set to null.<configured serial>`. `inspect` therefore reports
