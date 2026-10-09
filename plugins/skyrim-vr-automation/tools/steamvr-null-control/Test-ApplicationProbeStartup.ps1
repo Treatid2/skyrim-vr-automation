@@ -159,7 +159,7 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
         if($s.live){[pscustomobject]@{Id=12345}}
     }
     $kinds=@{empty='empty-output';undrained='stream-drain-incomplete';malformed='malformed-output';'package-drift'='provider-package-drift';continuity='continuity-failed';exit='bounded-process-failure';timeout='timeout';unqualified='observation-unqualified';'confirmation-malformed'='malformed-output'}
-    foreach ($case in @('empty','undrained','malformed','package-drift','continuity','exit','timeout','unqualified','confirmation-malformed','success','delayed-provider')) {
+    foreach ($case in @('empty','undrained','malformed','package-drift','continuity','exit','timeout','unqualified','confirmation-malformed','success','delayed-provider','insufficient-budget')) {
         $caseRoot=Join-Path $fixture $case
         $script:currentSteamRoot=Join-Path $caseRoot 'SteamVR'
         $provider=Join-Path $caseRoot 'provider'
@@ -181,11 +181,19 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
         $parameters=@{SettingsPath=$settings;NullProfilePath=$profile;SteamVRRoot=$script:currentSteamRoot;HeadPoseDriverRoot=$provider;ServerLogPath=$log;OpenVRPathsPath=$openVR;EvidenceDirectory=$evidence;Compact=$true;NoExit=$true}
         $apply=& $fixtureEntry apply @parameters|ConvertFrom-Json -Depth 80
         Assert-Startup ($apply.ok -and $apply.state -ceq 'null-applied') "$case real temporary apply transaction"
-        $result=& $fixtureEntry start @parameters -StartupTimeoutSeconds 10|ConvertFrom-Json -Depth 80
+        $startupSeconds=if($case -ceq 'insufficient-budget'){5}else{20}
+        $result=& $fixtureEntry start @parameters -StartupTimeoutSeconds $startupSeconds|ConvertFrom-Json -Depth 80
         if(-not $result.data.PSObject.Properties['runtimeReceiptPath']){throw "Public start did not reach attempt receipt: $($result|ConvertTo-Json -Depth 20 -Compress)"}
         $receipt=Get-Content -LiteralPath $result.data.runtimeReceiptPath -Raw|ConvertFrom-Json -Depth 80
-        $count=@(Get-Content -LiteralPath (Join-Path $provider 'dispatch-count.txt')).Count
-        if($case -in @('success','delayed-provider')){
+        $countPath=Join-Path $provider 'dispatch-count.txt'
+        $count=if(Test-Path -LiteralPath $countPath){@(Get-Content -LiteralPath $countPath).Count}else{0}
+        if($case -ceq 'insufficient-budget'){
+            $application=$result.data.runtime.applicationHeadPose
+            Assert-Startup (-not $result.ok -and $result.state -ceq 'application-pose-probe-insufficient-budget' -and $receipt.admissionState -ceq $result.state) 'budget refusal public state/receipt agree'
+            Assert-Startup ($count -eq 0 -and -not $application.probeAttempted -and -not $application.timedOut -and $null -eq $application.boundedProcess -and $application.failureKind -ceq 'insufficient-probe-budget') 'public late budget never dispatches or claims timeout'
+            Assert-Startup ($application.probeBudget.deadlineUtc -ceq $receipt.qualificationDeadlineUtc -and $application.probeBudget.requiredMilliseconds -eq 11450 -and -not $application.probeBudget.admitted) 'probe admission excludes final verification reserve'
+            Assert-Startup (-not $receipt.runtimeAccepted -and $null -eq $receipt.acceptedUtc -and -not $receipt.runtimeConfirmationAttempted -and $result.data.startupCleanup.verified) 'budget refusal preserves failed receipt/exact cleanup without confirmation'
+        }elseif($case -in @('success','delayed-provider')){
             Assert-Startup ($result.ok -and $receipt.runtimeAccepted -and $result.data.runtime.headPoseReady -and $result.data.runtime.controllersReady) "$case successful production qualification retained"
             Assert-Startup ($count -eq 2 -and $receipt.runtimeConfirmationAttempted) "$case independent success confirmation retained"
             Assert-Startup (-not $result.data.runtime.applicationHeadPose.terminalFailure -and $null -eq $result.data.runtime.applicationHeadPose.failureKind) "$case success disposition"
