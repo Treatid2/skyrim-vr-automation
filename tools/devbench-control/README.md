@@ -62,6 +62,14 @@ remain distinct. This does not broaden the read-only `calendar-window` allowlist
 set quality or render scale, take ownership from the live experiment, or qualify
 scientific colour. No mutation replay or second transport lane is permitted.
 
+## Finite same-session stereo stills
+
+`calendar-still-window` accepts an exclusive seven-field typed still plan. See
+[CALENDAR-STILL-WINDOW.md](CALENDAR-STILL-WINDOW.md) for bounded same-session
+calendar/capture ownership, original request cleanup, independently verified
+stereo publication and actual acquisition coverage. It is not a continuous
+sequence or quietness claim; existing read-only calendar/colour modes are unchanged.
+
 ## Finite same-session calendar observation
 
 `calendar-window` is a bounded ownership composition in this controller, not
