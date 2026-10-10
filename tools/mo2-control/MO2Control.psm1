@@ -3543,10 +3543,13 @@ function Invoke-MO2RetainedSessionDialogCleanup {
     }
     if (-not $WindowFactory) { $WindowFactory = { param($Binding) @(Get-MO2AutomationWindows -ProcessId ([int]$Binding.record.id)) } }
     if (-not $OwnedAction) {
+        # Preserve this module's session state so the default action can resolve
+        # private ownership/UI functions. It is invoked synchronously below;
+        # Config remains in this call's scope, not an escaping dynamic module.
         $OwnedAction = {
             param($AuthorityOwned, $Binding, $Action, [object[]]$Arguments)
             Invoke-MO2OwnedProcessAction -Config $Config -Owned $AuthorityOwned -Process $Binding.process -Action $Action -ArgumentList $Arguments
-        }.GetNewClosure()
+        }
     }
     $before = @(Get-MO2WindowSnapshot -Processes $Processes)
     $actions = [Collections.Generic.List[object]]::new()
