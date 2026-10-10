@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 [CmdletBinding()]
-param([switch]$DiscoveryOnly, [switch]$RequalificationOnly, [switch]$UnchangedCompletionOnly, [switch]$ConfigCustodyOnly, [switch]$PreservedCacheOnly, [switch]$DisabledInventoryOnly, [switch]$CompletedReconciliationOnly, [string]$FixtureRoot)
+param([switch]$DiscoveryOnly, [switch]$RequalificationOnly, [switch]$UnchangedCompletionOnly, [switch]$ConfigCustodyOnly, [switch]$PreservedCacheOnly, [switch]$DisabledInventoryOnly, [switch]$CompletedReconciliationOnly, [switch]$DurableBundleOnly, [string]$FixtureRoot)
 
 $ErrorActionPreference = 'Stop'
 $entry = Join-Path (Split-Path -Parent $PSScriptRoot) 'Invoke-MO2WorkspaceControl.ps1'
@@ -396,6 +396,10 @@ try {
     $preparedCache = & $catalogEntry prepare -CatalogRoot $catalogRoot -CachePath $created.data.runtimeOutput.cachePath -ProfilePath $created.data.modListPath -ModsPath $mods -BindToOverwrite -EvidenceDirectory $created.data.runtimeOutput.cacheEvidenceDirectory -BuildId $created.data.runtimeOutput.cachePrepareArguments.BuildId -ShaderCacheAbi $created.data.runtimeOutput.cachePrepareArguments.ShaderCacheAbi -WorkspaceId $created.data.workspaceId -OwnershipId $created.data.ownershipId -OwnerMarkerPath $created.data.runtimeOutput.ownerMarkerPath -OwnerMarkerSha256 $created.data.runtimeOutput.ownerMarkerSha256 -ShaderSourceSha256 $shaderSourceSha256 -RequireMaterializedOutput -BlockingProcessNames MO2WorkspaceImpossibleFixtureProcess -NoExit -Confirm:$false | ConvertFrom-Json
     $preparedIsolation = Get-MO2TaskWorkspaceIsolation -Config $config -Profile $created.data.profileName -Executable Test -AccessId $accessId -RequirePreparedCache
     if (-not $preparedCache.ok -or -not $preparedIsolation.ok -or -not $preparedIsolation.cachePlan.verification.ok -or [int]$preparedIsolation.cachePlan.verification.requiredProviderFiles -ne 2) { throw "Prepared Overwrite provider-shadow verification failed. Prepare: $($preparedCache | ConvertTo-Json -Depth 20 -Compress) Isolation: $($preparedIsolation | ConvertTo-Json -Depth 20 -Compress)" }
+    if ($DurableBundleOnly) {
+        . (Join-Path $PSScriptRoot 'Test-DurableBundle.inc.ps1')
+        return
+    }
     if ($RequalificationOnly) {
         . (Join-Path $PSScriptRoot 'Test-OutputRequalification.inc.ps1')
         return

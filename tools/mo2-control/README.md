@@ -251,6 +251,24 @@ the exit code, but must be reviewed before a state-changing operation.
 
 ## Package layout
 
+New prepared bundles use inventory/bundle version `1.1.0`, with the exact
+transaction, inventory and target-lock module under `shader-cache-control`,
+plus the lifecycle/configuration/custody modules and captured configuration.
+Every member is included in the producer's hash/physical-identity binding.
+Recovery still verifies original version `1.0.0` bindings as historical
+inventories; it does not retrofit or rewrite an old session. For a session
+whose launch preview refused because its bundle lacks a dependency, retain the
+original refusal and bundle, complete/release that session using its supported
+controls, resume its retained workspace under fresh owned access, and prepare
+a NEW session from the corrected source. Use the newly returned controller
+path and preview launch before any live dispatch. No plugin reinstall or
+native rebuild is needed for this PowerShell-only correction.
+
+Unavailable Community Shaders inspection vetoes launch and is reported as
+`communityShadersBuildInspection: unavailable`; it does not establish DLL,
+manifest, build ID or ABI drift. A successfully inspected mismatching binding
+still fails closed as an actual mismatch.
+
 - `Invoke-MO2Control.ps1` — stable command-line entry point.
 - `MO2Control.psm1` — inspection and validation implementation.
 - `config/machine.example.json` — portable configuration template.

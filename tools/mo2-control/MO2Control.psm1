@@ -668,10 +668,12 @@ function Get-MO2OverwriteWorkspaceIsolation {
     }
 
     $cacheProviders = $null; $backupProviders = $null; $cacheInventory = $null; $backupInventory = $null; $currentBuild = $null
+    $buildInspectionCompleted = $false
     try {
         $transactionTool = Resolve-MO2ShaderCacheTransactionTool
         if (-not $outputCompleted) {
             $currentBuild = Resolve-MO2CommunityShadersBuildBinding -TransactionTool $transactionTool -ProfilePath $modListPath -ModsPath $modsRoot
+            $buildInspectionCompleted = $true
             $cacheProviders = ConvertFrom-MO2JsonText ([string](& $transactionTool providers -ProfilePath $modListPath -ModsPath $modsRoot -RelativeCachePath 'ShaderCache' -DeepInventory -IncludeInventoryEntries -NoExit -Confirm:$false))
             $backupProviders = ConvertFrom-MO2JsonText ([string](& $transactionTool providers -ProfilePath $modListPath -ModsPath $modsRoot -RelativeCachePath 'backup' -DeepInventory -IncludeInventoryEntries -NoExit -Confirm:$false))
             $cacheInspection = ConvertFrom-MO2JsonText ([string](& $transactionTool inspect -CachePath $expectedCachePath -RelativeCachePath 'ShaderCache' -NoExit -Confirm:$false))
@@ -693,7 +695,9 @@ function Get-MO2OverwriteWorkspaceIsolation {
     catch { $errors.Add("Could not inspect bound MO2 Overwrite output: $($_.Exception.Message)") }
 
     $expectedBuild = if ($output.PSObject.Properties['communityShadersPlugin']) { $output.communityShadersPlugin } else { $null }
-    if (-not $outputCompleted -and -not (Test-MO2CommunityShadersBuildBinding -Expected $expectedBuild -Current $currentBuild)) {
+    # An unavailable inspection is already a launch veto, not evidence of drift.
+    # Compare only an independently returned current binding.
+    if (-not $outputCompleted -and $buildInspectionCompleted -and -not (Test-MO2CommunityShadersBuildBinding -Expected $expectedBuild -Current $currentBuild)) {
         $errors.Add('The winning Community Shaders DLL, manifest, build ID, or shader-cache ABI changed after workspace creation.')
     }
     if ($RequirePreparedCache -and $outputCompleted) {
@@ -835,6 +839,7 @@ function Get-MO2OverwriteWorkspaceIsolation {
         workspace = $Owned; runtimeOutput = $output
         cachePlan = [pscustomobject]@{ required = [bool]$RequirePreparedCache; path = $planPath; completionPath = $completionPath; verification = $cacheVerification }
         backupVerification = $backupVerification; checks = @($checks); errors = @($errors)
+        communityShadersBuildInspection = if ($outputCompleted) { 'not-required-completed-output' } elseif (-not $buildInspectionCompleted) { 'unavailable' } elseif (Test-MO2CommunityShadersBuildBinding -Expected $expectedBuild -Current $currentBuild) { 'matched' } else { 'mismatch' }
     }
 }
 
@@ -2452,7 +2457,7 @@ function New-MO2ControllerBundleBinding {
         }
     }
     return [pscustomobject][ordered]@{
-        contractVersion = '1.0.0'; inventoryVersion = '1.0.0'; bundleContractVersion = '1.0.0'
+        contractVersion = '1.0.0'; inventoryVersion = '1.1.0'; bundleContractVersion = '1.1.0'
         controllerPath = [string]$Controller.controllerPath; configPath = [string]$Controller.configPath
         receiptPath = [string]$Controller.receiptPath
         receiptBytes = (Get-Item -LiteralPath $Controller.receiptPath -Force).Length
@@ -2468,7 +2473,8 @@ function Assert-MO2ControllerBundleBinding {
         -not $Manifest.PSObject.Properties['controllerBundleBinding']) { throw 'Prepared generation has no independent controller bundle binding; historical evidence is not upgraded in place.' }
     $binding = $Data.controllerBundleBinding
     if (($binding | ConvertTo-Json -Depth 30 -Compress) -cne ($Manifest.controllerBundleBinding | ConvertTo-Json -Depth 30 -Compress) -or
-        $binding.contractVersion -cne '1.0.0' -or $binding.inventoryVersion -cne '1.0.0' -or $binding.bundleContractVersion -cne '1.0.0') { throw 'Controller binding version or lock/manifest inventory differs.' }
+        $binding.contractVersion -cne '1.0.0' -or $binding.inventoryVersion -cnotin @('1.0.0','1.1.0') -or
+        $binding.bundleContractVersion -cne $binding.inventoryVersion) { throw 'Controller binding version or lock/manifest inventory differs.' }
     $directory = Join-Path ([IO.Path]::GetFullPath([string]$Data.sessionPath)) 'controller'
     foreach ($pair in @(@('controllerPath','Invoke-MO2Control.ps1'),@('configPath','config\machine.local.json'),@('receiptPath','controller-bundle.json'))) {
         $property = $pair[0]
@@ -2507,6 +2513,11 @@ function Assert-MO2ControllerBundleBinding {
     foreach ($required in @('Invoke-MO2Control.ps1','ConfigResolution.psm1','MO2Control.psm1','config/machine.local.json')) {
         if (-not $names.Contains($required)) { throw 'Required controller member is missing.' }
     }
+    if ($binding.inventoryVersion -ceq '1.1.0') {
+        foreach ($required in @('CSXConfigCustodyProof.ps1','shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1','shader-cache-control\ShaderCacheInventory.ps1','shader-cache-control\ShaderCacheTargetLock.psm1')) {
+            if (-not $names.Contains($required)) { throw 'Required controller dependency is missing.' }
+        }
+    }
     return $binding
 }
 
@@ -2527,7 +2538,8 @@ function New-MO2DurableSessionController {
         [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'MO2Control.psm1'); relativePath = 'MO2Control.psm1' },
         [pscustomobject]@{ source = (Join-Path $PSScriptRoot 'CSXConfigCustodyProof.ps1'); relativePath = 'CSXConfigCustodyProof.ps1' },
         [pscustomobject]@{ source = (Join-Path (Split-Path -Parent $PSScriptRoot) 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1'); relativePath = 'shader-cache-control\Invoke-CSXShaderCacheTransaction.ps1' },
-        [pscustomobject]@{ source = (Join-Path (Split-Path -Parent $PSScriptRoot) 'shader-cache-control\ShaderCacheInventory.ps1'); relativePath = 'shader-cache-control\ShaderCacheInventory.ps1' }
+        [pscustomobject]@{ source = (Join-Path (Split-Path -Parent $PSScriptRoot) 'shader-cache-control\ShaderCacheInventory.ps1'); relativePath = 'shader-cache-control\ShaderCacheInventory.ps1' },
+        [pscustomobject]@{ source = (Join-Path (Split-Path -Parent $PSScriptRoot) 'shader-cache-control\ShaderCacheTargetLock.psm1'); relativePath = 'shader-cache-control\ShaderCacheTargetLock.psm1' }
     )
     if ($WhatIf) {
         return [pscustomobject][ordered]@{ controllerPath = $entryPath; configPath = $configPath; receiptPath = $receiptPath; durable = $true; wouldCopy = @($sourceFiles | ForEach-Object { $_.relativePath }) }
@@ -2546,7 +2558,7 @@ function New-MO2DurableSessionController {
     Write-MO2JsonAtomic -Path $configPath -Value $Config -CreateNew
     $files += [pscustomobject][ordered]@{ name = 'config/machine.local.json'; path = $configPath; sha256 = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash }
     Write-MO2JsonAtomic -Path $receiptPath -Value ([pscustomobject][ordered]@{
-        contractVersion = '1.0.0'; createdUtc = [DateTime]::UtcNow.ToString('o'); durable = $true
+        contractVersion = '1.1.0'; createdUtc = [DateTime]::UtcNow.ToString('o'); durable = $true
         purpose = 'Session-scoped lifecycle controller retained independently of the versioned Codex plugin cache.'
         controllerPath = $entryPath; configPath = $configPath; files = $files
     }) -CreateNew
