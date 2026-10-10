@@ -144,6 +144,27 @@ different. With no match it safely leaves the current tree in use; add
 Repeating `prepare` with the same immutable cache, evidence, and catalog
 identities reconciles and returns the existing prepared plan.
 
+A retry from the earlier `snapshot-preserved` boundary must first revalidate
+the canonical snapshot receipt, its preserved physical baseline and the current
+cache against the plan's `beforeTreeSha256`. A reconciled Overwrite owner also
+requires that same live tree to match its retained reconciled baseline. Any
+drift refuses before seeding, provider shadowing or plan advancement, preserving
+the plan, receipt, owner and changed cache for recovery; retry does not rebase
+the generation. A no-drift retry continues the original preparation.
+
+Preparation now owns the same canonical exclusive target lock as standalone
+snapshot/seed/restore for the complete admission-to-publication interval. This
+includes no-seed preparation, lower-provider materialization, final inventory
+and the `prepared` plan write. Nested transactions re-enter only an actually
+held in-process/runspace handle; there is no caller-provided skip-lock flag or
+borrowed/serialized capability. The bounded lock wait remains 10 seconds.
+Seeding from preparation also supplies `-ExpectedTargetTreeSha256`; it refuses
+target drift before a seed journal, displacement or receipt is written.
+Cooperating writers use the same lock. This does not protect against arbitrary
+non-controller filesystem writes: closed MO2/game gates, owner/profile checks,
+reparse refusals and bounded inventories remain required. Interrupted preparation
+and original failed readmission evidence are not silently rebased.
+
 ### Opt-in same-task preserved working-cache resume
 
 To resume a completed **unverified** working cache from the same retained MO2
@@ -285,7 +306,16 @@ explicitly needs that potentially large list in the command response.
 
 Restore never silently discards the current tree: it copies the displaced
 contents into the evidence directory, verifies that copy, and only then removes
-the temporary sibling used for the atomic swap. Seed and restore mirror unique
+the temporary sibling used for the atomic swap. `restore` optionally accepts
+`-RestoreEvidenceDirectory` for an explicit existing, reparse-free audit directory
+disjoint from both snapshot evidence and the live cache. Snapshot authority,
+baseline and receipt remain in `-EvidenceDirectory`; the restore receipt,
+committed journal, unique pre-restore inventory and displaced physical tree go
+to the separate audit directory. Their original snapshot transaction ID and
+receipt path are retained. Workspace requalification uses an attempt-local
+namespace so rolled-back forward restores never become normal completion
+authority. Ordinary callers retain the original namespace by default.
+Seed and restore mirror unique
 evidence journals while updating the one target-owned authoritative journal
 before each filesystem move. Any pre-commit failure first
 quarantines the uncommitted replacement, restores and hash-verifies the exact

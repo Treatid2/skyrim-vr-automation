@@ -10,9 +10,14 @@ param(
 
     [string]$EvidenceDirectory,
 
+    # Optional restore-only audit namespace; snapshot authority remains in EvidenceDirectory.
+    [string]$RestoreEvidenceDirectory,
+
     [string]$SourceCachePath,
 
     [string]$ExpectedSourceTreeSha256,
+
+    [string]$ExpectedTargetTreeSha256,
 
     [string]$ShaderCacheAbiOverride,
 
@@ -57,6 +62,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'ShaderCacheInventory.ps1')
+Import-Module (Join-Path $PSScriptRoot 'ShaderCacheTargetLock.psm1') -ErrorAction Stop
 
 function Get-LiveProcesses([string[]]$Names) {
     $records = @()
@@ -132,42 +138,11 @@ function Test-PathWithin([string]$Path, [string]$Parent) {
 }
 
 function Get-CacheTransactionControl([string]$LivePath) {
-    $canonical = [IO.Path]::GetFullPath($LivePath).TrimEnd('\')
-    $identity = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($canonical.ToUpperInvariant())))
-    $override = [Environment]::GetEnvironmentVariable('CSX_SHADER_CACHE_CONTROL_ROOT')
-    if ([string]::IsNullOrWhiteSpace($override)) {
-        $base = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'CSX-VR-Automation\ShaderCache\transactions'
-    }
-    else {
-        $base = [IO.Path]::GetFullPath($override)
-        $temporary = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
-        if (-not (Test-PathWithin -Path $canonical -Parent $temporary) -or -not (Test-PathWithin -Path $base -Parent $temporary)) {
-            throw 'CSX_SHADER_CACHE_CONTROL_ROOT is fixture-only and requires both the cache and control root beneath the OS temporary directory.'
-        }
-    }
-    $root = Join-Path $base $identity
-    return [pscustomobject][ordered]@{
-        identity = $identity
-        root = $root
-        lock = Join-Path $root 'target.lock'
-        journal = Join-Path $root 'transaction.journal.json'
-    }
+    return Get-CSXCacheTransactionControl $LivePath
 }
 
 function Enter-CacheTransactionLock($Control) {
-    New-Item -ItemType Directory -Path $Control.root -Force | Out-Null
-    $timer = [Diagnostics.Stopwatch]::StartNew()
-    do {
-        try {
-            return [IO.File]::Open($Control.lock, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-        }
-        catch [IO.IOException] {
-            if ($timer.ElapsedMilliseconds -ge $TransactionLockTimeoutMilliseconds) {
-                throw "Timed out acquiring shader-cache target lock after $TransactionLockTimeoutMilliseconds ms: $($Control.lock)"
-            }
-            Start-Sleep -Milliseconds ([Math]::Min(100, [Math]::Max(10, $TransactionLockTimeoutMilliseconds - [int]$timer.ElapsedMilliseconds)))
-        }
-    } while ($true)
+    return Enter-CSXCacheTargetLock -CachePath $resolvedCache -TimeoutMilliseconds $TransactionLockTimeoutMilliseconds
 }
 
 function Write-CacheJournal($Control, $Journal) {
@@ -438,6 +413,7 @@ $result = $null
 $cacheControl = $null
 $cacheLock = $null
 try {
+    if (-not [string]::IsNullOrWhiteSpace($RestoreEvidenceDirectory) -and $Command -ne 'restore') { throw '-RestoreEvidenceDirectory is supported only by restore.' }
     if ($Command -eq 'providers') {
         if ($IncludeInventoryEntries -and -not $DeepInventory) { throw '-IncludeInventoryEntries requires -DeepInventory.' }
         $result = [pscustomobject][ordered]@{ ok = $true; command = $Command; data = Get-Providers; errors = @() }
@@ -458,6 +434,21 @@ try {
         }
         else {
             $paths = Get-ReceiptPaths
+            if ($Command -eq 'restore') {
+                $restoreEvidence = $paths.evidence
+                if (-not [string]::IsNullOrWhiteSpace($RestoreEvidenceDirectory)) {
+                    $restoreEvidence = [IO.Path]::GetFullPath($RestoreEvidenceDirectory).TrimEnd('\', '/')
+                    $sourceEvidence = $paths.evidence.TrimEnd('\', '/')
+                    $liveRoot = $resolvedCache.TrimEnd('\', '/')
+                    foreach ($protectedRoot in @($sourceEvidence, $liveRoot)) {
+                        if ([string]::Equals($restoreEvidence, $protectedRoot, [StringComparison]::OrdinalIgnoreCase) -or
+                            $restoreEvidence.StartsWith($protectedRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+                            $protectedRoot.StartsWith($restoreEvidence + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'Separate restore evidence must be disjoint from snapshot evidence and the live cache.' }
+                    }
+                    if (-not (Test-Path -LiteralPath $restoreEvidence -PathType Container)) { throw 'Separate restore evidence must be an explicit existing directory.' }
+                    Assert-NoCacheReparsePoint -Path $restoreEvidence -Purpose 'Separate restore audit evidence'
+                }
+            }
             if ($Command -in @('snapshot', 'seed', 'restore') -and -not $WhatIfPreference) {
                 $cacheControl = Get-CacheTransactionControl $resolvedCache
                 $cacheLock = Enter-CacheTransactionLock $cacheControl
@@ -529,6 +520,10 @@ try {
                     $preservedDisplaced = Join-Path $paths.evidence ('cache.displaced-before-seed.' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '.' + [guid]::NewGuid().ToString('N'))
                     $current = Get-TreeInventory $resolvedCache
                     $abiBefore = $null
+                    if (-not [string]::IsNullOrWhiteSpace($ExpectedTargetTreeSha256) -and
+                        ($ExpectedTargetTreeSha256 -notmatch '\A[0-9A-Fa-f]{64}\z' -or $current.treeSha256 -ine $ExpectedTargetTreeSha256)) {
+                        throw 'Seed target tree no longer matches the caller-admitted baseline; refusing displacement.'
+                    }
                     $staged = $null
                     $journalPath = $null
                     $seedReceiptPath = $null
@@ -601,24 +596,26 @@ try {
                     $leaf = Split-Path -Leaf $resolvedCache
                     $staging = Join-Path $parent ('.' + $leaf + '.restore.' + [guid]::NewGuid().ToString('N'))
                     $displaced = Join-Path $parent ('.' + $leaf + '.displaced.' + [guid]::NewGuid().ToString('N'))
-                    $preservedDisplaced = Join-Path $paths.evidence ('cache.displaced.' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '.' + [guid]::NewGuid().ToString('N'))
+                    $preservedDisplaced = Join-Path $restoreEvidence ('cache.displaced.' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '.' + [guid]::NewGuid().ToString('N'))
                     $current = Get-TreeInventory $resolvedCache
                     $journalPath = $null
                     $restoreReceiptPath = $null
                     if ($PSCmdlet.ShouldProcess($resolvedCache, 'Restore exact preserved shader-cache tree and retain displaced contents')) {
                         $operationId = [guid]::NewGuid().ToString('N')
                         $journalPath = $cacheControl.journal
-                        $evidenceJournalPath = Join-Path $paths.evidence ("shader-cache-restore.$operationId.journal.json")
-                        $restoreReceiptPath = Join-Path $paths.evidence ("shader-cache-restore.$operationId.receipt.json")
+                        $evidenceJournalPath = Join-Path $restoreEvidence ("shader-cache-restore.$operationId.journal.json")
+                        $restoreReceiptPath = Join-Path $restoreEvidence ("shader-cache-restore.$operationId.receipt.json")
                         $journal = [pscustomobject][ordered]@{
                             contractVersion = '2.0.0'; operation = 'restore'; phase = 'prepared'; operationId = $operationId
                             snapshotTransactionId = [string]$receipt.transactionId; cachePath = $resolvedCache
+                            snapshotReceiptPath = $paths.receipt; restoreEvidenceDirectory = $restoreEvidence
                             originalTreeSha256 = [string]$current.treeSha256; requestedTreeSha256 = [string]$receipt.beforeTreeSha256
                             stagingPath = $staging; displacedPath = $displaced; evidenceJournalPath = $evidenceJournalPath
                             preparedUtc = [DateTime]::UtcNow.ToString('o'); rollback = $null
                         }
                         Write-CacheJournal -Control $cacheControl -Journal $journal
-                        Write-JsonFile (Join-Path $paths.evidence 'cache.current-before-restore.inventory.json') $current
+                        $inventoryName = if ([string]::IsNullOrWhiteSpace($RestoreEvidenceDirectory)) { 'cache.current-before-restore.inventory.json' } else { 'cache.current-before-restore.' + $operationId + '.inventory.json' }
+                        Write-JsonFile (Join-Path $restoreEvidence $inventoryName) $current
                         Copy-Item -LiteralPath $paths.before -Destination $staging -Recurse
                         $staged = Get-TreeInventory $staging
                         if ($staged.treeSha256 -ne [string]$receipt.beforeTreeSha256) { throw 'Staged restore tree failed verification.' }
@@ -639,6 +636,7 @@ try {
                             $restoreReceipt = [pscustomobject][ordered]@{
                                 contractVersion = '2.0.0'; operation = 'restore'; transactionId = $operationId
                                 snapshotTransactionId = [string]$receipt.transactionId; cachePath = $resolvedCache
+                                snapshotReceiptPath = $paths.receipt; restoreEvidenceDirectory = $restoreEvidence
                                 restoredTreeSha256 = [string]$receipt.beforeTreeSha256
                                 displacedTreeSha256 = $current.treeSha256
                                 displacedPath = $preservedDisplaced
@@ -663,7 +661,7 @@ catch {
     $result = [pscustomobject][ordered]@{ ok = $false; command = $Command; data = $null; errors = @($_.Exception.Message) }
 }
 finally {
-    if ($null -ne $cacheLock) { $cacheLock.Dispose() }
+    if ($null -ne $cacheLock) { Exit-CSXCacheTargetLock $cacheLock }
 }
 
 $json = $result | ConvertTo-Json -Depth 30 -Compress:$Compact
