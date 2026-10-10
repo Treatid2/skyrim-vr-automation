@@ -13,6 +13,7 @@
 #include <thread>
 #include <sstream>
 #include "FailedRoleDiagnostics.h"
+#include "ControllerRoleReadiness.h"
 
 namespace {
 using csx::probe::Observe;
@@ -94,38 +95,71 @@ struct ControllerCheck {
     unsigned samples{0};
     unsigned inputEvents{0};
     bool valid{false};
+    csx::probe::RoleAdmission admission{};
 };
 
-ControllerCheck CheckControllers(vr::IVRSystem* system)
+ControllerCheck CheckControllers(vr::IVRSystem* system, std::chrono::steady_clock::time_point probeBegan)
 {
     ControllerCheck result{};
-    result.left = Observe(Phase::LeftRole, [&] { return system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand); });
-    result.right = Observe(Phase::RightRole, [&] { return system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand); });
-    const std::array indices{result.left, result.right};
-    if (result.left == result.right || !Observe(Phase::CompositorInterface, [] { return vr::VRCompositor(); })) { return result; }
-    for (const auto index : indices) {
-        if (index >= vr::k_unMaxTrackedDeviceCount || index == vr::k_unTrackedDeviceIndex_Hmd) {
-            return result;
-        }
-    }
-    for (std::size_t hand = 0; hand < indices.size(); ++hand) {
+    const auto elapsed = [&] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - probeBegan).count(); };
+    const auto exactIdentity = [&](vr::TrackedDeviceIndex_t index, std::size_t hand, unsigned ordinal) {
+        const auto role = hand == 0 ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_RightHand;
+        if (index >= vr::k_unMaxTrackedDeviceCount || index == vr::k_unTrackedDeviceIndex_Hmd ||
+            Observe(Phase::ControllerClass, [&] { return system->GetTrackedDeviceClass(index); }, ordinal, static_cast<int>(hand)) != vr::TrackedDeviceClass_Controller ||
+            Observe(Phase::ControllerRole, [&] { return system->GetControllerRoleForTrackedDeviceIndex(index); }, ordinal, static_cast<int>(hand)) != role) { return false; }
         std::array<char, 128> serial{}, trackingSystem{};
         vr::ETrackedPropertyError propertyError = vr::TrackedProp_Success;
-        const auto serialSize = Observe(Phase::SerialProperty, [&] { return system->GetStringTrackedDeviceProperty(indices[hand],
-            vr::Prop_SerialNumber_String, serial.data(), static_cast<std::uint32_t>(serial.size()), &propertyError); }, -1, static_cast<int>(hand));
+        const auto serialSize = Observe(Phase::SerialProperty, [&] { return system->GetStringTrackedDeviceProperty(index,
+            vr::Prop_SerialNumber_String, serial.data(), static_cast<std::uint32_t>(serial.size()), &propertyError); }, ordinal, static_cast<int>(hand));
         const auto expected = hand == 0 ? "CSX-NULL-CONTROLLER-LEFT-1" : "CSX-NULL-CONTROLLER-RIGHT-1";
-        if (propertyError != vr::TrackedProp_Success || serialSize > serial.size() ||
-            std::string(serial.data()) != expected) { return result; }
-        const auto trackingSize = Observe(Phase::TrackingProperty, [&] { return system->GetStringTrackedDeviceProperty(indices[hand],
+        if (propertyError != vr::TrackedProp_Success || serialSize == 0 || serialSize > serial.size() || serial[serialSize - 1] != '\0' ||
+            std::string(serial.data()) != expected) { return false; }
+        const auto trackingSize = Observe(Phase::TrackingProperty, [&] { return system->GetStringTrackedDeviceProperty(index,
             vr::Prop_TrackingSystemName_String, trackingSystem.data(),
-            static_cast<std::uint32_t>(trackingSystem.size()), &propertyError); }, -1, static_cast<int>(hand));
-        if (propertyError != vr::TrackedProp_Success || trackingSize > trackingSystem.size() ||
-            std::string(trackingSystem.data()) != "codex_head_pose") { return result; }
-    }
+            static_cast<std::uint32_t>(trackingSystem.size()), &propertyError); }, ordinal, static_cast<int>(hand));
+        return propertyError == vr::TrackedProp_Success && trackingSize > 0 && trackingSize <= trackingSystem.size() &&
+            trackingSystem[trackingSize - 1] == '\0' && std::string(trackingSystem.data()) == "codex_head_pose";
+    };
+    unsigned readinessEvents = 0;
+    result.admission = csx::probe::AwaitControllerRoles(elapsed, [&](unsigned ordinal) {
+        csx::probe::RoleSnapshot snapshot{};
+        snapshot.left = Observe(Phase::LeftRole, [&] { return system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand); }, ordinal);
+        snapshot.right = Observe(Phase::RightRole, [&] { return system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand); }, ordinal);
+        const std::array roles{snapshot.left, snapshot.right};
+        for (std::size_t hand = 0; hand < roles.size(); ++hand) {
+            if (roles[hand] != vr::k_unTrackedDeviceIndexInvalid && !exactIdentity(roles[hand], hand, ordinal)) {
+                snapshot.observation = csx::probe::RoleObservation::Rejected; return snapshot;
+            }
+        }
+        // Pump the same application's bounded event queue while roles may be
+        // initializing. Binding success is context only, never admission.
+        vr::VREvent_t event{}; unsigned drained = 0;
+        Observe(Phase::EventDrain, [&] {
+            while (drained < 256 && readinessEvents < 4096 && system->PollNextEvent(&event, sizeof(event))) {
+                ++drained; ++readinessEvents;
+                // No readiness wait may hide nonneutral input before sampling.
+                if (event.eventType == vr::VREvent_ButtonPress || event.eventType == vr::VREvent_ButtonUnpress ||
+                    event.eventType == vr::VREvent_ButtonTouch || event.eventType == vr::VREvent_ButtonUntouch) { ++result.inputEvents; }
+            }
+        }, ordinal);
+        if (drained == 256 || readinessEvents == 4096 || result.inputEvents != 0 ||
+            (snapshot.left == snapshot.right && snapshot.left != vr::k_unTrackedDeviceIndexInvalid)) {
+            snapshot.observation = csx::probe::RoleObservation::Rejected;
+        } else if (snapshot.left != vr::k_unTrackedDeviceIndexInvalid && snapshot.right != vr::k_unTrackedDeviceIndexInvalid) {
+            snapshot.observation = csx::probe::RoleObservation::Assigned;
+        }
+        return snapshot;
+    }, [](std::int64_t milliseconds) { if (milliseconds > 0) { std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds)); } });
+    result.left = result.admission.last.left; result.right = result.admission.last.right;
+    if (result.admission.state != csx::probe::RoleAdmissionState::Assigned ||
+        !Observe(Phase::CompositorInterface, [] { return vr::VRCompositor(); })) { return result; }
+    const std::array indices{result.left, result.right};
     std::array<vr::TrackedDevicePose_t, vr::k_unMaxTrackedDeviceCount> game{}, render{}, standing{};
     // Observe a stable neutral pair for two seconds, including the compositor
     // arrays consumed by VR Tools. One good registration snapshot is insufficient.
     for (unsigned sample = 0; sample < 100; ++sample) {
+        if (elapsed() >= csx::probe::ProbeQualificationDeadlineMs) { return result; }
         if (Observe(Phase::LeftRole, [&] { return system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand); }, sample) != result.left ||
             Observe(Phase::RightRole, [&] { return system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand); }, sample) != result.right ||
             Observe(Phase::CompositorPoses, [&] {
@@ -161,9 +195,11 @@ ControllerCheck CheckControllers(vr::IVRSystem* system)
         }
         }, sample);
         if (drained == 256 || result.inputEvents != 0) { return result; }
+        if (elapsed() >= csx::probe::ProbeQualificationDeadlineMs) { return result; }
         ++result.samples;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    if (elapsed() >= csx::probe::ProbeQualificationDeadlineMs) { return result; }
     result.valid = true;
     return result;
 }
@@ -213,6 +249,7 @@ void PrintFailedRoleDiagnostics(vr::IVRSystem* system, std::ostream& output)
 
 int main(int argc, char** argv)
 {
+    const auto probeBegan = std::chrono::steady_clock::now();
     bool requireControllers = false;
     bool diagnosticPhases = false;
     bool diagnosticFailedRoles = false;
@@ -260,7 +297,7 @@ int main(int argc, char** argv)
     const auto stereoValid = IsFiniteEyeTransform(leftEye) && IsFiniteEyeTransform(rightEye) &&
         eyeSeparation >= 0.01 && eyeSeparation <= 0.20 && renderWidth > 0 && renderHeight > 0 &&
         runtimePathAvailable && requiredRuntimePath > 1 && requiredRuntimePath <= runtimePath.size();
-    const auto controllers = requireControllers ? CheckControllers(system) : ControllerCheck{};
+    const auto controllers = requireControllers ? CheckControllers(system, probeBegan) : ControllerCheck{};
     const auto qualified = stereoValid && (!requireControllers ||
         (ValidPose(standing[vr::k_unTrackedDeviceIndex_Hmd]) && controllers.valid));
 
@@ -282,6 +319,15 @@ int main(int argc, char** argv)
               << ",\"leftIndex\":" << controllers.left << ",\"rightIndex\":" << controllers.right
               << ",\"neutralSamples\":" << controllers.samples << ",\"inputEvents\":" << controllers.inputEvents
               << ",\"packetNumbers\":[" << controllers.packets[0] << ',' << controllers.packets[1] << "]}";
+    if (requireControllers) {
+        std::cout << ",\"roleAdmission\":{\"state\":\"" << csx::probe::RoleAdmissionName(controllers.admission.state)
+                  << "\",\"observations\":" << controllers.admission.observations
+                  << ",\"elapsedMs\":" << controllers.admission.elapsedMs
+                  << ",\"maxMilliseconds\":" << csx::probe::RoleReadinessBudgetMs
+                  << ",\"maxObservations\":" << csx::probe::MaxRoleObservations
+                  << ",\"firstLeftIndex\":" << controllers.admission.first.left
+                  << ",\"firstRightIndex\":" << controllers.admission.first.right << '}';
+    }
     if (diagnosticFailedRoles && requireControllers && !controllers.valid) {
         std::cout << ",\"failedRoleDiagnostics\":";
         try {

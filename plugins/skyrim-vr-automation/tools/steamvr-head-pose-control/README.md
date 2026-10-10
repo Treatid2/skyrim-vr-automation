@@ -147,3 +147,28 @@ Run `Test-DriverPackageAuthority.ps1`, `Test-SteamVRHeadPoseControl.ps1`,
 `Test-ProviderContinuity.ps1 -FixtureRoot <owned-fixture-directory>` and
 `Test-PassiveControllerAdmission.ps1` after changes. These isolated fixtures do
 not substitute for live OpenVR or in-game acceptance.
+
+### Bounded same-probe assigned-role readiness
+
+Inside the original required-controller process, actual assigned hand roles are
+observed for at most3000ms/151 observations, paced at most20ms only while pending.
+The clock begins before VR_Init; role admission stops by6500ms to reserve2500ms
+for all100 neutral samples. Qualification stops by9000ms, below the unchanged
+external10s child limit; blocked OpenVR calls still use existing owned-job
+deadline/cleanup. Late healthy observations cannot qualify.
+
+The first left/right lookup is retained in roleAdmission separately from the last
+lookup and the final100-sample result. Missing roles remain pending, not accepted.
+Each assigned index must expose exact expected hand role/controller class/serial/
+provider; wrong identities refuse immediately. The same application pumps a
+bounded event queue while pending, refusing input events/overflow. Binding events
+and role hints are not admission predicates. Once assigned, all original100
+connected/finite standing/game/render pose and neutral input samples, stable
+roles and zero input events remain mandatory. No second probe, startup sleep,
+forced assignment, hardcoded index, config change or budget extension.
+
+Mapping26's first failed lookup preceded application binding completion. This
+motivates finite readiness, but does not prove binding causes assignment or that
+a runtime will ever assign roles. Persistent nonassignment still fails with the
+original bounded diagnostics. New source requires exact Broker compilation and
+separately authorised host assertions; historical binaries do not implement it.
