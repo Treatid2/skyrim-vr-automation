@@ -1712,12 +1712,12 @@ function Get-MO2StorageRecord {
 }
 
 function Get-MO2SessionLockRecord {
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][string]$Path, $CommittedData = $null)
 
     $resolved = Resolve-MO2ControlPath $Path
     $record = [ordered]@{
         path = $resolved
-        exists = Test-Path -LiteralPath $resolved -PathType Leaf
+        exists = $null -ne $CommittedData -or (Test-Path -LiteralPath $resolved -PathType Leaf)
         valid = $null
         ownerPid = $null
         ownerRunning = $false
@@ -1739,7 +1739,7 @@ function Get-MO2SessionLockRecord {
     }
 
     try {
-        $data = ConvertFrom-MO2JsonText (Get-Content -LiteralPath $resolved -Raw -ErrorAction Stop)
+        $data = if ($null -ne $CommittedData) { $CommittedData } else { ConvertFrom-MO2JsonText (Get-Content -LiteralPath $resolved -Raw -ErrorAction Stop) }
         $record.valid = $true
         $record.data = $data
         if ($data.PSObject.Properties['ownerPid']) {
@@ -5503,6 +5503,10 @@ function Invoke-MO2Status {
         $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
         $openingCompleted = $true
     }
+    # Public lock and controller evidence must project the same committed owned
+    # generation after recovery/adoption/opening writes. Do not independently
+    # reread a newer lock while retaining evidence from this committed snapshot.
+    if ($owned) { $data.sessionLock = Get-MO2SessionLockRecord -Path ([string]$Config.session.lockFile) -CommittedData $owned.data }
     $headlessMO2 = $data.processes.mo2.Count -gt 0 -and @($windows | Where-Object visible).Count -eq 0
     $launchGraceSeconds = 30
     if ($Config.limits.PSObject.Properties['launchPendingGraceSeconds']) {
