@@ -18,6 +18,7 @@ try {
     $processRoot = Join-Path $fixture 'tools/process-control'
     $authorityRoot = Join-Path $fixture 'tools/steamvr-head-pose-control'
     foreach ($path in @($nullRoot,$processRoot,$authorityRoot)) { [IO.Directory]::CreateDirectory($path) | Out-Null }
+    [IO.File]::WriteAllText((Join-Path $processRoot 'ProcessLaunchInterop.ps1'), '# Fixture loader: normal launch boundary supplied below, never native.')
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../steamvr-head-pose-control/DriverPackageAuthority.ps1') -Destination $authorityRoot
     $entry = Join-Path $PSScriptRoot 'Invoke-SteamVRNullControl.ps1'
     $source = [IO.File]::ReadAllText($entry)
@@ -140,11 +141,11 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
     [IO.File]::WriteAllText((Join-Path $processRoot 'Invoke-BoundedProcess.ps1'),$boundedStub,[Text.UTF8Encoding]::new($false))
     # Process effects are mocked at their native API boundary. Production exact
     # root/start-time target filtering and post-stop verification remain real.
-    function Start-Process {
-        [CmdletBinding()]param($FilePath,$WindowStyle,[switch]$PassThru)
-        if ($WindowStyle -ne 'Hidden' -or $FilePath -cne (Join-Path $SteamVRRoot 'bin/win64/vrstartup.exe')) { throw 'Unexpected fixture launch.' }
+    function Start-NormalInteractiveProcess {
+        [CmdletBinding()]param($FilePath,$DeadlineUtc)
+        if ($DeadlineUtc -le [DateTime]::UtcNow -or $FilePath -cne (Join-Path $SteamVRRoot 'bin/win64/vrstartup.exe')) { throw 'Unexpected fixture launch.' }
         [IO.File]::WriteAllText((Join-Path $SteamVRRoot 'launch.json'),(@{live=$true;startedUtc=[DateTime]::UtcNow.ToString('o')}|ConvertTo-Json -Compress))
-        [pscustomobject]@{Id=12345}
+        [pscustomobject]@{Id=12345;interactiveLaunch=@{normalUserAccessVerified=$true;method='synthetic-fixture'}}
     }
     function Stop-Process {
         [CmdletBinding()]param([int]$Id,[switch]$Force)
@@ -226,7 +227,7 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
     @{ok=$true;passed=$passed;liveRuntimeUsed=$false;cases=$caseResults;replacedDependencies=@($replacements.name);externalStartupLogStub=$externalLogStub;productionStartLoopRetained=$true;productionProbeRetained=$true;productionContinuityRetained=$true;productionCleanupRetained=$true}|ConvertTo-Json -Depth 10 -Compress
 } finally {
     $env:CSX_STEAMVR_TRANSACTION_ROOT=$priorTransactionRoot
-    foreach($name in @('Start-Process','Stop-Process','Get-Process')){Remove-Item -LiteralPath ("Function:\$name") -ErrorAction SilentlyContinue}
+    foreach($name in @('Start-NormalInteractiveProcess','Stop-Process','Get-Process')){Remove-Item -LiteralPath ("Function:\$name") -ErrorAction SilentlyContinue}
     $resolved=[IO.Path]::GetFullPath($fixture)
     if(-not $resolved.StartsWith($temporary,[StringComparison]::OrdinalIgnoreCase) -or -not ([IO.Path]::GetFileName($resolved)).StartsWith('application-probe-startup-')){throw 'Refusing cleanup outside exact temporary fixture.'}
     if(Test-Path -LiteralPath $resolved){Remove-Item -LiteralPath $resolved -Recurse -Force}

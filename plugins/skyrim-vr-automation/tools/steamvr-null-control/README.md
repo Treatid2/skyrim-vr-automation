@@ -1,5 +1,20 @@
 # SteamVR null-HMD control
 
+Startup and its single independent probe use a supported normal-interactive-user
+route with same user/session and suspended-child effective-context/access proof.
+The startup receipt retains the launcher proof, and bounded-process evidence
+retains the original probe proof. No RunAs, privilege/ACL repair, elevated Steam
+or global Codex change is performed. Setup is charged to the existing90-second
+startup and full ten-second probe admission; missing context fails closed.
+
+With a NEW exact Broker-verified role-capable native package,
+`-ProbeDiagnosticFailedRoles` opts into one capped inventory in the SAME failed
+required-controller probe: device identity/connection/finite pose, actual assigned
+role separately from role hint, and existing read-only controller input-health
+and instance telemetry. It cannot qualify a failed result or trigger a retry.
+The switch is default-off; do not pass it to an older package or relabel old
+provenance. `-ProbeDiagnosticPhases` remains separately opt-in.
+
 `Invoke-SteamVRNullControl.ps1` transactionally inspects, applies, starts, and
 restores the Valve null-HMD route. Apply always takes an exact settings backup,
 and restore requires its hash receipt.

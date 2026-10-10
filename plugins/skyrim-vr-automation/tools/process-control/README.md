@@ -1,5 +1,19 @@
 # Bounded process control
 
+`-NormalInteractiveUser` is explicit; generic launches retain their default
+context. The SteamVR launcher and its original independent probe use this mode.
+It requires the exact interactive explorer process in the same user/session,
+medium integrity, unelevated and not AppContainer. Child context/path and normal
+token access (0x40/0x400/READ_CONTROL) are checked while suspended, before resume.
+From a high caller, the documented desktop-parent attribute supplies the normal
+token; initial NEW process/thread security uses that token's default DACL/owner
+and a medium mandatory label. No existing ACL, token or privilege is edited.
+Temporary inheritance is restricted to three owned stream handles; only those
+duplicates are removed from the parent. Read-only impersonation is reverted and
+verified. Missing context, identity drift, access denial or expired admission
+fails closed. Public receipts contain identities, not private handles.
+`Test-NormalInteractiveProcess.ps1` uses benign Windows fixture processes only.
+
 `Invoke-BoundedProcess.ps1` runs an exact executable with an argument array,
 captures each attempt, enforces a wall-clock timeout, and writes an optional
 receipt plus stdout/stderr logs. It retries only when output matches an explicit

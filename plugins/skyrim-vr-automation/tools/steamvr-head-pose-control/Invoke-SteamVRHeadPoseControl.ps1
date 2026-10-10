@@ -52,6 +52,7 @@ param(
     [switch]$SkipOpenVRProbe,
 
     [switch]$RequireControllers,
+    [switch]$ProbeDiagnosticFailedRoles,
     [switch]$Upgrade,
 
     [Parameter(DontShow)]
@@ -546,7 +547,8 @@ function Invoke-PoseProbe {
         if (-not (Test-Path -LiteralPath $boundedRunner -PathType Leaf)) { throw "The bounded process controller is unavailable: $boundedRunner" }
         $probeArguments = @()
         if ($RequireControllers) { $probeArguments += '--require-controllers' }
-        $run = & $boundedRunner -FilePath $resolvedProbe -ArgumentList $probeArguments -WorkingDirectory (Split-Path -Parent $resolvedProbe) -MaxAttempts 1 -TimeoutSeconds $ProbeTimeoutSeconds -RetryPatterns @() -EvidenceDirectory $EvidenceDirectory -NoExit -Compact | ConvertFrom-Json
+        if ($ProbeDiagnosticFailedRoles) { $probeArguments += '--diagnostic-failed-roles' }
+        $run = & $boundedRunner -FilePath $resolvedProbe -ArgumentList $probeArguments -WorkingDirectory (Split-Path -Parent $resolvedProbe) -NormalInteractiveUser -MaxAttempts 1 -TimeoutSeconds $ProbeTimeoutSeconds -RetryPatterns @() -EvidenceDirectory $EvidenceDirectory -NoExit -Compact | ConvertFrom-Json
         if (-not $run.ok -or @($run.attempts).Count -ne 1) {
             return [pscustomobject][ordered]@{ available = $true; qualified = $false; probePath = $resolvedProbe; probeSha256 = Get-HashOrNull $resolvedProbe; boundedRun = $run; error = 'The independent OpenVR pose probe did not complete successfully within its bounded budget.' }
         }
