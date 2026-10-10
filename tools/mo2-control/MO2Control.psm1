@@ -4547,6 +4547,16 @@ function Reset-MO2GameProcessStateForLaunch {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$PreLaunchGameProcesses
     )
 
+    if ($Data.PSObject.Properties['gameTerminationReconciliation'] -or $Data.PSObject.Properties['gameTerminationTargets'] -or
+        $Data.PSObject.Properties['gameTerminationResult'] -or $Data.PSObject.Properties['gameTerminationRequestId'] -or $Data.PSObject.Properties['gameTerminationRequestedUtc']) {
+        $priorTermination=Get-MO2PendingGameTermination -Owned ([pscustomobject]@{data=$Data;sessionId=$Data.sessionId})
+        if ($priorTermination.pending) { throw 'Accepted termination reconciliation must complete before a new launch.' }
+        if ($priorTermination.resolved) {
+            $history=@(if($Data.PSObject.Properties['gameTerminationHistory']){$Data.gameTerminationHistory})
+            $Data|Add-Member -NotePropertyName gameTerminationHistory -NotePropertyValue @($history+$priorTermination.record) -Force
+            foreach($key in @('gameTerminationReconciliation','gameTerminationTargets','gameTerminationResult','gameTerminationRequestId','gameTerminationRequestedUtc')){$Data.PSObject.Properties.Remove($key)}
+        }
+    }
     [object[]]$priorProcesses = @(if ($Data.PSObject.Properties['gameProcesses']) { $Data.gameProcesses })
     if ($priorProcesses.Count -gt 0) {
         [object[]]$history = @(if ($Data.PSObject.Properties['gameProcessHistory']) { $Data.gameProcessHistory })
@@ -5449,6 +5459,19 @@ function Invoke-MO2Status {
         $requestedExecutable = [string]$owned.data.executable
     }
     $data = Get-MO2InspectionData -Config $Config -RequestedProfile $requestedProfile -RequestedExecutable $requestedExecutable
+    $guardOwned=$owned
+    if (-not $guardOwned -and $data.PSObject.Properties['sessionLock'] -and $data.sessionLock.exists -and
+        $data.sessionLock.PSObject.Properties['data'] -and $data.sessionLock.data -and
+        $data.sessionLock.PSObject.Properties['sessionId'] -and -not [string]::IsNullOrWhiteSpace([string]$data.sessionLock.sessionId)) {
+        $guardOwned=[pscustomobject]@{data=$data.sessionLock.data;sessionId=[string]$data.sessionLock.sessionId}
+    }
+    $termination = if ($guardOwned) { Get-MO2PendingGameTermination -Owned $guardOwned } else { $null }
+    if ($termination -and $termination.pending) {
+        # Do not adopt processes, publish opening status or retire recovery evidence.
+        $data | Add-Member -NotePropertyName gameTermination -NotePropertyValue $termination -Force
+        $data | Add-Member -NotePropertyName recoveryRequired -NotePropertyValue $true -Force
+        return ConvertTo-MO2PublicResult -Result (New-MO2ActionResult -Config $Config -Command 'status' -Ok $false -State 'game-termination-recovery-required' -Data $data -Errors @('Accepted termination evidence is unresolved or malformed; the exact session remains held.'))
+    }
     $ownershipResolution = $null
     if ($owned -and $data.processes.mo2.Count -gt 0) {
         $ownershipResolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @($data.processes.mo2) -AdoptDetachedOwner
@@ -5530,7 +5553,10 @@ function Invoke-MO2Status {
     }
     else { $null }
     $ownedGameExact = $null -eq $owned -or ($null -ne $recordedGameResolution -and $recordedGameResolution.ok -and @($recordedGameResolution.targets).Count -gt 0)
-    $state = if ($data.processes.game.Count -gt 0) {
+    $state = if ($termination -and $termination.resolved -and $data.processes.game.Count -eq 0 -and $buildData.Count -eq 0) {
+        [string]$termination.record.state
+    }
+    elseif ($data.processes.game.Count -gt 0) {
         if ($ownedGameExact) { 'game-running' } else { 'game-running-unowned' }
     }
     elseif ($launchFailure) {
@@ -6851,72 +6877,191 @@ function Invoke-MO2OwnedGameCloseRequest {
 
 function Complete-MO2GameTerminationReporting {
     param($Config, $Owned, [string]$SessionId, [string]$State, [bool]$Success, [hashtable]$Data, [string[]]$Errors)
-    # Acceptance is durable before this helper runs. A pending reconciliation
-    # remains authoritative even if later status or receipt publication fails.
+    $existing=Get-MO2PendingGameTermination -Owned $Owned
+    if ($existing.resolved) {
+        return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $true -State $existing.record.state -Data @{priorReconciliation=$existing.record;newTerminationDispatched=$false;noAutomaticRetry=$true}
+    }
+    # Only the serialized reconciliation commit may publish terminal success.
+    # A proof candidate on disk is explicitly unresolved, never a success receipt.
     $reportingErrors = [Collections.Generic.List[string]]::new()
     $Data.reconciliationPersisted = $false
     $receiptPath = Join-Path ([string]$Owned.data.sessionPath) 'mo2-terminate-game.json'
     $Data.receiptPath = $receiptPath
-    try { Set-MO2OwnedSessionStatus -Owned $Owned -Status $State -TimestampProperty 'gameTerminatedUtc' }
+    $Data.reportingErrors = @()
+    $Data.receiptPublished = $false
+    $Data.recoveryRequired = $true
+    try { Set-MO2OwnedSessionStatus -Owned $Owned -Status 'game-termination-reporting' -TimestampProperty 'gameTerminationReportingUtc' }
     catch { $reportingErrors.Add($_.Exception.Message) }
     $persist = {
-        param([bool]$Resolved)
+        param([bool]$Resolved, $Proof)
         $null = Invoke-MO2OwnedSessionMutation -Owned $Owned -Action {
             param($currentData)
+            if (-not $currentData.PSObject.Properties['gameTerminationRequestId'] -or
+                [string]$currentData.gameTerminationRequestId -cne [string]$Owned.data.gameTerminationRequestId -or
+                (Get-MO2TerminationValueText $currentData.gameTerminationTargets) -cne (Get-MO2TerminationValueText $Data.terminatedProcesses) -or
+                (Get-MO2TerminationValueText $currentData.gameTerminationResult) -cne (Get-MO2TerminationValueText $Data.gameTermination)) {
+                throw 'Accepted termination identity changed before reporting commit.'
+            }
+            if ((Get-MO2PendingGameTermination -Owned ([pscustomobject]@{data=$currentData;sessionId=$SessionId})).resolved) {
+                throw 'The original termination is already resolved; do not overwrite its authoritative record.'
+            }
             $record = [pscustomobject][ordered]@{
+                schemaVersion='1.0'; sessionId=$SessionId; requestId=[string]$currentData.gameTerminationRequestId
                 resolved = $Resolved; state = $State; data = [pscustomobject]$Data
-                errors = @($Errors) + @($reportingErrors); updatedUtc = [DateTime]::UtcNow.ToString('o')
+                errors = @($Errors) + @($reportingErrors); proof=$Proof
             }
             # Snapshot values: do not retain aliases to later local flag changes.
             $record = ConvertFrom-MO2JsonText ($record | ConvertTo-Json -Depth 40)
             $currentData | Add-Member -NotePropertyName gameTerminationReconciliation -NotePropertyValue $record -Force
-            $currentData.status = if ($reportingErrors.Count) { 'game-termination-reporting-failed' } else { $State }
+            # Status and resolved authority commit together, never separately.
+            $currentData.status = if ($Resolved) { $State } elseif ($reportingErrors.Count) { 'game-termination-reporting-failed' } else { 'game-termination-reporting' }
+            if ($Resolved) {
+                $check=Get-MO2PendingGameTermination -Owned ([pscustomobject]@{data=$currentData;sessionId=$SessionId})
+                if (-not $check.resolved) { throw "Terminal reconciliation validation failed: $($check.reason)" }
+            }
             return [pscustomobject]@{ commit=$true; sessionData=$currentData; result=$true }
         }
     }
-    try { & $persist $false; $Data.reconciliationPersisted = $true }
+    try { & $persist $false $null; $Data.reconciliationPersisted = $true }
     catch { $reportingErrors.Add($_.Exception.Message) }
+    $proof=$null
     if ($reportingErrors.Count -eq 0 -and $State -cne 'game-termination-reporting-failed') {
         try {
-            $receipt = [pscustomobject][ordered]@{
-                contractVersion=$script:MO2ControlContractVersion; sessionId=$SessionId
-                state=$State; terminatedProcesses=$Data.terminatedProcesses; gameTermination=$Data.gameTermination
-                rootBuilder=$Data.rootBuilder; gameStopVerified=$Data.gameStopVerified; cleanupVerified=$Data.cleanupVerified
-                mutationDispatched=$true; recoveryRequired=(-not $Success); noAutomaticRetry=$true
-                completedUtc=[DateTime]::UtcNow.ToString('o')
+            $candidate = [pscustomobject][ordered]@{
+                schemaVersion='1.0'; evidenceRole='unresolved-terminal-proof'; resolved=$false
+                sessionId=$SessionId; requestId=[string]$Owned.data.gameTerminationRequestId
+                state=$State; data=[pscustomobject]$Data; errors=@($Errors)
             }
-            Write-MO2JsonAtomic -Path $receiptPath -Value $receipt
+            $candidate=ConvertFrom-MO2JsonText ($candidate|ConvertTo-Json -Depth 40)
+            $candidate.data.receiptPublished=$false
+            $candidate.data.reconciliationPersisted=$true
+            $candidate.data.recoveryRequired=$true
+            $candidate.data.reportingErrors=@()
+            $digest=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes((Get-MO2TerminationValueText $candidate)))).ToLowerInvariant()
+            $proofPath=Join-Path ([string]$Owned.data.sessionPath) ("mo2-termination-proof-$($Owned.data.gameTerminationRequestId)-$digest.json")
+            if (-not (Test-Path -LiteralPath $proofPath)) { Write-MO2JsonAtomic -Path $proofPath -Value $candidate }
+            $bytes=Read-MO2TerminationProofBytes $proofPath
+            $proof=[pscustomobject]@{path=$proofPath;bytes=$bytes.Length;sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()}
+            $read=ConvertFrom-MO2JsonText ([Text.UTF8Encoding]::new($false,$true).GetString($bytes))
+            if ((Get-MO2TerminationValueText $read) -cne (Get-MO2TerminationValueText $candidate)) { throw 'Original termination proof candidate changed.' }
             $Data.receiptPublished = $true
+            $Data.receiptPath = $proofPath
         } catch { $reportingErrors.Add($_.Exception.Message) }
     }
     if ($reportingErrors.Count) { $State='game-termination-reporting-failed'; $Success=$false }
     $Data.recoveryRequired = -not $Success
     # Only a published terminal receipt and independently verified cleanup may
     # resolve the original request. Failure to persist leaves the earlier guard.
-    try { & $persist ($Success -and $Data.receiptPublished); $Data.reconciliationPersisted=$true }
+    try {
+        $Data.reconciliationPersisted=$true
+        & $persist ($Success -and $Data.receiptPublished) $proof
+    }
     catch {
         $reportingErrors.Add($_.Exception.Message)
         $State='game-termination-reporting-failed'; $Success=$false
         $Data.recoveryRequired=$true; $Data.reconciliationPersisted=$false
     }
+    # This is a non-authoritative projection. Its failure does not unresolve
+    # the committed proof or grant another termination request.
+    if ($Success) {
+        $Data.publicReceiptPath=$receiptPath
+        $Data.publicReceiptPublished=$false
+        try {
+            Write-MO2JsonAtomic -Path $receiptPath -Value $Owned.data.gameTerminationReconciliation
+            $Data.publicReceiptPublished=$true
+        }
+        catch {
+            $reportingErrors.Add($_.Exception.Message); $State='game-termination-reporting-failed'; $Success=$false
+            $Data.projectionFailed=$true
+        }
+    }
     $Data.reportingErrors = @($reportingErrors)
     return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $Success -State $State -Data $Data -Errors (@($Errors) + @($reportingErrors))
+}
+
+function Get-MO2TerminationValueText {
+    param($Value)
+    return ConvertTo-Json -InputObject $Value -Depth 40 -Compress
+}
+
+function Assert-MO2TerminationShape {
+    param($Value, [string[]]$Names)
+    if ($null -eq $Value -or $Value -isnot [pscustomobject]) { throw 'Termination record must be an object.' }
+    $actual=@($Value.PSObject.Properties.Name)
+    if ($actual.Count -ne $Names.Count -or @(Compare-Object $actual $Names -CaseSensitive).Count) { throw 'Unknown or missing termination record fields.' }
+}
+
+function Read-MO2TerminationProofBytes {
+    param([string]$Path)
+    Assert-MO2ControllerPhysicalPath $Path
+    $stream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try {
+        if ($stream.Length -le 0 -or $stream.Length -gt 1048576) { throw 'Terminal proof exceeds bounded evidence limit.' }
+        $bytes=[byte[]]::new([int]$stream.Length);$stream.ReadExactly($bytes)
+        return ,$bytes
+    } finally { $stream.Dispose() }
 }
 
 function Get-MO2PendingGameTermination {
     param($Owned)
     $property = $Owned.data.PSObject.Properties['gameTerminationReconciliation']
-    if ($property -and ($null -eq $property.Value -or
-        -not $property.Value.PSObject.Properties['resolved'] -or
-        $property.Value.resolved -isnot [bool] -or -not $property.Value.resolved)) {
-        return [pscustomobject]@{ pending=$true; record=$property.Value }
-    }
     # Older accepted requests have no detailed reconciliation record. They are
     # not evidence of a clean stop and must not be silently replayed/upgraded.
-    if (-not $property -and $Owned.data.PSObject.Properties['gameTerminationTargets']) {
-        return [pscustomobject]@{ pending=$true; record=$null }
+    if (-not $property -and ($Owned.data.PSObject.Properties['gameTerminationTargets'] -or $Owned.data.PSObject.Properties['gameTerminationResult'] -or
+        $Owned.data.PSObject.Properties['gameTerminationRequestId'] -or $Owned.data.PSObject.Properties['gameTerminationRequestedUtc'])) {
+        return [pscustomobject]@{ pending=$true; resolved=$false; record=$null; reason='legacy-accepted-request' }
     }
-    return [pscustomobject]@{ pending=$false; record=$null }
+    if (-not $property) { return [pscustomobject]@{ pending=$false; resolved=$false; record=$null; reason='no-accepted-request' } }
+    $r=$property.Value
+    try {
+        Assert-MO2TerminationShape $r @('schemaVersion','sessionId','requestId','resolved','state','data','errors','proof')
+        if ($r.schemaVersion -isnot [string] -or $r.schemaVersion -cne '1.0' -or $r.resolved -isnot [bool] -or -not $r.resolved) { throw 'Unsupported or unresolved termination record.' }
+        if ($r.sessionId -isnot [string] -or $r.sessionId -cne $Owned.sessionId -or
+            $r.requestId -isnot [string] -or $r.requestId -cnotmatch '^[0-9a-f]{32}$' -or
+            -not $Owned.data.PSObject.Properties['gameTerminationRequestId'] -or $r.requestId -cne $Owned.data.gameTerminationRequestId) { throw 'Foreign or missing accepted request identity.' }
+        if ($r.state -isnot [string] -or $r.state -cne 'game-terminated-rootbuilder-restored' -or $r.errors -isnot [array] -or $r.errors.Count) { throw 'Contradictory terminal state or errors.' }
+        $names=@('sessionId','gameTermination','terminatedProcesses','targets','remaining','mutationDispatched','gameStopVerified','cleanupVerified','rootBuilder','mo2Retained','receiptPublished','recoveryRequired','noAutomaticRetry','reconciliationPersisted','receiptPath','reportingErrors')
+        Assert-MO2TerminationShape $r.data $names
+        $d=$r.data
+        foreach($key in @('mutationDispatched','gameStopVerified','cleanupVerified','mo2Retained','receiptPublished','noAutomaticRetry','reconciliationPersisted')) {
+            if ($d.$key -isnot [bool] -or -not $d.$key) { throw "Missing or false terminal fact: $key" }
+        }
+        if ($d.recoveryRequired -isnot [bool] -or $d.recoveryRequired -or $d.sessionId -isnot [string] -or $d.sessionId -cne $Owned.sessionId -or
+            $d.remaining -isnot [array] -or $d.remaining.Count -or $d.reportingErrors -isnot [array] -or $d.reportingErrors.Count) { throw 'Contradictory recovery, remaining processes or reporting errors.' }
+        if ($d.terminatedProcesses -isnot [array] -or $d.terminatedProcesses.Count -eq 0 -or $d.terminatedProcesses.Count -gt 4 -or
+            $d.targets -isnot [array] -or $d.gameTermination.ok -isnot [bool] -or -not $d.gameTermination.ok -or
+            $d.rootBuilder.restored -isnot [bool] -or -not $d.rootBuilder.restored -or @($d.rootBuilder.gameProcesses).Count) { throw 'Invalid terminal target/result/cleanup proof.' }
+        $seen=[Collections.Generic.HashSet[int]]::new()
+        foreach($target in $d.terminatedProcesses) {
+            if ($target.id -isnot [int] -and $target.id -isnot [long]) { throw 'Untyped terminal PID.' }
+            if ($target.id -le 0 -or -not $seen.Add([int]$target.id) -or $target.name -isnot [string] -or [string]::IsNullOrWhiteSpace($target.name) -or
+                $target.path -isnot [string] -or -not [IO.Path]::IsPathFullyQualified($target.path) -or $target.startTime -isnot [string]) { throw 'Invalid terminal process identity.' }
+            $null=[DateTimeOffset]::Parse($target.startTime,[Globalization.CultureInfo]::InvariantCulture)
+        }
+        foreach($other in @($d.targets,$d.gameTermination.targets,$Owned.data.gameTerminationTargets)) {
+            if ((Get-MO2TerminationValueText $other) -cne (Get-MO2TerminationValueText $d.terminatedProcesses)) { throw 'Accepted target identity mismatch.' }
+        }
+        if ((Get-MO2TerminationValueText $d.gameTermination) -cne (Get-MO2TerminationValueText $Owned.data.gameTerminationResult)) { throw 'Accepted result mismatch.' }
+        Assert-MO2TerminationShape $r.proof @('path','bytes','sha256')
+        if ($r.proof.sha256 -isnot [string] -or $r.proof.sha256 -cnotmatch '^[0-9a-f]{64}$' -or $r.proof.bytes -isnot [long] -and $r.proof.bytes -isnot [int] -or
+            $r.proof.bytes -le 0 -or $r.proof.bytes -gt 1048576 -or $r.proof.path -isnot [string] -or
+            $d.receiptPath -isnot [string] -or $d.receiptPath -cne $r.proof.path -or
+            [IO.Path]::GetDirectoryName($r.proof.path) -cne [IO.Path]::GetFullPath($Owned.data.sessionPath) -or
+            [IO.Path]::GetFileName($r.proof.path) -cnotmatch ('^mo2-termination-proof-'+$r.requestId+'-[0-9a-f]{64}\.json$')) { throw 'Invalid bounded proof binding.' }
+        $bytes=Read-MO2TerminationProofBytes $r.proof.path
+        if ($bytes.Length -ne $r.proof.bytes) { throw 'Terminal proof length mismatch.' }
+        if ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant() -cne $r.proof.sha256) { throw 'Terminal proof digest mismatch.' }
+        $candidate=ConvertFrom-MO2JsonText ([Text.UTF8Encoding]::new($false,$true).GetString($bytes))
+        Assert-MO2TerminationShape $candidate @('schemaVersion','evidenceRole','resolved','sessionId','requestId','state','data','errors')
+        if ($candidate.schemaVersion -cne '1.0' -or $candidate.evidenceRole -cne 'unresolved-terminal-proof' -or
+            $candidate.resolved -isnot [bool] -or $candidate.resolved -or $candidate.sessionId -cne $r.sessionId -or $candidate.requestId -cne $r.requestId -or
+            $candidate.state -cne $r.state -or $candidate.errors -isnot [array] -or $candidate.errors.Count) { throw 'Foreign or contradictory terminal proof.' }
+        $expected=ConvertFrom-MO2JsonText (Get-MO2TerminationValueText $d)
+        $expected.receiptPublished=$false;$expected.recoveryRequired=$true
+        $expected.receiptPath=Join-Path $Owned.data.sessionPath 'mo2-terminate-game.json'
+        if ((Get-MO2TerminationValueText $candidate.data) -cne (Get-MO2TerminationValueText $expected)) { throw 'Proof and authoritative terminal facts differ.' }
+        return [pscustomobject]@{pending=$false;resolved=$true;record=$r;reason='validated-authoritative-terminal-record'}
+    } catch { return [pscustomobject]@{pending=$true;resolved=$false;record=$r;reason=$_.Exception.Message} }
 }
 
 function Invoke-MO2TerminateGame {
@@ -6937,6 +7082,11 @@ function Invoke-MO2TerminateGame {
             mutationDispatched=$true; recoveryRequired=$true; noAutomaticRetry=$true
             priorReconciliation=$pendingTermination.record; newTerminationDispatched=$false
         } -Errors @('An accepted game termination remains unresolved. Preserve its original evidence and use the separately authorised exact-session recovery/closure route; no second termination or already-stopped success was issued.')
+    }
+    if ($pendingTermination.resolved) {
+        return New-MO2ActionResult -Config $Config -Command 'terminate-game' -Ok $true -State $pendingTermination.record.state -Data @{
+            sessionId=$SessionId; priorReconciliation=$pendingTermination.record; newTerminationDispatched=$false; noAutomaticRetry=$true
+        }
     }
     $inspection = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$owned.data.profile) -RequestedExecutable ([string]$owned.data.executable)
     $resolution = Resolve-MO2OwnedProcessTarget -Config $Config -Owned $owned -Processes @($inspection.processes.mo2)
@@ -6982,6 +7132,7 @@ function Invoke-MO2TerminateGame {
         $verified = Invoke-MO2VerifiedGameTerminationSet -Config $Config -Owned $currentOwned -Targets @($currentGameResolution.targets)
         if ($verified.ok) {
             $currentData.status = 'game-termination-requested'
+            $currentData | Add-Member -NotePropertyName gameTerminationRequestId -NotePropertyValue ([guid]::NewGuid().ToString('N')) -Force
             $currentData | Add-Member -NotePropertyName gameTerminationRequestedUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
             $currentData | Add-Member -NotePropertyName gameTerminationTargets -NotePropertyValue @($verified.targets) -Force
             $currentData | Add-Member -NotePropertyName gameTerminationResult -NotePropertyValue $verified -Force
@@ -7041,6 +7192,7 @@ function Invoke-MO2TerminateGame {
         rootBuilder=$rootBuilder; mo2Retained=$(if($cleanupVerified){$true}else{$null})
         receiptPublished=$receiptPublished; recoveryRequired=(-not $success); noAutomaticRetry=$true
     }
+    if ($afterTermination) { $data.remaining=@($afterTermination.processes.game) }
     return Complete-MO2GameTerminationReporting -Config $Config -Owned $owned -SessionId $SessionId -State $state -Success $success -Data $data -Errors $errors
 }
 
@@ -7130,6 +7282,11 @@ function Invoke-MO2ReleaseTransition {
             return New-MO2ActionResult -Config $FixtureConfig -Command 'release' -Ok $false -State 'blocked' -Data @{ lock = Get-MO2SessionLockRecord -Path $CurrentOwned.path; sessionPath = $RetainedSessionPath } -Errors @("Lock ownership or generation changed before release; the newer lifecycle was retained. $($_.Exception.Message)")
         }
 
+        $pendingTermination=Get-MO2PendingGameTermination -Owned $current
+        if ($pendingTermination.pending) {
+            return New-MO2ActionResult -Config $FixtureConfig -Command 'release' -Ok $false -State 'game-termination-recovery-required' -Data @{priorReconciliation=$pendingTermination;recoveryRequired=$true;sessionPath=$RetainedSessionPath} -Errors @('Unresolved or malformed accepted termination prevents release of the authoritative session.')
+        }
+
         $currentInspection = if ($CurrentInspectionFactory) {
             & $CurrentInspectionFactory $FixtureConfig $current.data
         }
@@ -7176,6 +7333,10 @@ function Invoke-MO2Release {
     )
 
     $owned = Get-MO2OwnedSession -Config $Config -SessionId $SessionId
+    $pendingTermination=Get-MO2PendingGameTermination -Owned $owned
+    if ($pendingTermination.pending) {
+        return New-MO2ActionResult -Config $Config -Command 'release' -Ok $false -State 'game-termination-recovery-required' -Data @{priorReconciliation=$pendingTermination;recoveryRequired=$true} -Errors @('Accepted termination evidence must be reconciled before session release, including release preview.')
+    }
     $inspection = Get-MO2InspectionData -Config $Config -RequestedProfile ([string]$owned.data.profile) -RequestedExecutable ([string]$owned.data.executable)
     $activeBuildData = @($inspection.rootBuilder.active | Where-Object { [IO.Path]::GetFileName([string]$_.path) -ieq 'BuildData.json' })
     $closed = $inspection.processes.game.Count -eq 0 -and $inspection.processes.mo2.Count -eq 0 -and $activeBuildData.Count -eq 0
