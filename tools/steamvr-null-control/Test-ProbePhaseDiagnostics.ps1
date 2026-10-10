@@ -68,7 +68,16 @@ Get-Content -LiteralPath (Join-Path $PSScriptRoot 'case.json') -Raw
  $native=[IO.File]::ReadAllText((Join-Path $nativeRoot 'probe.cpp'))
  $channel=[IO.File]::ReadAllText((Join-Path $nativeRoot 'FailedRoleDiagnostics.h'))
  Check ($native.Contains('if (diagnosticFailedRoles && requireControllers && !controllers.valid)')) 'inventory is default-off and only follows the original failed controller check'
- Check ($native -match 'sample < 100' -and $native.Contains('result.left == result.right') -and $native.Contains('GetTrackedDeviceIndexForControllerRole')) 'assigned-role and hundred-sample qualification retained'
+ Check ($native -match 'sample < 100' -and $native.Contains('snapshot.left == snapshot.right') -and $native.Contains('GetTrackedDeviceIndexForControllerRole')) 'assigned-role and hundred-sample qualification retained'
+ $readiness=[IO.File]::ReadAllText((Join-Path $nativeRoot 'ControllerRoleReadiness.h'))
+ Check ($native.Contains('AwaitControllerRoles(elapsed') -and $native.Contains('const auto probeBegan = std::chrono::steady_clock::now();')) 'single probe owns role readiness clock from before VR_Init'
+ Check ($readiness.Contains('RoleReadinessBudgetMs = 3000') -and $readiness.Contains('MaxRoleObservations = 151') -and $readiness.Contains('NeutralQualificationReserveMs = 2500')) 'finite role readiness has time/observation bounds and full neutral-sampling reserve'
+ Check ($readiness.Contains('ProbeQualificationDeadlineMs = 9000') -and $native.Contains('elapsed() >= csx::probe::ProbeQualificationDeadlineMs')) 'local qualification deadline remains below unchanged external ten seconds'
+ Check ($readiness.Contains('result.first = result.last') -and $native.Contains('firstLeftIndex') -and $native.Contains('firstRightIndex')) 'first assigned-role observation is retained separately from eventual readiness'
+ Check ($native.Contains('readinessEvents < 4096') -and $native.Contains('drained < 256') -and $native.Contains('result.inputEvents != 0')) 'same-probe event readiness is bounded and cannot hide nonneutral input'
+ Check ($native.Contains('!exactIdentity(roles[hand], hand, ordinal)') -and $native.Contains('RoleObservation::Rejected')) 'assigned foreign/wrong-class/wrong-role/property-error identity refuses immediately'
+ Check ($native.Contains('ValidPose(standing[index])') -and $native.Contains('ValidPose(game[index])') -and $native.Contains('ValidPose(render[index])') -and $native.Contains('!NeutralState(state)')) 'readiness does not replace full finite connected compositor/standing and neutral predicates'
+ Check ($native.Contains('return qualified ? 0 : 3') -and $native.Contains('Observe(Phase::Shutdown')) 'terminal role refusal keeps original exit and native shutdown'
  Check ($native.Contains('index < vr::k_unMaxTrackedDeviceCount') -and $native.Contains('text.size() > 262144')) 'device and output inventories are bounded'
  Check ($channel.Contains('FILE_MAP_READ') -and $channel.Contains('attempt < 3') -and $channel.Contains('snapshot.telemetrySequence == before')) 'existing input channel is read-only with bounded stable telemetry observation'
  Check ($native.Contains('catch (...)') -and $native.Contains('collector-failed') -and $native.Contains('return qualified ? 0 : 3')) 'collector failure preserves original exit/qualification result'
