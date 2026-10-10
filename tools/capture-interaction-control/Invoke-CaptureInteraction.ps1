@@ -422,6 +422,19 @@ function Add-ActionLog($State, $Entry) {
     return $path
 }
 
+function Get-BoundedActionEvidence($Value) {
+    if ($null -eq $Value) { return [pscustomobject]@{ retained=$false; bytes=0; sha256=$null; value=$null; reason='unavailable' } }
+    $json=$Value|ConvertTo-Json -Depth 80 -Compress
+    $bytes=[Text.UTF8Encoding]::new($false).GetBytes($json)
+    $fits=$bytes.Length -le 262144
+    return [pscustomobject]@{
+        retained=$fits; bytes=$bytes.Length
+        sha256=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+        value=$(if($fits){$Value}else{$null})
+        reason=$(if($fits){'complete-json-envelope'}else{'envelope-exceeds-262144-byte-budget-not-truncated'})
+    }
+}
+
 function Invoke-CaptureStartupCleanup($Recovery) {
     $errors = [Collections.Generic.List[string]]::new()
     $uncertainties = [Collections.Generic.List[string]]::new()
@@ -677,7 +690,22 @@ try {
             $startedUtc = [DateTime]::UtcNow.ToString('o')
             if (-not [string]::IsNullOrWhiteSpace($DirectTool)) {
                 $directArgs = Convert-Arguments $DirectArgumentsJson 'DirectArgumentsJson'
-                $call = Invoke-DevBench -Tool $DirectTool -Arguments $directArgs -Runtime ([string]$state.runtimePath) -ExpectedRuntimeIdentity $state.runtimeIdentity -RequireSuccess
+                try {
+                    $call = Invoke-DevBench -Tool $DirectTool -Arguments $directArgs -Runtime ([string]$state.runtimePath) -ExpectedRuntimeIdentity $state.runtimeIdentity -RequireSuccess
+                } catch {
+                    $actionFailure=$_
+                    $controllerEnvelope=$actionFailure.Exception.Data['DevBenchResponse']
+                    $attempt=$actionFailure.Exception.Data['DevBenchAttempt']
+                    $failedEntry=[pscustomobject][ordered]@{
+                        actionId=$actionId;sessionId=[string]$state.sessionId;startedUtc=$startedUtc;completedUtc=[DateTime]::UtcNow.ToString('o')
+                        receipt=[pscustomobject]@{mode='direct';tool=$DirectTool;qualified=$false;error=$actionFailure.Exception.Message;attempt=$attempt;arguments=(Get-BoundedActionEvidence $directArgs);controller=(Get-BoundedActionEvidence $controllerEnvelope);controllerEvidencePath=$(if($null -ne $controllerEnvelope -and $controllerEnvelope.PSObject.Properties['invocationEvidencePath'] -and $controllerEnvelope.invocationEvidencePath -is [string] -and $controllerEnvelope.invocationEvidencePath.Length -le 2048){$controllerEnvelope.invocationEvidencePath}else{$null})}
+                    }
+                    $failureData=[pscustomobject]@{cleanup=$null;action=$failedEntry;actionLogPath=$null;retentionError=$null}
+                    try { $failureData.actionLogPath=Add-ActionLog -State $state -Entry $failedEntry } catch { $failureData.retentionError=$_.Exception.Message }
+                    # Preserve the original failure. A returned dispatch result is
+                    # evidence only: no semantic acceptance, replay or inferred arrival.
+                    throw $actionFailure
+                }
                 $actionReceipt = [pscustomobject][ordered]@{ mode = 'direct'; tool = $DirectTool; arguments = $directArgs; result = $call.value }
             }
             else {

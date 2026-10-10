@@ -3,7 +3,8 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-function Assert-Test([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
+$captureChecks=0
+function Assert-Test([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message }; $script:captureChecks++ }
 
 $root = Join-Path ([IO.Path]::GetTempPath()) ('capture-interaction-test-' + [guid]::NewGuid().ToString('N'))
 try {
@@ -89,6 +90,12 @@ if ($ExpectedRuntimeIdentityJson) {
   }
 }
 [IO.File]::AppendAllText((Join-Path $env:CAPTURE_INTERACTION_FAKE_ROOT 'calls.log'), "$Tool/$($argsObject.action)`n")
+if ($Tool -ceq 'console' -and $env:CAPTURE_INTERACTION_FAIL_DIRECT -eq '1') {
+  $payload=@{commandId='fixture-coc';queued=$true;completed='wrong-type';command=$argsObject.command}
+  if($env:CAPTURE_INTERACTION_OVERSIZE_DIRECT -eq '1'){$payload.extra='x'*262144}
+  @{ok=$false;transportOk=$true;state='semantic-failed';dispatchReached=$true;responseDataRetained=$true;invocationEvidencePath='fixture-original-console.json';semantic=@{known=$true;ok=$false;reasons=@('Console completed has wrong type/value.')};data=@{content=@($payload)};errors=@('Console completed has wrong type/value.')}|ConvertTo-Json -Depth 20 -Compress
+  return
+}
 if ($Tool -eq 'record' -and $argsObject.action -eq 'start' -and $env:CAPTURE_INTERACTION_REJECT_RECORD_RECEIPT -eq '1') {
   $rejected=[pscustomobject]@{action='start';recording=$true;correlationId='foreign-capture'}
   [pscustomobject]@{ok=$false;transportOk=$true;state='semantic-failed';indeterminate=$false;dispatchReached=$true;responseDataRetained=$true;acceptedDataRetained=$false;runtimeIdentity=$runtimeIdentity;semantic=[pscustomobject]@{known=$true;ok=$false;guarded=$false;outcome='record-start-rejected'};data=[pscustomobject]@{content=@($rejected)};errors=@('fixture correlation mismatch')} | ConvertTo-Json -Depth 20 -Compress
@@ -260,6 +267,20 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     Assert-Test ($null -eq $demandPartial.data.observation.screenshot.error -and $demandPartial.data.observation.frameSubmission.path) 'a matching partial explicit expectation fills the remaining parameters from the same accepting identity'
     $guardedAct = & $entry act -SessionDirectory $demandSession -ActionName accept -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test $guardedAct.ok 'named input action forwards persisted artifact/build expectations under the same identity guard'
+    $env:CAPTURE_INTERACTION_FAIL_DIRECT='1'
+    foreach($oversized in @($false,$true)) {
+        $env:CAPTURE_INTERACTION_OVERSIZE_DIRECT=$(if($oversized){'1'}else{'0'})
+        $beforeCalls=@(Get-Content -LiteralPath (Join-Path $root 'calls.log'))
+        $failedAct=& $entry act -SessionDirectory $demandSession -DirectTool console -DirectArgumentsJson '{"action":"execute","command":"coc ThroatoftheWorldExterior"}' -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
+        $afterCalls=@(Get-Content -LiteralPath (Join-Path $root 'calls.log'))
+        Assert-Test (-not $failedAct.ok -and $failedAct.state -ceq 'tool-error' -and $failedAct.errors -match 'Console completed has wrong type/value' -and -not $failedAct.data.action.receipt.qualified -and $afterCalls.Count -eq $beforeCalls.Count+1) 'failed direct action retains original semantic error and exactly one dispatch without replay or acceptance'
+        $logged=@(Get-Content -LiteralPath $failedAct.data.actionLogPath)[-1]|ConvertFrom-Json -Depth 100
+        Assert-Test ($logged.actionId -ceq $failedAct.data.action.actionId -and $logged.receipt.controller.sha256 -ceq $failedAct.data.action.receipt.controller.sha256 -and $logged.receipt.arguments.value.command -ceq 'coc ThroatoftheWorldExterior') 'failed direct action has correlated durable action history and original bounded arguments'
+        if($oversized){Assert-Test (-not $logged.receipt.controller.retained -and $null -eq $logged.receipt.controller.value -and $logged.receipt.controller.bytes -gt 262144 -and $logged.receipt.controller.reason -match 'not-truncated') 'oversized rejected envelope retains digest/size/refusal, never truncated success'}
+        else {Assert-Test ($logged.receipt.controller.retained -and $logged.receipt.controller.value.dispatchReached -and $logged.receipt.controller.value.data.content[0].completed -ceq 'wrong-type' -and $logged.receipt.controller.value.invocationEvidencePath -ceq 'fixture-original-console.json') 'bounded original post-dispatch result and controller journal reference survive semantic window failure'}
+    }
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_DIRECT
+    Remove-Item Env:CAPTURE_INTERACTION_OVERSIZE_DIRECT
     $demandStop = & $entry stop -SessionDirectory $demandSession -DevBenchScriptPath $fake -Compact -NoExit | ConvertFrom-Json -Depth 100
     Assert-Test $demandStop.ok 'on-demand stop forwards accepting expectations without bootstrap flags repeated'
     foreach ($nativeSchema in @(1,2)) {
@@ -441,9 +462,11 @@ $ok = [bool]$semantic.known -and [bool]$semantic.ok
     Remove-Item Env:CAPTURE_INTERACTION_MALFORMED_RECORD_STOP -ErrorAction SilentlyContinue
     Assert-Test (-not $diagnosticStopped.ok -and $diagnosticStopped.errors -match 'vr-tracked-set-stop-contract-failed' -and $diagnosticStopped.errors -match 'record-stop-contract-failed') 'stop preserves semantic outcomes when a failed controller envelope has an empty errors array'
 
-    [pscustomobject]@{ ok=$true; sessionPath=$started.data.statePath; actionCount=(Get-CaptureInteractionActionCatalog).actions.Count } | ConvertTo-Json -Compress
+    [pscustomobject]@{ ok=$true; checks=$captureChecks; sessionPath=$started.data.statePath; actionCount=(Get-CaptureInteractionActionCatalog).actions.Count } | ConvertTo-Json -Compress
 }
 finally {
+    Remove-Item Env:CAPTURE_INTERACTION_FAIL_DIRECT -ErrorAction SilentlyContinue
+    Remove-Item Env:CAPTURE_INTERACTION_OVERSIZE_DIRECT -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_NATIVE_SCHEMA2 -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_NATIVE_REQUEST -ErrorAction SilentlyContinue
     Remove-Item Env:CAPTURE_INTERACTION_NATIVE_FAILURE -ErrorAction SilentlyContinue

@@ -110,6 +110,15 @@ returns, preventing a following action from colliding with an active owner.
 `-DirectArgumentsJson` is an explicit passthrough for operations not represented
 by the catalog; every action is appended to `actions.ndjson`.
 
+A rejected direct action also retains its action ID, bounded request and original
+controller failure envelope in `actions.ndjson` and returned failure data. The
+envelope preserves dispatch/result/journal evidence without accepting its semantic
+outcome or inferring arrival. Each request/envelope has a 262144-byte UTF-8 JSON
+retention budget; oversized evidence retains size/digest and an explicit omission,
+not truncated content. A bounded controller journal path remains available when
+returned. A logging failure is separate from the original action error. Never
+replay an action to obtain missing evidence.
+
 A direct `game load` is dispatched once. Require its receipt to report
 `queued: true`, then verify current `playerLoaded` and the exact target cell
 through read-only observations or the DevBench `playerLoaded` state barrier.
