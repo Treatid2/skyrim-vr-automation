@@ -11,6 +11,7 @@ param(
     [string]$ArtifactPath,
     [string]$ExpectedArtifactSha256,
     [string]$ExpectedBuildId,
+    [string]$WorkspaceManifestPath,
     [ValidateSet('none', 'on-demand', 'sequence')]
     [string]$VisualMode = 'on-demand',
     [ValidateSet('left_eye', 'right_eye', 'side_by_side', 'framed_combined', 'source_native')]
@@ -44,6 +45,7 @@ Import-Module (Join-Path $PSScriptRoot 'CaptureInteractionControl.psm1') -Force
 
 $stateFileName = 'capture-interaction.session.json'
 $screenshotTool = 'communityshaders.screenshot'
+$captureWorkspaceBinding = $null
 
 function Write-JsonAtomic([string]$Path, $Value) {
     $parent = Split-Path -Parent $Path
@@ -68,7 +70,80 @@ function Read-State([string]$Path) {
     $state = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -Depth 80
     if ([string]$state.contractVersion -ne '1.0.0') { throw "Unsupported capture interaction session contract '$($state.contractVersion)'." }
     if (-not $state.PSObject.Properties['runtimeIdentity']) { $state | Add-Member -NotePropertyName runtimeIdentity -NotePropertyValue $null }
+    if (-not $state.PSObject.Properties['workspaceBinding']) { $state | Add-Member -NotePropertyName workspaceBinding -NotePropertyValue $null }
     return $state
+}
+
+function Read-CaptureWorkspaceBinding([string]$Path) {
+    if (-not [IO.Path]::IsPathFullyQualified($Path)) { throw 'WorkspaceManifestPath must be fully qualified.' }
+    $resolved = [IO.Path]::GetFullPath($Path)
+    # One bounded read/hash snapshot. Later admission rechecks this exact content;
+    # central DevBench still owns save-policy and exact requested fixture checks.
+    $stream = [IO.File]::Open($resolved, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -lt 2 -or $stream.Length -gt 1048576) { throw 'Workspace manifest exceeds the 1 MiB admission bound or is empty.' }
+        $bytes = [byte[]]::new([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -eq 0) { throw 'Workspace manifest read was incomplete.' }
+            $offset += $read
+        }
+        $workspace = [Text.UTF8Encoding]::new($false, $true).GetString($bytes).TrimStart([char]0xfeff) | ConvertFrom-Json -Depth 50
+        foreach ($name in @('workspaceId', 'profilePath', 'status', 'savePolicy')) {
+            if ($null -eq $workspace -or -not $workspace.PSObject.Properties[$name] -or
+                $workspace.$name -isnot [string] -or [string]::IsNullOrWhiteSpace($workspace.$name)) {
+                throw "Workspace manifest lacks typed $name."
+            }
+        }
+        if (-not [IO.Path]::IsPathFullyQualified($workspace.profilePath) -or
+            $workspace.status -cnotin @('ready', 'retained') -or
+            $workspace.savePolicy -cnotin @('MainMenuOnly', 'FreshGame', 'VerifiedFixture')) {
+            throw 'Workspace profile/status/save policy is not admitted.'
+        }
+        if ($workspace.savePolicy -ceq 'VerifiedFixture' -and (
+            -not $workspace.PSObject.Properties['copiedVerifiedSaves'] -or
+            $workspace.copiedVerifiedSaves -isnot [bool] -or -not $workspace.copiedVerifiedSaves -or
+            -not $workspace.PSObject.Properties['saveFixture'] -or $null -eq $workspace.saveFixture -or
+            -not $workspace.saveFixture.PSObject.Properties['loadName'] -or
+            $workspace.saveFixture.loadName -isnot [string] -or [string]::IsNullOrWhiteSpace($workspace.saveFixture.loadName))) {
+            throw 'Workspace VerifiedFixture bootstrap is incomplete.'
+        }
+        return [pscustomobject][ordered]@{
+            schemaVersion = 1; manifestPath = $resolved
+            manifestSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+            manifestBytes = $bytes.Length; workspaceId = $workspace.workspaceId
+            profilePath = [IO.Path]::GetFullPath($workspace.profilePath)
+            savePolicy = $workspace.savePolicy; status = $workspace.status
+            runtimeIdentity = $null
+        }
+    } finally { $stream.Dispose() }
+}
+
+function Assert-CaptureWorkspaceBinding($Binding, $ExpectedRuntimeIdentity) {
+    if ($null -eq $Binding) {
+        if (-not [string]::IsNullOrWhiteSpace($WorkspaceManifestPath)) {
+            throw 'Capture session has no admitted workspace; start a fresh session, not a late workspace rebind.'
+        }
+        return $null # Central controller refuses game mutation without bootstrap.
+    }
+    foreach ($name in @('schemaVersion', 'manifestPath', 'manifestSha256', 'manifestBytes', 'workspaceId', 'profilePath', 'savePolicy', 'status', 'runtimeIdentity')) {
+        if (-not $Binding.PSObject.Properties[$name]) { throw "Persisted workspace binding lacks $name." }
+    }
+    if ($Binding.schemaVersion -ne 1 -or $Binding.manifestSha256 -notmatch '\A[0-9A-Fa-f]{64}\z' -or
+        -not (Test-CaptureRuntimeIdentity $Binding.runtimeIdentity) -or
+        ($Binding.runtimeIdentity | ConvertTo-Json -Compress) -cne ($ExpectedRuntimeIdentity | ConvertTo-Json -Compress)) {
+        throw 'Persisted workspace binding does not match the accepting runtime identity.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($WorkspaceManifestPath) -and
+        -not [string]::Equals([IO.Path]::GetFullPath($WorkspaceManifestPath), $Binding.manifestPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Explicit WorkspaceManifestPath contradicts the admitted capture workspace.'
+    }
+    $current = Read-CaptureWorkspaceBinding $Binding.manifestPath
+    foreach ($name in @('manifestSha256', 'manifestBytes', 'workspaceId', 'profilePath', 'savePolicy', 'status')) {
+        if ([string]$current.$name -cne [string]$Binding.$name) { throw "Capture workspace $name changed; no controller dispatch." }
+    }
+    return $current.manifestPath
 }
 
 function Test-CaptureRuntimeIdentity($Identity) {
@@ -155,6 +230,10 @@ function Invoke-DevBench([string]$Tool, [hashtable]$Arguments, [string]$Runtime,
     }
     if ($SkipRuntimeIdentityVerification) { $parameters['SkipRuntimeIdentityVerification'] = $true }
     try {
+        if ($Command -eq 'act') {
+            $manifest = Assert-CaptureWorkspaceBinding $captureWorkspaceBinding $ExpectedRuntimeIdentity
+            if ($null -ne $manifest) { $parameters['WorkspaceManifestPath'] = $manifest }
+        }
         if ($null -ne $ExpectedRuntimeIdentity) {
             if (-not (Test-CaptureRuntimeIdentity -Identity $ExpectedRuntimeIdentity)) {
                 throw 'Persisted accepting runtime identity is incomplete; no artifact/build expectation was inferred.'
@@ -505,6 +584,9 @@ try {
         $resolvedStatePath = Resolve-StatePath -ForCreate
         $resolvedSessionDirectory = Split-Path -Parent $resolvedStatePath
         if (Test-Path -LiteralPath $resolvedStatePath -PathType Leaf) { throw "Refusing to overwrite an existing session: $resolvedStatePath" }
+        if (-not [string]::IsNullOrWhiteSpace($WorkspaceManifestPath)) {
+            $captureWorkspaceBinding = Read-CaptureWorkspaceBinding $WorkspaceManifestPath
+        }
         $sessionId = [guid]::NewGuid().ToString()
         $sequencePreflight = if ($VisualMode -eq 'sequence') {
             Get-ScreenshotSequencePreflight -SessionId $sessionId -Runtime $RuntimePath -FrameCount $MaximumFrames -IntervalMs $FrameIntervalMs
@@ -517,6 +599,7 @@ try {
             runtimePath = [IO.Path]::GetFullPath($RuntimePath); sessionDirectory = $resolvedSessionDirectory
             intendedStatePath = $resolvedStatePath; receiptPath = (Join-Path $resolvedSessionDirectory 'capture-start-recovery.json')
             runtimeIdentity = $null; runtimeIdentityObservation = $null
+            workspaceBinding = $captureWorkspaceBinding
             recordAccepted = $false; recordOutcomeUncertain = $false; recordStartReceipt = $null; recordStartAttempt = $null; recordRejectedReceipt = $null; recordFailureEnvelope = $null; recordInvocationEvidencePath = $null
             screenshotRequestId = $null; screenshotOutcomeUncertain = $false; screenshotStartReceipt = $null; screenshotStartAttempt = $null; screenshotAttemptReceipt = $null; screenshotRejectedReceipt = $null; screenshotFailureEnvelope = $null; screenshotInvocationEvidencePath = $null
             cleanup = $null
@@ -649,10 +732,12 @@ try {
             createdUtc = [DateTime]::UtcNow.ToString('o'); updatedUtc = [DateTime]::UtcNow.ToString('o')
             sessionDirectory = $resolvedSessionDirectory; statePath = $resolvedStatePath; runtimePath = [IO.Path]::GetFullPath($RuntimePath)
             runtimeIdentity = $failureData.runtimeIdentity
+            workspaceBinding = $captureWorkspaceBinding
             visualMode = $VisualMode; preferredView = $PreferredView; framesDirectory = $framesDirectory
             recording = [pscustomobject][ordered]@{ startReceipt = $recordCall.value; stopReceipt = $null }
             screenshot = $screenshotState; stopErrors = @()
         }
+        if ($null -ne $captureWorkspaceBinding) { $captureWorkspaceBinding.runtimeIdentity = $failureData.runtimeIdentity }
         try { Write-JsonAtomic -Path $resolvedStatePath -Value $state }
         catch {
             $startupFailure = $_.Exception.Message
@@ -665,6 +750,7 @@ try {
     else {
         $resolvedStatePath = Resolve-StatePath
         $state = Read-State $resolvedStatePath
+        $captureWorkspaceBinding = $state.workspaceBinding
         $terminalCleanupRepeat = $Command -in @('stop', 'abort') -and [string]$state.status -in @('stopped', 'aborted')
         if ($Command -ne 'status' -and -not $SkipRuntimeIdentityVerification -and -not (
             $terminalCleanupRepeat -or

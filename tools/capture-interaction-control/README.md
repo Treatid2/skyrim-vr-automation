@@ -1,5 +1,37 @@
 # Capture interaction control
 
+## Workspace bootstrap for game actions
+
+Pass `-WorkspaceManifestPath` at `start` when the session will perform a
+save-policy-guarded game action. The fully qualified manifest is read once with
+a 1 MiB bound; workspace/profile identity, supported status/policy, exact bytes
+and SHA-256 are persisted as `workspaceBinding` with the accepting runtime
+identity. This is a local admission snapshot, not a new mutation grant.
+
+Later `act` commands forward that exact manifest through the central DevBench
+controller after rechecking its hash, identity and accepting runtime. The central
+controller still checks the requested action, exact VerifiedFixture name and
+profile saves directory. No `AllowUnprovenGameMutation` is exposed or passed.
+Manifest drift, deletion, incomplete binding, runtime mismatch or an explicitly
+different path refuses before controller dispatch. Same-byte replacement is not
+distinguished by this content binding; checks are cooperative snapshots, not an
+atomic filesystem/transport transaction.
+
+Omitting workspace at start preserves observation/input-only compatibility;
+central game mutation still refuses without workspace. Existing sessions cannot
+be rebound by supplying a path at `act`; use a fresh supported capture session
+after orderly finalization. Stop/abort recovery does not depend on workspace
+availability and retains its original runtime identity gates. `status` reports
+the persisted snapshot, not fresh workspace readiness.
+
+```powershell
+pwsh -NoProfile -File .\Invoke-CaptureInteraction.ps1 start `
+  -SessionDirectory D:\CodexScratch\...\interaction `
+  -RuntimePath D:\CSX-MO2-Sessions\...\devbench-runtime.json `
+  -WorkspaceManifestPath D:\CSX-MO2-Sessions\workspaces\exact-task.json `
+  -VisualMode none
+```
+
 For a newly deployed runtime, `capabilities` and `start` accept `-ArtifactPath`,
 `-ExpectedArtifactSha256` and `-ExpectedBuildId` and forward those exact
 expectations to every controller call, including initial input capabilities,
