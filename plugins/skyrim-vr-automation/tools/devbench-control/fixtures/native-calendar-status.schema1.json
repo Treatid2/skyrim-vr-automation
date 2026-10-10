@@ -1,0 +1,58 @@
+{
+  "action": "status",
+  "available": true,
+  "binding": {
+    "cellFormId": 91560,
+    "globalFormIds": [
+      53,
+      54,
+      55,
+      56,
+      57,
+      58
+    ],
+    "loadGeneration": 3,
+    "pid": 82384,
+    "processSession": "82384:01DD586E0A0FCA50"
+  },
+  "cleanupPending": false,
+  "commandId": "",
+  "disconnectRecovery": "expiry-bounded; no disconnect callback",
+  "expiryDue": false,
+  "frame": 84978,
+  "globalOrder": [
+    "year",
+    "month",
+    "day",
+    "gameHour",
+    "daysPassed",
+    "calendarRate"
+  ],
+  "holdValid": false,
+  "lastTransition": {
+    "ok": true,
+    "restored": false,
+    "status": "idle"
+  },
+  "leaseActive": false,
+  "observedMonotonicMs": 2657675402,
+  "ok": true,
+  "outstanding": false,
+  "plugin": "devbench",
+  "readbackFresh": true,
+  "restored": false,
+  "schemaVersion": 1,
+  "serviceStopping": false,
+  "status": "observed",
+  "values": {
+    "calendarRate": 20,
+    "day": 17,
+    "daysPassed": 0.38717925548553467,
+    "engineMultiplier": 1,
+    "gameHour": 9.292302131652832,
+    "month": 7,
+    "year": 201
+  },
+  "version": "1.22.0",
+  "worldLoaded": true
+}
