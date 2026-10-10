@@ -1112,7 +1112,7 @@ catch [IO.IOException] {
         $WhatIfPreference = $true
         New-MO2DurableSessionController -Config $fixtureConfig -SessionPath $candidateSessionPath -WhatIf
     } $config $prepareDryRun.data.sessionPath
-    Assert-MO2Test (@($previewBundle.wouldCopy).Count -eq 6 -and $previewBundle.wouldCopy -contains 'MO2Control.psm1' -and $previewBundle.wouldCopy -contains 'CSXConfigCustodyProof.ps1') 'inherited WhatIf retains complete planned controller-file inventory including config custody proof'
+    Assert-MO2Test (@($previewBundle.wouldCopy).Count -eq 7 -and $previewBundle.wouldCopy -contains 'MO2Control.psm1' -and $previewBundle.wouldCopy -contains 'CSXConfigCustodyProof.ps1' -and $previewBundle.wouldCopy -contains 'shader-cache-control\ShaderCacheTargetLock.psm1') 'inherited WhatIf retains complete planned controller dependency inventory'
     $dryRunLease = Invoke-MO2AccessStatus -Config $config -AccessId $sessionAccessId
     Assert-MO2Test ($dryRunLease.state -eq 'access-owned' -and [string]::IsNullOrWhiteSpace([string]$dryRunLease.data.access.sessionId)) 'prepare dry-run leaves the access-only lease unbound'
     Assert-MO2Test (-not (Test-Path -LiteralPath $prepareDryRun.data.sessionPath -PathType Container)) 'prepare dry-run creates no evidence directory'
