@@ -11,20 +11,22 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <sstream>
+#include "FailedRoleDiagnostics.h"
 
 namespace {
 using csx::probe::Observe;
 using csx::probe::Phase;
 
-void PrintPose(const char* name, const vr::TrackedDevicePose_t& pose)
+void PrintPose(const char* name, const vr::TrackedDevicePose_t& pose, std::ostream& output = std::cout)
 {
     const auto& matrix = pose.mDeviceToAbsoluteTracking;
-    std::cout << '"' << name << "\":{";
-    std::cout << "\"connected\":" << (pose.bDeviceIsConnected ? "true" : "false") << ',';
-    std::cout << "\"valid\":" << (pose.bPoseIsValid ? "true" : "false") << ',';
-    std::cout << "\"trackingResult\":" << static_cast<int>(pose.eTrackingResult) << ',';
-    std::cout << "\"position\":[" << matrix.m[0][3] << ',' << matrix.m[1][3] << ',' << matrix.m[2][3] << ']';
-    std::cout << '}';
+    output << '"' << name << "\":{";
+    output << "\"connected\":" << (pose.bDeviceIsConnected ? "true" : "false") << ',';
+    output << "\"valid\":" << (pose.bPoseIsValid ? "true" : "false") << ',';
+    output << "\"trackingResult\":" << static_cast<int>(pose.eTrackingResult) << ',';
+    output << "\"position\":[" << matrix.m[0][3] << ',' << matrix.m[1][3] << ',' << matrix.m[2][3] << ']';
+    output << '}';
 }
 
 std::string JsonEscape(const char* value)
@@ -34,6 +36,13 @@ std::string JsonEscape(const char* value)
         return escaped;
     }
     for (const auto character : std::string(value)) {
+        if (static_cast<unsigned char>(character) < 0x20) {
+            const char digits[] = "0123456789abcdef";
+            escaped += "\\u00";
+            escaped.push_back(digits[(static_cast<unsigned char>(character) >> 4) & 15]);
+            escaped.push_back(digits[static_cast<unsigned char>(character) & 15]);
+            continue;
+        }
         if (character == '\\' || character == '"') {
             escaped.push_back('\\');
         }
@@ -159,17 +168,60 @@ ControllerCheck CheckControllers(vr::IVRSystem* system)
     return result;
 }
 
+void PrintFailedRoleDiagnostics(vr::IVRSystem* system, std::ostream& output)
+{
+    // Exactly one inventory, capped by OpenVR's64-device limit. Role hints
+    // remain separate from actual assignment; no qualification or extra probe.
+    std::array<vr::TrackedDevicePose_t, vr::k_unMaxTrackedDeviceCount> poses{};
+    Observe(Phase::DiagnosticInventoryPose, [&] { system->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0F, poses.data(), static_cast<std::uint32_t>(poses.size())); });
+    output << "{\"diagnosticOnly\":true,\"maxDevices\":" << vr::k_unMaxTrackedDeviceCount << ",\"devices\":[";
+    bool comma = false;
+    for (vr::TrackedDeviceIndex_t index = 0; index < vr::k_unMaxTrackedDeviceCount; ++index) {
+        const auto deviceClass = Observe(Phase::ControllerClass, [&] { return system->GetTrackedDeviceClass(index); });
+        if (deviceClass == vr::TrackedDeviceClass_Invalid) { continue; }
+        if (comma) { output << ','; } comma = true;
+        const auto assigned = Observe(Phase::ControllerRole, [&] { return system->GetControllerRoleForTrackedDeviceIndex(index); });
+        vr::ETrackedPropertyError hintError = vr::TrackedProp_Success;
+        const auto hint = Observe(Phase::DiagnosticRoleHint, [&] { return system->GetInt32TrackedDeviceProperty(index, vr::Prop_ControllerRoleHint_Int32, &hintError); });
+        const auto connected = Observe(Phase::DiagnosticConnected, [&] { return system->IsTrackedDeviceConnected(index); });
+        std::array<char, 128> serial{}, tracking{};
+        vr::ETrackedPropertyError serialError = vr::TrackedProp_Success, trackingError = vr::TrackedProp_Success;
+        const auto serialSize = Observe(Phase::SerialProperty, [&] { return system->GetStringTrackedDeviceProperty(index, vr::Prop_SerialNumber_String, serial.data(), static_cast<std::uint32_t>(serial.size()), &serialError); });
+        const auto trackingSize = Observe(Phase::TrackingProperty, [&] { return system->GetStringTrackedDeviceProperty(index, vr::Prop_TrackingSystemName_String, tracking.data(), static_cast<std::uint32_t>(tracking.size()), &trackingError); });
+        serial.back() = tracking.back() = 0;
+        output << "{\"index\":" << index << ",\"deviceClass\":" << static_cast<int>(deviceClass)
+                  << ",\"assignedRole\":" << static_cast<int>(assigned) << ",\"roleHint\":" << hint
+                  << ",\"roleHintError\":" << static_cast<int>(hintError)
+                  << ",\"connected\":" << (connected ? "true" : "false")
+                  << ",\"serialError\":" << static_cast<int>(serialError) << ",\"trackingError\":" << static_cast<int>(trackingError)
+                  << ",\"serial\":";
+        if (serialError == vr::TrackedProp_Success && serialSize > 0 && serialSize <= serial.size()) { output << '"' << JsonEscape(serial.data()) << '"'; } else { output << "null"; }
+        output << ",\"trackingSystem\":";
+        if (trackingError == vr::TrackedProp_Success && trackingSize > 0 && trackingSize <= tracking.size()) { output << '"' << JsonEscape(tracking.data()) << '"'; } else { output << "null"; }
+        output << ",\"finitePose\":" << (IsFiniteEyeTransform(poses[index].mDeviceToAbsoluteTracking) ? "true" : "false") << ',';
+        // Invalid/nonfinite pose coordinates must not emit invalid JSON.
+        if (IsFiniteEyeTransform(poses[index].mDeviceToAbsoluteTracking)) { PrintPose("standing", poses[index], output); }
+        else { output << "\"standing\":null"; }
+        output << '}';
+    }
+    output << "],\"controllerChannel\":";
+    Observe(Phase::DiagnosticChannel, [&] { csx::probe::PrintControllerChannel(output); });
+    output << '}';
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
 {
     bool requireControllers = false;
     bool diagnosticPhases = false;
+    bool diagnosticFailedRoles = false;
     bool validArguments = true;
     for (int i = 1; i < argc; ++i) {
         const std::string argument{argv[i]};
         if (argument == "--require-controllers" && !requireControllers) { requireControllers = true; }
         else if (argument == "--diagnostic-phases" && !diagnosticPhases) { diagnosticPhases = true; }
+        else if (argument == "--diagnostic-failed-roles" && !diagnosticFailedRoles) { diagnosticFailedRoles = true; }
         else { validArguments = false; }
     }
     if (!validArguments) {
@@ -230,6 +282,19 @@ int main(int argc, char** argv)
               << ",\"leftIndex\":" << controllers.left << ",\"rightIndex\":" << controllers.right
               << ",\"neutralSamples\":" << controllers.samples << ",\"inputEvents\":" << controllers.inputEvents
               << ",\"packetNumbers\":[" << controllers.packets[0] << ',' << controllers.packets[1] << "]}";
+    if (diagnosticFailedRoles && requireControllers && !controllers.valid) {
+        std::cout << ",\"failedRoleDiagnostics\":";
+        try {
+            std::ostringstream diagnostics;
+            diagnostics << std::fixed << std::setprecision(6);
+            PrintFailedRoleDiagnostics(system, diagnostics);
+            const auto text = diagnostics.str();
+            if (text.size() > 262144) { std::cout << "{\"diagnosticOnly\":true,\"error\":\"byte-budget-exceeded\"}"; }
+            else { std::cout << text; }
+        } catch (...) {
+            std::cout << "{\"diagnosticOnly\":true,\"error\":\"collector-failed\"}";
+        }
+    }
     std::cout << "}\n";
     Observe(Phase::Shutdown, [] { vr::VR_Shutdown(); });
     return qualified ? 0 : 3;

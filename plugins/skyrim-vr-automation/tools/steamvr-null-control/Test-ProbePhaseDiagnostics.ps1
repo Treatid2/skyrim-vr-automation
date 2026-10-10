@@ -22,7 +22,7 @@ try {
  foreach($dir in @('tools/steamvr-null-control','tools/process-control','provider/tools')){[IO.Directory]::CreateDirectory((Join-Path $fixture $dir))|Out-Null}
  [IO.File]::WriteAllText((Join-Path $fixture 'provider/tools/csx_openvr_pose_probe.exe'),'Synthetic fixture marker, never executable.')
  $setup=@'
-param([string]$Fixture,[switch]$DiagnosticPhases,[switch]$Expired,[switch]$BadAuthority)
+param([string]$Fixture,[switch]$DiagnosticPhases,[switch]$DiagnosticFailedRoles,[switch]$Expired,[switch]$BadAuthority)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $HeadPoseDriverRoot=Join-Path $Fixture 'provider'
@@ -34,13 +34,13 @@ function Get-HeadPoseCanonicalPath {param($Path) [IO.Path]::GetFullPath($Path)}
  $run=@'
 $contract=@{poseProbeRelativePath='tools/csx_openvr_pose_probe.exe'}
 $deadline=if($Expired){[datetime]::UtcNow.AddSeconds(-1)}else{[datetime]::UtcNow.AddSeconds(90)}
-Get-ApplicationHeadPose -Contract $contract -PreProbePose @{} -PreProbePackageAuthority @{} -DeadlineUtc $deadline -DiagnosticPhases:$DiagnosticPhases|ConvertTo-Json -Depth 60 -Compress
+Get-ApplicationHeadPose -Contract $contract -PreProbePose @{} -PreProbePackageAuthority @{} -DeadlineUtc $deadline -DiagnosticPhases:$DiagnosticPhases -DiagnosticFailedRoles:$DiagnosticFailedRoles|ConvertTo-Json -Depth 60 -Compress
 '@
  $harness=Join-Path $fixture 'tools/steamvr-null-control/harness.ps1'
  [IO.File]::WriteAllText($harness,($setup+"`n"+$function[0].Extent.Text+"`n"+$run))
  $fake=@'
-param($FilePath,[string[]]$ArgumentList,$WorkingDirectory,$MaxAttempts,$TimeoutSeconds,$TerminationGraceMilliseconds,$StreamDrainGraceMilliseconds,[switch]$NoExit,[switch]$Compact)
-$record=@{args=$ArgumentList;file=$FilePath;maxAttempts=$MaxAttempts;timeout=$TimeoutSeconds;terminationGrace=$TerminationGraceMilliseconds;drainGrace=$StreamDrainGraceMilliseconds}
+param($FilePath,[string[]]$ArgumentList,$WorkingDirectory,$MaxAttempts,$TimeoutSeconds,$TerminationGraceMilliseconds,$StreamDrainGraceMilliseconds,[switch]$NormalInteractiveUser,[switch]$NoExit,[switch]$Compact)
+$record=@{args=$ArgumentList;file=$FilePath;maxAttempts=$MaxAttempts;timeout=$TimeoutSeconds;terminationGrace=$TerminationGraceMilliseconds;drainGrace=$StreamDrainGraceMilliseconds;normalInteractive=[bool]$NormalInteractiveUser}
 [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'dispatch.json'),($record|ConvertTo-Json -Compress))
 Get-Content -LiteralPath (Join-Path $PSScriptRoot 'case.json') -Raw
 '@
@@ -49,16 +49,29 @@ Get-Content -LiteralPath (Join-Path $PSScriptRoot 'case.json') -Raw
  $stderr="CSX_OPENVR_PROBE_PHASE_V1 seq=1 call=1 phase=VR_Init state=entered sample=-1 hand=-1`n"
  $bounded=@{ok=$false;attempts=@(@{timedOut=$true;stdout='';stderr=$stderr;exitVerified=$true;jobQuiescent=$true;streamDrainComplete=$true;pid=123});errors=@('synthetic10s timeout')}
  [IO.File]::WriteAllText((Join-Path $processRoot 'case.json'),($bounded|ConvertTo-Json -Depth 20 -Compress))
- foreach($enabled in @($false,$true)){
-  $result=& $harness -Fixture $fixture -DiagnosticPhases:$enabled|ConvertFrom-Json -Depth 60
+ foreach($roles in @($false,$true)){ foreach($enabled in @($false,$true)){
+  $result=& $harness -Fixture $fixture -DiagnosticPhases:$enabled -DiagnosticFailedRoles:$roles|ConvertFrom-Json -Depth 60
   $dispatch=Get-Content -LiteralPath (Join-Path $processRoot 'dispatch.json') -Raw|ConvertFrom-Json
-  $expected=if($enabled){@('--require-controllers','--diagnostic-phases')}else{@('--require-controllers')}
+  $expected=@(if($enabled){'--require-controllers';'--diagnostic-phases'}else{'--require-controllers'})
+  if($roles){$expected+=@('--diagnostic-failed-roles')}
+  Check $dispatch.normalInteractive 'original probe explicitly requires the normal interactive context'
   Check (($dispatch.args -join '|') -ceq ($expected -join '|')) "opt-in=$enabled exact admitted native argv"
   Check ($dispatch.maxAttempts -eq 1 -and $dispatch.timeout -eq 10 -and $dispatch.terminationGrace -eq 100 -and $dispatch.drainGrace -eq 100) "opt-in=$enabled retains attempt/budget/cleanup limits"
   Check ($result.timedOut -and $result.terminalFailure -and $result.failureKind -ceq 'timeout' -and -not $result.qualified) "opt-in=$enabled breadcrumbs cannot qualify timeout"
   Check ($result.boundedProcess.attempts[0].stderr -ceq $stderr -and $result.boundedProcess.attempts[0].stdout -ceq '') "opt-in=$enabled exact partial native streams retained"
   Check ($result.boundedProcess.attempts[0].exitVerified -and $result.boundedProcess.attempts[0].jobQuiescent) "opt-in=$enabled exact cleanup evidence retained"
- }
+ }}
+ Check (@($ast.ParamBlock.Parameters|Where-Object {$_.Name.VariablePath.UserPath -ceq 'ProbeDiagnosticFailedRoles'}).Count -eq 1) 'failed-role switch explicit and default-off'
+ foreach($call in $runtimeCalls){Check ($call.Extent.Text.Contains('-DiagnosticFailedRoles:$ProbeDiagnosticFailedRoles')) 'runtime call forwards failed-role opt-in'}
+ Check ($appCall[0].Extent.Text.Contains('-DiagnosticFailedRoles:$DiagnosticFailedRoles')) 'single admitted probe forwards failed-role opt-in'
+ $nativeRoot=Join-Path $PSScriptRoot '../../native/steamvr-head-pose/src'
+ $native=[IO.File]::ReadAllText((Join-Path $nativeRoot 'probe.cpp'))
+ $channel=[IO.File]::ReadAllText((Join-Path $nativeRoot 'FailedRoleDiagnostics.h'))
+ Check ($native.Contains('if (diagnosticFailedRoles && requireControllers && !controllers.valid)')) 'inventory is default-off and only follows the original failed controller check'
+ Check ($native -match 'sample < 100' -and $native.Contains('result.left == result.right') -and $native.Contains('GetTrackedDeviceIndexForControllerRole')) 'assigned-role and hundred-sample qualification retained'
+ Check ($native.Contains('index < vr::k_unMaxTrackedDeviceCount') -and $native.Contains('text.size() > 262144')) 'device and output inventories are bounded'
+ Check ($channel.Contains('FILE_MAP_READ') -and $channel.Contains('attempt < 3') -and $channel.Contains('snapshot.telemetrySequence == before')) 'existing input channel is read-only with bounded stable telemetry observation'
+ Check ($native.Contains('catch (...)') -and $native.Contains('collector-failed') -and $native.Contains('return qualified ? 0 : 3')) 'collector failure preserves original exit/qualification result'
  $dispatchPath=Join-Path $processRoot 'dispatch.json';$before=(Get-FileHash $dispatchPath).Hash
  foreach($case in @('Expired','BadAuthority')){
   $flags=@{Fixture=$fixture;DiagnosticPhases=$true};$flags[$case]=$true

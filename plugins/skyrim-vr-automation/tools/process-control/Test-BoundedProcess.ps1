@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 [CmdletBinding()]
-param()
+param([string]$AggregateContractPath)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -106,6 +106,9 @@ Start-Sleep -Seconds 30
         throw 'Late terminal projection did not atomically replace the earlier receipt.'
     }
     $aggregatePath = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'tests\Test-Toolset.ps1'
+    # Packaged plugin deliberately omits repository-wide tests; its fixture
+    # wrapper may explicitly pin the root aggregate contract, never fabricate it.
+    if ($AggregateContractPath) { $aggregatePath = [IO.Path]::GetFullPath($AggregateContractPath) }
     $aggregateText = Get-Content -LiteralPath $aggregatePath -Raw
     if ($aggregateText -notmatch 'Invoke-BoundedProcess\.ps1' -or
         $aggregateText -notmatch '\[ValidateRange\(30, 3600\)\]\[int\]\$PerSuiteTimeoutSeconds = 600' -or

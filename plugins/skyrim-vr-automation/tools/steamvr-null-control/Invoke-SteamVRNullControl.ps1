@@ -22,6 +22,7 @@ param(
 
     # Opt-in stderr breadcrumbs from a matching new native probe; not readiness.
     [switch]$ProbeDiagnosticPhases,
+    [switch]$ProbeDiagnosticFailedRoles,
 
     [string]$EvidenceDirectory,
 
@@ -1236,7 +1237,8 @@ function Get-ApplicationHeadPose {
         [Parameter(Mandatory)]$PreProbePose,
         [Parameter(Mandatory)]$PreProbePackageAuthority,
         [DateTime]$DeadlineUtc = [DateTime]::MaxValue,
-        [switch]$DiagnosticPhases
+        [switch]$DiagnosticPhases,
+        [switch]$DiagnosticFailedRoles
     )
     if ([string]::IsNullOrWhiteSpace($HeadPoseDriverRoot)) {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; probeAttempted = $false; terminalFailure = $true; failureKind = 'provider-package-unavailable'; timedOut = $false; boundedProcess = $null; error = 'The stable head-pose driver root could not be resolved.' }
@@ -1291,7 +1293,8 @@ function Get-ApplicationHeadPose {
         $probeAttempted = $true
         $probeArguments = @('--require-controllers')
         if ($DiagnosticPhases) { $probeArguments += '--diagnostic-phases' }
-        $bounded = & $boundedTool -FilePath $probePath -ArgumentList $probeArguments -WorkingDirectory (Split-Path -Parent $probePath) -MaxAttempts 1 -TimeoutSeconds $probeTimeoutSeconds -TerminationGraceMilliseconds 100 -StreamDrainGraceMilliseconds 100 -NoExit -Compact | ConvertFrom-Json -Depth 30
+        if ($DiagnosticFailedRoles) { $probeArguments += '--diagnostic-failed-roles' }
+        $bounded = & $boundedTool -FilePath $probePath -ArgumentList $probeArguments -WorkingDirectory (Split-Path -Parent $probePath) -NormalInteractiveUser -MaxAttempts 1 -TimeoutSeconds $probeTimeoutSeconds -TerminationGraceMilliseconds 100 -StreamDrainGraceMilliseconds 100 -NoExit -Compact | ConvertFrom-Json -Depth 30
         $failureKind = 'bounded-attempt-invalid'
         $attempts = @($bounded.attempts)
         if ($attempts.Count -ne 1 -or $null -eq $attempts[0]) { throw 'Independent OpenVR pose probe did not retain exactly one bounded attempt.' }
@@ -1391,7 +1394,8 @@ function Get-NullRuntimeEvidence {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Processes,
         [Parameter(Mandatory)]$Profile,
         [DateTime]$DeadlineUtc = [DateTime]::MaxValue,
-        [switch]$DiagnosticPhases
+        [switch]$DiagnosticPhases,
+        [switch]$DiagnosticFailedRoles
     )
     $resolvedRoot = [IO.Path]::GetFullPath($SteamVRRoot).TrimEnd('\') + '\'
     $owned = @($Processes | Where-Object {
@@ -1441,7 +1445,7 @@ function Get-NullRuntimeEvidence {
         }
     }
     $providerLogReady = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active -and $null -ne $headPoseLoaded -and $null -ne $headPoseRegistered
-    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified -and $packageAuthority.verified -and $headPoseState.driverCreatorPid -eq $server[0].id -and [uint64][DateTime]::Parse($server[0].startTimeUtc).ToUniversalTime().ToFileTimeUtc() -eq $headPoseState.creatorAuthority.processStartFileTimeUtc) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -PreProbePose $headPoseState -PreProbePackageAuthority $packageAuthority -DeadlineUtc $DeadlineUtc -DiagnosticPhases:$DiagnosticPhases } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; probeAttempted = $false; terminalFailure = $false; failureKind = $null; timedOut = $false; error = 'The provider creator/package is not ready for an application-facing pose probe.' } }
+    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified -and $packageAuthority.verified -and $headPoseState.driverCreatorPid -eq $server[0].id -and [uint64][DateTime]::Parse($server[0].startTimeUtc).ToUniversalTime().ToFileTimeUtc() -eq $headPoseState.creatorAuthority.processStartFileTimeUtc) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -PreProbePose $headPoseState -PreProbePackageAuthority $packageAuthority -DeadlineUtc $DeadlineUtc -DiagnosticPhases:$DiagnosticPhases -DiagnosticFailedRoles:$DiagnosticFailedRoles } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; probeAttempted = $false; terminalFailure = $false; failureKind = $null; timedOut = $false; error = 'The provider creator/package is not ready for an application-facing pose probe.' } }
     $preProbeServerProcess = if ($server.Count -eq 1) { $server[0] } else { $null }
     $serverProcess = $preProbeServerProcess
     if ($applicationHeadPose.qualified) {
@@ -1870,7 +1874,7 @@ try {
     })
     $unprovenProcesses = @($processes | Where-Object { $_ -notin $ownedProcesses })
     $effective = Get-EffectiveState -Settings $settings -Profile $profile
-    $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DiagnosticPhases:$ProbeDiagnosticPhases
+    $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DiagnosticPhases:$ProbeDiagnosticPhases -DiagnosticFailedRoles:$ProbeDiagnosticFailedRoles
     $externalDrivers = Get-ExternalDriverInventory -Path $OpenVRPathsPath
     $mo2Admission = if ($Command -in @('apply', 'start')) { Get-MO2NullAdmission } else { $null }
     $authoritativeEvidenceDirectory = if ($null -ne $recoveredTransaction -and (Test-JsonDictionaryContains $recoveredTransaction 'evidenceDirectory')) { [string]$recoveredTransaction['evidenceDirectory'] } else { $null }
@@ -2061,11 +2065,13 @@ try {
                     throw "The current runtime receipt could not be made nonaccepted before launch: $($_.Exception.Message)"
                 }
                 $startedUtc = [DateTime]::UtcNow
-                $launcher = Start-Process -FilePath $startupPath -WindowStyle Hidden -PassThru
                 $startupAttemptStartedUtc = $startedUtc
                 $script:SteamVRStartupAttemptActive = $true
                 $deadline = $startedUtc.AddSeconds($StartupTimeoutSeconds)
                 $startupDeadlineUtc = $deadline
+                . (Join-Path (Split-Path -Parent $PSScriptRoot) 'process-control/ProcessLaunchInterop.ps1')
+                $launcher = Start-NormalInteractiveProcess -FilePath $startupPath -DeadlineUtc $deadline
+                $runtimeReceipt['interactiveLaunch'] = $launcher.interactiveLaunch
                 $logReadReserveMilliseconds = [int][Math]::Min(2000, [Math]::Max(500, $StartupTimeoutSeconds * 50))
                 $qualificationDeadline = $deadline.AddMilliseconds(-$logReadReserveMilliseconds)
                 $runtimeReceipt['startedUtc'] = $startedUtc.ToString('o')
@@ -2095,7 +2101,7 @@ try {
                     $processes = @(Get-SteamVRProcesses)
                     try {
                         $runtimeProbeAttempts++
-                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $qualificationDeadline -DiagnosticPhases:$ProbeDiagnosticPhases
+                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $qualificationDeadline -DiagnosticPhases:$ProbeDiagnosticPhases -DiagnosticFailedRoles:$ProbeDiagnosticFailedRoles
                     }
                     catch [TimeoutException] {
                         $lastRuntimeProbeError = $_.Exception.Message
@@ -2119,7 +2125,7 @@ try {
                         if ($InternalTestFailurePoint -in @('runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-confirmation-timeout-input-contract-failure')) {
                             throw [TimeoutException]::new('Injected runtime confirmation timeout.')
                         }
-                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $qualificationDeadline -DiagnosticPhases:$ProbeDiagnosticPhases
+                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $qualificationDeadline -DiagnosticPhases:$ProbeDiagnosticPhases -DiagnosticFailedRoles:$ProbeDiagnosticFailedRoles
                         if ($runtime.applicationHeadPose.terminalFailure) {
                             $lastRuntimeProbeError = [string]$runtime.applicationHeadPose.error
                             $runtimeConfirmationTimedOut = [bool]$runtime.applicationHeadPose.timedOut

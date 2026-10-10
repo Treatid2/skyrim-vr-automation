@@ -26,8 +26,8 @@ try {
     foreach($directory in @($nullRoot,$processRoot,$providerRoot)){[IO.Directory]::CreateDirectory($directory)|Out-Null}
     [IO.File]::WriteAllText((Join-Path $providerRoot 'csx_openvr_pose_probe.exe'),'Never executed: bounded controller is a test fixture.')
     $boundedStub=@'
-param($FilePath,$ArgumentList,$WorkingDirectory,$MaxAttempts,$TimeoutSeconds,$TerminationGraceMilliseconds,$StreamDrainGraceMilliseconds,[switch]$NoExit,[switch]$Compact)
-if($MaxAttempts -ne 1 -or $ArgumentList -cne '--require-controllers' -or $TimeoutSeconds -gt 10 -or $TerminationGraceMilliseconds -ne 100 -or $StreamDrainGraceMilliseconds -ne 100){throw 'Production probe dispatch contract changed.'}
+param($FilePath,$ArgumentList,$WorkingDirectory,$MaxAttempts,$TimeoutSeconds,$TerminationGraceMilliseconds,$StreamDrainGraceMilliseconds,[switch]$NormalInteractiveUser,[switch]$NoExit,[switch]$Compact)
+if(-not $NormalInteractiveUser -or $MaxAttempts -ne 1 -or $ArgumentList -cne '--require-controllers' -or $TimeoutSeconds -gt 10 -or $TerminationGraceMilliseconds -ne 100 -or $StreamDrainGraceMilliseconds -ne 100){throw 'Production probe dispatch contract changed.'}
 [IO.File]::AppendAllText((Join-Path $PSScriptRoot 'dispatch-count.txt'),"one`n")
 Get-Content -LiteralPath (Join-Path $PSScriptRoot 'case.json') -Raw
 '@
