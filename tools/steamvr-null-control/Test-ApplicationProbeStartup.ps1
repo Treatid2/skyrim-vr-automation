@@ -195,9 +195,10 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
     function Stop-Process {
         [CmdletBinding()]param([int]$Id,$InputObject,[switch]$Force)
         if($null -ne $InputObject){$Id=$InputObject.Id}
+        $cleanupCase=Get-Content -LiteralPath (Join-Path $HeadPoseDriverRoot 'case.txt') -Raw
         if($Id -ne 12345 -or -not $Force){throw 'Unexpected fixture stop target.'}
-        if($script:cleanupCase -ceq 'cleanup-denied'){throw [ComponentModel.Win32Exception]::new(5)}
-        if($script:cleanupCase -in @('cleanup-self-exit','cleanup-pid-reused-after-stop')){
+        if($cleanupCase -ceq 'cleanup-denied'){throw [ComponentModel.Win32Exception]::new(5)}
+        if($cleanupCase -in @('cleanup-self-exit','cleanup-pid-reused-after-stop')){
             $InputObject.HasExited=$true
             [IO.File]::WriteAllText((Join-Path $SteamVRRoot 'launch.json'),'{"live":false}')
             throw [InvalidOperationException]::new('Synthetic process exited before Stop-Process.')
@@ -208,16 +209,17 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
     function Get-Process {
         [CmdletBinding()]param([int]$Id)
         if($Id -ne 12345){throw 'Unexpected fixture process query.'}
+        $cleanupCase=Get-Content -LiteralPath (Join-Path $HeadPoseDriverRoot 'case.txt') -Raw
         $s=Get-Content -LiteralPath (Join-Path $SteamVRRoot 'launch.json') -Raw|ConvertFrom-Json
-        if($script:cleanupCase -ceq 'cleanup-inspect-unavailable'){throw [ComponentModel.Win32Exception]::new(5)}
-        if($script:cleanupCase -ceq 'cleanup-already-exited' -and $s.live){
-            [IO.File]::WriteAllText((Join-Path $script:currentSteamRoot 'launch.json'),'{"live":false}')
+        if($cleanupCase -ceq 'cleanup-inspect-unavailable'){throw [ComponentModel.Win32Exception]::new(5)}
+        if($cleanupCase -ceq 'cleanup-already-exited' -and $s.live){
+            [IO.File]::WriteAllText((Join-Path $SteamVRRoot 'launch.json'),'{"live":false}')
             return
         }
-        if($s.live -or $script:cleanupCase -ceq 'cleanup-pid-reused-after-stop'){
-            $path=Join-Path $script:currentSteamRoot 'bin/win64/vrserver.exe'
+        if($s.live -or $cleanupCase -ceq 'cleanup-pid-reused-after-stop'){
+            $path=Join-Path $SteamVRRoot 'bin/win64/vrserver.exe'
             $start=if($s.live){([DateTimeOffset]$s.startedUtc).UtcDateTime}else{[DateTime]::UtcNow.AddMinutes(1)}
-            if($script:cleanupCase -ceq 'cleanup-pid-drift'){$start=$start.AddMinutes(1)}
+            if($cleanupCase -ceq 'cleanup-pid-drift'){$start=$start.AddMinutes(1)}
             $p=[pscustomobject]@{Id=12345;Path=$path;StartTime=$start;Handle=1;HasExited=$false}
             $p|Add-Member ScriptMethod Dispose {}
             return $p
@@ -225,7 +227,6 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
     }
     $kinds=@{empty='empty-output';undrained='stream-drain-incomplete';malformed='malformed-output';'package-drift'='provider-package-drift';continuity='continuity-failed';exit='bounded-process-failure';timeout='timeout';unqualified='observation-unqualified';'confirmation-malformed'='malformed-output'}
     foreach ($case in @('empty','undrained','malformed','package-drift','continuity','exit','timeout','unqualified','confirmation-malformed','success','delayed-provider','insufficient-budget','log-budget','log-replacement','log-truncation','log-mutation','log-rotation-success','log-rotation-missing','log-rotation-identity','log-rotation-length','log-rotation-guard','log-rotation-pid','log-rotation-config','log-rotation-time','log-rotation-later','cleanup-self-exit','cleanup-already-exited','cleanup-denied','cleanup-pid-drift','cleanup-inspect-unavailable','cleanup-pid-reused-after-stop')) {
-        $script:cleanupCase=$case
         $caseRoot=Join-Path $fixture $case
         $script:currentSteamRoot=Join-Path $caseRoot 'SteamVR'
         $provider=Join-Path $caseRoot 'provider'
