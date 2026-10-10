@@ -326,6 +326,48 @@ prove an application bypassing SteamVR is attached to it.
 
 Run `Test-SteamVRNullControl.ps1` after changing the control contract.
 
+### Attempt-relative startup log proof
+
+Before the owned launcher runs, `start` captures and persists a schema-1 log
+anchor in the nonaccepted runtime receipt: canonical selected path, OS physical
+file identity, prelaunch EOF offset, LF/partial-first-line framing, and SHA-256
+of at most 4096 boundary bytes. Historical bytes do not consume the unchanged
+`LogTailMaxBytes` attempt payload budget. An existing file must remain append-only
+for that attempt. Truncation, rotation, same-name replacement, boundary mutation
+or retained-range mutation is refused; there is no in-attempt reanchor. If the
+path was absent before launch, it may be created once and remains physically
+bound after observation. Initial absence is pollable; disappearance after
+observation is terminal. Concurrent boundary advance during anchor capture
+refuses launch. Directory/access/identity failures are not treated as absence.
+
+The reader examines only the bounded window starting at that offset, skips any
+historical partial first line through its next LF, and publishes only fully
+LF-framed records. It requires the exact current server's startup PID, runtime
+root and creation-time-correlated timestamp before the existing exact-serial
+null/HMD and head-provider records. Byte/line/deadline caps remain unchanged;
+delayed observation and noisy moving-tail rollover do not slide the immutable
+startup window. Each observation hashes retained attempt bytes and the boundary
+guard, then reopens the selected path to verify identity, nontruncation and those
+same ranges before publication. These hashes are bounded range proofs, not a
+whole historical-file immutability claim. Timestamp parsing retains the existing
+local-log/UTC contract. Retained physical offsets are [inclusive, exclusive).
+
+Nonrecoverable acquisition errors return `startup-log-proof-acquisition-failed`
+on the first failed readiness observation, preserving the primary error and
+performing the existing exact-attempt cleanup; they do not cause futile repolls
+or a native probe. A later invocation may reuse only an exact accepted runtime
+receipt from the authoritative committed apply journal's evidence directory,
+and must revalidate its original physical identity and hashes. Legacy/unknown
+anchors remain unqualified rather than being invented or silently migrated.
+This is log admission, not application/controller qualification: the separate
+probe, full probe budget and all 100-sample predicates remain mandatory.
+
+`Test-StartupLogProof.ps1 -FixtureRoot <temporary-fixture-root>` exercises bounded
+history/append/framing/identity/hash/deadline and accepted-receipt continuity.
+`Test-ApplicationProbeStartup.ps1` additionally drives the real public apply/start
+loop with temporary log faults and verifies one observation, zero probe calls,
+nonaccepted receipts and exact owned cleanup. No live runtime is used.
+
 ## Resuming a retained environment under a new access lease
 
 Releasing MO2 access preserves the task workspace; it does not transfer the
