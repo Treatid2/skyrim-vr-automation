@@ -15,6 +15,7 @@ foreach($name in @('Get-StreamRangeSha256','Get-ByteArraySha256','Get-Utf8Traili
 }
 . (Join-Path $PSScriptRoot 'StartupLogProof.ps1')
 $SteamVRRoot=Join-Path $fixture 'SteamVR';$ServerLogPath=Join-Path $fixture 'vrserver.txt';$LogTailMaxBytes=4096
+$ConfigDirectory=Join-Path $fixture 'config'
 $InternalTestFailurePoint='';$script:SharedTextTailState=@{};$utf8=[Text.UTF8Encoding]::new($false)
 $server=[pscustomobject]@{name='vrserver';id=123;path=(Join-Path $SteamVRRoot 'bin/win64/vrserver.exe');startTimeUtc=''}
 $profile=@{driver_null=@{serialNumber='fixture-null'};headPoseProviderContract=@{};dashboard=@{enableDashboard=$false}}
@@ -24,12 +25,12 @@ function Get-HeadPoseSharedState{param($Contract) [pscustomobject]@{qualified=$t
 function Get-ApplicationHeadPose{param($Contract,$PreProbePose,$PreProbePackageAuthority,$DeadlineUtc) $script:probes++;[pscustomobject]@{qualified=$true;controllersQualified=$true;poseAfterProbe=$PreProbePose;packageAuthority=$PreProbePackageAuthority;providerContinuity=@{verified=$true}}}
 function Reset-Log([string]$History=''){
  $script:SharedTextTailState.Clear();[IO.File]::WriteAllText($ServerLogPath,$History,$utf8)
- $null=New-NullStartupLogAnchor -Path $ServerLogPath -AttemptId ([guid]::NewGuid().ToString('N')) -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(5))
+ $null=New-NullStartupLogAnchor -Path $ServerLogPath -AttemptId ([guid]::NewGuid().ToString('N')) -ConfigDirectory $ConfigDirectory -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(5))
  $server.startTimeUtc=[DateTime]::UtcNow.ToString('o')
 }
 function Proof-Lines([string]$Serial='fixture-null',[int]$PidValue=$server.id,[string]$RuntimeRoot=$SteamVRRoot,[DateTime]$At=([DateTimeOffset]$server.startTimeUtc).UtcDateTime){
  $stamp=$At.ToLocalTime().ToString('ddd MMM d yyyy HH:mm:ss.fff',[cultureinfo]::InvariantCulture)
- @("$stamp [Info] - vrserver 2.17.10 startup with PID=$PidValue, config=fixture, runtime=$RuntimeRoot, arch=win64",
+ @("$stamp [Info] - vrserver 2.17.10 startup with PID=$PidValue, config=$ConfigDirectory, runtime=$RuntimeRoot, arch=win64",
  "$stamp [Info] Loaded server driver null fixture driver_null.dll","$stamp [Info] Active HMD set to null.$Serial",
  "$stamp [Info] Loaded server driver codex_head_pose fixture driver_codex_head_pose.dll",
  "$stamp [Info] codex_head_pose: registered synthetic head-pose device at configured standing pose") -join "`n"
@@ -105,14 +106,14 @@ Reset-Log $history;Append-Proof;$good=Read-Proof
 $receipt=[pscustomobject]@{schemaVersion=2;attemptId=$good.attemptId;runtimeAccepted=$true;admissionState='accepted';startupLogAnchor=$good.anchor;runtime=[pscustomobject]@{startupLogProof=$good}}
 $receipt=$receipt|ConvertTo-Json -Depth 15|ConvertFrom-Json -Depth 15
 $script:NullStartupLogAnchor=$null;$script:NullStartupLogProofState.Clear()
-Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes
+Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -ConfigDirectory $ConfigDirectory
 Require ((Read-Proof).complete -and (Read-Proof).retained) 'read-only accepted-receipt continuity verifies original ranges rather than live reanchoring'
 $importFailed=$false
-try{Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'foreign' -MaxBytes $LogTailMaxBytes}catch{$importFailed=$true}
+try{Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'foreign' -MaxBytes $LogTailMaxBytes -ConfigDirectory $ConfigDirectory}catch{$importFailed=$true}
 Require ($importFailed) 'accepted receipt cannot lend proof to different configured serial'
 $edit=[IO.File]::Open($ServerLogPath,'Open','Write',[IO.FileShare]::ReadWrite)
 try{$edit.Position=$offset+30;$edit.WriteByte([byte][char]'X')}finally{$edit.Dispose()}
-Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes
+Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -ConfigDirectory $ConfigDirectory
 Require ((Read-Proof).terminalFailure) 'accepted receipt hash revalidation rejects changed live proof on later invocation'
 $script:NullStartupLogAnchor=$null;$script:NullStartupLogProofState.Clear()
 Require ((Read-Proof).terminalFailure) 'missing prelaunch provenance cannot be reconstructed from running log'
@@ -128,6 +129,72 @@ Require ($empty.stable -and -not $empty.complete -and -not $empty.terminalFailur
 Append-Proof;$good=Read-Proof
 Require ($good.complete -and $good.anchor.existed -and $good.anchor.guardLength -eq 0) 'empty prelaunch file can append current proof'
 $receipt=[pscustomobject]@{schemaVersion=2;attemptId=$good.attemptId;runtimeAccepted=$true;admissionState='accepted';startupLogAnchor=$good.anchor;runtime=[pscustomobject]@{startupLogProof=$good}}
-Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes
+Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -ConfigDirectory $ConfigDirectory
 Require ((Read-Proof).complete) 'empty-boundary guard preserves accepted-receipt continuity'
+
+function Rotate-Startup([string]$NewText=((Proof-Lines)+"`n")){
+ $previous=$script:NullStartupLogAnchor.previousPath
+ if([IO.File]::Exists($previous)){[IO.File]::Delete($previous)} # Exact disposable fixture only.
+ [IO.File]::Move($ServerLogPath,$previous)
+ [IO.File]::WriteAllText($ServerLogPath,$NewText,$utf8)
+}
+Reset-Log $history;Rotate-Startup
+$good=Read-Proof
+Require ($good.complete -and $good.offset -eq 0 -and $good.startupRotation.startupRecordVerified -and $good.anchor.offset -gt 262144 -and $good.startupRotation.oldFileIdentity -ceq $good.anchor.fileIdentity -and $good.fileIdentity -cne $good.anchor.fileIdentity) 'startup rotation pins both identities and exact archive without scanning historical prefix'
+Require ($good.bytesRead -le 4096 -and $good.hashBytesRead -le 12288 -and $good.serverStartup.configDirectory -ieq $ConfigDirectory) 'rotation same payload/hash budgets and config binding'
+[IO.File]::AppendAllText($ServerLogPath,$noise,$utf8);$again=Read-Proof
+Require ($again.complete -and $again.retained -and $again.sha256 -ceq $good.sha256 -and $again.bytesRead -eq 0) 'rotation retains immutable range through delayed noise rollover'
+$receipt=[pscustomobject]@{schemaVersion=2;attemptId=$good.attemptId;runtimeAccepted=$true;admissionState='accepted';startupLogAnchor=$good.anchor;runtime=[pscustomobject]@{startupLogProof=$again}}
+$receipt=$receipt|ConvertTo-Json -Depth 20|ConvertFrom-Json -Depth 20
+$script:NullStartupLogAnchor=$null;$script:NullStartupLogProofState.Clear()
+Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -ConfigDirectory $ConfigDirectory
+Require ((Read-Proof).complete -and (Read-Proof).retained) 'accepted rotated receipt preserves original anchor and prospective transition'
+$failed=$false;try{Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -ConfigDirectory (Join-Path $fixture 'foreign')}catch{$failed=$true}
+Require ($failed) 'accepted rotation cannot lend config binding'
+foreach($fault in @('missing','identity','length','guard','pid','config','runtime','time','partial')){
+ Reset-Log $history;Rotate-Startup
+ $previous=$script:NullStartupLogAnchor.previousPath
+ switch($fault){
+  missing {[IO.File]::Move($previous,($previous+'.missing'))}
+  identity {[IO.File]::Move($previous,($previous+'.identity'));[IO.File]::WriteAllText($previous,$history,$utf8)}
+  length {[IO.File]::AppendAllText($previous,"drift`n",$utf8)}
+  guard {$edit=[IO.File]::Open($previous,'Open','Write',[IO.FileShare]::ReadWrite);try{$edit.Position=$script:NullStartupLogAnchor.offset-1;$edit.WriteByte(88)}finally{$edit.Dispose()}}
+  pid {[IO.File]::WriteAllText($ServerLogPath,(Proof-Lines -PidValue 99)+"`n",$utf8)}
+  config {[IO.File]::WriteAllText($ServerLogPath,((Proof-Lines).Replace("config=$ConfigDirectory,","config=foreign,"))+"`n",$utf8)}
+  runtime {[IO.File]::WriteAllText($ServerLogPath,(Proof-Lines -RuntimeRoot (Join-Path $fixture 'wrong'))+"`n",$utf8)}
+  time {[IO.File]::WriteAllText($ServerLogPath,(Proof-Lines -At ([DateTime]::UtcNow.AddSeconds(10)))+"`n",$utf8)}
+  partial {[IO.File]::WriteAllText($ServerLogPath,(Proof-Lines).TrimEnd([char]10),$utf8)}
+ }
+ $bad=Read-Proof
+ if($fault -eq 'partial'){
+  Require (-not $bad.complete -and -not $bad.terminalFailure) 'rotation partial last line remains pending, never proof'
+  [IO.File]::AppendAllText($ServerLogPath,"`n",$utf8);Require ((Read-Proof).complete) 'rotation fully framed extension qualifies only after LF'
+ }else{Require ($bad.terminalFailure -and -not $bad.complete) "rotation rejects $fault evidence"}
+}
+Reset-Log $history;Rotate-Startup '';$pending=Read-Proof;Append-Proof
+Require ($pending.stable -and -not $pending.complete -and -not $pending.startupRotation.startupRecordVerified -and (Read-Proof).complete) 'first-observation candidate is pinned while current marker is delayed'
+foreach($fault in @('later-rotation','later-truncation','new-mutation','archive-mutation','archive-race','selected-race')){
+ Reset-Log $history;Rotate-Startup;$good=Read-Proof
+ switch($fault){
+  later-rotation {[IO.File]::Move($ServerLogPath,($ServerLogPath+'.second'));[IO.File]::WriteAllText($ServerLogPath,(Proof-Lines)+"`n",$utf8)}
+  later-truncation {[IO.File]::WriteAllText($ServerLogPath,'short',$utf8)}
+  new-mutation {$edit=[IO.File]::Open($ServerLogPath,'Open','Write',[IO.FileShare]::ReadWrite);try{$edit.Position=30;$edit.WriteByte(88)}finally{$edit.Dispose()}}
+  archive-mutation {[IO.File]::AppendAllText($good.anchor.previousPath,"changed`n",$utf8)}
+ }
+ if($fault -in @('archive-race','selected-race')){
+  # Force incomplete acquisition so the between-read publication hook executes.
+  Reset-Log $history;Rotate-Startup
+  $bad=Get-NullStartupLogProof -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -InternalMutationHook {
+   param($path)
+   if($fault -eq 'archive-race'){[IO.File]::AppendAllText($script:NullStartupLogAnchor.previousPath,"race`n")}
+   else{[IO.File]::Move($path,($path+'.race'));[IO.File]::WriteAllText($path,(Proof-Lines)+"`n")}
+  }
+ }else{$bad=Read-Proof}
+ Require ($bad.terminalFailure -and -not $bad.complete) "$fault invalidates rotation without reanchoring"
+}
+Reset-Log $history;Rotate-Startup '';$null=Read-Proof
+$expired=$false;try{Get-NullStartupLogProof -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(-1))|Out-Null}catch [TimeoutException]{$expired=$true}
+Require ($expired -and (Read-Proof).terminalFailure) 'rotation candidate deadline remains terminal and sticky'
+Reset-Log $history;$null=Read-Proof;Rotate-Startup
+Require ((Read-Proof).terminalFailure) 'rotation after first append observation refused even with attributable archive'
 [pscustomobject]@{ok=$true;checks=$checks;liveRuntimeChanged=$false;applicationProbe='fixture only';fixtureRoot=$fixture;historicalBytes=$offset;maxPayloadBytes=$LogTailMaxBytes}|ConvertTo-Json -Depth 8 -Compress

@@ -1884,7 +1884,7 @@ try {
         if ($receiptServer.Count -eq 1 -and (Test-Path -LiteralPath $boundRuntimePath -PathType Leaf)) {
             try {
                 $acceptedRuntime = Get-Content -LiteralPath $boundRuntimePath -Raw | ConvertFrom-Json -Depth 80
-                Import-NullStartupLogAnchor -Receipt $acceptedRuntime -Path $ServerLogPath -Server $receiptServer[0] -SerialNumber ([string]$profile['driver_null']['serialNumber']) -MaxBytes $LogTailMaxBytes
+                Import-NullStartupLogAnchor -Receipt $acceptedRuntime -Path $ServerLogPath -Server $receiptServer[0] -SerialNumber ([string]$profile['driver_null']['serialNumber']) -MaxBytes $LogTailMaxBytes -ConfigDirectory ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($SettingsPath)))
             }
             catch {
                 # Unknown provenance remains unqualified; inspection/stop remains
@@ -2092,7 +2092,7 @@ try {
                 # Capture and persist the exact prelaunch log boundary before any
                 # owned child can run. Existing files are append-only this attempt;
                 # an absent path may be created once. Never reanchor after launch.
-                $runtimeReceipt['startupLogAnchor'] = New-NullStartupLogAnchor -Path $ServerLogPath -AttemptId $runtimeAttemptId -DeadlineUtc $deadline
+                $runtimeReceipt['startupLogAnchor'] = New-NullStartupLogAnchor -Path $ServerLogPath -AttemptId $runtimeAttemptId -DeadlineUtc $deadline -ConfigDirectory ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($SettingsPath)))
                 Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
                 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'process-control/ProcessLaunchInterop.ps1')
                 $launcher = Start-NormalInteractiveProcess -FilePath $startupPath -DeadlineUtc $deadline
