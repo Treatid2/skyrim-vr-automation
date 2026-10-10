@@ -1,5 +1,14 @@
 # SteamVR null-HMD control
 
+Exact-attempt failed-start cleanup pins a process handle, rechecks its exact
+path/start identity and stops that object, never a newly resolved PID. A structured
+exit race may be classified as self-exited only after the pinned process proves
+exit and a fresh PID lookup proves absence. The original error remains in cleanup
+`outcomes`; permission/unknown inspection/identity drift and replacement PIDs stay
+unverified. Pre-dispatch absence requires a second absence observation. Final
+survivor checks remain mandatory within the existing five-second cleanup budget.
+This classification does not retroactively change historical failed receipts.
+
 Startup and its single independent probe use a supported normal-interactive-user
 route with same user/session and suspended-child effective-context/access proof.
 The startup receipt retains the launcher proof, and bounded-process evidence
