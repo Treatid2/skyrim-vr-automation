@@ -3485,7 +3485,7 @@ function Invoke-MO2Status {
     # Public lock and controller evidence must project the same committed owned
     # generation after recovery/adoption/opening writes. Do not independently
     # reread a newer lock while retaining evidence from this committed snapshot.
-    if ($owned) { $data.sessionLock = Get-MO2SessionLockRecord -Path ([string]$Config.session.lockFile) -CommittedData $owned.data }
+    if ($owned) { $data.sessionLock = Get-MO2SessionLockRecord -Path ([string]$owned.path) -CommittedData $owned.data }
     $headlessMO2 = $data.processes.mo2.Count -gt 0 -and @($windows | Where-Object visible).Count -eq 0
     $launchGraceSeconds = 30
     if ($Config.limits.PSObject.Properties['launchPendingGraceSeconds']) {
