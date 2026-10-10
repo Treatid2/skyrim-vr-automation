@@ -9,7 +9,7 @@ $root=Join-Path ([IO.Path]::GetFullPath($FixtureRoot)) ('dialog-scope-'+[guid]::
 [IO.Directory]::CreateDirectory($root)|Out-Null
 $checks=0
 function Check([bool]$Condition,[string]$Label){if(-not $Condition){throw $Label};$script:checks++}
-$cases=if($ExpectLegacyFailure){@('healthy')}else{@('healthy','window-close','stale-generation','changed-path','changed-start','exited-binding','invalid-handle','unknown-modal','action-denied','remaining-dialog')}
+[object[]]$cases=if($ExpectLegacyFailure){@('healthy')}else{@('healthy','window-close','stale-generation','changed-path','changed-start','exited-binding','invalid-handle','unknown-modal','action-denied','remaining-dialog')}
 foreach($case in $cases){
  $directory=Join-Path $root $case
  [IO.Directory]::CreateDirectory($directory)|Out-Null
