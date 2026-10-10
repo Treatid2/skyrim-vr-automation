@@ -1045,6 +1045,8 @@ Assert-Test (-not $restFallbackIssued) 'a qualification failure after proven MCP
 $tokens = $null
 $parseErrors = $null
 $entryPointAst = [Management.Automation.Language.Parser]::ParseInput($entryPointText, [ref]$tokens, [ref]$parseErrors)
+$httpSnapshotAst = $entryPointAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-HttpFailureEvidenceSnapshot' }, $true)
+Invoke-Expression $httpSnapshotAst.Extent.Text
 $updateEvidenceAst = $entryPointAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Update-InvocationEvidence' }, $true)
 Invoke-Expression $updateEvidenceAst.Extent.Text
 function Write-JsonAtomic { param([string]$Path, $Value) $Value | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $Path -Encoding utf8NoBOM }
@@ -1055,7 +1057,7 @@ try {
             state = 'prepared'; endpoint = $null; transport = $null; runtimeIdentity = $null
             effectiveOperationTimeoutSeconds = $null; operationDeadlineUtc = $null
             serverTimeoutMilliseconds = $null; serverTimeoutDispatchRemainingSeconds = $null
-            transportRetries = @(); semantic = $null; data = $null; errors = @()
+            transportRetries = @(); httpFailureEvidence = $null; semantic = $null; data = $null; errors = @()
             dispatchIntentUtc = $null; completedUtc = $null
         }
         $script:invocationEvidencePath = $terminalJournalPath
