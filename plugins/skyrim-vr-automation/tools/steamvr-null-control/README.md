@@ -328,13 +328,25 @@ Run `Test-SteamVRNullControl.ps1` after changing the control contract.
 
 ### Attempt-relative startup log proof
 
-Before the owned launcher runs, `start` captures and persists a schema-1 log
+Before the owned launcher runs, `start` captures and persists a schema-2 log
 anchor in the nonaccepted runtime receipt: canonical selected path, OS physical
 file identity, prelaunch EOF offset, LF/partial-first-line framing, and SHA-256
 of at most 4096 boundary bytes. Historical bytes do not consume the unchanged
-`LogTailMaxBytes` attempt payload budget. An existing file must remain append-only
-for that attempt. Truncation, rotation, same-name replacement, boundary mutation
-or retained-range mutation is refused; there is no in-attempt reanchor. If the
+`LogTailMaxBytes` attempt payload budget. The settings parent config directory and
+fixed sibling `<log-base>.previous<extension>` path are bound before launch.
+An existing file normally remains append-only. ONE prelaunch-to-first-server
+observation startup rotation is supported only when that fixed previous path
+contains the exact old physical identity, exact prelaunch EOF and boundary guard;
+a prelaunch alias of the old file is refused. The new selected identity on the
+same volume is pinned immediately, with range offset zero, while the original
+anchor remains unchanged. A delayed/partially framed current marker may remain
+pending, but no proof qualifies until its exact current PID, runtime, config and
+creation-time-correlated timestamp (also not before the anchor) match. This is
+a prospective pinned candidate, not permission to reanchor on a later poll.
+Archive identity/length/guard and current retained-range/selected-path identity
+are revalidated on every observation and confirmation. Missing/drifted archive,
+unknown replacement, rotation after any append observation, subsequent rotation,
+truncation, boundary mutation or retained-range mutation is terminal. If the
 path was absent before launch, it may be created once and remains physically
 bound after observation. Initial absence is pollable; disappearance after
 observation is terminal. Concurrent boundary advance during anchor capture
@@ -343,7 +355,7 @@ refuses launch. Directory/access/identity failures are not treated as absence.
 The reader examines only the bounded window starting at that offset, skips any
 historical partial first line through its next LF, and publishes only fully
 LF-framed records. It requires the exact current server's startup PID, runtime
-root and creation-time-correlated timestamp before the existing exact-serial
+root, config directory and creation-time-correlated timestamp before the existing exact-serial
 null/HMD and head-provider records. Byte/line/deadline caps remain unchanged;
 delayed observation and noisy moving-tail rollover do not slide the immutable
 startup window. Each observation hashes retained attempt bytes and the boundary
@@ -357,15 +369,19 @@ on the first failed readiness observation, preserving the primary error and
 performing the existing exact-attempt cleanup; they do not cause futile repolls
 or a native probe. A later invocation may reuse only an exact accepted runtime
 receipt from the authoritative committed apply journal's evidence directory,
-and must revalidate its original physical identity and hashes. Legacy/unknown
+and must revalidate its original physical identities, immutable transition and
+hashes. Accepted schema-1 append receipts remain append-only; they do not acquire
+rotation authority. Unknown
 anchors remain unqualified rather than being invented or silently migrated.
 This is log admission, not application/controller qualification: the separate
 probe, full probe budget and all 100-sample predicates remain mandatory.
 
 `Test-StartupLogProof.ps1 -FixtureRoot <temporary-fixture-root>` exercises bounded
-history/append/framing/identity/hash/deadline and accepted-receipt continuity.
+history/append/absent-create/startup-rotation/framing/identity/hash/deadline and
+accepted-receipt continuity, including archive and selected-path races.
 `Test-ApplicationProbeStartup.ps1` additionally drives the real public apply/start
-loop with temporary log faults and verifies one observation, zero probe calls,
+loop with temporary rotation success/faults and verifies first permanent failure
+termination, zero probe calls on invalid proof,
 nonaccepted receipts and exact owned cleanup. No live runtime is used.
 
 ## Resuming a retained environment under a new access lease

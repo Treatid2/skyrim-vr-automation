@@ -82,7 +82,12 @@ function Get-NullStartupLogProof {
     param($Path,$Server,$SerialNumber,$MaxBytes,$DeadlineUtc)
     $case = Get-Content -LiteralPath (Join-Path $HeadPoseDriverRoot 'case.txt') -Raw
     if ($case.StartsWith('log-')) {
-        return Get-FixtureRealStartupLogProof -Path $Path -Server $Server -SerialNumber $SerialNumber -MaxBytes $MaxBytes -DeadlineUtc $DeadlineUtc
+        $proof = Get-FixtureRealStartupLogProof -Path $Path -Server $Server -SerialNumber $SerialNumber -MaxBytes $MaxBytes -DeadlineUtc $DeadlineUtc
+        if ($case -ceq 'log-rotation-later' -and $proof.stable -and -not $proof.complete) {
+            [IO.File]::Move($Path, ($Path+'.later'))
+            [IO.File]::WriteAllText($Path, 'replacement after first pinned observation')
+        }
+        return $proof
     }
     $prefix=[string]$Server.startTimeUtc
     @{
@@ -160,6 +165,29 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
                 'log-truncation' { [IO.File]::WriteAllText($ServerLogPath, '') }
                 'log-mutation' { $edit=[IO.File]::Open($ServerLogPath,'Open','Write',[IO.FileShare]::ReadWrite); try{$edit.Position=0;$edit.WriteByte([byte][char]'X')}finally{$edit.Dispose()} }
             }
+            if ($case.StartsWith('log-rotation-')) {
+                $previous=$receipt.startupLogAnchor.previousPath
+                [IO.File]::Move($ServerLogPath,$previous)
+                $s=Get-Content -LiteralPath (Join-Path $SteamVRRoot 'launch.json') -Raw|ConvertFrom-Json
+                $stamp=([DateTimeOffset]$s.startedUtc).LocalDateTime.ToString('ddd MMM d yyyy HH:mm:ss.fff',[cultureinfo]::InvariantCulture)
+                $config=[IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($SettingsPath))
+                $text=@("$stamp [Info] - vrserver 2.17.10 startup with PID=12345, config=$config, runtime=$SteamVRRoot, arch=win64",
+                    "$stamp [Info] - Loaded server driver null from driver_null.dll",
+                    "$stamp [Info] - Active HMD set to null.$($Profile['driver_null']['serialNumber'])",
+                    "$stamp [Info] - Loaded server driver codex_head_pose from driver_codex_head_pose.dll",
+                    "$stamp [Info] - codex_head_pose: registered synthetic head-pose device at configured standing pose") -join "`n"
+                [IO.File]::WriteAllText($ServerLogPath, $text+"`n")
+                switch($case){
+                    'log-rotation-missing' {[IO.File]::Move($previous,($previous+'.missing'))}
+                    'log-rotation-identity' {[IO.File]::Move($previous,($previous+'.copy'));[IO.File]::Copy(($previous+'.copy'),$previous)}
+                    'log-rotation-length' {[IO.File]::AppendAllText($previous,"changed`n")}
+                    'log-rotation-guard' {$edit=[IO.File]::Open($previous,'Open','Write',[IO.FileShare]::ReadWrite);try{$edit.Position=$receipt.startupLogAnchor.offset-1;$edit.WriteByte(88)}finally{$edit.Dispose()}}
+                    'log-rotation-pid' {[IO.File]::WriteAllText($ServerLogPath,$text.Replace('PID=12345,','PID=999,')+"`n")}
+                    'log-rotation-config' {[IO.File]::WriteAllText($ServerLogPath,$text.Replace("config=$config,","config=foreign,")+"`n")}
+                    'log-rotation-time' {$late=([DateTimeOffset]$s.startedUtc).LocalDateTime.AddSeconds(10).ToString('ddd MMM d yyyy HH:mm:ss.fff',[cultureinfo]::InvariantCulture);[IO.File]::WriteAllText($ServerLogPath,$text.Replace($stamp,$late)+"`n")}
+                    'log-rotation-later' {[IO.File]::WriteAllText($ServerLogPath,'')}
+                }
+            }
         }
         [pscustomobject]@{Id=12345;interactiveLaunch=@{normalUserAccessVerified=$true;method='synthetic-fixture'}}
     }
@@ -176,7 +204,7 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
         if($s.live){[pscustomobject]@{Id=12345}}
     }
     $kinds=@{empty='empty-output';undrained='stream-drain-incomplete';malformed='malformed-output';'package-drift'='provider-package-drift';continuity='continuity-failed';exit='bounded-process-failure';timeout='timeout';unqualified='observation-unqualified';'confirmation-malformed'='malformed-output'}
-    foreach ($case in @('empty','undrained','malformed','package-drift','continuity','exit','timeout','unqualified','confirmation-malformed','success','delayed-provider','insufficient-budget','log-budget','log-replacement','log-truncation','log-mutation')) {
+    foreach ($case in @('empty','undrained','malformed','package-drift','continuity','exit','timeout','unqualified','confirmation-malformed','success','delayed-provider','insufficient-budget','log-budget','log-replacement','log-truncation','log-mutation','log-rotation-success','log-rotation-missing','log-rotation-identity','log-rotation-length','log-rotation-guard','log-rotation-pid','log-rotation-config','log-rotation-time','log-rotation-later')) {
         $caseRoot=Join-Path $fixture $case
         $script:currentSteamRoot=Join-Path $caseRoot 'SteamVR'
         $provider=Join-Path $caseRoot 'provider'
@@ -191,7 +219,7 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
         $openVR=Join-Path $caseRoot 'openvrpaths.vrpath'
         $log=Join-Path $caseRoot 'vrserver.txt'
         [IO.File]::WriteAllText($settings,'{"unrelated":{"retained":true}}')
-        [IO.File]::WriteAllText($log,'Synthetic log only.')
+        [IO.File]::WriteAllText($log,$(if($case.StartsWith('log-rotation-')){"Historical fixture line`n"*15000}else{'Synthetic log only.'}))
         [IO.File]::WriteAllText($openVR,(@{version=1;external_drivers=@($provider)}|ConvertTo-Json -Compress))
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../profiles/steamvr-null.profile.json') -Destination $profile
         $env:CSX_STEAMVR_TRANSACTION_ROOT=Join-Path $caseRoot 'transactions'
@@ -204,9 +232,14 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
         $receipt=Get-Content -LiteralPath $result.data.runtimeReceiptPath -Raw|ConvertFrom-Json -Depth 80
         $countPath=Join-Path $provider 'dispatch-count.txt'
         $count=if(Test-Path -LiteralPath $countPath){@(Get-Content -LiteralPath $countPath).Count}else{0}
-        if($case.StartsWith('log-')){
+        if($case -ceq 'log-rotation-success'){
+            Assert-Startup ($result.ok -and $receipt.runtimeAccepted -and $result.data.runtime.headPoseReady -and $result.data.runtime.controllersReady) 'real rotated reader reaches unchanged production qualification with synthetic native result only'
+            Assert-Startup ($count -eq 2 -and $receipt.runtimeConfirmationAttempted -and $receipt.runtime.startupLogProof.retained -and $receipt.runtime.startupLogProof.startupRotation.startupRecordVerified) 'rotated confirmation retains exact range/transition and normal bounded probe contract'
+            Assert-Startup ($receipt.runtime.startupLogProof.offset -eq 0 -and $receipt.startupLogAnchor.offset -gt 262144 -and $receipt.runtime.startupLogProof.bytesRead -eq 0) 'public rotated proof avoids history and never resets original anchor'
+        }elseif($case.StartsWith('log-')){
             Assert-Startup (-not $result.ok -and $result.state -ceq 'startup-log-proof-acquisition-failed' -and $receipt.admissionState -ceq $result.state) "$case terminal log acquisition classification returned/persisted"
-            Assert-Startup ($count -eq 0 -and $receipt.runtimeProbeAttempts -eq 1 -and -not $receipt.runtimeConfirmationAttempted -and -not $result.data.runtime.applicationHeadPose.probeAttempted) "$case one readiness observation, no native probe or futile repoll"
+            $expectedPolls=if($case -ceq 'log-rotation-later'){2}else{1}
+            Assert-Startup ($count -eq 0 -and $receipt.runtimeProbeAttempts -eq $expectedPolls -and -not $receipt.runtimeConfirmationAttempted -and -not $result.data.runtime.applicationHeadPose.probeAttempted) "$case terminal at first permanent failure, no native probe or futile repoll"
             Assert-Startup (-not $receipt.runtimeAccepted -and -not $result.data.inputContract.measurementReady -and $result.data.runtime.startupLogProof.terminalFailure) "$case immutable failed-first proof remains nonaccepted"
             Assert-Startup ($result.data.startupCleanup.verified -and @($result.data.startupCleanup.requested).Count -eq 1 -and $result.data.startupCleanup.requested[0].id -eq 12345 -and @($result.data.startupCleanup.remaining).Count -eq 0 -and @(Get-Content -LiteralPath (Join-Path $script:currentSteamRoot 'stopped.txt')).Count -eq 1) "$case real owner filtering/cleanup and survivor verification"
             Assert-Startup ($receipt.lastRuntimeProbeError -ceq $result.data.runtime.startupLogProof.error -and ([DateTimeOffset]$receipt.failureObservedUtc) -lt ([DateTimeOffset]$receipt.startupDeadlineUtc)) "$case exact primary error before deadline preserved"
