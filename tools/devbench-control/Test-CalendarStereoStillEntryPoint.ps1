@@ -56,7 +56,7 @@ foreach($mode in $Modes){
             Check ($response.data.heldBaseline.basis -ceq 'original-admitted-lease-captured' -and $response.data.heldBaseline.leaseId -ceq 'stills-lease' -and $response.data.heldBaseline.values.gameHour -eq $acquired.lease.captured.gameHour -and $response.data.heldBaseline.values.daysPassed -eq $acquired.lease.captured.daysPassed) 'held baseline did not pin original acquisition'
             Check ($captures.Count -eq 2 -and $response.data.restorationVerified -and -not $response.data.indeterminate) 'advancing prehold case did not complete original captures/restoration'
         }
-        $caseResults+=@{mode=$mode;ok=$response.ok;captures=$captures.Count;cancels=$cancels.Count;holds=$holds.Count;releases=$releases.Count;restorationVerified=$(if($response.data.PSObject.Properties['restorationVerified']){$response.data.restorationVerified}else{$null});sessionClosed=$response.sessionCleanup.ok;errors=@($response.errors)}
+        $caseResults+=@{mode=$mode;ok=$response.ok;captures=$captures.Count;cancels=$cancels.Count;holds=$holds.Count;releases=$releases.Count;restorationVerified=$(if($null -ne $response.data -and $response.data.PSObject.Properties['restorationVerified']){$response.data.restorationVerified}else{$null});sessionClosed=$(if($response.PSObject.Properties['sessionCleanup'] -and $null -ne $response.sessionCleanup){$response.sessionCleanup.ok}else{$null});errors=@($response.errors)}
     }finally{if(-not $worker.HasExited){$worker.Kill();$worker.WaitForExit(5000)|Out-Null};$worker.Dispose()}
 }
 [pscustomobject]@{ok=$true;checks=$checks;cases=$Modes.Count;caseResults=$caseResults;root=$root;nativeLiveQualification=$false}|ConvertTo-Json -Depth 12 -Compress
