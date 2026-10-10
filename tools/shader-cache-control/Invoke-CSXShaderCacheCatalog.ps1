@@ -67,6 +67,9 @@ param(
     [int]$InventoryTimeoutSeconds = 120,
     [ValidateSet('', 'prepare-interrupt-after-snapshot-plan')]
     [string]$InternalTestFailurePoint = '',
+    [ValidateSet('', 'before-target-lock', 'after-readmission', 'before-publication')]
+    [string]$InternalTestBarrierPoint = '',
+    [string]$InternalTestBarrierPath,
     [switch]$NoExit,
     [switch]$IncludeInventoryEntries,
     [switch]$Compact
@@ -78,6 +81,7 @@ $script:CatalogCommandContext = $PSCmdlet
 $contractVersion = '1.0.0'
 $transactionTool = Join-Path $PSScriptRoot 'Invoke-CSXShaderCacheTransaction.ps1'
 . (Join-Path $PSScriptRoot 'ShaderCacheInventory.ps1')
+Import-Module (Join-Path $PSScriptRoot 'ShaderCacheTargetLock.psm1') -ErrorAction Stop
 
 function Test-Property($Value, [string]$Name) {
     return $null -ne $Value -and $Value.PSObject.Properties.Name -contains $Name
@@ -1264,10 +1268,40 @@ function New-TaskCacheCompletionArguments($Storage, [string]$ResolvedCache, [str
     }
 }
 
+function Wait-PrepareFixtureBarrier([string]$Point, [string]$Target) {
+    if ($InternalTestBarrierPoint -cne $Point) { return }
+    $temporary = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+    $barrier = [IO.Path]::GetFullPath($InternalTestBarrierPath)
+    if ([string]::IsNullOrWhiteSpace($env:CSX_SHADER_CACHE_CONTROL_ROOT) -or
+        -not $barrier.StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $Target.StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Preparation barrier is fixture-only beneath the OS temporary directory.'
+    }
+    Assert-CSXNoCacheReparsePoint -Path (Split-Path -Parent $barrier) -Purpose 'Preparation fixture barrier'
+    [IO.File]::WriteAllText($barrier + '.ready', $Point)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path -LiteralPath ($barrier + '.continue') -PathType Leaf)) {
+        if ($timer.ElapsedMilliseconds -ge 15000) { throw 'Preparation fixture barrier timed out.' }
+        Start-Sleep -Milliseconds 20
+    }
+}
+
 function Prepare-TaskCache($Storage) {
     Assert-CompatibilityInput
     $cacheResolution = Resolve-TaskCacheBinding
     $resolvedCache = [string]$cacheResolution.cachePath
+    if ($WhatIfPreference) { return Prepare-TaskCacheUnderLock $Storage $cacheResolution }
+    Wait-PrepareFixtureBarrier 'before-target-lock' $resolvedCache
+    $targetLock = Enter-CSXCacheTargetLock -CachePath $resolvedCache
+    try { return Prepare-TaskCacheUnderLock $Storage $cacheResolution }
+    finally { Exit-CSXCacheTargetLock $targetLock }
+}
+
+function Prepare-TaskCacheUnderLock($Storage, $cacheResolution) {
+    $resolvedCache = [string]$cacheResolution.cachePath
+    # The caller retains the canonical target lock through every comparison,
+    # nested snapshot/seed transaction, shadow copy, inventory and publication.
+    Assert-TaskCacheBindingCurrent $cacheResolution.binding
     $evidence = Assert-SafeDirectory $EvidenceDirectory 'shader-cache task evidence'
     $planPath = Join-Path $evidence 'shader-cache-task.plan.json'
     $resume = Get-SameTaskResume $cacheResolution.binding $evidence
@@ -1292,8 +1326,8 @@ function Prepare-TaskCache($Storage) {
             throw 'Existing task cache plan belongs to a different workspace owner.'
         }
         if ([string]$existingPlan.state -ceq 'snapshot-preserved') {
-            # Snapshot releases its target lock before the durable plan is published.
-            # Re-admit the original baseline on restart, never later shared writes.
+            # Re-admit under the composed target lock: no writer can intervene
+            # between this comparison and seed/shadow/final plan publication.
             $baselineHash = Assert-Hash ([string]$existingPlan.beforeTreeSha256) 'Snapshot-preserved baseline'
             $snapshotPath = Join-Path $evidence 'shader-cache-transaction.receipt.json'
             if (-not (Test-SamePath ([string]$existingPlan.transactionReceiptPath) $snapshotPath) -or
@@ -1316,6 +1350,8 @@ function Prepare-TaskCache($Storage) {
     $selection = if ($null -ne $existingPlan) { $existingPlan.selection } else { Select-CatalogSnapshot $Storage }
     if ($RequireMatch -and $null -eq $selection.selected) { throw 'No compatible known-working shader-cache snapshot matched the task request.' }
     $seedSource = if ($null -ne $resume) { $resume } else { $selection.selected }
+
+    if (-not $WhatIfPreference) { Wait-PrepareFixtureBarrier 'after-readmission' $resolvedCache }
 
     if ($WhatIfPreference) {
         $current = Invoke-Transaction 'inspect' @{ CachePath = $resolvedCache }
@@ -1370,6 +1406,7 @@ function Prepare-TaskCache($Storage) {
                 EvidenceDirectory = $evidence
                 SourceCachePath = [string]$seedSource.cachePath
                 ExpectedSourceTreeSha256 = [string]$seedSource.treeSha256
+                ExpectedTargetTreeSha256 = [string]$snapshot.data.inventory.treeSha256
                 BlockingProcessNames = $BlockingProcessNames
                 Confirm = $false
             }
@@ -1388,6 +1425,7 @@ function Prepare-TaskCache($Storage) {
     $plan | Add-Member -NotePropertyName providerShadow -NotePropertyValue $providerShadow -Force
     $plan | Add-Member -NotePropertyName preparedTreeSha256 -NotePropertyValue ([string]$preparedInventory.treeSha256) -Force
     Assert-OverwriteOwnerBinding $cacheResolution.binding
+    Wait-PrepareFixtureBarrier 'before-publication' $resolvedCache
     Write-JsonAtomic $planPath $plan
     return [pscustomobject][ordered]@{ state = 'prepared'; planPath = $planPath; completionArguments = New-TaskCacheCompletionArguments $Storage $resolvedCache $evidence; action = $action; selection = $selection; resume = $resume; providerShadow = $providerShadow; cacheBinding = $cacheResolution.binding; requireMaterializedOutput = [bool]$RequireMaterializedOutput; before = $snapshot.data.inventory; seed = $seed }
 }

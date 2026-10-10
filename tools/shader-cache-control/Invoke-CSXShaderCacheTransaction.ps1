@@ -17,6 +17,8 @@ param(
 
     [string]$ExpectedSourceTreeSha256,
 
+    [string]$ExpectedTargetTreeSha256,
+
     [string]$ShaderCacheAbiOverride,
 
     [string]$CompatibilityReason,
@@ -60,6 +62,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'ShaderCacheInventory.ps1')
+Import-Module (Join-Path $PSScriptRoot 'ShaderCacheTargetLock.psm1') -ErrorAction Stop
 
 function Get-LiveProcesses([string[]]$Names) {
     $records = @()
@@ -135,42 +138,11 @@ function Test-PathWithin([string]$Path, [string]$Parent) {
 }
 
 function Get-CacheTransactionControl([string]$LivePath) {
-    $canonical = [IO.Path]::GetFullPath($LivePath).TrimEnd('\')
-    $identity = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($canonical.ToUpperInvariant())))
-    $override = [Environment]::GetEnvironmentVariable('CSX_SHADER_CACHE_CONTROL_ROOT')
-    if ([string]::IsNullOrWhiteSpace($override)) {
-        $base = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'CSX-VR-Automation\ShaderCache\transactions'
-    }
-    else {
-        $base = [IO.Path]::GetFullPath($override)
-        $temporary = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
-        if (-not (Test-PathWithin -Path $canonical -Parent $temporary) -or -not (Test-PathWithin -Path $base -Parent $temporary)) {
-            throw 'CSX_SHADER_CACHE_CONTROL_ROOT is fixture-only and requires both the cache and control root beneath the OS temporary directory.'
-        }
-    }
-    $root = Join-Path $base $identity
-    return [pscustomobject][ordered]@{
-        identity = $identity
-        root = $root
-        lock = Join-Path $root 'target.lock'
-        journal = Join-Path $root 'transaction.journal.json'
-    }
+    return Get-CSXCacheTransactionControl $LivePath
 }
 
 function Enter-CacheTransactionLock($Control) {
-    New-Item -ItemType Directory -Path $Control.root -Force | Out-Null
-    $timer = [Diagnostics.Stopwatch]::StartNew()
-    do {
-        try {
-            return [IO.File]::Open($Control.lock, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-        }
-        catch [IO.IOException] {
-            if ($timer.ElapsedMilliseconds -ge $TransactionLockTimeoutMilliseconds) {
-                throw "Timed out acquiring shader-cache target lock after $TransactionLockTimeoutMilliseconds ms: $($Control.lock)"
-            }
-            Start-Sleep -Milliseconds ([Math]::Min(100, [Math]::Max(10, $TransactionLockTimeoutMilliseconds - [int]$timer.ElapsedMilliseconds)))
-        }
-    } while ($true)
+    return Enter-CSXCacheTargetLock -CachePath $resolvedCache -TimeoutMilliseconds $TransactionLockTimeoutMilliseconds
 }
 
 function Write-CacheJournal($Control, $Journal) {
@@ -548,6 +520,10 @@ try {
                     $preservedDisplaced = Join-Path $paths.evidence ('cache.displaced-before-seed.' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '.' + [guid]::NewGuid().ToString('N'))
                     $current = Get-TreeInventory $resolvedCache
                     $abiBefore = $null
+                    if (-not [string]::IsNullOrWhiteSpace($ExpectedTargetTreeSha256) -and
+                        ($ExpectedTargetTreeSha256 -notmatch '\A[0-9A-Fa-f]{64}\z' -or $current.treeSha256 -ine $ExpectedTargetTreeSha256)) {
+                        throw 'Seed target tree no longer matches the caller-admitted baseline; refusing displacement.'
+                    }
                     $staged = $null
                     $journalPath = $null
                     $seedReceiptPath = $null
@@ -685,7 +661,7 @@ catch {
     $result = [pscustomobject][ordered]@{ ok = $false; command = $Command; data = $null; errors = @($_.Exception.Message) }
 }
 finally {
-    if ($null -ne $cacheLock) { $cacheLock.Dispose() }
+    if ($null -ne $cacheLock) { Exit-CSXCacheTargetLock $cacheLock }
 }
 
 $json = $result | ConvertTo-Json -Depth 30 -Compress:$Compact

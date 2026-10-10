@@ -180,6 +180,19 @@ that workflow. Native `-File` wrappers must forward the same explicit three
 paths plus the `complete` command as separate arguments. Ambient defaults are
 conveniences for initial selection, not cross-host completion identities.
 
+Preparation now owns the same canonical exclusive target lock as standalone
+snapshot/seed/restore for the complete admission-to-publication interval. This
+includes no-seed preparation, lower-provider materialization, final inventory
+and the `prepared` plan write. Nested transactions re-enter only an actually
+held in-process/runspace handle; there is no caller-provided skip-lock flag or
+borrowed/serialized capability. The bounded lock wait remains 10 seconds.
+Seeding from preparation also supplies `-ExpectedTargetTreeSha256`; it refuses
+target drift before a seed journal, displacement or receipt is written.
+Cooperating writers use the same lock. This does not protect against arbitrary
+non-controller filesystem writes: closed MO2/game gates, owner/profile checks,
+reparse refusals and bounded inventories remain required. Interrupted preparation
+and original failed readmission evidence are not silently rebased.
+
 ### Opt-in same-task preserved working-cache resume
 
 To resume a completed **unverified** working cache from the same retained MO2
