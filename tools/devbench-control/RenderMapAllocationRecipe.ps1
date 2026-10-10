@@ -80,7 +80,10 @@ function Get-RenderMapAllocationRecipe($ResolvedRegistry, [string]$RecipePath, [
     $capture = Read-RenderMapAllocationEvidence $RecipePath $RecipeSha256
     $recipe = $capture.data
     $expectedLayoutStatus = switch -CaseSensitive ($recipe.status) {
-        'PASS_SOURCE_AND_EXACT_PDB_ALLOCATION_RECIPE' { 'PASS_EXACT_F362_PDB_LAYOUT' }
+        'PASS_SOURCE_AND_EXACT_PDB_ALLOCATION_RECIPE' {
+            if ($recipe.commit -isnot [string] -or $recipe.commit -cne 'f3623871660d0d5073957458daeb8055dddc40ce') { throw 'F362 receipt marker requires exact qualified F362 source.' }
+            'PASS_EXACT_F362_PDB_LAYOUT'
+        }
         'PASS_SOURCE_AND_EXACT_AD8_PDB_ALLOCATION_RECIPE' {
             if ($recipe.commit -cne 'ad8c7a2a8cf7dc9295d40dadd3f45da85fec4dd0') { throw 'AD8 receipt marker requires exact qualified AD8 source.' }
             'PASS_EXACT_AD8_PDB_LAYOUT'

@@ -34,9 +34,19 @@ function Get-RenderMapStartSelection($BoundParameters, $ResolvedRegistry, [objec
     }
     if ($BoundParameters.ContainsKey('ExecutionWithinSelectedGeometry')) {
         $execution = $BoundParameters.ExecutionWithinSelectedGeometry
+        $geometry = Get-Property $ResolvedRegistry.registry 'geometrySelection'
+        # Read the value without function-pipeline enumeration: a singleton array
+        # must remain an array, not become an apparently supported scalar string.
+        $capability = $null
+        if ($geometry -is [Collections.IDictionary]) {
+            if ($geometry.Contains('executionWithinSelectedGeometry')) { $capability = $geometry['executionWithinSelectedGeometry'] }
+        } elseif ($null -ne $geometry) {
+            $property = $geometry.PSObject.Properties['executionWithinSelectedGeometry']
+            if ($null -ne $property) { $capability = $property.Value }
+        }
         if ($execution -isnot [bool] -or
             (Get-Property (Get-Property $properties 'executionWithinSelectedGeometry') 'type') -cne 'boolean' -or
-            [string]::IsNullOrWhiteSpace([string](Get-Property (Get-Property $ResolvedRegistry.registry 'geometrySelection') 'executionWithinSelectedGeometry'))) { throw 'ExecutionWithinSelectedGeometry requires an actual Boolean and advertised registry/schema support.' }
+            $capability -isnot [string] -or $capability -cne 'optional native Boolean') { throw 'ExecutionWithinSelectedGeometry requires an actual Boolean and exact reviewed registry/schema support.' }
         # Presence, not truthiness: explicit false must survive immutable receipt.
         $selected.executionWithinSelectedGeometry = $execution
     }

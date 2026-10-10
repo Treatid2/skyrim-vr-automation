@@ -50,6 +50,11 @@ foreach($case in @('major','modes','runtime','wait-limit','missing-window','geom
     switch($case){'major'{$bad.result.major=2};'modes'{$bad.result.activationModes=@('immediate')};'runtime'{$bad.result.lateWindow.runtime='SkyrimSE'};'wait-limit'{$bad.result.lateWindow.maximumActivationWaitMs=1999};'missing-window'{$bad.result.PSObject.Properties.Remove('lateWindow')};'geometry'{$bad.result.PSObject.Properties.Remove('geometrySelection')}}
     Reject @{RegistryPath=(Write-Fixture $bad)} "unsupported registry $case refused"
 }
+foreach ($case in @(@{value=$false},@{value=$true},@{value=0},@{value=1},@{value='false'},@{value='true'},@{value='0'},@{value='optional native boolean'},@{value=' optional native Boolean'},@{value='optional native Boolean '},@{value='unsupported'},@{value=@('optional native Boolean')},@{value=[pscustomobject]@{supported=$true}},@{value=$null})) {
+    $bad=$registry|ConvertTo-Json -Depth 30|ConvertFrom-Json -Depth 30
+    $bad.result.geometrySelection.executionWithinSelectedGeometry=$case.value
+    Reject @{RegistryPath=(Write-Fixture $bad)} 'malformed registry geometry capability refused without coercion'
+}
 foreach($case in @('tool','type','major','action','activation','wait','boolean','minimum','maximum')) {
     $bad=$descriptor|ConvertTo-Json -Depth 30|ConvertFrom-Json -Depth 30
     switch($case){'tool'{$bad.name='foreign'};'type'{$bad.inputSchema.type='string'};'major'{$bad.inputSchema.properties.contractMajor.const=2};'action'{$bad.inputSchema.properties.action.enum=@('registry')};'activation'{$bad.inputSchema.properties.activation.enum=@('immediate')};'wait'{$bad.inputSchema.properties.maxActivationWaitMs.type='string'};'boolean'{$bad.inputSchema.properties.executionWithinSelectedGeometry.type='string'};'minimum'{$bad.inputSchema.properties.maxActivationWaitMs.minimum=2001};'maximum'{$bad.inputSchema.properties.maxActivationWaitMs.maximum=1999}}
