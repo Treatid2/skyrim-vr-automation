@@ -2,6 +2,7 @@
 [CmdletBinding()]param([Parameter(Mandatory)][string]$FixtureRoot,[switch]$ExpectLegacyFailure,[string]$ControllerSource)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
+trap { Write-Host $_.ScriptStackTrace; break }
 $source=Split-Path -Parent $PSScriptRoot
 if($ControllerSource){$source=[IO.Path]::GetFullPath($ControllerSource)}
 $root=Join-Path ([IO.Path]::GetFullPath($FixtureRoot)) ('dialog-scope-'+[guid]::NewGuid().ToString('N'))
