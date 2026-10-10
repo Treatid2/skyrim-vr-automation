@@ -58,6 +58,21 @@ foreach($case in @('commit','tree','buildKey','pdbGuid','pdbAge','coefficient','
     Assert-RecipeTest (-not $failed.ok -and -not $failed.receiptPublished -and $null -eq $failed.arguments) "recipe $case inconsistency fails before publication"
 }
 $events=$workload|ConvertTo-Json -Depth 30|ConvertFrom-Json;$events.expectedEvents=65537
+if ($recipe.status -ceq 'PASS_SOURCE_AND_EXACT_PDB_ALLOCATION_RECIPE') {
+    # Coherent caller re-pinning must not turn a generic marker into a new source allowlist.
+    foreach ($foreign in @(('0'*40),'ad8c7a2a8cf7dc9295d40dadd3f45da85fec4dd0','e03bd1fd4790795f9dd205d9458f34ce96092ca8')) {
+        $badRecipe=$recipe|ConvertTo-Json -Depth 30|ConvertFrom-Json
+        $badLayout=Get-Content -LiteralPath $LayoutPath -Raw|ConvertFrom-Json
+        $badManifest=$manifest|ConvertTo-Json -Depth 30|ConvertFrom-Json
+        $badRecipe.commit=$foreign;$badLayout.commit=$foreign;$badManifest.identity.source.commit=$foreign
+        $layoutFixture=Write-TestJson ('f362-repinned-layout-'+$foreign+'.json') $badLayout
+        $badRecipe.layoutReceipt.sha256=(Get-FileHash -LiteralPath $layoutFixture).Hash
+        $recipeFixture=Write-TestJson ('f362-repinned-recipe-'+$foreign+'.json') $badRecipe
+        $manifestFixture=Write-TestJson ('f362-repinned-manifest-'+$foreign+'.json') $badManifest
+        $failed=Invoke-TestPlan @{AllocationRecipePath=$recipeFixture;ExpectedAllocationRecipeSha256=(Get-FileHash -LiteralPath $recipeFixture).Hash;AllocationLayoutPath=$layoutFixture;ProducerBuildManifestPath=$manifestFixture;ExpectedProducerBuildManifestSha256=(Get-FileHash -LiteralPath $manifestFixture).Hash}
+        Assert-RecipeTest (-not $failed.ok -and -not $failed.receiptPublished -and $null -eq $failed.arguments) "coherently re-pinned foreign F362 source refused: $foreign"
+    }
+}
 $failed=Invoke-TestPlan @{WorkloadPath=(Write-TestJson 'too-many-events.json' $events)}
 Assert-RecipeTest (-not $failed.ok -and $null -eq $failed.arguments -and @($failed.exceededCeilings|Where-Object bound -eq 'maxEvents').Count -eq 1) '65536 event ceiling remains absolute'
 $failed=Invoke-TestPlan @{MaxBytes=(58021023+$baseDelta)}
