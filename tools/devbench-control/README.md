@@ -507,6 +507,23 @@ unverified-outcome diagnostic:
 
 Thus an API payload such as `idempotency_conflict` cannot be mistaken for
 successful work with or without the switch.
+
+The exact `calendar` `action:status` has a schema-1 read adapter. It requires
+one `devbench` observation with actual typed `ok/readbackFresh/available=true`,
+the process/session and calendar-global binding, finite calendar values, and
+the native ordered inventory. Stale, unavailable, malformed, explicit-error,
+unknown-schema and extra-argument receipts fail closed. Historical
+`lastTransition` and optional retained lease facts are typed read telemetry;
+their negative prior outcomes do not turn a fresh read into a failed mutation.
+Conversely `completionBasis=read-schema-only` and `qualifiedCalendarStatus`
+prove no hold, restoration, world readiness, stable observation window or
+measurement neutrality. Status has `restored=false` by native contract.
+The public call additionally compares receipt PID/processSession against the
+admitted listener process and creation time, refusing foreign/stale identity.
+Pure offline classification without an expected runtime proves shape only.
+This does not add `observed` to the generic success vocabulary, change
+hold/release qualification, or relax existing full runtime/artifact identity
+admission. Validate offline with `Test-CalendarStatusRead.ps1`.
 The `communityshaders.profiler` bridge has a contract-specific adapter because
 its legacy response does not carry a generic top-level `ok`: `status` must
 contain a frame-bearing status object, while `enable` and `disable` must report

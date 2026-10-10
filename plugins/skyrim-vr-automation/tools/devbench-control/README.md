@@ -62,64 +62,6 @@ remain distinct. This does not broaden the read-only `calendar-window` allowlist
 set quality or render scale, take ownership from the live experiment, or qualify
 scientific colour. No mutation replay or second transport lane is permitted.
 
-## Finite same-session calendar observation
-
-`calendar-window` is a bounded ownership composition in this controller, not
-a second DevBench transport or a general scenario/mutation wrapper. Select the
-controller MCP lane only when direct MCP is unavailable for that workflow
-before its first live request (direct-only protocols remain direct-only). It
-opens exactly one actual MCP session, discovers the native
-calendar schema and complete runtime/artifact identity, reads fresh status,
-copies the exact source binding into one finite hold, brackets 1..16 qualified
-read-only observations with current calendar state, then releases the original
-exact lease and verifies fresh prior-rate restoration before session close.
-The hold's captured values—not an earlier status's date—are authoritative.
-
-```powershell
-.\Invoke-DevBenchControl.ps1 calendar-window -RuntimePath '<exact-runtime.json>' `
-  -CalendarOwner '<task-owner>' -CalendarHoldMilliseconds 60000 `
-  -CalendarObservationsJson '[{"tool":"inspect","arguments":{"kind":"scene"}},{"tool":"camera","arguments":{"action":"get"}}]' `
-  -MaxTransientRetries 0 -TimeoutSeconds 60 -EvidenceDirectory '<owned-evidence>'
-```
-
-Supply build/artifact expectations as for other ownership-bearing calls. The
-total invocation budget reserves its final 15 seconds for bounded same-session
-cleanup. Hold maximum is 300000 ms; there is no renewal. Late responses fail
-their phase deadline. Lost/already-started hold responses are reconciled once
-by the same session and hold command ID: no replay, replacement session, REST
-downgrade, or unrelated lease adoption. An absent/failed cleanup proof is
-explicitly indeterminate. A failed observation may still have separately
-verified restoration; it never becomes a successful observation window.
-
-Cell drift invalidates observation continuity, but cleanup can independently be
-verified in a different cell. Release still uses the original exact `lease.binding`
-and lease ID on the same actual MCP session, with a distinct release command ID.
-Native restoration must positively succeed after its private SameStorage/owned-zero
-check. Both the release receipt and a fresh status must preserve process session,
-PID, load generation and all six global IDs, retain the exact original lease and
-captured rate, and show no outstanding custody and the restored prior rate; fresh
-`lastTransition` must also affirm restoration with the same exact reason as the
-release receipt. Supported positive reasons are only `released`, `expired`, and
-`scene_lost`: native Tick may already have restored and retired the original
-lease before explicit release, which then returns that same result without a
-second write. A reason by itself never proves restoration; every custody and
-fresh-readback guard still applies. Only the current contextual cell may
-differ for cleanup proof. No current-binding substitution, foreign-rate overwrite,
-generation adoption, lease disappearance inference or automatic retry is permitted.
-Raw release/status remain evidence; public IDs do not expose or replace native
-storage-address checks. Offline proof is not a live restoration guarantee.
-
-This first interface admits only existing allowlisted non-mutating reads. It
-does not start capture, arm probes, change quality/weather/physics, save, jump
-time, or promise an atomic rendered frame or invariant lighting. Experiment
-owners retain calibration and scientific acceptance. Native expiry needs a
-serviced main thread; disconnect/crash is not verified restoration. Closing the
-MCP session is separately reported, never substituted for calendar cleanup.
-Source/offline validation does not qualify native runtime operation.
-
-Run `Test-CalendarObservationWindow.ps1` for the finite offline RPC negatives
-and public production-entry refusal tests.
-
 ## Async dispatch and compiler qualification
 
 An uncaptured console queue receipt proves dispatch acceptance, not arrival,
@@ -565,6 +507,23 @@ unverified-outcome diagnostic:
 
 Thus an API payload such as `idempotency_conflict` cannot be mistaken for
 successful work with or without the switch.
+
+The exact `calendar` `action:status` has a schema-1 read adapter. It requires
+one `devbench` observation with actual typed `ok/readbackFresh/available=true`,
+the process/session and calendar-global binding, finite calendar values, and
+the native ordered inventory. Stale, unavailable, malformed, explicit-error,
+unknown-schema and extra-argument receipts fail closed. Historical
+`lastTransition` and optional retained lease facts are typed read telemetry;
+their negative prior outcomes do not turn a fresh read into a failed mutation.
+Conversely `completionBasis=read-schema-only` and `qualifiedCalendarStatus`
+prove no hold, restoration, world readiness, stable observation window or
+measurement neutrality. Status has `restored=false` by native contract.
+The public call additionally compares receipt PID/processSession against the
+admitted listener process and creation time, refusing foreign/stale identity.
+Pure offline classification without an expected runtime proves shape only.
+This does not add `observed` to the generic success vocabulary, change
+hold/release qualification, or relax existing full runtime/artifact identity
+admission. Validate offline with `Test-CalendarStatusRead.ps1`.
 The `communityshaders.profiler` bridge has a contract-specific adapter because
 its legacy response does not carry a generic top-level `ok`: `status` must
 contain a frame-bearing status object, while `enable` and `disable` must report

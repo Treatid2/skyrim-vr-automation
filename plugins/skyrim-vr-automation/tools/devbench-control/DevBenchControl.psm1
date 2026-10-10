@@ -5,6 +5,7 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'ShaderCompilerHealth.ps1')
 Export-ModuleMember -Function Get-DevBenchShaderCompilerHealth, Test-DevBenchShaderCompilerWindow, Test-DevBenchShaderSnapshotRequest
 . (Join-Path $PSScriptRoot 'NativeReadContracts.ps1')
+. (Join-Path $PSScriptRoot 'CalendarStatusRead.ps1')
 . (Join-Path $PSScriptRoot 'ScreenshotRequestRead.ps1')
 
 function Get-DevBenchHealthSemanticStatus {
@@ -631,9 +632,13 @@ function Get-DevBenchCallSemanticStatus {
     param(
         [Parameter(Mandatory)][string]$ToolName,
         [Parameter(Mandatory)][Collections.IDictionary]$Arguments,
-        [AllowEmptyCollection()][object[]]$Content
+        [AllowEmptyCollection()][object[]]$Content,
+        $ExpectedRuntimeIdentity
     )
 
+    if ($ToolName -ceq 'calendar' -and $Arguments.Contains('action') -and $Arguments['action'] -is [string] -and $Arguments['action'] -ceq 'status') {
+        return Get-DevBenchCalendarStatusRead -Arguments $Arguments -Content $Content -ExpectedRuntimeIdentity $ExpectedRuntimeIdentity
+    }
     if ($ToolName -ceq 'console' -and $Arguments.Contains('action') -and $Arguments.action -is [string] -and $Arguments.action -ceq 'exec' -and $Arguments.Contains('capture') -and $Arguments.capture -is [bool] -and -not $Arguments.capture) {
         return Get-DevBenchConsoleDispatchStatus -Arguments $Arguments -Content $Content
     }

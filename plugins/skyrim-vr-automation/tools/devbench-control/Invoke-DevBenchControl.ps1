@@ -1558,7 +1558,7 @@ try {
             if ($performanceGuard) {
                 $data | Add-Member -NotePropertyName performanceGuard -NotePropertyValue $performanceGuard -Force
             }
-            $semantic = Get-DevBenchCallSemanticStatus -ToolName $Tool -Arguments $arguments -Content @($data.content)
+            $semantic = Get-DevBenchCallSemanticStatus -ToolName $Tool -Arguments $arguments -Content @($data.content) -ExpectedRuntimeIdentity $runtimeIdentity
             if ($Tool -eq 'communityshaders.profiler' -and -not $semantic.known) {
                 $profilerPayload = @($data.content | Select-Object -First 1)
                 if ($profilerPayload.Count -eq 1 -and -not $profilerPayload[0].PSObject.Properties['error']) {
