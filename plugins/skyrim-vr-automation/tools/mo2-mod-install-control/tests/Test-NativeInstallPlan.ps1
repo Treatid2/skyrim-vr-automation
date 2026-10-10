@@ -79,6 +79,16 @@ foreach ($name in @('..','.', 'CON','nul.dll','COM1','LPT9.txt','Trailing.', ' l
     Check "unsafe mod name $name" { $plan.modName=$name } $false 'safe exact Windows'
 }
 Check 'unsafe exact profile' { $plan.profile='CON'; $argsOverride.ExpectedProfile='CON' } $false 'safe exact Windows'
+foreach ($prefix in @('COM','LPT')) {
+    foreach ($digit in @([char]0xB9,[char]0xB2,[char]0xB3)) {
+        foreach ($suffix in @('','.txt')) {
+            $name = $prefix.ToLowerInvariant()+$digit+$suffix
+            Check "reserved superscript mod $name" { $plan.modName=$name } $false 'safe exact Windows'
+            Check "reserved superscript profile $name" { $plan.profile=$name; $argsOverride.ExpectedProfile=$name } $false 'safe exact Windows'
+        }
+    }
+}
+Check 'non-reserved superscript directory remains admitted' { $plan.modName='Native '+[char]0xB9+' TEST' } $true
 Check 'receipt missing reference field' { $plan.buildReceipt.Remove('sha256') } $false 'missing|unexpected'
 Check 'receipt extra reference field' { $plan.buildReceipt.token='refuse' } $false 'missing|unexpected'
 Check 'receipt digest drift' { $plan.buildReceipt.sha256='0'*64 } $false 'receipt digest mismatch'
@@ -144,6 +154,58 @@ Check 'source ancestor reparse' { $plan.files[0].sourcePath=Join-Path $link 'exa
 Check 'metadata ancestor reparse' { $argsOverride.PlanPath=Join-Path $link 'plan.json' } $false 'reparse point'
 # Unlink only this fixture junction; never recursively traverse its target.
 [IO.Directory]::Delete($link)
+# OS-boundary fault injection uses the actual public admission entry point and
+# leaves its classification/path/identity checks intact. No drive mappings change.
+$module = Get-Module NativeInstallPlan
+& $module {
+    $script:originalNamespace = ${function:Get-NativePlanNamespaceData}
+    $script:originalOpened = ${function:Get-NativePlanOpenedFileData}
+}
+try {
+    foreach ($selected in @($planPath,$receiptPath,$dll)) {
+        foreach ($mode in @('remote','unknown','subst','unknown-device','api-failure','opened-drift')) {
+            & $module { param($path,$mode)
+                $script:fixtureNamespacePath=$path; $script:fixtureNamespaceMode=$mode; $script:fixtureNamespaceCalls=0
+                function script:Get-NativePlanNamespaceData([string]$Path) {
+                    if ($Path -ine $script:fixtureNamespacePath) { return & $script:originalNamespace $Path }
+                    $script:fixtureNamespaceCalls++
+                    switch ($script:fixtureNamespaceMode) {
+                        remote { return @{driveType=4;device='\Device\LanmanRedirector'} }
+                        unknown { return @{driveType=0;device='\Device\HarddiskVolume1'} }
+                        subst { return @{driveType=3;device='\??\C:\fixture'} }
+                        unknown-device { return @{driveType=3;device='\Device\UnknownLocal'} }
+                        api-failure { throw 'Namespace API unavailable (synthetic).' }
+                        opened-drift { if ($script:fixtureNamespaceCalls -ge 2) { return @{driveType=3;device='\Device\HarddiskVolume999999'} } }
+                    }
+                    return & $script:originalNamespace $Path
+                }
+            } $selected $mode
+            Check "namespace $mode refused for $([IO.Path]::GetFileName($selected))" {} $false 'namespace|Namespace'
+        }
+    }
+    & $module {
+        Set-Item Function:script:Get-NativePlanNamespaceData $script:originalNamespace
+        function script:Get-NativePlanOpenedFileData([IO.FileStream]$Stream) {
+            $data = & $script:originalOpened $Stream
+            $data.path += '.alias'
+            return $data
+        }
+    }
+    Check 'opened metadata exact-path mismatch' {} $false 'opened-file namespace'
+    & $module { Set-Item Function:script:Get-NativePlanOpenedFileData $script:originalOpened }
+    $hardLink = Join-Path $root 'same-physical.dll'
+    $null = New-Item -ItemType HardLink -Path $hardLink -Target $dll
+    Check 'different leaves sharing physical file identity refused' {
+        $plan.files+=@(@{sourcePath=$hardLink;relativePath='SKSE/Plugins/same-physical.dll';bytes=4;sha256=(Hash $hardLink)})
+        $receipt.artifacts+=@(@{path=$hardLink;bytes=4;sha256=(Hash $hardLink)}); Refresh-Receipt
+    } $false 'Duplicate physical native source identity'
+    Check 'opened local payload identity retained' {} $true
+} finally {
+    & $module {
+        Set-Item Function:script:Get-NativePlanNamespaceData $script:originalNamespace
+        Set-Item Function:script:Get-NativePlanOpenedFileData $script:originalOpened
+    }
+}
 $exports=@(Get-Command -Module NativeInstallPlan | Select-Object -ExpandProperty Name)
 if ($exports.Count -eq 1 -and $exports[0] -ceq 'Get-VerifiedNativeInstallPlan') { $passed++ } else { $failures.Add('Unexpected public mutation interface') }
 @{ok=$failures.Count -eq 0; passed=$passed; failed=$failures.Count; failures=$failures.ToArray(); cases=$cases.ToArray();
