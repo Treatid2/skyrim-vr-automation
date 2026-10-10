@@ -2021,13 +2021,26 @@ try {
     elseif ($Command -eq 'inspect') {
         $providerDriver = @($externalDrivers.drivers | Where-Object { $_.name -ceq 'codex_head_pose' -and (Get-NormalizedPath $_.root) -eq (Get-NormalizedPath $HeadPoseDriverRoot) })
         $inputContract = Get-RuntimeInputContract -BaseContract $profile['automationInputContract'] -Effective $effective -Runtime $runtime -ExternalDrivers $externalDrivers
-        $state = if ($externalDrivers.errors.Count -gt 0) { 'external-driver-inventory-failed' } elseif ($providerDriver.Count -ne 1) { 'head-pose-provider-unavailable' } elseif ($externalDrivers.conflicts.Count -gt 0) { 'external-driver-conflict' } elseif ($runtime.headPoseAuthorizationError) { 'head-pose-provider-authorization-failed' } elseif ($runtime.active -and -not $runtime.headPoseReady) { 'head-pose-provider-not-ready' } elseif ($runtime.active -and $effective.active) { 'null-runtime-active-head-pose-ready' } elseif ($effective.active) { 'null-configured-runtime-stopped' } else { 'null-inactive' }
+        # runtime.active is retained null-driver proof, not process presence.
+        # Losing that proof must not project a running configured-root runtime
+        # as stopped. Keep qualification and all error precedence unchanged.
+        $state = if ($externalDrivers.errors.Count -gt 0) { 'external-driver-inventory-failed' } elseif ($providerDriver.Count -ne 1) { 'head-pose-provider-unavailable' } elseif ($externalDrivers.conflicts.Count -gt 0) { 'external-driver-conflict' } elseif ($runtime.headPoseAuthorizationError) { 'head-pose-provider-authorization-failed' } elseif ($runtime.active -and -not $runtime.headPoseReady) { 'head-pose-provider-not-ready' } elseif ($runtime.active -and $effective.active) { 'null-runtime-active-head-pose-ready' } elseif ($effective.active -and $ownedProcesses.Count -gt 0) { 'null-runtime-active-unqualified' } elseif ($effective.active) { 'null-configured-runtime-stopped' } else { 'null-inactive' }
         $result = New-Result -Ok (-not [bool]$runtime.headPoseAuthorizationError) -State $state -Data @{
             settingsPath = $SettingsPath
             settingsSha256 = Get-HashOrNull $SettingsPath
             profilePath = $NullProfilePath
             profileSha256 = Get-HashOrNull $NullProfilePath
             processes = $processes
+            processPresence = [ordered]@{
+                schemaVersion = 1
+                scope = 'configured-SteamVR-root-pre-probe-process-inventory'
+                state = if ($ownedProcesses.Count -gt 0) { 'processes-present' } else { 'inventory-empty' }
+                configuredRoot = $resolvedSteamVRRoot
+                ownedProcessCount = $ownedProcesses.Count
+                unprovenProcessCount = $unprovenProcesses.Count
+                closureVerified = $ownedProcesses.Count -eq 0
+                proof = 'point-in-time-inventory-not-runtime-qualification-or-continuous-closure'
+            }
             effective = $effective
             runtime = $runtime
             externalDrivers = $externalDrivers

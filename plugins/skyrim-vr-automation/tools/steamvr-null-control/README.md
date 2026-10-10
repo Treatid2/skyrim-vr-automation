@@ -48,6 +48,19 @@ and `Active HMD set to null.<configured serial>`. `inspect` therefore reports
 versioned shared-memory state, and appear as a valid standing HMD to the bundled
 independent OpenVR probe.
 
+Inspection separates three facts: `effective.active` is configuration agreement,
+`data.processPresence` is the already-observed configured-SteamVR-root process
+inventory, and `runtime.active` is retained null-driver log proof. A running
+root-owned process inventory with unavailable/invalidated log proof reports
+`null-runtime-active-unqualified`, never `null-configured-runtime-stopped`.
+Higher-priority provider/inventory/conflict/authorization failures remain errors
+and still carry process presence. `processPresence.closureVerified` is scoped to
+that point-in-time root-owned inventory only; unproven same-name processes remain
+counted separately, and this is not continuous closure or qualification evidence.
+Inspect success means the inspection completed, not measurement readiness. A
+later unsupported log rotation may invalidate qualification while processes
+continue running; no live reanchor, probe retry or proof relaxation follows.
+
 The profile sets `dashboard.enableDashboard=false` so the generic-HMD
 laser-mouse/dashboard route cannot be summoned. A resident `vrdashboard.exe`
 is retained as process telemetry; its presence alone is not an input-conflict
