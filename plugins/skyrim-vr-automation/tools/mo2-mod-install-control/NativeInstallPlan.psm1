@@ -3,6 +3,82 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # Read-only admission foundation, NOT a deployment or ownership interface.
+function Initialize-NativePlanFileProof {
+    if ('SkyrimVRAutomation.NativePlanFileProofV1' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+namespace SkyrimVRAutomation {
+    public static class NativePlanFileProofV1 {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct FileId { public ulong Volume; public ulong Low; public ulong High; }
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode)]
+        public static extern uint GetDriveTypeW(string root);
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+        static extern uint QueryDosDeviceW(string name, [Out] char[] buffer, uint size);
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+        static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder path, uint size, uint flags);
+        [DllImport("kernel32.dll", SetLastError=true)]
+        static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int kind, out FileId id, uint size);
+        public static string Device(string drive) {
+            var buffer = new char[32768];
+            uint count = QueryDosDeviceW(drive, buffer, (uint)buffer.Length);
+            if (count == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            int end = Array.IndexOf(buffer, '\0', 0, (int)count);
+            if (end <= 0) throw new InvalidOperationException("Unknown DOS device mapping.");
+            // Only the first entry is current; later entries may be historical mappings.
+            return new string(buffer, 0, end);
+        }
+        public static string[] Opened(SafeFileHandle handle) {
+            var path = new StringBuilder(32768);
+            uint count = GetFinalPathNameByHandleW(handle, path, (uint)path.Capacity, 2); // VOLUME_NAME_NT
+            if (count == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (count >= path.Capacity) throw new InvalidOperationException("Opened path exceeds proof budget.");
+            FileId id;
+            if (!GetFileInformationByHandleEx(handle, 18, out id, (uint)Marshal.SizeOf<FileId>()))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return new [] { path.ToString(), id.Volume.ToString("x16") + ":" + id.Low.ToString("x16") + id.High.ToString("x16") };
+        }
+    }
+}
+'@
+}
+
+# Narrow private OS seams; fixtures replace these, not the admission predicates.
+function Get-NativePlanNamespaceData([string]$Path) {
+    Initialize-NativePlanFileProof
+    $drive = $Path.Substring(0, 2)
+    return @{ driveType=[SkyrimVRAutomation.NativePlanFileProofV1]::GetDriveTypeW($drive+'\');
+        device=[SkyrimVRAutomation.NativePlanFileProofV1]::Device($drive) }
+}
+function Get-NativePlanOpenedFileData([IO.FileStream]$Stream) {
+    Initialize-NativePlanFileProof
+    $data = [SkyrimVRAutomation.NativePlanFileProofV1]::Opened($Stream.SafeFileHandle)
+    return @{ path=$data[0]; identity=$data[1] }
+}
+function Get-NativePlanLocalDevice([string]$Path) {
+    $data = Get-NativePlanNamespaceData $Path
+    # Conservative supported namespace: fixed local HarddiskVolume only. Refuse
+    # UNC/network, SUBST/path-backed DOS mappings and unknown device classes.
+    if ($data.driveType -ne 3 -or $data.device -isnot [string] -or
+        $data.device -cnotmatch '\A\\Device\\HarddiskVolume[0-9]+\z') {
+        throw 'Native plan namespace is not a supported fixed local volume.'
+    }
+    return $data.device
+}
+function Get-NativePlanOpenedIdentity([IO.FileStream]$Stream, [string]$Path) {
+    $device = Get-NativePlanLocalDevice $Path
+    $data = Get-NativePlanOpenedFileData $Stream
+    $expected = $device + $Path.Substring(2)
+    if ($data.path -isnot [string] -or -not [string]::Equals($data.path, $expected, [StringComparison]::OrdinalIgnoreCase) -or
+        $data.identity -isnot [string] -or $data.identity -cnotmatch '\A[a-f0-9]{16}:[a-f0-9]{32}\z') {
+        throw 'Native plan opened-file namespace or identity does not match its exact path.'
+    }
+    return $data.identity
+}
 function Assert-NativePlanDeadline([datetime]$DeadlineUtc) {
     if ([datetime]::UtcNow -ge $DeadlineUtc) { throw 'Native plan validation deadline exceeded.' }
 }
@@ -56,6 +132,7 @@ function Assert-NativePlanSafePath([string]$Path) {
             $part -match '[*?"<>|\x00-\x1F]') { throw 'Native plan path contains an ambiguous Windows component.' }
     }
     $full = [IO.Path]::GetFullPath($Path)
+    $null = Get-NativePlanLocalDevice $full
     $cursor = Get-Item -LiteralPath $full -Force -ErrorAction Stop
     while ($null -ne $cursor) {
         if (($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Native plan path traverses a reparse point.' }
@@ -70,6 +147,7 @@ function Read-NativePlanBoundedFile([string]$Path, [long]$MaximumBytes, [datetim
     $stream = [IO.File]::Open($full, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $memory = [IO.MemoryStream]::new()
     try {
+        $identity = Get-NativePlanOpenedIdentity $stream $full
         if ($stream.Length -gt $MaximumBytes) { throw 'Native plan metadata exceeds its byte limit.' }
         $buffer = [byte[]]::new(65536)
         while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
@@ -78,6 +156,7 @@ function Read-NativePlanBoundedFile([string]$Path, [long]$MaximumBytes, [datetim
             $memory.Write($buffer, 0, $read)
         }
         $null = Assert-NativePlanSafePath $full
+        if ((Get-NativePlanOpenedIdentity $stream $full) -cne $identity) { throw 'Native plan metadata identity changed during validation.' }
         return ,$memory.ToArray()
     } finally { $memory.Dispose(); $stream.Dispose() }
 }
@@ -85,7 +164,7 @@ function Read-NativePlanBoundedFile([string]$Path, [long]$MaximumBytes, [datetim
 function Assert-NativePlanName($Value, [string]$Label) {
     if ($Value -isnot [string] -or $Value.Length -lt 1 -or $Value.Length -gt 120 -or $Value -cne $Value.Trim() -or
         $Value -match '[\\/:*?"<>|\x00-\x1F]' -or $Value.EndsWith('.') -or $Value -in @('.', '..') -or
-        $Value -match '\A(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|\z)') { throw "$Label is not a safe exact Windows directory name." }
+        $Value -match '\A(CON|PRN|AUX|NUL|COM[1-9\u00B9\u00B2\u00B3]|LPT[1-9\u00B9\u00B2\u00B3])(?:\.|\z)') { throw "$Label is not a safe exact Windows directory name." }
 }
 
 function Get-VerifiedNativeInstallPlan {
@@ -127,6 +206,7 @@ function Get-VerifiedNativeInstallPlan {
     if ($plan.files -isnot [array] -or $plan.files.Count -lt 1 -or $plan.files.Count -gt 32) { throw 'Native plan requires 1..32 declared files.' }
     $targets = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $sources = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $physicalSources = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $verified = [Collections.Generic.List[object]]::new()
     $totalBytes = 0L
     foreach ($file in $plan.files) {
@@ -159,6 +239,8 @@ function Get-VerifiedNativeInstallPlan {
         $stream = [IO.File]::Open($source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
         $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
         try {
+            $identity = Get-NativePlanOpenedIdentity $stream $source
+            if (-not $physicalSources.Add($identity)) { throw 'Duplicate physical native source identity.' }
             if ($stream.Length -ne $file.bytes) { throw 'Native source size mismatch.' }
             $buffer = [byte[]]::new(1048576)
             $readBytes = 0L
@@ -170,8 +252,9 @@ function Get-VerifiedNativeInstallPlan {
             }
             if ($readBytes -ne $file.bytes -or [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant() -cne $file.sha256) { throw 'Native source hash mismatch.' }
             $null = Assert-NativePlanSafePath $source
+            if ((Get-NativePlanOpenedIdentity $stream $source) -cne $identity) { throw 'Native source identity changed during validation.' }
         } finally { $hasher.Dispose(); $stream.Dispose() }
-        $verified.Add([pscustomobject]@{ sourcePath=$source; relativePath=$file.relativePath; bytes=[long]$file.bytes; sha256=$file.sha256 })
+        $verified.Add([pscustomobject]@{ sourcePath=$source; relativePath=$file.relativePath; bytes=[long]$file.bytes; sha256=$file.sha256; sourceIdentity=$identity })
     }
     if (@($verified | Where-Object relativePath -CLike '*.dll').Count -eq 0) { throw 'Native plan must contain a DLL.' }
     foreach ($file in $verified) {

@@ -26,6 +26,14 @@ Data payload is admitted. Case-colliding targets and duplicated sources refuse.
 The source filename must match the target. Source and metadata paths must be
 explicit local Windows drive paths, not UNC/device/ADS/environment expansions
 or reparse paths. No installation layout flattening is involved.
+Drive spelling alone is not proof: admission checks GetDriveType and the current
+QueryDosDevice mapping, conservatively accepting only fixed local HarddiskVolume
+devices. Remote, SUBST/path-backed and unknown namespaces refuse for both metadata
+and payloads. The same opened read handle supplies its normalized NT path and
+volume/file ID before and after reading. Its exact path must match the current
+mapping; duplicate physical payload identities (including hard links) refuse.
+Each verified file includes `sourceIdentity`, not a reusable custody capability.
+Profile/mod names also refuse reserved COM/LPT superscript 1/2/3 forms and suffixes.
 
 The caller-pinned build receipt must contain the exact `commit` and a bounded
 `artifacts` array. Every selected file must have exactly one matching issued
@@ -44,6 +52,9 @@ read-only validation snapshot. Handles close before return; it is NOT durable
 file custody and must not authorise later staging or deployment without fresh
 validation/pinning. No physical ancestor identity/atomic cross-file snapshot is
 claimed. Unknown current lease/process/RootBuilder/UI state stays unknown.
+Mapping checks are sequential observations, not an atomic DOS-namespace generation
+or protection against an undetectable change-and-revert between checks. Handles
+pin the actual files read; a later installer must freshly pin its deployment set.
 
 The future installer must stage/pin this exact set, persist its uniquely owned
 publication journal, and publish a new directory under the supported holder
