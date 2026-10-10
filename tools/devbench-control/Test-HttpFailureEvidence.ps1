@@ -20,8 +20,18 @@ function Get-RuntimeIdentity {
 }
 '@
 $text=$text.Remove($node[0].Extent.StartOffset,$node[0].Extent.EndOffset-$node[0].Extent.StartOffset).Insert($node[0].Extent.StartOffset,$stub)
+$writerNode=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Write-JsonAtomic'},$true));if($writerNode.Count -ne 1){throw 'Ambiguous writer boundary.'}
+$originalWriter=$writerNode[0].Extent.Text.Replace('function Write-JsonAtomic {','function Write-FixtureJsonAtomic {')
+$writer=@'
+function Write-JsonAtomic {
+ param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Value)
+ if((Get-Content -LiteralPath (Join-Path $PSScriptRoot 'case.txt') -Raw).Trim() -ceq 'journal-failure' -and $Value.state -ceq 'failed'){throw 'Synthetic terminal journal failure after original HTTP refusal.'}
+ Write-FixtureJsonAtomic -Path $Path -Value $Value
+}
+'@
+$text=$text.Replace($writerNode[0].Extent.Text,$originalWriter+[Environment]::NewLine+$writer)
 [IO.File]::WriteAllText($entry,$text,[Text.UTF8Encoding]::new($false))
-foreach($case in @('initialize503','html502','empty500','large503','secret403','initialized503','mutation503','rest503','wait503')){
+foreach($case in @('initialize503','html502','empty500','large503','secret403','initialized503','mutation503','rest503','wait503','journal-failure')){
  $portProbe=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0);$portProbe.Start();$port=$portProbe.LocalEndpoint.Port;$portProbe.Stop()
  $ready=[Threading.ManualResetEventSlim]::new($false);$events=[Collections.Concurrent.ConcurrentQueue[object]]::new()
  $listener=[Net.HttpListener]::new();$listener.Prefixes.Add("http://127.0.0.1:$port/")
@@ -56,6 +66,7 @@ foreach($case in @('initialize503','html502','empty500','large503','secret403','
  try{
   if(-not $ready.Wait(5000) -or $server.State -eq 'Failed'){throw 'Isolated fixture server failed.'}
   $dir=Join-Path $root $case;[IO.Directory]::CreateDirectory($dir)|Out-Null;$runtime=Join-Path $dir 'runtime.json';[IO.File]::WriteAllText($runtime,(@{port=$port}|ConvertTo-Json))
+  [IO.File]::WriteAllText((Join-Path $copied 'case.txt'),$case)
   $params=@{RuntimePath=$runtime;EvidenceDirectory=$dir;TimeoutSeconds=8;RequestTimeoutSeconds=2;MaxTransientRetries=0;Compact=$true;NoExit=$true}
   if($case -ceq 'mutation503'){$params.Command='call';$params.Tool='fixture.mutate';$params.ArgumentsJson='{"action":"start"}'}
   elseif($case -ceq 'wait503'){$params.Command='wait';$params.Condition='toolAvailable';$params.Tool='fixture.mutate';$params.TimeoutSeconds=2;$params.PollMilliseconds=50;$params.MaxPollMilliseconds=50}
@@ -63,8 +74,13 @@ foreach($case in @('initialize503','html502','empty500','large503','secret403','
   $result=& $entry @params|ConvertFrom-Json -Depth 60
   $journal=Get-Content -LiteralPath $result.invocationEvidencePath -Raw|ConvertFrom-Json -Depth 60
   $observed=@($events.ToArray());$records=@($result.httpFailureEvidence.records)
-  Check (-not $result.ok -and $result.evidenceJournalFinalized) "$case refusal and terminal evidence survive"
-  Check ($records.Count -gt 0 -and $records.Count -le 8 -and ($result.httpFailureEvidence|ConvertTo-Json -Depth 30 -Compress) -ceq ($journal.httpFailureEvidence|ConvertTo-Json -Depth 30 -Compress)) "$case original evidence equal in result/journal"
+  if($case -ceq 'journal-failure'){
+   Check (-not $result.ok -and -not $result.evidenceJournalFinalized -and @($result.evidenceWarnings).Count -gt 0) 'journal failure retains primary refusal and explicit persistence warning'
+   Check ($records.Count -eq 1 -and $records[0].statusCode -eq 503 -and $journal.state -ceq 'preparing') 'failed journal leaves original prepared file/result refusal evidence, no false finalized claim'
+  }else{
+   Check (-not $result.ok -and $result.evidenceJournalFinalized) "$case refusal and terminal evidence survive"
+   Check ($records.Count -gt 0 -and $records.Count -le 8 -and ($result.httpFailureEvidence|ConvertTo-Json -Depth 30 -Compress) -ceq ($journal.httpFailureEvidence|ConvertTo-Json -Depth 30 -Compress)) "$case original evidence equal in result/journal"
+  }
   $json=$result.httpFailureEvidence|ConvertTo-Json -Depth 30 -Compress
   Check ($json -notmatch 'PRIVATE_FIXTURE|PRIVATE_BODY_TOKEN') "$case secret headers/body not published"
   Check (@($records|Where-Object {$_.extraRequest}).Count -eq 0) "$case evidence capture sends no request"
@@ -100,4 +116,15 @@ foreach($body in @(('x'*70000),('é'*10000),'{broken json','')){
  elseif($body -like 'é*'){Check ($r.sourceBytes -eq 20000 -and $r.retainedBytes -eq 16384 -and $r.omitted) 'UTF8 multibyte exact byte cap'}
  else{Check ($r.sourceBytes -eq [Text.Encoding]::UTF8.GetByteCount($body) -and -not $r.omitted) 'nonJSON/empty buffer is evidence, never semantic success'}
 }
+# Unknown transport/non-HTTP failure cannot invent response/body evidence.
+$before=(Get-HttpFailureEvidenceSnapshot).observedCount
+$err=[Management.Automation.ErrorRecord]::new([TimeoutException]::new('Synthetic transport timeout'),'timeout',[Management.Automation.ErrorCategory]::OperationTimeout,$null)
+Retain-HttpFailureEvidence -Failure $err -Uri 'http://127.0.0.1:1/mcp' -Method Post
+Check ((Get-HttpFailureEvidenceSnapshot).observedCount -eq $before) 'response-less timeout does not fabricate HTTP refusal'
+# Unsupported response metadata cannot replace the original refusal.
+$ex=[InvalidOperationException]::new('Original503');$ex|Add-Member -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{StatusCode=503})
+$err=[Management.Automation.ErrorRecord]::new($ex,'metadata',[Management.Automation.ErrorCategory]::InvalidOperation,$null)
+Retain-HttpFailureEvidence -Failure $err -Uri 'http://127.0.0.1:1/mcp' -Method Post
+$r=(Get-HttpFailureEvidenceSnapshot).records[-1]
+Check ($r.statusCode -eq 503 -and $r.omissionReason -ceq 'metadata-capture-failed' -and $ex.Message -ceq 'Original503') 'metadata collection failure retains status/omission and original failure'
 [pscustomobject]@{ok=$true;checks=$passed;cases=$cases;scope='copied public HTTP entry/journal/original cleanup plus exact collector AST; identity observation synthetic; isolated loopback fixture only';runtimeCalls=0;liveQualified=$false}|ConvertTo-Json -Depth 8
