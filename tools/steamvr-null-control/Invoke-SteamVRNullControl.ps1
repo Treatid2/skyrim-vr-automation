@@ -1425,7 +1425,7 @@ function Get-NullRuntimeEvidence {
             $headPoseRegistered = $startupLogProof.headPoseDeviceRegistered
         }
     }
-    else { $script:NullStartupLogProofState.Clear() }
+    else { if (-not $script:NullStartupLogAnchor) { $script:NullStartupLogProofState.Clear() } }
     $headPoseAuthorizationError = $null
     try {
         $denyAfterStart = $InternalTestFailurePoint -eq 'head-pose-access-denied-after-start' -and
@@ -1874,6 +1874,26 @@ try {
     })
     $unprovenProcesses = @($processes | Where-Object { $_ -notin $ownedProcesses })
     $effective = Get-EffectiveState -Settings $settings -Profile $profile
+    # Read-only continuity may reuse only the exact accepted receipt from the
+    # authoritative committed apply, then revalidate all retained ranges. No
+    # live log reanchoring and no legacy receipt migration is permitted.
+    if ($Command -in @('inspect', 'start') -and $effective.active -and $recoveredTransaction -and
+        [string]$recoveredTransaction['operation'] -eq 'apply' -and [string]$recoveredTransaction['phase'] -eq 'committed') {
+        $receiptServer = @($ownedProcesses | Where-Object name -eq 'vrserver')
+        $boundRuntimePath = Join-Path ([string]$recoveredTransaction['evidenceDirectory']) 'steamvr-null-runtime.receipt.json'
+        if ($receiptServer.Count -eq 1 -and (Test-Path -LiteralPath $boundRuntimePath -PathType Leaf)) {
+            try {
+                $acceptedRuntime = Get-Content -LiteralPath $boundRuntimePath -Raw | ConvertFrom-Json -Depth 80
+                Import-NullStartupLogAnchor -Receipt $acceptedRuntime -Path $ServerLogPath -Server $receiptServer[0] -SerialNumber ([string]$profile['driver_null']['serialNumber']) -MaxBytes $LogTailMaxBytes
+            }
+            catch {
+                # Unknown provenance remains unqualified; inspection/stop remains
+                # available and a running runtime cannot be silently relaunched.
+                $script:NullStartupLogAnchor = $null
+                $script:NullStartupLogProofState.Clear()
+            }
+        }
+    }
     $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DiagnosticPhases:$ProbeDiagnosticPhases -DiagnosticFailedRoles:$ProbeDiagnosticFailedRoles
     $externalDrivers = Get-ExternalDriverInventory -Path $OpenVRPathsPath
     $mo2Admission = if ($Command -in @('apply', 'start')) { Get-MO2NullAdmission } else { $null }
@@ -2069,6 +2089,11 @@ try {
                 $script:SteamVRStartupAttemptActive = $true
                 $deadline = $startedUtc.AddSeconds($StartupTimeoutSeconds)
                 $startupDeadlineUtc = $deadline
+                # Capture and persist the exact prelaunch log boundary before any
+                # owned child can run. Existing files are append-only this attempt;
+                # an absent path may be created once. Never reanchor after launch.
+                $runtimeReceipt['startupLogAnchor'] = New-NullStartupLogAnchor -Path $ServerLogPath -AttemptId $runtimeAttemptId -DeadlineUtc $deadline
+                Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
                 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'process-control/ProcessLaunchInterop.ps1')
                 $launcher = Start-NormalInteractiveProcess -FilePath $startupPath -DeadlineUtc $deadline
                 $runtimeReceipt['interactiveLaunch'] = $launcher.interactiveLaunch
@@ -2105,6 +2130,16 @@ try {
                     }
                     catch [TimeoutException] {
                         $lastRuntimeProbeError = $_.Exception.Message
+                        $failedLogProof = @($script:NullStartupLogProofState.Values | Where-Object { $_.PSObject.Properties['terminalFailure'] -and $_.terminalFailure } | Select-Object -First 1)
+                        if ($failedLogProof.Count -eq 1) {
+                            $runtime.startupLogProof = $failedLogProof[0]
+                            $runtime.active = $false
+                            $runtime.headPoseReady = $false
+                        }
+                        break
+                    }
+                    if ($runtime.startupLogProof -and $runtime.startupLogProof.PSObject.Properties['terminalFailure'] -and $runtime.startupLogProof.terminalFailure) {
+                        $lastRuntimeProbeError = [string]$runtime.startupLogProof.error
                         break
                     }
                     if ($runtime.headPoseAuthorizationError) {
@@ -2154,6 +2189,11 @@ try {
                 elseif ($runtime.headPoseAuthorizationError) {
                     $failureState = 'head-pose-provider-authorization-failed'
                     $failureErrors.Add([string]$runtime.headPoseAuthorizationError)
+                }
+                elseif ($runtime.startupLogProof -and $runtime.startupLogProof.PSObject.Properties['terminalFailure'] -and $runtime.startupLogProof.terminalFailure) {
+                    $failureState = 'startup-log-proof-acquisition-failed'
+                    $failureErrors.Add([string]$runtime.startupLogProof.error)
+                    $failureErrors.Add('The attempt-relative startup log proof is irrecoverable; no further readiness poll or probe is authorised for this attempt.')
                 }
                 elseif ($runtime.applicationHeadPose.failureKind -eq 'insufficient-probe-budget') {
                     $failureState = 'application-pose-probe-insufficient-budget'

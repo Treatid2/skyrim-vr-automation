@@ -80,6 +80,10 @@ function Get-SharedTextTail {
 }
 function Get-NullStartupLogProof {
     param($Path,$Server,$SerialNumber,$MaxBytes,$DeadlineUtc)
+    $case = Get-Content -LiteralPath (Join-Path $HeadPoseDriverRoot 'case.txt') -Raw
+    if ($case.StartsWith('log-')) {
+        return Get-FixtureRealStartupLogProof -Path $Path -Server $Server -SerialNumber $SerialNumber -MaxBytes $MaxBytes -DeadlineUtc $DeadlineUtc
+    }
     $prefix=[string]$Server.startTimeUtc
     @{
         stable=$true;complete=$true
@@ -106,7 +110,8 @@ function Get-NullStartupLogProof {
     $externalLogStub=$false
     if(Test-Path -LiteralPath (Join-Path $PSScriptRoot 'StartupLogProof.ps1')){
         $stub=@($stubAst.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-NullStartupLogProof'},$true))[0].Extent.Text
-        [IO.File]::WriteAllText((Join-Path $nullRoot 'StartupLogProof.ps1'),('$script:NullStartupLogProofState=@{}'+[Environment]::NewLine+$stub),[Text.UTF8Encoding]::new($false))
+        $realLogSource=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'StartupLogProof.ps1')).Replace('function Get-NullStartupLogProof {','function Get-FixtureRealStartupLogProof {')
+        [IO.File]::WriteAllText((Join-Path $nullRoot 'StartupLogProof.ps1'),($realLogSource+[Environment]::NewLine+$stub),[Text.UTF8Encoding]::new($false))
         $externalLogStub=$true
     }
     if(Test-Path -LiteralPath (Join-Path $PSScriptRoot 'DesktopUIRestore.ps1')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'DesktopUIRestore.ps1') -Destination $nullRoot}
@@ -145,6 +150,17 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
         [CmdletBinding()]param($FilePath,$DeadlineUtc)
         if ($DeadlineUtc -le [DateTime]::UtcNow -or $FilePath -cne (Join-Path $SteamVRRoot 'bin/win64/vrstartup.exe')) { throw 'Unexpected fixture launch.' }
         [IO.File]::WriteAllText((Join-Path $SteamVRRoot 'launch.json'),(@{live=$true;startedUtc=[DateTime]::UtcNow.ToString('o')}|ConvertTo-Json -Compress))
+        $case = Get-Content -LiteralPath (Join-Path $HeadPoseDriverRoot 'case.txt') -Raw
+        if ($case.StartsWith('log-')) {
+            $receipt=Get-Content -LiteralPath (Join-Path $EvidenceDirectory 'steamvr-null-runtime.receipt.json') -Raw|ConvertFrom-Json -Depth 80
+            if ($receipt.runtimeAccepted -or $receipt.startupLogAnchor.attemptId -cne $receipt.attemptId -or $receipt.startupLogAnchor.offset -ne ([IO.FileInfo]$ServerLogPath).Length) { throw 'Anchor was not persisted before fixture child launch.' }
+            switch ($case) {
+                'log-budget' { [IO.File]::AppendAllText($ServerLogPath, ("new noise`n" * 30000)) }
+                'log-replacement' { [IO.File]::Move($ServerLogPath, "$ServerLogPath.old"); [IO.File]::WriteAllText($ServerLogPath, 'same-name replacement') }
+                'log-truncation' { [IO.File]::WriteAllText($ServerLogPath, '') }
+                'log-mutation' { $edit=[IO.File]::Open($ServerLogPath,'Open','Write',[IO.FileShare]::ReadWrite); try{$edit.Position=0;$edit.WriteByte([byte][char]'X')}finally{$edit.Dispose()} }
+            }
+        }
         [pscustomobject]@{Id=12345;interactiveLaunch=@{normalUserAccessVerified=$true;method='synthetic-fixture'}}
     }
     function Stop-Process {
@@ -160,7 +176,7 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
         if($s.live){[pscustomobject]@{Id=12345}}
     }
     $kinds=@{empty='empty-output';undrained='stream-drain-incomplete';malformed='malformed-output';'package-drift'='provider-package-drift';continuity='continuity-failed';exit='bounded-process-failure';timeout='timeout';unqualified='observation-unqualified';'confirmation-malformed'='malformed-output'}
-    foreach ($case in @('empty','undrained','malformed','package-drift','continuity','exit','timeout','unqualified','confirmation-malformed','success','delayed-provider','insufficient-budget')) {
+    foreach ($case in @('empty','undrained','malformed','package-drift','continuity','exit','timeout','unqualified','confirmation-malformed','success','delayed-provider','insufficient-budget','log-budget','log-replacement','log-truncation','log-mutation')) {
         $caseRoot=Join-Path $fixture $case
         $script:currentSteamRoot=Join-Path $caseRoot 'SteamVR'
         $provider=Join-Path $caseRoot 'provider'
@@ -188,7 +204,13 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
         $receipt=Get-Content -LiteralPath $result.data.runtimeReceiptPath -Raw|ConvertFrom-Json -Depth 80
         $countPath=Join-Path $provider 'dispatch-count.txt'
         $count=if(Test-Path -LiteralPath $countPath){@(Get-Content -LiteralPath $countPath).Count}else{0}
-        if($case -ceq 'insufficient-budget'){
+        if($case.StartsWith('log-')){
+            Assert-Startup (-not $result.ok -and $result.state -ceq 'startup-log-proof-acquisition-failed' -and $receipt.admissionState -ceq $result.state) "$case terminal log acquisition classification returned/persisted"
+            Assert-Startup ($count -eq 0 -and $receipt.runtimeProbeAttempts -eq 1 -and -not $receipt.runtimeConfirmationAttempted -and -not $result.data.runtime.applicationHeadPose.probeAttempted) "$case one readiness observation, no native probe or futile repoll"
+            Assert-Startup (-not $receipt.runtimeAccepted -and -not $result.data.inputContract.measurementReady -and $result.data.runtime.startupLogProof.terminalFailure) "$case immutable failed-first proof remains nonaccepted"
+            Assert-Startup ($result.data.startupCleanup.verified -and @($result.data.startupCleanup.requested).Count -eq 1 -and $result.data.startupCleanup.requested[0].id -eq 12345 -and @($result.data.startupCleanup.remaining).Count -eq 0 -and @(Get-Content -LiteralPath (Join-Path $script:currentSteamRoot 'stopped.txt')).Count -eq 1) "$case real owner filtering/cleanup and survivor verification"
+            Assert-Startup ($receipt.lastRuntimeProbeError -ceq $result.data.runtime.startupLogProof.error -and ([DateTimeOffset]$receipt.failureObservedUtc) -lt ([DateTimeOffset]$receipt.startupDeadlineUtc)) "$case exact primary error before deadline preserved"
+        }elseif($case -ceq 'insufficient-budget'){
             $application=$result.data.runtime.applicationHeadPose
             Assert-Startup (-not $result.ok -and $result.state -ceq 'application-pose-probe-insufficient-budget' -and $receipt.admissionState -ceq $result.state) 'budget refusal public state/receipt agree'
             Assert-Startup ($count -eq 0 -and -not $application.probeAttempted -and -not $application.timedOut -and $null -eq $application.boundedProcess -and $application.failureKind -ceq 'insufficient-probe-budget') 'public late budget never dispatches or claims timeout'
