@@ -135,7 +135,8 @@ try {
     [IO.File]::WriteAllText($runtimePath, '{}', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText($fakeControl, @'
-param([string]$Command,[string]$Tool,[string]$ArgumentsJson,[string]$RuntimePath,[string]$EvidenceDirectory,[string]$EvidenceLabel,[int]$TimeoutSeconds,[switch]$RequireSuccess,[switch]$RequirePerformanceNeutral,[switch]$NoExit,[switch]$Compact,[string]$ExpectedRuntimeIdentityJson)
+param([string]$Command,[string]$Tool,[string]$ArgumentsJson,[string]$RuntimePath,[string]$EvidenceDirectory,[string]$EvidenceLabel,[int]$TimeoutSeconds,[switch]$RequireSuccess,[switch]$RequirePerformanceNeutral,[switch]$NoExit,[switch]$Compact,[string]$ExpectedRuntimeIdentityJson,[string]$ArtifactPath,[string]$WorkspaceManifestPath,[string]$ExpectedArtifactSha256,[string]$ExpectedBuildId)
+$suppliedArtifactPath=$ArtifactPath
 $null = New-Item -ItemType Directory -Path $EvidenceDirectory -Force
 [IO.File]::WriteAllText((Join-Path $EvidenceDirectory "$EvidenceLabel.admission.json"), '{"admitted":true}', [Text.UTF8Encoding]::new($false))
 $state = Get-Content -LiteralPath $env:CSX_PROFILER_TEST_STATE -Raw | ConvertFrom-Json -AsHashtable
@@ -151,6 +152,13 @@ $processStartTimeUtc = if ($driftNow -and $driftField -eq 'start') { '2026-08-28
 $buildId = if ($driftNow -and $driftField -eq 'build') { 'replacement-build' } else { 'fixture' }
 $artifactPath = if ($driftNow -and $driftField -eq 'artifact') { 'C:\Fixture\ReplacementCommunityShaders.dll' } else { 'C:\Fixture\CommunityShaders.dll' }
 $artifactSha256 = if ($driftNow -and $driftField -eq 'artifact') { 'BB' } else { 'AA' }
+if ($env:CSX_PROFILER_TEST_REQUIRE_BOOTSTRAP -eq '1' -and
+    ($suppliedArtifactPath -cne $artifactPath -or $ExpectedArtifactSha256 -cne $artifactSha256 -or $ExpectedBuildId -cne $buildId)) {
+    $state.rejectedBeforeMutation = $true
+    $state | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:CSX_PROFILER_TEST_STATE -Encoding utf8
+    @{ok=$false;errors=@('Fixture bootstrap artifact/build binding missing or mismatched before dispatch.')} | ConvertTo-Json -Compress
+    return
+}
 if (-not [string]::IsNullOrWhiteSpace($ExpectedRuntimeIdentityJson)) {
     $expected = $ExpectedRuntimeIdentityJson | ConvertFrom-Json
     $expectedStartTimeUtc = if ($expected.processStartTimeUtc -is [DateTime]) {
@@ -200,6 +208,28 @@ $semantic = if ($optionalUnavailable) { [pscustomobject]@{known=$true;ok=$false;
     $env:CSX_PROFILER_CONTROL_ROOT = Join-Path $resolvedTestRoot 'profiler-control'
     $measure = Join-Path $PSScriptRoot 'Measure-CSXProfiler.ps1'
     $contextJson = @{ environment = @{ mo2Profile = 'fixture'; scene = 'still'; hmdMode = 'null'; renderResolution = '100x100' }; treatment = @{ shaderState = 'enabled' } } | ConvertTo-Json -Compress
+    $env:CSX_PROFILER_TEST_REQUIRE_BOOTSTRAP='1'
+    foreach ($case in @(@{name='missing';args=@{}},@{name='bad-path';args=@{ArtifactPath='foreign';ExpectedArtifactSha256='AA';ExpectedBuildId='fixture'}},@{name='bad-hash';args=@{ArtifactPath='C:\Fixture\CommunityShaders.dll';ExpectedArtifactSha256='BB';ExpectedBuildId='fixture'}},@{name='bad-build';args=@{ArtifactPath='C:\Fixture\CommunityShaders.dll';ExpectedArtifactSha256='AA';ExpectedBuildId='foreign'}})) {
+        [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
+        $bindingError=$null;$bindingArgs=$case.args;$bindingRoot=Join-Path $resolvedTestRoot ('bootstrap-'+$case.name)
+        try { & $measure -Label $case.name -EvidenceDirectory $bindingRoot -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl @bindingArgs | Out-Null } catch { $bindingError=$_.Exception.Message }
+        $bindingReceipt=Get-Content -LiteralPath (@(Get-ChildItem -LiteralPath $bindingRoot -Directory)[0].FullName+'/capture.receipt.json') -Raw|ConvertFrom-Json
+        $bindingState=Get-Content -LiteralPath $statePath -Raw|ConvertFrom-Json
+        Assert-Test ($bindingError -match 'bootstrap.*missing or mismatched' -and $bindingError -notmatch 'state was restored' -and $bindingReceipt.state -ceq 'admission-failed' -and $null -eq $bindingReceipt.priorEnabled -and -not $bindingReceipt.stateRestored -and $bindingState.calls -eq 1 -and -not $bindingState.enabled) ('bootstrap '+$case.name+' refuses before enable/samples and preserves unknown restoration')
+    }
+    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
+    $pinnedIdentity=@{listenerPid=123;processPath='C:\Fixture\SkyrimVR.exe';processStartTimeUtc='2026-08-28T00:00:00.1234567Z';buildId='fixture';artifactPath='C:\Fixture\CommunityShaders.dll';artifactSha256='AA'}
+    $wrongIdentity=$pinnedIdentity.Clone();$wrongIdentity.listenerPid=456
+    $identityFailure=$null;$identityRoot=Join-Path $resolvedTestRoot 'bootstrap-runtime-mismatch'
+    try { & $measure -Label wrong-runtime -EvidenceDirectory $identityRoot -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl -ArtifactPath 'C:\Fixture\CommunityShaders.dll' -ExpectedArtifactSha256 'AA' -ExpectedBuildId 'fixture' -ExpectedRuntimeIdentityJson ($wrongIdentity|ConvertTo-Json -Compress)|Out-Null }catch{$identityFailure=$_.Exception.Message}
+    $identityState=Get-Content -LiteralPath $statePath -Raw|ConvertFrom-Json
+    $identityReceipt=Get-Content -LiteralPath (@(Get-ChildItem -LiteralPath $identityRoot -Directory)[0].FullName+'/capture.receipt.json') -Raw|ConvertFrom-Json
+    Assert-Test ($identityFailure -match 'Expected runtime identity changed before dispatch' -and $identityState.calls -eq 1 -and -not $identityState.enabled -and $null -eq $identityReceipt.priorEnabled -and -not $identityReceipt.stateRestored) 'caller pinned process identity is forwarded before initial admission and cannot mutate mismatched runtime'
+    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
+    $boundMeasurement=& $measure -Label bound -EvidenceDirectory (Join-Path $resolvedTestRoot 'bound') -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl -ArtifactPath 'C:\Fixture\CommunityShaders.dll' -ExpectedArtifactSha256 'AA' -ExpectedBuildId 'fixture' -ExpectedRuntimeIdentityJson ($pinnedIdentity|ConvertTo-Json -Compress) | ConvertFrom-Json
+    Assert-Test ($boundMeasurement.ok -and $boundMeasurement.summary.profilerStateRestored -and $boundMeasurement.summary.uniqueFreshFrames -eq 3) 'explicit bootstrap identity forwarded through initial, profiler, resource and restoration calls'
+    Remove-Item Env:CSX_PROFILER_TEST_REQUIRE_BOOTSTRAP
+    [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
     $measurement = & $measure -Label fixture -EvidenceDirectory (Join-Path $resolvedTestRoot 'measure') -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl | ConvertFrom-Json
     $finalProfilerState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
     Assert-Test ($measurement.ok -and $measurement.summary.uniqueFreshFrames -eq 3 -and $measurement.summary.profilerStateRestored) 'measurement uses fresh frames and records verified state restoration'
@@ -352,6 +382,7 @@ $semantic = if ($optionalUnavailable) { [pscustomobject]@{known=$true;ok=$false;
 }
 finally {
     Remove-Item Env:CSX_PROFILER_TEST_STATE -ErrorAction SilentlyContinue
+    Remove-Item Env:CSX_PROFILER_TEST_REQUIRE_BOOTSTRAP -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_DRIFT_AT_CALL -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_BREAK_MIRROR -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_RENDER_SCALE_EPOCH_AFTER -ErrorAction SilentlyContinue

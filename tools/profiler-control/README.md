@@ -63,6 +63,16 @@ Supply DevBench runtime metadata with `-RuntimePath` or set
 `CSX_DEVBENCH_RUNTIME_PATH`. No installation-specific path is built into the
 collector.
 
+When metadata does not contain the independently verified deployed artifact,
+pass `-ArtifactPath`, `-ExpectedArtifactSha256`, `-ExpectedBuildId` and, when
+available, `-ExpectedRuntimeIdentityJson` or `-WorkspaceManifestPath`. These
+are forwarded to the central controller on the initial status, every profiler
+and resource-publication call, and restoration. They are expectations, not an
+identity bypass; the controller must still verify the answering runtime.
+If initial admission fails, the receipt is `admission-failed`, prior/final
+enable state remains unknown and `stateRestored` is false. No restoration
+success is reported without its verified postcondition.
+
 `ContextJson` is mandatory. Its `environment` object identifies the MO2
 profile, scene, HMD mode, and render resolution; `treatment` records the
 intended variable such as shader state. The environment and exact runtime

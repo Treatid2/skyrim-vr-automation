@@ -13,6 +13,11 @@ param(
     [ValidateRange(1, 120)][int]$RestoreReserveSeconds = 15,
     [ValidateRange(1, 120)][int]$LeaseTimeoutSeconds = 10,
     [string]$RuntimePath = $env:CSX_DEVBENCH_RUNTIME_PATH,
+    [string]$ArtifactPath,
+    [string]$WorkspaceManifestPath,
+    [string]$ExpectedBuildId,
+    [string]$ExpectedArtifactSha256,
+    [string]$ExpectedRuntimeIdentityJson,
     [string]$DevBenchControlPath
 )
 
@@ -185,6 +190,12 @@ $operationDeadlineUtc = [DateTime]::UtcNow.AddSeconds($TotalTimeoutSeconds)
 $captureDeadlineUtc = $operationDeadlineUtc.AddSeconds(-$RestoreReserveSeconds)
 $expectedRuntimeIdentity = $null
 $expectedRuntimeIdentityFingerprint = $null
+$bootstrapIdentityArguments = @{}
+foreach ($name in @('ArtifactPath','WorkspaceManifestPath','ExpectedBuildId','ExpectedArtifactSha256','ExpectedRuntimeIdentityJson')) {
+    if ($PSBoundParameters.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace([string]$PSBoundParameters[$name])) {
+        $bootstrapIdentityArguments[$name] = $PSBoundParameters[$name]
+    }
+}
 $performanceGuardInitialized = $false
 $expectedPerformanceApplicable = $false
 $expectedPerformanceEpoch = $null
@@ -254,6 +265,7 @@ function Invoke-ProfilerAction([string]$Action, [switch]$ForRestore) {
         TimeoutSeconds = $remainingSeconds; RequireSuccess = $true; RequirePerformanceNeutral = (-not $ForRestore)
         NoExit = $true; Compact = $true
     }
+    foreach ($name in $bootstrapIdentityArguments.Keys) { $controlArguments[$name] = $bootstrapIdentityArguments[$name] }
     if ($null -ne $script:expectedRuntimeIdentity) {
         $controlArguments.ExpectedRuntimeIdentityJson = ($script:expectedRuntimeIdentity | ConvertTo-Json -Depth 20 -Compress)
     }
@@ -285,12 +297,17 @@ function Invoke-ProfilerAction([string]$Action, [switch]$ForRestore) {
 
 function Get-ResourcePublicationSnapshot([Parameter(Mandatory)][string]$Phase) {
     $remainingSeconds = Get-RemainingProfilerSeconds
+    $identityArguments = @{};foreach ($name in $bootstrapIdentityArguments.Keys) { $identityArguments[$name] = $bootstrapIdentityArguments[$name] }
+    $identityArguments.ExpectedRuntimeIdentityJson = ($script:expectedRuntimeIdentity | ConvertTo-Json -Depth 20 -Compress)
     $call = & $control call -Tool 'communityshaders.renderscale' `
         -ArgumentsJson '{"action":"status"}' -RuntimePath $RuntimePath `
         -EvidenceDirectory $runDirectory -EvidenceLabel "renderscale-$Phase" `
         -TimeoutSeconds $remainingSeconds -RequireSuccess `
-        -RequirePerformanceNeutral -NoExit -Compact | ConvertFrom-Json -Depth 80
+        -RequirePerformanceNeutral -NoExit -Compact @identityArguments | ConvertFrom-Json -Depth 80
     $callCleanup = if ($call.PSObject.Properties['sessionCleanup']) { $call.sessionCleanup } else { $null }
+    if (-not $call.ok -and -not (Test-OptionalRenderScaleUnavailable $call)) {
+        throw "DevBench render-scale '$Phase' guard or status call failed: $($call.errors -join '; ')"
+    }
     Assert-CapturePerformanceObservation -Call $call -Action "renderscale-$Phase" -SessionCleanup $callCleanup
     $stableIdentity = Get-StableRuntimeIdentity -Identity $call.runtimeIdentity
     $identityFingerprint = Get-CanonicalHash $stableIdentity
@@ -524,7 +541,7 @@ finally {
     }
     $receipt.restoreErrors = @($restoreErrors)
     $receipt.evidenceErrors = @($evidenceErrors)
-    $receipt.state = if ($restoreErrors.Count -gt 0) { 'recovery-required' } elseif ($captureFailure) { 'rolled-back' } else { 'completed' }
+    $receipt.state = if ($restoreErrors.Count -gt 0) { 'recovery-required' } elseif ($captureFailure -and $null -eq $receipt.priorEnabled) { 'admission-failed' } elseif ($captureFailure) { 'rolled-back' } else { 'completed' }
     if ($transactionJournal) {
         $transactionJournal.phase = [string]$receipt.state
         $transactionJournal.completedUtc = [DateTime]::UtcNow.ToString('o')
@@ -548,8 +565,12 @@ finally {
 }
 
 if ($receipt.restoreErrors.Count -gt 0) { throw "Profiler capture requires state recovery: $($receipt.restoreErrors -join '; '). Receipt: $receiptPath" }
-if ($evidenceErrors.Count -gt 0) { throw "Profiler capture evidence is incomplete after state restoration: $($evidenceErrors -join '; '). Receipt: $receiptPath" }
-if ($captureFailure) { throw "$captureFailure Profiler state was restored. Receipt: $receiptPath" }
+$restorationSummary = if ($receipt.stateRestored) { 'Profiler state was restored and verified.' } else { 'Prior profiler state or restoration is unverified; no restoration success is claimed.' }
+if ($evidenceErrors.Count -gt 0) {
+    $evidenceState=if($receipt.stateRestored){'after state restoration'}else{'with unverified restoration'}
+    throw "Profiler capture evidence is incomplete $evidenceState. $restorationSummary $($evidenceErrors -join '; '). Receipt: $receiptPath"
+}
+if ($captureFailure) { throw "$captureFailure $restorationSummary Receipt: $receiptPath" }
 if ($records.Count -ne $Samples -or @($records.frame | Sort-Object -Unique).Count -ne $Samples) { throw 'Profiler capture did not produce the requested number of unique fresh frames.' }
 
 $endedUtc = [DateTime]::UtcNow
