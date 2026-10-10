@@ -1,5 +1,27 @@
 # DevBench Control
 
+## Bounded original HTTP refusal evidence
+
+The source controller retains `httpFailureEvidence` in invocation journals and
+terminal results before classifying/rethrowing failed MCP/REST requests, including
+initialize and initialized notification refusals. It uses the already-buffered
+PowerShell `ErrorDetails.Message` and response metadata, never another request or
+stream read. Bytes/hashes are UTF-8 re-encoding of that message, not a claim about
+physical HTTP wire bytes. Body encoding/hash work is capped at65536 characters;
+above that cap full byte count/hash/privacy remain unknown and body is withheld.
+Below it, at most16384 bytes are retained, with complete-source and retained-prefix
+hashes and explicit omission reason. Potential credential markers withhold body
+bytes/text; headers are limited to bounded nonsecret Content-Type/Content-Length,
+Retry-After and MCP-Protocol-Version. No cookie/auth/session headers or URI query.
+
+At most8 records survive: first7 plus latest when overflow occurs, with original
+observation ordinals/count/omitted-record count. Failed evidence capture is marked
+as omitted and does not replace the primary refusal. This diagnostic evidence
+does not establish request acceptance, runtime identity, session-capacity cause,
+mutation non-execution or semantic success. Retry/fallback/deadline/failed-first
+and original owned session cleanup rules are unchanged. Do not delete unknown
+sessions or replay an operation merely to acquire its error body.
+
 ## Bounded scene-light reads
 
 Explicit `inspect {kind:lights,scope:scene,limit:<integer 1..64>}` admits only

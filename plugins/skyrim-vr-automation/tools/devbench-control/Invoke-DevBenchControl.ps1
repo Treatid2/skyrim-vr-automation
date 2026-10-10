@@ -75,6 +75,7 @@ $transport = 'unknown'
 $headers = $null
 $runtimeIdentity = $null
 $transportRetries = [Collections.Generic.List[object]]::new()
+$httpFailureEvidence = [ordered]@{ observedCount = 0; maxRetained = 8; records = [Collections.Generic.List[object]]::new() }
 $ownedMcpSessions = [Collections.Generic.List[object]]::new()
 $mcpSessionInvalidationCount = 0
 $mcpCapabilityPreviouslyProven = $false
@@ -225,6 +226,99 @@ function Get-InvocationEvidenceDirectory {
     return [IO.Path]::GetFullPath((Join-Path $localRoot 'SkyrimVRAutomation\evidence\devbench-control'))
 }
 
+function Get-HttpFailureEvidenceSnapshot {
+    # First seven and latest refusal survive overflow. No response is reread.
+    if (-not (Get-Variable -Name httpFailureEvidence -Scope Script -ErrorAction SilentlyContinue)) { return $null }
+    return [pscustomobject][ordered]@{
+        schemaVersion = 1; observedCount = $script:httpFailureEvidence.observedCount
+        maxRetained = $script:httpFailureEvidence.maxRetained
+        omittedRecords = [Math]::Max(0, $script:httpFailureEvidence.observedCount - $script:httpFailureEvidence.records.Count)
+        retention = 'first-seven-and-latest-on-overflow'
+        records = @($script:httpFailureEvidence.records)
+    }
+}
+
+function Retain-HttpFailureEvidence {
+    param([Parameter(Mandatory)][Management.Automation.ErrorRecord]$Failure, [string]$Uri, [string]$Method)
+    # Diagnostic only: consume already-buffered ErrorDetails/response metadata,
+    # never read a stream, send a request, or change the primary failure.
+    $status = $null
+    try { $status = [int]$Failure.Exception.Response.StatusCode } catch { return }
+    try {
+        $secret = '(?i)authorization|bearer\s|password|access[_-]?token|refresh[_-]?token|client[_-]?secret|cookie|session[_-]?id'
+        $response = $Failure.Exception.Response
+        $reason = $null
+        if ($response.PSObject.Properties['ReasonPhrase']) {
+            $candidate = [string]$response.ReasonPhrase
+            if ($candidate.Length -le 128 -and $candidate -notmatch $secret) { $reason = $candidate }
+        }
+        $usefulHeaders = [ordered]@{}
+        foreach ($name in @('Content-Type','Content-Length','Retry-After','MCP-Protocol-Version')) {
+            $values = $null
+            foreach ($collection in @($response.Headers, $(if ($response.PSObject.Properties['Content']) { $response.Content.Headers }))) {
+                if ($null -eq $collection) { continue }
+                if ($collection -is [Collections.IDictionary]) { $values = $collection[$name] }
+                elseif ($collection.PSObject.Methods['TryGetValues']) {
+                    $found = $null
+                    if ($collection.TryGetValues($name,[ref]$found)) { $values = $found }
+                }
+                if ($null -ne $values) { break }
+            }
+            if ($null -ne $values) {
+                $text = @($values) -join ', '
+                if ([Text.Encoding]::UTF8.GetByteCount($text) -le 512 -and $text -notmatch $secret) { $usefulHeaders[$name] = $text }
+            }
+        }
+        $source = if ($null -ne $Failure.ErrorDetails) { [string]$Failure.ErrorDetails.Message } else { $null }
+        $bytes = $null; $hash = $null; $retained = $null; $bodyText = $null
+        $sourceBytes = $null; $sourceCapped = $false; $omission = 'error-details-unavailable'
+        if ($null -ne $source) {
+            # Bound encoding/hashing work as well as published payload size.
+            $sourceCapped = $source.Length -gt 65536
+            $bounded = if ($sourceCapped) { $source.Substring(0,65536) } else { $source }
+            $bytes = [Text.UTF8Encoding]::new($false).GetBytes($bounded)
+            if (-not $sourceCapped) {
+                $sourceBytes = $bytes.Length
+                $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+            }
+            if ($sourceCapped) { $omission = 'source-character-cap-privacy-unverified' }
+            elseif ($bounded -match $secret) { $omission = 'potential-secret-body-withheld' }
+            else {
+                $length = [Math]::Min(16384,$bytes.Length)
+                $retained = [byte[]]::new($length); [Array]::Copy($bytes,$retained,$length)
+                $omission = if ($length -lt $bytes.Length) { 'body-byte-cap' } else { $null }
+                if ($null -eq $omission) { $bodyText = $bounded }
+            }
+        }
+        $parsed = [Uri]$Uri
+        $record = [pscustomobject][ordered]@{
+            schemaVersion = 1; capturedUtc = [DateTime]::UtcNow.ToString('o'); method = $Method
+            endpoint = ('{0}://{1}:{2}{3}' -f $parsed.Scheme,$parsed.Host,$parsed.Port,$parsed.AbsolutePath); statusCode = $status; reasonPhrase = $reason
+            headers = $usefulHeaders; headerPolicy = 'four-nonsecret-allowlisted-headers-only; no session/auth/cookie headers'
+            bodySource = 'already-buffered-PowerShell-ErrorDetails.Message-UTF8-reencoding-not-physical-HTTP-bytes'
+            sourceCharacters = if ($null -ne $source) { $source.Length } else { $null }
+            sourceBytes = $sourceBytes; sourceSha256 = $hash; sourceCharacterCap = 65536; retainedByteCap = 16384
+            retainedBytes = if ($null -ne $retained) { $retained.Length } else { 0 }
+            retainedSha256 = if ($null -ne $retained) { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($retained)) } else { $null }
+            bodyText = $bodyText; bodyBase64 = if ($null -ne $retained) { [Convert]::ToBase64String($retained) } else { $null }
+            omitted = $null -ne $omission; omissionReason = $omission; extraRequest = $false
+        }
+    }
+    catch {
+        $record = [pscustomobject][ordered]@{schemaVersion=1;capturedUtc=[DateTime]::UtcNow.ToString('o');statusCode=$status;omitted=$true;omissionReason='metadata-capture-failed';extraRequest=$false}
+    }
+    # AST fixtures may load this function without the public entry's initializer.
+    if (-not (Get-Variable -Name httpFailureEvidence -Scope Script -ErrorAction SilentlyContinue)) {
+        $script:httpFailureEvidence = [ordered]@{ observedCount = 0; maxRetained = 8; records = [Collections.Generic.List[object]]::new() }
+    }
+    $script:httpFailureEvidence.observedCount++
+    $record | Add-Member -NotePropertyName observation -NotePropertyValue $script:httpFailureEvidence.observedCount
+    if ($script:httpFailureEvidence.records.Count -lt 8) { $script:httpFailureEvidence.records.Add($record) }
+    else { $script:httpFailureEvidence.records[7] = $record }
+    $Failure.Exception.Data['DevBenchHttpFailureEvidence'] = $record
+    if ((Get-Variable -Name invocationRecord -Scope Script -ErrorAction SilentlyContinue) -and $null -ne $script:invocationRecord) { $script:invocationRecord['httpFailureEvidence'] = Get-HttpFailureEvidenceSnapshot }
+}
+
 function Initialize-InvocationEvidence {
     $resolved = Get-InvocationEvidenceDirectory
     New-Item -ItemType Directory -Path $resolved -Force | Out-Null
@@ -260,6 +354,7 @@ function Initialize-InvocationEvidence {
         completedUtc = $null
         runtimeIdentity = $runtimeIdentity
         transportRetries = @()
+        httpFailureEvidence = Get-HttpFailureEvidenceSnapshot
         semantic = $null
         data = $null
         errors = @()
@@ -279,6 +374,7 @@ function Update-InvocationEvidence {
     $script:invocationRecord.serverTimeoutMilliseconds = $serverTimeoutMilliseconds
     $script:invocationRecord.serverTimeoutDispatchRemainingSeconds = $serverTimeoutDispatchRemainingSeconds
     $script:invocationRecord.transportRetries = @($transportRetries)
+    $script:invocationRecord.httpFailureEvidence = Get-HttpFailureEvidenceSnapshot
     $script:invocationRecord.semantic = $Semantic
     $script:invocationRecord.data = $Data
     $script:invocationRecord.errors = @($Errors)
@@ -541,6 +637,7 @@ function Invoke-McpRequest {
             return [pscustomobject]@{ response = $response; json = $json; attempts = $attempt }
         }
         catch {
+            Retain-HttpFailureEvidence -Failure $_ -Uri $Endpoint -Method Post
             $statusCode = $null
             try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = $null }
             $operationDeadlineExpired = $_.Exception.Message -eq 'The DevBench operation deadline expired before another request could start.'
@@ -636,6 +733,7 @@ function Invoke-RestRequest {
             return [pscustomobject]@{ response = $response; json = $json; attempts = $attempt }
         }
         catch {
+            Retain-HttpFailureEvidence -Failure $_ -Uri $Uri -Method $Method
             $statusCode = $null
             try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = $null }
             $transient = $statusCode -in @(408, 429, 500, 502, 503, 504) -or
@@ -1001,6 +1099,7 @@ function Open-McpSession($Runtime, [switch]$AllowDeferredBuildIdentity, [switch]
     }
     catch {
         $discoveryFailure = $_
+        if ($discoveryPhase -ceq 'initialized') { Retain-HttpFailureEvidence -Failure $_ -Uri $endpoint -Method Post }
         $statusCode = $null
         try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = $null }
         $returnedSessionId = [string]$_.Exception.Data['DevBenchMcpSessionId']
@@ -2316,6 +2415,7 @@ catch {
 $sessionCloseDeadline = if ($finalizationReserveMilliseconds -gt 0) { $totalInvocationDeadlineUtc.AddMilliseconds(-1000) } else { $script:operationDeadlineUtc }
 $sessionCleanup = Close-AllMcpSessions -DeadlineUtc $sessionCloseDeadline
 $result | Add-Member -NotePropertyName sessionCleanup -NotePropertyValue $sessionCleanup
+$result | Add-Member -NotePropertyName httpFailureEvidence -NotePropertyValue (Get-HttpFailureEvidenceSnapshot)
 if ($finalizationReserveMilliseconds -gt 0) {
     $result | Add-Member -NotePropertyName finalization -NotePropertyValue ([pscustomobject][ordered]@{
         originalDeadlineUtc = $totalInvocationDeadlineUtc.ToString('o')

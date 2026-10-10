@@ -7,7 +7,7 @@ $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot
 if($errors.Count){throw 'Controller parse failed'}
 Import-Module (Join-Path $PSScriptRoot 'DevBenchControl.psm1') -Force
 $nodes=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst]},$true))
-foreach($name in @('Invoke-McpRequest','Invoke-RestRequest','Invoke-ToolRpc','Test-CaptureBracketRpcRequest')){
+foreach($name in @('Get-HttpFailureEvidenceSnapshot','Retain-HttpFailureEvidence','Invoke-McpRequest','Invoke-RestRequest','Invoke-ToolRpc','Test-CaptureBracketRpcRequest')){
     $node=@($nodes|Where-Object Name -CEQ $name)
     if($node.Count){Invoke-Expression $node[0].Extent.Text}
 }
