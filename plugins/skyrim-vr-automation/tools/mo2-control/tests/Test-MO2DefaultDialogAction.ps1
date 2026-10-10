@@ -90,7 +90,8 @@ function Stop-Process {throw 'Physical process termination forbidden'}
   Check ($evidence.actions -eq 1 -and $evidence.authorityChecks -eq 1) "$case exactly one revalidated simulated action"
   Check ($cleanup.actions.Count -eq 1 -and $cleanup.actions[0].accepted -and $cleanup.actions[0].processId -eq 700001) "$case exact action receipt"
  }else{
-  Check (-not $result.ok -and $result.state -ceq 'game-stopped-needs-attention' -and -not $cleanup.cleared) "$case preserves structured refusal"
+  Check (-not $result.ok -and $result.state -ceq 'game-stopped-needs-attention' -and ($case -ceq 'unknown-modal' -or -not $cleanup.cleared)) "$case preserves structured refusal"
+  if($case -ceq 'unknown-modal'){Check ($cleanup.needsAttention.Count -eq 1) 'Unknown modal remains attended and untouched, even when no known failed-to-run dialog remains'}
   if($case -ceq 'remaining-dialog'){Check ($evidence.actions -gt 0 -and $cleanup.remainingKnown.Count -eq 1) 'Accepted action is not cleared-dialog proof'}else{Check ($evidence.actions -eq 0) "$case zero action before authority/identity/UI refusal"}
   if($case -ceq 'stale-generation'){Check ($cleanup.blockedReason -ceq 'stale-session-generation') 'Stale generation classification preserved'}
  }
