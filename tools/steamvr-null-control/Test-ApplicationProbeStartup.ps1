@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Full public apply/start transactions. Only process, log, package and shared-state
 # boundaries are synthetic; native executables and live runtime are never called.
+[CmdletBinding()]
+param([string]$FixtureRoot = [IO.Path]::GetTempPath())
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$fixture = Join-Path ([IO.Path]::GetTempPath()) ('application-probe-startup-' + [guid]::NewGuid().ToString('N'))
-$temporary = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+$fixture = Join-Path $FixtureRoot ('application-probe-startup-' + [guid]::NewGuid().ToString('N'))
+$temporary = [IO.Path]::GetFullPath($FixtureRoot).TrimEnd('\') + '\'
 $priorTransactionRoot = $env:CSX_STEAMVR_TRANSACTION_ROOT
 $passed = 0
 $caseResults = @()
@@ -13,7 +15,7 @@ function Assert-Startup([bool]$Condition, [string]$Message) {
     $script:passed++
 }
 try {
-    if (-not ([IO.Path]::GetFullPath($fixture)).StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase)) { throw 'Fixture escaped OS temporary storage.' }
+    if (-not ([IO.Path]::GetFullPath($fixture)).StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase)) { throw 'Fixture escaped its explicit storage boundary.' }
     $nullRoot = Join-Path $fixture 'tools/steamvr-null-control'
     $processRoot = Join-Path $fixture 'tools/process-control'
     $authorityRoot = Join-Path $fixture 'tools/steamvr-head-pose-control'
@@ -136,6 +138,7 @@ $ok=$true;$code=0;$timedOut=$false;$errors=@();$drained=$true;$stderr='first nat
 # Every first-failure case would succeed on a second call. This is intentional:
 # a faulty outer retry must make the public test fail by accepting the attempt.
 if($count -eq 1){
+    if($case.StartsWith('cleanup-')){$payload.standing.valid=$false;$stdout=$payload|ConvertTo-Json -Depth 8 -Compress}
     switch($case){
         'empty' {$stdout=''}
         'undrained' {$ok=$false;$drained=$false;$stdout=$null;$stderr=$null;$errors=@('synthetic stream drain incomplete')}
@@ -192,8 +195,15 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
         [pscustomobject]@{Id=12345;interactiveLaunch=@{normalUserAccessVerified=$true;method='synthetic-fixture'}}
     }
     function Stop-Process {
-        [CmdletBinding()]param([int]$Id,[switch]$Force)
+        [CmdletBinding()]param([int]$Id,$InputObject,[switch]$Force)
+        if($null -ne $InputObject){$Id=$InputObject.Id}
         if($Id -ne 12345 -or -not $Force){throw 'Unexpected fixture stop target.'}
+        if($script:cleanupCase -ceq 'cleanup-denied'){throw [ComponentModel.Win32Exception]::new(5)}
+        if($script:cleanupCase -in @('cleanup-self-exit','cleanup-pid-reused-after-stop')){
+            $InputObject.HasExited=$true
+            [IO.File]::WriteAllText((Join-Path $SteamVRRoot 'launch.json'),'{"live":false}')
+            throw [InvalidOperationException]::new('Synthetic process exited before Stop-Process.')
+        }
         [IO.File]::AppendAllText((Join-Path $SteamVRRoot 'stopped.txt'),"$Id`n")
         [IO.File]::WriteAllText((Join-Path $SteamVRRoot 'launch.json'),'{"live":false}')
     }
@@ -201,10 +211,23 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
         [CmdletBinding()]param([int]$Id)
         if($Id -ne 12345){throw 'Unexpected fixture process query.'}
         $s=Get-Content -LiteralPath (Join-Path $SteamVRRoot 'launch.json') -Raw|ConvertFrom-Json
-        if($s.live){[pscustomobject]@{Id=12345}}
+        if($script:cleanupCase -ceq 'cleanup-inspect-unavailable'){throw [ComponentModel.Win32Exception]::new(5)}
+        if($script:cleanupCase -ceq 'cleanup-already-exited' -and $s.live){
+            [IO.File]::WriteAllText((Join-Path $script:currentSteamRoot 'launch.json'),'{"live":false}')
+            return
+        }
+        if($s.live -or $script:cleanupCase -ceq 'cleanup-pid-reused-after-stop'){
+            $path=Join-Path $script:currentSteamRoot 'bin/win64/vrserver.exe'
+            $start=if($s.live){([DateTimeOffset]$s.startedUtc).UtcDateTime}else{[DateTime]::UtcNow.AddMinutes(1)}
+            if($script:cleanupCase -ceq 'cleanup-pid-drift'){$start=$start.AddMinutes(1)}
+            $p=[pscustomobject]@{Id=12345;Path=$path;StartTime=$start;Handle=1;HasExited=$false}
+            $p|Add-Member ScriptMethod Dispose {}
+            return $p
+        }
     }
     $kinds=@{empty='empty-output';undrained='stream-drain-incomplete';malformed='malformed-output';'package-drift'='provider-package-drift';continuity='continuity-failed';exit='bounded-process-failure';timeout='timeout';unqualified='observation-unqualified';'confirmation-malformed'='malformed-output'}
-    foreach ($case in @('empty','undrained','malformed','package-drift','continuity','exit','timeout','unqualified','confirmation-malformed','success','delayed-provider','insufficient-budget','log-budget','log-replacement','log-truncation','log-mutation','log-rotation-success','log-rotation-missing','log-rotation-identity','log-rotation-length','log-rotation-guard','log-rotation-pid','log-rotation-config','log-rotation-time','log-rotation-later')) {
+    foreach ($case in @('empty','undrained','malformed','package-drift','continuity','exit','timeout','unqualified','confirmation-malformed','success','delayed-provider','insufficient-budget','log-budget','log-replacement','log-truncation','log-mutation','log-rotation-success','log-rotation-missing','log-rotation-identity','log-rotation-length','log-rotation-guard','log-rotation-pid','log-rotation-config','log-rotation-time','log-rotation-later','cleanup-self-exit','cleanup-already-exited','cleanup-denied','cleanup-pid-drift','cleanup-inspect-unavailable','cleanup-pid-reused-after-stop')) {
+        $script:cleanupCase=$case
         $caseRoot=Join-Path $fixture $case
         $script:currentSteamRoot=Join-Path $caseRoot 'SteamVR'
         $provider=Join-Path $caseRoot 'provider'
@@ -232,7 +255,19 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
         $receipt=Get-Content -LiteralPath $result.data.runtimeReceiptPath -Raw|ConvertFrom-Json -Depth 80
         $countPath=Join-Path $provider 'dispatch-count.txt'
         $count=if(Test-Path -LiteralPath $countPath){@(Get-Content -LiteralPath $countPath).Count}else{0}
-        if($case -ceq 'log-rotation-success'){
+        if($case.StartsWith('cleanup-')){
+            Assert-Startup (-not $result.ok -and -not $receipt.runtimeAccepted -and $count -eq 1 -and -not $receipt.runtimeConfirmationAttempted) "$case failed-first native observation remains terminal"
+            $cleanup=$result.data.startupCleanup
+            if($case -ceq 'cleanup-already-exited'){
+                Assert-Startup ($cleanup.verified -and @($cleanup.remaining).Count -eq 0 -and @($cleanup.errors).Count -eq 0 -and $cleanup.outcomes[0].state -ceq 'already-exited-before-dispatch' -and $cleanup.outcomes[0].freshAbsent -and -not $cleanup.outcomes[0].stopDispatched) 'pre-dispatch self-exit has two absence observations and no stop'
+            }elseif($case -ceq 'cleanup-self-exit'){
+                Assert-Startup ($cleanup.verified -and @($cleanup.remaining).Count -eq 0 -and @($cleanup.errors).Count -eq 0 -and $cleanup.outcomes[0].state -ceq 'self-exited-before-stop' -and $cleanup.outcomes[0].identityVerified -and $cleanup.outcomes[0].freshAbsent -and $cleanup.outcomes[0].error -like '*exited before*') 'exact self-exit classified with identity/closed postcondition and original error retained'
+            }else{
+                Assert-Startup (-not $cleanup.verified -and @($cleanup.remaining).Count -eq 1 -and @($cleanup.errors).Count -gt 0 -and $cleanup.outcomes[0].state -ceq 'cleanup-error') "$case remains unverified with survivors/unknowns and error"
+                Assert-Startup (-not (Test-Path -LiteralPath (Join-Path $script:currentSteamRoot 'stopped.txt'))) "$case no replacement/denied process falsely stopped"
+            }
+            Assert-Startup (($receipt.startupCleanup|ConvertTo-Json -Depth 20 -Compress) -ceq ($cleanup|ConvertTo-Json -Depth 20 -Compress)) "$case exact cleanup disposition persisted"
+        }elseif($case -ceq 'log-rotation-success'){
             Assert-Startup ($result.ok -and $receipt.runtimeAccepted -and $result.data.runtime.headPoseReady -and $result.data.runtime.controllersReady) 'real rotated reader reaches unchanged production qualification with synthetic native result only'
             Assert-Startup ($count -eq 2 -and $receipt.runtimeConfirmationAttempted -and $receipt.runtime.startupLogProof.retained -and $receipt.runtime.startupLogProof.startupRotation.startupRecordVerified) 'rotated confirmation retains exact range/transition and normal bounded probe contract'
             Assert-Startup ($receipt.runtime.startupLogProof.offset -eq 0 -and $receipt.startupLogAnchor.offset -gt 262144 -and $receipt.runtime.startupLogProof.bytesRead -eq 0) 'public rotated proof avoids history and never resets original anchor'

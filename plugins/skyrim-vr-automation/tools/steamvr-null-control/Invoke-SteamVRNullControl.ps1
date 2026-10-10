@@ -993,17 +993,70 @@ function Assert-SteamVRJournalTargets {
     }
 }
 
+function Get-NullCleanupProcess([int]$ProcessId) {
+    try { return Get-Process -Id $ProcessId -ErrorAction Stop }
+    catch {
+        if ($_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::ObjectNotFound -and
+            $_.FullyQualifiedErrorId -like 'NoProcessFoundForGivenId*') { return $null }
+        throw
+    }
+}
+
+function Test-NullCleanupProcessAbsent([int]$ProcessId) {
+    $current = Get-NullCleanupProcess $ProcessId
+    try { return $null -eq $current } finally { if ($null -ne $current) { $current.Dispose() } }
+}
+
 function Stop-ExactStartedSteamVRProcesses([DateTime]$StartedUtc) {
+    $ownedRoot = $resolvedSteamVRRoot.TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
     $targets = @(Get-SteamVRProcesses | Where-Object {
         -not [string]::IsNullOrWhiteSpace([string]$_.path) -and
-        [IO.Path]::GetFullPath([string]$_.path).StartsWith($resolvedSteamVRRoot, [StringComparison]::OrdinalIgnoreCase) -and
+        [IO.Path]::GetFullPath([string]$_.path).StartsWith($ownedRoot, [StringComparison]::OrdinalIgnoreCase) -and
         -not [string]::IsNullOrWhiteSpace([string]$_.startTimeUtc) -and [DateTime]::Parse([string]$_.startTimeUtc).ToUniversalTime() -ge $StartedUtc.AddSeconds(-1)
     })
     $errors = @()
-    foreach ($target in $targets) { try { Stop-Process -Id ([int]$target.id) -Force -ErrorAction Stop } catch { $errors += "$($target.name)[$($target.id)]: $($_.Exception.Message)" } }
+    $outcomes = @()
+    foreach ($target in $targets) {
+        $process = $null; $identityVerified = $false
+        try {
+            $process = Get-NullCleanupProcess ([int]$target.id)
+            if ($null -eq $process) {
+                if (-not (Test-NullCleanupProcessAbsent ([int]$target.id))) { throw 'Cleanup PID appeared after absence observation; identity is unknown.' }
+                $outcomes += @{id=$target.id;state='already-exited-before-dispatch';freshAbsent=$true;stopDispatched=$false;error=$null}
+                continue
+            }
+            # Pin this process object/handle before verifying identity or dispatch.
+            # Never resolve its PID again as a new kill target.
+            $null = $process.Handle
+            if (-not [string]::Equals([IO.Path]::GetFullPath($process.Path), [IO.Path]::GetFullPath([string]$target.path), [StringComparison]::OrdinalIgnoreCase) -or
+                $process.StartTime.ToUniversalTime() -ne [DateTime]::Parse([string]$target.startTimeUtc).ToUniversalTime()) {
+                throw 'Cleanup process identity drift; refusing a replacement PID.'
+            }
+            $identityVerified = $true
+            Stop-Process -InputObject $process -Force -ErrorAction Stop
+            $outcomes += @{id=$target.id;state='stop-dispatched';identityVerified=$true;stopDispatched=$true;error=$null}
+        } catch {
+            $failure = $_; $selfExited = $false
+            # Only a structured missing-process/invalid-operation race can be
+            # reconciled. Denial, unknown identity and all other errors remain.
+            $missing = $failure.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::ObjectNotFound -and $failure.FullyQualifiedErrorId -like 'NoProcessFoundForGivenId*'
+            $exitRace = $missing -or $failure.Exception -is [InvalidOperationException]
+            if ($identityVerified -and $exitRace -and $null -ne $process) {
+                try { $selfExited = $process.HasExited -and (Test-NullCleanupProcessAbsent ([int]$target.id)) }
+                catch { $selfExited = $false }
+            }
+            $text = "$($target.name)[$($target.id)]: $($failure.Exception.Message)"
+            if (-not $selfExited) { $errors += $text }
+            $outcomes += @{id=$target.id;state=$(if($selfExited){'self-exited-before-stop'}else{'cleanup-error'});identityVerified=$identityVerified;freshAbsent=$selfExited;error=$text}
+        } finally { if ($null -ne $process) { $process.Dispose() } }
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
-        $remaining = @($targets | Where-Object { Get-Process -Id ([int]$_.id) -ErrorAction SilentlyContinue })
+        $remaining = @($targets | Where-Object {
+            $candidate = $_
+            try { -not (Test-NullCleanupProcessAbsent ([int]$_.id)) }
+            catch { $errors += "Cleanup survivor inspection failed for PID $($candidate.id): $($_.Exception.Message)"; $true }
+        })
         if ($remaining.Count -gt 0) { Start-Sleep -Milliseconds 100 }
     } while ($remaining.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
     if ($InternalTestFailurePoint -in @('runtime-early-post-launch-cleanup-crosses-deadline', 'runtime-early-post-launch-cleanup-crosses-deadline-failure')) {
@@ -1017,7 +1070,7 @@ function Stop-ExactStartedSteamVRProcesses([DateTime]$StartedUtc) {
         $errors += 'Injected incomplete exact-attempt cleanup verification.'
         $verified = $false
     }
-    return [pscustomobject][ordered]@{ requested = $targets; remaining = $remaining; errors = $errors; verified = $verified }
+    return [pscustomobject][ordered]@{ requested = $targets; remaining = $remaining; errors = $errors; verified = $verified; outcomes = $outcomes }
 }
 
 function Assert-ControllerPowerProfile {
