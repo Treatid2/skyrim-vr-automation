@@ -163,7 +163,7 @@ $module = Get-Module NativeInstallPlan
 }
 try {
     foreach ($selected in @($planPath,$receiptPath,$dll)) {
-        foreach ($mode in @('remote','unknown','subst','unknown-device','api-failure','opened-drift')) {
+        foreach ($mode in @('remote','unknown','subst','unknown-device','api-failure','opened-drift','after-read-drift')) {
             & $module { param($path,$mode)
                 $script:fixtureNamespacePath=$path; $script:fixtureNamespaceMode=$mode; $script:fixtureNamespaceCalls=0
                 function script:Get-NativePlanNamespaceData([string]$Path) {
@@ -176,6 +176,7 @@ try {
                         unknown-device { return @{driveType=3;device='\Device\UnknownLocal'} }
                         api-failure { throw 'Namespace API unavailable (synthetic).' }
                         opened-drift { if ($script:fixtureNamespaceCalls -ge 2) { return @{driveType=3;device='\Device\HarddiskVolume999999'} } }
+                        after-read-drift { if ($script:fixtureNamespaceCalls -ge 3) { return @{driveType=3;device='\Device\HarddiskVolume999999'} } }
                     }
                     return & $script:originalNamespace $Path
                 }
