@@ -1052,11 +1052,13 @@ function Stop-ExactStartedSteamVRProcesses([DateTime]$StartedUtc) {
     }
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
+        $inspectionFailed = $false
         $remaining = @($targets | Where-Object {
             $candidate = $_
             try { -not (Test-NullCleanupProcessAbsent ([int]$_.id)) }
-            catch { $errors += "Cleanup survivor inspection failed for PID $($candidate.id): $($_.Exception.Message)"; $true }
+            catch { $inspectionFailed = $true; $errors += "Cleanup survivor inspection failed for PID $($candidate.id): $($_.Exception.Message)"; $true }
         })
+        if ($inspectionFailed) { break }
         if ($remaining.Count -gt 0) { Start-Sleep -Milliseconds 100 }
     } while ($remaining.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
     if ($InternalTestFailurePoint -in @('runtime-early-post-launch-cleanup-crosses-deadline', 'runtime-early-post-launch-cleanup-crosses-deadline-failure')) {
