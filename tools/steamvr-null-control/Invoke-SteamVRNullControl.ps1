@@ -20,6 +20,10 @@ param(
 
     [string]$HeadPoseExpectedProvenanceSha256,
 
+    # Opt-in stderr breadcrumbs from a matching new native probe; not readiness.
+    [switch]$ProbeDiagnosticPhases,
+    [switch]$ProbeDiagnosticFailedRoles,
+
     [string]$EvidenceDirectory,
 
     [string]$MO2AccessId,
@@ -1232,7 +1236,9 @@ function Get-ApplicationHeadPose {
         [Parameter(Mandatory)]$Contract,
         [Parameter(Mandatory)]$PreProbePose,
         [Parameter(Mandatory)]$PreProbePackageAuthority,
-        [DateTime]$DeadlineUtc = [DateTime]::MaxValue
+        [DateTime]$DeadlineUtc = [DateTime]::MaxValue,
+        [switch]$DiagnosticPhases,
+        [switch]$DiagnosticFailedRoles
     )
     if ([string]::IsNullOrWhiteSpace($HeadPoseDriverRoot)) {
         return [pscustomobject][ordered]@{ available = $false; qualified = $false; probeAttempted = $false; terminalFailure = $true; failureKind = 'provider-package-unavailable'; timedOut = $false; boundedProcess = $null; error = 'The stable head-pose driver root could not be resolved.' }
@@ -1251,6 +1257,7 @@ function Get-ApplicationHeadPose {
     $afterAuthority = $null
     $afterPose = $null
     $continuityAfter = $null
+    $probeBudget = $null
     try {
         $packageAuthority = Get-NullProviderAuthority -DeadlineUtc $DeadlineUtc
         if (-not $packageAuthority.verified) { throw "Provider package refused before probe execution: $($packageAuthority.errors -join '; ')" }
@@ -1266,15 +1273,28 @@ function Get-ApplicationHeadPose {
         $probeTimeoutSeconds = 10
         if ($DeadlineUtc -ne [DateTime]::MaxValue) {
             $remainingMilliseconds = [long]($DeadlineUtc - [DateTime]::UtcNow).TotalMilliseconds
-            if ($remainingMilliseconds -lt 1450) {
-                $failureKind = 'insufficient-budget'
-                throw [TimeoutException]::new('SteamVR readiness deadline leaves insufficient time for the application-facing pose probe and bounded cleanup.')
+            # Never truncate the independent experiment to fit late readiness.
+            # This deadline already excludes the startup's final log reserve.
+            $probeBudget = [pscustomobject][ordered]@{
+                deadlineUtc = $DeadlineUtc.ToString('o')
+                remainingMilliseconds = $remainingMilliseconds
+                probeTimeoutMilliseconds = 10000
+                processCleanupReserveMilliseconds = 450
+                postProbeVerificationReserveMilliseconds = 1000
+                requiredMilliseconds = 11450
+                admitted = $remainingMilliseconds -ge 11450
             }
-            $probeTimeoutSeconds = [Math]::Max(1, [Math]::Min(10, [Math]::Floor(($remainingMilliseconds - 450) / 1000)))
+            if (-not $probeBudget.admitted) {
+                $failureKind = 'insufficient-probe-budget'
+                throw [TimeoutException]::new("Application probe refused before dispatch: $remainingMilliseconds ms remain before the qualification deadline; 11450 ms are required for the full 10-second probe, bounded process cleanup and post-probe verification.")
+            }
         }
         $failureKind = 'bounded-process-failure'
         $probeAttempted = $true
-        $bounded = & $boundedTool -FilePath $probePath -ArgumentList @('--require-controllers') -WorkingDirectory (Split-Path -Parent $probePath) -MaxAttempts 1 -TimeoutSeconds $probeTimeoutSeconds -TerminationGraceMilliseconds 100 -StreamDrainGraceMilliseconds 100 -NoExit -Compact | ConvertFrom-Json -Depth 30
+        $probeArguments = @('--require-controllers')
+        if ($DiagnosticPhases) { $probeArguments += '--diagnostic-phases' }
+        if ($DiagnosticFailedRoles) { $probeArguments += '--diagnostic-failed-roles' }
+        $bounded = & $boundedTool -FilePath $probePath -ArgumentList $probeArguments -WorkingDirectory (Split-Path -Parent $probePath) -NormalInteractiveUser -MaxAttempts 1 -TimeoutSeconds $probeTimeoutSeconds -TerminationGraceMilliseconds 100 -StreamDrainGraceMilliseconds 100 -NoExit -Compact | ConvertFrom-Json -Depth 30
         $failureKind = 'bounded-attempt-invalid'
         $attempts = @($bounded.attempts)
         if ($attempts.Count -ne 1 -or $null -eq $attempts[0]) { throw 'Independent OpenVR pose probe did not retain exactly one bounded attempt.' }
@@ -1322,6 +1342,7 @@ function Get-ApplicationHeadPose {
             probePath = $probePath
             exitCode = $attempt.exitCode
             boundedProcess = $bounded
+            probeBudget = $probeBudget
             observation = $payload
             packageAuthority = $afterAuthority
             providerContinuity = $continuityAfter
@@ -1333,7 +1354,8 @@ function Get-ApplicationHeadPose {
             available = $false; qualified = $false
             probeAttempted = $probeAttempted; terminalFailure = $true; failureKind = $failureKind
             controllersRequired = $true; controllersQualified = $false
-            timedOut = $true; probePath = $probePath
+            timedOut = $probeAttempted; probePath = $probePath
+            probeBudget = $probeBudget
             boundedProcess = $bounded; observation = $payload; packageAuthority = $afterAuthority
             providerContinuity = $continuityAfter; poseAfterProbe = $afterPose; error = $_.Exception.Message
         }
@@ -1344,6 +1366,7 @@ function Get-ApplicationHeadPose {
             probeAttempted = $probeAttempted; terminalFailure = $true; failureKind = $failureKind
             controllersRequired = $true; controllersQualified = $false
             timedOut = $false; probePath = $probePath
+            probeBudget = $probeBudget
             boundedProcess = $bounded; observation = $payload; packageAuthority = $afterAuthority
             providerContinuity = $continuityAfter; poseAfterProbe = $afterPose; error = $_.Exception.Message
         }
@@ -1370,7 +1393,9 @@ function Get-NullRuntimeEvidence {
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Processes,
         [Parameter(Mandatory)]$Profile,
-        [DateTime]$DeadlineUtc = [DateTime]::MaxValue
+        [DateTime]$DeadlineUtc = [DateTime]::MaxValue,
+        [switch]$DiagnosticPhases,
+        [switch]$DiagnosticFailedRoles
     )
     $resolvedRoot = [IO.Path]::GetFullPath($SteamVRRoot).TrimEnd('\') + '\'
     $owned = @($Processes | Where-Object {
@@ -1400,7 +1425,7 @@ function Get-NullRuntimeEvidence {
             $headPoseRegistered = $startupLogProof.headPoseDeviceRegistered
         }
     }
-    else { $script:NullStartupLogProofState.Clear() }
+    else { if (-not $script:NullStartupLogAnchor) { $script:NullStartupLogProofState.Clear() } }
     $headPoseAuthorizationError = $null
     try {
         $denyAfterStart = $InternalTestFailurePoint -eq 'head-pose-access-denied-after-start' -and
@@ -1420,7 +1445,7 @@ function Get-NullRuntimeEvidence {
         }
     }
     $providerLogReady = $server.Count -eq 1 -and $null -ne $loaded -and $null -ne $active -and $null -ne $headPoseLoaded -and $null -ne $headPoseRegistered
-    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified -and $packageAuthority.verified -and $headPoseState.driverCreatorPid -eq $server[0].id -and [uint64][DateTime]::Parse($server[0].startTimeUtc).ToUniversalTime().ToFileTimeUtc() -eq $headPoseState.creatorAuthority.processStartFileTimeUtc) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -PreProbePose $headPoseState -PreProbePackageAuthority $packageAuthority -DeadlineUtc $DeadlineUtc } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; probeAttempted = $false; terminalFailure = $false; failureKind = $null; timedOut = $false; error = 'The provider creator/package is not ready for an application-facing pose probe.' } }
+    $applicationHeadPose = if ($providerLogReady -and [bool]$headPoseState.qualified -and $packageAuthority.verified -and $headPoseState.driverCreatorPid -eq $server[0].id -and [uint64][DateTime]::Parse($server[0].startTimeUtc).ToUniversalTime().ToFileTimeUtc() -eq $headPoseState.creatorAuthority.processStartFileTimeUtc) { Get-ApplicationHeadPose -Contract $Profile['headPoseProviderContract'] -PreProbePose $headPoseState -PreProbePackageAuthority $packageAuthority -DeadlineUtc $DeadlineUtc -DiagnosticPhases:$DiagnosticPhases -DiagnosticFailedRoles:$DiagnosticFailedRoles } else { [pscustomobject][ordered]@{ available = $false; qualified = $false; probeAttempted = $false; terminalFailure = $false; failureKind = $null; timedOut = $false; error = 'The provider creator/package is not ready for an application-facing pose probe.' } }
     $preProbeServerProcess = if ($server.Count -eq 1) { $server[0] } else { $null }
     $serverProcess = $preProbeServerProcess
     if ($applicationHeadPose.qualified) {
@@ -1849,7 +1874,27 @@ try {
     })
     $unprovenProcesses = @($processes | Where-Object { $_ -notin $ownedProcesses })
     $effective = Get-EffectiveState -Settings $settings -Profile $profile
-    $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile
+    # Read-only continuity may reuse only the exact accepted receipt from the
+    # authoritative committed apply, then revalidate all retained ranges. No
+    # live log reanchoring and no legacy receipt migration is permitted.
+    if ($Command -in @('inspect', 'start') -and $effective.active -and $recoveredTransaction -and
+        [string]$recoveredTransaction['operation'] -eq 'apply' -and [string]$recoveredTransaction['phase'] -eq 'committed') {
+        $receiptServer = @($ownedProcesses | Where-Object name -eq 'vrserver')
+        $boundRuntimePath = Join-Path ([string]$recoveredTransaction['evidenceDirectory']) 'steamvr-null-runtime.receipt.json'
+        if ($receiptServer.Count -eq 1 -and (Test-Path -LiteralPath $boundRuntimePath -PathType Leaf)) {
+            try {
+                $acceptedRuntime = Get-Content -LiteralPath $boundRuntimePath -Raw | ConvertFrom-Json -Depth 80
+                Import-NullStartupLogAnchor -Receipt $acceptedRuntime -Path $ServerLogPath -Server $receiptServer[0] -SerialNumber ([string]$profile['driver_null']['serialNumber']) -MaxBytes $LogTailMaxBytes -ConfigDirectory ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($SettingsPath)))
+            }
+            catch {
+                # Unknown provenance remains unqualified; inspection/stop remains
+                # available and a running runtime cannot be silently relaunched.
+                $script:NullStartupLogAnchor = $null
+                $script:NullStartupLogProofState.Clear()
+            }
+        }
+    }
+    $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DiagnosticPhases:$ProbeDiagnosticPhases -DiagnosticFailedRoles:$ProbeDiagnosticFailedRoles
     $externalDrivers = Get-ExternalDriverInventory -Path $OpenVRPathsPath
     $mo2Admission = if ($Command -in @('apply', 'start')) { Get-MO2NullAdmission } else { $null }
     $authoritativeEvidenceDirectory = if ($null -ne $recoveredTransaction -and (Test-JsonDictionaryContains $recoveredTransaction 'evidenceDirectory')) { [string]$recoveredTransaction['evidenceDirectory'] } else { $null }
@@ -2040,11 +2085,18 @@ try {
                     throw "The current runtime receipt could not be made nonaccepted before launch: $($_.Exception.Message)"
                 }
                 $startedUtc = [DateTime]::UtcNow
-                $launcher = Start-Process -FilePath $startupPath -WindowStyle Hidden -PassThru
                 $startupAttemptStartedUtc = $startedUtc
                 $script:SteamVRStartupAttemptActive = $true
                 $deadline = $startedUtc.AddSeconds($StartupTimeoutSeconds)
                 $startupDeadlineUtc = $deadline
+                # Capture and persist the exact prelaunch log boundary before any
+                # owned child can run. Existing files are append-only this attempt;
+                # an absent path may be created once. Never reanchor after launch.
+                $runtimeReceipt['startupLogAnchor'] = New-NullStartupLogAnchor -Path $ServerLogPath -AttemptId $runtimeAttemptId -DeadlineUtc $deadline -ConfigDirectory ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($SettingsPath)))
+                Write-JsonAtomic -Path $runtimeReceiptPath -Value $runtimeReceipt
+                . (Join-Path (Split-Path -Parent $PSScriptRoot) 'process-control/ProcessLaunchInterop.ps1')
+                $launcher = Start-NormalInteractiveProcess -FilePath $startupPath -DeadlineUtc $deadline
+                $runtimeReceipt['interactiveLaunch'] = $launcher.interactiveLaunch
                 $logReadReserveMilliseconds = [int][Math]::Min(2000, [Math]::Max(500, $StartupTimeoutSeconds * 50))
                 $qualificationDeadline = $deadline.AddMilliseconds(-$logReadReserveMilliseconds)
                 $runtimeReceipt['startedUtc'] = $startedUtc.ToString('o')
@@ -2074,10 +2126,20 @@ try {
                     $processes = @(Get-SteamVRProcesses)
                     try {
                         $runtimeProbeAttempts++
-                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline
+                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $qualificationDeadline -DiagnosticPhases:$ProbeDiagnosticPhases -DiagnosticFailedRoles:$ProbeDiagnosticFailedRoles
                     }
                     catch [TimeoutException] {
                         $lastRuntimeProbeError = $_.Exception.Message
+                        $failedLogProof = @($script:NullStartupLogProofState.Values | Where-Object { $_.PSObject.Properties['terminalFailure'] -and $_.terminalFailure } | Select-Object -First 1)
+                        if ($failedLogProof.Count -eq 1) {
+                            $runtime.startupLogProof = $failedLogProof[0]
+                            $runtime.active = $false
+                            $runtime.headPoseReady = $false
+                        }
+                        break
+                    }
+                    if ($runtime.startupLogProof -and $runtime.startupLogProof.PSObject.Properties['terminalFailure'] -and $runtime.startupLogProof.terminalFailure) {
+                        $lastRuntimeProbeError = [string]$runtime.startupLogProof.error
                         break
                     }
                     if ($runtime.headPoseAuthorizationError) {
@@ -2098,7 +2160,7 @@ try {
                         if ($InternalTestFailurePoint -in @('runtime-confirmation-timeout', 'runtime-confirmation-timeout-receipt-failure', 'runtime-confirmation-timeout-cleanup-failure', 'runtime-confirmation-timeout-input-contract-failure')) {
                             throw [TimeoutException]::new('Injected runtime confirmation timeout.')
                         }
-                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $deadline
+                        $runtime = Get-NullRuntimeEvidence -Processes $processes -Profile $profile -DeadlineUtc $qualificationDeadline -DiagnosticPhases:$ProbeDiagnosticPhases -DiagnosticFailedRoles:$ProbeDiagnosticFailedRoles
                         if ($runtime.applicationHeadPose.terminalFailure) {
                             $lastRuntimeProbeError = [string]$runtime.applicationHeadPose.error
                             $runtimeConfirmationTimedOut = [bool]$runtime.applicationHeadPose.timedOut
@@ -2127,6 +2189,16 @@ try {
                 elseif ($runtime.headPoseAuthorizationError) {
                     $failureState = 'head-pose-provider-authorization-failed'
                     $failureErrors.Add([string]$runtime.headPoseAuthorizationError)
+                }
+                elseif ($runtime.startupLogProof -and $runtime.startupLogProof.PSObject.Properties['terminalFailure'] -and $runtime.startupLogProof.terminalFailure) {
+                    $failureState = 'startup-log-proof-acquisition-failed'
+                    $failureErrors.Add([string]$runtime.startupLogProof.error)
+                    $failureErrors.Add('The attempt-relative startup log proof is irrecoverable; no further readiness poll or probe is authorised for this attempt.')
+                }
+                elseif ($runtime.applicationHeadPose.failureKind -eq 'insufficient-probe-budget') {
+                    $failureState = 'application-pose-probe-insufficient-budget'
+                    $failureErrors.Add([string]$lastRuntimeProbeError)
+                    $failureErrors.Add('No independent probe was launched; the full probe and verification budget was unavailable.')
                 }
                 elseif ($runtime.applicationHeadPose.PSObject.Properties['timedOut'] -and $runtime.applicationHeadPose.timedOut) {
                     $failureState = 'application-pose-probe-timeout'

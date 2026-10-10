@@ -1,129 +1,200 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$FixtureRoot, [string]$RetainedLogPath)
+param([Parameter(Mandatory)][string]$FixtureRoot)
 Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$checks = 0
-function Require([bool]$Condition, [string]$Name) { if (-not $Condition) { throw $Name }; $script:checks++ }
-$fixture = Join-Path ([IO.Path]::GetFullPath($FixtureRoot)) ('startup-proof-' + [guid]::NewGuid().ToString('N'))
+$ErrorActionPreference='Stop';$checks=0
+function Require([bool]$Condition,[string]$Name){if(-not $Condition){throw $Name};$script:checks++}
+$fixture=Join-Path ([IO.Path]::GetFullPath($FixtureRoot)) ('startup-proof-'+[guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($fixture)
-$source = Join-Path $PSScriptRoot 'Invoke-SteamVRNullControl.ps1'
-$tokens = $errors = $null
-$ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
+$tokens=$errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'Invoke-SteamVRNullControl.ps1'),[ref]$tokens,[ref]$errors)
 Require (@($errors).Count -eq 0) 'controller parses'
-foreach ($name in @('Get-StreamRangeSha256', 'Get-ByteArraySha256', 'Get-Utf8TrailingIncompleteByteCount', 'Get-SharedTextTail', 'Get-LogTimestampUtc', 'Get-NullRuntimeEvidence')) {
-    $node = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true))[0]
-    Invoke-Expression $node.Extent.Text
+foreach($name in @('Get-StreamRangeSha256','Get-ByteArraySha256','Get-Utf8TrailingIncompleteByteCount','Get-SharedTextTail','Get-LogTimestampUtc','Get-NullRuntimeEvidence')){
+ $node=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true))[0]
+ Invoke-Expression $node.Extent.Text
 }
 . (Join-Path $PSScriptRoot 'StartupLogProof.ps1')
-$SteamVRRoot = Join-Path $fixture 'SteamVR'
-$ServerLogPath = Join-Path $fixture 'vrserver.txt'
-$LogTailMaxBytes = 4096
-$InternalTestFailurePoint = ''
-$script:SharedTextTailState = @{}
-$utf8 = [Text.UTF8Encoding]::new($false)
-$start = [DateTime]::UtcNow.AddSeconds(-10)
-$server = [pscustomobject]@{ name = 'vrserver'; id = 123; path = (Join-Path $SteamVRRoot 'bin/win64/vrserver.exe'); startTimeUtc = $start.ToString('o') }
-$profile = @{ driver_null = @{ serialNumber = 'fixture-null' }; headPoseProviderContract = @{}; dashboard = @{ enableDashboard = $false } }
-$script:probes = 0
-function Get-NullProviderAuthority { param($DeadlineUtc) [pscustomobject]@{ verified = $true } }
-function Get-HeadPoseSharedState {
-    param($Contract)
-    [pscustomobject]@{ qualified = $true; driverCreatorPid = $server.id; creatorAuthority = [pscustomobject]@{ pid = $server.id; executablePath = $server.path; processStartFileTimeUtc = $start.ToFileTimeUtc() } }
+$SteamVRRoot=Join-Path $fixture 'SteamVR';$ServerLogPath=Join-Path $fixture 'vrserver.txt';$LogTailMaxBytes=4096
+$ConfigDirectory=Join-Path $fixture 'config'
+$InternalTestFailurePoint='';$script:SharedTextTailState=@{};$utf8=[Text.UTF8Encoding]::new($false)
+$server=[pscustomobject]@{name='vrserver';id=123;path=(Join-Path $SteamVRRoot 'bin/win64/vrserver.exe');startTimeUtc=''}
+$profile=@{driver_null=@{serialNumber='fixture-null'};headPoseProviderContract=@{};dashboard=@{enableDashboard=$false}}
+$script:probes=0
+function Get-NullProviderAuthority{param($DeadlineUtc) [pscustomobject]@{verified=$true}}
+function Get-HeadPoseSharedState{param($Contract) [pscustomobject]@{qualified=$true;driverCreatorPid=$server.id;creatorAuthority=[pscustomobject]@{pid=$server.id;executablePath=$server.path;processStartFileTimeUtc=([DateTimeOffset]$server.startTimeUtc).UtcDateTime.ToFileTimeUtc()}}}
+function Get-ApplicationHeadPose{param($Contract,$PreProbePose,$PreProbePackageAuthority,$DeadlineUtc) $script:probes++;[pscustomobject]@{qualified=$true;controllersQualified=$true;poseAfterProbe=$PreProbePose;packageAuthority=$PreProbePackageAuthority;providerContinuity=@{verified=$true}}}
+function Reset-Log([string]$History=''){
+ $script:SharedTextTailState.Clear();[IO.File]::WriteAllText($ServerLogPath,$History,$utf8)
+ $null=New-NullStartupLogAnchor -Path $ServerLogPath -AttemptId ([guid]::NewGuid().ToString('N')) -ConfigDirectory $ConfigDirectory -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(5))
+ $server.startTimeUtc=[DateTime]::UtcNow.ToString('o')
 }
-function Get-ApplicationHeadPose {
-    param($Contract, $PreProbePose, $PreProbePackageAuthority, $DeadlineUtc)
-    $script:probes++
-    [pscustomobject]@{ qualified = $true; controllersQualified = $true; poseAfterProbe = $PreProbePose; packageAuthority = $PreProbePackageAuthority; providerContinuity = @{ verified = $true } }
+function Proof-Lines([string]$Serial='fixture-null',[int]$PidValue=$server.id,[string]$RuntimeRoot=$SteamVRRoot,[DateTime]$At=([DateTimeOffset]$server.startTimeUtc).UtcDateTime){
+ $stamp=$At.ToLocalTime().ToString('ddd MMM d yyyy HH:mm:ss.fff',[cultureinfo]::InvariantCulture)
+ @("$stamp [Info] - vrserver 2.17.10 startup with PID=$PidValue, config=$ConfigDirectory, runtime=$RuntimeRoot, arch=win64",
+ "$stamp [Info] Loaded server driver null fixture driver_null.dll","$stamp [Info] Active HMD set to null.$Serial",
+ "$stamp [Info] Loaded server driver codex_head_pose fixture driver_codex_head_pose.dll",
+ "$stamp [Info] codex_head_pose: registered synthetic head-pose device at configured standing pose") -join "`n"
 }
-function Reset-Log([string]$Text) {
-    $script:NullStartupLogProofState.Clear(); $script:SharedTextTailState.Clear()
-    [IO.File]::WriteAllText($ServerLogPath, $Text, $utf8)
+function Append-Proof{[IO.File]::AppendAllText($ServerLogPath,(Proof-Lines)+"`n",$utf8)}
+function Read-Proof{Get-NullStartupLogProof -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(5))}
+$history="historical framed line`n"*15000;$noise="diagnostic noise`n"*3000
+Reset-Log $history;Append-Proof
+$offset=$utf8.GetByteCount($history);$length=$utf8.GetByteCount((Proof-Lines)+"`n")
+[IO.File]::AppendAllText($ServerLogPath,$noise,$utf8)
+$runtime=Get-NullRuntimeEvidence -Processes @($server) -Profile $profile -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(5))
+Require ($runtime.active -and $runtime.headPoseReady -and $runtime.controllersReady -and $script:probes -eq 1) 'delayed observation beyond history and tail still reaches unchanged fixture probe gate'
+Require ($runtime.startupLogProof.offset -eq $offset -and $runtime.startupLogProof.length -eq $length -and $runtime.startupLogProof.serverStartup.byteStartInclusive -eq $offset) 'physical offsets and current PID bind attempt, not byte zero'
+Require ($runtime.startupLogProof.bytesRead -le 4096 -and $runtime.startupLogProof.hashBytesRead -le 12288) 'bounded acquisition does not scan history'
+[IO.File]::AppendAllText($ServerLogPath,$noise,$utf8);$again=Read-Proof
+Require ($again.complete -and $again.retained -and $again.sha256 -ceq $runtime.startupLogProof.sha256 -and $again.bytesRead -eq 0) 'append/noise rollover preserves exact immutable range'
+Require ($again.hashBytesRead -eq 2*($again.length+$again.anchor.guardLength)) 'retained proof checks exactly two ranges plus two guards'
+$edit=[IO.File]::Open($ServerLogPath,'Open','Write',[IO.FileShare]::ReadWrite)
+try{$edit.Position=$offset+30;$edit.WriteByte([byte][char]'X')}finally{$edit.Dispose()}
+$bad=Read-Proof
+Require ($bad.terminalFailure -and -not $bad.complete -and $bad.error -match 'in place') 'retained-range mutation terminal'
+[IO.File]::WriteAllText($ServerLogPath,$history+(Proof-Lines)+"`n"+$noise,$utf8)
+Require ((Read-Proof).terminalFailure) 'restored bytes cannot silently reanchor rejected attempt'
+Reset-Log $history;Append-Proof;$null=Read-Proof
+$rotated=Join-Path $fixture 'rotated.txt';[IO.File]::Move($ServerLogPath,$rotated)
+[IO.File]::WriteAllText($ServerLogPath,$history+(Proof-Lines)+"`n",$utf8)
+[IO.File]::SetCreationTimeUtc($ServerLogPath,[IO.File]::GetCreationTimeUtc($rotated))
+Require ((Read-Proof).terminalFailure) 'same-name identical-content replacement with copied creation time refused by physical ID'
+Reset-Log $history;Append-Proof;$null=Read-Proof;[IO.File]::WriteAllText($ServerLogPath,'truncated',$utf8)
+Require ((Read-Proof).error -match 'truncated') 'prelaunch truncation refused'
+Reset-Log $history;Append-Proof;[IO.File]::AppendAllText($ServerLogPath,$noise,$utf8);$null=Read-Proof
+$cut=[IO.File]::Open($ServerLogPath,'Open','Write',[IO.FileShare]::ReadWrite)
+try{$cut.SetLength($offset+$utf8.GetByteCount((Proof-Lines)+"`n"))}finally{$cut.Dispose()}
+Require ((Read-Proof).error -match 'truncated') 'post-proof truncation refused even with retained bytes intact'
+Reset-Log $history
+$edit=[IO.File]::Open($ServerLogPath,'Open','Write',[IO.FileShare]::ReadWrite)
+try{$edit.Position=$offset-1;$edit.WriteByte([byte][char]'X')}finally{$edit.Dispose()}
+Append-Proof;Require ((Read-Proof).error -match 'guard changed') 'framing guard in-place mutation refused'
+Reset-Log 'historical partial';Append-Proof
+Require (-not (Read-Proof).complete) 'partial historical first line cannot synthesize startup proof'
+Reset-Log 'historical partial';[IO.File]::AppendAllText($ServerLogPath," continuation`n"+(Proof-Lines)+"`n",$utf8)
+Require ((Read-Proof).complete) 'partial first line skipped to LF before current proof'
+Reset-Log $history;$text=(Proof-Lines)+"`n";[IO.File]::AppendAllText($ServerLogPath,$text.TrimEnd([char]10),$utf8)
+Require (-not (Read-Proof).complete) 'partial last line not proof'
+[IO.File]::AppendAllText($ServerLogPath,"`n",$utf8);Require ((Read-Proof).complete) 'LF completion extends unchanged incomplete range'
+foreach($serial in @('fixture-null-extra','FIXTURE-NULL')){
+ Reset-Log $history;[IO.File]::AppendAllText($ServerLogPath,(Proof-Lines -Serial $serial)+"`n",$utf8)
+ Require (-not (Read-Proof).complete) 'exact serial suffix/case matching'
 }
-function Proof-Lines([DateTime]$At, [string]$Serial = 'fixture-null') {
-    $stamp = $At.ToLocalTime().ToString('ddd MMM d yyyy HH:mm:ss.fff', [cultureinfo]::InvariantCulture)
-    @("$stamp [Info] Loaded server driver null fixture driver_null.dll",
-      "$stamp [Info] Active HMD set to null.$Serial",
-      "$stamp [Info] Loaded server driver codex_head_pose fixture driver_codex_head_pose.dll",
-      "$stamp [Info] codex_head_pose: registered synthetic head-pose device at configured standing pose") -join "`n"
+Reset-Log $history;[IO.File]::AppendAllText($ServerLogPath,(Proof-Lines -PidValue 999)+"`n",$utf8)
+Require ((Read-Proof).terminalFailure) 'wrong startup PID refused'
+Reset-Log $history;[IO.File]::AppendAllText($ServerLogPath,(Proof-Lines -RuntimeRoot (Join-Path $fixture 'foreign'))+"`n",$utf8)
+Require ((Read-Proof).terminalFailure) 'foreign startup runtime refused'
+Reset-Log $history;[IO.File]::AppendAllText($ServerLogPath,(Proof-Lines -At ([DateTime]::UtcNow.AddSeconds(-10)))+"`n",$utf8)
+Require (-not (Read-Proof).complete) 'historical timestamp refused'
+Reset-Log $history;Append-Proof;$null=Read-Proof;$server.id++
+Require ((Read-Proof).terminalFailure) 'server binding drift cannot transfer authority'
+Reset-Log $history;[IO.File]::AppendAllText($ServerLogPath,$noise,$utf8)
+Require ((Read-Proof).error -match 'byte budget') 'new payload cap terminal without scanning history'
+Reset-Log $history;[IO.File]::AppendAllText($ServerLogPath,("n`n"*10001),$utf8)
+$cap=Get-NullStartupLogProof -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes 65536
+Require ($cap.terminalFailure -and $cap.error -match 'line budget') 'line budget preserved'
+Reset-Log $history;Append-Proof
+$drift=Get-NullStartupLogProof -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -InternalMutationHook {param($path) [IO.File]::WriteAllText($path,'rewritten')}
+Require ($drift.terminalFailure -and -not $drift.stable) 'selected-path revalidation rejects between-read mutation'
+Reset-Log $history;Append-Proof;$expired=$false
+try{Get-NullStartupLogProof -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(-1))|Out-Null}catch [TimeoutException]{$expired=$true}
+Require ($expired -and @($script:NullStartupLogProofState.Values)[0].terminalFailure) 'deadline invalidates proof before publication'
+Reset-Log $history;$anchorFailed=$false
+try{New-NullStartupLogAnchor -Path $ServerLogPath -AttemptId 'mutation' -InternalMutationHook {param($path) [IO.File]::AppendAllText($path,"advance`n")}|Out-Null}catch{$anchorFailed=$true}
+Require ($anchorFailed -and $null -eq $script:NullStartupLogAnchor) 'concurrent writer during anchor refuses launch boundary'
+Reset-Log $history;Append-Proof;$good=Read-Proof
+$receipt=[pscustomobject]@{schemaVersion=2;attemptId=$good.attemptId;runtimeAccepted=$true;admissionState='accepted';startupLogAnchor=$good.anchor;runtime=[pscustomobject]@{startupLogProof=$good}}
+$receipt=$receipt|ConvertTo-Json -Depth 15|ConvertFrom-Json -Depth 15
+$script:NullStartupLogAnchor=$null;$script:NullStartupLogProofState.Clear()
+Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -ConfigDirectory $ConfigDirectory
+Require ((Read-Proof).complete -and (Read-Proof).retained) 'read-only accepted-receipt continuity verifies original ranges rather than live reanchoring'
+$importFailed=$false
+try{Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'foreign' -MaxBytes $LogTailMaxBytes -ConfigDirectory $ConfigDirectory}catch{$importFailed=$true}
+Require ($importFailed) 'accepted receipt cannot lend proof to different configured serial'
+$edit=[IO.File]::Open($ServerLogPath,'Open','Write',[IO.FileShare]::ReadWrite)
+try{$edit.Position=$offset+30;$edit.WriteByte([byte][char]'X')}finally{$edit.Dispose()}
+Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -ConfigDirectory $ConfigDirectory
+Require ((Read-Proof).terminalFailure) 'accepted receipt hash revalidation rejects changed live proof on later invocation'
+$script:NullStartupLogAnchor=$null;$script:NullStartupLogProofState.Clear()
+Require ((Read-Proof).terminalFailure) 'missing prelaunch provenance cannot be reconstructed from running log'
+$ServerLogPath=Join-Path $fixture 'initially-absent.txt'
+$null=New-NullStartupLogAnchor -Path $ServerLogPath -AttemptId 'absent';$server.startTimeUtc=[DateTime]::UtcNow.ToString('o')
+Require (-not (Read-Proof).terminalFailure -and $script:NullStartupLogProofState.Count -eq 0) 'initial absence waits without poisoning cache or creating log'
+[IO.File]::WriteAllText($ServerLogPath,(Proof-Lines)+"`n",$utf8);Require ((Read-Proof).complete) 'single new file admitted with exact startup identity'
+[IO.File]::Move($ServerLogPath,(Join-Path $fixture 'created-old.txt'))
+Require ((Read-Proof).terminalFailure) 'created path disappearance is terminal'
+Reset-Log ''
+$empty=Read-Proof
+Require ($empty.stable -and -not $empty.complete -and -not $empty.terminalFailure -and $empty.length -eq 0) 'empty existing log is pending, not proof failure'
+Append-Proof;$good=Read-Proof
+Require ($good.complete -and $good.anchor.existed -and $good.anchor.guardLength -eq 0) 'empty prelaunch file can append current proof'
+$receipt=[pscustomobject]@{schemaVersion=2;attemptId=$good.attemptId;runtimeAccepted=$true;admissionState='accepted';startupLogAnchor=$good.anchor;runtime=[pscustomobject]@{startupLogProof=$good}}
+Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -ConfigDirectory $ConfigDirectory
+Require ((Read-Proof).complete) 'empty-boundary guard preserves accepted-receipt continuity'
+
+function Rotate-Startup([string]$NewText=((Proof-Lines)+"`n")){
+ $previous=$script:NullStartupLogAnchor.previousPath
+ if([IO.File]::Exists($previous)){[IO.File]::Delete($previous)} # Exact disposable fixture only.
+ [IO.File]::Move($ServerLogPath,$previous)
+ [IO.File]::WriteAllText($ServerLogPath,$NewText,$utf8)
 }
-function Read-Proof {
-    Get-NullStartupLogProof -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(5))
+Reset-Log $history;Rotate-Startup
+$good=Read-Proof
+Require ($good.complete -and $good.offset -eq 0 -and $good.startupRotation.startupRecordVerified -and $good.anchor.offset -gt 262144 -and $good.startupRotation.oldFileIdentity -ceq $good.anchor.fileIdentity -and $good.fileIdentity -cne $good.anchor.fileIdentity) 'startup rotation pins both identities and exact archive without scanning historical prefix'
+Require ($good.bytesRead -le 4096 -and $good.hashBytesRead -le 12288 -and $good.serverStartup.configDirectory -ieq $ConfigDirectory) 'rotation same payload/hash budgets and config binding'
+[IO.File]::AppendAllText($ServerLogPath,$noise,$utf8);$again=Read-Proof
+Require ($again.complete -and $again.retained -and $again.sha256 -ceq $good.sha256 -and $again.bytesRead -eq 0) 'rotation retains immutable range through delayed noise rollover'
+$receipt=[pscustomobject]@{schemaVersion=2;attemptId=$good.attemptId;runtimeAccepted=$true;admissionState='accepted';startupLogAnchor=$good.anchor;runtime=[pscustomobject]@{startupLogProof=$again}}
+$receipt=$receipt|ConvertTo-Json -Depth 20|ConvertFrom-Json -Depth 20
+$script:NullStartupLogAnchor=$null;$script:NullStartupLogProofState.Clear()
+Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -ConfigDirectory $ConfigDirectory
+Require ((Read-Proof).complete -and (Read-Proof).retained) 'accepted rotated receipt preserves original anchor and prospective transition'
+$failed=$false;try{Import-NullStartupLogAnchor -Receipt $receipt -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -ConfigDirectory (Join-Path $fixture 'foreign')}catch{$failed=$true}
+Require ($failed) 'accepted rotation cannot lend config binding'
+foreach($fault in @('missing','identity','length','guard','pid','config','runtime','time','partial')){
+ Reset-Log $history;Rotate-Startup
+ $previous=$script:NullStartupLogAnchor.previousPath
+ switch($fault){
+  missing {[IO.File]::Move($previous,($previous+'.missing'))}
+  identity {[IO.File]::Move($previous,($previous+'.identity'));[IO.File]::WriteAllText($previous,$history,$utf8)}
+  length {[IO.File]::AppendAllText($previous,"drift`n",$utf8)}
+  guard {$edit=[IO.File]::Open($previous,'Open','Write',[IO.FileShare]::ReadWrite);try{$edit.Position=$script:NullStartupLogAnchor.offset-1;$edit.WriteByte(88)}finally{$edit.Dispose()}}
+  pid {[IO.File]::WriteAllText($ServerLogPath,(Proof-Lines -PidValue 99)+"`n",$utf8)}
+  config {[IO.File]::WriteAllText($ServerLogPath,((Proof-Lines).Replace("config=$ConfigDirectory,","config=foreign,"))+"`n",$utf8)}
+  runtime {[IO.File]::WriteAllText($ServerLogPath,(Proof-Lines -RuntimeRoot (Join-Path $fixture 'wrong'))+"`n",$utf8)}
+  time {[IO.File]::WriteAllText($ServerLogPath,(Proof-Lines -At ([DateTime]::UtcNow.AddSeconds(10)))+"`n",$utf8)}
+  partial {[IO.File]::WriteAllText($ServerLogPath,(Proof-Lines).TrimEnd([char]10),$utf8)}
+ }
+ $bad=Read-Proof
+ if($fault -eq 'partial'){
+  Require (-not $bad.complete -and -not $bad.terminalFailure) 'rotation partial last line remains pending, never proof'
+  [IO.File]::AppendAllText($ServerLogPath,"`n",$utf8);Require ((Read-Proof).complete) 'rotation fully framed extension qualifies only after LF'
+ }else{Require ($bad.terminalFailure -and -not $bad.complete) "rotation rejects $fault evidence"}
 }
-$proofText = (Proof-Lines $start.AddSeconds(1)) + "`n"
-$noise = ("diagnostic noise`n" * 3000)
-Reset-Log ($proofText + $noise)
-$runtime = Get-NullRuntimeEvidence -Processes @($server) -Profile $profile -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(5))
-Require ($runtime.active -and $runtime.headPoseReady -and $runtime.controllersReady -and $script:probes -eq 1) 'delayed first poll admits four early lines even beyond byte and 2000-line tail limits'
-Require ($runtime.serverLogHashOffset -gt 0 -and $runtime.startupLogProof.offset -eq 0 -and $runtime.startupLogProof.length -eq $utf8.GetByteCount($proofText)) 'startup prefix and diagnostic tail have distinct exact offsets'
-[IO.File]::AppendAllText($ServerLogPath, $noise, $utf8)
-$again = Get-NullRuntimeEvidence -Processes @($server) -Profile $profile -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(5))
-Require ($again.headPoseReady -and $again.startupLogProof.retained -and $again.startupLogProof.sha256 -ceq $runtime.startupLogProof.sha256) 'validated pinned prefix survives append and tail rollover across observations'
-Require ($again.startupLogProof.bytesRead -eq 0 -and $again.startupLogProof.hashBytesRead -eq 2 * $again.startupLogProof.length) 'retained confirmation examines only two bounded proof spans'
-Require ($script:NullStartupLogProofState.Count -eq 1) 'retention has a single current server binding'
-$edit = [IO.File]::Open($ServerLogPath, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
-try { $edit.Position = 30; $edit.WriteByte([byte][char]'X') } finally { $edit.Dispose() }
-$bad = Get-NullRuntimeEvidence -Processes @($server) -Profile $profile -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(5))
-Require (-not $bad.active -and -not $bad.headPoseReady -and $bad.startupLogProof.error -match 'in place' -and $script:probes -eq 2) 'in-place proof drift outside diagnostic tail refuses probe and readiness'
-[IO.File]::WriteAllText($ServerLogPath, $proofText + $noise, $utf8)
-Require (-not (Read-Proof).complete) 'same-server invalidation cannot silently reacquire formerly rejected proof'
-Reset-Log ($proofText + $noise)
-$null = Read-Proof
-$rotated = Join-Path $fixture 'rotated.txt'
-[IO.File]::Move($ServerLogPath, $rotated)
-[IO.File]::WriteAllText($ServerLogPath, $proofText + $noise, $utf8)
-[IO.File]::SetCreationTimeUtc($ServerLogPath, [IO.File]::GetCreationTimeUtc($rotated))
-Require (-not (Read-Proof).complete) 'replacement with identical content and creation timestamp is rejected by OS file identity'
-Reset-Log ($proofText + $noise)
-$null = Read-Proof
-[IO.File]::WriteAllText($ServerLogPath, $proofText, $utf8)
-Require ((Read-Proof).error -match 'truncated') 'truncation rejects retained proof even when its bytes survive'
-Reset-Log ($proofText + $noise)
-$null = Read-Proof
-[IO.File]::Move($ServerLogPath, (Join-Path $fixture 'temporarily-missing.txt'))
-$missing = Get-NullRuntimeEvidence -Processes @($server) -Profile $profile -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(5))
-[IO.File]::WriteAllText($ServerLogPath, $proofText + $noise, $utf8)
-Require (-not $missing.active -and -not (Read-Proof).complete) 'missing selected path invalidates rather than clearing and reacquiring same-server proof'
-Reset-Log (Proof-Lines $start.AddSeconds(-10))
-Require (-not (Read-Proof).complete) 'historical pre-server lines never establish readiness'
-Reset-Log ((Proof-Lines $start.AddSeconds(1) 'fixture-null-extra') + "`n")
-Require (-not (Read-Proof).complete) 'different serial suffix is not an exact HMD match'
-Reset-Log ((Proof-Lines $start.AddSeconds(1) 'FIXTURE-NULL') + "`n")
-Require (-not (Read-Proof).complete) 'case-changed serial cannot borrow the configured identity'
-$split = $proofText.LastIndexOf("`n")
-Reset-Log $proofText.Substring(0, $split)
-Require (-not (Read-Proof).complete) 'unterminated proof line is not published'
-[IO.File]::AppendAllText($ServerLogPath, "`n", $utf8)
-Require ((Read-Proof).complete) 'newline completion safely extends the verified prefix'
-Reset-Log ($proofText + $noise)
-$null = Read-Proof
-$server.id++
-$start = $start.AddMinutes(1)
-$server.startTimeUtc = $start.ToString('o')
-Require (-not (Read-Proof).complete -and $script:NullStartupLogProofState.Count -eq 1) 'new PID/start identity discards old proof rather than transferring authority'
-$start = $start.AddMinutes(-1); $server.startTimeUtc = $start.ToString('o')
-Reset-Log $noise
-Require ((Read-Proof).error -match 'byte budget') 'missing proof beyond byte cap fails explicitly without an unbounded scan'
-Reset-Log ("n`n" * 10001)
-$lineCapped = Get-NullStartupLogProof -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes 65536 -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(5))
-Require ($lineCapped.error -match 'line budget') 'many short lines cannot turn the byte cap into unbounded parsing work'
-Reset-Log $proofText
-$drift = Get-NullStartupLogProof -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -InternalMutationHook { param($path) [IO.File]::WriteAllText($path, 'rewritten') }
-Require (-not $drift.stable -and -not $drift.complete) 'between-read and selected-path mutation cannot publish proof'
-Reset-Log $proofText
-$expired = $false
-try { Get-NullStartupLogProof -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(-1)) | Out-Null } catch [TimeoutException] { $expired = $true }
-Require ($expired -and -not @($script:NullStartupLogProofState.Values)[0].complete) 'expired deadline throws and removes admissible cached evidence'
-$retainedResult = $null
-if ($RetainedLogPath) {
-    $logInfo = Get-Item -LiteralPath $RetainedLogPath
-    Require ($logInfo.Length -le 2097152) 'retained diagnostic input stays within declared 2MiB scope'
-    $ServerLogPath = $RetainedLogPath; $LogTailMaxBytes = 262144
-    $server.id = 54956; $start = [DateTimeOffset]::Parse('2026-10-05T10:35:44.5780874Z').UtcDateTime; $server.startTimeUtc = $start.ToString('o')
-    $script:NullStartupLogProofState.Clear(); $script:SharedTextTailState.Clear()
-    $profile.driver_null.serialNumber = 'CSX Null HMD'
-    $retainedResult = Get-NullRuntimeEvidence -Processes @($server) -Profile $profile -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(5))
-    Require ($retainedResult.startupLogProof.complete -and $retainedResult.startupLogProof.length -eq 14963 -and $retainedResult.serverLogHashOffset -gt 500000) 'exact immutable failed-run log admits prefix proof while moving tail contains none'
-    Require ($retainedResult.headPoseReady) 'actual retained log reaches production runtime probe gate with explicit fixture observations only'
+Reset-Log $history;Rotate-Startup '';$pending=Read-Proof;Append-Proof
+Require ($pending.stable -and -not $pending.complete -and -not $pending.startupRotation.startupRecordVerified -and (Read-Proof).complete) 'first-observation candidate is pinned while current marker is delayed'
+foreach($fault in @('later-rotation','later-truncation','new-mutation','archive-mutation','archive-race','selected-race')){
+ Reset-Log $history;Rotate-Startup;$good=Read-Proof
+ switch($fault){
+  later-rotation {[IO.File]::Move($ServerLogPath,($ServerLogPath+'.second'));[IO.File]::WriteAllText($ServerLogPath,(Proof-Lines)+"`n",$utf8)}
+  later-truncation {[IO.File]::WriteAllText($ServerLogPath,'short',$utf8)}
+  new-mutation {$edit=[IO.File]::Open($ServerLogPath,'Open','Write',[IO.FileShare]::ReadWrite);try{$edit.Position=30;$edit.WriteByte(88)}finally{$edit.Dispose()}}
+  archive-mutation {[IO.File]::AppendAllText($good.anchor.previousPath,"changed`n",$utf8)}
+ }
+ if($fault -in @('archive-race','selected-race')){
+  # Force incomplete acquisition so the between-read publication hook executes.
+  Reset-Log $history;Rotate-Startup
+  $bad=Get-NullStartupLogProof -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -InternalMutationHook {
+   param($path)
+   if($fault -eq 'archive-race'){[IO.File]::AppendAllText($script:NullStartupLogAnchor.previousPath,"race`n")}
+   else{[IO.File]::Move($path,($path+'.race'));[IO.File]::WriteAllText($path,(Proof-Lines)+"`n")}
+  }
+ }else{$bad=Read-Proof}
+ Require ($bad.terminalFailure -and -not $bad.complete) "$fault invalidates rotation without reanchoring"
 }
-[pscustomobject]@{ ok = $true; checks = $checks; liveRuntimeChanged = $false; applicationProbe = 'fixture only'; retainedLogProof = $(if ($retainedResult) { $retainedResult.startupLogProof } else { $null }); fixtureRoot = $fixture } | ConvertTo-Json -Depth 8 -Compress
+Reset-Log $history;Rotate-Startup '';$null=Read-Proof
+$expired=$false;try{Get-NullStartupLogProof -Path $ServerLogPath -Server $server -SerialNumber 'fixture-null' -MaxBytes $LogTailMaxBytes -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(-1))|Out-Null}catch [TimeoutException]{$expired=$true}
+Require ($expired -and (Read-Proof).terminalFailure) 'rotation candidate deadline remains terminal and sticky'
+Reset-Log $history;$null=Read-Proof;Rotate-Startup
+Require ((Read-Proof).terminalFailure) 'rotation after first append observation refused even with attributable archive'
+[pscustomobject]@{ok=$true;checks=$checks;liveRuntimeChanged=$false;applicationProbe='fixture only';fixtureRoot=$fixture;historicalBytes=$offset;maxPayloadBytes=$LogTailMaxBytes}|ConvertTo-Json -Depth 8 -Compress

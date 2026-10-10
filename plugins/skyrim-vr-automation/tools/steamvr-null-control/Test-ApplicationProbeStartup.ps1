@@ -18,6 +18,7 @@ try {
     $processRoot = Join-Path $fixture 'tools/process-control'
     $authorityRoot = Join-Path $fixture 'tools/steamvr-head-pose-control'
     foreach ($path in @($nullRoot,$processRoot,$authorityRoot)) { [IO.Directory]::CreateDirectory($path) | Out-Null }
+    [IO.File]::WriteAllText((Join-Path $processRoot 'ProcessLaunchInterop.ps1'), '# Fixture loader: normal launch boundary supplied below, never native.')
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../steamvr-head-pose-control/DriverPackageAuthority.ps1') -Destination $authorityRoot
     $entry = Join-Path $PSScriptRoot 'Invoke-SteamVRNullControl.ps1'
     $source = [IO.File]::ReadAllText($entry)
@@ -79,6 +80,15 @@ function Get-SharedTextTail {
 }
 function Get-NullStartupLogProof {
     param($Path,$Server,$SerialNumber,$MaxBytes,$DeadlineUtc)
+    $case = Get-Content -LiteralPath (Join-Path $HeadPoseDriverRoot 'case.txt') -Raw
+    if ($case.StartsWith('log-')) {
+        $proof = Get-FixtureRealStartupLogProof -Path $Path -Server $Server -SerialNumber $SerialNumber -MaxBytes $MaxBytes -DeadlineUtc $DeadlineUtc
+        if ($case -ceq 'log-rotation-later' -and $proof.stable -and -not $proof.complete) {
+            [IO.File]::Move($Path, ($Path+'.later'))
+            [IO.File]::WriteAllText($Path, 'replacement after first pinned observation')
+        }
+        return $proof
+    }
     $prefix=[string]$Server.startTimeUtc
     @{
         stable=$true;complete=$true
@@ -105,7 +115,8 @@ function Get-NullStartupLogProof {
     $externalLogStub=$false
     if(Test-Path -LiteralPath (Join-Path $PSScriptRoot 'StartupLogProof.ps1')){
         $stub=@($stubAst.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-NullStartupLogProof'},$true))[0].Extent.Text
-        [IO.File]::WriteAllText((Join-Path $nullRoot 'StartupLogProof.ps1'),('$script:NullStartupLogProofState=@{}'+[Environment]::NewLine+$stub),[Text.UTF8Encoding]::new($false))
+        $realLogSource=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'StartupLogProof.ps1')).Replace('function Get-NullStartupLogProof {','function Get-FixtureRealStartupLogProof {')
+        [IO.File]::WriteAllText((Join-Path $nullRoot 'StartupLogProof.ps1'),($realLogSource+[Environment]::NewLine+$stub),[Text.UTF8Encoding]::new($false))
         $externalLogStub=$true
     }
     if(Test-Path -LiteralPath (Join-Path $PSScriptRoot 'DesktopUIRestore.ps1')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'DesktopUIRestore.ps1') -Destination $nullRoot}
@@ -140,11 +151,45 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
     [IO.File]::WriteAllText((Join-Path $processRoot 'Invoke-BoundedProcess.ps1'),$boundedStub,[Text.UTF8Encoding]::new($false))
     # Process effects are mocked at their native API boundary. Production exact
     # root/start-time target filtering and post-stop verification remain real.
-    function Start-Process {
-        [CmdletBinding()]param($FilePath,$WindowStyle,[switch]$PassThru)
-        if ($WindowStyle -ne 'Hidden' -or $FilePath -cne (Join-Path $SteamVRRoot 'bin/win64/vrstartup.exe')) { throw 'Unexpected fixture launch.' }
+    function Start-NormalInteractiveProcess {
+        [CmdletBinding()]param($FilePath,$DeadlineUtc)
+        if ($DeadlineUtc -le [DateTime]::UtcNow -or $FilePath -cne (Join-Path $SteamVRRoot 'bin/win64/vrstartup.exe')) { throw 'Unexpected fixture launch.' }
         [IO.File]::WriteAllText((Join-Path $SteamVRRoot 'launch.json'),(@{live=$true;startedUtc=[DateTime]::UtcNow.ToString('o')}|ConvertTo-Json -Compress))
-        [pscustomobject]@{Id=12345}
+        $case = Get-Content -LiteralPath (Join-Path $HeadPoseDriverRoot 'case.txt') -Raw
+        if ($case.StartsWith('log-')) {
+            $receipt=Get-Content -LiteralPath (Join-Path $EvidenceDirectory 'steamvr-null-runtime.receipt.json') -Raw|ConvertFrom-Json -Depth 80
+            if ($receipt.runtimeAccepted -or $receipt.startupLogAnchor.attemptId -cne $receipt.attemptId -or $receipt.startupLogAnchor.offset -ne ([IO.FileInfo]$ServerLogPath).Length) { throw 'Anchor was not persisted before fixture child launch.' }
+            switch ($case) {
+                'log-budget' { [IO.File]::AppendAllText($ServerLogPath, ("new noise`n" * 30000)) }
+                'log-replacement' { [IO.File]::Move($ServerLogPath, "$ServerLogPath.old"); [IO.File]::WriteAllText($ServerLogPath, 'same-name replacement') }
+                'log-truncation' { [IO.File]::WriteAllText($ServerLogPath, '') }
+                'log-mutation' { $edit=[IO.File]::Open($ServerLogPath,'Open','Write',[IO.FileShare]::ReadWrite); try{$edit.Position=0;$edit.WriteByte([byte][char]'X')}finally{$edit.Dispose()} }
+            }
+            if ($case.StartsWith('log-rotation-')) {
+                $previous=$receipt.startupLogAnchor.previousPath
+                [IO.File]::Move($ServerLogPath,$previous)
+                $s=Get-Content -LiteralPath (Join-Path $SteamVRRoot 'launch.json') -Raw|ConvertFrom-Json
+                $stamp=([DateTimeOffset]$s.startedUtc).LocalDateTime.ToString('ddd MMM d yyyy HH:mm:ss.fff',[cultureinfo]::InvariantCulture)
+                $config=[IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($SettingsPath))
+                $text=@("$stamp [Info] - vrserver 2.17.10 startup with PID=12345, config=$config, runtime=$SteamVRRoot, arch=win64",
+                    "$stamp [Info] - Loaded server driver null from driver_null.dll",
+                    "$stamp [Info] - Active HMD set to null.$($Profile['driver_null']['serialNumber'])",
+                    "$stamp [Info] - Loaded server driver codex_head_pose from driver_codex_head_pose.dll",
+                    "$stamp [Info] - codex_head_pose: registered synthetic head-pose device at configured standing pose") -join "`n"
+                [IO.File]::WriteAllText($ServerLogPath, $text+"`n")
+                switch($case){
+                    'log-rotation-missing' {[IO.File]::Move($previous,($previous+'.missing'))}
+                    'log-rotation-identity' {[IO.File]::Move($previous,($previous+'.copy'));[IO.File]::Copy(($previous+'.copy'),$previous)}
+                    'log-rotation-length' {[IO.File]::AppendAllText($previous,"changed`n")}
+                    'log-rotation-guard' {$edit=[IO.File]::Open($previous,'Open','Write',[IO.FileShare]::ReadWrite);try{$edit.Position=$receipt.startupLogAnchor.offset-1;$edit.WriteByte(88)}finally{$edit.Dispose()}}
+                    'log-rotation-pid' {[IO.File]::WriteAllText($ServerLogPath,$text.Replace('PID=12345,','PID=999,')+"`n")}
+                    'log-rotation-config' {[IO.File]::WriteAllText($ServerLogPath,$text.Replace("config=$config,","config=foreign,")+"`n")}
+                    'log-rotation-time' {$late=([DateTimeOffset]$s.startedUtc).LocalDateTime.AddSeconds(10).ToString('ddd MMM d yyyy HH:mm:ss.fff',[cultureinfo]::InvariantCulture);[IO.File]::WriteAllText($ServerLogPath,$text.Replace($stamp,$late)+"`n")}
+                    'log-rotation-later' {[IO.File]::WriteAllText($ServerLogPath,'')}
+                }
+            }
+        }
+        [pscustomobject]@{Id=12345;interactiveLaunch=@{normalUserAccessVerified=$true;method='synthetic-fixture'}}
     }
     function Stop-Process {
         [CmdletBinding()]param([int]$Id,[switch]$Force)
@@ -159,7 +204,7 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
         if($s.live){[pscustomobject]@{Id=12345}}
     }
     $kinds=@{empty='empty-output';undrained='stream-drain-incomplete';malformed='malformed-output';'package-drift'='provider-package-drift';continuity='continuity-failed';exit='bounded-process-failure';timeout='timeout';unqualified='observation-unqualified';'confirmation-malformed'='malformed-output'}
-    foreach ($case in @('empty','undrained','malformed','package-drift','continuity','exit','timeout','unqualified','confirmation-malformed','success','delayed-provider')) {
+    foreach ($case in @('empty','undrained','malformed','package-drift','continuity','exit','timeout','unqualified','confirmation-malformed','success','delayed-provider','insufficient-budget','log-budget','log-replacement','log-truncation','log-mutation','log-rotation-success','log-rotation-missing','log-rotation-identity','log-rotation-length','log-rotation-guard','log-rotation-pid','log-rotation-config','log-rotation-time','log-rotation-later')) {
         $caseRoot=Join-Path $fixture $case
         $script:currentSteamRoot=Join-Path $caseRoot 'SteamVR'
         $provider=Join-Path $caseRoot 'provider'
@@ -174,18 +219,37 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
         $openVR=Join-Path $caseRoot 'openvrpaths.vrpath'
         $log=Join-Path $caseRoot 'vrserver.txt'
         [IO.File]::WriteAllText($settings,'{"unrelated":{"retained":true}}')
-        [IO.File]::WriteAllText($log,'Synthetic log only.')
+        [IO.File]::WriteAllText($log,$(if($case.StartsWith('log-rotation-')){"Historical fixture line`n"*15000}else{'Synthetic log only.'}))
         [IO.File]::WriteAllText($openVR,(@{version=1;external_drivers=@($provider)}|ConvertTo-Json -Compress))
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../profiles/steamvr-null.profile.json') -Destination $profile
         $env:CSX_STEAMVR_TRANSACTION_ROOT=Join-Path $caseRoot 'transactions'
         $parameters=@{SettingsPath=$settings;NullProfilePath=$profile;SteamVRRoot=$script:currentSteamRoot;HeadPoseDriverRoot=$provider;ServerLogPath=$log;OpenVRPathsPath=$openVR;EvidenceDirectory=$evidence;Compact=$true;NoExit=$true}
         $apply=& $fixtureEntry apply @parameters|ConvertFrom-Json -Depth 80
         Assert-Startup ($apply.ok -and $apply.state -ceq 'null-applied') "$case real temporary apply transaction"
-        $result=& $fixtureEntry start @parameters -StartupTimeoutSeconds 10|ConvertFrom-Json -Depth 80
+        $startupSeconds=if($case -ceq 'insufficient-budget'){5}else{20}
+        $result=& $fixtureEntry start @parameters -StartupTimeoutSeconds $startupSeconds|ConvertFrom-Json -Depth 80
         if(-not $result.data.PSObject.Properties['runtimeReceiptPath']){throw "Public start did not reach attempt receipt: $($result|ConvertTo-Json -Depth 20 -Compress)"}
         $receipt=Get-Content -LiteralPath $result.data.runtimeReceiptPath -Raw|ConvertFrom-Json -Depth 80
-        $count=@(Get-Content -LiteralPath (Join-Path $provider 'dispatch-count.txt')).Count
-        if($case -in @('success','delayed-provider')){
+        $countPath=Join-Path $provider 'dispatch-count.txt'
+        $count=if(Test-Path -LiteralPath $countPath){@(Get-Content -LiteralPath $countPath).Count}else{0}
+        if($case -ceq 'log-rotation-success'){
+            Assert-Startup ($result.ok -and $receipt.runtimeAccepted -and $result.data.runtime.headPoseReady -and $result.data.runtime.controllersReady) 'real rotated reader reaches unchanged production qualification with synthetic native result only'
+            Assert-Startup ($count -eq 2 -and $receipt.runtimeConfirmationAttempted -and $receipt.runtime.startupLogProof.retained -and $receipt.runtime.startupLogProof.startupRotation.startupRecordVerified) 'rotated confirmation retains exact range/transition and normal bounded probe contract'
+            Assert-Startup ($receipt.runtime.startupLogProof.offset -eq 0 -and $receipt.startupLogAnchor.offset -gt 262144 -and $receipt.runtime.startupLogProof.bytesRead -eq 0) 'public rotated proof avoids history and never resets original anchor'
+        }elseif($case.StartsWith('log-')){
+            Assert-Startup (-not $result.ok -and $result.state -ceq 'startup-log-proof-acquisition-failed' -and $receipt.admissionState -ceq $result.state) "$case terminal log acquisition classification returned/persisted"
+            $expectedPolls=if($case -ceq 'log-rotation-later'){2}else{1}
+            Assert-Startup ($count -eq 0 -and $receipt.runtimeProbeAttempts -eq $expectedPolls -and -not $receipt.runtimeConfirmationAttempted -and -not $result.data.runtime.applicationHeadPose.probeAttempted) "$case terminal at first permanent failure, no native probe or futile repoll"
+            Assert-Startup (-not $receipt.runtimeAccepted -and -not $result.data.inputContract.measurementReady -and $result.data.runtime.startupLogProof.terminalFailure) "$case immutable failed-first proof remains nonaccepted"
+            Assert-Startup ($result.data.startupCleanup.verified -and @($result.data.startupCleanup.requested).Count -eq 1 -and $result.data.startupCleanup.requested[0].id -eq 12345 -and @($result.data.startupCleanup.remaining).Count -eq 0 -and @(Get-Content -LiteralPath (Join-Path $script:currentSteamRoot 'stopped.txt')).Count -eq 1) "$case real owner filtering/cleanup and survivor verification"
+            Assert-Startup ($receipt.lastRuntimeProbeError -ceq $result.data.runtime.startupLogProof.error -and ([DateTimeOffset]$receipt.failureObservedUtc) -lt ([DateTimeOffset]$receipt.startupDeadlineUtc)) "$case exact primary error before deadline preserved"
+        }elseif($case -ceq 'insufficient-budget'){
+            $application=$result.data.runtime.applicationHeadPose
+            Assert-Startup (-not $result.ok -and $result.state -ceq 'application-pose-probe-insufficient-budget' -and $receipt.admissionState -ceq $result.state) 'budget refusal public state/receipt agree'
+            Assert-Startup ($count -eq 0 -and -not $application.probeAttempted -and -not $application.timedOut -and $null -eq $application.boundedProcess -and $application.failureKind -ceq 'insufficient-probe-budget') 'public late budget never dispatches or claims timeout'
+            Assert-Startup ($application.probeBudget.deadlineUtc -ceq $receipt.qualificationDeadlineUtc -and $application.probeBudget.requiredMilliseconds -eq 11450 -and -not $application.probeBudget.admitted) 'probe admission excludes final verification reserve'
+            Assert-Startup (-not $receipt.runtimeAccepted -and $null -eq $receipt.acceptedUtc -and -not $receipt.runtimeConfirmationAttempted -and $result.data.startupCleanup.verified) 'budget refusal preserves failed receipt/exact cleanup without confirmation'
+        }elseif($case -in @('success','delayed-provider')){
             Assert-Startup ($result.ok -and $receipt.runtimeAccepted -and $result.data.runtime.headPoseReady -and $result.data.runtime.controllersReady) "$case successful production qualification retained"
             Assert-Startup ($count -eq 2 -and $receipt.runtimeConfirmationAttempted) "$case independent success confirmation retained"
             Assert-Startup (-not $result.data.runtime.applicationHeadPose.terminalFailure -and $null -eq $result.data.runtime.applicationHeadPose.failureKind) "$case success disposition"
@@ -218,7 +282,7 @@ if($case -ceq 'confirmation-malformed' -and $count -eq 2){$stdout='{confirmation
     @{ok=$true;passed=$passed;liveRuntimeUsed=$false;cases=$caseResults;replacedDependencies=@($replacements.name);externalStartupLogStub=$externalLogStub;productionStartLoopRetained=$true;productionProbeRetained=$true;productionContinuityRetained=$true;productionCleanupRetained=$true}|ConvertTo-Json -Depth 10 -Compress
 } finally {
     $env:CSX_STEAMVR_TRANSACTION_ROOT=$priorTransactionRoot
-    foreach($name in @('Start-Process','Stop-Process','Get-Process')){Remove-Item -LiteralPath ("Function:\$name") -ErrorAction SilentlyContinue}
+    foreach($name in @('Start-NormalInteractiveProcess','Stop-Process','Get-Process')){Remove-Item -LiteralPath ("Function:\$name") -ErrorAction SilentlyContinue}
     $resolved=[IO.Path]::GetFullPath($fixture)
     if(-not $resolved.StartsWith($temporary,[StringComparison]::OrdinalIgnoreCase) -or -not ([IO.Path]::GetFileName($resolved)).StartsWith('application-probe-startup-')){throw 'Refusing cleanup outside exact temporary fixture.'}
     if(Test-Path -LiteralPath $resolved){Remove-Item -LiteralPath $resolved -Recurse -Force}

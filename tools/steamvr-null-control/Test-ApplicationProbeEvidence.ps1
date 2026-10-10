@@ -26,14 +26,14 @@ try {
     foreach($directory in @($nullRoot,$processRoot,$providerRoot)){[IO.Directory]::CreateDirectory($directory)|Out-Null}
     [IO.File]::WriteAllText((Join-Path $providerRoot 'csx_openvr_pose_probe.exe'),'Never executed: bounded controller is a test fixture.')
     $boundedStub=@'
-param($FilePath,$ArgumentList,$WorkingDirectory,$MaxAttempts,$TimeoutSeconds,$TerminationGraceMilliseconds,$StreamDrainGraceMilliseconds,[switch]$NoExit,[switch]$Compact)
-if($MaxAttempts -ne 1 -or $ArgumentList -cne '--require-controllers' -or $TimeoutSeconds -gt 10 -or $TerminationGraceMilliseconds -ne 100 -or $StreamDrainGraceMilliseconds -ne 100){throw 'Production probe dispatch contract changed.'}
+param($FilePath,$ArgumentList,$WorkingDirectory,$MaxAttempts,$TimeoutSeconds,$TerminationGraceMilliseconds,$StreamDrainGraceMilliseconds,[switch]$NormalInteractiveUser,[switch]$NoExit,[switch]$Compact)
+if(-not $NormalInteractiveUser -or $MaxAttempts -ne 1 -or $ArgumentList -cne '--require-controllers' -or $TimeoutSeconds -gt 10 -or $TerminationGraceMilliseconds -ne 100 -or $StreamDrainGraceMilliseconds -ne 100){throw 'Production probe dispatch contract changed.'}
 [IO.File]::AppendAllText((Join-Path $PSScriptRoot 'dispatch-count.txt'),"one`n")
 Get-Content -LiteralPath (Join-Path $PSScriptRoot 'case.json') -Raw
 '@
     [IO.File]::WriteAllText((Join-Path $processRoot 'Invoke-BoundedProcess.ps1'),$boundedStub)
     $setup=@'
-param([string]$Fixture,[switch]$Expired,[switch]$NotReady)
+param([string]$Fixture,[switch]$Expired,[switch]$NotReady,[int]$RemainingMilliseconds=90000)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $HeadPoseDriverRoot=Join-Path $Fixture 'provider'
@@ -67,7 +67,7 @@ function Get-SharedTextTail {param($Path,$Count,$MaxBytes,$DeadlineUtc)
 '@
     $run=@'
 $profile=@{driver_null=@{serialNumber='Fixture'};dashboard=@{enableDashboard=$false};headPoseProviderContract=@{poseProbeRelativePath='tools/csx_openvr_pose_probe.exe';minimumQualifiedEyeHeightMeters=1;maximumQualifiedEyeHeightMeters=2.5}}
-$deadline=if($Expired){[DateTime]::UtcNow.AddSeconds(-1)}else{[DateTime]::UtcNow.AddSeconds(90)}
+$deadline=if($Expired){[DateTime]::UtcNow.AddSeconds(-1)}else{[DateTime]::UtcNow.AddMilliseconds($RemainingMilliseconds)}
 $process=[pscustomobject]@{name='vrserver';id=12345;path=(Join-Path $SteamVRRoot 'vrserver.exe');startTimeUtc=$serverStart.ToString('o')}
 Get-NullRuntimeEvidence -Processes @($process) -Profile $profile -DeadlineUtc $deadline | ConvertTo-Json -Depth 50 -Compress
 '@
@@ -109,8 +109,13 @@ Get-NullRuntimeEvidence -Processes @($process) -Profile $profile -DeadlineUtc $d
         Assert-Evidence (($result.applicationHeadPose.boundedProcess|ConvertTo-Json -Depth 10 -Compress) -ceq (($bounded|ConvertTo-Json -Depth 10 -Compress|ConvertFrom-Json)|ConvertTo-Json -Depth 10 -Compress)) "$shape retains exact bounded evidence"
     }
     $expired=& $harness -Fixture $fixture -Expired | ConvertFrom-Json -Depth 50
-    Assert-Evidence ($expired.applicationHeadPose.timedOut -and $null -eq $expired.applicationHeadPose.boundedProcess -and -not $expired.headPoseReady) 'insufficient outer budget retains explicit unexecuted/unknown probe outcome'
-    Assert-Evidence (-not $expired.applicationHeadPose.probeAttempted -and $expired.applicationHeadPose.terminalFailure -and $expired.applicationHeadPose.failureKind -ceq 'insufficient-budget') 'budget refusal is terminal but does not claim an executed probe'
+    Assert-Evidence (-not $expired.applicationHeadPose.timedOut -and $null -eq $expired.applicationHeadPose.boundedProcess -and -not $expired.headPoseReady) 'insufficient outer budget is a refusal, not an executed timeout'
+    Assert-Evidence (-not $expired.applicationHeadPose.probeAttempted -and $expired.applicationHeadPose.terminalFailure -and $expired.applicationHeadPose.failureKind -ceq 'insufficient-probe-budget') 'budget refusal is terminal but does not claim an executed probe'
+    foreach($remaining in @(2777,10450,11400)){
+        $late=& $harness -Fixture $fixture -RemainingMilliseconds $remaining | ConvertFrom-Json -Depth 50
+        Assert-Evidence (-not $late.applicationHeadPose.probeAttempted -and -not $late.applicationHeadPose.timedOut -and $late.applicationHeadPose.failureKind -ceq 'insufficient-probe-budget') "$remaining ms refuses without native dispatch"
+        Assert-Evidence (-not $late.applicationHeadPose.probeBudget.admitted -and $late.applicationHeadPose.probeBudget.requiredMilliseconds -eq 11450 -and $late.applicationHeadPose.probeBudget.probeTimeoutMilliseconds -eq 10000 -and $null -eq $late.applicationHeadPose.boundedProcess) "$remaining ms retains exact required/full probe budget"
+    }
     $notReady=& $harness -Fixture $fixture -NotReady | ConvertFrom-Json -Depth 50
     Assert-Evidence (-not $notReady.applicationHeadPose.probeAttempted -and -not $notReady.applicationHeadPose.terminalFailure -and $null -eq $notReady.applicationHeadPose.failureKind) 'pre-admission provider state is not a terminal probe outcome'
     Assert-Evidence (-not $notReady.headPoseReady -and -not $notReady.controllersReady) 'pre-admission observation remains unqualified'

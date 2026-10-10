@@ -11,11 +11,13 @@ $payloadPath = Join-Path $fixture 'payload.json'
 $stub = Join-Path $fixture 'bounded-fixture.ps1'
 [IO.File]::WriteAllText($probe, 'fixture only; never executed')
 $stubText = @'
-param($FilePath, [string[]]$ArgumentList, $WorkingDirectory, $MaxAttempts, $TimeoutSeconds, $TerminationGraceMilliseconds, $StreamDrainGraceMilliseconds, $RetryPatterns, $EvidenceDirectory, [switch]$NoExit, [switch]$Compact)
+param($FilePath, [string[]]$ArgumentList, $WorkingDirectory, $MaxAttempts, $TimeoutSeconds, $TerminationGraceMilliseconds, $StreamDrainGraceMilliseconds, $RetryPatterns, $EvidenceDirectory, [switch]$NormalInteractiveUser, [switch]$NoExit, [switch]$Compact)
+if(-not $NormalInteractiveUser){throw 'Original probe normal-interactive context was not requested.'}
 [pscustomobject]@{
     ok = $true
     argumentsReceived = @($ArgumentList)
-    attempts = @([pscustomobject]@{exitCode=0;timedOut=$false;stdout=[IO.File]::ReadAllText((Microsoft.PowerShell.Management\Join-Path $PSScriptRoot 'payload.json'))})
+    errors = @()
+    attempts = @([pscustomobject]@{exitCode=0;timedOut=$false;exitVerified=$true;jobQuiescent=$true;streamDrainComplete=$true;stderr='';stdout=[IO.File]::ReadAllText((Microsoft.PowerShell.Management\Join-Path $PSScriptRoot 'payload.json'))})
 } | ConvertTo-Json -Depth 15 -Compress
 '@
 [IO.File]::WriteAllText($stub, $stubText)
@@ -46,6 +48,7 @@ function New-FixturePose {
 function Read-PoseState { New-FixturePose }
 function Get-HeadPoseSharedState { param($Contract);New-FixturePose }
 $ExpectedPackageProvenanceSha256 = $null
+$ProbeDiagnosticFailedRoles = $false
 function New-Payload {
     [pscustomobject]@{
         ok=$true
@@ -100,11 +103,26 @@ try {
             $MinimumEyeHeightMeters=1.0; $MaximumEyeHeightMeters=2.5; $RequireControllers=$true
             if ($lane -eq 'head') { $observation = Invoke-PoseProbe -PreProbePose (New-FixturePose) }
             else { $observation=Get-ApplicationHeadPose -Contract @{poseProbeRelativePath='probe-fixture.exe';minimumQualifiedEyeHeightMeters=1.0;maximumQualifiedEyeHeightMeters=2.5} -PreProbePose (New-FixturePose) -PreProbePackageAuthority (Get-HeadPosePackageAuthority) }
-            if (-not $observation.available) { throw "Fixture probe failed: $($observation | ConvertTo-Json -Depth 10 -Compress)" }
             $run = if ($lane -eq 'head') { $observation.boundedRun } else { $observation.boundedProcess }
+            # The null owner deliberately returns available:false for a terminal
+            # unqualified observation; retained single dispatch is still required.
+            if (($expected -and -not $observation.available) -or $null -eq $run) { throw "Fixture probe failed: $($observation | ConvertTo-Json -Depth 10 -Compress)" }
             Assert-Controller ($observation.qualified -eq $expected) "$lane production probe function enforces controller gate: $case"
             Assert-Controller (@($run.argumentsReceived).Count -eq 1 -and $run.argumentsReceived[0] -ceq '--require-controllers') "$lane dispatches exact required-controller option"
         }
+        $ProbeDiagnosticFailedRoles=$true
+        foreach($short in @($false,$true)){
+            $payload=New-Payload
+            if($short){$payload.controllers.neutralSamples=99}
+            $payload|Add-Member -NotePropertyName failedRoleDiagnostics -NotePropertyValue @{diagnosticOnly=$true;devices=@(@{roleHint=1;assignedRole=0});controllerChannel=@{inputHealthy=1}}
+            [IO.File]::WriteAllText($payloadPath,($payload|ConvertTo-Json -Depth 15))
+            if($lane -eq 'head'){$observation=Invoke-PoseProbe -PreProbePose (New-FixturePose)}
+            else{$observation=Get-ApplicationHeadPose -Contract @{poseProbeRelativePath='probe-fixture.exe';minimumQualifiedEyeHeightMeters=1.0;maximumQualifiedEyeHeightMeters=2.5} -PreProbePose (New-FixturePose) -PreProbePackageAuthority (Get-HeadPosePackageAuthority) -DiagnosticFailedRoles}
+            $run=if($lane -eq 'head'){$observation.boundedRun}else{$observation.boundedProcess}
+            Assert-Controller ($observation.qualified -eq (-not $short)) "$lane diagnostic content cannot replace hundred-sample qualification"
+            Assert-Controller (($run.argumentsReceived -join '|') -ceq '--require-controllers|--diagnostic-failed-roles') "$lane one admitted probe receives exact role opt-in"
+        }
+        $ProbeDiagnosticFailedRoles=$false
     }
     $RequireControllers=$false
     $legacy=New-Payload; $legacy.PSObject.Properties.Remove('controllers')

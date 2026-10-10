@@ -1,8 +1,34 @@
 # SteamVR null-HMD control
 
+Startup and its single independent probe use a supported normal-interactive-user
+route with same user/session and suspended-child effective-context/access proof.
+The startup receipt retains the launcher proof, and bounded-process evidence
+retains the original probe proof. No RunAs, privilege/ACL repair, elevated Steam
+or global Codex change is performed. Setup is charged to the existing90-second
+startup and full ten-second probe admission; missing context fails closed.
+
+With a NEW exact Broker-verified role-capable native package,
+`-ProbeDiagnosticFailedRoles` opts into one capped inventory in the SAME failed
+required-controller probe: device identity/connection/finite pose, actual assigned
+role separately from role hint, and existing read-only controller input-health
+and instance telemetry. It cannot qualify a failed result or trigger a retry.
+The switch is default-off; do not pass it to an older package or relabel old
+provenance. `-ProbeDiagnosticPhases` remains separately opt-in.
+
 `Invoke-SteamVRNullControl.ps1` transactionally inspects, applies, starts, and
 restores the Valve null-HMD route. Apply always takes an exact settings backup,
 and restore requires its hash receipt.
+
+For an explicitly authorised diagnosis with a matching new exact native package,
+opt in with `-ProbeDiagnosticPhases`. The existing admitted independent probe
+then receives `--diagnostic-phases`: flushed fixed-domain stderr records identify
+entered/completed/aborted native call boundaries. The original stdout JSON,
+ten-second probe share, one attempt and package/creator/continuity/readiness gates
+are unchanged. Raw partial stderr stays in the bounded result even on timeout;
+it is diagnostic coverage, never pose readiness or historical root-cause proof.
+Older probes reject the flag, so new source alone does not enable live use.
+See `native/steamvr-head-pose/PROBE-PHASE-DIAGNOSTICS.md` for the output bound,
+truncation limits and source/build/live distinctions. Default behavior is unchanged.
 
 Applying settings is not runtime proof. `start` launches SteamVR and succeeds
 only after the current `vrserver` session logs both the Valve null driver load
@@ -166,6 +192,16 @@ central bounded-process controller. The probe and its process-tree cleanup are
 charged to the outer readiness deadline. Shared-memory protocol versions are
 admitted before size selection, and access-denied state is surfaced distinctly
 from a provider that is simply not running. A probe cannot outlive its timeout.
+Startup never shortens the independent probe's 10-second timeout to fit late
+provider readiness. After package/creator checks, admission requires 11450 ms
+before the qualification deadline: 10000 ms for the probe, 450 ms process-cleanup
+allowance and 1000 ms post-probe verification allowance. That deadline separately
+excludes the final log/receipt reserve from the unchanged outer startup cap.
+Insufficient budget returns `application-pose-probe-insufficient-budget` before
+dispatch, retaining the required/remaining budget and exact-attempt cleanup.
+It is not a native timeout or evidence of a hung OpenVR call. The existing
+successful-start confirmation also refuses its probe if the full budget is
+unavailable after its two-second wait; failures never trigger replay.
 If a start or qualification attempt fails, cleanup stops only
 SteamVR-root-owned processes whose creation time belongs to that attempt and
 reports the verified survivor inventory.
@@ -289,6 +325,64 @@ not be used for Skyrim through MO2. A running null SteamVR instance does not
 prove an application bypassing SteamVR is attached to it.
 
 Run `Test-SteamVRNullControl.ps1` after changing the control contract.
+
+### Attempt-relative startup log proof
+
+Before the owned launcher runs, `start` captures and persists a schema-2 log
+anchor in the nonaccepted runtime receipt: canonical selected path, OS physical
+file identity, prelaunch EOF offset, LF/partial-first-line framing, and SHA-256
+of at most 4096 boundary bytes. Historical bytes do not consume the unchanged
+`LogTailMaxBytes` attempt payload budget. The settings parent config directory and
+fixed sibling `<log-base>.previous<extension>` path are bound before launch.
+An existing file normally remains append-only. ONE prelaunch-to-first-server
+observation startup rotation is supported only when that fixed previous path
+contains the exact old physical identity, exact prelaunch EOF and boundary guard;
+a prelaunch alias of the old file is refused. The new selected identity on the
+same volume is pinned immediately, with range offset zero, while the original
+anchor remains unchanged. A delayed/partially framed current marker may remain
+pending, but no proof qualifies until its exact current PID, runtime, config and
+creation-time-correlated timestamp (also not before the anchor) match. This is
+a prospective pinned candidate, not permission to reanchor on a later poll.
+Archive identity/length/guard and current retained-range/selected-path identity
+are revalidated on every observation and confirmation. Missing/drifted archive,
+unknown replacement, rotation after any append observation, subsequent rotation,
+truncation, boundary mutation or retained-range mutation is terminal. If the
+path was absent before launch, it may be created once and remains physically
+bound after observation. Initial absence is pollable; disappearance after
+observation is terminal. Concurrent boundary advance during anchor capture
+refuses launch. Directory/access/identity failures are not treated as absence.
+
+The reader examines only the bounded window starting at that offset, skips any
+historical partial first line through its next LF, and publishes only fully
+LF-framed records. It requires the exact current server's startup PID, runtime
+root, config directory and creation-time-correlated timestamp before the existing exact-serial
+null/HMD and head-provider records. Byte/line/deadline caps remain unchanged;
+delayed observation and noisy moving-tail rollover do not slide the immutable
+startup window. Each observation hashes retained attempt bytes and the boundary
+guard, then reopens the selected path to verify identity, nontruncation and those
+same ranges before publication. These hashes are bounded range proofs, not a
+whole historical-file immutability claim. Timestamp parsing retains the existing
+local-log/UTC contract. Retained physical offsets are [inclusive, exclusive).
+
+Nonrecoverable acquisition errors return `startup-log-proof-acquisition-failed`
+on the first failed readiness observation, preserving the primary error and
+performing the existing exact-attempt cleanup; they do not cause futile repolls
+or a native probe. A later invocation may reuse only an exact accepted runtime
+receipt from the authoritative committed apply journal's evidence directory,
+and must revalidate its original physical identities, immutable transition and
+hashes. Accepted schema-1 append receipts remain append-only; they do not acquire
+rotation authority. Unknown
+anchors remain unqualified rather than being invented or silently migrated.
+This is log admission, not application/controller qualification: the separate
+probe, full probe budget and all 100-sample predicates remain mandatory.
+
+`Test-StartupLogProof.ps1 -FixtureRoot <temporary-fixture-root>` exercises bounded
+history/append/absent-create/startup-rotation/framing/identity/hash/deadline and
+accepted-receipt continuity, including archive and selected-path races.
+`Test-ApplicationProbeStartup.ps1` additionally drives the real public apply/start
+loop with temporary rotation success/faults and verifies first permanent failure
+termination, zero probe calls on invalid proof,
+nonaccepted receipts and exact owned cleanup. No live runtime is used.
 
 ## Resuming a retained environment under a new access lease
 
