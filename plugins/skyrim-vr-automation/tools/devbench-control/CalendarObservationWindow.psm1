@@ -62,8 +62,10 @@ function Invoke-DevBenchCalendarWindow {
           [Parameter(Mandatory)][string]$Owner,
           [AllowEmptyCollection()][array]$Observations=@(),
           [Collections.IDictionary]$ColourPlan,
+          [Collections.IDictionary]$StillSeriesPlan,
           [switch]$FixedAutoExposure,
           [scriptblock]$CompilerGuard,
+          [scriptblock]$PerformanceGuard,
           [ValidateRange(1,300000)][int]$HoldMilliseconds=60000,
           [Parameter(Mandatory)][datetime]$DeadlineUtc,
           [Parameter(Mandatory)][ValidateRange(1,2147483647)][int]$ExpectedProcessId,
@@ -96,7 +98,12 @@ function Invoke-DevBenchCalendarWindow {
     try {
         if($FixedAutoExposure -and $null -eq $ColourPlan){throw 'Fixed-AE baseline requires its exact typed colour plan.'}
         if ([string]::IsNullOrWhiteSpace($Owner) -or $Owner.Length -gt 128) { throw 'Calendar owner is required.' }
-        if ($null -ne $ColourPlan) {
+        if($null -ne $StillSeriesPlan){
+            Assert-CalendarStereoStillPlan $StillSeriesPlan
+            if($null -ne $ColourPlan -or $FixedAutoExposure -or $Observations.Count -ne 0 -or $null -eq $CompilerGuard -or $null -eq $PerformanceGuard){throw 'Typed still workflow is exclusive and requires compiler/neutrality admission.'}
+            if($HoldMilliseconds -lt ($DeadlineUtc-[datetime]::UtcNow).TotalMilliseconds){throw 'Still hold must cover the original total window.'}
+            if(([decimal]$StillSeriesPlan.sampleCount-1)*$StillSeriesPlan.minimumArmIntervalMilliseconds+1000 -ge ($workDeadline-[datetime]::UtcNow).TotalMilliseconds){throw 'Still minimum coverage cannot fit original work/cleanup budget; no hold dispatched.'}
+        } elseif ($null -ne $ColourPlan) {
             Assert-ColourMeasurementPlan $ColourPlan -FixedAutoExposure:$FixedAutoExposure
             if($Observations.Count -ne 0 -or $null -eq $CompilerGuard){throw 'Typed colour workflow cannot mix generic observations or omit compiler admission.'}
             if($FixedAutoExposure){
@@ -113,6 +120,7 @@ function Invoke-DevBenchCalendarWindow {
         if ($before.outstanding -or $before.expiryDue -or $before.cleanupPending -or $before.values.calendarRate -le 0) { throw 'Calendar initial state already has custody or unsupported progression.' }
         $binding=$before.binding
         if($null -ne $ColourPlan -and $binding.cellFormId -ne $ColourPlan.expectedCellFormId){throw 'Colour calibrated cell differs from fresh calendar binding.'}
+        if($null -ne $StillSeriesPlan -and $binding.cellFormId -ne $StillSeriesPlan.expectedCellFormId){throw 'Still expected cell differs from fresh calendar binding.'}
         $holdAttempted=$true
         $held=Get-CalendarPayload (Invoke-WindowCall calendar @{action='hold';owner=$Owner;commandId=$holdId;binding=$binding;holdMs=$HoldMilliseconds} $true $workDeadline)
         # Retain only an exact owner/command/source lease for finally, even if
@@ -156,6 +164,20 @@ function Invoke-DevBenchCalendarWindow {
                 return $response
             }
             if(-not $measurement.ok){$uncertain=[bool]$measurement.indeterminate;throw ('Colour measurement: '+($measurement.errors -join '; '))}
+        }
+        if($null -ne $StillSeriesPlan){
+            $measurement=Invoke-CalendarStereoStillSeries -Plan $StillSeriesPlan -DeadlineUtc $workDeadline -CleanupDeadlineUtc $DeadlineUtc.AddSeconds(-5) -CompilerGuard $CompilerGuard -PerformanceGuard $PerformanceGuard -Call {
+                param($name,$argsMap,$mutation,$bound)
+                if($name -cne 'communityshaders.screenshot' -or $argsMap.action -cnotin @('capture','request_get','request_cancel') -or $mutation -ne ($argsMap.action -cne 'request_get')){throw 'Still workflow rejects non-owned capture operations.'}
+                return Invoke-WindowCall $name $argsMap $mutation $bound
+            } -CalendarGuard {
+                param($bound)
+                $current=Get-CalendarPayload (Invoke-WindowCall calendar @{action='status'} $false $bound)
+                Assert-CalendarReadback $current
+                $currentLease=Assert-CalendarLease $current $Owner $holdId $binding
+                if($currentLease.id -cne $lease.id -or -not (Test-CalendarBindingEqual $current.binding $binding) -or -not $current.holdValid -or -not $current.leaseActive -or -not $current.outstanding -or $current.expiryDue -or $current.cleanupPending -or $current.values.calendarRate -ne 0 -or $current.values.engineMultiplier -ne $before.values.engineMultiplier -or $current.values.gameHour -ne $before.values.gameHour -or $current.values.daysPassed -ne $before.values.daysPassed){throw 'Original still calendar custody/values changed.'}
+            }
+            if(-not $measurement.ok){$uncertain=[bool]$measurement.indeterminate;throw ('Still measurement: '+($measurement.errors -join '; '))}
         }
         foreach ($observation in $Observations) {
             $current=Get-CalendarPayload (Invoke-WindowCall calendar @{action='status'} $false $workDeadline)
