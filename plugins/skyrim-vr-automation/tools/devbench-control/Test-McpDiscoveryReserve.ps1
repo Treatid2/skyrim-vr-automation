@@ -9,7 +9,7 @@ $text=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'Invoke-DevBenchControl.ps
 $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseInput($text,[ref]$tokens,[ref]$errors)
 if(@($errors).Count){throw 'Source parse failed'}
-foreach($name in @('Get-RequestTimeoutSeconds','Assert-OwnershipDiscoveryDeadline','Get-McpSessionHeaderValue','Invoke-McpRequest','Open-McpSession','Close-OwnedMcpSession','Close-AllMcpSessions','Close-McpSession','Write-TerminalInvocationEvidence')){
+foreach($name in @('Get-HttpFailureEvidenceSnapshot','Retain-HttpFailureEvidence','Get-RequestTimeoutSeconds','Assert-OwnershipDiscoveryDeadline','Get-McpSessionHeaderValue','Invoke-McpRequest','Open-McpSession','Close-OwnedMcpSession','Close-AllMcpSessions','Close-McpSession','Write-TerminalInvocationEvidence')){
  $nodes=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name},$true))
  if($nodes.Count-ne 1){throw "Ambiguous source boundary: $name"}
  . ([scriptblock]::Create($nodes[0].Extent.Text))
