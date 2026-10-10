@@ -72,7 +72,16 @@ $results=& $module {
   $out.firstPublicReceiptIdentity=$status.data.controller.launchFailureReceiptPath -ceq $receiptPath -and (Get-FileHash -LiteralPath $receiptPath).Hash -ceq $receiptHash
   $canonicalLockData=ConvertTo-MO2LaunchEvidenceCanonicalValue $status.data.sessionLock.data | ConvertTo-Json -Depth 24 -Compress
   $out.firstPublicLockGeneration=$status.data.sessionLock.data.generation -eq 4 -and $status.data.sessionLock.status -ceq 'launch-failed' -and $status.data.controller.lockStatus -ceq $status.data.sessionLock.status
-  $out.firstPublicWholeLockIdentity=$canonicalLockData -ceq (ConvertTo-MO2LaunchEvidenceCanonicalValue $durable.data | ConvertTo-Json -Depth 24 -Compress) -and $canonicalLockData -ceq (ConvertTo-MO2LaunchEvidenceCanonicalValue $manifest | ConvertTo-Json -Depth 24 -Compress)
+  # Newer integrations intentionally redact private access fields. Compare the
+  # complete PUBLIC projection, not private durable data, without weakening the
+  # generation/evidence identity checks or changing production redaction.
+  $publicDurable=$durable.data;$publicManifest=$manifest
+  if(Get-Command ConvertTo-MO2PublicValue -ErrorAction SilentlyContinue){
+   $publicDurable=ConvertTo-MO2PublicValue $durable.data
+   $publicManifest=ConvertTo-MO2PublicValue $manifest
+   $out.firstPublicPrivateFieldsAbsent=-not $status.data.sessionLock.data.PSObject.Properties['accessId'] -and -not $status.data.sessionLock.data.PSObject.Properties['accessCredentialSha256'] -and -not $status.data.sessionLock.data.PSObject.Properties['humanMutationId'] -and -not $status.data.sessionLock.data.PSObject.Properties['humanMutationHash']
+  }
+  $out.firstPublicWholeLockIdentity=$canonicalLockData -ceq (ConvertTo-MO2LaunchEvidenceCanonicalValue $publicDurable | ConvertTo-Json -Depth 24 -Compress) -and $canonicalLockData -ceq (ConvertTo-MO2LaunchEvidenceCanonicalValue $publicManifest | ConvertTo-Json -Depth 24 -Compress)
   $lockHash=(Get-FileHash -LiteralPath $cfg.session.lockFile).Hash
   $manifestHash=(Get-FileHash -LiteralPath (Join-Path $durable.data.sessionPath 'session.json')).Hash
   $repeat=Status 'interrupted'
