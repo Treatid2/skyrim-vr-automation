@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Full public apply/start transactions. Only process, log, package and shared-state
 # boundaries are synthetic; native executables and live runtime are never called.
-[CmdletBinding()]
-param([string]$FixtureRoot = [IO.Path]::GetTempPath())
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$fixture = Join-Path $FixtureRoot ('application-probe-startup-' + [guid]::NewGuid().ToString('N'))
-$temporary = [IO.Path]::GetFullPath($FixtureRoot).TrimEnd('\') + '\'
+$fixture = Join-Path ([IO.Path]::GetTempPath()) ('application-probe-startup-' + [guid]::NewGuid().ToString('N'))
+$temporary = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
 $priorTransactionRoot = $env:CSX_STEAMVR_TRANSACTION_ROOT
 $passed = 0
 $caseResults = @()
@@ -15,7 +13,7 @@ function Assert-Startup([bool]$Condition, [string]$Message) {
     $script:passed++
 }
 try {
-    if (-not ([IO.Path]::GetFullPath($fixture)).StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase)) { throw 'Fixture escaped its explicit storage boundary.' }
+    if (-not ([IO.Path]::GetFullPath($fixture)).StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase)) { throw 'Fixture escaped OS temporary storage.' }
     $nullRoot = Join-Path $fixture 'tools/steamvr-null-control'
     $processRoot = Join-Path $fixture 'tools/process-control'
     $authorityRoot = Join-Path $fixture 'tools/steamvr-head-pose-control'
