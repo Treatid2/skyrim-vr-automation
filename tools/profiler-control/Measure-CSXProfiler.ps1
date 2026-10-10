@@ -32,6 +32,7 @@ function Invoke-DevBenchNormalizer([string]$Name, $Response) {
 }
 
 function Write-JsonAtomic([string]$Path, $Value) {
+    if (Test-Path -LiteralPath $Path -PathType Container) { throw "JSON publication target is a directory: $Path" }
     $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
     try {
         [IO.File]::WriteAllText($temporary, ($Value | ConvertTo-Json -Depth 80), [Text.UTF8Encoding]::new($false))
@@ -83,6 +84,13 @@ function Get-MetricSummary([double[]]$Values) {
 
 function Assert-Finite([double]$Value, [string]$Name) {
     if ([double]::IsNaN($Value) -or [double]::IsInfinity($Value)) { throw "Profiler metric '$Name' is not finite." }
+}
+
+function ConvertTo-FiniteProfilerMetric($Value, [string]$Name) {
+    if ($null -eq $Value -or $Value -is [bool] -or ($Value -is [string] -and [string]::IsNullOrWhiteSpace($Value))) { throw "Profiler metric '$Name' is not a numeric value." }
+    $number = [double]$Value
+    Assert-Finite $number $Name
+    return $number
 }
 
 function Get-ProfilerControlRoot([string]$CanonicalRuntimePath) {
@@ -490,13 +498,13 @@ try {
             Start-ProfilerDelay -RequestedMilliseconds ([Math]::Min(50, $IntervalMs))
         } while ([DateTime]::UtcNow -lt $freshDeadline)
         if ($frame -le $lastFrame) { throw "Profiler did not advance beyond frame $lastFrame within $FreshFrameTimeoutSeconds seconds." }
-        $resolvedTotal = [double]$status.resolvedTotalMs
-        $resolvedCpuTotal = [double]$status.resolvedCpuTotalMs
+        $resolvedTotal = ConvertTo-FiniteProfilerMetric $status.resolvedTotalMs 'resolvedTotalMs'
+        $resolvedCpuTotal = ConvertTo-FiniteProfilerMetric $status.resolvedCpuTotalMs 'resolvedCpuTotalMs'
         Assert-Finite $resolvedTotal 'resolvedTotalMs'
         Assert-Finite $resolvedCpuTotal 'resolvedCpuTotalMs'
         foreach ($timer in @($status.timers)) {
             foreach ($metric in @('gpuMs', 'topLevelMs', 'cpuMs')) {
-                if ($timer.PSObject.Properties[$metric]) { Assert-Finite ([double]$timer.$metric) "$($timer.name).$metric" }
+                if ($timer.PSObject.Properties[$metric]) { $null = ConvertTo-FiniteProfilerMetric $timer.$metric "$($timer.name).$metric" }
             }
         }
         $records.Add([pscustomobject][ordered]@{
@@ -571,15 +579,38 @@ if ($evidenceErrors.Count -gt 0) {
     throw "Profiler capture evidence is incomplete $evidenceState. $restorationSummary $($evidenceErrors -join '; '). Receipt: $receiptPath"
 }
 if ($captureFailure) { throw "$captureFailure $restorationSummary Receipt: $receiptPath" }
+# Reporting is distinct from the completed capture/restoration transaction. Retain
+# the original selected records before any fallible aggregation or derived output.
+$rawPath = Join-Path $runDirectory "$safeLabel.raw.json"
+$summaryPath = Join-Path $runDirectory "$safeLabel.summary.json"
+$csvPath = Join-Path $runDirectory "$safeLabel.timers.csv"
+$reportReceiptPath = Join-Path $runDirectory 'report.receipt.json'
+$reportFallbackPath = Join-Path $controlRoot "report-$transactionId.receipt.json"
+$reportReceipt = [ordered]@{
+    schemaVersion = 1; operation = 'publish-profiler-report'; transactionId = $transactionId
+    captureReceiptPath = $receiptPath; captureState = $receipt.state
+    priorEnabled = $receipt.priorEnabled; finalEnabled = $receipt.finalEnabled; stateRestored = $receipt.stateRestored
+    state = 'publishing'; phase = 'raw-publication'; error = $null; startedUtc = [DateTime]::UtcNow.ToString('o')
+    selectedSamples = $records.Count; rawPath = $rawPath; rawRetained = $false; rawSha256 = $null
+    summaryPath = $summaryPath; summaryPublished = $false; csvPath = $csvPath; csvPublished = $false
+}
+try {
+Write-JsonAtomic $rawPath @($records)
+$reportReceipt.rawSha256 = (Get-FileHash -LiteralPath $rawPath -Algorithm SHA256).Hash
+$reportReceipt.rawRetained = $true
+$reportReceipt.phase = 'report-receipt-publication'
+Write-JsonAtomic $reportReceiptPath $reportReceipt
+$reportReceipt.phase = 'aggregation'
 if ($records.Count -ne $Samples -or @($records.frame | Sort-Object -Unique).Count -ne $Samples) { throw 'Profiler capture did not produce the requested number of unique fresh frames.' }
-
 $endedUtc = [DateTime]::UtcNow
 $timerRows = foreach ($record in $records) {
     foreach ($timer in $record.timers) {
         [pscustomobject][ordered]@{
             sample = $record.sample; timestampUtc = $record.timestampUtc; frame = $record.frame; name = [string]$timer.name
             activeGpu = [bool]$timer.activeGpu; activeCpu = [bool]$timer.activeCpu; hasGpu = [bool]$timer.hasGpu; hasCpu = [bool]$timer.hasCpu
-            gpuMs = [double]$timer.gpuMs; topLevelMs = [double]$timer.topLevelMs; cpuMs = [double]$timer.cpuMs
+            gpuMs = ConvertTo-FiniteProfilerMetric $timer.gpuMs "$($timer.name).gpuMs"
+            topLevelMs = ConvertTo-FiniteProfilerMetric $timer.topLevelMs "$($timer.name).topLevelMs"
+            cpuMs = ConvertTo-FiniteProfilerMetric $timer.cpuMs "$($timer.name).cpuMs"
         }
     }
 }
@@ -587,7 +618,8 @@ $timerSummaries = foreach ($group in ($timerRows | Group-Object name | Sort-Obje
     $activeGpu = @($group.Group | Where-Object { $_.activeGpu -and $_.hasGpu })
     [pscustomobject][ordered]@{
         name = $group.Name; observedSamples = $group.Count; activeGpuSamples = $activeGpu.Count
-        gpuMs = Get-MetricSummary ([double[]]@($activeGpu.gpuMs)); topLevelMs = Get-MetricSummary ([double[]]@($activeGpu.topLevelMs))
+        gpuMs = Get-MetricSummary ([double[]]@($activeGpu | ForEach-Object { $_.gpuMs }))
+        topLevelMs = Get-MetricSummary ([double[]]@($activeGpu | ForEach-Object { $_.topLevelMs }))
         cpuMs = Get-MetricSummary ([double[]]@($group.Group | Where-Object { $_.activeCpu -and $_.hasCpu } | ForEach-Object cpuMs))
     }
 }
@@ -620,13 +652,31 @@ $summary = [pscustomobject][ordered]@{
     resolvedTotalMs = Get-MetricSummary ([double[]]@($records.resolvedTotalMs)); resolvedCpuTotalMs = Get-MetricSummary ([double[]]@($records.resolvedCpuTotalMs))
     maxSlotRefusals = [int](($records | Measure-Object slotRefusals -Maximum).Maximum); timers = @($timerSummaries)
 }
-$rawPath = Join-Path $runDirectory "$safeLabel.raw.json"
-$summaryPath = Join-Path $runDirectory "$safeLabel.summary.json"
-$csvPath = Join-Path $runDirectory "$safeLabel.timers.csv"
-Write-JsonAtomic $rawPath @($records)
+$reportReceipt.phase = 'summary-publication'
 Write-JsonAtomic $summaryPath $summary
+$reportReceipt.summaryPublished = $true
+$reportReceipt.phase = 'csv-publication'
 $timerSummaries | ForEach-Object {
     [pscustomobject][ordered]@{ name = $_.name; observedSamples = $_.observedSamples; activeGpuSamples = $_.activeGpuSamples; gpuMeanMs = $_.gpuMs.mean; gpuMedianMs = $_.gpuMs.median; gpuP95Ms = $_.gpuMs.p95; gpuP99Ms = $_.gpuMs.p99; gpuMaxMs = $_.gpuMs.max; topLevelMeanMs = $_.topLevelMs.mean; cpuMeanMs = $_.cpuMs.mean }
 } | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding utf8
+$reportReceipt.csvPublished = $true
+$reportReceipt.state = 'completed'; $reportReceipt.phase = 'completed'
+$reportReceipt.completedUtc = [DateTime]::UtcNow.ToString('o')
+Write-JsonAtomic $reportReceiptPath $reportReceipt
+}
+catch {
+    $reportError = $_.Exception.Message
+    if ($reportReceipt.phase -eq 'completed') { $reportReceipt.phase = 'report-receipt-publication' }
+    $reportReceipt.state = 'failed'; $reportReceipt.error = $reportError
+    $reportReceipt.completedUtc = [DateTime]::UtcNow.ToString('o')
+    $reportEvidenceErrors = [Collections.Generic.List[string]]::new()
+    try { Write-JsonAtomic $reportReceiptPath $reportReceipt }
+    catch { $reportEvidenceErrors.Add("Report receipt unavailable: $($_.Exception.Message)") }
+    # Per-transaction fallback avoids touching the shared recovery journal after
+    # lease release, even if another capture has already acquired that lease.
+    try { Write-JsonAtomic $reportFallbackPath $reportReceipt }
+    catch { $reportEvidenceErrors.Add("Fallback receipt unavailable: $($_.Exception.Message)") }
+    throw "Profiler report failed during $($reportReceipt.phase): $reportError $restorationSummary Raw retained: $($reportReceipt.rawRetained). Report receipt: $reportReceiptPath; fallback: $reportFallbackPath. $($reportEvidenceErrors -join '; ')"
+}
 
-[pscustomobject][ordered]@{ ok = $true; label = $Label; transactionId = $transactionId; rawPath = $rawPath; summaryPath = $summaryPath; csvPath = $csvPath; receiptPath = $receiptPath; summary = $summary } | ConvertTo-Json -Depth 80
+[pscustomobject][ordered]@{ ok = $true; label = $Label; transactionId = $transactionId; rawPath = $rawPath; summaryPath = $summaryPath; csvPath = $csvPath; receiptPath = $receiptPath; reportReceiptPath = $reportReceiptPath; summary = $summary } | ConvertTo-Json -Depth 80
