@@ -190,7 +190,27 @@ if ($action -eq 'enable' -and $env:CSX_PROFILER_TEST_BREAK_MIRROR -eq '1') {
     'blocked-evidence-directory' | Set-Content -LiteralPath $EvidenceDirectory -Encoding utf8
 }
 $timer = [pscustomobject]@{name='Synthetic';activeGpu=$true;activeCpu=$true;hasGpu=$true;hasCpu=$true;gpuMs=1.0;topLevelMs=1.0;cpuMs=0.1}
+switch ($env:CSX_PROFILER_TEST_TIMER_MODE) {
+    'cpu-only' { $timer.activeGpu=$false; $timer.hasGpu=$false }
+    'inactive' { $timer.activeGpu=$false; $timer.activeCpu=$false }
+    'malformed' { $timer.gpuMs='not-a-number' }
+    'nonfinite' { $timer.gpuMs='NaN' }
+    'null' { $timer.gpuMs=$null }
+    'blank' { $timer.gpuMs='' }
+    'boolean' { $timer.gpuMs=$false }
+    'infinity' { $timer.gpuMs='Infinity' }
+    'missing' { $timer.PSObject.Properties.Remove('cpuMs') }
+}
 $status = [pscustomobject]@{enabled=[bool]$state.enabled;frame_count=[long]$state.frame;capturedFrameCount=[long]$state.frame;resolvedTotalMs=1.0;resolvedCpuTotalMs=0.1;acquiredSlots=1;slotRefusals=0;timers=@($timer)}
+if ($env:CSX_PROFILER_TEST_TIMER_MODE -eq 'empty') { $status.timers=@() }
+if ($action -eq 'disable' -and $env:CSX_PROFILER_TEST_REPORT_BLOCK) {
+    $journal=Get-Content -LiteralPath (Join-Path $env:CSX_PROFILER_CONTROL_ROOT 'transaction.journal.json') -Raw|ConvertFrom-Json
+    $capture=Get-Content -LiteralPath $journal.receiptPath -Raw|ConvertFrom-Json
+    $label=($capture.label -replace '[^A-Za-z0-9_.-]', '_').Trim('_')
+    $blockedPath=Join-Path (Split-Path -Parent $journal.receiptPath) "$label.$($env:CSX_PROFILER_TEST_REPORT_BLOCK)"
+    if ($env:CSX_PROFILER_TEST_REPORT_BLOCK -eq 'receipt') { $blockedPath=Join-Path (Split-Path -Parent $journal.receiptPath) 'report.receipt.json' }
+    $null=New-Item -ItemType Directory -Path $blockedPath
+}
 $data = [ordered]@{content=@([pscustomobject]@{ok=$true;status=$status})}
 if ($RequirePerformanceNeutral) {
     $distorted = (-not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DISTORT_ACTION) -and $env:CSX_PROFILER_TEST_DISTORT_ACTION -eq $action) -or (-not [string]::IsNullOrWhiteSpace($env:CSX_PROFILER_TEST_DISTORT_LABEL) -and $env:CSX_PROFILER_TEST_DISTORT_LABEL -eq $EvidenceLabel)
@@ -243,6 +263,48 @@ $semantic = if ($optionalUnavailable) { [pscustomobject]@{known=$true;ok=$false;
     Assert-Test (@($measurement.summary.performanceObservations | Where-Object { -not $_.window.valid -or $_.guard.performanceEpoch -ne 7 }).Count -eq 0) 'measurement retains one valid performance epoch across the capture'
     Assert-Test (@($measurement.summary.performanceObservations | Where-Object { $_.action -in @('renderscale-before', 'renderscale-after') }).Count -eq 2) 'capture-wide performance evidence includes both render-scale snapshots'
     Assert-Test (@($measurement.summary.performanceObservations | Where-Object { -not $_.sessionCleanup.ok }).Count -eq 0) 'measurement preserves final MCP cleanup evidence for every guarded profiler call'
+
+    foreach ($mode in @('cpu-only','inactive','empty','numeric')) {
+        [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
+        $env:CSX_PROFILER_TEST_TIMER_MODE=$mode
+        $measured=& $measure -Label $mode -EvidenceDirectory (Join-Path $resolvedTestRoot $mode) -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl|ConvertFrom-Json
+        $report=Get-Content -LiteralPath $measured.reportReceiptPath -Raw|ConvertFrom-Json
+        $original=@(Get-Content -LiteralPath $measured.rawPath -Raw|ConvertFrom-Json)
+        Assert-Test ($measured.ok -and $original.Count -eq 3 -and $report.state -eq 'completed' -and $report.rawRetained -and $report.stateRestored -and $report.rawSha256 -eq (Get-FileHash -LiteralPath $measured.rawPath).Hash) "$mode publishes original samples with separate completed reporting receipt and exact restoration"
+        if ($mode -eq 'empty') {
+            Assert-Test (@($measured.summary.timers).Count -eq 0) 'timerless records retain valid totals and an empty group collection'
+        } else {
+            $group=@($measured.summary.timers)[0]
+            if ($mode -eq 'numeric') {
+                Assert-Test ($group.gpuMs.count -eq 3 -and $group.gpuMs.mean -eq 1 -and $group.topLevelMs.mean -eq 1 -and [Math]::Abs($group.cpuMs.mean - 0.1) -lt 0.000001) 'valid numeric aggregation remains unchanged'
+            } else {
+                Assert-Test ($group.activeGpuSamples -eq 0 -and $group.gpuMs.count -eq 0 -and $null -eq $group.gpuMs.mean -and $null -eq $group.topLevelMs.mean) "$mode zero GPU observations remain unknown cost, not fabricated zero"
+                Assert-Test (($mode -eq 'cpu-only' -and $group.cpuMs.count -eq 3 -and [Math]::Abs($group.cpuMs.mean - 0.1) -lt 0.000001) -or ($mode -eq 'inactive' -and $group.cpuMs.count -eq 0 -and $null -eq $group.cpuMs.mean)) "$mode preserves CPU metric activity semantics"
+            }
+        }
+    }
+    foreach ($mode in @('malformed','nonfinite','null','blank','boolean','infinity','missing','summary-block','csv-block','receipt-block')) {
+        [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
+        $env:CSX_PROFILER_TEST_TIMER_MODE=$mode
+        $env:CSX_PROFILER_TEST_REPORT_BLOCK=if($mode -eq 'summary-block'){'summary.json'}elseif($mode -eq 'csv-block'){'timers.csv'}elseif($mode -eq 'receipt-block'){'receipt'}else{''}
+        $caseRoot=Join-Path $resolvedTestRoot $mode; $caseError=$null
+        try { & $measure -Label $mode -EvidenceDirectory $caseRoot -ContextJson $contextJson -Samples 3 -WarmupSamples 0 -IntervalMs 50 -RuntimePath $runtimePath -DevBenchControlPath $fakeControl|Out-Null } catch { $caseError=$_.Exception.Message }
+        $caseDirectory=@(Get-ChildItem -LiteralPath $caseRoot -Directory)[0].FullName
+        $capture=Get-Content -LiteralPath (Join-Path $caseDirectory 'capture.receipt.json') -Raw|ConvertFrom-Json
+        $final=Get-Content -LiteralPath $statePath -Raw|ConvertFrom-Json
+        Assert-Test ($caseError -and $capture.stateRestored -and -not $final.enabled -and $capture.restoreErrors.Count -eq 0) "$mode failure preserves verified restoration and no runtime replay"
+        if ($mode -in @('missing','summary-block','csv-block','receipt-block')) {
+            $fallback=Get-Content -LiteralPath (Join-Path $env:CSX_PROFILER_CONTROL_ROOT "report-$($capture.transactionId).receipt.json") -Raw|ConvertFrom-Json
+            $report=if($mode -eq 'receipt-block'){$fallback}else{Get-Content -LiteralPath (Join-Path $caseDirectory 'report.receipt.json') -Raw|ConvertFrom-Json}
+            $raw=@(Get-Content -LiteralPath $report.rawPath -Raw|ConvertFrom-Json)
+            Assert-Test ($capture.state -eq 'completed' -and $null -eq $capture.captureError -and $report.state -eq 'failed' -and $fallback.error -eq $report.error -and $report.rawRetained -and $raw.Count -eq 3 -and $report.rawSha256 -eq (Get-FileHash -LiteralPath $report.rawPath).Hash) "$mode post-capture failure retains exact selected raw samples and separate durable failure evidence"
+            $expectedPhase=if($mode -eq 'missing'){'aggregation'}elseif($mode -eq 'summary-block'){'summary-publication'}elseif($mode -eq 'receipt-block'){'report-receipt-publication'}else{'csv-publication'}
+            Assert-Test ($report.phase -eq $expectedPhase -and -not $report.csvPublished -and $report.summaryPublished -eq ($mode -eq 'csv-block')) "$mode accurately identifies partial publication without claiming a complete report"
+        } else {
+            Assert-Test ($capture.state -eq 'rolled-back' -and $capture.captureError -and -not (Test-Path -LiteralPath (Join-Path $caseDirectory "$mode.summary.json"))) "$mode metric rejected before report admission instead of coercing invalid data to zero"
+        }
+    }
+    Remove-Item Env:CSX_PROFILER_TEST_TIMER_MODE,Env:CSX_PROFILER_TEST_REPORT_BLOCK
 
     [IO.File]::WriteAllText($statePath, '{"enabled":false,"frame":0,"calls":0,"renderScaleCalls":0}', [Text.UTF8Encoding]::new($false))
     $env:CSX_PROFILER_TEST_RENDER_SCALE_EPOCH_AFTER = '1'
@@ -381,6 +443,7 @@ $semantic = if ($optionalUnavailable) { [pscustomobject]@{known=$true;ok=$false;
     ) -ge 0) 'profiler contract restores caller-owned state'
 }
 finally {
+    Remove-Item Env:CSX_PROFILER_TEST_TIMER_MODE,Env:CSX_PROFILER_TEST_REPORT_BLOCK -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_STATE -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_REQUIRE_BOOTSTRAP -ErrorAction SilentlyContinue
     Remove-Item Env:CSX_PROFILER_TEST_DRIFT_AT_CALL -ErrorAction SilentlyContinue

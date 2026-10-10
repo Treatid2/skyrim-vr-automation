@@ -24,6 +24,17 @@ calls in the recovery reserve write beneath the authoritative control root.
 Losing the optional run directory therefore remains an explicit evidence error
 without preventing identity-bound restoration of the surviving runtime.
 
+Report publication is a separate phase after capture and restoration. Selected
+original samples are written atomically to `*.raw.json` and hashed before
+aggregation or summary/CSV publication. CPU-only and inactive GPU groups retain
+zero observations with null summary values, not invented zero GPU cost.
+Missing, malformed, null or nonfinite metrics cannot become accepted summaries.
+`report.receipt.json` identifies the reporting phase, raw retention/hash and any
+partial derived publication. A reporting failure leaves the capture receipt's
+verified restoration facts unchanged and also attempts a per-transaction receipt
+under the control root; it never overwrites the shared recovery journal after
+lease release. Report failure is not capture failure or a complete report.
+
 Every non-restoration profiler call uses the central controller's
 `-RequirePerformanceNeutral` guard. If the standalone temporal probe is
 registered, each call requires a proven neutral physical state and unchanged
