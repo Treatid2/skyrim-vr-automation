@@ -26,18 +26,22 @@ function Test-CalendarBindingEqual($Left,$Right) {
     return $Left.cellFormId -eq $Right.cellFormId
 }
 
+function Assert-CalendarValueSet($Values) {
+    if ($Values -isnot [pscustomobject]) { throw 'Fresh calendar values are missing.' }
+    foreach ($name in @('year','month','day','gameHour','daysPassed','calendarRate','engineMultiplier')) {
+        $property=$Values.PSObject.Properties[$name]
+        if (-not $property -or $null -eq $property.Value -or $property.Value.GetType() -notin @([int],[long],[uint32],[uint64],[double],[single],[decimal]) -or -not [double]::IsFinite([double]$property.Value)) { throw "Invalid calendar value $name." }
+    }
+    if ($Values.engineMultiplier -le 0 -or $Values.year -lt 0 -or $Values.month -lt 0 -or $Values.month -ge 12 -or $Values.day -lt 1 -or $Values.day -gt 31 -or $Values.gameHour -lt 0 -or $Values.gameHour -ge 24 -or $Values.daysPassed -lt 0) { throw 'Calendar values are outside the native operating boundary.' }
+}
+
 function Assert-CalendarReadback($Payload) {
     if ($Payload -isnot [pscustomobject]) { throw 'Calendar requires one structured native payload.' }
     foreach ($name in @('ok','readbackFresh','available','worldLoaded')) { if (-not $Payload.PSObject.Properties[$name] -or $Payload.$name -isnot [bool] -or -not $Payload.$name) { throw "Calendar $name is not positively qualified." } }
     foreach ($name in @('outstanding','leaseActive','expiryDue','cleanupPending','holdValid','serviceStopping','restored')) { if (-not $Payload.PSObject.Properties[$name] -or $Payload.$name -isnot [bool]) { throw "Calendar $name must be Boolean." } }
     if ($Payload.serviceStopping -or $null -eq $Payload.schemaVersion -or $Payload.schemaVersion.GetType() -notin @([int],[long],[uint32],[uint64]) -or $Payload.schemaVersion -ne 1 -or $Payload.plugin -isnot [string] -or $Payload.plugin -cne 'devbench' -or $Payload.status -isnot [string]) { throw 'Unsupported calendar state/schema.' }
     Assert-CalendarBinding $Payload.binding
-    if ($Payload.values -isnot [pscustomobject]) { throw 'Fresh calendar values are missing.' }
-    foreach ($name in @('year','month','day','gameHour','daysPassed','calendarRate','engineMultiplier')) {
-        $property=$Payload.values.PSObject.Properties[$name]
-        if (-not $property -or $null -eq $property.Value -or $property.Value.GetType() -notin @([int],[long],[uint32],[uint64],[double],[single],[decimal]) -or -not [double]::IsFinite([double]$property.Value)) { throw "Invalid calendar value $name." }
-    }
-    if ($Payload.values.engineMultiplier -le 0 -or $Payload.values.year -lt 0 -or $Payload.values.month -lt 0 -or $Payload.values.month -ge 12 -or $Payload.values.day -lt 1 -or $Payload.values.day -gt 31 -or $Payload.values.gameHour -lt 0 -or $Payload.values.gameHour -ge 24 -or $Payload.values.daysPassed -lt 0) { throw 'Calendar values are outside the native operating boundary.' }
+    Assert-CalendarValueSet $Payload.values
 }
 
 function Assert-CalendarLease($Payload,[string]$Owner,[string]$CommandId,$Binding) {
@@ -53,6 +57,15 @@ function Test-CalendarPositiveCleanupReason($Reason) {
     # Native Tick may retire the same lease before explicit release dispatch.
     # Reason is corroboration only; callers still require all custody/readback proof.
     return $Reason -is [string] -and $Reason -cin @('released','expired','scene_lost')
+}
+
+function Assert-CalendarStillHeldBaseline($Payload,$CurrentLease,$Baseline) {
+    Assert-CalendarValueSet $CurrentLease.captured
+    if($CurrentLease.id -cne $Baseline.leaseId){throw 'Original still calendar lease changed.'}
+    foreach($name in @('year','month','day','gameHour','daysPassed','calendarRate','engineMultiplier')){
+        if($CurrentLease.captured.$name -ne $Baseline.values.$name){throw 'Original still calendar captured baseline changed.'}
+        if($name -cne 'calendarRate' -and $Payload.values.$name -ne $Baseline.values.$name){throw 'Original still calendar held values changed.'}
+    }
 }
 
 function Invoke-DevBenchCalendarWindow {
@@ -72,7 +85,7 @@ function Invoke-DevBenchCalendarWindow {
           [ValidateRange(5,30)][int]$CleanupSeconds=15)
     $holdId=[guid]::NewGuid().ToString(); $releaseId=[guid]::NewGuid().ToString()
     $trace=[Collections.Generic.List[object]]::new(); $errors=[Collections.Generic.List[string]]::new()
-    $lease=$null; $binding=$null; $holdAttempted=$false; $restorationVerified=$false; $continuity=$false; $uncertain=$false; $measurement=$null
+    $lease=$null; $binding=$null; $holdAttempted=$false; $restorationVerified=$false; $continuity=$false; $uncertain=$false; $measurement=$null; $heldBaseline=$null
     # Reserve a bounded cleanup budget from the outset, not an indefinite finally.
     $workDeadline=$DeadlineUtc.AddSeconds(-$CleanupSeconds)
     function Invoke-WindowCall([string]$Name,[hashtable]$Arguments,[bool]$Mutation,[datetime]$Bound) {
@@ -166,6 +179,15 @@ function Invoke-DevBenchCalendarWindow {
             if(-not $measurement.ok){$uncertain=[bool]$measurement.indeterminate;throw ('Colour measurement: '+($measurement.errors -join '; '))}
         }
         if($null -ne $StillSeriesPlan){
+            # Time may advance between the prehold status and native acquisition.
+            # Pin a detached immutable-value snapshot from the ORIGINAL admitted
+            # lease, never reanchor to a later status or allow held drift.
+            Assert-CalendarValueSet $lease.captured
+            if($lease.captured.calendarRate -ne $before.values.calendarRate -or $lease.captured.engineMultiplier -ne $before.values.engineMultiplier){throw 'Still acquisition changed prior rate or engine multiplier.'}
+            $capturedValues=[ordered]@{}
+            foreach($name in @('year','month','day','gameHour','daysPassed','calendarRate','engineMultiplier')){$capturedValues[$name]=$lease.captured.$name}
+            $heldBaseline=[pscustomobject]@{basis='original-admitted-lease-captured';leaseId=$lease.id;values=[pscustomobject]$capturedValues}
+            Assert-CalendarStillHeldBaseline $held $lease $heldBaseline
             $measurement=Invoke-CalendarStereoStillSeries -Plan $StillSeriesPlan -DeadlineUtc $workDeadline -CleanupDeadlineUtc $DeadlineUtc.AddSeconds(-5) -CompilerGuard $CompilerGuard -PerformanceGuard $PerformanceGuard -Call {
                 param($name,$argsMap,$mutation,$bound)
                 if($name -cne 'communityshaders.screenshot' -or $argsMap.action -cnotin @('capture','request_get','request_cancel') -or $mutation -ne ($argsMap.action -cne 'request_get')){throw 'Still workflow rejects non-owned capture operations.'}
@@ -175,7 +197,8 @@ function Invoke-DevBenchCalendarWindow {
                 $current=Get-CalendarPayload (Invoke-WindowCall calendar @{action='status'} $false $bound)
                 Assert-CalendarReadback $current
                 $currentLease=Assert-CalendarLease $current $Owner $holdId $binding
-                if($currentLease.id -cne $lease.id -or -not (Test-CalendarBindingEqual $current.binding $binding) -or -not $current.holdValid -or -not $current.leaseActive -or -not $current.outstanding -or $current.expiryDue -or $current.cleanupPending -or $current.values.calendarRate -ne 0 -or $current.values.engineMultiplier -ne $before.values.engineMultiplier -or $current.values.gameHour -ne $before.values.gameHour -or $current.values.daysPassed -ne $before.values.daysPassed){throw 'Original still calendar custody/values changed.'}
+                if($currentLease.id -cne $lease.id -or -not (Test-CalendarBindingEqual $current.binding $binding) -or -not $current.holdValid -or -not $current.leaseActive -or -not $current.outstanding -or $current.expiryDue -or $current.cleanupPending -or $current.values.calendarRate -ne 0){throw 'Original still calendar custody/values changed.'}
+                Assert-CalendarStillHeldBaseline $current $currentLease $heldBaseline
             }
             if(-not $measurement.ok){$uncertain=[bool]$measurement.indeterminate;throw ('Still measurement: '+($measurement.errors -join '; '))}
         }
@@ -223,6 +246,6 @@ function Invoke-DevBenchCalendarWindow {
             catch { $errors.Add("Calendar cleanup: $($_.Exception.Message)"); $uncertain=$true }
         }
     }
-    return [pscustomobject]@{ ok=($errors.Count -eq 0 -and $continuity -and $restorationVerified); continuityVerified=$continuity; restorationVerified=$restorationVerified; indeterminate=$uncertain; measurement=$measurement; owner=$Owner; holdCommandId=$holdId; releaseCommandId=$releaseId; lease=$lease; calls=@($trace); errors=@($errors); completionBasis='bounded-calendar-state-bracket-not-atomic-render'; disconnectRestorationClaimed=$false }
+    return [pscustomobject]@{ ok=($errors.Count -eq 0 -and $continuity -and $restorationVerified); continuityVerified=$continuity; restorationVerified=$restorationVerified; indeterminate=$uncertain; measurement=$measurement; heldBaseline=$heldBaseline; owner=$Owner; holdCommandId=$holdId; releaseCommandId=$releaseId; lease=$lease; calls=@($trace); errors=@($errors); completionBasis='bounded-calendar-state-bracket-not-atomic-render'; disconnectRestorationClaimed=$false }
 }
 Export-ModuleMember -Function Invoke-DevBenchCalendarWindow

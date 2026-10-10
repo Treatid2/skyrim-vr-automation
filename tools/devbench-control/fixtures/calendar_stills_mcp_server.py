@@ -71,7 +71,7 @@ class Handler(BaseHTTPRequestHandler):
         (root/'events.json').write_text(json.dumps(events),encoding='utf-8')
     def do_DELETE(self):self.record('DELETE');self.reply({})
     def do_POST(self):
-        global lease, restored, snapshot_count, neutral_count
+        global lease, restored, snapshot_count, neutral_count, values
         rpc=json.loads(self.rfile.read(int(self.headers['Content-Length'])));method=rpc['method'];args=rpc.get('params',{});self.record(method,args)
         if method=='notifications/initialized': self.reply({});return
         if method=='initialize':result=dict(protocolVersion='2025-03-26',capabilities={},serverInfo=dict(name='offline-stills',version='1'))
@@ -85,7 +85,10 @@ class Handler(BaseHTTPRequestHandler):
             if name=='inspect':p=dict(pid=os.getpid(),exe=Path(sys.executable).name,port=self.server.server_port,frame=1,lastTaskFrame=1,pendingTasks=0,vr=True)
             elif name=='calendar':
                 action=q['action']
-                if action=='hold':lease=dict(id='stills-lease',owner=q['owner'],commandId=q['commandId'],binding=copy.deepcopy(binding),applied=True,captured=values.copy())
+                if action=='hold':
+                    if mode=='prehold-advance':
+                        values=dict(values,gameHour=12.000960350036622,daysPassed=1.0000399947166443)
+                    lease=dict(id='stills-lease',owner=q['owner'],commandId=q['commandId'],binding=copy.deepcopy(binding),applied=True,captured=values.copy())
                 if action=='release':
                     if q['leaseId']!=lease['id'] or q['owner']!=lease['owner'] or q['binding']!=lease['binding']:raise ValueError('foreign release')
                     restored=mode!='release-failed'
@@ -93,7 +96,18 @@ class Handler(BaseHTTPRequestHandler):
                 if mode=='cell-drift' and capture_count:b['cellFormId']=8
                 active=bool(lease) and not restored
                 p=dict(ok=True,action=action,status='held' if action=='hold' else 'released' if action=='release' else 'observed',schemaVersion=1,plugin='devbench',binding=b,readbackFresh=True,available=True,worldLoaded=True,values=dict(values,calendarRate=0 if active else 20),outstanding=active,leaseActive=active,expiryDue=False,cleanupPending=False,holdValid=active,serviceStopping=False,restored=restored,lastTransition=dict(ok=True,status='released',restored=restored))
-                if lease:p['lease']=lease
+                if lease:p['lease']=copy.deepcopy(lease)
+                if active and action=='status':
+                    if mode=='held-drift-hour':p['values']['gameHour']+=0.0001
+                    if mode=='held-drift-days':p['values']['daysPassed']+=0.0001
+                    if mode=='held-drift-date':p['values']['day']+=1
+                    if mode=='held-drift-engine':p['values']['engineMultiplier']=2
+                    if mode=='captured-drift':p['lease']['captured']['gameHour']+=0.0001
+                    if mode=='held-lease-id':p['lease']['id']='foreign-lease'
+                    if mode=='held-expiry':p['expiryDue']=True
+                if active and action=='hold':
+                    if mode=='captured-missing':del p['lease']['captured']['gameHour']
+                    if mode=='captured-type':p['lease']['captured']['daysPassed']='1'
             elif name=='communityshaders.screenshot':p,tool_error=screenshot(q)
             elif name=='skyrimvrupscaler.temporalProbe':
                 neutral_count+=1;p=dict(performanceDistorted=mode=='nonneutral',physicalStateKnown=True,performanceEpoch=neutral_count if mode=='epoch-drift' else 1)

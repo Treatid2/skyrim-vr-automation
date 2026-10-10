@@ -41,6 +41,14 @@ producer schema. Capability advertisement alone does not authorize an `observe`
 enum bypass. Until that independent contract is supplied, do not call this series
 a post-position pose-qualified or quiet scientific comparison.
 
+The immutable held-clock baseline comes from the exact original admitted lease's
+captured values, not the earlier pre-hold status. Natural advancement before
+acquisition is allowed; prior-rate/engine changes are refused. Every still guard
+requires unchanged captured year/month/day/hour/days/rate/engine values, actual
+held values matching that original baseline (rate zero), and all original
+owner/command/id/binding/expiry/cleanup predicates. No tolerance, later-status
+reanchor, retry or deadline expansion is used. The detached baseline is retained.
+
 Each unique command requests HMD-submission/no-fallback, left/right PNG SDR-sRGB,
 no clipboard, unique exact paths and overwrite-never. Fresh compiler first/after
 snapshots and neutral standalone-probe registration/epoch checks bracket each
