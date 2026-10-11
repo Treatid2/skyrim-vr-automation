@@ -30,7 +30,7 @@ $before=@{};foreach($path in @($dll,$pdb,$planPath,$receiptPath)){$before[$path]
 $invoke=InvokeArgs;$priorSnapshot=Get-VerifiedNativeInstallPlan @invoke
 Check 'preloaded admission-only helper has no custody type yet' ($priorSnapshot.ok -and
  $null -ne ('SkyrimVRAutomation.NativePlanFileProofV1' -as [type]) -and
- $null -eq ('SkyrimVRAutomation.NativePlanPayloadCustodyV1' -as [type]))
+ $null -eq ('SkyrimVRAutomation.NativePlanPayloadCustodyV2' -as [type]))
 $custody=OpenCustody
 try {
  Check 'exact disposable custody, two payloads, not disposed' ($custody -is [IDisposable] -and $custody.PayloadCount -eq 2 -and -not $custody.IsDisposed)
@@ -46,7 +46,7 @@ try {
  Check 'captured validation has no mutable setter' (-not $changed)
  $validation.files[0].sha256='0'*64
  Check 'caller projection cannot change captured immutable validation' (($custody.ValidationJson|ConvertFrom-Json).files[0].sha256 -ceq $plan.files[0].sha256)
- Check 'no payload streams/copy/callback exposed' (@($custody.PSObject.Properties|Where-Object Name -match 'stream|handle').Count -eq 0 -and $null -eq $custody.PSObject.Methods['CopyTo'])
+ Check 'no payload streams or generic callback exposed' (@($custody.PSObject.Properties|Where-Object Name -match 'stream|handle').Count -eq 0 -and $null -eq $custody.PSObject.Methods['CopyTo'])
 }finally{$custody.Dispose()}
 $custody.Dispose()
 Check 'explicit disposal is idempotent and releases both files' ($custody.IsDisposed -and (CanWrite $dll) -and (CanWrite $pdb))

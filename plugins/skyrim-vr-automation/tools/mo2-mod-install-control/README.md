@@ -65,10 +65,35 @@ closes every acquired handle; successful callers must use `try/finally` and call
 expire custody; the future staging owner must enforce its complete process budget.
 The immutable `ValidationJson` is evidence only, not serializable handle custody,
 private holder authority, a restart/replay capability or installation permission.
-No payload stream, staging/copy/publication method or generic callback is exposed.
+No source payload stream, filesystem staging/publication method or generic callback is exposed.
 These file handles block cooperating writes/deletes to their files, not DOS mapping
 changes or all ancestor mutation; no atomic cross-file/ancestor identity claim.
 Disposed custody is ended, even though its captured validation remains readable.
+
+The V2 custody object provides one `CopyToValidatedStreams(Stream[], DateTime)`
+attempt. Supply exactly one empty, readable/writable/seekable exact FileStream or
+MemoryStream per validation-file ordinal, and an absolute UTC deadline no more
+than60s ahead. Custom subclasses and duplicate stream references refuse. All
+targets are checked before the first write; their reference array is cloned.
+Bytes come from the SAME pinned source handles, not reopened paths. Each copied
+source must still match its admitted size/hash, and the complete destination set
+is independently reread after the final write before a content receipt returns.
+Expected sizes/hashes are cloned separately from mutable caller projections.
+The deadline is checked between bounded64KiB I/O operations; blocked OS I/O is
+not hard-preempted. Use the owning bounded process wrapper for the whole workflow.
+Dispose and copy serialize on the custody object. Any failure closes all source
+handles and returns no qualified copy receipt. A second attempt refuses; there
+is no automatic retry. Caller-owned destination streams remain open and any
+partial bytes remain untouched for accountable owner recovery; do not confuse a
+partial write with verified content or silently delete it.
+
+This is stream-content qualification, NOT a protected Data-root stage, unique
+destination/ancestor identity proof, durable disk flush, atomic publication,
+holder validation or installation authority. The caller must own destinations
+and keep other writers out. A readback is a sequential observation, not protection
+against later destination mutation. Successful custody remains held until explicit
+Dispose. V2 is initialized independently of the earlier V1/FileProofV1 types so
+an already-loaded admission helper does not prevent the new implementation.
 
 The future installer must stage this exact set, persist its uniquely owned
 publication journal, and publish a new directory under the supported holder
@@ -76,8 +101,9 @@ transaction. It must release that nonreentrant lock before the existing
 independently guarded `add-enable` service. Revocation/drift between stages must
 retain truthful deployed-not-enabled custody; committed refresh failure is not
 rolled back or called ready. Existing add-enable owns DLL priority and conservative
-retirement. This module implements only admission and in-process payload read
-custody, none of the staging/publication/journal/holder/add-enable stages.
+retirement. This module implements admission, in-process payload read custody and
+single-attempt verified stream copying, none of the protected filesystem
+staging/publication/journal/holder/add-enable stages.
 
 Fixtures use synthetic native bytes and receipts in an explicit fixture root;
 they do not launch or manipulate MO2, Skyrim, SteamVR or a real lease.

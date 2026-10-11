@@ -5,24 +5,118 @@ $ErrorActionPreference = 'Stop'
 # Independent type initialization allows a process that already loaded the
 # original admission-only FileProofV1 to use custody without redefining it.
 function Initialize-NativePlanPayloadCustody {
-    if ('SkyrimVRAutomation.NativePlanPayloadCustodyV1' -as [type]) { return }
+    if ('SkyrimVRAutomation.NativePlanPayloadCustodyV2' -as [type]) { return }
     Add-Type -TypeDefinition @'
 using System;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
+using System.Globalization;
 namespace SkyrimVRAutomation {
     // In-process read custody only. No deployment, ownership or replay token.
-    public sealed class NativePlanPayloadCustodyV1 : IDisposable {
+    public sealed class NativePlanPayloadCustodyV2 : IDisposable {
         private FileStream[] streams;
+        private readonly long[] sizes;
+        private readonly string[] hashes;
+        private readonly object gate = new object();
+        private bool copyAttempted;
         public string ValidationJson { get; }
         public int PayloadCount { get; }
-        public bool IsDisposed { get { return streams == null; } }
-        public NativePlanPayloadCustodyV1(string validationJson, FileStream[] payloads) {
+        public bool IsDisposed { get { lock (gate) { return streams == null; } } }
+        public NativePlanPayloadCustodyV2(string validationJson, FileStream[] payloads, long[] bytes, string[] sha256) {
+            if (payloads == null || bytes == null || sha256 == null || payloads.Length < 1 || payloads.Length > 32 ||
+                payloads.Length != bytes.Length || bytes.Length != sha256.Length) throw new ArgumentException("Invalid payload set.");
+            long total = 0;
+            for (int i = 0; i < bytes.Length; i++) {
+                if (payloads[i] == null || bytes[i] < 1 || bytes[i] > 268435456 || sha256[i] == null ||
+                    !System.Text.RegularExpressions.Regex.IsMatch(sha256[i], "\\A[a-f0-9]{64}\\z")) throw new ArgumentException("Invalid payload expectation.");
+                total += bytes[i];
+            }
+            if (total > 536870912) throw new ArgumentException("Payload byte budget exceeded.");
             ValidationJson = validationJson;
             PayloadCount = payloads.Length;
             streams = (FileStream[])payloads.Clone();
+            sizes = (long[])bytes.Clone();
+            hashes = (string[])sha256.Clone();
+        }
+        private static void Deadline(DateTime deadline) {
+            if (DateTime.UtcNow >= deadline) throw new TimeoutException("Native payload copy deadline exceeded.");
+        }
+        private string ReadHash(Stream stream, long expected, DateTime deadline, Stream output) {
+            Deadline(deadline);
+            if (stream.Length != expected) throw new InvalidOperationException("Native payload copy length mismatch.");
+            stream.Position = 0;
+            var buffer = new byte[65536];
+            long count = 0;
+            using (var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256)) {
+                int read;
+                while (true) {
+                    Deadline(deadline);
+                    read = stream.Read(buffer, 0, buffer.Length);
+                    Deadline(deadline);
+                    if (read == 0) break;
+                    count += read;
+                    if (count > expected) throw new InvalidOperationException("Native payload copy grew beyond its expected length.");
+                    hash.AppendData(buffer, 0, read);
+                    if (output != null) { output.Write(buffer, 0, read); Deadline(deadline); }
+                }
+                if (count != expected || stream.Length != expected) throw new InvalidOperationException("Native payload copy length mismatch.");
+                return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+            }
+        }
+        // Single attempt, exact pinned source handles. Caller retains destination
+        // ownership and partial bytes on failure. This is content proof only.
+        public string CopyToValidatedStreams(Stream[] destinations, DateTime deadlineUtc) {
+            lock (gate) {
+                if (streams == null) throw new ObjectDisposedException("NativePlanPayloadCustodyV2");
+                try {
+                    if (copyAttempted) throw new InvalidOperationException("Native payload copy already attempted.");
+                    copyAttempted = true;
+                    var now = DateTime.UtcNow;
+                    if (deadlineUtc.Kind != DateTimeKind.Utc || deadlineUtc <= now || deadlineUtc > now.AddSeconds(60))
+                        throw new ArgumentException("Copy requires an unexpired UTC deadline within sixty seconds.");
+                    if (destinations == null || destinations.Length != streams.Length) throw new ArgumentException("Exact destination count required.");
+                    // Capture the array so caller mutation cannot retarget the transaction.
+                    var outputs = (Stream[])destinations.Clone();
+                    for (int i = 0; i < outputs.Length; i++) {
+                        Deadline(deadlineUtc);
+                        var target = outputs[i];
+                        if (target == null || (target.GetType() != typeof(FileStream) && target.GetType() != typeof(MemoryStream)) ||
+                            !target.CanRead || !target.CanWrite || !target.CanSeek || target.Length != 0 || target.Position != 0)
+                            throw new ArgumentException("Destinations must be empty exact FileStream or MemoryStream instances with read/write/seek access.");
+                        for (int j = 0; j < i; j++) if (Object.ReferenceEquals(target, outputs[j])) throw new ArgumentException("Duplicate destination stream.");
+                    }
+                    for (int i = 0; i < outputs.Length; i++) {
+                        if (!String.Equals(ReadHash(streams[i], sizes[i], deadlineUtc, outputs[i]), hashes[i], StringComparison.Ordinal))
+                            throw new InvalidOperationException("Pinned source copy hash mismatch.");
+                        outputs[i].Flush();
+                        Deadline(deadlineUtc);
+                    }
+                    // Verify the entire copied set after the final write, not only
+                    // each earlier stream before a later stream could alter it.
+                    var receipt = new StringBuilder("{\"schema\":\"mo2.native-payload-stream-copy.1\",\"ok\":true,\"publicationPerformed\":false,\"deploymentPerformed\":false,\"files\":[");
+                    for (int i = 0; i < outputs.Length; i++) {
+                        if (!String.Equals(ReadHash(outputs[i], sizes[i], deadlineUtc, null), hashes[i], StringComparison.Ordinal))
+                            throw new InvalidOperationException("Copied payload readback hash mismatch.");
+                        if (i != 0) receipt.Append(',');
+                        receipt.Append("{\"ordinal\":").Append(i.ToString(CultureInfo.InvariantCulture)).Append(",\"bytes\":")
+                            .Append(sizes[i].ToString(CultureInfo.InvariantCulture)).Append(",\"sha256\":\"").Append(hashes[i])
+                            .Append("\",\"readbackVerified\":true}");
+                    }
+                    Deadline(deadlineUtc);
+                    return receipt.Append("]}").ToString();
+                } catch {
+                    // Every failure ends source custody. Preserve the original
+                    // exception, and attempt every close without touching outputs.
+                    try { Dispose(); } catch { }
+                    throw;
+                }
+            }
         }
         public void Dispose() {
-            var owned = System.Threading.Interlocked.Exchange(ref streams, null);
+            lock (gate) {
+            var owned = streams;
+            streams = null;
             if (owned == null) return;
             // Attempt every close even if one OS close reports an error.
             Exception first = null;
@@ -30,6 +124,7 @@ namespace SkyrimVRAutomation {
                 try { stream.Dispose(); } catch (Exception error) { if (first == null) first = error; }
             }
             if (first != null) throw first;
+            }
         }
     }
 }
@@ -326,8 +421,9 @@ function Get-NativeInstallPlanCore {
         Initialize-NativePlanPayloadCustody
         $validationJson=$result | ConvertTo-Json -Depth 12 -Compress
         Assert-NativePlanDeadline $deadline
-        $custody=[SkyrimVRAutomation.NativePlanPayloadCustodyV1]::new(
-            $validationJson, $held.ToArray())
+        $custody=[SkyrimVRAutomation.NativePlanPayloadCustodyV2]::new(
+            $validationJson, $held.ToArray(), [long[]]@($verified | ForEach-Object bytes),
+            [string[]]@($verified | ForEach-Object sha256))
         Assert-NativePlanDeadline $deadline
         $custodyTransferred=$true
         return $custody
