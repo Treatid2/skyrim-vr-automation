@@ -65,6 +65,39 @@ $legacy=Invoke-Plan @{} @('Activation','MaxActivationWaitMs','ExecutionWithinSel
 Assert-Selection ($legacy.ok -and -not $legacy.arguments.PSObject.Properties['activation']) 'omitted selectors preserve existing planner behavior'
 $immediate=Invoke-Plan @{Activation='immediate';ExecutionWithinSelectedGeometry=$true} @('MaxActivationWaitMs')
 Assert-Selection ($immediate.ok -and $immediate.arguments.executionWithinSelectedGeometry) 'supported immediate selection preserves true Boolean'
+$ad25=$registry|ConvertTo-Json -Depth 30|ConvertFrom-Json -Depth 30
+$ad25.result.producerBuildId='91278a15be065cee3cd583d80b29991f9ae4d19b472b54717418052c8fcb8fff'
+$ad25.result.geometrySelection.executionWithinSelectedGeometry='optional; when true, draws require either an active selected geometry scope or the one-shot same-thread next-draw handoff from selected SetupGeometry'
+$ad25|Add-Member contract ([pscustomobject]@{name='communityshaders.render-map';major=1;minor=26;schemaRevision=28})
+$ad25|Add-Member server ([pscustomobject]@{sourceCommit='ad25cd6edfb5f3d2da8386cb07a43c34e3d5efda';buildId=$ad25.result.producerBuildId;sourceDirty=$false})
+$ad25Path=Write-Fixture $ad25
+$r=Invoke-Plan @{RegistryPath=$ad25Path}
+Assert-Selection $r.ok 'exact source-bound AD25 prose descriptor admitted by production planner'
+$receipt=Get-Content -LiteralPath $r.receiptPath -Raw|ConvertFrom-Json -Depth 30
+Assert-Selection ($r.arguments.executionWithinSelectedGeometry -is [bool] -and -not $r.arguments.executionWithinSelectedGeometry -and $receipt.arguments.executionWithinSelectedGeometry -is [bool] -and -not $receipt.arguments.executionWithinSelectedGeometry) 'AD25 explicit false survives returned and immutable requests'
+Assert-Selection ($receipt.startSelection.geometryCapabilityQualification.basis -ceq 'source-bound-ad25-descriptive-native-boolean' -and $receipt.startSelection.geometryCapabilityQualification.handlerGitBlob -ceq '443db2b24a27fa4a9ef80d8818e4f6705d09643a' -and $receipt.registrySha256 -ceq (Get-FileHash -LiteralPath $ad25Path).Hash) 'exact AD25 compatibility basis and original registry hash retained'
+Assert-Selection (($r.arguments|ConvertTo-Json -Depth 20 -Compress) -ceq ($receipt.arguments|ConvertTo-Json -Depth 20 -Compress)) 'AD25 returned request equals published receipt'
+$r=Invoke-Plan @{RegistryPath=$ad25Path;Activation='immediate';ExecutionWithinSelectedGeometry=$true} @('MaxActivationWaitMs')
+Assert-Selection ($r.ok -and $r.arguments.executionWithinSelectedGeometry -is [bool] -and $r.arguments.executionWithinSelectedGeometry) 'AD25 supported immediate true remains distinct from late false'
+foreach($case in @('no-contract','no-server','no-major','no-minor','no-revision','no-source','no-build','no-dirty','major-string','major-array','minor-float','minor-array','minor-drift','revision-drift','revision-string','name-drift','source-drift','source-array','build-drift','build-array','producer-drift','dirty-true','dirty-string','dirty-array','description-case','description-space','description-array')) {
+    $bad=$ad25|ConvertTo-Json -Depth 30|ConvertFrom-Json -Depth 30
+    switch($case) {
+        'no-contract'{$bad.PSObject.Properties.Remove('contract')}; 'no-server'{$bad.PSObject.Properties.Remove('server')}
+        'no-major'{$bad.contract.PSObject.Properties.Remove('major')}; 'no-minor'{$bad.contract.PSObject.Properties.Remove('minor')}; 'no-revision'{$bad.contract.PSObject.Properties.Remove('schemaRevision')}
+        'no-source'{$bad.server.PSObject.Properties.Remove('sourceCommit')}; 'no-build'{$bad.server.PSObject.Properties.Remove('buildId')}; 'no-dirty'{$bad.server.PSObject.Properties.Remove('sourceDirty')}
+        'major-string'{$bad.contract.major='1'}; 'major-array'{$bad.contract.major=@(1)}; 'minor-float'{$bad.contract.minor=26.5}; 'minor-array'{$bad.contract.minor=@(26)}; 'minor-drift'{$bad.contract.minor=27}
+        'revision-drift'{$bad.contract.schemaRevision=29}; 'revision-string'{$bad.contract.schemaRevision='28'}; 'name-drift'{$bad.contract.name='foreign'}
+        'source-drift'{$bad.server.sourceCommit='0'*40}; 'source-array'{$bad.server.sourceCommit=@($bad.server.sourceCommit)}
+        'build-drift'{$bad.server.buildId='0'*64}; 'build-array'{$bad.server.buildId=@($bad.server.buildId)}; 'producer-drift'{$bad.result.producerBuildId='0'*64}
+        'dirty-true'{$bad.server.sourceDirty=$true}; 'dirty-string'{$bad.server.sourceDirty='false'}; 'dirty-array'{$bad.server.sourceDirty=@($false)}
+        'description-case'{$bad.result.geometrySelection.executionWithinSelectedGeometry=$bad.result.geometrySelection.executionWithinSelectedGeometry.ToUpperInvariant()}
+        'description-space'{$bad.result.geometrySelection.executionWithinSelectedGeometry+=' '}; 'description-array'{$bad.result.geometrySelection.executionWithinSelectedGeometry=@($bad.result.geometrySelection.executionWithinSelectedGeometry)}
+    }
+    Reject @{RegistryPath=(Write-Fixture $bad)} ('AD25 unknown or malformed identity/descriptor '+$case+' refuses before receipt/arguments')
+}
+foreach($value in @('false',0,$null,$true)) { Reject @{RegistryPath=$ad25Path;ExecutionWithinSelectedGeometry=$value} 'AD25 non-Boolean or restricted late geometry still refused' }
+Reject @{RegistryPath=$ad25Path;EventKinds=@('draw')} 'AD25 late selection without eye submission still refused'
+Reject @{RegistryPath=$ad25Path;ExpectedInputSchemaSha256=('0'*64)} 'AD25 wrong schema hash still refused'
 $r=Invoke-Plan @{InternalTestFailurePoint='receipt-hash'}
 Assert-Selection (-not $r.ok -and $r.receiptPublished -and $null -eq $r.arguments) 'finalization failure withholds selected start arguments'
-[pscustomobject]@{ok=$true;checks=$checks.Count;scope='Production planner entry point with source-derived ad8 schema and synthetic registry; no live schema currency or runtime qualification';runtimeChanged=$false;liveQualified=$false}|ConvertTo-Json -Compress
+[pscustomobject]@{ok=$true;checks=$checks.Count;scope='Production planner entry point with source-derived schema and synthetic legacy/AD25 registry identities; no live currency or runtime qualification';runtimeChanged=$false;liveQualified=$false}|ConvertTo-Json -Compress

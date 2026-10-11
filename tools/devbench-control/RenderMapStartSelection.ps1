@@ -1,11 +1,56 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Private planner qualification only: no runtime/session or capture dispatch.
+# Preserve raw member types; a singleton array is never a scalar capability.
+function Read-RenderMapSelectionMember($Value, [string]$Name) {
+    $raw = $null
+    if ($Value -is [Collections.IDictionary]) {
+        if ($Value.Contains($Name)) { $raw = $Value[$Name] }
+    } elseif ($Value -is [pscustomobject]) {
+        $property = $Value.PSObject.Properties[$Name]
+        if ($null -ne $property) { $raw = $property.Value }
+    }
+    return [pscustomobject]@{ value = $raw }
+}
+
+function Get-RenderMapGeometryCapabilityQualification($ResolvedRegistry, $Capability) {
+    if ($Capability -isnot [string]) { return $null }
+    if ($Capability -ceq 'optional native Boolean') {
+        return [pscustomobject]@{ basis = 'reviewed-literal-native-boolean'; sourceCommit = $null }
+    }
+    # One exact source-proven compatibility record, not arbitrary prose matching.
+    # AD25 DevBenchBridge blob443db2b... explicitly rejects non-Booleans and
+    # requires actual false for VR late/eye selection. Unknown successors refuse.
+    $description = 'optional; when true, draws require either an active selected geometry scope or the one-shot same-thread next-draw handoff from selected SetupGeometry'
+    if ($Capability -cne $description) { return $null }
+    $native = $ResolvedRegistry.envelope
+    $contract = (Read-RenderMapSelectionMember $native 'contract').value
+    $server = (Read-RenderMapSelectionMember $native 'server').value
+    $major = (Read-RenderMapSelectionMember $contract 'major').value
+    $minor = (Read-RenderMapSelectionMember $contract 'minor').value
+    $revision = (Read-RenderMapSelectionMember $contract 'schemaRevision').value
+    $name = (Read-RenderMapSelectionMember $contract 'name').value
+    $source = (Read-RenderMapSelectionMember $server 'sourceCommit').value
+    $build = (Read-RenderMapSelectionMember $server 'buildId').value
+    $dirty = (Read-RenderMapSelectionMember $server 'sourceDirty').value
+    if ($null -eq $major -or $major.GetType() -notin @([int],[long]) -or $major -ne 1 -or
+        $null -eq $minor -or $minor.GetType() -notin @([int],[long]) -or $minor -ne 26 -or
+        $null -eq $revision -or $revision.GetType() -notin @([int],[long]) -or $revision -ne 28 -or
+        $name -isnot [string] -or $name -cne 'communityshaders.render-map' -or
+        $source -isnot [string] -or $source -cne 'ad25cd6edfb5f3d2da8386cb07a43c34e3d5efda' -or
+        $build -isnot [string] -or $build -cne '91278a15be065cee3cd583d80b29991f9ae4d19b472b54717418052c8fcb8fff' -or
+        $ResolvedRegistry.producerBuildId -cne $build -or $dirty -isnot [bool] -or $dirty) { return $null }
+    return [pscustomobject]@{ basis = 'source-bound-ad25-descriptive-native-boolean'; sourceCommit = $source;
+        producerBuildId = $build; contractMinor = $minor; schemaRevision = $revision;
+        handlerGitBlob = '443db2b24a27fa4a9ef80d8818e4f6705d09643a' }
+}
+
 function Get-RenderMapStartSelection($BoundParameters, $ResolvedRegistry, [object[]]$EventKinds) {
     $fields = @('Activation', 'MaxActivationWaitMs', 'ExecutionWithinSelectedGeometry')
     $supplied = @($fields | Where-Object { $BoundParameters.ContainsKey($_) })
     $schemaFields = @('InputSchemaPath', 'ExpectedInputSchemaSha256')
     $schemaSupplied = @($schemaFields | Where-Object { $BoundParameters.ContainsKey($_) })
     $selected = [ordered]@{}
+    $geometryQualification = $null
     if ($supplied.Count -eq 0 -and $schemaSupplied.Count -eq 0) {
         return [pscustomobject]@{ arguments = $selected; evidence = $null }
     }
@@ -44,9 +89,10 @@ function Get-RenderMapStartSelection($BoundParameters, $ResolvedRegistry, [objec
             $property = $geometry.PSObject.Properties['executionWithinSelectedGeometry']
             if ($null -ne $property) { $capability = $property.Value }
         }
+        $geometryQualification = Get-RenderMapGeometryCapabilityQualification $ResolvedRegistry $capability
         if ($execution -isnot [bool] -or
             (Get-Property (Get-Property $properties 'executionWithinSelectedGeometry') 'type') -cne 'boolean' -or
-            $capability -isnot [string] -or $capability -cne 'optional native Boolean') { throw 'ExecutionWithinSelectedGeometry requires an actual Boolean and exact reviewed registry/schema support.' }
+            $null -eq $geometryQualification) { throw 'ExecutionWithinSelectedGeometry requires an actual Boolean and exact reviewed registry/schema support.' }
         # Presence, not truthiness: explicit false must survive immutable receipt.
         $selected.executionWithinSelectedGeometry = $execution
     }
@@ -74,6 +120,7 @@ function Get-RenderMapStartSelection($BoundParameters, $ResolvedRegistry, [objec
             inputSchemaPath = $capture.path; inputSchemaSha256 = $capture.sha256
             inputSchemaBytes = $capture.bytes; registryMajor = $ResolvedRegistry.major
             producerBuildId = $ResolvedRegistry.producerBuildId
+            geometryCapabilityQualification = $geometryQualification
             selected = [pscustomobject]$selected
             qualification = 'Caller-retained schema descriptor plus registry capabilities; offline planning does not prove live currency. Capture both from the same selected answering runtime and revalidate that binding before dispatch.'
         }
