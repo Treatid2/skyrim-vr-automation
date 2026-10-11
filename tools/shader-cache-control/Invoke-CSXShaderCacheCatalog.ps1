@@ -1058,42 +1058,101 @@ function Get-TaskOutputEntries($Inventory, $PreparedInventory) {
     })
 }
 
-function Complete-TaskProviderShadow($Binding, [string]$EvidenceRoot) {
+function Read-TaskCacheMetadata([string]$Root) {
+    $path = Join-Path $Root 'Info.ini'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    Assert-CSXNoCacheReparsePoint -Path $path -Purpose 'Provider cache metadata'
+    $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -gt 262144) { throw 'Shader-cache metadata exceeds the 256KiB bound.' }
+        $bytes = [byte[]]::new([int]$stream.Length)
+        $stream.ReadExactly($bytes)
+        if ($stream.ReadByte() -ne -1) { throw 'Shader-cache metadata changed during bounded read.' }
+    } finally { $stream.Dispose() }
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes).TrimStart([char]0xfeff)
+    $inside = $false; $values = [Collections.Generic.List[string]]::new()
+    foreach ($line in ($text -split "`n")) {
+        if ($line -match '^\s*\[(?<section>[^]]+)\]\s*$') { $inside = $Matches.section -ieq 'Cache'; continue }
+        if ($inside -and $line -match '^\s*ShaderCacheABI\s*=\s*(?<value>.*?)\s*$') { $values.Add($Matches.value) }
+    }
+    if ($values.Count -ne 1 -or [string]::IsNullOrWhiteSpace($values[0])) { throw 'Shader-cache metadata must contain exactly one nonempty [Cache] ShaderCacheABI.' }
+    if ($values[0] -cne $ShaderCacheAbi) { throw "Shader-cache metadata ABI mismatch: cached '$($values[0])', requested '$ShaderCacheAbi'. Provider shadow refused; preserve cache and select compatible providers." }
+    return [pscustomobject]@{ path = $path; bytes = $bytes.Length; sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)); shaderCacheAbi = $values[0] }
+}
+
+function Get-TaskProviderShadowAdmission($Binding, [string]$ProjectedRoot) {
     if ($null -eq $Binding) { return $null }
     Assert-OverwriteOwnerBinding $Binding
-    $receiptPath = Join-Path $EvidenceRoot 'shader-cache-provider-shadow.receipt.json'
     $providerResult = Invoke-Transaction 'providers' @{
-        ProfilePath = [string]$Binding.profilePath
-        ModsPath = [string]$Binding.modsPath
-        RelativeCachePath = [string]$Binding.relativeCachePath
-        DeepInventory = $true
-        IncludeInventoryEntries = $true
+        ProfilePath = [string]$Binding.profilePath; ModsPath = [string]$Binding.modsPath
+        RelativeCachePath = [string]$Binding.relativeCachePath; DeepInventory = $true; IncludeInventoryEntries = $true
     }
-    if ([string]$providerResult.data.profileSha256 -cne [string]$Binding.profileSha256) {
-        throw 'The task MO2 modlist changed while materializing lower shader-cache providers.'
-    }
-
-    $targetRoot = Assert-SafeDirectory ([string]$Binding.cachePath) 'winning live shader-cache' -MustExist
+    if ([string]$providerResult.data.profileSha256 -cne [string]$Binding.profileSha256) { throw 'The task MO2 modlist changed during cache metadata admission.' }
     $required = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+    $providerInfo = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($provider in @($providerResult.data.providers | Where-Object {
         [bool]$_.enabled -and [string]$_.providerType -ceq 'directory' -and
         ([string]$Binding.mode -ceq 'mo2-overwrite-output' -or
             -not [string]::Equals([string]$_.modName, [string]$Binding.modName, [StringComparison]::OrdinalIgnoreCase))
     } | Sort-Object lineNumber)) {
+        $infoEntries = @($provider.inventory.entries | Where-Object relativePath -ieq 'Info.ini')
+        if ($infoEntries.Count -gt 1) { throw 'Ambiguous provider cache metadata inventory.' }
+        if ($infoEntries.Count -eq 1) { $providerInfo[[string]$provider.cachePath] = $infoEntries[0] }
         foreach ($entry in @($provider.inventory.entries)) {
             $relative = [string]$entry.relativePath
-            if ([string]::IsNullOrWhiteSpace($relative) -or [IO.Path]::IsPathRooted($relative) -or $relative -match '(^|[\\/])\.\.([\\/]|$)') {
-                throw "A lower shader-cache provider returned an unsafe relative path: '$relative'."
-            }
+            if ([string]::IsNullOrWhiteSpace($relative) -or [IO.Path]::IsPathRooted($relative) -or $relative -match '(^|[\\/])\.\.([\\/]|$)') { throw 'Unsafe provider cache path during metadata admission.' }
             if (-not $required.ContainsKey($relative)) {
-                $required.Add($relative, [pscustomobject][ordered]@{
-                    relativePath = $relative; sourceRoot = [string]$provider.cachePath
-                    sourceModName = [string]$provider.modName; sourceSha256 = [string]$entry.sha256
-                    bytes = [long]$entry.bytes
-                })
+                $required.Add($relative, [pscustomobject]@{ relativePath = $relative; sourceRoot = [string]$provider.cachePath; sourceModName = [string]$provider.modName; sourceSha256 = [string]$entry.sha256; bytes = [long]$entry.bytes })
             }
         }
     }
+    $projected = Get-TreeInventory $ProjectedRoot
+    $present = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in @($projected.entries)) { $null = $present.Add([string]$entry.relativePath) }
+    $effective = Read-TaskCacheMetadata $ProjectedRoot
+    $metadata = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+    if ($null -ne $effective) {
+        $entries = @($projected.entries | Where-Object relativePath -ieq 'Info.ini')
+        if ($entries.Count -ne 1 -or $entries[0].sha256 -cne $effective.sha256) { throw 'Projected cache metadata drifted from its inventory.' }
+        $metadata.Add($effective.path, $effective)
+    }
+    elseif ($required.ContainsKey('Info.ini')) {
+        $effective = Read-TaskCacheMetadata ([string]$required['Info.ini'].sourceRoot)
+        if ($null -eq $effective -or $effective.sha256 -cne [string]$required['Info.ini'].sourceSha256) { throw 'Effective provider cache metadata drifted from its inventory.' }
+        $metadata.Add($effective.path, $effective)
+    }
+    foreach ($record in $required.Values) {
+        if ($present.Contains([string]$record.relativePath) -or [IO.Path]::GetFileName([string]$record.relativePath) -in @('.codex-vfs-sentinel.txt','.gitkeep')) { continue }
+        $path = Join-Path ([string]$record.sourceRoot) 'Info.ini'
+        if (-not $metadata.ContainsKey($path)) {
+            $proof = Read-TaskCacheMetadata ([string]$record.sourceRoot)
+            if ($null -eq $proof) { throw 'Contributing provider lacks Info.ini; cache metadata compatibility is unproven. Provider shadow refused without filling metadata.' }
+            if (-not $providerInfo.ContainsKey([string]$record.sourceRoot) -or $providerInfo[[string]$record.sourceRoot].sha256 -cne $proof.sha256) { throw 'Contributing provider metadata drifted from its inventory.' }
+            $metadata.Add($path, $proof)
+        }
+        if ($null -eq $effective -or $metadata[$path].sha256 -cne $effective.sha256) { throw 'Contributing provider Info.ini differs from effective metadata; whole-metadata compatibility is unproven. Provider shadow refused.' }
+    }
+    return [pscustomobject]@{ required = $required; metadata = @($metadata.Values); projectedTreeSha256 = $projected.treeSha256;
+        evidence = [pscustomobject]@{ schemaVersion = 1; state = $(if ($null -eq $effective) { 'metadata-absent-no-provider-import' } else { 'abi-and-exact-contributor-metadata-admitted' });
+            requestedAbi = $ShaderCacheAbi; effectiveMetadata = $effective; checkedMetadataFiles = $metadata.Count;
+            rule = 'Only missing provider files contribute; their original whole Info.ini bytes must equal effective metadata and its ABI must match. No metadata fabrication, native acceptance or current feature-equivalence claim.' } }
+}
+
+function Assert-TaskProviderMetadataStable($Admission) {
+    foreach ($proof in @($Admission.metadata)) {
+        Assert-CSXNoCacheReparsePoint -Path ([string]$proof.path) -Purpose 'Admitted cache metadata'
+        if (-not (Test-Path -LiteralPath $proof.path -PathType Leaf) -or (Get-Item -LiteralPath $proof.path).Length -ne $proof.bytes -or
+            (Get-FileHash -LiteralPath $proof.path -Algorithm SHA256).Hash -cne $proof.sha256) { throw 'Admitted provider cache metadata changed before shadow publication.' }
+    }
+}
+
+function Complete-TaskProviderShadow($Binding, [string]$EvidenceRoot) {
+    if ($null -eq $Binding) { return $null }
+    Assert-OverwriteOwnerBinding $Binding
+    $receiptPath = Join-Path $EvidenceRoot 'shader-cache-provider-shadow.receipt.json'
+    $targetRoot = Assert-SafeDirectory ([string]$Binding.cachePath) 'winning live shader-cache' -MustExist
+    $admission = Get-TaskProviderShadowAdmission $Binding $targetRoot
+    $required = $admission.required
 
     $copied = [Collections.Generic.List[object]]::new()
     $alreadyPresent = [Collections.Generic.List[object]]::new()
@@ -1118,6 +1177,7 @@ function Complete-TaskProviderShadow($Binding, [string]$EvidenceRoot) {
             throw "Lower shader-cache provider changed during preparation: $source"
         }
         $parent = Split-Path -Parent $target
+        Assert-TaskProviderMetadataStable $admission
         if (-not (Test-Path -LiteralPath $parent -PathType Container)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
         Assert-OverwriteOwnerBinding $Binding
         Copy-Item -LiteralPath $source -Destination $target
@@ -1130,7 +1190,12 @@ function Complete-TaskProviderShadow($Binding, [string]$EvidenceRoot) {
         })
     }
 
+    Assert-TaskProviderMetadataStable $admission
     $prepared = Invoke-Transaction 'inspect' @{ CachePath = $targetRoot }
+    $finalMetadata = Read-TaskCacheMetadata $targetRoot
+    $expectedMetadata = $admission.evidence.effectiveMetadata
+    if (($null -eq $expectedMetadata) -ne ($null -eq $finalMetadata) -or
+        ($null -ne $expectedMetadata -and $expectedMetadata.sha256 -cne $finalMetadata.sha256)) { throw 'Effective cache metadata changed before provider-shadow publication.' }
     $preparedPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($entry in @($prepared.data.entries)) { $null = $preparedPaths.Add([string]$entry.relativePath) }
     $missing = @($required.Keys | Where-Object { -not $preparedPaths.Contains([string]$_) })
@@ -1144,6 +1209,7 @@ function Complete-TaskProviderShadow($Binding, [string]$EvidenceRoot) {
         cachePath = $targetRoot; requiredLowerProviderFiles = $required.Count
         copiedFiles = $copied.Count; alreadyPresentFiles = $alreadyPresent.Count
         copied = @($copied); alreadyPresent = @($alreadyPresent)
+        metadataAdmission = $admission.evidence
         preparedInventory = $prepared.data; completedUtc = [DateTime]::UtcNow.ToString('o')
     }
     Assert-OverwriteOwnerBinding $Binding
@@ -1350,6 +1416,15 @@ function Prepare-TaskCacheUnderLock($Storage, $cacheResolution) {
     $selection = if ($null -ne $existingPlan) { $existingPlan.selection } else { Select-CatalogSnapshot $Storage }
     if ($RequireMatch -and $null -eq $selection.selected) { throw 'No compatible known-working shader-cache snapshot matched the task request.' }
     $seedSource = if ($null -ne $resume) { $resume } else { $selection.selected }
+
+    # Admit the prospective seed/current metadata BEFORE snapshot, seed, shadow
+    # writes or new plan publication. A missing resume Info.ini cannot inherit a
+    # foreign lower-provider ABI merely because its completion proof was valid.
+    # Already-prepared readmission does not seed again. Admit its actual live
+    # bytes, including historical plans created before metadata admission existed.
+    $projectedRoot = if ($null -ne $existingPlan -and [string]$existingPlan.state -ceq 'prepared') { $resolvedCache } elseif ($null -ne $seedSource) { [string]$seedSource.cachePath } else { $resolvedCache }
+    $metadataPreflight = Get-TaskProviderShadowAdmission $cacheResolution.binding $projectedRoot
+    if ($null -ne $metadataPreflight) { Assert-TaskProviderMetadataStable $metadataPreflight }
 
     if (-not $WhatIfPreference) { Wait-PrepareFixtureBarrier 'after-readmission' $resolvedCache }
 

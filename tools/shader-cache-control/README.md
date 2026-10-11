@@ -258,6 +258,34 @@ current providers. Before the first launch, the live Overwrite cache must match
 Overwrite, but every relaunch still requires all current provider paths to
 remain shadowed.
 
+Provider materialization also admits metadata before any new snapshot, seed,
+shadow copy or plan publication. The projected selected seed/resume tree takes
+precedence over the current target; otherwise the current target is inspected.
+Original `Info.ini` is read as bounded strict UTF-8 (256KiB maximum), requires
+exactly one nonempty `[Cache] ShaderCacheABI`, and must match the requested ABI.
+If projected metadata is absent, the effective lower provider's original file
+may supply it only after that same check. Every provider contributing a missing
+path must have original `Info.ini` bytes identical to that effective metadata.
+This conservative whole-file identity gate does not infer semantic equivalence
+from a shared ABI, file name, build label or an unknown feature fingerprint.
+Already shadowed paths remain authoritative; a fully covered foreign provider
+does not contribute files. Missing metadata is retained as unknown only when
+no lower-provider data or metadata is imported. No `Info.ini` is manufactured,
+rewritten or silently omitted to defeat virtual-file-system resolution.
+
+The admission is repeated after the normal seed transaction; inventory-bound
+metadata hashes are revalidated before copies and publication, and the final
+effective metadata must match. The provider-shadow receipt retains bounded
+`metadataAdmission` evidence. An incompatible or unproven provider refuses before
+seeding and leaves useful same-task preserved bytes intact. Use a separately
+authorised compatible provider/profile or an independently admitted compatible
+cache with complete shadow coverage; do not increase timeouts, force native ABI
+acceptance, alter shaders/settings or delete the retained working cache. Existing
+foreign prepared evidence is not rewritten or rebased. Same-task completion
+proof authorises provenance-bound reuse, not acceptance of foreign metadata.
+Compatibility here is a source-bound import gate, not proof that the native
+engine will accept every shader or avoid compilation within a menu deadline.
+
 After the game and MO2 are closed, complete the cache transaction:
 
 ```powershell
@@ -362,3 +390,6 @@ retain their existing contracts.
 Run `Test-CSXShaderCacheControl.ps1` after changing comparison or transaction
 logic, and `Test-CSXShaderCacheCatalog.ps1` after changing catalog selection or
 task lifecycle logic.
+Run `Test-CSXShaderCacheProviderMetadata.ps1` for public prepare/complete coverage
+of compatible imports, ABI/whole-metadata mismatch, malformed/missing metadata,
+fully shadowed providers and exact same-task missing-metadata resume preservation.
