@@ -56,13 +56,28 @@ Mapping checks are sequential observations, not an atomic DOS-namespace generati
 or protection against an undetectable change-and-revert between checks. Handles
 pin the actual files read; a later installer must freshly pin its deployment set.
 
-The future installer must stage/pin this exact set, persist its uniquely owned
+`Open-VerifiedNativeInstallPayloadCustody` uses the same complete admission core
+but retains every verified payload's non-write/delete-sharing read handle until
+the returned in-process `IDisposable` object is disposed. It rechecks all retained
+paths/namespace/file IDs/lengths after the last payload read. Failure at any point
+closes every acquired handle; successful callers must use `try/finally` and call
+`Dispose()` promptly (idempotent). The acquisition deadline does not automatically
+expire custody; the future staging owner must enforce its complete process budget.
+The immutable `ValidationJson` is evidence only, not serializable handle custody,
+private holder authority, a restart/replay capability or installation permission.
+No payload stream, staging/copy/publication method or generic callback is exposed.
+These file handles block cooperating writes/deletes to their files, not DOS mapping
+changes or all ancestor mutation; no atomic cross-file/ancestor identity claim.
+Disposed custody is ended, even though its captured validation remains readable.
+
+The future installer must stage this exact set, persist its uniquely owned
 publication journal, and publish a new directory under the supported holder
 transaction. It must release that nonreentrant lock before the existing
 independently guarded `add-enable` service. Revocation/drift between stages must
 retain truthful deployed-not-enabled custody; committed refresh failure is not
 rolled back or called ready. Existing add-enable owns DLL priority and conservative
-retirement. This module implements none of those future stages.
+retirement. This module implements only admission and in-process payload read
+custody, none of the staging/publication/journal/holder/add-enable stages.
 
 Fixtures use synthetic native bytes and receipts in an explicit fixture root;
 they do not launch or manipulate MO2, Skyrim, SteamVR or a real lease.

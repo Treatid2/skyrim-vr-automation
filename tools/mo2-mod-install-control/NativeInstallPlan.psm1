@@ -2,6 +2,40 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Independent type initialization allows a process that already loaded the
+# original admission-only FileProofV1 to use custody without redefining it.
+function Initialize-NativePlanPayloadCustody {
+    if ('SkyrimVRAutomation.NativePlanPayloadCustodyV1' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+namespace SkyrimVRAutomation {
+    // In-process read custody only. No deployment, ownership or replay token.
+    public sealed class NativePlanPayloadCustodyV1 : IDisposable {
+        private FileStream[] streams;
+        public string ValidationJson { get; }
+        public int PayloadCount { get; }
+        public bool IsDisposed { get { return streams == null; } }
+        public NativePlanPayloadCustodyV1(string validationJson, FileStream[] payloads) {
+            ValidationJson = validationJson;
+            PayloadCount = payloads.Length;
+            streams = (FileStream[])payloads.Clone();
+        }
+        public void Dispose() {
+            var owned = System.Threading.Interlocked.Exchange(ref streams, null);
+            if (owned == null) return;
+            // Attempt every close even if one OS close reports an error.
+            Exception first = null;
+            foreach (var stream in owned) {
+                try { stream.Dispose(); } catch (Exception error) { if (first == null) first = error; }
+            }
+            if (first != null) throw first;
+        }
+    }
+}
+'@
+}
+
 # Read-only admission foundation, NOT a deployment or ownership interface.
 function Initialize-NativePlanFileProof {
     if ('SkyrimVRAutomation.NativePlanFileProofV1' -as [type]) { return }
@@ -167,7 +201,7 @@ function Assert-NativePlanName($Value, [string]$Label) {
         $Value -match '\A(CON|PRN|AUX|NUL|COM[1-9\u00B9\u00B2\u00B3]|LPT[1-9\u00B9\u00B2\u00B3])(?:\.|\z)') { throw "$Label is not a safe exact Windows directory name." }
 }
 
-function Get-VerifiedNativeInstallPlan {
+function Get-NativeInstallPlanCore {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$PlanPath,
@@ -175,7 +209,8 @@ function Get-VerifiedNativeInstallPlan {
         [Parameter(Mandatory)][ValidatePattern('^[a-f0-9]{40}$')][string]$ExpectedSourceCommit,
         [Parameter(Mandatory)][string]$ExpectedProfile,
         [Parameter(Mandatory)][string]$ExpectedLeaseId,
-        [ValidateRange(1, 60)][int]$TimeoutSeconds = 30
+        [ValidateRange(1, 60)][int]$TimeoutSeconds = 30,
+        [switch]$RetainPayloadHandles
     )
     $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
     if ($ExpectedPlanSha256 -cnotmatch '\A[a-f0-9]{64}\z' -or $ExpectedSourceCommit -cnotmatch '\A[a-f0-9]{40}\z') {
@@ -209,6 +244,9 @@ function Get-VerifiedNativeInstallPlan {
     $physicalSources = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $verified = [Collections.Generic.List[object]]::new()
     $totalBytes = 0L
+    $held = [Collections.Generic.List[IO.FileStream]]::new()
+    $custodyTransferred = $false
+    try {
     foreach ($file in $plan.files) {
         Assert-NativePlanDeadline $deadline
         Assert-NativePlanObject $file @('sourcePath', 'relativePath', 'bytes', 'sha256') 'Native file'
@@ -237,8 +275,10 @@ function Get-VerifiedNativeInstallPlan {
             ($matches[0].bytes -isnot [long] -and $matches[0].bytes -isnot [int]) -or $matches[0].bytes -ne $file.bytes -or
             $matches[0].sha256 -isnot [string] -or $matches[0].sha256 -cne $file.sha256) { throw 'Native file is not uniquely bound to its issued artifact receipt.' }
         $stream = [IO.File]::Open($source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-        $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+        if ($RetainPayloadHandles) { $held.Add($stream) }
+        $hasher = $null
         try {
+            $hasher = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
             $identity = Get-NativePlanOpenedIdentity $stream $source
             if (-not $physicalSources.Add($identity)) { throw 'Duplicate physical native source identity.' }
             if ($stream.Length -ne $file.bytes) { throw 'Native source size mismatch.' }
@@ -253,7 +293,7 @@ function Get-VerifiedNativeInstallPlan {
             if ($readBytes -ne $file.bytes -or [Convert]::ToHexString($hasher.GetHashAndReset()).ToLowerInvariant() -cne $file.sha256) { throw 'Native source hash mismatch.' }
             $null = Assert-NativePlanSafePath $source
             if ((Get-NativePlanOpenedIdentity $stream $source) -cne $identity) { throw 'Native source identity changed during validation.' }
-        } finally { $hasher.Dispose(); $stream.Dispose() }
+        } finally { if ($null -ne $hasher) { $hasher.Dispose() }; if (-not $RetainPayloadHandles) { $stream.Dispose() } }
         $verified.Add([pscustomobject]@{ sourcePath=$source; relativePath=$file.relativePath; bytes=[long]$file.bytes; sha256=$file.sha256; sourceIdentity=$identity })
     }
     if (@($verified | Where-Object relativePath -CLike '*.dll').Count -eq 0) { throw 'Native plan must contain a DLL.' }
@@ -262,7 +302,7 @@ function Get-VerifiedNativeInstallPlan {
             -not $targets.Contains($file.relativePath.Substring(0, $file.relativePath.Length-4)+'.dll')) { throw 'PDB must accompany the matching declared DLL.' }
     }
     Assert-NativePlanDeadline $deadline
-    return [pscustomobject][ordered]@{
+    $result = [pscustomobject][ordered]@{
         schema='mo2.native-install-plan-validation.1'; ok=$true
         planPath=[IO.Path]::GetFullPath($PlanPath); planSha256=$planHash
         installId=$plan.installId; sourceCommit=$plan.sourceCommit; profile=$plan.profile
@@ -272,6 +312,60 @@ function Get-VerifiedNativeInstallPlan {
         mutationAuthorized=$false; deploymentPerformed=$false; enablePerformed=$false
         requiresFreshDeploymentValidation=$true
     }
+    if ($RetainPayloadHandles) {
+        # Recheck the entire retained set after the last read. Earlier payloads
+        # must remain tied to the same supported namespace and opened identity.
+        for ($index=0; $index -lt $verified.Count; $index++) {
+            Assert-NativePlanDeadline $deadline
+            $file=$verified[$index]
+            $null=Assert-NativePlanSafePath $file.sourcePath
+            if ((Get-NativePlanOpenedIdentity $held[$index] $file.sourcePath) -cne $file.sourceIdentity -or
+                $held[$index].Length -ne $file.bytes) { throw 'Native payload custody identity or length drifted.' }
+        }
+        Assert-NativePlanDeadline $deadline
+        Initialize-NativePlanPayloadCustody
+        $validationJson=$result | ConvertTo-Json -Depth 12 -Compress
+        Assert-NativePlanDeadline $deadline
+        $custody=[SkyrimVRAutomation.NativePlanPayloadCustodyV1]::new(
+            $validationJson, $held.ToArray())
+        Assert-NativePlanDeadline $deadline
+        $custodyTransferred=$true
+        return $custody
+    }
+    return $result
+    } finally {
+        if (-not $custodyTransferred) {
+            $closeError=$null
+            foreach ($handle in $held) { try { $handle.Dispose() } catch { if ($null -eq $closeError) { $closeError=$_ } } }
+            if ($null -ne $closeError) { throw $closeError }
+        }
+    }
 }
 
-Export-ModuleMember -Function Get-VerifiedNativeInstallPlan
+function Get-VerifiedNativeInstallPlan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PlanPath,
+        [Parameter(Mandatory)][ValidatePattern('^[a-f0-9]{64}$')][string]$ExpectedPlanSha256,
+        [Parameter(Mandatory)][ValidatePattern('^[a-f0-9]{40}$')][string]$ExpectedSourceCommit,
+        [Parameter(Mandatory)][string]$ExpectedProfile,
+        [Parameter(Mandatory)][string]$ExpectedLeaseId,
+        [ValidateRange(1,60)][int]$TimeoutSeconds=30
+    )
+    Get-NativeInstallPlanCore @PSBoundParameters
+}
+
+function Open-VerifiedNativeInstallPayloadCustody {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PlanPath,
+        [Parameter(Mandatory)][ValidatePattern('^[a-f0-9]{64}$')][string]$ExpectedPlanSha256,
+        [Parameter(Mandatory)][ValidatePattern('^[a-f0-9]{40}$')][string]$ExpectedSourceCommit,
+        [Parameter(Mandatory)][string]$ExpectedProfile,
+        [Parameter(Mandatory)][string]$ExpectedLeaseId,
+        [ValidateRange(1,60)][int]$TimeoutSeconds=30
+    )
+    Get-NativeInstallPlanCore @PSBoundParameters -RetainPayloadHandles
+}
+
+Export-ModuleMember -Function Get-VerifiedNativeInstallPlan, Open-VerifiedNativeInstallPayloadCustody
