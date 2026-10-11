@@ -7,6 +7,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $passes = [Collections.Generic.List[string]]::new()
 $failures = [Collections.Generic.List[string]]::new()
+$script:lastCatalogResult = $null
 
 function Assert-Test([bool]$Condition, [string]$Message) {
     if ($Condition) { $passes.Add($Message) } else { $failures.Add($Message) }
@@ -14,7 +15,9 @@ function Assert-Test([bool]$Condition, [string]$Message) {
 
 function Invoke-Catalog([hashtable]$Arguments) {
     $raw = & $catalogTool @Arguments
-    return $raw | ConvertFrom-Json -Depth 40
+    $result = $raw | ConvertFrom-Json -Depth 40
+    $script:lastCatalogResult = $result
+    return $result
 }
 
 $resolvedTemp = if ($FixtureRoot) { [IO.Path]::GetFullPath($FixtureRoot) } else { [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) }
@@ -531,6 +534,9 @@ try {
     [IO.File]::WriteAllBytes((Join-Path $otherCache 'other-provider.bin'), [byte[]](4, 2))
     [IO.File]::WriteAllBytes((Join-Path $otherCache 'existing-provider.bin'), [byte[]](4, 3))
     [IO.File]::WriteAllBytes((Join-Path $taskCache 'existing-provider.bin'), [byte[]](9, 3))
+    # Real provider imports require original metadata, not ABI-less synthetic bins.
+    Set-Content -LiteralPath (Join-Path $otherCache 'Info.ini') -Value @('[Cache]', 'ShaderCacheABI = abi-bound') -Encoding utf8
+    Copy-Item -LiteralPath (Join-Path $otherCache 'Info.ini') -Destination (Join-Path $taskCache 'Info.ini')
     $expectedPluginBytes = [byte[]](1, 4, 1, 5, 9)
     $wrongPluginBytes = [byte[]](2, 7, 1, 8, 2)
     $expectedPluginPath = Join-Path $expectedPluginRoot 'CommunityShaders.dll'
@@ -595,7 +601,7 @@ try {
     Assert-Test ([string]$boundPrepare.data.task.before.root -eq [IO.Path]::GetFullPath($taskCache)) 'task preparation snapshots the provider-backed cache instead of global overwrite'
     $shadowedLowerCache = Join-Path $taskCache 'other-provider.bin'
     Assert-Test ((Test-Path -LiteralPath $shadowedLowerCache -PathType Leaf) -and (Get-FileHash -LiteralPath $shadowedLowerCache -Algorithm SHA256).Hash -ceq (Get-FileHash -LiteralPath (Join-Path $otherCache 'other-provider.bin') -Algorithm SHA256).Hash) 'task preparation materializes a byte-identical shadow for a lower-provider-only cache file'
-    Assert-Test ([int]$boundPrepare.data.task.providerShadow.receipt.requiredLowerProviderFiles -eq 2 -and [int]$boundPrepare.data.task.providerShadow.receipt.copiedFiles -eq 1 -and [int]$boundPrepare.data.task.providerShadow.receipt.alreadyPresentFiles -eq 1 -and (Test-Path -LiteralPath $boundPrepare.data.task.providerShadow.receiptPath -PathType Leaf)) 'task preparation records exact lower-provider shadow coverage'
+    Assert-Test ([int]$boundPrepare.data.task.providerShadow.receipt.requiredLowerProviderFiles -eq 3 -and [int]$boundPrepare.data.task.providerShadow.receipt.copiedFiles -eq 1 -and [int]$boundPrepare.data.task.providerShadow.receipt.alreadyPresentFiles -eq 2 -and (Test-Path -LiteralPath $boundPrepare.data.task.providerShadow.receiptPath -PathType Leaf)) 'task preparation records exact lower-provider shadow coverage'
     $smallBoundJson = $boundPrepare | ConvertTo-Json -Depth 40 -Compress
     Assert-Test ($smallBoundJson -notmatch '"(?:copied|alreadyPresent|entries)"\s*:' -and
         $smallBoundJson -notmatch '(?:other|existing)-provider\.bin' -and
@@ -606,8 +612,8 @@ try {
     $planHash = (Get-FileHash -LiteralPath $planPath -Algorithm SHA256).Hash
     $durableShadow = Get-Content -LiteralPath $boundPrepare.data.task.providerShadow.receiptPath -Raw | ConvertFrom-Json -Depth 40
     $durablePlan = Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json -Depth 40
-    Assert-Test ($durableShadow.copied.Count -eq 1 -and $durableShadow.alreadyPresent.Count -eq 1 -and
-        $durablePlan.providerShadow.receipt.copied.Count -eq 1 -and $durablePlan.providerShadow.receipt.alreadyPresent.Count -eq 1) 'provider per-file records remain complete in the authoritative receipt and plan'
+    Assert-Test ($durableShadow.copied.Count -eq 1 -and $durableShadow.alreadyPresent.Count -eq 2 -and
+        $durablePlan.providerShadow.receipt.copied.Count -eq 1 -and $durablePlan.providerShadow.receipt.alreadyPresent.Count -eq 2) 'provider per-file records remain complete in the authoritative receipt and plan'
     $boundPrepareAgain = Invoke-Catalog $boundPrepareArgs
     Assert-Test ($boundPrepareAgain.ok -and $boundPrepareAgain.state -eq 'already-prepared' -and [string]$boundPrepareAgain.data.task.providerShadow.receipt.preparedInventory.treeSha256 -ceq [string]$boundPrepare.data.task.providerShadow.receipt.preparedInventory.treeSha256) 'provider-bound preparation retry validates the materialized task tree instead of the pre-shadow seed hash'
     Assert-Test (($boundPrepareAgain | ConvertTo-Json -Depth 40 -Compress) -notmatch '"(?:copied|alreadyPresent|entries)"\s*:|(?:other|existing)-provider\.bin') 'already-prepared default output applies the same whole-tree provider detail bound'
@@ -615,7 +621,7 @@ try {
     $optInPrepareArgs.IncludeInventoryEntries = $true
     $optInPrepare = Invoke-Catalog $optInPrepareArgs
     Assert-Test ($optInPrepare.ok -and $optInPrepare.data.task.providerShadow.receipt.copied.Count -eq 1 -and
-        $optInPrepare.data.task.providerShadow.receipt.alreadyPresent.Count -eq 1 -and
+        $optInPrepare.data.task.providerShadow.receipt.alreadyPresent.Count -eq 2 -and
         $optInPrepare.data.task.providerShadow.receipt.preparedInventory.entries.Count -gt 0) 'explicit opt-in returns copied, already-present, and inventory detail on retry'
     Assert-Test ($shadowReceiptHash -ceq (Get-FileHash -LiteralPath $boundPrepare.data.task.providerShadow.receiptPath -Algorithm SHA256).Hash -and
         $planHash -ceq (Get-FileHash -LiteralPath $planPath -Algorithm SHA256).Hash) 'default and opted-in retries do not compact or rewrite durable provider evidence'
@@ -706,6 +712,7 @@ try {
 
     # Provider coverage already present before preparation: true no-op cleanup.
     Copy-Item -LiteralPath (Join-Path $otherCache 'other-provider.bin') -Destination (Join-Path $taskCache 'other-provider.bin')
+    Copy-Item -LiteralPath (Join-Path $otherCache 'Info.ini') -Destination (Join-Path $taskCache 'Info.ini')
     $noopFailedArgs = @{} + $boundPrepareArgs
     $noopFailedArgs.EvidenceDirectory = Join-Path $resolvedTestRoot 'failed-bound-noop'
     $noopFailedPrepare = Invoke-Catalog $noopFailedArgs
@@ -734,14 +741,14 @@ try {
     $largePrepareArgs.ProfilePath = $largeProfilePath
     $largePrepare = Invoke-Catalog $largePrepareArgs
     $largeBoundJson = $largePrepare | ConvertTo-Json -Depth 40 -Compress
-    Assert-Test ($largePrepare.ok -and $largePrepare.data.task.providerShadow.receipt.requiredLowerProviderFiles -eq 130 -and
+    Assert-Test ($largePrepare.ok -and $largePrepare.data.task.providerShadow.receipt.requiredLowerProviderFiles -eq 131 -and
         $largeBoundJson -notmatch '"(?:copied|alreadyPresent|entries)"\s*:|(?:bulk|other|existing)-provider' -and
         $largeBoundJson.Length -le ($smallBoundJson.Length + 1024)) '128 additional lower-provider files do not create file-count-sized default response growth'
     $largeOptInArgs = @{} + $largePrepareArgs
     $largeOptInArgs.IncludeInventoryEntries = $true
     $largeOptIn = Invoke-Catalog $largeOptInArgs
     Assert-Test ($largeOptIn.ok -and $largeOptIn.data.task.providerShadow.receipt.copied.Count -eq 129 -and
-        $largeOptIn.data.task.providerShadow.receipt.alreadyPresent.Count -eq 1 -and
+        $largeOptIn.data.task.providerShadow.receipt.alreadyPresent.Count -eq 2 -and
         ($largeOptIn | ConvertTo-Json -Depth 40 -Compress).Length -gt ($largeBoundJson.Length + 10000)) 'large explicit opt-in retains all provider detail while default remains bounded'
 
     $unboundOverwrite = Invoke-Catalog @{
@@ -793,7 +800,7 @@ try {
         BlockingProcessNames = $blockers; Confirm = $false; Compact = $true; NoExit = $true
     }
     Assert-Test ($overwritePrepare.ok -and [string]$overwritePrepare.data.task.cacheBinding.mode -eq 'mo2-overwrite-output') 'catalog explicitly binds the exact MO2 Overwrite tree'
-    Assert-Test ((Test-Path -LiteralPath (Join-Path $overwriteCache 'other-provider.bin') -PathType Leaf) -and [int]$overwritePrepare.data.task.providerShadow.receipt.requiredLowerProviderFiles -eq 3) 'Overwrite preparation materializes the complete enabled-provider union'
+    Assert-Test ((Test-Path -LiteralPath (Join-Path $overwriteCache 'other-provider.bin') -PathType Leaf) -and [int]$overwritePrepare.data.task.providerShadow.receipt.requiredLowerProviderFiles -eq 4) 'Overwrite preparation materializes the complete enabled-provider union'
     [IO.File]::WriteAllBytes((Join-Path $overwriteCache 'later-area.bin'), [byte[]](3, 1, 4, 1, 5))
     $overwriteComplete = Invoke-Catalog @{
         Command = 'complete'; CatalogRoot = (Join-Path $resolvedTestRoot 'overwrite-catalog')
@@ -958,6 +965,13 @@ try {
 
     $finalList = Invoke-Catalog @{ Command = 'list'; CatalogRoot = $catalogRoot; Compact = $true; NoExit = $true }
     Assert-Test (@($finalList.data.snapshots).Count -eq 5 -and @($finalList.data.issues).Count -eq 0) 'catalog retains all known-working compatibility records and validates every manifest'
+}
+catch {
+    if ($FixtureRoot) {
+        [IO.File]::WriteAllText((Join-Path $resolvedTemp ('catalog-failure-'+[guid]::NewGuid().ToString('N')+'.json')),
+            (@{error=$_.Exception.Message;stack=$_.ScriptStackTrace;priorFailures=@($failures);lastOriginalCatalogResult=$script:lastCatalogResult}|ConvertTo-Json -Depth 45),[Text.UTF8Encoding]::new($false))
+    }
+    throw
 }
 finally {
     $env:CSX_SHADER_CACHE_CONTROL_ROOT = $priorControlRoot
