@@ -208,7 +208,8 @@ try {
     }
 }
 $exports=@(Get-Command -Module NativeInstallPlan | Select-Object -ExpandProperty Name)
-if ($exports.Count -eq 1 -and $exports[0] -ceq 'Get-VerifiedNativeInstallPlan') { $passed++ } else { $failures.Add('Unexpected public mutation interface') }
+if ($exports.Count -eq 2 -and 'Get-VerifiedNativeInstallPlan' -cin $exports -and
+    'Open-VerifiedNativeInstallPayloadCustody' -cin $exports) { $passed++ } else { $failures.Add('Unexpected public mutation interface') }
 @{ok=$failures.Count -eq 0; passed=$passed; failed=$failures.Count; failures=$failures.ToArray(); cases=$cases.ToArray();
     fixtureRoot=$root; syntheticPayloads=$true; liveRuntimeUsed=$false; realLeaseUsed=$false; moduleExports=$exports} | ConvertTo-Json -Depth 20
 if ($failures.Count) { exit 1 }
