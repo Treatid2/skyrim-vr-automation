@@ -899,6 +899,26 @@ Native event selection/dependency expansion stays authoritative and receives
 no catalogue-cost discount. Historical registry snapshots do not establish a
 fresh runtime identity; retain a new registry for the actual start.
 
+Late start selection retains explicit native Boolean `false`; it is not omission
+or a role/geometry bypass. Alongside the existing exact `optional native Boolean`
+descriptor, the planner admits one source-proven descriptive compatibility record:
+AD25 commit `ad25cd6edfb5f3d2da8386cb07a43c34e3d5efda`, build
+`91278a15be065cee3cd583d80b29991f9ae4d19b472b54717418052c8fcb8fff`, clean source,
+native contract `communityshaders.render-map` 1.26/schemaRevision28, and the exact
+published prose. Server and registry build identities must match. Missing,
+malformed, dirty, changed or successor identities refuse; arbitrary descriptive
+text is never treated as Boolean capability evidence. The immutable receipt
+records `geometryCapabilityQualification`, including the admitted handler blob
+`443db2b24a27fa4a9ef80d8818e4f6705d09643a`. The five raw AD25 handler/collector/
+activation/submission sources were independently matched to the original Broker
+source manifest in Auto's `map43-ad25-late-contract-20261011/SOURCE-ADMISSION.json`.
+This compatibility record qualifies semantics only: callers still hash-pin the
+same selected runtime's input schema/registry and revalidate its identity before
+dispatch. The unchanged late guard requires VR, `main_post_processing`, an
+explicit Boolean false, `eye-submitted` and bounded activation wait. It does not
+prove future activation, a complete eye trace, runtime freshness or scientific
+acceptance. No native rebuild, registry mutation or additional transport is used.
+
 Use optional `-EventKinds @('draw','resource-flow','eye-submitted')` only for an
 experiment-selected subset. Every name must be distinct and match the retained
 registry's `eventKinds` exactly. Unknown/planned kinds, duplicates or an empty
