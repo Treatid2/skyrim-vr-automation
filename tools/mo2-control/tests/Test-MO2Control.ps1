@@ -498,6 +498,20 @@ selected_profile=@ByteArray(Codex)
     $missingOwnerInspection = [pscustomobject]@{ processes = [pscustomobject]@{ game = @($observedGame); mo2 = @() } }
     $missingOwnerClose = & $mo2Module { param($cfg, $owned, $data, $inspection, $closer) Invoke-MO2CurrentGameCloseRequest -Config $cfg -Owned $owned -CurrentData $data -CurrentInspection $inspection -CloseAction $closer } $config $recordedCloseOwned $recordedCloseOwned.data $missingOwnerInspection $unrecordedCloser
     Assert-MO2Test (-not $missingOwnerClose.ok -and $missingOwnerClose.reason -eq 'mo2-owner-changed-before-game-close' -and $unrecordedCloseCalls.Count -eq 0) 'graceful game close requires the exact current MO2 owner before invoking CloseMainWindow'
+    # Preserve exact process-start strings; date coercion loses subsecond
+    # identity when cast back to string by the ownership verifier.
+    $neverLaunchedOwned = $launchingOwned | ConvertTo-Json -Depth 20 | ConvertFrom-Json -DateKind String
+    $neverLaunchedOwned.data.PSObject.Properties.Remove('gameProcesses')
+    $neverLaunchedOwned.data.status = 'mo2-open'
+    $emptyGameInspection = [pscustomobject]@{processes=[pscustomobject]@{game=@();mo2=@($launchOwner.targets)}}
+    $emptyGameClose = & $mo2Module {param($cfg,$owned,$inspection,$closer) Invoke-MO2CurrentGameCloseRequest -Config $cfg -Owned $owned -CurrentData $owned.data -CurrentInspection $inspection -CloseAction $closer} $config $neverLaunchedOwned $emptyGameInspection $unrecordedCloser
+    if (-not $emptyGameClose.ok) { throw "Never-launched empty-game close failed: $($emptyGameClose|ConvertTo-Json -Depth 12 -Compress)" }
+    Assert-MO2Test ($emptyGameClose.ok -and @($emptyGameClose.targets).Count -eq 0 -and $unrecordedCloseCalls.Count -eq 0) 'never-launched mo2-open session without gameProcesses safely passes empty-game close without process action'
+    $unrecordedEmptyClose = & $mo2Module {param($cfg,$owned,$inspection,$closer) Invoke-MO2CurrentGameCloseRequest -Config $cfg -Owned $owned -CurrentData $owned.data -CurrentInspection $inspection -CloseAction $closer} $config $neverLaunchedOwned $unrecordedInspection $unrecordedCloser
+    Assert-MO2Test (-not $unrecordedEmptyClose.ok -and $unrecordedEmptyClose.reason -eq 'unrecorded-game-process-present' -and $unrecordedCloseCalls.Count -eq 0) 'missing gameProcesses never adopts or closes an unrecorded live game'
+    $emptyGameInspection.processes.mo2=@()
+    $ownerlessEmptyClose = & $mo2Module {param($cfg,$owned,$inspection,$closer) Invoke-MO2CurrentGameCloseRequest -Config $cfg -Owned $owned -CurrentData $owned.data -CurrentInspection $inspection -CloseAction $closer} $config $neverLaunchedOwned $emptyGameInspection $unrecordedCloser
+    Assert-MO2Test (-not $ownerlessEmptyClose.ok -and $ownerlessEmptyClose.reason -eq 'mo2-owner-changed-before-game-close') 'missing gameProcesses still requires exact MO2 owner before cooperative shutdown'
 
     $dialogAuthority = & $mo2Module {
         param($cfg, $owned, $ownerRecord)
@@ -543,7 +557,7 @@ selected_profile=@ByteArray(Codex)
         $stopSource -notmatch 'Invoke-MO2OwnedGameCloseRequest[^\r\n]+-Targets' -and
         $ownedCloseSource -match 'Invoke-MO2CurrentGameCloseRequest[^\r\n]+-CurrentData \$currentData' -and
         $moduleSource -match 'Resolve-MO2OwnedProcessTarget -Config \$Config -Owned \$Owned -Processes @\(\$CurrentInspection[.]processes[.]mo2\)' -and
-        $moduleSource -match 'Resolve-MO2RecordedGameProcessTargets -Recorded @\(\$CurrentData[.]gameProcesses\)' -and
+        $moduleSource -match 'Resolve-MO2RecordedGameProcessTargets -Recorded \$recorded -Current @\(\$CurrentInspection[.]processes[.]game\)' -and
         $stopGameSource -notmatch 'Get-Process -Id' -and $stopSource -notmatch 'Get-Process -Id') 'stop-game and stop close only the serialized session-recorded game set through retained live handles'
     $recoverCloseSource = [regex]::Match($moduleSource, '(?s)function Invoke-MO2RecoverClose \{.*?\n\}').Value
     Assert-MO2Test (@([regex]::Matches($recoverCloseSource, '\$owned = Get-MO2OwnedSession -Config \$Config -SessionId \$sessionId')).Count -eq 1 -and $recoverCloseSource -match 'Invoke-MO2CooperativeClose -Config \$Config -Owned \$owned' -and $recoverCloseSource -match 'Set-MO2OwnedSessionStatus -Owned \$owned') 'recovery close preserves one initiating owned-session generation through process action and completion write'
