@@ -1,0 +1,494 @@
+{
+  "capabilities": {
+    "keyboard": {
+      "actions": [
+        "status",
+        "down",
+        "up",
+        "tap",
+        "sequence",
+        "releaseAll"
+      ],
+      "available": true,
+      "defaultMaxHoldMs": 5000,
+      "defaultTapMs": 50,
+      "encoding": "DirectInputScanCode",
+      "injection": "Skyrim.BSInputEventQueue",
+      "keys": [
+        {
+          "key": "escape",
+          "scancode": 1
+        },
+        {
+          "key": "1",
+          "scancode": 2
+        },
+        {
+          "key": "2",
+          "scancode": 3
+        },
+        {
+          "key": "3",
+          "scancode": 4
+        },
+        {
+          "key": "4",
+          "scancode": 5
+        },
+        {
+          "key": "5",
+          "scancode": 6
+        },
+        {
+          "key": "6",
+          "scancode": 7
+        },
+        {
+          "key": "7",
+          "scancode": 8
+        },
+        {
+          "key": "8",
+          "scancode": 9
+        },
+        {
+          "key": "9",
+          "scancode": 10
+        },
+        {
+          "key": "0",
+          "scancode": 11
+        },
+        {
+          "key": "minus",
+          "scancode": 12
+        },
+        {
+          "key": "equals",
+          "scancode": 13
+        },
+        {
+          "key": "backspace",
+          "scancode": 14
+        },
+        {
+          "key": "tab",
+          "scancode": 15
+        },
+        {
+          "key": "q",
+          "scancode": 16
+        },
+        {
+          "key": "w",
+          "scancode": 17
+        },
+        {
+          "key": "e",
+          "scancode": 18
+        },
+        {
+          "key": "r",
+          "scancode": 19
+        },
+        {
+          "key": "t",
+          "scancode": 20
+        },
+        {
+          "key": "y",
+          "scancode": 21
+        },
+        {
+          "key": "u",
+          "scancode": 22
+        },
+        {
+          "key": "i",
+          "scancode": 23
+        },
+        {
+          "key": "o",
+          "scancode": 24
+        },
+        {
+          "key": "p",
+          "scancode": 25
+        },
+        {
+          "key": "leftBracket",
+          "scancode": 26
+        },
+        {
+          "key": "rightBracket",
+          "scancode": 27
+        },
+        {
+          "key": "enter",
+          "scancode": 28
+        },
+        {
+          "key": "leftControl",
+          "scancode": 29
+        },
+        {
+          "key": "a",
+          "scancode": 30
+        },
+        {
+          "key": "s",
+          "scancode": 31
+        },
+        {
+          "key": "d",
+          "scancode": 32
+        },
+        {
+          "key": "f",
+          "scancode": 33
+        },
+        {
+          "key": "g",
+          "scancode": 34
+        },
+        {
+          "key": "h",
+          "scancode": 35
+        },
+        {
+          "key": "j",
+          "scancode": 36
+        },
+        {
+          "key": "k",
+          "scancode": 37
+        },
+        {
+          "key": "l",
+          "scancode": 38
+        },
+        {
+          "key": "semicolon",
+          "scancode": 39
+        },
+        {
+          "key": "apostrophe",
+          "scancode": 40
+        },
+        {
+          "key": "grave",
+          "scancode": 41
+        },
+        {
+          "key": "leftShift",
+          "scancode": 42
+        },
+        {
+          "key": "backslash",
+          "scancode": 43
+        },
+        {
+          "key": "z",
+          "scancode": 44
+        },
+        {
+          "key": "x",
+          "scancode": 45
+        },
+        {
+          "key": "c",
+          "scancode": 46
+        },
+        {
+          "key": "v",
+          "scancode": 47
+        },
+        {
+          "key": "b",
+          "scancode": 48
+        },
+        {
+          "key": "n",
+          "scancode": 49
+        },
+        {
+          "key": "m",
+          "scancode": 50
+        },
+        {
+          "key": "comma",
+          "scancode": 51
+        },
+        {
+          "key": "period",
+          "scancode": 52
+        },
+        {
+          "key": "slash",
+          "scancode": 53
+        },
+        {
+          "key": "rightShift",
+          "scancode": 54
+        },
+        {
+          "key": "numpadMultiply",
+          "scancode": 55
+        },
+        {
+          "key": "leftAlt",
+          "scancode": 56
+        },
+        {
+          "key": "space",
+          "scancode": 57
+        },
+        {
+          "key": "capsLock",
+          "scancode": 58
+        },
+        {
+          "key": "f1",
+          "scancode": 59
+        },
+        {
+          "key": "f2",
+          "scancode": 60
+        },
+        {
+          "key": "f3",
+          "scancode": 61
+        },
+        {
+          "key": "f4",
+          "scancode": 62
+        },
+        {
+          "key": "f5",
+          "scancode": 63
+        },
+        {
+          "key": "f6",
+          "scancode": 64
+        },
+        {
+          "key": "f7",
+          "scancode": 65
+        },
+        {
+          "key": "f8",
+          "scancode": 66
+        },
+        {
+          "key": "f9",
+          "scancode": 67
+        },
+        {
+          "key": "f10",
+          "scancode": 68
+        },
+        {
+          "key": "numLock",
+          "scancode": 69
+        },
+        {
+          "key": "scrollLock",
+          "scancode": 70
+        },
+        {
+          "key": "numpad7",
+          "scancode": 71
+        },
+        {
+          "key": "numpad8",
+          "scancode": 72
+        },
+        {
+          "key": "numpad9",
+          "scancode": 73
+        },
+        {
+          "key": "numpadSubtract",
+          "scancode": 74
+        },
+        {
+          "key": "numpad4",
+          "scancode": 75
+        },
+        {
+          "key": "numpad5",
+          "scancode": 76
+        },
+        {
+          "key": "numpad6",
+          "scancode": 77
+        },
+        {
+          "key": "numpadAdd",
+          "scancode": 78
+        },
+        {
+          "key": "numpad1",
+          "scancode": 79
+        },
+        {
+          "key": "numpad2",
+          "scancode": 80
+        },
+        {
+          "key": "numpad3",
+          "scancode": 81
+        },
+        {
+          "key": "numpad0",
+          "scancode": 82
+        },
+        {
+          "key": "numpadDecimal",
+          "scancode": 83
+        },
+        {
+          "key": "f11",
+          "scancode": 87
+        },
+        {
+          "key": "f12",
+          "scancode": 88
+        },
+        {
+          "key": "numpadEnter",
+          "scancode": 156
+        },
+        {
+          "key": "rightControl",
+          "scancode": 157
+        },
+        {
+          "key": "numpadDivide",
+          "scancode": 181
+        },
+        {
+          "key": "rightAlt",
+          "scancode": 184
+        },
+        {
+          "key": "home",
+          "scancode": 199
+        },
+        {
+          "key": "up",
+          "scancode": 200
+        },
+        {
+          "key": "pageUp",
+          "scancode": 201
+        },
+        {
+          "key": "left",
+          "scancode": 203
+        },
+        {
+          "key": "right",
+          "scancode": 205
+        },
+        {
+          "key": "end",
+          "scancode": 207
+        },
+        {
+          "key": "down",
+          "scancode": 208
+        },
+        {
+          "key": "pageDown",
+          "scancode": 209
+        },
+        {
+          "key": "insert",
+          "scancode": 210
+        },
+        {
+          "key": "delete",
+          "scancode": 211
+        },
+        {
+          "key": "leftWindows",
+          "scancode": 219
+        },
+        {
+          "key": "rightWindows",
+          "scancode": 220
+        },
+        {
+          "key": "menu",
+          "scancode": 221
+        },
+        {
+          "key": "mouseLeft",
+          "scancode": 256
+        },
+        {
+          "key": "mouseRight",
+          "scancode": 257
+        },
+        {
+          "key": "mouseMiddle",
+          "scancode": 258
+        }
+      ],
+      "maximumHeldKeys": 8,
+      "maximumMaxHoldMs": 60000,
+      "maximumSequenceEvents": 128,
+      "maximumSequenceMs": 30000,
+      "mouseButtons": {
+        "codeBase": 256,
+        "keys": [
+          "mouseLeft",
+          "mouseRight",
+          "mouseMiddle"
+        ]
+      },
+      "ready": true,
+      "version": 1
+    },
+    "vrTrackedSet": {
+      "actions": [
+        "status",
+        "observe",
+        "sequence",
+        "stop",
+        "releaseAll"
+      ],
+      "atomicDevices": [
+        "hmd",
+        "left",
+        "right"
+      ],
+      "available": true,
+      "controllerEncoding": "OpenVR packetNumber/pressed/touched/five x-y axes",
+      "device": "vrTrackedSet",
+      "injection": "OpenVR IVRCompositor poses + IVRSystem controller state",
+      "lifecyclePolicy": "default stop; recording replay may explicitly survive recorded load/new-game boundaries",
+      "maximumDurationMs": 1800000,
+      "maximumFrames": 60000,
+      "ordering": "tMs then seq",
+      "ownership": "one bounded sequence owner; start returns a required external cleanup token",
+      "passThroughWhenInactive": true,
+      "poseEncoding": "OpenVR device-to-absolute 3x4 row-major",
+      "ready": true,
+      "timing": "steadyMillisecondsFromSequenceStart",
+      "validation": "complete sequence before activation",
+      "version": {
+        "major": 1,
+        "minor": 1
+      }
+    }
+  },
+  "contract": {
+    "name": "devbench.input",
+    "version": {
+      "major": 2,
+      "minor": 0
+    }
+  }
+}
