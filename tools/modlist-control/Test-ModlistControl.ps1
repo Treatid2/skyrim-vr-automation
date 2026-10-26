@@ -48,11 +48,17 @@ try {
     $scalarRegister = & $entry register -Name scalar -ConfigPath $scalarSource -UserRoot $fixture -NoExit | ConvertFrom-Json
     Assert-ModlistTest (-not $scalarRegister.ok -and $scalarRegister.errors[0] -match "field 'storage' must be a JSON object") 'register rejects scalar values for required configuration objects'
 
-    $main = & $entry register -Name main -ConfigPath $source -UserRoot $fixture -NoExit | ConvertFrom-Json
-    $synergy = & $entry register -Name synergy -ConfigPath $source -UserRoot $fixture -NoExit | ConvertFrom-Json
-    Assert-ModlistTest ($main.ok -and $synergy.ok) 'register creates two exact named configs'
-
     $stablePath = Join-Path $fixture 'machine.local.json'
+    $noneConfigured = Resolve-MO2ControlConfigPath -PackageRoot (Join-Path $toolRoot 'mo2-control') -UserConfigPath $stablePath
+    Assert-ModlistTest (-not $noneConfigured.exists -and $noneConfigured.source -eq 'user' -and @($noneConfigured.candidates).Count -eq 2) 'zero named configs fall through to the stable and legacy candidates without a scalar Count failure'
+
+    $main = & $entry register -Name main -ConfigPath $source -UserRoot $fixture -NoExit | ConvertFrom-Json
+    $singleUnselected = Resolve-MO2ControlConfigPath -PackageRoot (Join-Path $toolRoot 'mo2-control') -UserConfigPath $stablePath
+    Assert-ModlistTest ($main.ok -and -not $singleUnselected.exists -and $singleUnselected.source -eq 'named-selection-required' -and @($singleUnselected.candidates).Count -eq 1) 'one unselected named config returns an attributable selection requirement'
+
+    $synergy = & $entry register -Name synergy -ConfigPath $source -UserRoot $fixture -NoExit | ConvertFrom-Json
+    Assert-ModlistTest ($synergy.ok) 'register creates a second exact named config'
+
     $unselected = Resolve-MO2ControlConfigPath -PackageRoot (Join-Path $toolRoot 'mo2-control') -UserConfigPath $stablePath
     Assert-ModlistTest (-not $unselected.exists -and $unselected.source -eq 'named-selection-required') 'multiple named configs never fall through to a default'
 
