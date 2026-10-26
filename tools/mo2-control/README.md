@@ -36,6 +36,14 @@ visible MO2-owned modal windows. It never closes Tullius,
 Notepad++, or another editor and never force-terminates. Existing retained-MO2
 game cycling and explicit safe-gated termination remain available.
 
+`inspect` classifies MO2's "waiting on an application" exit dialog as an
+external USVFS participant, not an application dependency. Its
+`data.usvfsWait` record reports the exact executable/PID, process age and command
+line when readable, matching USVFS modules from this MO2 installation, and
+`executable_blacklist` coverage. External editors and crash viewers are never
+automation close targets: exit an already injected process under user control;
+blacklisting only prevents future MO2-launched instances from joining USVFS.
+
 `open` and `launch` accept `-StartOnly`: they write their exact session receipt,
 start only the intended process, return immediately with the session/evidence
 path, and direct the caller to poll `status`. When `status` proves the one exact
