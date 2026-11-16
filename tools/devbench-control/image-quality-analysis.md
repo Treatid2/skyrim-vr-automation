@@ -28,7 +28,13 @@ directory glob chooses a sequence or build. Sequence-manifest relative paths
 start at the capture directory; relative artifact paths start beside their
 owning receipt. Relocated absolute receipt paths always resolve inside the
 selected copy, even if the old copy still exists. Escapes and ambiguous
-relocations are rejected.
+relocations are rejected. The top-level manifest must also resolve within the
+selected capture. JSON is parsed from the verified buffer. Pixel measurement
+and optional reference scoring use verified temporary copies of the PNGs and
+worker inputs, which may require disk space for a second copy. The optional
+scorer must be a standalone executable available from the temporary directory.
+The result receipt binds the validated output bytes. Use a trusted local
+account and scorer; the temporary workspace is not a sandbox.
 
 - `run`: capture directory with a `comparison-native-images-v2` manifest
   named `image-manifest.json`; `imageManifestSha256` pins it.

@@ -72,7 +72,7 @@ class AnalysisTest(unittest.TestCase):
                 _, jobs, _, audit = analysis.prepare(root/"input.json",evidence)
                 self.assertEqual(len(jobs),2)
                 self.assertEqual(audit[0]["frames"],3)
-                self.assertEqual(len(evidence),5)
+                self.assertEqual(len(evidence),6)
                 variants = []
                 empty = copy.deepcopy(sequence); empty["children"] = []; variants.append(empty)
                 for field, value in (("sourceWidth",1512.5),("orientation",{}),("burstRegions",[])):
@@ -97,18 +97,98 @@ class AnalysisTest(unittest.TestCase):
             config = dict(mask=dict(effectiveRuntimeVerified=False),regionLabels={},views=[])
             analysis.write(config_path,config)
             job = dict(view="test",kind="burst",regions=[dict(Eye="left",Zone="center",Width=4,Height=4,MaskRuns=[[0,4]]*4)],
-                       frames=[dict(ordinal=1,timestampUs=100)])
+                       frames=[dict(ordinal=1,timestampUs=100,path=str(config_path))])
             def runner(*args,**kwargs):
-                (output/"frame-metrics.csv").write_text(
+                Path(args[0][-1]).write_text(
                     "view,kind,ordinal,timestampUs,eye,region,samples,meanLuma,edgeContrast,previousMeanAbsDiff\n"
                     "test,burst,1,100,left,center,4,10,2,\n")
                 analysis.write(config_path,dict(config,changed=True))
             with patch.object(sys,"argv",["analyzer","--input",str(config_path),"--output",str(output),"--measure-only"]), \
-                 patch.object(analysis,"prepare",return_value=(config,[job],[],[])), \
+                 patch.object(analysis,"prepare",side_effect=lambda path, evidence: (
+                     analysis.read(path, evidence=evidence), [job], [], [])), \
                  patch.object(analysis.subprocess,"run",side_effect=runner):
                 with self.assertRaisesRegex(ValueError,"Hash mismatch"):
                     analysis.main()
             self.assertFalse((output/"analysis-receipt.json").exists())
+
+    def test_top_manifest_link_cannot_escape_selected_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture_fixture(root)
+            manifest = root / "capture" / "image-manifest.json"
+            outside = root / "outside.json"
+            manifest.rename(outside)
+            try:
+                manifest.symlink_to(outside)
+            except OSError as exc:
+                if os.name != "nt" or getattr(exc, "winerror", None) != 1314:
+                    raise
+                # A junction can be created without the symlink privilege.
+                outside_dir = root / "outside"
+                outside_dir.mkdir()
+                outside.rename(outside_dir / "image-manifest.json")
+                subprocess.run(
+                    ["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+                     "New-Item -ItemType Junction -Path $env:TEST_CAPTURE_LINK -Target $env:TEST_CAPTURE_OUTSIDE | Out-Null"],
+                    env=dict(os.environ, TEST_CAPTURE_LINK=str(manifest), TEST_CAPTURE_OUTSIDE=str(outside_dir)),
+                    check=True)
+            with self.assertRaisesRegex(ValueError, "escapes selected capture"):
+                analysis.prepare(root / "input.json")
+
+    def test_json_parses_the_admitted_buffer_after_path_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            raw = b'{"correct": true}'
+            path.write_bytes(raw)
+            expected = analysis.digest(path)
+            actual_loads = json.loads
+
+            def replace_before_parse(buffer):
+                path.write_bytes(b'{"correct": false}')
+                try:
+                    return actual_loads(buffer)
+                finally:
+                    path.write_bytes(raw)
+
+            with patch.object(analysis.json, "loads", side_effect=replace_before_parse):
+                self.assertEqual(analysis.read(path, expected), {"correct": True})
+            self.assertEqual(analysis.digest(path), expected)
+
+    def test_worker_consumes_private_verified_bytes_after_original_is_swapped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path, output, image = root/"input.json", root/"output", root/"frame.png"
+            config = dict(mask=dict(effectiveRuntimeVerified=False), regionLabels={}, views=[])
+            analysis.write(config_path, config)
+            image.write_bytes(b"original")
+            job = dict(view="test", kind="burst",
+                       regions=[dict(Eye="left", Zone="center", Width=4, Height=4, MaskRuns=[[0,4]]*4)],
+                       frames=[dict(ordinal=1, timestampUs=100, path=str(image))])
+
+            def prepare(path, evidence):
+                analysis.checked(image, analysis.digest(image), evidence)
+                return analysis.read(path, evidence=evidence), [job], [], []
+
+            def runner(args, **kwargs):
+                private_plan = Path(args[args.index("-PlanPath") + 1])
+                private_image = Path(analysis.read(private_plan)[0]["frames"][0]["path"])
+                self.assertNotEqual(private_image, image)
+                image.write_bytes(b"replaced")
+                try:
+                    self.assertEqual(private_image.read_bytes(), b"original")
+                finally:
+                    image.write_bytes(b"original")
+                Path(args[-1]).write_text(
+                    "view,kind,ordinal,timestampUs,eye,region,samples,meanLuma,edgeContrast,previousMeanAbsDiff\n"
+                    "test,burst,1,100,left,center,4,10,2,\n")
+
+            with patch.object(sys, "argv", ["analyzer","--input",str(config_path),"--output",str(output),"--measure-only"]), \
+                 patch.object(analysis, "prepare", side_effect=prepare), \
+                 patch.object(analysis.subprocess, "run", side_effect=runner):
+                analysis.main()
+            receipt = analysis.read(output / "analysis-receipt.json")
+            self.assertEqual(receipt["evidenceSha256"][str(image.resolve())], analysis.digest(image))
+            self.assertEqual(receipt["outputSha256"]["frame-metrics.csv"], analysis.digest(output / "frame-metrics.csv"))
 
     def test_json_pointer_reads_runtime_arrays(self):
         self.assertEqual(analysis.pointer({"results":[{"a/b":.5}]}, "/results/0/a~1b"), .5)

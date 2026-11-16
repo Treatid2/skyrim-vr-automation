@@ -4,19 +4,29 @@
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
 from pathlib import Path
 import statistics
 import subprocess
+import tempfile
 
 
-def read(path):
-    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+def read(path, sha256=None, evidence=None):
+    path = Path(path).resolve()
+    data = path.read_bytes()
+    actual = hashlib.sha256(data).hexdigest()
+    if sha256 is not None:
+        require(actual == sha256.lower(), f"Hash mismatch: {path}")
+    remember(path, actual, evidence)
+    return json.loads(data.decode("utf-8-sig"))
 
 
 def write(path, value):
-    Path(path).write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    data = (json.dumps(value, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    Path(path).write_bytes(data)
+    return hashlib.sha256(data).hexdigest()
 
 
 def require(condition, message):
@@ -32,10 +42,26 @@ def digest(path):
 def checked(path, sha256, evidence=None):
     path = Path(path).resolve()
     require(digest(path) == sha256.lower(), f"Hash mismatch: {path}")
-    if evidence is not None:
-        require(str(path) not in evidence or evidence[str(path)] == sha256.lower(), "Conflicting evidence hashes")
-        evidence[str(path)] = sha256.lower()
+    remember(path, sha256.lower(), evidence)
     return path
+
+
+def remember(path, sha256, evidence):
+    if evidence is not None:
+        require(str(path) not in evidence or evidence[str(path)] == sha256, "Conflicting evidence hashes")
+        evidence[str(path)] = sha256
+
+
+def copy_verified(path, destination, expected):
+    # Hash the bytes written to the private copy, using the same source handle.
+    sha256 = hashlib.sha256()
+    with Path(path).open("rb") as source, destination.open("xb") as target:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            sha256.update(chunk)
+            target.write(chunk)
+    require(sha256.hexdigest() == expected.lower(), f"Hash mismatch: {path}")
+    checked(destination, expected)
+    return destination
 
 
 def pointer(value, path):
@@ -53,8 +79,8 @@ def finite_number(value):
 
 
 def load_mask(config, base, evidence=None):
-    source = checked(base / config["source"]["path"], config["source"]["sha256"], evidence)
-    settings = read(source)
+    source = config["source"]
+    settings = read(base / source["path"], source["sha256"], evidence)
     values = {key: pointer(settings, field) for key, field in config["fields"].items()}
     require(all(finite_number(x) for x in values.values()), "Non-numeric or non-finite mask settings")
     require(config["model"] in ("squircle", "rectangle-inward"), "Unsupported mask model; do not infer geometry")
@@ -206,11 +232,11 @@ def resolve_artifact(run, sequence, artifact, evidence=None):
 
 def prepare(config_path, evidence=None):
     config_path = Path(config_path).resolve()
-    config, base = read(config_path), config_path.parent
+    config, base = read(config_path, evidence=evidence), config_path.parent
     require(config["schema"] == "stereo-image-analysis-v1", "Unknown analysis schema")
     run = (base / config["run"]).resolve()
-    manifest_path = checked(run / "image-manifest.json", config["imageManifestSha256"], evidence)
-    manifest = read(manifest_path)
+    manifest_path = resolve_capture_path(run, run, "image-manifest.json")
+    manifest = read(manifest_path, config["imageManifestSha256"], evidence)
     require(manifest["schema"] == "comparison-native-images-v2" and manifest["verified"] is True,
             "Image manifest schema/verification mismatch")
     values = load_mask(config["mask"], base, evidence)
@@ -230,8 +256,7 @@ def prepare(config_path, evidence=None):
     for review in config["views"]:
         view = views[review["view"]]
         sequence_path = resolve_capture_path(run, run, view["burst"]["manifest"])
-        checked(sequence_path, review["sequenceSha256"], evidence)
-        sequence = read(sequence_path)
+        sequence = read(sequence_path, review["sequenceSha256"], evidence)
         require(sequence["continuity"]["complete"] is True and not sequence["errors"], "Incomplete sequence")
         children = sequence["children"]
         require(children and type(view["burst"]["frameCount"]) is int and
@@ -324,7 +349,7 @@ def prepare(config_path, evidence=None):
             for endpoint in ("first", "last"):
                 require(phase[endpoint + "TimestampUs"] == frames[phase[endpoint] - 1]["timestampUs"],
                         "Phase timestamps do not match selected receipt")
-        audit.append(dict(view=view["view"], sequence=str(sequence_path), sequenceSha256=digest(sequence_path),
+        audit.append(dict(view=view["view"], sequence=str(sequence_path), sequenceSha256=review["sequenceSha256"].lower(),
                           frames=len(frames), phases=review["phases"], goldenRectangles=rects,
                           excludedFromPhaseAnalysis=[f["ordinal"] for f in frames if f["ordinal"] not in phases]))
     return config, jobs, scoring, audit
@@ -414,7 +439,7 @@ def main():
     args = parser.parse_args()
     output = args.output.resolve()
     require(not output.exists(), "Use a new derived output directory; do not overwrite evidence")
-    evidence = {str(args.input.resolve()): digest(args.input)}
+    evidence = {}
     producers = {str(Path(__file__).resolve().with_name(name)): digest(Path(__file__).with_name(name))
                  for name in ("image_quality_analysis.py", "ImageMetrics.cs", "Measure-ImageRegions.ps1")}
     config, jobs, scoring, audit = prepare(args.input, evidence)
@@ -425,38 +450,84 @@ def main():
         require(args.ssim_exe is not None, "Existing DevBench SSIM adapter required when references are supplied")
         producers[str(args.ssim_exe.resolve())] = digest(args.ssim_exe)
     output.mkdir(parents=True)
-    write(output / "input.json", config)
-    write(output / "plan.json", jobs)
-    write(output / "golden-requests.json", scoring)
-    write(output / "region-and-phase-audit.json", audit)
-    subprocess.run(["pwsh", "-NoProfile", "-File", str(Path(__file__).with_name("Measure-ImageRegions.ps1")),
-                    "-PlanPath", str(output / "plan.json"), "-OutputPath", str(output / "frame-metrics.csv")], check=True)
-    if scoring:
-        result = subprocess.run([str(args.ssim_exe.resolve()), str(output / "golden-requests.json")],
-                                capture_output=True, text=True, check=True)
-        scores = json.loads(result.stdout)
-        validate_scores(scores, scoring)
-        write(output / "reference-scores.json", scores)
-    with (output / "frame-metrics.csv").open(encoding="utf-8-sig", newline="") as source:
-        rows = list(csv.DictReader(source))
+    output_hashes = {
+        "input.json": write(output / "input.json", config),
+        "plan.json": write(output / "plan.json", jobs),
+        "golden-requests.json": write(output / "golden-requests.json", scoring),
+        "region-and-phase-audit.json": write(output / "region-and-phase-audit.json", audit),
+    }
+    # Children receive only private copies. The published plan keeps original paths
+    # so its evidence remains usable after the working directory has been removed.
+    with tempfile.TemporaryDirectory(prefix="stereo-analysis-") as temp:
+        stage = Path(temp)
+        copies = {}
+        staged_hashes = {}
+
+        def stage_file(path, expected, name=None):
+            if path not in copies:
+                target = stage / (name or f"{len(copies):06d}{Path(path).suffix}")
+                copies[path] = str(copy_verified(path, target, expected))
+                staged_hashes[copies[path]] = expected
+            return copies[path]
+
+        worker = {}
+        for path, expected in producers.items():
+            if scoring and path == str(args.ssim_exe.resolve()):
+                stage_file(path, expected)
+            else:
+                worker[Path(path).name] = stage_file(path, expected, Path(path).name)
+        private_jobs = [
+            dict(job, frames=[dict(frame, path=stage_file(frame["path"], evidence[frame["path"]]))
+                              for frame in job["frames"]])
+            for job in jobs
+        ]
+        private_scoring = [
+            dict(request, candidate=stage_file(request["candidate"], evidence[request["candidate"]]),
+                 golden=stage_file(request["golden"], evidence[request["golden"]]))
+            for request in scoring
+        ]
+        plan_path, score_path = stage / "plan.json", stage / "golden-requests.json"
+        staged_hashes[str(plan_path)] = write(plan_path, private_jobs)
+        staged_hashes[str(score_path)] = write(score_path, private_scoring)
+        metrics_path = stage / "frame-metrics.csv"
+        subprocess.run(["pwsh", "-NoProfile", "-File", worker["Measure-ImageRegions.ps1"],
+                        "-PlanPath", str(plan_path), "-OutputPath", str(metrics_path)], check=True)
+        metrics_bytes = metrics_path.read_bytes()
+        rows = list(csv.DictReader(io.StringIO(metrics_bytes.decode("utf-8-sig"), newline="")))
+        validate_metrics(rows, jobs)
+        if scoring:
+            result = subprocess.run([copies[str(args.ssim_exe.resolve())], str(score_path)],
+                                    capture_output=True, text=True, check=True)
+            scores = json.loads(result.stdout)
+            validate_scores(scores, scoring)
+            output_hashes["reference-scores.json"] = write(output / "reference-scores.json", scores)
+        for path, sha256 in staged_hashes.items():
+            checked(path, sha256)
+        (output / "frame-metrics.csv").write_bytes(metrics_bytes)
+        output_hashes["frame-metrics.csv"] = hashlib.sha256(metrics_bytes).hexdigest()
     if not args.measure_only:
         summaries = summary(rows, jobs, config)
-        with (output / "temporal-per-eye.csv").open("w", encoding="utf-8", newline="") as target:
-            writer = csv.DictWriter(target, fieldnames=summaries[0].keys())
-            writer.writeheader()
-            writer.writerows(summaries)
-    else:
-        validate_metrics(rows, jobs)
+        target = io.StringIO(newline="")
+        writer = csv.DictWriter(target, fieldnames=summaries[0].keys())
+        writer.writeheader()
+        writer.writerows(summaries)
+        summary_bytes = target.getvalue().encode("utf-8")
+        (output / "temporal-per-eye.csv").write_bytes(summary_bytes)
+        output_hashes["temporal-per-eye.csv"] = hashlib.sha256(summary_bytes).hexdigest()
     for path, sha256 in (evidence | producers).items():
         checked(path, sha256)
-    write(output / "analysis-receipt.json", dict(status="phase_review_pending" if args.measure_only else "computed",
+    for name, sha256 in output_hashes.items():
+        checked(output / name, sha256)
+    receipt = dict(status="phase_review_pending" if args.measure_only else "computed",
           inputPath=str(args.input.resolve()), inputSha256=evidence[str(args.input.resolve())],
           evidenceSha256=evidence, producerSha256=producers,
-          outputSha256={p.name: digest(p) for p in sorted(output.iterdir()) if p.is_file()},
+          outputSha256=output_hashes,
           maskEffectiveRuntimeVerified=config["mask"]["effectiveRuntimeVerified"],
           referenceRole=config.get("referenceRole"), regionLabels=config["regionLabels"],
           visualReview=config.get("visualReview"),
-          interpretation="Raw luminance change includes animation and camera motion; SSIM is similarity, not quality."))
+          interpretation="Raw luminance change includes animation and camera motion; SSIM is similarity, not quality.")
+    with (output / "analysis-receipt.json").open("x", encoding="utf-8") as target:
+        target.write(json.dumps(receipt, indent=2, allow_nan=False) + "\n")
     print(f"Analyzed {len(audit)} views; results: {output}")
 
 
