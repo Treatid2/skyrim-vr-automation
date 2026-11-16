@@ -1,5 +1,10 @@
 # DevBench Control
 
+For offline review of saved stereo stills and bursts, use the
+[image-analysis workflow](image-quality-analysis.md). It selects receipt
+artifacts and reviewed phases, reports each eye separately, and reuses
+DevBench reference scoring without a live game connection.
+
 ## Bounded scene-light reads
 
 Explicit `inspect {kind:lights,scope:scene,limit:<integer 1..64>}` admits only
