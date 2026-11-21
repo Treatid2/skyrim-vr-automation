@@ -399,6 +399,126 @@ private:
     SharedPoseChannel channel_;
 };
 
+// These devices supply the legacy roles/poses used by VR Tools. They have no
+// command channel: all input remains neutral for the lifetime of the device.
+class PassiveControllerDevice final : public vr::ITrackedDeviceServerDriver {
+public:
+    explicit PassiveControllerDevice(vr::ETrackedControllerRole role) : role_(role) {}
+
+    const char* Serial() const
+    {
+        return role_ == vr::TrackedControllerRole_LeftHand ?
+            "CSX-NULL-CONTROLLER-LEFT-1" : "CSX-NULL-CONTROLLER-RIGHT-1";
+    }
+
+    vr::EVRInitError Activate(vr::TrackedDeviceIndex_t objectId) override
+    {
+        const auto properties = vr::VRProperties()->TrackedDeviceToPropertyContainer(objectId);
+        auto* props = vr::VRProperties();
+        bool valid = true;
+        const auto check = [&valid](vr::ETrackedPropertyError error) {
+            valid = valid && error == vr::TrackedProp_Success;
+        };
+        check(props->SetInt32Property(properties, vr::Prop_ControllerRoleHint_Int32, role_));
+        check(props->SetStringProperty(properties, vr::Prop_ControllerType_String, "vive_controller"));
+        check(props->SetStringProperty(properties, vr::Prop_InputProfilePath_String,
+            "{codex_head_pose}/input/passive_controller_profile.json"));
+        check(props->SetStringProperty(properties, vr::Prop_ModelNumber_String, "CSX Passive Controller"));
+        check(props->SetStringProperty(properties, vr::Prop_RenderModelName_String, "vr_controller_vive_1_5"));
+        check(props->SetStringProperty(properties, vr::Prop_TrackingSystemName_String, "codex_head_pose"));
+        check(props->SetStringProperty(properties, vr::Prop_ManufacturerName_String, "Treatid2"));
+        check(props->SetUint64Property(properties, vr::Prop_CurrentUniverseId_Uint64, 2));
+        check(props->SetBoolProperty(properties, vr::Prop_NeverTracked_Bool, false));
+        check(props->SetBoolProperty(properties, vr::Prop_DeviceProvidesBatteryStatus_Bool, false));
+        check(props->SetInt32Property(properties, vr::Prop_Axis0Type_Int32, vr::k_eControllerAxis_TrackPad));
+        check(props->SetInt32Property(properties, vr::Prop_Axis1Type_Int32, vr::k_eControllerAxis_Trigger));
+        check(props->SetUint64Property(properties, vr::Prop_SupportedButtons_Uint64,
+            vr::ButtonMaskFromId(vr::k_EButton_System) |
+            vr::ButtonMaskFromId(vr::k_EButton_ApplicationMenu) |
+            vr::ButtonMaskFromId(vr::k_EButton_Grip) |
+            vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad) |
+            vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger)));
+        auto* input = vr::VRDriverInput();
+        for (std::size_t i = 0; i < booleanPaths_.size(); ++i) {
+            valid = (input->CreateBooleanComponent(properties, booleanPaths_[i], &booleans_[i]) ==
+                vr::VRInputError_None) && valid;
+        }
+        for (std::size_t i = 0; i < scalarPaths_.size(); ++i) {
+            valid = (input->CreateScalarComponent(properties, scalarPaths_[i], &scalars_[i],
+                vr::VRScalarType_Absolute, i == 2 ? vr::VRScalarUnits_NormalizedOneSided :
+                vr::VRScalarUnits_NormalizedTwoSided) == vr::VRInputError_None) && valid;
+        }
+        valid = (input->CreateHapticComponent(properties, "/output/haptic", &haptic_) ==
+            vr::VRInputError_None) && valid;
+        if (!valid || !PublishNeutralInputs()) {
+            Log(std::string("failed to activate passive controller ") + Serial());
+            return vr::VRInitError_Driver_Failed;
+        }
+        objectId_ = objectId;
+        Log(std::string("activated passive controller ") + Serial());
+        return vr::VRInitError_None;
+    }
+
+    void Deactivate() override { objectId_ = vr::k_unTrackedDeviceIndexInvalid; }
+    void EnterStandby() override {}
+    void* GetComponent(const char*) override { return nullptr; }
+    void DebugRequest(const char*, char* response, std::uint32_t size) override
+    {
+        if (response && size > 0) { response[0] = '\0'; }
+    }
+
+    vr::DriverPose_t GetPose() override
+    {
+        vr::DriverPose_t pose{};
+        pose.qWorldFromDriverRotation = Quaternion(1.0, 0.0, 0.0, 0.0);
+        pose.qDriverFromHeadRotation = Quaternion(1.0, 0.0, 0.0, 0.0);
+        pose.qRotation = Quaternion(1.0, 0.0, 0.0, 0.0);
+        pose.vecPosition[0] = role_ == vr::TrackedControllerRole_LeftHand ? -0.25 : 0.25;
+        pose.vecPosition[1] = 1.25;
+        pose.vecPosition[2] = -0.35;
+        pose.result = vr::TrackingResult_Running_OK;
+        pose.deviceIsConnected = objectId_ != vr::k_unTrackedDeviceIndexInvalid;
+        pose.poseIsValid = pose.deviceIsConnected && inputHealthy_;
+        return pose;
+    }
+
+    void RunFrame()
+    {
+        if (objectId_ != vr::k_unTrackedDeviceIndexInvalid) {
+            // Repeated false/zero updates never synthesize a press or touch.
+            inputHealthy_ = PublishNeutralInputs();
+            vr::VRServerDriverHost()->TrackedDevicePoseUpdated(objectId_, GetPose(), sizeof(vr::DriverPose_t));
+        }
+    }
+
+private:
+    bool PublishNeutralInputs()
+    {
+        bool valid = true;
+        for (const auto handle : booleans_) {
+            valid = (vr::VRDriverInput()->UpdateBooleanComponent(handle, false, 0.0) ==
+                vr::VRInputError_None) && valid;
+        }
+        for (const auto handle : scalars_) {
+            valid = (vr::VRDriverInput()->UpdateScalarComponent(handle, 0.0F, 0.0) ==
+                vr::VRInputError_None) && valid;
+        }
+        return valid;
+    }
+
+    inline static constexpr std::array<const char*, 6> booleanPaths_{
+        "/input/system/click", "/input/application_menu/click", "/input/grip/click",
+        "/input/trackpad/click", "/input/trackpad/touch", "/input/trigger/click"};
+    inline static constexpr std::array<const char*, 3> scalarPaths_{
+        "/input/trackpad/x", "/input/trackpad/y", "/input/trigger/value"};
+    vr::ETrackedControllerRole role_;
+    vr::TrackedDeviceIndex_t objectId_{vr::k_unTrackedDeviceIndexInvalid};
+    std::array<vr::VRInputComponentHandle_t, 6> booleans_{};
+    std::array<vr::VRInputComponentHandle_t, 3> scalars_{};
+    vr::VRInputComponentHandle_t haptic_{};
+    bool inputHealthy_{true};
+};
+
 class HeadPoseProvider final : public vr::IServerTrackedDeviceProvider {
 public:
     vr::EVRInitError Init(vr::IVRDriverContext* context) override
@@ -436,11 +556,26 @@ public:
             return vr::VRInitError_Driver_Failed;
         }
         Log("registered synthetic head-pose device at configured standing pose");
+        if (ReadBoolSetting("enableControllers", false)) {
+            controllers_[0] = std::make_unique<PassiveControllerDevice>(vr::TrackedControllerRole_LeftHand);
+            controllers_[1] = std::make_unique<PassiveControllerDevice>(vr::TrackedControllerRole_RightHand);
+            for (auto& controller : controllers_) {
+                if (!vr::VRServerDriverHost()->TrackedDeviceAdded(controller->Serial(),
+                        vr::TrackedDeviceClass_Controller, controller.get())) {
+                    Log("passive controller registration failed; pair is unqualified");
+                    // Keep accepted objects alive until runtime Cleanup, including
+                    // partial admission. The application probe rejects a missing hand.
+                    return vr::VRInitError_Driver_Failed;
+                }
+            }
+            Log("registered passive left/right controller pair");
+        }
         return vr::VRInitError_None;
     }
 
     void Cleanup() override
     {
+        for (auto& controller : controllers_) { controller.reset(); }
         device_.reset();
         vr::CleanupDriverContext();
     }
@@ -451,6 +586,9 @@ public:
         if (device_) {
             device_->RunFrame();
         }
+        for (auto& controller : controllers_) {
+            if (controller) { controller->RunFrame(); }
+        }
     }
     bool ShouldBlockStandbyMode() override { return false; }
     void EnterStandby() override {}
@@ -458,6 +596,7 @@ public:
 
 private:
     std::unique_ptr<HeadPoseDevice> device_;
+    std::array<std::unique_ptr<PassiveControllerDevice>, 2> controllers_;
 };
 
 HeadPoseProvider g_provider;

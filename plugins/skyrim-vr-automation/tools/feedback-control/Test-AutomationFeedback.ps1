@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+[CmdletBinding()]
+param([string]$FixtureRoot = [IO.Path]::GetTempPath())
+
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$fixture = Join-Path ([IO.Path]::GetTempPath()) ('skyrim-vr-feedback-' + [guid]::NewGuid().ToString('N'))
+$fixture = Join-Path ([IO.Path]::GetFullPath($FixtureRoot)) ('skyrim-vr-feedback-' + [guid]::NewGuid().ToString('N'))
 $script = Join-Path $PSScriptRoot 'Invoke-AutomationFeedback.ps1'
 $powerShell = (Get-Process -Id $PID).Path
 
@@ -50,6 +53,15 @@ try {
     $amended = Invoke-Feedback @('amend', '-FeedbackId', $id, '-Observed', 'Corrected observation.', '-BlockedState', 'false', '-Actor', 'task-one', '-ActorRole', 'reporter')
     if (-not $amended.result.ok -or $amended.result.data.feedback.observed -ne 'Corrected observation.' -or $amended.result.data.feedback.blocked) { throw 'Amend did not fold correctly.' }
 
+    $severityOnly = Invoke-Feedback @('amend', '-FeedbackId', $id, '-Severity', 'critical', '-Actor', 'maintainer', '-ActorRole', 'maintainer')
+    if ($severityOnly.exitCode -ne 0 -or -not $severityOnly.result.ok -or $severityOnly.result.data.feedback.severity -ne 'critical') { throw 'Explicit severity-only amendment was ignored.' }
+    $severityRead = (Invoke-Feedback @('get', '-FeedbackId', $id)).result.data.feedback
+    if ($severityRead.severity -ne 'critical') { throw 'Explicit severity amendment was not durably folded.' }
+    $withoutSeverity = Invoke-Feedback @('amend', '-FeedbackId', $id, '-Observed', 'Observation without severity.', '-Actor', 'maintainer', '-ActorRole', 'maintainer')
+    if (-not $withoutSeverity.result.ok -or $withoutSeverity.result.data.feedback.severity -ne 'critical') { throw 'Omitted severity overwrote the previous value.' }
+    $severityDown = Invoke-Feedback @('amend', '-FeedbackId', $id, '-Severity', 'low', '-Observed', 'Corrected lower impact.', '-Actor', 'maintainer', '-ActorRole', 'maintainer')
+    if (-not $severityDown.result.ok -or $severityDown.result.data.feedback.severity -ne 'low' -or $severityDown.result.data.feedback.observed -ne 'Corrected lower impact.') { throw 'Combined severity amendment did not fold correctly.' }
+
     foreach ($transition in @(
         @('triage', '-FeedbackId', $id, '-Actor', 'maintainer', '-ActorRole', 'maintainer', '-Note', 'Reproduced.'),
         @('accept', '-FeedbackId', $id, '-Actor', 'maintainer', '-ActorRole', 'maintainer'),
@@ -59,7 +71,7 @@ try {
         if (-not $changed.result.ok) { throw "Transition failed: $($transition[0])" }
     }
     $resolved = (Invoke-Feedback @('get', '-FeedbackId', $id)).result.data.feedback
-    if ($resolved.status -ne 'resolved' -or $resolved.resolutionLinks.commit -ne 'abc123') { throw 'Resolution state is incomplete.' }
+    if ($resolved.status -ne 'resolved' -or $resolved.resolutionLinks.commit -ne 'abc123' -or $resolved.severity -ne 'low') { throw 'Resolution state is incomplete or changed amended severity.' }
 
     $closedAmend = Invoke-Feedback @('amend', '-FeedbackId', $id, '-Observed', 'Must fail.')
     if ($closedAmend.exitCode -eq 0 -or $closedAmend.result.ok) { throw 'Terminal feedback accepted an amendment without reopen.' }

@@ -4,6 +4,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## Unreleased
 
+## 0.9.0+codex.20261121 (2026-11-21)
+
+- Synchronize the installable Codex plugin with the public source, including
+  the passive SteamVR controller files and workspace recovery tools.
+- Add offline stereo-image analysis for saved captures. The optional native
+  SSIM scorer is built separately.
+
 - Normalize the evidence-directory boundary before validating snapshot
   containment so an equivalent trailing-separator spelling cannot block task
   completion or receipt-only recovery.
