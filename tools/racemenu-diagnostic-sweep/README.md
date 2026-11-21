@@ -80,7 +80,7 @@ Use the stable `CODEX_PYTHON` entry point. Example PowerShell shape (replace eve
 placeholder with the runtime owner's exact qualified paths):
 
 ```powershell
-& 'L:\Codex\shared\tools\python\python.cmd' -B `
+& $env:CODEX_PYTHON -B `
   '<durable-controller-root>\racemenu_sweep.py' `
   --capture-session '<owned-capture>\capture-interaction.session.json' `
   --capture-controller '<exact-installed-plugin>\tools\capture-interaction-control\Invoke-CaptureInteraction.ps1' `
@@ -175,7 +175,7 @@ allocates scratch nor releases the owner's allocation.
 ## Offline validation
 
 ```powershell
-& 'L:\Codex\shared\tools\python\python.cmd' -B .\tests\test_sweep.py
+& $env:CODEX_PYTHON -B .\tests\test_sweep.py
 ```
 
 Fixtures use temporary isolated state, never Skyrim or network calls. Tests

@@ -10,6 +10,9 @@ param(
 
     [string]$EvidenceDirectory,
 
+    # Optional restore-only audit namespace; snapshot authority remains in EvidenceDirectory.
+    [string]$RestoreEvidenceDirectory,
+
     [string]$SourceCachePath,
 
     [string]$ExpectedSourceTreeSha256,
@@ -438,6 +441,7 @@ $result = $null
 $cacheControl = $null
 $cacheLock = $null
 try {
+    if (-not [string]::IsNullOrWhiteSpace($RestoreEvidenceDirectory) -and $Command -ne 'restore') { throw '-RestoreEvidenceDirectory is supported only by restore.' }
     if ($Command -eq 'providers') {
         if ($IncludeInventoryEntries -and -not $DeepInventory) { throw '-IncludeInventoryEntries requires -DeepInventory.' }
         $result = [pscustomobject][ordered]@{ ok = $true; command = $Command; data = Get-Providers; errors = @() }
@@ -458,6 +462,21 @@ try {
         }
         else {
             $paths = Get-ReceiptPaths
+            if ($Command -eq 'restore') {
+                $restoreEvidence = $paths.evidence
+                if (-not [string]::IsNullOrWhiteSpace($RestoreEvidenceDirectory)) {
+                    $restoreEvidence = [IO.Path]::GetFullPath($RestoreEvidenceDirectory).TrimEnd('\', '/')
+                    $sourceEvidence = $paths.evidence.TrimEnd('\', '/')
+                    $liveRoot = $resolvedCache.TrimEnd('\', '/')
+                    foreach ($protectedRoot in @($sourceEvidence, $liveRoot)) {
+                        if ([string]::Equals($restoreEvidence, $protectedRoot, [StringComparison]::OrdinalIgnoreCase) -or
+                            $restoreEvidence.StartsWith($protectedRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+                            $protectedRoot.StartsWith($restoreEvidence + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'Separate restore evidence must be disjoint from snapshot evidence and the live cache.' }
+                    }
+                    if (-not (Test-Path -LiteralPath $restoreEvidence -PathType Container)) { throw 'Separate restore evidence must be an explicit existing directory.' }
+                    Assert-NoCacheReparsePoint -Path $restoreEvidence -Purpose 'Separate restore audit evidence'
+                }
+            }
             if ($Command -in @('snapshot', 'seed', 'restore') -and -not $WhatIfPreference) {
                 $cacheControl = Get-CacheTransactionControl $resolvedCache
                 $cacheLock = Enter-CacheTransactionLock $cacheControl
@@ -601,24 +620,26 @@ try {
                     $leaf = Split-Path -Leaf $resolvedCache
                     $staging = Join-Path $parent ('.' + $leaf + '.restore.' + [guid]::NewGuid().ToString('N'))
                     $displaced = Join-Path $parent ('.' + $leaf + '.displaced.' + [guid]::NewGuid().ToString('N'))
-                    $preservedDisplaced = Join-Path $paths.evidence ('cache.displaced.' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '.' + [guid]::NewGuid().ToString('N'))
+                    $preservedDisplaced = Join-Path $restoreEvidence ('cache.displaced.' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '.' + [guid]::NewGuid().ToString('N'))
                     $current = Get-TreeInventory $resolvedCache
                     $journalPath = $null
                     $restoreReceiptPath = $null
                     if ($PSCmdlet.ShouldProcess($resolvedCache, 'Restore exact preserved shader-cache tree and retain displaced contents')) {
                         $operationId = [guid]::NewGuid().ToString('N')
                         $journalPath = $cacheControl.journal
-                        $evidenceJournalPath = Join-Path $paths.evidence ("shader-cache-restore.$operationId.journal.json")
-                        $restoreReceiptPath = Join-Path $paths.evidence ("shader-cache-restore.$operationId.receipt.json")
+                        $evidenceJournalPath = Join-Path $restoreEvidence ("shader-cache-restore.$operationId.journal.json")
+                        $restoreReceiptPath = Join-Path $restoreEvidence ("shader-cache-restore.$operationId.receipt.json")
                         $journal = [pscustomobject][ordered]@{
                             contractVersion = '2.0.0'; operation = 'restore'; phase = 'prepared'; operationId = $operationId
                             snapshotTransactionId = [string]$receipt.transactionId; cachePath = $resolvedCache
+                            snapshotReceiptPath = $paths.receipt; restoreEvidenceDirectory = $restoreEvidence
                             originalTreeSha256 = [string]$current.treeSha256; requestedTreeSha256 = [string]$receipt.beforeTreeSha256
                             stagingPath = $staging; displacedPath = $displaced; evidenceJournalPath = $evidenceJournalPath
                             preparedUtc = [DateTime]::UtcNow.ToString('o'); rollback = $null
                         }
                         Write-CacheJournal -Control $cacheControl -Journal $journal
-                        Write-JsonFile (Join-Path $paths.evidence 'cache.current-before-restore.inventory.json') $current
+                        $inventoryName = if ([string]::IsNullOrWhiteSpace($RestoreEvidenceDirectory)) { 'cache.current-before-restore.inventory.json' } else { 'cache.current-before-restore.' + $operationId + '.inventory.json' }
+                        Write-JsonFile (Join-Path $restoreEvidence $inventoryName) $current
                         Copy-Item -LiteralPath $paths.before -Destination $staging -Recurse
                         $staged = Get-TreeInventory $staging
                         if ($staged.treeSha256 -ne [string]$receipt.beforeTreeSha256) { throw 'Staged restore tree failed verification.' }
@@ -639,6 +660,7 @@ try {
                             $restoreReceipt = [pscustomobject][ordered]@{
                                 contractVersion = '2.0.0'; operation = 'restore'; transactionId = $operationId
                                 snapshotTransactionId = [string]$receipt.transactionId; cachePath = $resolvedCache
+                                snapshotReceiptPath = $paths.receipt; restoreEvidenceDirectory = $restoreEvidence
                                 restoredTreeSha256 = [string]$receipt.beforeTreeSha256
                                 displacedTreeSha256 = $current.treeSha256
                                 displacedPath = $preservedDisplaced
